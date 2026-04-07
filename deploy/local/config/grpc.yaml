@@ -1,0 +1,38 @@
+# SchemaBot Configuration (gRPC Mode)
+#
+# This config is shared between SchemaBot and Tern services.
+# - SchemaBot reads tern_deployments to know where Tern services are
+# - Tern reads databases and uses TERN_ENVIRONMENT to extract its environment's DSNs
+#
+# Deployment patterns:
+#   1. Separate Tern per environment (strict isolation):
+#      staging: "tern-staging:9090"
+#      production: "tern-production:9090"
+#
+#   2. Single Tern for all environments (downward trust):
+#      staging: "tern:9090"
+#      production: "tern:9090"
+#      (Production Tern can manage staging databases too)
+
+# SchemaBot's own storage database
+storage:
+  dsn: "env:MYSQL_DSN"
+
+# gRPC mode: separate Tern services per environment
+# Change both to the same address for single-Tern deployment
+tern_deployments:
+  default:
+    staging: "tern-staging:9090"
+    production: "tern-production:9090"
+
+# Database configurations (source of truth for both modes)
+# Tern services use TERN_TARGET_DSN (points to testapp) as the Spirit target.
+# MYSQL_DSN (points to tern db) is used for SchemaBot storage only.
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "env:TERN_TARGET_DSN"
+      production:
+        dsn: "env:TERN_TARGET_DSN"

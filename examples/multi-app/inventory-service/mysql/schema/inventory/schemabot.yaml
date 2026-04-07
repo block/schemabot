@@ -1,0 +1,5 @@
+database: inventory
+type: mysql
+environments:
+  - staging
+  - production

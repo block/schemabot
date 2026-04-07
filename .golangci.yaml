@@ -1,0 +1,25 @@
+version: "2"
+linters:
+  enable:
+    - errcheck        # unchecked errors
+    - govet           # suspicious constructs
+    - staticcheck     # comprehensive static analysis
+    - ineffassign     # useless assignments
+    - unused          # unused code
+    - gocritic        # opinionated but catches real bugs
+    - errorlint       # proper error wrapping/comparison
+    - modernize       # suggest modern Go idioms (wg.Go, etc.)
+    - noctx           # requests without context
+    - bodyclose       # unclosed HTTP response bodies
+    - usetesting      # enforce t.Context() over context.Background() in tests
+  settings:
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close          # bodyclose linter handles HTTP resp.Body; other Close() checked by closeandlog analyzer
+    usetesting:
+      context-background: true
+      context-todo: true
+formatters:
+  enable:
+    - gofmt
+    - goimports

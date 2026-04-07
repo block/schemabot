@@ -1,0 +1,24 @@
+# SchemaBot Configuration (Local Mode)
+#
+# This is the default configuration for SchemaBot with embedded Tern.
+# No external Tern services are needed - everything runs in a single process.
+#
+# For gRPC mode (separate Tern services), add tern_deployments section.
+# See config/schemabot.yaml for an example.
+
+# SchemaBot's own storage database
+storage:
+  dsn: "env:MYSQL_DSN"
+
+# Database configurations (source of truth)
+# In local mode, SchemaBot uses embedded Tern to manage these databases.
+# Staging and production use separate MySQL instances (different hosts),
+# both with the same database name (testapp).
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root:testpassword@tcp(mysql-staging:3306)/testapp?parseTime=true"
+      production:
+        dsn: "root:testpassword@tcp(mysql-production:3306)/testapp?parseTime=true"

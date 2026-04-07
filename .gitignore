@@ -1,0 +1,94 @@
+# Build output
+bin/
+/localscale
+/localscale-linux
+/vtcombo-linux
+/mysqlctl-linux
+deploy/local/vitess-config/
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Test coverage
+*.out
+*.coverprofile
+coverage/
+coverage.*
+coverage.html
+test-output.txt
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Dependency directories
+# vendor/
+
+# Environment
+.env
+*.env.local
+state.json
+
+# AI assistants
+.goosehints
+.goose
+**/.agents/knowledge/
+
+# Lint logs
+lint-error.logs
+
+# Logs
+/logs
+*.log
+
+# Docker
+*.pid
+docker-compose.override.yml
+
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars.json
+terraform.tfvars.local
+*.auto.tfvars
+*.auto.tfvars.json
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Claude Code (keep shared config, ignore local)
+.claude/*
+!.claude/settings.json
+!.claude/commands/
+!.claude/hooks/
+!.claude/agents/
+!.claude/docs/
+
+# Preview gist tracking
+.gist-id
+
+# OS files
+.DS_Store
+deploy/local/schemabot
+.gist-id

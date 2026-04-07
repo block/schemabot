@@ -1,0 +1,97 @@
+name: "Tests"
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - master
+      - main
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    name: "Build"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+      - name: "Build"
+        run: go build -v ./...
+      - name: "Vet (all tags)"
+        run: |
+          go vet ./...
+          go vet -tags=integration ./...
+          go vet -tags=e2e ./e2e/...
+
+  unit:
+    name: "Unit Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+      - name: "Test"
+        run: make test-unit
+
+  integration:
+    name: "Integration Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+      - name: "Test"
+        run: go test -tags=integration -timeout=10m -count=1 $(go list -tags=integration ./... | grep -v /localscale)
+
+  localscale:
+    name: "LocalScale Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+      - name: "Cache Vitess binaries"
+        uses: actions/cache@v4
+        with:
+          path: |
+            bin/vtcombo-linux
+            bin/mysqlctl-linux
+          key: vitess-bins-${{ hashFiles('go.sum') }}
+      - name: "Build LocalScale image"
+        run: |
+          CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux ./cmd/localscale &
+          [ -f bin/vtcombo-linux ] || CGO_ENABLED=0 GOOS=linux go build -o bin/vtcombo-linux vitess.io/vitess/go/cmd/vtcombo &
+          [ -f bin/mysqlctl-linux ] || CGO_ENABLED=0 GOOS=linux go build -o bin/mysqlctl-linux vitess.io/vitess/go/cmd/mysqlctl &
+          wait
+          scripts/copy-vitess-config.sh
+          docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
+      - name: "Test"
+        run: go test -tags=integration -timeout=15m -count=1 -v ./pkg/localscale/... 2>&1 | tee /dev/stderr | tail -50
+
+  e2e:
+    name: "E2E Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+      - name: "Test"
+        run: make test-e2e

@@ -1,0 +1,494 @@
+syntax = "proto3";
+
+package tern.v1;
+
+import "google/api/annotations.proto";
+
+option go_package = "github.com/block/schemabot/pkg/proto/ternv1";
+
+// Tern provides schema change planning and execution.
+//
+// NOTE: require_unimplemented_servers=false is set in buf.gen.yaml.
+// Embedding UnimplementedTernServer is optional. We recommend implementing
+// all RPCs explicitly so that adding a new RPC causes a compile error
+// rather than silently returning "unimplemented".
+//
+// Lifecycle: Plan -> Apply -> [Progress] -> [Cutover] -> [Revert|SkipRevert]
+// Control:   Stop, Start, Volume (can be called during Apply execution)
+//
+// State machine (per apply):
+//   pending -> running -> waiting_for_cutover -> cutting_over -> completed
+//                |                                                  |
+//                v                                            revert_window -> reverted
+//              failed                                               |
+//                ^                                                  v
+//              stopped -(Start)-> running                       completed
+//
+// Only one active schema change per database at a time (enforced by Apply).
+service Tern {
+  // Plan generates a schema change plan by diffing declarative schema files
+  // against the live database schema. Returns DDL statements needed to converge.
+  //
+  // This is a stateless operation — it does not modify the database.
+  // The returned plan_id is used to invoke Apply.
+  //
+  // The response includes:
+  //   - DDL changes per table (CREATE/ALTER/DROP)
+  //   - Unsafe change detection (DROP TABLE, DROP COLUMN, etc.)
+  //   - Schema lint warnings
+  //   - Errors (e.g., invalid SQL syntax)
+  //
+  // Errors are returned in the response body (not as RPC errors) so the caller
+  // can display them to the user.
+  rpc Plan(PlanRequest) returns (PlanResponse) {
+    option (google.api.http) = {
+      post: "/v1/plan"
+      body: "*"
+    };
+  }
+
+  // Apply executes a previously generated plan. Returns immediately with an
+  // apply_id; execution happens asynchronously. Use Progress to track status.
+  //
+  // Preconditions:
+  //   - Plan must exist (referenced by plan_id).
+  //   - No other active schema change for this database (returns accepted=false).
+  //
+  // Options:
+  //   - defer_cutover: If true, pauses at waiting_for_cutover state until
+  //     the Cutover RPC is called. If false (default), cutover is automatic.
+  //   - allow_unsafe: If true, permits DROP TABLE/COLUMN operations.
+  //
+  // Execution modes:
+  //   - Sequential (default): Each DDL runs independently — copy, cutover, next.
+  //     Failure in one DDL cancels remaining DDLs.
+  //   - Atomic (defer_cutover=true): All DDLs copy in parallel, then cut over
+  //     together. Use for cross-table consistency.
+  //
+  // Creates Apply and Task records in storage for lifecycle tracking.
+  rpc Apply(ApplyRequest) returns (ApplyResponse) {
+    option (google.api.http) = {
+      post: "/v1/apply"
+      body: "*"
+    };
+  }
+
+  // Progress returns detailed progress for an active or recently completed
+  // schema change. Read-only — does not modify state.
+  //
+  // Returns per-table progress including rows copied, ETA, percent complete,
+  // and a human-readable summary. For Vitess, includes per-shard progress.
+  //
+  // The overall state is derived from task priority:
+  //   running > waiting_for_cutover > cutting_over > pending > stopped > failed > completed
+  //
+  // If no schema change exists for the database, returns STATE_NO_ACTIVE_CHANGE.
+  rpc Progress(ProgressRequest) returns (ProgressResponse) {
+    option (google.api.http) = {
+      post: "/v1/progress"
+      body: "*"
+    };
+  }
+
+  // Cutover triggers the table swap phase for a schema change that was started
+  // with defer_cutover=true. Only valid when state is waiting_for_cutover.
+  //
+  // In atomic mode, all tables cut over together. In sequential mode, the
+  // current table cuts over (subsequent tables proceed automatically).
+  //
+  // No-op if defer_cutover was not used (cutover happens automatically).
+  rpc Cutover(CutoverRequest) returns (CutoverResponse) {
+    option (google.api.http) = {
+      post: "/v1/cutover"
+      body: "*"
+    };
+  }
+
+  // Revert rolls back a completed schema change to the original schema.
+  // Only valid during the revert window (state = revert_window).
+  //
+  // Transitions: revert_window -> reverted.
+  //
+  // After the revert window expires, the schema change is finalized and
+  // can no longer be reverted.
+  rpc Revert(RevertRequest) returns (RevertResponse) {
+    option (google.api.http) = {
+      post: "/v1/revert"
+      body: "*"
+    };
+  }
+
+  // SkipRevert closes the revert window early and finalizes the schema change.
+  // Only valid when state is revert_window.
+  //
+  // Transitions: revert_window -> completed.
+  //
+  // Call this when you are confident the schema change is correct and want to
+  // skip the monitoring period.
+  rpc SkipRevert(SkipRevertRequest) returns (SkipRevertResponse) {
+    option (google.api.http) = {
+      post: "/v1/skip-revert"
+      body: "*"
+    };
+  }
+
+  // Health checks service health by verifying storage connectivity.
+  rpc Health(HealthRequest) returns (HealthResponse) {
+    option (google.api.http) = {
+      get: "/v1/health"
+    };
+  }
+
+  // Stop pauses all non-terminal tasks for a schema change.
+  //
+  // Transitions: any non-terminal state -> stopped.
+  //
+  // For MySQL (Spirit engine): The user has limited time to resume based on
+  // binlog retention (default 7 days). After that, the checkpoint expires
+  // and the schema change cannot be resumed.
+  //
+  // Returns stopped_count and skipped_count to indicate how many tasks
+  // were affected.
+  rpc Stop(StopRequest) returns (StopResponse) {
+    option (google.api.http) = {
+      post: "/v1/stop"
+      body: "*"
+    };
+  }
+
+  // Start resumes a previously stopped schema change from its checkpoint.
+  //
+  // Transitions: stopped -> running.
+  //
+  // Preconditions:
+  //   - At least one stopped task must exist for the database.
+  //   - For MySQL: binlog must not have expired (default 7 day window).
+  //
+  // Execution resumes asynchronously (same as Apply). Use Progress to track.
+  rpc Start(StartRequest) returns (StartResponse) {
+    option (google.api.http) = {
+      post: "/v1/start"
+      body: "*"
+    };
+  }
+
+  // Volume adjusts the schema change speed/concurrency while running.
+  //
+  // Scale: 1 (conservative, minimal database load) to 11 (aggressive, maximum
+  // throughput). Affects chunk size, lock hold time, and throttle parameters.
+  //
+  // Can be called multiple times during a running schema change. The engine
+  // is stopped and restarted internally to apply the new settings.
+  //
+  // Preconditions:
+  //   - Active schema change must exist for the database.
+  //   - Volume must be 1-11 inclusive.
+  rpc Volume(VolumeRequest) returns (VolumeResponse) {
+    option (google.api.http) = {
+      post: "/v1/volume"
+      body: "*"
+    };
+  }
+
+}
+
+// Engine represents the schema change engine type.
+enum Engine {
+  ENGINE_SPIRIT = 0;
+  ENGINE_PLANETSCALE = 1;
+}
+
+// State represents the state of a schema change task.
+enum State {
+  STATE_NO_ACTIVE_CHANGE = 0;
+  STATE_PENDING = 1;
+  STATE_RUNNING = 2;
+  STATE_WAITING_FOR_CUTOVER = 3;
+  STATE_CUTTING_OVER = 4;
+  STATE_REVERT_WINDOW = 5;
+  STATE_COMPLETED = 6;
+  STATE_FAILED = 7;
+  STATE_STOPPED = 8;
+  STATE_REVERTED = 9;
+}
+
+// ChangeType represents the type of DDL change.
+enum ChangeType {
+  CHANGE_TYPE_OTHER = 0;
+  CHANGE_TYPE_CREATE = 1;
+  CHANGE_TYPE_ALTER = 2;
+  CHANGE_TYPE_DROP = 3;
+}
+
+// SchemaFiles contains the schema files for a namespace (e.g. schema name for MySQL, keyspace for Vitess).
+message SchemaFiles {
+  // Filename → content mapping (e.g., "users.sql" → CREATE TABLE, "vschema.json" → VSchema JSON).
+  map<string, string> files = 1;
+}
+
+// PlanRequest requests a schema change plan from declarative schema files.
+message PlanRequest {
+  // Database name (e.g., "banklin"). Used for database discovery and connection lookup.
+  string database = 1;
+  // Database type: "vitess" or "mysql".
+  string type = 2;
+  // Schema files per namespace (e.g. schema name for MySQL, keyspace for Vitess).
+  map<string, SchemaFiles> schema_files = 3;
+  // Source repository (e.g., "org/repo").
+  string repository = 4;
+  // Source pull request number.
+  int32 pull_request = 5;
+  // Environment: "staging" or "production".
+  string environment = 6;
+  reserved 7;
+  // Opaque identifier for endpoint discovery (e.g., database identifier).
+  // Forwarded to Tern for provider-based resolution. Defaults to database if empty.
+  string target = 8;
+}
+
+// TableChange represents a DDL change to a table.
+message TableChange {
+  string table_name = 1;
+  string ddl = 2;
+  ChangeType change_type = 3;
+  string namespace = 4;
+  // Unsafe change tracking
+  bool is_unsafe = 5;
+  string unsafe_reason = 6;
+}
+
+// SchemaChange groups all changes for a single namespace (keyspace/schema).
+message SchemaChange {
+  string namespace = 1;
+  repeated TableChange table_changes = 2;
+  map<string, string> metadata = 3; // Engine-specific data (e.g., "vschema" → diff)
+}
+
+// LintWarning represents a schema linting violation.
+// Violations with severity "error" block apply unless --allow-unsafe is passed.
+message LintWarning {
+  string message = 1;
+  string table = 2;
+  string column = 3;
+  string linter = 4;
+  string fix_type = 5;
+  string severity = 6; // "error", "warning", or "info"
+}
+
+// PlanResponse contains the generated schema change plan.
+// Lint warnings with severity "error" block apply unless --allow-unsafe.
+message PlanResponse {
+  string plan_id = 1;
+  Engine engine = 2;
+  repeated SchemaChange changes = 3;
+  repeated LintWarning lint_warnings = 4;
+  repeated string errors = 5;
+}
+
+// ApplyRequest requests execution of a previously generated plan.
+// DDL changes are passed by the caller since clients are stateless.
+message ApplyRequest {
+  string plan_id = 1;
+  map<string, string> options = 2;
+  map<string, SchemaFiles> schema_files = 3;
+  // Database name for the apply operation.
+  string database = 4;
+  // Database type: "vitess" or "mysql".
+  string type = 5;
+  // DDL changes from PlanStore (clients are stateless and don't store plans).
+  repeated TableChange ddl_changes = 6;
+  // Environment: "staging" or "production".
+  string environment = 7;
+  // Opaque identifier for endpoint discovery (e.g., database identifier).
+  // Forwarded to Tern for provider-based resolution. Defaults to database if empty.
+  string target = 8;
+}
+
+// ApplyResponse indicates whether the apply was accepted.
+message ApplyResponse {
+  bool accepted = 1;
+  string error_message = 2;
+  // The apply identifier for tracking this schema change.
+  string apply_id = 3;
+}
+
+// ProgressRequest requests detailed progress for an active schema change.
+message ProgressRequest {
+  string database = 1;
+  // Database type: "vitess" or "mysql". Used by stateless clients.
+  string type = 2;
+  // Environment: "staging" or "production".
+  string environment = 3;
+  // Optional: scope progress to a specific apply ID.
+  // If empty, returns progress for the active schema change.
+  string apply_id = 4;
+}
+
+// ShardProgress contains progress information for a single Vitess shard.
+message ShardProgress {
+  string shard = 1;
+  string status = 2;
+  int64 rows_copied = 3;
+  int64 rows_total = 4;
+  int64 eta_seconds = 5;
+  int32 cutover_attempts = 6;
+  string last_cutover_attempt = 7;
+  bool ready_to_complete = 8;
+}
+
+// TableProgress contains progress information for a single table.
+message TableProgress {
+  string task_id = 1;
+  string namespace = 2;
+  string table_name = 3;
+  string ddl = 4;
+  string status = 5;
+  int64 rows_copied = 6;
+  int64 rows_total = 7;
+  int32 percent_complete = 8;
+  int64 eta_seconds = 9;
+  bool is_instant = 10;
+  repeated ShardProgress shards = 11;
+  string progress_detail = 12;
+}
+
+// ProgressResponse contains detailed progress information.
+message ProgressResponse {
+  string apply_id = 1;
+  State state = 2;
+  Engine engine = 3;
+  string summary = 4;
+  string error_message = 5;
+  repeated TableProgress tables = 6;
+  string started_at = 7;
+  string completed_at = 8;
+  int32 volume = 9;
+  map<string, string> metadata = 10;
+}
+
+// CutoverRequest triggers the cutover phase.
+message CutoverRequest {
+  string database = 1;
+  // Database type: "vitess" or "mysql". Used by stateless clients.
+  string type = 2;
+  // Environment: "staging" or "production".
+  string environment = 3;
+  // Scope cutover to a specific apply ID.
+  string apply_id = 4;
+}
+
+// CutoverResponse indicates whether the cutover was accepted.
+message CutoverResponse {
+  bool accepted = 1;
+  string error_message = 2;
+}
+
+// RevertRequest reverts a completed schema change.
+message RevertRequest {
+  string database = 1;
+  // Database type: "vitess" or "mysql". Used by stateless clients.
+  string type = 2;
+  // Environment: "staging" or "production".
+  string environment = 3;
+  // Scope revert to a specific apply ID.
+  string apply_id = 4;
+}
+
+// RevertResponse indicates whether the revert was accepted.
+message RevertResponse {
+  bool accepted = 1;
+  string error_message = 2;
+}
+
+// SkipRevertRequest skips the revert window.
+message SkipRevertRequest {
+  string database = 1;
+  // Database type: "vitess" or "mysql". Used by stateless clients.
+  string type = 2;
+  // Environment: "staging" or "production".
+  string environment = 3;
+  // Scope skip-revert to a specific apply ID.
+  string apply_id = 4;
+}
+
+// SkipRevertResponse indicates whether the skip was accepted.
+message SkipRevertResponse {
+  bool accepted = 1;
+  string error_message = 2;
+}
+
+// HealthRequest is the health check request.
+message HealthRequest {}
+
+// HealthResponse is the health check response.
+message HealthResponse {
+  string status = 1;
+}
+
+// StopRequest pauses in-progress schema changes for a database.
+message StopRequest {
+  string database = 1;
+  // Database type: "vitess" or "mysql". Used by stateless clients.
+  string type = 2;
+  // Environment: "staging" or "production".
+  string environment = 3;
+  // Scope stop to a specific apply ID.
+  string apply_id = 4;
+}
+
+// StopResponse indicates whether the stop was accepted.
+message StopResponse {
+  bool accepted = 1;
+  string error_message = 2;
+  // For MySQL: time remaining before binlog expires and resume becomes impossible.
+  string resume_deadline = 3;
+  // Number of tasks that were stopped.
+  int64 stopped_count = 4;
+  // Number of tasks skipped (already in terminal state).
+  int64 skipped_count = 5;
+}
+
+// StartRequest resumes stopped schema changes for a database.
+message StartRequest {
+  string database = 1;
+  // Database type: "vitess" or "mysql". Used by stateless clients.
+  string type = 2;
+  // Environment: "staging" or "production".
+  string environment = 3;
+  // Scope start to a specific apply ID.
+  string apply_id = 4;
+}
+
+// StartResponse indicates whether the start was accepted.
+message StartResponse {
+  bool accepted = 1;
+  string error_message = 2;
+  // Number of tasks that were started.
+  int64 started_count = 3;
+  // Number of tasks skipped (not in stopped state).
+  int64 skipped_count = 4;
+}
+
+// VolumeRequest modifies the schema change speed/concurrency.
+message VolumeRequest {
+  string database = 1;
+  // Database type: "vitess" or "mysql". Used by stateless clients.
+  string type = 2;
+  // Environment: "staging" or "production".
+  string environment = 3;
+  // Volume level 1-11 (1=conservative, 11=aggressive).
+  int32 volume = 4;
+  // Scope volume change to a specific apply ID.
+  string apply_id = 5;
+}
+
+// VolumeResponse indicates whether the volume change was accepted.
+message VolumeResponse {
+  bool accepted = 1;
+  string error_message = 2;
+  // Previous volume level.
+  int32 previous_volume = 3;
+  // New volume level.
+  int32 new_volume = 4;
+}
+

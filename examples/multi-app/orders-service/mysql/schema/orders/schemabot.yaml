@@ -1,0 +1,5 @@
+database: orders
+type: mysql
+environments:
+  - staging
+  - production

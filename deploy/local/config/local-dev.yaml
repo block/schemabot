@@ -1,0 +1,14 @@
+# SchemaBot Configuration (Local Dev - outside Docker)
+# Uses localhost ports to connect to Docker MySQL instances
+
+storage:
+  dsn: "root:testpassword@tcp(localhost:13371)/schemabot?parseTime=true&multiStatements=true"
+
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root:testpassword@tcp(localhost:13372)/testapp?parseTime=true"
+      production:
+        dsn: "root:testpassword@tcp(localhost:13373)/testapp?parseTime=true"

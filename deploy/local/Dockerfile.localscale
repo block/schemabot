@@ -1,0 +1,43 @@
+# All-in-one LocalScale image: fake PlanetScale API + embedded Vitess.
+#
+# Runs in managed mode — starts its own vtcombo + mysqld internally.
+# No external vttestserver or MySQL containers needed.
+#
+# Build (host binaries + config + docker):
+#   CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux ./cmd/localscale
+#   CGO_ENABLED=0 GOOS=linux go build -o bin/vtcombo-linux vitess.io/vitess/go/cmd/vtcombo
+#   CGO_ENABLED=0 GOOS=linux go build -o bin/mysqlctl-linux vitess.io/vitess/go/cmd/mysqlctl
+#   scripts/copy-vitess-config.sh
+#   docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
+#
+# Run:
+#   docker run -p 8080:8080 -v ./config.json:/etc/localscale/config.json \
+#     -e CONFIG_FILE=/etc/localscale/config.json localscale
+
+# mysql:8.0 provides mysqld which vtcombo manages internally.
+FROM mysql:8.0
+
+ENV VTROOT=/vt
+ENV VTDATAROOT=/vt/vtdataroot
+ENV PATH="/vt/bin:${PATH}"
+
+# Install curl for health checks, create non-root user (mysqlctl refuses to run as root).
+RUN microdnf install -y curl && microdnf clean all && \
+    groupadd -r vitess && useradd -r -g vitess vitess && \
+    mkdir -p /vt/vtdataroot && chown -R vitess:vitess /vt
+
+# Vitess config files (init_db.sql, mycnf templates) from the Go module cache.
+COPY --chown=vitess:vitess deploy/local/vitess-config/ /vt/config/
+
+# Host-built binaries.
+COPY --chown=vitess:vitess bin/vtcombo-linux /vt/bin/vtcombo
+COPY --chown=vitess:vitess bin/mysqlctl-linux /vt/bin/mysqlctl
+COPY --chown=vitess:vitess bin/localscale-linux /vt/bin/localscale
+
+# Override mysql:8.0's docker-entrypoint.sh which doesn't handle non-MySQL binaries.
+ENTRYPOINT []
+USER vitess
+
+EXPOSE 8080
+
+CMD ["localscale"]

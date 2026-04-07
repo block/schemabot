@@ -1,0 +1,38 @@
+services:
+  vttestserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.vttestserver
+    ports:
+      - "${VTCTLD_GRPC_PORT:-28001}:28001"
+      - "${VTGATE_MYSQL_PORT:-28003}:28003"
+    command:
+      - /vt/bin/vttestserver
+      - --port=28000
+      - --mysql-bind-host=0.0.0.0
+      - --keyspaces=testapp,testapp_sharded
+      - --num-shards=1,2
+      - --foreign-key-mode=disallow
+      - --vtcombo-bind-host=0.0.0.0
+      - --gateway-initial-tablet-timeout=5s
+      - --migration-check-interval=5s
+      - --per-shard-sidecar
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-P", "28003", "--protocol=tcp"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  localscale-mysql:
+    image: mysql:8.0
+    ports:
+      - "${LOCALSCALE_MYSQL_PORT:-28004}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: localscale
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

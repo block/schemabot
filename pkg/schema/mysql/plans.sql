@@ -1,0 +1,16 @@
+CREATE TABLE `plans` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `plan_identifier` varchar(255) NOT NULL,
+  `database_name` varchar(255) NOT NULL,
+  `database_type` varchar(50) NOT NULL,
+  `repository` varchar(255) NOT NULL,
+  `pull_request` int unsigned NOT NULL,
+  `environment` varchar(50) NOT NULL DEFAULT '',
+  `schema_files` json NOT NULL,
+  `plan_data` json NOT NULL,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_plan_identifier` (`plan_identifier`),
+  KEY `idx_repo_pr` (`repository`,`pull_request`),
+  KEY `idx_database_env` (`database_name`,`database_type`,`environment`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
