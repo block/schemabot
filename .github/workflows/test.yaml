@@ -10,6 +10,9 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+env:
+  # Only save caches on pushes to protected branches (prevents cache poisoning from fork PRs).
+  SAVE_CACHE: ${{ github.event_name == 'push' }}
 jobs:
   build:
     name: "Build"
@@ -21,7 +24,15 @@ jobs:
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
-          cache: ${{ github.event_name == 'push' }}
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-
       - name: "Build"
         run: go build -v ./...
       - name: "Vet (all tags)"
@@ -29,6 +40,14 @@ jobs:
           go vet ./...
           go vet -tags=integration ./...
           go vet -tags=e2e ./e2e/...
+      - name: "Save Go cache"
+        if: env.SAVE_CACHE == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
 
   unit:
     name: "Unit Tests"
@@ -40,7 +59,15 @@ jobs:
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
-          cache: ${{ github.event_name == 'push' }}
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-
       - name: "Test"
         run: make test-unit
 
@@ -54,7 +81,15 @@ jobs:
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
-          cache: ${{ github.event_name == 'push' }}
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-
       - name: "Test"
         run: go test -tags=integration -timeout=10m -count=1 $(go list -tags=integration ./... | grep -v /localscale)
 
@@ -68,9 +103,17 @@ jobs:
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
-          cache: ${{ github.event_name == 'push' }}
-      - name: "Cache Vitess binaries"
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache@v4
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-
+      - name: "Restore Vitess binaries"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
         with:
           path: |
             bin/vtcombo-linux
@@ -84,6 +127,14 @@ jobs:
           wait
           scripts/copy-vitess-config.sh
           docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
+      - name: "Save Vitess binaries"
+        if: env.SAVE_CACHE == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
+        with:
+          path: |
+            bin/vtcombo-linux
+            bin/mysqlctl-linux
+          key: vitess-bins-${{ hashFiles('go.sum') }}
       - name: "Test"
         run: go test -tags=integration -timeout=15m -count=1 -v ./pkg/localscale/... 2>&1 | tee /dev/stderr | tail -50
 
@@ -97,6 +148,14 @@ jobs:
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
-          cache: ${{ github.event_name == 'push' }}
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-
       - name: "Test"
         run: make test-e2e

@@ -28,7 +28,15 @@ jobs:
       - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
-          cache: ${{ github.event_name == 'push' }}
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-
       - name: golangci-lint (${{ matrix.name }})
         uses: golangci/golangci-lint-action@0a35821d5c230e903fcfe077583637dea1b27b47 # ratchet:golangci/golangci-lint-action@v9.0.0
         with:
