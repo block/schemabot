@@ -182,7 +182,7 @@ func startMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS 
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("open db for schema: %w", err)
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 
 		// Wait for MySQL to be ready to accept connections
 		var pingErr error
