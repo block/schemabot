@@ -182,7 +182,7 @@ func startMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS 
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("open db for schema: %w", err)
 		}
-		defer func() { _ = db.Close() }()
+		defer db.Close()
 
 		// Wait for MySQL to be ready to accept connections
 		var pingErr error
@@ -197,7 +197,7 @@ func startMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS 
 			return nil, fmt.Errorf("MySQL not ready after 15s: %w", pingErr)
 		}
 
-		if err := applySchemaFS(db, *schemaFS); err != nil {
+		if err := applySchemaFS(ctx, db, *schemaFS); err != nil {
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("apply schema: %w", err)
 		}
@@ -206,7 +206,7 @@ func startMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS 
 	return container, nil
 }
 
-func applySchemaFS(db *sql.DB, schemaFS embed.FS) error {
+func applySchemaFS(ctx context.Context, db *sql.DB, schemaFS embed.FS) error {
 	entries, err := schemaFS.ReadDir("mysql")
 	if err != nil {
 		return fmt.Errorf("read schema directory: %w", err)
@@ -223,11 +223,11 @@ func applySchemaFS(db *sql.DB, schemaFS embed.FS) error {
 		// Extract table name from CREATE TABLE statement to drop first (idempotent for reused containers)
 		contentStr := string(content)
 		if tableName := extractTableName(contentStr); tableName != "" {
-			if _, err := db.ExecContext(context.Background(), fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)); err != nil {
+			if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)); err != nil {
 				return fmt.Errorf("drop table %s: %w", tableName, err)
 			}
 		}
-		if _, err := db.ExecContext(context.Background(), contentStr); err != nil {
+		if _, err := db.ExecContext(ctx, contentStr); err != nil {
 			return fmt.Errorf("execute schema %s: %w", entry.Name(), err)
 		}
 	}

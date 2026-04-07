@@ -21,6 +21,7 @@ jobs:
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
+          cache: ${{ github.event_name == 'push' }}
       - name: "Build"
         run: go build -v ./...
       - name: "Vet (all tags)"
@@ -39,6 +40,7 @@ jobs:
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
+          cache: ${{ github.event_name == 'push' }}
       - name: "Test"
         run: make test-unit
 
@@ -52,6 +54,7 @@ jobs:
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
+          cache: ${{ github.event_name == 'push' }}
       - name: "Test"
         run: go test -tags=integration -timeout=10m -count=1 $(go list -tags=integration ./... | grep -v /localscale)
 
@@ -65,8 +68,9 @@ jobs:
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
+          cache: ${{ github.event_name == 'push' }}
       - name: "Cache Vitess binaries"
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache@v4
         with:
           path: |
             bin/vtcombo-linux
@@ -93,5 +97,6 @@ jobs:
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
+          cache: ${{ github.event_name == 'push' }}
       - name: "Test"
         run: make test-e2e

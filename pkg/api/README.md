@@ -55,7 +55,7 @@ Lazy creation means a connection failure to one database doesn't block startup o
 | GET | `/api/history/{database}` | `handleDatabaseHistory` | Apply history for a database |
 | GET | `/api/databases/{database}/environments` | `handleDatabaseEnvironments` | List environments |
 | GET | `/api/logs/{database}` | `handleLogs` | Apply logs for a database |
-| GET | `/api/logs` | `handleAllLogs` | All apply logs |
+| GET | `/api/logs` | `handleLogsWithoutDatabase` | Logs by apply ID |
 
 ### Locks and Settings
 
