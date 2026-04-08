@@ -250,7 +250,14 @@ test-e2e-local: build ## Run local e2e tests in isolated environment
 	SCHEMABOT_MYSQL_PORT=14371 \
 	STAGING_MYSQL_PORT=14372 \
 	PRODUCTION_MYSQL_PORT=14373 \
-	docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml up --build -d
+	docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml up --build -d || \
+		(echo "docker compose up failed — dumping logs:"; \
+		SCHEMABOT_PORT=14370 SCHEMABOT_MYSQL_PORT=14371 STAGING_MYSQL_PORT=14372 PRODUCTION_MYSQL_PORT=14373 \
+		docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml logs; \
+		SCHEMABOT_PORT=14370 SCHEMABOT_MYSQL_PORT=14371 STAGING_MYSQL_PORT=14372 PRODUCTION_MYSQL_PORT=14373 \
+		docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml down -v; \
+		rm -f deploy/local/schemabot; \
+		exit 1)
 	@rm -f deploy/local/schemabot
 	@echo "Waiting for SchemaBot e2e environment to be healthy..."
 	@for i in $$(seq 1 60); do \
@@ -301,7 +308,12 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 	CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd
 	cp bin/schemabot-linux deploy/local/schemabot
 	@$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v 2>/dev/null || true
-	@$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml up --build -d
+	@$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml up --build -d || \
+		(echo "docker compose up failed — dumping logs:"; \
+		$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs; \
+		$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
+		rm -f deploy/local/schemabot; \
+		exit 1)
 	@rm -f deploy/local/schemabot
 	@echo "Waiting for SchemaBot gRPC e2e environment to be healthy..."
 	@for i in $$(seq 1 90); do \
