@@ -41,7 +41,8 @@ service:
 #       default:
 #         staging: "tern-staging:9090"
 #         production: "tern-production:9090"
-config: {}
+# config is required — helm install will fail without it.
+config: null
 
 # Additional environment variables for the SchemaBot container.
 # Useful for env: secret references in the config file.

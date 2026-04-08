@@ -1,4 +1,4 @@
-{{- if .Values.config }}
+{{- $_ := required "config is required — set config.storage.dsn and at least one of config.databases or config.tern_deployments (see values.yaml for examples)" .Values.config }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -9,4 +9,3 @@ metadata:
 data:
   config.yaml: |
     {{- toYaml .Values.config | nindent 4 }}
-{{- end }}
