@@ -1,0 +1,173 @@
+# gRPC mode: SchemaBot + separate Tern services with isolated MySQL instances.
+#
+# Use this for:
+#   - Testing gRPC mode locally
+#   - Development requiring strict service isolation
+#   - Each Tern service gets its own MySQL (no shared state)
+#
+# For simpler setup, use the default docker-compose.yml instead.
+#
+# Usage:
+#   docker-compose -f docker-compose.grpc.yml up
+#
+# Access (default ports):
+#   SchemaBot:         http://localhost:13380
+#   Tern Staging:      http://localhost:13384 (HTTP), localhost:13385 (gRPC)
+#   Tern Production:   http://localhost:13386 (HTTP), localhost:13387 (gRPC)
+#   Staging MySQL:     localhost:13382
+#   Production MySQL:  localhost:13383
+name: schemabot-grpc
+
+services:
+  # =============================================================================
+  # Tern Staging
+  # =============================================================================
+  tern-staging-mysql:
+    image: mysql:8.0
+    container_name: tern-staging-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: testpassword
+      MYSQL_DATABASE: tern
+      MYSQL_INITDB_SKIP_TZINFO: "1"
+    volumes:
+      - ./mysql-init/init-tern.sql:/docker-entrypoint-initdb.d/init-tern.sql:ro
+      - ./mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
+      - tern-staging-mysql-data:/var/lib/mysql
+    ports:
+      - "${TERN_STAGING_MYSQL_PORT:-13382}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptestpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  tern-staging:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: tern-staging
+    environment:
+      MYSQL_DSN: "root:testpassword@tcp(tern-staging-mysql:3306)/tern?parseTime=true&multiStatements=true"
+      TERN_TARGET_DSN: "root:testpassword@tcp(tern-staging-mysql:3306)/testapp?parseTime=true&multiStatements=true"
+      SCHEMABOT_CONFIG_FILE: "/config/grpc-tern.yaml"
+      TERN_ENVIRONMENT: "staging"
+      PORT: "8080"
+      GRPC_PORT: "9090"
+      LOG_LEVEL: "debug"
+    volumes:
+      - ./config:/config:ro
+    ports:
+      - "${TERN_STAGING_PORT:-13384}:8080"
+      - "${TERN_STAGING_GRPC_PORT:-13385}:9090"
+    depends_on:
+      tern-staging-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # =============================================================================
+  # Tern Production
+  # =============================================================================
+  tern-production-mysql:
+    image: mysql:8.0
+    container_name: tern-production-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: testpassword
+      MYSQL_DATABASE: tern
+      MYSQL_INITDB_SKIP_TZINFO: "1"
+    volumes:
+      - ./mysql-init/init-tern.sql:/docker-entrypoint-initdb.d/init-tern.sql:ro
+      - ./mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
+      - tern-production-mysql-data:/var/lib/mysql
+    ports:
+      - "${TERN_PRODUCTION_MYSQL_PORT:-13383}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptestpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  tern-production:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: tern-production
+    environment:
+      MYSQL_DSN: "root:testpassword@tcp(tern-production-mysql:3306)/tern?parseTime=true&multiStatements=true"
+      TERN_TARGET_DSN: "root:testpassword@tcp(tern-production-mysql:3306)/testapp?parseTime=true&multiStatements=true"
+      SCHEMABOT_CONFIG_FILE: "/config/grpc-tern.yaml"
+      TERN_ENVIRONMENT: "production"
+      PORT: "8080"
+      GRPC_PORT: "9090"
+      LOG_LEVEL: "debug"
+    volumes:
+      - ./config:/config:ro
+    ports:
+      - "${TERN_PRODUCTION_PORT:-13386}:8080"
+      - "${TERN_PRODUCTION_GRPC_PORT:-13387}:9090"
+    depends_on:
+      tern-production-mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # =============================================================================
+  # SchemaBot
+  # =============================================================================
+  # SchemaBot's internal storage database
+  # Note: Schema is applied by SchemaBot on startup (dogfooding)
+  schemabot-mysql:
+    image: mysql:8.0
+    container_name: schemabot-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: testpassword
+      MYSQL_DATABASE: schemabot
+      MYSQL_INITDB_SKIP_TZINFO: "1"
+    ports:
+      - "${SCHEMABOT_MYSQL_PORT:-13381}:3306"
+    volumes:
+      - ./mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
+      - schemabot-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptestpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  schemabot:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: schemabot
+    environment:
+      MYSQL_DSN: "root:testpassword@tcp(schemabot-mysql:3306)/schemabot?parseTime=true&multiStatements=true"
+      SCHEMABOT_CONFIG_FILE: "/config/grpc-schemabot.yaml"
+      PORT: "8080"
+      LOG_LEVEL: "debug"
+    volumes:
+      - ./config:/config:ro
+    ports:
+      - "${SCHEMABOT_PORT:-13380}:8080"
+    depends_on:
+      schemabot-mysql:
+        condition: service_healthy
+      tern-staging:
+        condition: service_healthy
+      tern-production:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  tern-staging-mysql-data:
+  tern-production-mysql-data:
+  schemabot-mysql-data:

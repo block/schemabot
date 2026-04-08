@@ -1,0 +1,20 @@
+# Tern Service Configuration (gRPC Mode - Tern server)
+#
+# Each Tern service reads this config with its TERN_ENVIRONMENT to find the
+# database DSN for its environment. It creates a LocalClient backed by Spirit
+# and serves the Tern proto over gRPC.
+
+# Tern's own storage database (SchemaBot schema, used by LocalClient)
+storage:
+  dsn: "env:MYSQL_DSN"
+
+# Database configurations — Tern creates a LocalClient for the matching environment.
+# TERN_TARGET_DSN points to the testapp database (Spirit target).
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "env:TERN_TARGET_DSN"
+      production:
+        dsn: "env:TERN_TARGET_DSN"

@@ -1,0 +1,55 @@
+#!/bin/sh
+set -e
+
+# Ensure we're in the worktree root (not the git common dir).
+# Must unset GIT_DIR first — it's set by git during hooks and causes
+# git commands in subprocesses to resolve the wrong repo root.
+unset GIT_DIR
+cd "$(git rev-parse --show-toplevel)"
+
+# Ensure GOROOT matches the Go version in go.mod. External tools (hermit,
+# asdf) may set GOROOT to a different version, causing "compile: version
+# does not match go tool version" errors in golangci-lint and go build.
+GO_VERSION=$(sed -n 's/^go //p' go.mod | head -1)
+if [ -n "$GO_VERSION" ]; then
+    # Check common Go installation paths for the matching version.
+    for candidate in \
+        "/opt/homebrew/opt/go/libexec" \
+        "/usr/local/go" \
+        "$HOME/sdk/go${GO_VERSION}" \
+        "$HOME/Library/Caches/hermit/pkg/go-${GO_VERSION}"; do
+        if [ -x "$candidate/bin/go" ]; then
+            CANDIDATE_VERSION=$("$candidate/bin/go" version 2>/dev/null | grep -o "go${GO_VERSION}" || true)
+            if [ -n "$CANDIDATE_VERSION" ]; then
+                export GOROOT="$candidate"
+                export PATH="$GOROOT/bin:$PATH"
+                break
+            fi
+        fi
+    done
+fi
+
+# Run golangci-lint with autofix on staged Go files
+scripts/lint-fix.sh
+
+# Regenerate TEMPLATES.md if any template source files changed
+TEMPLATE_FILES=$(git diff --cached --name-only -- 'pkg/webhook/templates/*.go' 'pkg/cmd/templates/*.go')
+if [ -n "$TEMPLATE_FILES" ]; then
+    # Ensure Go is in PATH (hooks may not inherit the full user PATH)
+    export PATH="$PATH:$HOME/go/bin:/usr/local/go/bin:/opt/homebrew/bin"
+    unset GIT_INDEX_FILE
+    make build -s
+    scripts/update-templates.sh
+    git add TEMPLATES.md
+fi
+
+# Format embedded schema files if any .sql files changed.
+# Uses local MySQL on :3306 if available, otherwise starts a Docker container.
+# Only formats and re-stages the specific files that were staged.
+SCHEMA_FILES=$(git diff --cached --name-only -- 'pkg/schema/mysql/*.sql')
+if [ -n "$SCHEMA_FILES" ]; then
+    export PATH="$PATH:$HOME/go/bin:/usr/local/go/bin:/opt/homebrew/bin"
+    echo "Schema .sql files changed — running spirit fmt..."
+    scripts/run-spirit-fmt.sh $SCHEMA_FILES
+    git add $SCHEMA_FILES
+fi

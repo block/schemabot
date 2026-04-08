@@ -1,0 +1,13 @@
+{
+  "tables": {
+    "users_seq": {
+      "type": "sequence"
+    },
+    "orders_seq": {
+      "type": "sequence"
+    },
+    "products_seq": {
+      "type": "sequence"
+    }
+  }
+}

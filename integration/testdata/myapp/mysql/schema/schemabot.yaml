@@ -1,0 +1,14 @@
+# Per-service SchemaBot configuration
+# This file lives in the service's schema directory.
+# See docs/configuration.md for full specification.
+
+# Database name
+database: myapp
+
+# Database type: mysql or vitess
+type: mysql
+
+# Optional: deployments for multi-region databases
+# deployments:
+#   - cash-na
+#   - cash-eu

@@ -1,0 +1,21 @@
+CREATE TABLE `checks` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `repository` varchar(255) NOT NULL,
+  `pull_request` int unsigned NOT NULL,
+  `head_sha` varchar(64) NOT NULL,
+  `environment` varchar(50) NOT NULL,
+  `database_type` varchar(50) NOT NULL,
+  `database_name` varchar(255) NOT NULL,
+  `check_run_id` bigint DEFAULT NULL,
+  `has_changes` tinyint(1) NOT NULL DEFAULT '1',
+  `status` varchar(255) NOT NULL,
+  `conclusion` varchar(255) DEFAULT NULL,
+  `error_message` text,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `idx_check_key` (`repository`,`pull_request`,`environment`,`database_type`,`database_name`),
+  KEY `idx_repo_env_db` (`repository`,`environment`,`database_type`,`database_name`),
+  KEY `idx_repo_pr` (`repository`,`pull_request`),
+  KEY `idx_check_run` (`check_run_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

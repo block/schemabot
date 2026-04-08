@@ -1,0 +1,5 @@
+database: payments
+type: mysql
+environments:
+  - staging
+  - production
