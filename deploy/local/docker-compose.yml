@@ -30,7 +30,7 @@ services:
       - mysql-schemabot-data:/var/lib/mysql
       - ./mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptestpassword"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-ptestpassword"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -49,7 +49,7 @@ services:
       - ./mysql-init:/docker-entrypoint-initdb.d:ro
       - ./mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptestpassword"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-ptestpassword"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -67,7 +67,7 @@ services:
       - ./mysql-init:/docker-entrypoint-initdb.d:ro
       - ./mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptestpassword"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-ptestpassword"]
       interval: 5s
       timeout: 5s
       retries: 10
