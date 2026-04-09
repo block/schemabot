@@ -85,9 +85,21 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 **Never silently fail:** Prefer returning errors over silently swallowing them. If a function encounters a condition it can't handle, return an error — don't log and continue. Callers should decide how to handle errors, not the callee. The `Canonicalize` / `FormatDDL` functions in `pkg/ddl/format.go` are an exception: they are best-effort display formatters where returning the original string on parse failure is acceptable.
 
+**Error early, never swallow.** Functions must return errors, not log and swallow them. A function that logs an error and returns void forces every caller to silently proceed as if nothing went wrong — this leads to corrupted state and subtle bugs. Patterns to avoid:
+- `func doThing() { if err != nil { log(err) } }` — should be `func doThing() error`
+- `if err != nil { log(err); continue }` in loops — return error unless the iteration is truly independent (e.g., polling different databases where one failure should not block others)
+- `_ = someFunc()` — never discard errors; check and propagate them
+- Background goroutines that cannot return errors to callers should transition to an error state (e.g., `dr.Error`) and return, not silently continue with partial results
+
 **Wrap errors with context:** Always wrap errors with `fmt.Errorf("context: %w", err)` instead of returning bare `err`. The context should include *what was being done* and *key identifiers* — not just the method name. For example, `fmt.Errorf("proxy query %s: %w", query, err)` tells you which query failed, while `fmt.Errorf("exec query: %w", err)` just restates the function name. Include the data that will help someone debug the issue from the error message alone.
 
 **Info logging on critical paths:** Add `slog.Info` logging at key decision points and state transitions in critical-path code (server startup, request handling, background processors). Logs should include relevant identifiers (org, database, keyspace, branch) so operators can trace the flow. Don't log in hot loops or purely internal helpers — focus on boundaries and state changes.
+
+**No silent branch cases.** Every `continue`, `return`, or early-exit in a conditional branch must have a log statement explaining why. Use `slog.Debug` if the case is expected and frequent (e.g., polling loops), `slog.Warn` if it indicates a surprising or degraded condition. Never silently skip work — someone debugging a production issue needs to see why a code path was taken. This includes:
+- `if !ok { return }` after helper calls — the helper must log, or the caller must
+- `if err != nil { continue }` in loops — always log the error before continuing
+- `_ = someFunc()` — never discard errors silently; log them even if the operation is best-effort
+- Fallback branches (e.g., "assume changed on error") — log why the fallback was taken
 
 **No bug references in code:** When fixing a bug, write code and tests as if the correct behavior always existed. Don't add comments like `// this is where the bug was`, `// regression test for #123`, or `// without this fix, X breaks`. The git history has the context. Code and test comments should describe *what* and *why*, not the history of what was wrong.
 

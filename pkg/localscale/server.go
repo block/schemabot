@@ -64,16 +64,28 @@ type databaseBackend struct {
 	shardCounts      map[string]int     // keyspace → number of shards (from config)
 }
 
+const (
+	// defaultRevertWindowDuration is how long the revert window stays open after a deploy completes.
+	defaultRevertWindowDuration = 30 * time.Minute
+
+	// processorTickInterval is how often the background state processor polls for active deploy requests.
+	processorTickInterval = 500 * time.Millisecond
+)
+
 // Server is a fake PlanetScale HTTP API server backed by one or more vtcombo instances.
 type Server struct {
-	backends         map[backendKey]*databaseBackend // (org, database) -> backend
-	metadataDB       *sql.DB
-	branchDSNBase    string           // DSN prefix for branch database connections (e.g., "user@unix(socket)/")
-	httpServer       *httptest.Server // used in test mode (ListenAddr == "")
-	standaloneServer *http.Server     // used in standalone mode (ListenAddr != "")
-	baseURL          string
-	logger           *slog.Logger
-	wg               sync.WaitGroup // tracks background goroutines
+	backends             map[backendKey]*databaseBackend // (org, database) -> backend
+	metadataDB           *sql.DB
+	branchDSNBase        string           // DSN prefix for branch database connections (e.g., "user@unix(socket)/")
+	httpServer           *httptest.Server // used in test mode (ListenAddr == "")
+	standaloneServer     *http.Server     // used in standalone mode (ListenAddr != "")
+	baseURL              string
+	logger               *slog.Logger
+	processorCancel      context.CancelFunc
+	processorDone        chan struct{}
+	wg                   sync.WaitGroup // tracks background goroutines
+	revertWindowDuration time.Duration  // how long the revert window stays open after deploy completes
+	defaultThrottleRatio float64        // default throttle ratio applied to new deploys (0.0 = no throttle, max 0.95)
 
 	// proxies maps branch name → TCP proxy. Each proxy gives a branch its own
 	// network endpoint by rewriting MySQL database names in the handshake.
@@ -88,6 +100,15 @@ type Server struct {
 	// In production PlanetScale, this is the "Edge" — the public MySQL endpoint
 	// that routes queries to the correct Vitess cluster.
 	edgeAddrs map[string]string
+
+	// shutdownCtx is cancelled when Close() is called, allowing background
+	// goroutines with artificial delays to exit promptly during shutdown.
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+
+	// Artificial delays for realistic demo rendering.
+	branchCreationDelay time.Duration
+	deployRequestDelay  time.Duration
 }
 
 // OrgConfig holds the databases for a single organization.
@@ -108,8 +129,10 @@ type KeyspaceConfig struct {
 
 // Config holds the connection parameters for the LocalScale server.
 type Config struct {
-	Orgs       map[string]OrgConfig // org name -> databases
-	ListenAddr string               // When set, listen on this address instead of using httptest (e.g., ":8080")
+	Orgs                 map[string]OrgConfig // org name -> databases
+	ListenAddr           string               // When set, listen on this address instead of using httptest (e.g., ":8080")
+	RevertWindowDuration time.Duration        // How long to keep the revert window open after deploy completes (default 30m)
+	DefaultThrottleRatio float64              // Default throttle ratio for new deploys (0.0 = no throttle, max 0.95; default 0)
 	// Branch proxy settings. In standalone mode (ListenAddr set), these auto-default
 	// to 0.0.0.0:19100-19199. In test mode (ListenAddr empty), 127.0.0.1:0 (OS-assigned).
 	// The advertise host in password responses is derived from the request Host header,
@@ -117,7 +140,10 @@ type Config struct {
 	ProxyHost          string // Bind host for branch proxies (default: "0.0.0.0" standalone, "127.0.0.1" test)
 	ProxyAdvertiseHost string // Override host in password responses (default: derived from request Host header)
 	ProxyPortRange     [2]int // [start, end] port range (default: [19100, 19199] standalone, [0,0] = OS-assigned test)
-	Logger             *slog.Logger
+	// Artificial delays for realistic demo rendering. Zero means no delay.
+	BranchCreationDelay time.Duration // Delay before branch snapshot starts
+	DeployRequestDelay  time.Duration // Delay before deploy request diff computation starts
+	Logger              *slog.Logger
 }
 
 // New creates a new LocalScale server and starts it on a random port.
@@ -258,15 +284,33 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		pa = newPortAllocator(proxyPortRange[0], proxyPortRange[1])
 	}
 
+	if cfg.RevertWindowDuration < 0 {
+		return nil, fmt.Errorf("revert_window_duration must be non-negative, got %v", cfg.RevertWindowDuration)
+	}
+	revertWindow := cfg.RevertWindowDuration
+	if revertWindow == 0 {
+		revertWindow = defaultRevertWindowDuration
+	}
+	if cfg.DefaultThrottleRatio < 0 || cfg.DefaultThrottleRatio > 0.95 {
+		return nil, fmt.Errorf("default_throttle_ratio must be between 0.0 and 0.95, got %f", cfg.DefaultThrottleRatio)
+	}
+
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	s := &Server{
-		backends:           backends,
-		metadataDB:         metadataDB,
-		branchDSNBase:      branchDSNBase,
-		logger:             cfg.Logger,
-		proxies:            make(map[string]*branchProxy),
-		proxyHost:          proxyHost,
-		proxyAdvertiseHost: proxyAdvertiseHost,
-		portAlloc:          pa,
+		backends:             backends,
+		metadataDB:           metadataDB,
+		branchDSNBase:        branchDSNBase,
+		logger:               cfg.Logger,
+		revertWindowDuration: revertWindow,
+		defaultThrottleRatio: cfg.DefaultThrottleRatio,
+		branchCreationDelay:  cfg.BranchCreationDelay,
+		deployRequestDelay:   cfg.DeployRequestDelay,
+		proxies:              make(map[string]*branchProxy),
+		proxyHost:            proxyHost,
+		proxyAdvertiseHost:   proxyAdvertiseHost,
+		portAlloc:            pa,
+		shutdownCtx:          shutdownCtx,
+		shutdownCancel:       shutdownCancel,
 	}
 
 	// Create metadata tables
@@ -317,6 +361,12 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		)
 	}
 
+	// Start background state machine processor
+	processorCtx, processorCancel := context.WithCancel(context.Background())
+	s.processorCancel = processorCancel
+	s.processorDone = make(chan struct{})
+	go s.runStateProcessor(processorCtx)
+
 	// Start HTTP server
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
@@ -340,6 +390,15 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		// Test mode: use httptest for random port
 		s.httpServer = httptest.NewServer(mux)
 		s.baseURL = s.httpServer.URL
+	}
+
+	// Wait for Vitess's online DDL executor to be ready in each keyspace.
+	// The executor requires per-shard sidecar databases to be initialized before
+	// it can process migrations. By waiting here, /health only returns 200 after
+	// DDL submissions will succeed.
+	if err := s.waitForOnlineDDLReady(ctx); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("wait for online DDL readiness: %w", err)
 	}
 
 	cfg.Logger.Info("localscale server started", "url", s.baseURL)
@@ -389,8 +448,10 @@ func (s *Server) ResetState(ctx context.Context) error {
 	for _, backend := range s.backends {
 		for keyspace := range backend.vtgateDBs {
 			if err := s.forEachShard(ctx, backend, keyspace, func(conn *sql.Conn) error {
-				_, err := conn.ExecContext(ctx, "ALTER VITESS_MIGRATION CANCEL ALL")
-				return err
+				if _, err := conn.ExecContext(ctx, "ALTER VITESS_MIGRATION CANCEL ALL"); err != nil {
+					return fmt.Errorf("cancel all vitess migrations: %w", err)
+				}
+				return nil
 			}); err != nil {
 				s.logger.Warn("cancel all migrations failed", "keyspace", keyspace, "error", err)
 			}
@@ -467,7 +528,7 @@ func (s *Server) ResetState(ctx context.Context) error {
 	}
 
 	// Truncate tables to reset state and auto-increment numbering.
-	for _, table := range []string{"localscale_branches"} {
+	for _, table := range []string{"localscale_deploy_requests", "localscale_branches"} {
 		if _, err := s.metadataDB.ExecContext(ctx, "TRUNCATE TABLE "+table); err != nil {
 			return fmt.Errorf("truncate %s: %w", table, err)
 		}
@@ -573,6 +634,17 @@ func (s *Server) trackProxy(branch string, proxy *branchProxy) {
 	}
 }
 
+// closeProxy shuts down and removes the TCP proxy for a branch.
+func (s *Server) closeProxy(branch string) {
+	s.proxyMu.Lock()
+	defer s.proxyMu.Unlock()
+	if p, ok := s.proxies[branch]; ok {
+		s.releaseProxyPort(p)
+		utils.CloseAndLog(p)
+		delete(s.proxies, branch)
+	}
+}
+
 // closeAllProxies shuts down all branch TCP proxies.
 func (s *Server) closeAllProxies() {
 	s.proxyMu.Lock()
@@ -586,6 +658,11 @@ func (s *Server) closeAllProxies() {
 
 // Close shuts down the HTTP server and all connections.
 func (s *Server) Close() {
+	if s.processorCancel != nil {
+		s.processorCancel()
+		<-s.processorDone
+	}
+	s.shutdownCancel()
 	s.wg.Wait()
 	s.closeAllProxies()
 	if s.standaloneServer != nil {
@@ -686,24 +763,26 @@ func (s *Server) initMetadata(ctx context.Context) error {
 // handleGetEdges returns the edge proxy addresses for each org/database.
 // The edge is the public MySQL endpoint (vtgate) for each database.
 // Response: {"localscale-production/testapp-vitess": "0.0.0.0:19100", ...}
-func (s *Server) handleGetEdges(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetEdges(w http.ResponseWriter, _ *http.Request) error {
 	s.writeJSON(w, s.edgeAddrs)
+	return nil
 }
 
 // handleProxyPortMap sets the internal → external port mapping for branch proxies.
 // This is used by testcontainers where dynamic port mapping means internal container
 // ports (e.g. 19100) map to different host ports (e.g. 54321). The password API uses
 // this mapping to return correct access_host_url values.
-func (s *Server) handleProxyPortMap(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleProxyPortMap(w http.ResponseWriter, r *http.Request) error {
 	var portMap map[int]int
-	if !s.decodeJSON(w, r, &portMap) {
-		return
+	if err := s.decodeJSON(r, &portMap); err != nil {
+		return err
 	}
 	s.proxyMu.Lock()
 	s.proxyPortMap = portMap
 	s.proxyMu.Unlock()
 	s.logger.Info("proxy port map configured", "mappings", len(portMap))
 	s.writeJSON(w, map[string]any{"ok": true, "mappings": len(portMap)})
+	return nil
 }
 
 // handleSeedDDL executes DDL statements directly against vtgate using
@@ -714,7 +793,7 @@ func (s *Server) handleProxyPortMap(w http.ResponseWriter, r *http.Request) {
 //   - strategy: DDL strategy (default "direct"). Use "vitess --prefer-instant-ddl ..."
 //     for online DDL warmup where SET @@ddl_strategy must be on the same connection.
 //   - migration_context: migration context for online DDL tracking.
-func (s *Server) handleSeedDDL(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSeedDDL(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Org              string   `json:"org"`
 		Database         string   `json:"database"`
@@ -723,19 +802,17 @@ func (s *Server) handleSeedDDL(w http.ResponseWriter, r *http.Request) {
 		Strategy         string   `json:"strategy"`
 		MigrationContext string   `json:"migration_context"`
 	}
-	if !s.decodeJSON(w, r, &body) {
-		return
+	if err := s.decodeJSON(r, &body); err != nil {
+		return err
 	}
 
 	backend, err := s.backendFor(body.Org, body.Database)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "%v", err)
-		return
+		return newHTTPError(http.StatusNotFound, "%v", err)
 	}
 	db, ok := backend.vtgateDBs[body.Keyspace]
 	if !ok {
-		s.writeError(w, http.StatusNotFound, "keyspace not found: %s", body.Keyspace)
-		return
+		return newHTTPError(http.StatusNotFound, "keyspace not found: %s", body.Keyspace)
 	}
 
 	strategy := body.Strategy
@@ -743,76 +820,69 @@ func (s *Server) handleSeedDDL(w http.ResponseWriter, r *http.Request) {
 		strategy = "direct"
 	}
 	if err := validateSessionString(strategy); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid strategy: %v", err)
-		return
+		return newHTTPError(http.StatusBadRequest, "invalid strategy: %v", err)
 	}
 
 	conn, err := db.Conn(r.Context())
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "get connection: %v", err)
-		return
+		return newHTTPError(http.StatusInternalServerError, "get connection: %v", err)
 	}
 	defer utils.CloseAndLog(conn)
 
 	// SET @@variable doesn't support prepared statement placeholders (?).
 	// Input is validated by validateSessionString above (rejects quotes/backslash).
 	if _, err := conn.ExecContext(r.Context(), fmt.Sprintf("SET @@ddl_strategy='%s'", strategy)); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "set ddl_strategy: %v", err)
-		return
+		return newHTTPError(http.StatusInternalServerError, "set ddl_strategy: %v", err)
 	}
 
 	if body.MigrationContext != "" {
 		if err := validateSessionString(body.MigrationContext); err != nil {
-			s.writeError(w, http.StatusBadRequest, "invalid migration_context: %v", err)
-			return
+			return newHTTPError(http.StatusBadRequest, "invalid migration_context: %v", err)
 		}
 		if _, err := conn.ExecContext(r.Context(), fmt.Sprintf("SET @@migration_context='%s'", body.MigrationContext)); err != nil {
-			s.writeError(w, http.StatusInternalServerError, "set migration_context: %v", err)
-			return
+			return newHTTPError(http.StatusInternalServerError, "set migration_context: %v", err)
 		}
 	}
 
 	for _, stmt := range body.Statements {
 		if err := sanitizeDDL(stmt); err != nil {
-			s.writeError(w, http.StatusBadRequest, "invalid DDL: %v", err)
-			return
+			return newHTTPError(http.StatusBadRequest, "invalid DDL: %v", err)
 		}
 		if _, err := conn.ExecContext(r.Context(), stmt); err != nil {
-			s.writeError(w, http.StatusInternalServerError, "execute DDL: %v\nstatement: %s", err, stmt)
-			return
+			return newHTTPError(http.StatusInternalServerError, "execute DDL: %v\nstatement: %s", err, stmt)
 		}
 	}
 
 	s.writeJSON(w, map[string]any{"ok": true, "executed": len(body.Statements)})
+	return nil
 }
 
 // handleSeedVSchema applies a VSchema (as JSON) to a keyspace via vtctldclient gRPC.
-func (s *Server) handleSeedVSchema(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSeedVSchema(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Org      string          `json:"org"`
 		Database string          `json:"database"`
 		Keyspace string          `json:"keyspace"`
 		VSchema  json.RawMessage `json:"vschema"`
 	}
-	if !s.decodeJSON(w, r, &body) {
-		return
+	if err := s.decodeJSON(r, &body); err != nil {
+		return err
 	}
 
 	backend, err := s.backendFor(body.Org, body.Database)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "%v", err)
-		return
+		return newHTTPError(http.StatusNotFound, "%v", err)
 	}
 
 	if err := s.applyVSchemaInternal(r.Context(), backend, body.Keyspace, body.VSchema); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "apply vschema: %v", err)
-		return
+		return newHTTPError(http.StatusInternalServerError, "apply vschema: %v", err)
 	}
 	s.writeJSON(w, map[string]any{"ok": true})
+	return nil
 }
 
 // handleVtgateExec executes a SQL query against vtgate for a given keyspace.
-func (s *Server) handleVtgateExec(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleVtgateExec(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Org      string `json:"org"`
 		Database string `json:"database"`
@@ -820,80 +890,87 @@ func (s *Server) handleVtgateExec(w http.ResponseWriter, r *http.Request) {
 		Query    string `json:"query"`
 		Args     []any  `json:"args"`
 	}
-	if !s.decodeJSON(w, r, &body) {
-		return
+	if err := s.decodeJSON(r, &body); err != nil {
+		return err
 	}
 
 	backend, err := s.backendFor(body.Org, body.Database)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "%v", err)
-		return
+		return newHTTPError(http.StatusNotFound, "%v", err)
 	}
 	db, ok := backend.vtgateDBs[body.Keyspace]
 	if !ok {
-		s.writeError(w, http.StatusNotFound, "keyspace not found: %s", body.Keyspace)
-		return
+		return newHTTPError(http.StatusNotFound, "keyspace not found: %s", body.Keyspace)
 	}
 
 	result, err := executeQuery(r.Context(), db, body.Query, body.Args...)
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "execute query: %v", err)
-		return
+		return newHTTPError(http.StatusInternalServerError, "execute query: %v", err)
 	}
 	s.writeJSON(w, result)
+	return nil
 }
 
 // handleMetadataQuery executes a SQL query against the metadata database.
-func (s *Server) handleMetadataQuery(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleMetadataQuery(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Query string `json:"query"`
 		Args  []any  `json:"args"`
 	}
-	if !s.decodeJSON(w, r, &body) {
-		return
+	if err := s.decodeJSON(r, &body); err != nil {
+		return err
 	}
 
 	result, err := executeQuery(r.Context(), s.metadataDB, body.Query, body.Args...)
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "execute query: %v", err)
-		return
+		return newHTTPError(http.StatusInternalServerError, "execute query: %v", err)
 	}
 	s.writeJSON(w, result)
+	return nil
 }
 
 // handleResetState resets all LocalScale state (cancel migrations, truncate metadata).
-func (s *Server) handleResetState(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleResetState(w http.ResponseWriter, r *http.Request) error {
 	if err := s.ResetState(r.Context()); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "reset state: %v", err)
-		return
+		return newHTTPError(http.StatusInternalServerError, "reset state: %v", err)
 	}
 	s.writeJSON(w, map[string]any{"ok": true})
+	return nil
 }
 
 // handleBranchDBQuery executes a SQL query against a branch database.
-func (s *Server) handleBranchDBQuery(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleBranchDBQuery(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Branch   string `json:"branch"`
 		Keyspace string `json:"keyspace"`
 		Query    string `json:"query"`
 	}
-	if !s.decodeJSON(w, r, &body) {
-		return
+	if err := s.decodeJSON(r, &body); err != nil {
+		return err
 	}
 
 	db, err := s.openBranchDB(r.Context(), body.Branch, body.Keyspace)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "open branch db: %v", err)
-		return
+		return newHTTPError(http.StatusNotFound, "open branch db: %v", err)
 	}
 	defer utils.CloseAndLog(db)
 
 	result, err := executeQuery(r.Context(), db, body.Query)
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "execute query: %v", err)
-		return
+		return newHTTPError(http.StatusInternalServerError, "execute query: %v", err)
 	}
 	s.writeJSON(w, result)
+	return nil
+}
+
+// handleError wraps an error-returning handler so it can be used with http.ServeMux.
+// If the handler returns an *httpError, the response uses its status code; otherwise 500.
+func (s *Server) handleError(fn func(http.ResponseWriter, *http.Request) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := fn(w, r); err != nil {
+			s.writeHTTPError(w, err)
+		}
+	}
 }
 
 func (s *Server) registerRoutes(mux *http.ServeMux) {
@@ -903,29 +980,41 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	})
 
 	// Admin endpoints
-	mux.HandleFunc("GET /admin/edges", s.handleGetEdges)
-	mux.HandleFunc("POST /admin/proxy-port-map", s.handleProxyPortMap)
-	mux.HandleFunc("POST /admin/seed-ddl", s.handleSeedDDL)
-	mux.HandleFunc("POST /admin/seed-vschema", s.handleSeedVSchema)
-	mux.HandleFunc("POST /admin/vtgate-exec", s.handleVtgateExec)
-	mux.HandleFunc("POST /admin/metadata-query", s.handleMetadataQuery)
-	mux.HandleFunc("POST /admin/reset-state", s.handleResetState)
-	mux.HandleFunc("POST /admin/branch-db-query", s.handleBranchDBQuery)
+	mux.HandleFunc("GET /admin/edges", s.handleError(s.handleGetEdges))
+	mux.HandleFunc("POST /admin/proxy-port-map", s.handleError(s.handleProxyPortMap))
+	mux.HandleFunc("POST /admin/seed-ddl", s.handleError(s.handleSeedDDL))
+	mux.HandleFunc("POST /admin/seed-vschema", s.handleError(s.handleSeedVSchema))
+	mux.HandleFunc("POST /admin/vtgate-exec", s.handleError(s.handleVtgateExec))
+	mux.HandleFunc("POST /admin/metadata-query", s.handleError(s.handleMetadataQuery))
+	mux.HandleFunc("POST /admin/reset-state", s.handleError(s.handleResetState))
+	mux.HandleFunc("POST /admin/branch-db-query", s.handleError(s.handleBranchDBQuery))
 
 	// Keyspace and schema endpoints
-	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/keyspaces", s.handleListKeyspaces)
-	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/schema", s.handleGetBranchSchema)
-	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/vschema", s.handleGetBranchVSchema)
-	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/keyspaces/{keyspace}/vschema", s.handleGetKeyspaceVSchema)
-	mux.HandleFunc("PATCH /v1/organizations/{org}/databases/{db}/branches/{branch}/keyspaces/{keyspace}/vschema", s.handleUpdateKeyspaceVSchema)
+	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/keyspaces", s.handleError(s.handleListKeyspaces))
+	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/schema", s.handleError(s.handleGetBranchSchema))
+	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/vschema", s.handleError(s.handleGetBranchVSchema))
+	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/keyspaces/{keyspace}/vschema", s.handleError(s.handleGetKeyspaceVSchema))
+	mux.HandleFunc("PATCH /v1/organizations/{org}/databases/{db}/branches/{branch}/keyspaces/{keyspace}/vschema", s.handleError(s.handleUpdateKeyspaceVSchema))
 
 	// Branch endpoints
-	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}", s.handleGetBranch)
-	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/branches", s.handleCreateBranch)
-	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/branches/{branch}/passwords", s.handleCreateBranchPassword)
+	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}", s.handleError(s.handleGetBranch))
+	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/branches", s.handleError(s.handleCreateBranch))
+	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/branches/{branch}/passwords", s.handleError(s.handleCreateBranchPassword))
 
 	// Apply DDL/VSchema to a branch (used by PlanetScale engine before CreateDeployRequest)
-	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/branches/{branch}/schema", s.handleApplyBranchSchema)
+	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/branches/{branch}/schema", s.handleError(s.handleApplyBranchSchema))
+
+	// Deploy request action endpoints (registered before the GET for {number})
+	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/deploy", s.handleError(s.handleDeployDeployRequest))
+	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/cancel", s.handleError(s.handleCancelDeployRequest))
+	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/apply-deploy", s.handleError(s.handleApplyDeployRequest))
+	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/revert", s.handleError(s.handleRevertDeployRequest))
+	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/skip-revert", s.handleError(s.handleSkipRevertDeployRequest))
+	mux.HandleFunc("PUT /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/throttle", s.handleError(s.handleThrottleDeployRequest))
+
+	// Deploy request CRUD endpoints
+	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/deploy-requests/{number}", s.handleError(s.handleGetDeployRequest))
+	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests", s.handleError(s.handleCreateDeployRequest))
 
 	// Catch-all for unimplemented PlanetScale API endpoints.
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {

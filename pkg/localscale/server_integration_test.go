@@ -5,10 +5,13 @@ package localscale_test
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +24,9 @@ import (
 	"github.com/block/schemabot/pkg/localscale"
 	"github.com/block/schemabot/pkg/psclient"
 )
+
+//go:embed testdata/schema
+var testSchema embed.FS
 
 const (
 	testOrg = "test-org"
@@ -48,7 +54,8 @@ func TestMain(m *testing.M) {
 				}},
 			}},
 		},
-		Reuse: os.Getenv("DEBUG") == "1",
+		RevertWindowDuration: "5s",
+		Reuse:                os.Getenv("DEBUG") == "1",
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start LocalScale container: %v\n", err)
@@ -80,9 +87,30 @@ func TestMain(m *testing.M) {
 }
 
 func seedInitialSchema(ctx context.Context) error {
-	// Seed schema from testdata directory (VSchema first, then DDL per keyspace).
-	if err := testContainer.SchemaDir(ctx, testOrg, testDB, "testdata/schema"); err != nil {
-		return fmt.Errorf("seed schema dir: %w", err)
+	// Apply VSchema from testdata files before creating tables so vtgate knows how to route queries.
+	for _, ks := range []string{"testapp", "testapp_sharded"} {
+		vschema := readTestdataFile("testdata/schema/" + ks + "/vschema.json")
+		if err := testContainer.SeedVSchema(ctx, testOrg, testDB, ks, vschema); err != nil {
+			return fmt.Errorf("apply %s vschema: %w", ks, err)
+		}
+		// Drop and recreate tables so we get a clean schema (previous test runs
+		// may have added columns via ALTER TABLE on the reused container).
+		// Uses SeedDDL which sets @@ddl_strategy='direct' for synchronous execution.
+		var dropStmts []string
+		for _, stmt := range loadKeyspaceDDL(ks) {
+			tableName := extractTableName(stmt)
+			if tableName != "" {
+				dropStmts = append(dropStmts, fmt.Sprintf("DROP TABLE IF EXISTS `%s`", tableName))
+			}
+		}
+		if len(dropStmts) > 0 {
+			if err := testContainer.SeedDDL(ctx, testOrg, testDB, ks, dropStmts...); err != nil {
+				testLogger.Warn("drop tables failed (may be first run)", "keyspace", ks, "error", err)
+			}
+		}
+		if err := testContainer.SeedDDL(ctx, testOrg, testDB, ks, loadKeyspaceDDL(ks)...); err != nil {
+			return fmt.Errorf("seed %s DDL: %w", ks, err)
+		}
 	}
 
 	// Seed sequence data via vtgate exec (DML, no DDL strategy needed)
@@ -120,6 +148,8 @@ func seedInitialSchema(ctx context.Context) error {
 	return nil
 }
 
+// warmupOnlineDDL submits a trivial instant DDL to the sharded keyspace and waits
+// for completion. This validates vtcombo's online DDL executor works before tests run.
 func TestListKeyspaces(t *testing.T) {
 	ctx := t.Context()
 
@@ -293,10 +323,58 @@ func TestGetKeyspaceVSchema(t *testing.T) {
 	assert.True(t, emptyVS == nil || emptyVS.Raw == "" || emptyVS.Raw == "{}", "expected empty VSchema for nonexistent keyspace, got: %v", emptyVS)
 }
 
+// verifyColumnExists checks that a column exists in a table via vtgate.
+// Uses testapp_sharded keyspace by default; pass a keyspace argument to override.
+func verifyColumnExists(t *testing.T, table, column string, keyspace ...string) {
+	t.Helper()
+	ks := "testapp_sharded"
+	if len(keyspace) > 0 {
+		ks = keyspace[0]
+	}
+	result, err := testContainer.VtgateExec(t.Context(), testOrg, testDB, ks,
+		fmt.Sprintf("SHOW COLUMNS FROM %s LIKE '%s'", table, column))
+	require.NoError(t, err, "verify column %s.%s in %s", table, column, ks)
+	require.Greater(t, len(result.Rows), 0, "column '%s' not found in table '%s' (keyspace %s)", column, table, ks)
+}
+
+// verifyColumnNotExists checks that a column does NOT exist in a table via vtgate.
+// Retries for up to 5s to account for vtgate schema cache refresh delay.
+func verifyColumnNotExists(t *testing.T, table, column string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		result, err := testContainer.VtgateExec(t.Context(), testOrg, testDB, "testapp_sharded",
+			fmt.Sprintf("SHOW COLUMNS FROM %s LIKE '%s'", table, column))
+		require.NoError(t, err, "verify column not exists %s.%s", table, column)
+		if len(result.Rows) == 0 {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	assert.Failf(t, "column still exists", "column '%s' still exists in table '%s' after waiting for schema cache refresh", column, table)
+}
+
+// --- Branch database test helpers ---
+
+// branchDatabaseExists checks if a branch database exists in localscale-mysql.
+func branchDatabaseExists(t *testing.T, branch, keyspace string) bool {
+	t.Helper()
+	dbName := fmt.Sprintf("branch_%s_%s", branch, keyspace)
+	result, err := testContainer.MetadataQuery(t.Context(),
+		"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?", dbName)
+	require.NoError(t, err, "check branch database exists")
+	return len(result.Rows) > 0
+}
+
+const (
+	shortPollTimeout = 15 * time.Second // branch readiness, deploy diff
+	longPollTimeout  = 60 * time.Second // deploy state transitions (DDL execution)
+)
+
 // waitForBranchReady polls until a branch is ready or the deadline is exceeded.
 func waitForBranchReady(t *testing.T, ctx context.Context, branchName string) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(shortPollTimeout)
 	for time.Now().Before(deadline) {
 		got, err := testClient.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
 			Organization: testOrg,
@@ -309,7 +387,73 @@ func waitForBranchReady(t *testing.T, ctx context.Context, branchName string) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	require.Failf(t, "branch not ready", "branch %q not ready after 15s", branchName)
+	require.Failf(t, "branch not ready", "branch %q not ready after %v", branchName, shortPollTimeout)
+}
+
+// waitForDeployReady polls until a deploy request reaches "ready" or "no_changes" state.
+func waitForDeployReady(t *testing.T, ctx context.Context, number uint64) *ps.DeployRequest {
+	t.Helper()
+	deadline := time.Now().Add(shortPollTimeout)
+	for time.Now().Before(deadline) {
+		dr, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+			Organization: testOrg,
+			Database:     testDB,
+			Number:       number,
+		})
+		require.NoError(t, err, "GetDeployRequest(%d)", number)
+		if dr.DeploymentState == drState.Ready || dr.DeploymentState == drState.NoChanges {
+			return dr
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	require.Failf(t, "deploy not ready", "deploy request %d not ready after %v", number, shortPollTimeout)
+	return nil
+}
+
+// waitForDeployState polls until a deploy request reaches one of the specified states.
+func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantStates ...string) *ps.DeployRequest {
+	t.Helper()
+	wantSet := make(map[string]bool, len(wantStates))
+	for _, s := range wantStates {
+		wantSet[s] = true
+	}
+	deadline := time.Now().Add(longPollTimeout)
+	var lastState string
+	for time.Now().Before(deadline) {
+		dr, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+			Organization: testOrg,
+			Database:     testDB,
+			Number:       number,
+		})
+		require.NoError(t, err, "GetDeployRequest(%d)", number)
+		lastState = dr.DeploymentState
+		if wantSet[lastState] {
+			return dr
+		}
+		// Fail fast on terminal error states (unless we're specifically waiting for them)
+		if lastState == drState.CompleteError && !wantSet[drState.CompleteError] {
+			require.Failf(t, "deploy failed", "deploy %d reached complete_error", number)
+		}
+		if lastState == drState.Error && !wantSet[drState.Error] {
+			require.Failf(t, "deploy failed", "deploy %d reached error", number)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	require.Failf(t, "deploy state timeout", "deploy %d: expected one of %v, last state was %q", number, wantStates, lastState)
+	return nil
+}
+
+// cancelAllVitessMigrations cancels all pending Vitess migrations across keyspaces.
+func cancelAllVitessMigrations(t *testing.T, ctx context.Context) {
+	t.Helper()
+	for _, ks := range []string{"testapp", "testapp_sharded"} {
+		if _, err := testContainer.VtgateExec(ctx, testOrg, testDB, ks,
+			"ALTER VITESS_MIGRATION CANCEL ALL"); err != nil {
+			t.Logf("cancel all migrations for %s: %v (may be expected)", ks, err)
+		}
+	}
+	// Brief wait to let Vitess process the cancellations
+	time.Sleep(500 * time.Millisecond)
 }
 
 // --- Test helpers ---
@@ -330,8 +474,22 @@ func createBranch(t *testing.T, ctx context.Context, prefix string) string {
 	return branchName
 }
 
+// createBranchWithDDL creates a branch with a unique name, applies DDL and/or
+// VSchema changes, and returns the branch name.
+func createBranchWithDDL(t *testing.T, ctx context.Context, prefix string, ddl map[string][]string, vschema map[string]json.RawMessage) string {
+	t.Helper()
+	branchName := createBranch(t, ctx, prefix)
+	if len(ddl) > 0 {
+		applyBranchDDL(t, ctx, branchName, ddl)
+	}
+	if len(vschema) > 0 {
+		applyBranchVSchema(t, ctx, branchName, vschema)
+	}
+	return branchName
+}
+
 // applyBranchDDL applies DDL statements to a branch via MySQL connection
-// (CreateBranchPassword → connect → execute DDL).
+// (CreateBranchPassword -> connect -> execute DDL).
 func applyBranchDDL(t *testing.T, ctx context.Context, branchName string, ddl map[string][]string) {
 	t.Helper()
 	pw, err := testClient.CreateBranchPassword(ctx, &ps.DatabaseBranchPasswordRequest{
@@ -369,8 +527,113 @@ func applyBranchVSchema(t *testing.T, ctx context.Context, branchName string, vs
 	}
 }
 
+// createDeploy creates a deploy request for the given branch, waits for the
+// background diff to complete, and returns the ready deploy request.
+func createDeploy(t *testing.T, ctx context.Context, branchName string, autoCutover bool) *ps.DeployRequest {
+	t.Helper()
+	dr, err := testClient.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
+		Organization: testOrg,
+		Database:     testDB,
+		Branch:       branchName,
+		IntoBranch:   "main",
+		AutoCutover:  autoCutover,
+	})
+	require.NoError(t, err, "CreateDeployRequest")
+	return waitForDeployReady(t, ctx, dr.Number)
+}
+
+// deploy deploys a deploy request and returns the response.
+func deploy(t *testing.T, ctx context.Context, number uint64, instantDDL bool) *ps.DeployRequest {
+	t.Helper()
+	dr, err := testClient.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+		Organization: testOrg,
+		Database:     testDB,
+		Number:       number,
+		InstantDDL:   instantDDL,
+	})
+	require.NoError(t, err, "DeployDeployRequest")
+	return dr
+}
+
+// testShardedVSchema returns the base sharded VSchema from testdata, optionally
+// with extra vindexes added. Each extra vindex is "name:type" (e.g., "xxhash:xxhash").
+func testShardedVSchema(extraVindexes ...string) json.RawMessage {
+	if len(extraVindexes) == 0 {
+		return readTestdataFile("testdata/schema/testapp_sharded/vschema.json")
+	}
+	// Parse base, add vindexes, re-marshal.
+	var vs map[string]any
+	base := readTestdataFile("testdata/schema/testapp_sharded/vschema.json")
+	if err := json.Unmarshal(base, &vs); err != nil {
+		panic(fmt.Sprintf("parse base VSchema: %v", err))
+	}
+	vindexes := vs["vindexes"].(map[string]any)
+	for _, v := range extraVindexes {
+		name, typ, _ := strings.Cut(v, ":")
+		vindexes[name] = map[string]any{"type": typ}
+	}
+	out, err := json.Marshal(vs)
+	if err != nil {
+		panic(fmt.Sprintf("marshal VSchema: %v", err))
+	}
+	return out
+}
+
+// readTestdataFile reads a file from the embedded testdata.
+func readTestdataFile(path string) []byte {
+	data, err := testSchema.ReadFile(path)
+	if err != nil {
+		panic(fmt.Sprintf("read testdata %s: %v", path, err))
+	}
+	return data
+}
+
+// extractTableName extracts the table name from a CREATE TABLE statement.
+func extractTableName(stmt string) string {
+	upper := strings.ToUpper(stmt)
+	idx := strings.Index(upper, "CREATE TABLE")
+	if idx < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(stmt[idx+len("CREATE TABLE"):])
+	if strings.HasPrefix(strings.ToUpper(rest), "IF NOT EXISTS") {
+		rest = strings.TrimSpace(rest[len("IF NOT EXISTS"):])
+	}
+	// Take the first word (table name), stopping at space, (, or newline
+	name := strings.FieldsFunc(rest, func(c rune) bool {
+		return c == ' ' || c == '(' || c == '\n' || c == '\t'
+	})
+	if len(name) == 0 {
+		return ""
+	}
+	return strings.Trim(name[0], "`")
+}
+
+// loadKeyspaceDDL reads all .sql files from a testdata/schema/{keyspace}/ directory.
+func loadKeyspaceDDL(keyspace string) []string {
+	dir := "testdata/schema/" + keyspace
+	entries, err := testSchema.ReadDir(dir)
+	if err != nil {
+		panic(fmt.Sprintf("read schema dir %s: %v", dir, err))
+	}
+	var stmts []string
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != ".sql" {
+			continue
+		}
+		data, err := testSchema.ReadFile(dir + "/" + e.Name())
+		if err != nil {
+			panic(fmt.Sprintf("read %s/%s: %v", dir, e.Name(), err))
+		}
+		stmt := strings.TrimSpace(string(data))
+		stmt = strings.Replace(stmt, "CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+		stmts = append(stmts, stmt)
+	}
+	return stmts
+}
+
 // queryBranchVSchema queries the vschema_data for a branch from the metadata DB
-// and returns it as a parsed map of keyspace → raw VSchema JSON.
+// and returns it as a parsed map of keyspace -> raw VSchema JSON.
 func queryBranchVSchema(t *testing.T, ctx context.Context, branchName string) map[string]json.RawMessage {
 	t.Helper()
 	result, err := testContainer.MetadataQuery(ctx,

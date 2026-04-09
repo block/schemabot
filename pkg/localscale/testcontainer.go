@@ -50,11 +50,12 @@ func NewTestHelper(url string) *LocalScaleContainer {
 
 // ContainerConfig configures the LocalScale testcontainer.
 type ContainerConfig struct {
-	Orgs           map[string]ContainerOrgConfig `json:"organizations"`
-	ListenAddr     string                        `json:"listen_addr"`
-	ProxyHost      string                        `json:"proxy_host"`
-	ProxyPortStart int                           `json:"proxy_port_start"`
-	ProxyPortEnd   int                           `json:"proxy_port_end"`
+	Orgs                 map[string]ContainerOrgConfig `json:"organizations"`
+	ListenAddr           string                        `json:"listen_addr"`
+	RevertWindowDuration string                        `json:"revert_window_duration,omitempty"`
+	ProxyHost            string                        `json:"proxy_host"`
+	ProxyPortStart       int                           `json:"proxy_port_start"`
+	ProxyPortEnd         int                           `json:"proxy_port_end"`
 
 	// Reuse keeps the container running between test invocations for fast iteration.
 	// When true, RunContainer reuses an existing container (by name) and automatically
