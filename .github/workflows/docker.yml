@@ -39,6 +39,24 @@ jobs:
       - name: Run chart-testing lint
         run: ct lint --target-branch ${{ github.event.pull_request.base.ref }} --charts charts/schemabot
 
+      - name: Check chart version bump
+        run: |
+          # If any chart files changed, Chart.yaml version must be bumped.
+          CHANGED=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD -- 'charts/schemabot/')
+          if [ -z "$CHANGED" ]; then
+            echo "No chart changes detected, skipping version check."
+            exit 0
+          fi
+
+          BASE_VERSION=$(git show origin/${{ github.event.pull_request.base.ref }}:charts/schemabot/Chart.yaml 2>/dev/null | grep '^version:' | awk '{print $2}')
+          HEAD_VERSION=$(grep '^version:' charts/schemabot/Chart.yaml | awk '{print $2}')
+
+          if [ "$BASE_VERSION" = "$HEAD_VERSION" ]; then
+            echo "::error::Chart files changed but charts/schemabot/Chart.yaml version was not bumped (still ${HEAD_VERSION}). Bump the version before merging."
+            exit 1
+          fi
+          echo "Chart version bumped: ${BASE_VERSION} → ${HEAD_VERSION}"
+
   build-and-push:
     runs-on: ubuntu-latest
     if: github.repository == 'block/schemabot'
