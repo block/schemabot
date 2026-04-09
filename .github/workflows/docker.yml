@@ -1,0 +1,131 @@
+# .github/workflows/docker.yml — Docker image + Helm chart publishing
+#
+# Triggers:
+#   - Pull request: build Docker image (single platform) + lint Helm chart
+#   - Push to main: build + push Docker image (multi-arch, latest + sha)
+#   - Tag v*:       build + push Docker image (multi-arch) + package + push Helm chart
+#
+# Published to:
+#   - Docker: ghcr.io/block/schemabot:<tag>
+#   - Helm:   oci://ghcr.io/block/charts/schemabot:<version>
+
+name: Docker & Helm
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+  pull_request:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  lint-chart:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # azure/setup-helm@v4
+
+      - name: Lint Helm chart
+        uses: helm/chart-testing-action@0d28d3144d3a25ea2cc349d6e59901c4ff469b3b # helm/chart-testing-action@v2.7.0
+
+      - name: Run chart-testing lint
+        run: ct lint --target-branch ${{ github.event.pull_request.base.ref }} --charts charts/schemabot
+
+      - name: Check chart version bump
+        run: |
+          # If any chart files changed, Chart.yaml version must be bumped.
+          CHANGED=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD -- 'charts/schemabot/')
+          if [ -z "$CHANGED" ]; then
+            echo "No chart changes detected, skipping version check."
+            exit 0
+          fi
+
+          BASE_VERSION=$(git show origin/${{ github.event.pull_request.base.ref }}:charts/schemabot/Chart.yaml 2>/dev/null | grep '^version:' | awk '{print $2}')
+          HEAD_VERSION=$(grep '^version:' charts/schemabot/Chart.yaml | awk '{print $2}')
+
+          if [ "$BASE_VERSION" = "$HEAD_VERSION" ]; then
+            echo "::error::Chart files changed but charts/schemabot/Chart.yaml version was not bumped (still ${HEAD_VERSION}). Bump the version before merging."
+            exit 1
+          fi
+          echo "Chart version bumped: ${BASE_VERSION} → ${HEAD_VERSION}"
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    if: github.repository == 'block/schemabot'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+
+      - name: Set up QEMU
+        if: github.event_name != 'pull_request'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          # Multi-arch on push/tag, single platform on PR for speed
+          platforms: ${{ github.event_name != 'pull_request' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at }}
+
+      # Helm chart publishing (only on tags)
+      - name: Install Helm
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # azure/setup-helm@v4
+
+      - name: Package and push Helm chart
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          # Chart.yaml is the source of truth for version and appVersion.
+          # Validate that the tag matches what's committed.
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CHART_VERSION=$(grep '^version:' charts/schemabot/Chart.yaml | awk '{print $2}')
+          if [ "$TAG_VERSION" != "$CHART_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Chart.yaml version ${CHART_VERSION}. Bump Chart.yaml before tagging."
+            exit 1
+          fi
+
+          # Package and push
+          helm package charts/schemabot --destination ./build
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+          helm push ./build/schemabot-${CHART_VERSION}.tgz oci://ghcr.io/block/charts

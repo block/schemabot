@@ -1,0 +1,84 @@
+# SchemaBot Helm Chart — Default Values
+#
+# Override these for your deployment. See docs/configuration.md for the
+# full config file reference.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/block/schemabot
+  tag: ""  # defaults to appVersion
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# SchemaBot config file contents. Rendered into a ConfigMap and mounted
+# at /config/config.yaml. See docs/configuration.md for all options.
+#
+# Example (local mode, embedded Tern):
+#   config:
+#     storage:
+#       dsn: "env:MYSQL_DSN"
+#     databases:
+#       myapp:
+#         type: mysql
+#         environments:
+#           staging:
+#             dsn: "root:pass@tcp(mysql-staging:3306)/myapp"
+#
+# Example (gRPC mode, remote Tern):
+#   config:
+#     storage:
+#       dsn: "secretsmanager:schemabot-db#dsn"
+#     tern_deployments:
+#       default:
+#         staging: "tern-staging:9090"
+#         production: "tern-production:9090"
+# config is required — helm install will fail without it.
+config: null
+
+# Additional environment variables for the SchemaBot container.
+# Useful for env: secret references in the config file.
+env: []
+  # - name: MYSQL_DSN
+  #   value: "root:pass@tcp(mysql:3306)/schemabot"
+  # - name: MYSQL_DSN
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: schemabot-db
+  #       key: dsn
+
+# Additional volume mounts (e.g., for file: secret references).
+extraVolumeMounts: []
+  # - name: github-app-secrets
+  #   mountPath: /secrets/github-app
+  #   readOnly: true
+
+# Additional volumes.
+extraVolumes: []
+  # - name: github-app-secrets
+  #   secret:
+  #     secretName: schemabot-github-app
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+# Pod annotations (e.g., Istio sidecar config, Datadog).
+podAnnotations: {}
+
+# Node selector, tolerations, affinity.
+nodeSelector: {}
+tolerations: []
+affinity: {}
