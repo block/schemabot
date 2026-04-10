@@ -4,16 +4,45 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 
+	"github.com/block/schemabot/pkg/ddl"
+
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 )
+
+// httpError carries an HTTP status code with an error message. Helpers return
+// these so callers can write the response explicitly, keeping control flow visible.
+type httpError struct {
+	code int
+	msg  string
+}
+
+func (e *httpError) Error() string { return e.msg }
+
+func newHTTPError(code int, format string, args ...any) *httpError {
+	return &httpError{code: code, msg: fmt.Sprintf(format, args...)}
+}
+
+// writeHTTPError writes an HTTP error response from an error. If the error is
+// an *httpError, uses its status code; otherwise defaults to 500.
+func (s *Server) writeHTTPError(w http.ResponseWriter, err error) {
+	var he *httpError
+	if errors.As(err, &he) {
+		s.writeError(w, he.code, "%s", he.msg)
+	} else {
+		s.writeError(w, http.StatusInternalServerError, "%v", err)
+	}
+}
 
 // querier is the common interface satisfied by *sql.DB, *sql.Conn, and *sql.Tx.
 type querier interface {
@@ -145,6 +174,19 @@ func hasVSchemaData(s sql.NullString) bool {
 	return s.Valid && s.String != "" && s.String != "null"
 }
 
+// buildDDLStrategy constructs the Vitess online DDL strategy string.
+// If instantDDL is true, --prefer-instant-ddl is used; otherwise --postpone-completion.
+func buildDDLStrategy(instantDDL bool) string {
+	const baseFlags = " --in-order-completion --allow-zero-in-date --analyze-table" +
+		" --force-cut-over-after=1ms --cut-over-threshold=15s" +
+		" --singleton-context --allow-concurrent"
+
+	if instantDDL {
+		return "vitess --prefer-instant-ddl" + baseFlags
+	}
+	return "vitess --postpone-completion" + baseFlags
+}
+
 // scanDynamicRows scans all rows from a result set with dynamic columns into
 // a slice of maps. Each map has column name → value for non-NULL columns.
 func scanDynamicRows(rows *sql.Rows) ([]map[string]string, error) {
@@ -264,6 +306,267 @@ func (s *Server) snapshotKeyspaceSchema(ctx context.Context, backend *databaseBa
 		stmts[i] = t.Schema
 	}
 	return stmts, nil
+}
+
+// getBranchSchema reads all CREATE TABLE statements from a branch database in localscale-mysql.
+func (s *Server) getBranchSchemaFromBackend(ctx context.Context, backend *databaseBackend, branch, keyspace string) ([]string, error) {
+	return s.getBranchSchemaWithDSN(ctx, backend.mysqlDSNBase, branch, keyspace)
+}
+
+func (s *Server) getBranchSchemaWithDSN(ctx context.Context, dsnBase, branch, keyspace string) ([]string, error) {
+	db, err := sql.Open("mysql", dsnBase+branchDBName(branch, keyspace))
+	if err != nil {
+		return nil, fmt.Errorf("open branch db %s/%s: %w", branch, keyspace, err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		utils.CloseAndLog(db)
+		return nil, fmt.Errorf("ping branch db %s/%s: %w", branch, keyspace, err)
+	}
+	defer utils.CloseAndLog(db)
+
+	tables, err := table.LoadSchemaFromDB(ctx, db)
+	if err != nil {
+		return nil, fmt.Errorf("load branch schema for %s/%s: %w", branch, keyspace, err)
+	}
+	stmts := make([]string, len(tables))
+	for i, t := range tables {
+		stmts[i] = t.Schema
+	}
+	return stmts, nil
+}
+
+// submitOnlineDDL submits DDL statements as Vitess online DDL migrations.
+func (s *Server) submitOnlineDDL(ctx context.Context, backend *databaseBackend, ddlByKeyspace map[string][]string, strategy, migrationContext string) error {
+	if err := validateSessionString(strategy); err != nil {
+		return fmt.Errorf("invalid ddl_strategy: %w", err)
+	}
+	if err := validateSessionString(migrationContext); err != nil {
+		return fmt.Errorf("invalid migration_context: %w", err)
+	}
+	for keyspace, stmts := range ddlByKeyspace {
+		db, ok := backend.vtgateDBs[keyspace]
+		if !ok {
+			return fmt.Errorf("no vtgate connection for keyspace %s", keyspace)
+		}
+		for _, stmt := range stmts {
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				return fmt.Errorf("get connection for %s: %w", keyspace, err)
+			}
+			if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET @@ddl_strategy='%s'", strategy)); err != nil {
+				utils.CloseAndLog(conn)
+				return fmt.Errorf("set ddl_strategy for %s: %w", keyspace, err)
+			}
+			if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET @@migration_context='%s'", migrationContext)); err != nil {
+				utils.CloseAndLog(conn)
+				return fmt.Errorf("set migration_context for %s: %w", keyspace, err)
+			}
+			if _, err := conn.ExecContext(ctx, stmt); err != nil {
+				utils.CloseAndLog(conn)
+				return fmt.Errorf("submit online DDL to %s: %w\nstatement: %s", keyspace, err, stmt)
+			}
+			utils.CloseAndLog(conn)
+			s.logger.Info("submitted online DDL", "keyspace", keyspace, "stmt", stmt, "context", migrationContext)
+		}
+	}
+	return nil
+}
+
+// extractTableNames parses DDL statements and returns the set of table names they reference.
+func extractTableNames(stmts []string) (map[string]struct{}, error) {
+	tables := make(map[string]struct{})
+	for _, stmt := range stmts {
+		parsed, err := statement.New(stmt)
+		if err != nil {
+			return nil, fmt.Errorf("parse DDL statement: %w", err)
+		}
+		if len(parsed) == 0 {
+			continue
+		}
+		if tableName := parsed[0].Table; tableName != "" {
+			tables[tableName] = struct{}{}
+		}
+	}
+	return tables, nil
+}
+
+// snapshotSchema captures SHOW CREATE TABLE for all tables affected by the DDL.
+// Returns a map of keyspace → []createTableStatement for use in DDL-based revert.
+func (s *Server) snapshotSchema(ctx context.Context, backend *databaseBackend, ddlByKeyspace map[string][]string) (map[string][]string, error) {
+	snapshot := make(map[string][]string)
+	for keyspace, stmts := range ddlByKeyspace {
+		db, ok := backend.vtgateDBs[keyspace]
+		if !ok {
+			return nil, fmt.Errorf("snapshot schema: no vtgate connection for keyspace %s", keyspace)
+		}
+		tables, err := extractTableNames(stmts)
+		if err != nil {
+			return nil, fmt.Errorf("extract table names for keyspace %s: %w", keyspace, err)
+		}
+		// Get current CREATE TABLE for each affected table.
+		for table := range tables {
+			var tName, createStmt string
+			err := db.QueryRowContext(ctx, "SHOW CREATE TABLE "+quoteIdentifier(table)).Scan(&tName, &createStmt)
+			if err != nil {
+				// Table might not exist yet (CREATE TABLE DDL) — skip.
+				s.logger.Debug("snapshot: table not found", "keyspace", keyspace, "table", table, "error", err)
+				continue
+			}
+			snapshot[keyspace] = append(snapshot[keyspace], createStmt)
+		}
+	}
+	return snapshot, nil
+}
+
+// computeReverseDDL computes the DDL needed to revert a deploy by diffing the
+// current schema against the stored pre-deploy schema snapshot.
+//
+// Only tables affected by the deploy are queried from the current schema (not
+// the entire keyspace). Affected tables are those present in schemaBefore plus
+// those referenced by ddlByKeyspace (to handle CREATE TABLE → DROP TABLE).
+func (s *Server) computeReverseDDL(ctx context.Context, backend *databaseBackend, schemaBefore map[string][]string, ddlByKeyspace map[string][]string) (map[string][]string, error) {
+	differ := ddl.NewDiffer()
+	reverseDDL := make(map[string][]string)
+
+	// Process all keyspaces that have either a before snapshot or DDL.
+	keyspaces := make(map[string]struct{})
+	for ks := range schemaBefore {
+		keyspaces[ks] = struct{}{}
+	}
+	for ks := range ddlByKeyspace {
+		keyspaces[ks] = struct{}{}
+	}
+
+	for keyspace := range keyspaces {
+		beforeStmts := schemaBefore[keyspace]
+
+		// Collect affected table names from both before snapshot and original DDL.
+		affectedTables, err := extractTableNames(beforeStmts)
+		if err != nil {
+			return nil, fmt.Errorf("extract table names from before snapshot for %s: %w", keyspace, err)
+		}
+		ddlTables, err := extractTableNames(ddlByKeyspace[keyspace])
+		if err != nil {
+			return nil, fmt.Errorf("extract table names from DDL for %s: %w", keyspace, err)
+		}
+		for t := range ddlTables {
+			affectedTables[t] = struct{}{}
+		}
+
+		// Get current CREATE TABLE only for affected tables via shard-targeted connection.
+		conn, cleanup, err := s.vtgateShardConn(ctx, backend, keyspace)
+		if err != nil {
+			return nil, fmt.Errorf("shard conn for %s: %w", keyspace, err)
+		}
+		var currentStmts []string
+		for table := range affectedTables {
+			var tName, createStmt string
+			if err := conn.QueryRowContext(ctx, "SHOW CREATE TABLE "+quoteIdentifier(table)).Scan(&tName, &createStmt); err != nil {
+				continue // Table doesn't exist in current schema (e.g., was DROPped by the deploy)
+			}
+			currentStmts = append(currentStmts, createStmt)
+		}
+		cleanup()
+
+		// Diff current → before to get reverse DDL.
+		result, err := differ.DiffStatements(currentStmts, beforeStmts)
+		if err != nil {
+			return nil, fmt.Errorf("diff %s: %w", keyspace, err)
+		}
+		if len(result.Statements) > 0 {
+			reverseDDL[keyspace] = result.Statements
+		}
+	}
+	return reverseDDL, nil
+}
+
+// parseDeployNumber parses the deploy request number from the URL path.
+func (s *Server) parseDeployNumber(r *http.Request) (uint64, error) {
+	number, err := strconv.ParseUint(r.PathValue("number"), 10, 64)
+	if err != nil {
+		return 0, newHTTPError(http.StatusBadRequest, "invalid deploy request number: %v", err)
+	}
+	return number, nil
+}
+
+// resolveDeployAction is shared preamble for deploy action handlers: resolves the
+// backend from URL path values and parses the deploy number.
+func (s *Server) resolveDeployAction(r *http.Request) (*databaseBackend, uint64, error) {
+	org := r.PathValue("org")
+	database := r.PathValue("db")
+	backend, err := s.backendFor(org, database)
+	if err != nil {
+		return nil, 0, newHTTPError(http.StatusNotFound, "%v", err)
+	}
+	number, err := s.parseDeployNumber(r)
+	if err != nil {
+		return nil, 0, err // already an *httpError
+	}
+	return backend, number, nil
+}
+
+// deployResponse returns the standard deploy request response map with number, branch, and state.
+func deployResponse(number uint64, branch, state string) map[string]any {
+	return map[string]any{
+		"number":           number,
+		"branch":           branch,
+		"deployment_state": state,
+	}
+}
+
+// deployRequestInfo holds commonly needed fields from a deploy request row.
+type deployRequestInfo struct {
+	branch           string
+	migrationContext string
+	deploymentState  string
+}
+
+// getDeployRequestInfo fetches common deploy request fields.
+func (s *Server) getDeployRequestInfo(ctx context.Context, number uint64) (*deployRequestInfo, error) {
+	var info deployRequestInfo
+	err := s.metadataDB.QueryRowContext(ctx,
+		"SELECT branch, migration_context, deployment_state FROM localscale_deploy_requests WHERE number = ?",
+		number,
+	).Scan(&info.branch, &info.migrationContext, &info.deploymentState)
+	if err != nil {
+		return nil, newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
+	}
+	return &info, nil
+}
+
+// dropBranchDatabases drops all branch databases for a given branch name
+// and shuts down any TCP proxy associated with the branch. Branches live on
+// the backend's mysqld (not the metadata DB), so we connect there for the DROP.
+func (s *Server) dropBranchDatabases(ctx context.Context, backend *databaseBackend, branch string) {
+	db, err := sql.Open("mysql", backend.mysqlDSNBase)
+	if err != nil {
+		s.logger.Error("dropBranchDatabases: open backend", "branch", branch, "error", err)
+		return
+	}
+	if err := db.PingContext(ctx); err != nil {
+		s.logger.Error("dropBranchDatabases: ping backend", "branch", branch, "error", err)
+		utils.CloseAndLog(db)
+		return
+	}
+	defer utils.CloseAndLog(db)
+
+	for keyspace := range backend.vtgateDBs {
+		dbName := branchDBName(branch, keyspace)
+		if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteIdentifier(dbName))); err != nil {
+			s.logger.Warn("drop branch database", "branch", branch, "keyspace", keyspace, "error", err)
+		}
+	}
+	s.closeProxy(branch)
+}
+
+// normalizeJSON re-marshals JSON to normalize formatting for comparison.
+func normalizeJSON(data []byte) string {
+	var v any
+	if err := json.Unmarshal(data, &v); err != nil {
+		return string(data)
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 // addAlgorithmInstant rewrites an ALTER TABLE statement to include ALGORITHM=INSTANT.
@@ -389,21 +692,51 @@ func validateBranchName(name string) error {
 	return nil
 }
 
-// execLog executes a SQL statement and logs any error. Use this instead of
-// `_, _ = s.metadataDB.ExecContext(...)` to ensure DB errors are never silently lost.
-func (s *Server) execLog(ctx context.Context, query string, args ...any) {
-	if _, err := s.metadataDB.ExecContext(ctx, query, args...); err != nil {
-		s.logger.Error("exec failed", "query", query[:min(len(query), 80)], "error", err)
+// waitForOnlineDDLReady polls each keyspace's sidecar database until Vitess's
+// online DDL executor is operational. The executor requires the per-shard sidecar
+// databases to be initialized before it can process migrations. Without this check,
+// the first deploy request's DDL submission can hang waiting for a sidecar that
+// hasn't been created yet.
+func (s *Server) waitForOnlineDDLReady(ctx context.Context) error {
+	for key, backend := range s.backends {
+		for keyspace, db := range backend.vtgateDBs {
+			deadline := time.Now().Add(60 * time.Second)
+			ready := false
+			for time.Now().Before(deadline) {
+				rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS")
+				if err == nil {
+					utils.CloseAndLog(rows)
+					s.logger.Info("online DDL ready", "database", key.database, "keyspace", keyspace)
+					ready = true
+					break
+				}
+				s.logger.Debug("waiting for online DDL readiness", "database", key.database, "keyspace", keyspace, "error", err)
+				time.Sleep(time.Second)
+			}
+			if !ready {
+				return fmt.Errorf("online DDL not ready after 60s for %s/%s", key.database, keyspace)
+			}
+		}
 	}
+	return nil
 }
 
-// decodeJSON decodes the request body into v. Returns false and writes a 400 error if decoding fails.
-func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
-		s.writeError(w, http.StatusBadRequest, "decode body: %v", err)
-		return false
+// execLog executes a SQL statement and logs any error. Use this instead of
+// `_, _ = s.metadataDB.ExecContext(...)` to ensure DB errors are never silently lost.
+func (s *Server) execLog(ctx context.Context, query string, args ...any) error {
+	if _, err := s.metadataDB.ExecContext(ctx, query, args...); err != nil {
+		s.logger.Error("exec failed", "query", query[:min(len(query), 80)], "error", err)
+		return fmt.Errorf("exec %s: %w", query[:min(len(query), 80)], err)
 	}
-	return true
+	return nil
+}
+
+// decodeJSON decodes the request body into v.
+func (s *Server) decodeJSON(r *http.Request, v any) error {
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		return newHTTPError(http.StatusBadRequest, "decode body: %v", err)
+	}
+	return nil
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, data any) {

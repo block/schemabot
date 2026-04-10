@@ -11,21 +11,19 @@ import (
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 )
 
-func (s *Server) handleListKeyspaces(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListKeyspaces(w http.ResponseWriter, r *http.Request) error {
 	org := r.PathValue("org")
 	database := r.PathValue("db")
 	s.logger.Debug("list keyspaces", "org", org, "database", database)
 
 	backend, err := s.backendFor(org, database)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "%v", err)
-		return
+		return newHTTPError(http.StatusNotFound, "%v", err)
 	}
 
 	resp, err := backend.vtctld.GetKeyspaces(r.Context(), &vtctldatapb.GetKeyspacesRequest{})
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "list keyspaces: %v", err)
-		return
+		return newHTTPError(http.StatusInternalServerError, "list keyspaces: %v", err)
 	}
 
 	type keyspaceJSON struct {
@@ -52,9 +50,10 @@ func (s *Server) handleListKeyspaces(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, map[string]any{"data": keyspaces})
+	return nil
 }
 
-func (s *Server) handleGetBranchSchema(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetBranchSchema(w http.ResponseWriter, r *http.Request) error {
 	org := r.PathValue("org")
 	database := r.PathValue("db")
 	branch := r.PathValue("branch")
@@ -62,14 +61,12 @@ func (s *Server) handleGetBranchSchema(w http.ResponseWriter, r *http.Request) {
 
 	backend, err := s.backendFor(org, database)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "%v", err)
-		return
+		return newHTTPError(http.StatusNotFound, "%v", err)
 	}
 
 	keyspace := r.URL.Query().Get("keyspace")
 	if keyspace == "" {
-		s.writeError(w, http.StatusBadRequest, "keyspace query parameter required")
-		return
+		return newHTTPError(http.StatusBadRequest, "keyspace query parameter required")
 	}
 
 	var tables []table.TableSchema
@@ -77,29 +74,25 @@ func (s *Server) handleGetBranchSchema(w http.ResponseWriter, r *http.Request) {
 		// Use a shard-targeted connection to bypass vtgate's schema tracker cache.
 		conn, cleanup, err := s.vtgateShardConn(r.Context(), backend, keyspace)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, "shard-targeted conn for %s: %v", keyspace, err)
-			return
+			return newHTTPError(http.StatusInternalServerError, "shard-targeted conn for %s: %v", keyspace, err)
 		}
 		defer cleanup()
 
 		tables, err = showCreateAllFromConn(r.Context(), conn, table.WithoutUnderscoreTables)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, "%v", err)
-			return
+			return newHTTPError(http.StatusInternalServerError, "%v", err)
 		}
 	} else {
 		// Read schema from the branch database.
 		branchDB, err := s.openBranchDB(r.Context(), branch, keyspace)
 		if err != nil {
-			s.writeError(w, http.StatusNotFound, "branch database not found: %v", err)
-			return
+			return newHTTPError(http.StatusNotFound, "branch database not found: %v", err)
 		}
 		defer utils.CloseAndLog(branchDB)
 
 		tables, err = table.LoadSchemaFromDB(r.Context(), branchDB, table.WithoutUnderscoreTables)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, "%v", err)
-			return
+			return newHTTPError(http.StatusInternalServerError, "%v", err)
 		}
 	}
 
@@ -115,26 +108,26 @@ func (s *Server) handleGetBranchSchema(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, map[string]any{"data": schemas})
+	return nil
 }
 
-func (s *Server) handleGetBranchVSchema(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetBranchVSchema(w http.ResponseWriter, r *http.Request) error {
 	keyspace := r.URL.Query().Get("keyspace")
 	if keyspace == "" {
-		s.writeError(w, http.StatusBadRequest, "keyspace query parameter required")
-		return
+		return newHTTPError(http.StatusBadRequest, "keyspace query parameter required")
 	}
-	s.serveKeyspaceVSchema(w, r, keyspace, false)
+	return s.serveKeyspaceVSchema(w, r, keyspace, false)
 }
 
 // handleGetKeyspaceVSchema serves the standard PS SDK path: /branches/{branch}/keyspaces/{keyspace}/vschema
-func (s *Server) handleGetKeyspaceVSchema(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetKeyspaceVSchema(w http.ResponseWriter, r *http.Request) error {
 	keyspace := r.PathValue("keyspace")
-	s.serveKeyspaceVSchema(w, r, keyspace, true)
+	return s.serveKeyspaceVSchema(w, r, keyspace, true)
 }
 
 // serveKeyspaceVSchema is the shared implementation for VSchema GET handlers.
 // includeHTML controls whether the response includes an "html" field (PS SDK compat).
-func (s *Server) serveKeyspaceVSchema(w http.ResponseWriter, r *http.Request, keyspace string, includeHTML bool) {
+func (s *Server) serveKeyspaceVSchema(w http.ResponseWriter, r *http.Request, keyspace string, includeHTML bool) error {
 	org := r.PathValue("org")
 	database := r.PathValue("db")
 	branch := r.PathValue("branch")
@@ -147,8 +140,7 @@ func (s *Server) serveKeyspaceVSchema(w http.ResponseWriter, r *http.Request, ke
 	if branch == "main" {
 		backend, err := s.backendFor(org, database)
 		if err != nil {
-			s.writeError(w, http.StatusNotFound, "%v", err)
-			return
+			return newHTTPError(http.StatusNotFound, "%v", err)
 		}
 
 		resp, err := backend.vtctld.GetVSchema(r.Context(), &vtctldatapb.GetVSchemaRequest{
@@ -156,19 +148,19 @@ func (s *Server) serveKeyspaceVSchema(w http.ResponseWriter, r *http.Request, ke
 		})
 		if err != nil {
 			s.writeJSON(w, emptyResp)
-			return
+			return nil
 		}
 		data, err := vschemaMarshaler.Marshal(resp.VSchema)
 		if err != nil {
 			s.writeJSON(w, emptyResp)
-			return
+			return nil
 		}
 		result := map[string]any{"raw": string(data)}
 		if includeHTML {
 			result["html"] = ""
 		}
 		s.writeJSON(w, result)
-		return
+		return nil
 	}
 
 	// For non-main branches, read vschema_data from the branch row.
@@ -178,25 +170,24 @@ func (s *Server) serveKeyspaceVSchema(w http.ResponseWriter, r *http.Request, ke
 		org, database, branch,
 	).Scan(&vschemaSQL)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "branch not found: %s", branch)
-		return
+		return newHTTPError(http.StatusNotFound, "branch not found: %s", branch)
 	}
 
 	if !hasVSchemaData(vschemaSQL) {
 		s.writeJSON(w, emptyResp)
-		return
+		return nil
 	}
 
 	var vschemaMap map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(vschemaSQL.String), &vschemaMap); err != nil {
 		s.writeJSON(w, emptyResp)
-		return
+		return nil
 	}
 
 	ksData, ok := vschemaMap[keyspace]
 	if !ok {
 		s.writeJSON(w, emptyResp)
-		return
+		return nil
 	}
 
 	result := map[string]any{"raw": string(ksData)}
@@ -204,10 +195,11 @@ func (s *Server) serveKeyspaceVSchema(w http.ResponseWriter, r *http.Request, ke
 		result["html"] = ""
 	}
 	s.writeJSON(w, result)
+	return nil
 }
 
 // handleUpdateKeyspaceVSchema serves PATCH /branches/{branch}/keyspaces/{keyspace}/vschema
-func (s *Server) handleUpdateKeyspaceVSchema(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleUpdateKeyspaceVSchema(w http.ResponseWriter, r *http.Request) error {
 	org := r.PathValue("org")
 	database := r.PathValue("db")
 	branch := r.PathValue("branch")
@@ -216,13 +208,12 @@ func (s *Server) handleUpdateKeyspaceVSchema(w http.ResponseWriter, r *http.Requ
 	var body struct {
 		VSchema string `json:"vschema"`
 	}
-	if !s.decodeJSON(w, r, &body) {
-		return
+	if err := s.decodeJSON(r, &body); err != nil {
+		return err
 	}
 
 	if !json.Valid([]byte(body.VSchema)) {
-		s.writeError(w, http.StatusBadRequest, "invalid VSchema JSON")
-		return
+		return newHTTPError(http.StatusBadRequest, "invalid VSchema JSON")
 	}
 
 	// Read existing vschema_data from branch row.
@@ -232,8 +223,7 @@ func (s *Server) handleUpdateKeyspaceVSchema(w http.ResponseWriter, r *http.Requ
 		org, database, branch,
 	).Scan(&vschemaSQL)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, "branch not found: %s", branch)
-		return
+		return newHTTPError(http.StatusNotFound, "branch not found: %s", branch)
 	}
 
 	existing := make(map[string]json.RawMessage)
@@ -249,10 +239,10 @@ func (s *Server) handleUpdateKeyspaceVSchema(w http.ResponseWriter, r *http.Requ
 		string(merged), org, database, branch,
 	)
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "update branch vschema: %v", err)
-		return
+		return newHTTPError(http.StatusInternalServerError, "update branch vschema: %v", err)
 	}
 
 	s.logger.Info("updated branch vschema", "org", org, "database", database, "branch", branch, "keyspace", keyspace)
 	s.writeJSON(w, map[string]any{"raw": body.VSchema, "html": ""})
+	return nil
 }
