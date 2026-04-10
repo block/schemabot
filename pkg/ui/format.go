@@ -59,9 +59,12 @@ func ClampPercent(pct int) int {
 	return pct
 }
 
+// NowFunc returns the current time. Override in previews for deterministic output.
+var NowFunc = time.Now
+
 // FormatTimeAgo formats a time as a relative string like "5 minutes ago".
 func FormatTimeAgo(t time.Time) string {
-	d := time.Since(t)
+	d := NowFunc().Sub(t)
 	if d < time.Minute {
 		return "just now"
 	}

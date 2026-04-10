@@ -1128,7 +1128,7 @@ Schema changes require approval from a code owner before applying.
 ┌───────────────────────────────────┐
 │  Database:   testapp (mysql)      │
 │  Locked by:  block/schemabot#123  │
-│  Since:      85 days ago          │
+│  Since:      2 hours ago          │
 │  PR:         block/schemabot#123  │
 └───────────────────────────────────┘
 
@@ -1154,7 +1154,7 @@ Options:
 ┌────────────────────────────────────────────────┐
 │  Database:   testapp (mysql)                   │
 │  Locked by:  cli:deploy@prod-host.example.com  │
-│  Since:      85 days ago                       │
+│  Since:      45 minutes ago                    │
 └────────────────────────────────────────────────┘
 
 Another schema change is in progress for this database.
@@ -1226,12 +1226,12 @@ Use --force to release a lock owned by someone else.
 
   1. testapp (mysql)
      Owner: cli:aparajon@macbook
-     Since: 85 days ago
-     Last activity: 85 days ago
+     Since: 30 minutes ago
+     Last activity: 5 minutes ago
 
   2. payments (vitess)
      Owner: block/payments-api#456
-     Since: 85 days ago
+     Since: 3 hours ago
      PR:    block/payments-api#456
 
 To release a lock:
@@ -2971,10 +2971,10 @@ Volume: ██░░░░░░░░░ 2/11
 
 3 active schema changes
 
-  APPLY ID      DATABASE   ENV         STATE                STARTED      DURATION  CALLER
-  apply_abc123  orders-db  staging     Running              85 days ago  15m       
-  apply_def456  users-db   production  Waiting for cutover  85 days ago  45m       
-  apply_ghi789  analytics  staging     Stopped              85 days ago  2h        
+  APPLY ID      DATABASE   ENV         STATE                STARTED         DURATION  CALLER
+  apply_abc123  orders-db  staging     Running              15 minutes ago  15m       
+  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  45m       
+  apply_ghi789  analytics  staging     Stopped              2 hours ago     2h        
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -2992,11 +2992,11 @@ No recent schema changes
 
 Schema change history for orders-db
 
-  APPLY ID      ENV         STATE      STARTED      DURATION  CALLER
-  apply_abc123  staging     Completed  85 days ago  15m       cli
-  apply_def456  staging     Running    85 days ago  15m       PR 42
-  apply_ghi789  production  Failed     85 days ago  30m       PR 42
-  apply_jkl012  production  Completed  86 days ago  30m       cli
+  APPLY ID      ENV         STATE      STARTED         DURATION  CALLER
+  apply_abc123  staging     Completed  1 hour ago      15m       cli
+  apply_def456  staging     Running    15 minutes ago  15m       PR 42
+  apply_ghi789  production  Failed     3 hours ago     30m       PR 42
+  apply_jkl012  production  Completed  1 day ago       30m       cli
 
 Use 'schemabot status <apply_id>' to view details
 
