@@ -102,6 +102,72 @@ func TestBuildPlanCommentData_MixedSafeAndUnsafe(t *testing.T) {
 	assert.Equal(t, "users", data.UnsafeChanges[0].Table)
 }
 
+func TestRenderPlanComment_ShowsUnsafeWarning(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `orders` DROP INDEX `idx_status`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{{
+			Table:  "orders",
+			Reason: "DROP INDEX without making invisible first",
+		}},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "Unsafe Changes Detected")
+	assert.Contains(t, rendered, "`orders`")
+	assert.Contains(t, rendered, "DROP INDEX without making invisible first")
+	// Plan comment should NOT say "--allow-unsafe enabled" since it wasn't
+	assert.NotContains(t, rendered, "--allow-unsafe` enabled")
+}
+
+func TestRenderPlanComment_UnsafeWithAllowUnsafe(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		IsLocked:    true,
+		AllowUnsafe: true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `users`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{{
+			Table:  "users",
+			Reason: "DROP TABLE removes all data",
+		}},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "--allow-unsafe` enabled")
+	assert.Contains(t, rendered, "`users`")
+	assert.Contains(t, rendered, "apply-confirm -e staging --allow-unsafe")
+}
+
+func TestRenderPlanComment_NoUnsafe_NoWarning(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `orders` ADD COLUMN `x` INT"},
+		}},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.NotContains(t, rendered, "Unsafe")
+}
+
 func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 	// Verify RenderUnsafeChangesBlocked produces the expected blocking content
 	data := templates.PlanCommentData{
