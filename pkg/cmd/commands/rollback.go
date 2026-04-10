@@ -82,7 +82,7 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 
 	// Show unsafe warning if any
 	if planResult.HasErrors() {
-		unsafeChanges := GetUnsafeChanges(planResult)
+		unsafeChanges := planResult.UnsafeChanges()
 		templates.WriteUnsafeWarningAllowed(unsafeChanges)
 	}
 

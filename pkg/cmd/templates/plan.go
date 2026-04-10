@@ -8,6 +8,7 @@ import (
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 )
 
@@ -324,11 +325,8 @@ func WriteOptions(deferCutover bool) {
 }
 
 // LintWarning represents a lint warning.
-type LintWarning struct {
-	Message string
-	Table   string
-	Linter  string
-}
+// LintWarning is a type alias for the shared lint warning type.
+type LintWarning = apitypes.LintWarning
 
 // WriteLintWarnings writes lint warnings if any.
 func WriteLintWarnings(warnings []LintWarning) {
@@ -367,12 +365,8 @@ func WriteErrors(errors []string) {
 	fmt.Println()
 }
 
-// UnsafeChange represents a destructive schema change.
-type UnsafeChange struct {
-	Table      string
-	Reason     string
-	ChangeType string
-}
+// UnsafeChange is a type alias for the shared unsafe change type.
+type UnsafeChange = apitypes.UnsafeChange
 
 // WriteUnsafeChangesWarning writes a warning about unsafe changes (for plan output).
 func WriteUnsafeChangesWarning(changes []UnsafeChange) {

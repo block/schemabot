@@ -178,17 +178,15 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 
 	// Check for unsafe changes and show with ⛔ (error level)
 	// Skip in apply context — apply shows its own 🚨 warning via WriteUnsafeWarningAllowed
-	unsafeChanges := GetUnsafeChanges(result)
+	unsafeChanges := result.UnsafeChanges()
 	if len(unsafeChanges) > 0 && !isApply {
 		templates.WriteUnsafeChangesWarning(unsafeChanges)
 	}
 
 	// Show non-unsafe lint warnings with ⚠️
-	if len(result.LintWarnings) > 0 {
-		lintWarnings := ParseNonUnsafeLintWarnings(result.LintWarnings)
-		if len(lintWarnings) > 0 {
-			templates.WriteLintWarnings(lintWarnings)
-		}
+	lintWarnings := result.LintWarnings()
+	if len(lintWarnings) > 0 {
+		templates.WriteLintWarnings(lintWarnings)
 	}
 
 	// Write summary line at the end

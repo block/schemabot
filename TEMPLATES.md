@@ -1128,7 +1128,7 @@ Schema changes require approval from a code owner before applying.
 ┌───────────────────────────────────┐
 │  Database:   testapp (mysql)      │
 │  Locked by:  block/schemabot#123  │
-│  Since:      82 days ago          │
+│  Since:      84 days ago          │
 │  PR:         block/schemabot#123  │
 └───────────────────────────────────┘
 
@@ -1154,7 +1154,7 @@ Options:
 ┌────────────────────────────────────────────────┐
 │  Database:   testapp (mysql)                   │
 │  Locked by:  cli:deploy@prod-host.example.com  │
-│  Since:      82 days ago                       │
+│  Since:      84 days ago                       │
 └────────────────────────────────────────────────┘
 
 Another schema change is in progress for this database.
@@ -1226,12 +1226,12 @@ Use --force to release a lock owned by someone else.
 
   1. testapp (mysql)
      Owner: cli:aparajon@macbook
-     Since: 82 days ago
-     Last activity: 82 days ago
+     Since: 84 days ago
+     Last activity: 84 days ago
 
   2. payments (vitess)
      Owner: block/payments-api#456
-     Since: 82 days ago
+     Since: 84 days ago
      PR:    block/payments-api#456
 
 To release a lock:
@@ -2972,9 +2972,9 @@ Volume: ██░░░░░░░░░ 2/11
 3 active schema changes
 
   APPLY ID      DATABASE   ENV         STATE                STARTED      DURATION  CALLER
-  apply_abc123  orders-db  staging     Running              82 days ago  15m       
-  apply_def456  users-db   production  Waiting for cutover  82 days ago  45m       
-  apply_ghi789  analytics  staging     Stopped              82 days ago  2h        
+  apply_abc123  orders-db  staging     Running              84 days ago  15m       
+  apply_def456  users-db   production  Waiting for cutover  84 days ago  45m       
+  apply_ghi789  analytics  staging     Stopped              84 days ago  2h        
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -2993,10 +2993,10 @@ No recent schema changes
 Schema change history for orders-db
 
   APPLY ID      ENV         STATE      STARTED      DURATION  CALLER
-  apply_abc123  staging     Completed  82 days ago  15m       cli
-  apply_def456  staging     Running    82 days ago  15m       PR 42
-  apply_ghi789  production  Failed     82 days ago  30m       PR 42
-  apply_jkl012  production  Completed  83 days ago  30m       cli
+  apply_abc123  staging     Completed  84 days ago  15m       cli
+  apply_def456  staging     Running    84 days ago  15m       PR 42
+  apply_ghi789  production  Failed     84 days ago  30m       PR 42
+  apply_jkl012  production  Completed  85 days ago  30m       cli
 
 Use 'schemabot status <apply_id>' to view details
 
