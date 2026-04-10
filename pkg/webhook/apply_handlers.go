@@ -137,7 +137,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	}
 
 	// Block unsafe changes unless --allow-unsafe was specified
-	if planResp.HasErrors() && !result.AllowUnsafe {
+	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
@@ -266,6 +266,14 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	if len(planResp.FlatTables()) == 0 {
 		_ = h.service.Storage().Locks().ForceRelease(ctx, database, dbType)
 		h.postComment(repo, pr, installationID, templates.RenderApplyConfirmNoChanges(database, environment))
+		return
+	}
+
+	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
+	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+		h.logger.Info("apply-confirm blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
 		return
 	}
 

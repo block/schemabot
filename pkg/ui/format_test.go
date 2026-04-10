@@ -53,6 +53,11 @@ func TestCleanLintReason(t *testing.T) {
 			expect: "DROP TABLE removes all data",
 		},
 		{
+			name:   "multiple reasons joined by semicolon",
+			input:  "[ERROR] unsafe: DROP COLUMN removes data; [ERROR] invisible_index_before_drop: Index should be invisible first",
+			expect: "DROP COLUMN removes data; Index should be invisible first",
+		},
+		{
 			name:   "empty string",
 			input:  "",
 			expect: "",

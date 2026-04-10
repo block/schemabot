@@ -100,12 +100,12 @@ func buildCheckRunSummary(planResp *apitypes.PlanResponse) string {
 		fmt.Fprintf(&sb, "- `%s` (%s)\n", table.TableName, table.ChangeType)
 	}
 
-	if len(planResp.LintResults) > 0 {
-		fmt.Fprintf(&sb, "\n**%d lint warning(s)**\n", len(planResp.LintResults))
+	if lintWarnings := planResp.LintWarnings(); len(lintWarnings) > 0 {
+		fmt.Fprintf(&sb, "\n**%d lint warning(s)**\n", len(lintWarnings))
 	}
 
-	if planResp.HasErrors() {
-		sb.WriteString("\n**Warning: contains unsafe changes that require --allow-unsafe**\n")
+	if lintErrors := planResp.LintErrors(); len(lintErrors) > 0 {
+		fmt.Fprintf(&sb, "\n**%d unsafe change(s) require --allow-unsafe**\n", len(lintErrors))
 	}
 
 	return sb.String()
