@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // ApplyLockConflictData contains data for apply lock conflict comments.
@@ -56,8 +58,9 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	sb.WriteString("---\n\n")
 	sb.WriteString("**⛔ Unsafe Changes Detected:**\n")
 	for _, c := range data.UnsafeChanges {
-		if c.Reason != "" {
-			fmt.Fprintf(&sb, "- `%s`: %s\n", c.Table, c.Reason)
+		reason := ui.CleanLintReason(c.Reason)
+		if reason != "" {
+			fmt.Fprintf(&sb, "- `%s`: %s\n", c.Table, reason)
 		} else {
 			fmt.Fprintf(&sb, "- `%s`\n", c.Table)
 		}

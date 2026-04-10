@@ -15,6 +15,7 @@ type CommandParser struct {
 	databaseRegex          *regexp.Regexp
 	enableRevertRegex      *regexp.Regexp
 	deferCutoverRegex      *regexp.Regexp
+	allowUnsafeRegex       *regexp.Regexp
 }
 
 // NewCommandParser creates a new command parser.
@@ -28,6 +29,7 @@ func NewCommandParser() *CommandParser {
 		databaseRegex:          regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
 		enableRevertRegex:      regexp.MustCompile(`(?i)--enable-revert\b`),
 		deferCutoverRegex:      regexp.MustCompile(`(?i)--defer-cutover\b`),
+		allowUnsafeRegex:       regexp.MustCompile(`(?i)--allow-unsafe\b`),
 	}
 }
 
@@ -39,6 +41,7 @@ type CommandResult struct {
 	Database     string // Optional -d flag value
 	EnableRevert bool
 	DeferCutover bool
+	AllowUnsafe  bool
 	Found        bool
 	IsHelp       bool
 	IsMention    bool
@@ -79,6 +82,7 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 			IsMention:    true,
 			EnableRevert: p.enableRevertRegex.MatchString(body),
 			DeferCutover: p.deferCutoverRegex.MatchString(body),
+			AllowUnsafe:  p.allowUnsafeRegex.MatchString(body),
 		}
 
 		dbMatches := p.databaseRegex.FindStringSubmatch(body)

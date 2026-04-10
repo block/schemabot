@@ -233,8 +233,19 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		data.Changes = append(data.Changes, ksData)
 	}
 
-	// Add lint warnings
-	for _, w := range planResp.LintWarnings {
+	unsafeChanges := planResp.UnsafeChanges()
+	if len(unsafeChanges) > 0 {
+		data.HasUnsafeChanges = true
+		for _, uc := range unsafeChanges {
+			data.UnsafeChanges = append(data.UnsafeChanges, templates.UnsafeChangeData{
+				Table:  uc.Table,
+				Reason: uc.Reason,
+			})
+		}
+	}
+
+	// Add lint warnings (error-severity results are shown via UnsafeChanges instead)
+	for _, w := range planResp.LintWarnings() {
 		data.LintWarnings = append(data.LintWarnings, templates.LintWarningData{
 			Message: w.Message,
 			Table:   w.Table,

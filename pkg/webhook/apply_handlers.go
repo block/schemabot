@@ -136,6 +136,14 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
+	// Block unsafe changes unless --allow-unsafe was specified
+	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
+		return
+	}
+
 	// Acquire lock
 	lock := &storage.Lock{
 		DatabaseName: database,
@@ -162,6 +170,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	commentData.LockAcquired = time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
 	commentData.DeferCutover = result.DeferCutover
 	commentData.EnableRevert = result.EnableRevert
+	commentData.AllowUnsafe = result.AllowUnsafe
 
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
@@ -260,6 +269,14 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		return
 	}
 
+	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
+	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+		h.logger.Info("apply-confirm blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
+		return
+	}
+
 	// Build apply options
 	options := make(map[string]string)
 	if result.DeferCutover {
@@ -267,6 +284,9 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	}
 	if result.EnableRevert {
 		options["enable_revert"] = "true"
+	}
+	if result.AllowUnsafe {
+		options["allow_unsafe"] = "true"
 	}
 
 	caller := fmt.Sprintf("github:%s@%s#%d", requestedBy, repo, pr)

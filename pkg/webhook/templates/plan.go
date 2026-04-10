@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // LintWarningData represents a structured lint warning for template rendering.
@@ -97,9 +98,9 @@ func RenderPlanComment(data PlanCommentData) string {
 	// Detailed changes
 	writeKeyspaceChanges(&sb, data)
 
-	// Unsafe changes warning (when --allow-unsafe was used)
-	if data.HasUnsafeChanges && data.AllowUnsafe && len(data.UnsafeChanges) > 0 {
-		writeUnsafeWarning(&sb, data.UnsafeChanges)
+	// Unsafe changes warning
+	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 {
+		writeUnsafeWarning(&sb, data.UnsafeChanges, data.AllowUnsafe)
 	}
 
 	// Lint warnings
@@ -283,11 +284,16 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 	}
 }
 
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData) {
-	sb.WriteString("**🚨 Unsafe Changes** (`--allow-unsafe` enabled):\n")
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUnsafe bool) {
+	if allowUnsafe {
+		sb.WriteString("**🚨 Unsafe Changes** (`--allow-unsafe` enabled):\n")
+	} else {
+		sb.WriteString("**⛔ Unsafe Changes Detected:**\n")
+	}
 	for _, c := range changes {
-		if c.Reason != "" {
-			fmt.Fprintf(sb, "- `%s`: %s\n", c.Table, c.Reason)
+		reason := ui.CleanLintReason(c.Reason)
+		if reason != "" {
+			fmt.Fprintf(sb, "- `%s`: %s\n", c.Table, reason)
 		} else {
 			fmt.Fprintf(sb, "- `%s`\n", c.Table)
 		}
@@ -417,9 +423,9 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, isM
 	// Detailed changes
 	writeKeyspaceChanges(sb, *plan)
 
-	// Unsafe changes warning (when --allow-unsafe was used)
-	if plan.HasUnsafeChanges && plan.AllowUnsafe && len(plan.UnsafeChanges) > 0 {
-		writeUnsafeWarning(sb, plan.UnsafeChanges)
+	// Unsafe changes warning
+	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
+		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.AllowUnsafe)
 	}
 
 	// Lint warnings

@@ -59,9 +59,12 @@ func ClampPercent(pct int) int {
 	return pct
 }
 
+// NowFunc returns the current time. Override in previews for deterministic output.
+var NowFunc = time.Now
+
 // FormatTimeAgo formats a time as a relative string like "5 minutes ago".
 func FormatTimeAgo(t time.Time) string {
-	d := time.Since(t)
+	d := NowFunc().Sub(t)
 	if d < time.Minute {
 		return "just now"
 	}
@@ -170,4 +173,28 @@ func TableStatePriority(taskState string) int {
 	default:
 		return 2
 	}
+}
+
+// CleanLintReason strips severity prefixes like "[ERROR] linter_name:" from
+// Spirit's raw lint violation strings for cleaner display. Handles multiple
+// violations joined by "; " by cleaning each segment individually.
+func CleanLintReason(reason string) string {
+	segments := strings.Split(reason, "; ")
+	for i, seg := range segments {
+		segments[i] = cleanSingleLintReason(seg)
+	}
+	return strings.Join(segments, "; ")
+}
+
+func cleanSingleLintReason(reason string) string {
+	for _, prefix := range []string{"[ERROR] ", "[WARNING] ", "[INFO] "} {
+		if strings.HasPrefix(reason, prefix) {
+			reason = reason[len(prefix):]
+			if idx := strings.Index(reason, ": "); idx != -1 {
+				reason = reason[idx+2:]
+			}
+			break
+		}
+	}
+	return reason
 }

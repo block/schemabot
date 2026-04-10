@@ -15,7 +15,6 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
-	"github.com/block/schemabot/pkg/cmd/templates"
 	ghclient "github.com/block/schemabot/pkg/github"
 )
 
@@ -124,57 +123,6 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	}
 
 	return &cfg, nil
-}
-
-// GetUnsafeChanges extracts unsafe change descriptions from a plan result.
-// Used by both plan and apply commands to display unsafe changes consistently.
-func GetUnsafeChanges(planResult *apitypes.PlanResponse) []templates.UnsafeChange {
-	var changes []templates.UnsafeChange
-
-	for _, tbl := range planResult.FlatTables() {
-		if !tbl.IsUnsafe {
-			continue
-		}
-		changes = append(changes, templates.UnsafeChange{
-			Table:      tbl.TableName,
-			Reason:     tbl.UnsafeReason,
-			ChangeType: tbl.ChangeType,
-		})
-	}
-
-	return changes
-}
-
-// ParseLintWarnings extracts all lint warnings from the API response.
-func ParseLintWarnings(warnings []*apitypes.LintWarningResponse) []templates.LintWarning {
-	var lintWarnings []templates.LintWarning
-	for _, warn := range warnings {
-		lintWarnings = append(lintWarnings, templates.LintWarning{
-			Message: warn.Message,
-			Table:   warn.Table,
-			Linter:  warn.Linter,
-		})
-	}
-	return lintWarnings
-}
-
-// ParseNonUnsafeLintWarnings extracts lint warnings that are NOT unsafe changes.
-// Unsafe changes are shown separately with the ⛔ template.
-func ParseNonUnsafeLintWarnings(warnings []*apitypes.LintWarningResponse) []templates.LintWarning {
-	var lintWarnings []templates.LintWarning
-	for _, warn := range warnings {
-		// Skip unsafe linter warnings - they're shown in the unsafe changes section
-		if warn.Linter == "unsafe" || warn.Linter == "invisible_index_before_drop" {
-			continue
-		}
-
-		lintWarnings = append(lintWarnings, templates.LintWarning{
-			Message: warn.Message,
-			Table:   warn.Table,
-			Linter:  warn.Linter,
-		})
-	}
-	return lintWarnings
 }
 
 // resolveEndpoint resolves the API endpoint from explicit flag or profile config.

@@ -84,13 +84,13 @@ type PlanResponse struct {
 	Environment  string                  `json:"environment,omitempty"`
 	Engine       string                  `json:"engine"`
 	Changes      []*SchemaChangeResponse `json:"changes"`
-	LintWarnings []*LintWarningResponse  `json:"lint_warnings"`
+	LintResults  []*LintWarningResponse  `json:"lint_warnings"`
 	Errors       []string                `json:"errors"`
 }
 
-// HasErrors returns true if any lint warning has error severity.
+// HasErrors returns true if any lint result has error severity.
 func (r *PlanResponse) HasErrors() bool {
-	for _, w := range r.LintWarnings {
+	for _, w := range r.LintResults {
 		if w.Severity == "error" {
 			return true
 		}
@@ -105,6 +105,70 @@ func (r *PlanResponse) FlatTables() []*TableChangeResponse {
 		tables = append(tables, sc.TableChanges...)
 	}
 	return tables
+}
+
+// UnsafeChange represents a destructive schema change extracted from a plan.
+type UnsafeChange struct {
+	Table      string
+	Reason     string
+	ChangeType string
+}
+
+// UnsafeChanges extracts all table changes marked as unsafe (DROP TABLE, DROP COLUMN, etc.).
+func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
+	var changes []UnsafeChange
+	for _, tbl := range r.FlatTables() {
+		if !tbl.IsUnsafe {
+			continue
+		}
+		changes = append(changes, UnsafeChange{
+			Table:      tbl.TableName,
+			Reason:     tbl.UnsafeReason,
+			ChangeType: tbl.ChangeType,
+		})
+	}
+	return changes
+}
+
+// LintWarning represents a lint warning extracted from a plan response.
+type LintWarning struct {
+	Message string
+	Table   string
+	Linter  string
+}
+
+// LintWarnings returns non-error lint results (warning and info severity).
+// Error-severity results represent unsafe/blocking changes and are shown
+// separately via UnsafeChanges().
+func (r *PlanResponse) LintWarnings() []LintWarning {
+	var warnings []LintWarning
+	for _, w := range r.LintResults {
+		if w.Severity == "error" {
+			continue
+		}
+		warnings = append(warnings, LintWarning{
+			Message: w.Message,
+			Table:   w.Table,
+			Linter:  w.Linter,
+		})
+	}
+	return warnings
+}
+
+// LintErrors returns error-severity lint results (unsafe/blocking changes).
+func (r *PlanResponse) LintErrors() []LintWarning {
+	var warnings []LintWarning
+	for _, w := range r.LintResults {
+		if w.Severity != "error" {
+			continue
+		}
+		warnings = append(warnings, LintWarning{
+			Message: w.Message,
+			Table:   w.Table,
+			Linter:  w.Linter,
+		})
+	}
+	return warnings
 }
 
 // SchemaChangeResponse groups changes for a single namespace.

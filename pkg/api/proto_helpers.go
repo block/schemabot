@@ -13,11 +13,11 @@ import (
 // planResponseFromProto converts a protobuf PlanResponse to an HTTP PlanResponse.
 func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 	httpResp := &apitypes.PlanResponse{
-		PlanID:       resp.PlanId,
-		Engine:       engineName(resp.Engine),
-		Changes:      []*apitypes.SchemaChangeResponse{},
-		LintWarnings: []*apitypes.LintWarningResponse{},
-		Errors:       []string{},
+		PlanID:      resp.PlanId,
+		Engine:      engineName(resp.Engine),
+		Changes:     []*apitypes.SchemaChangeResponse{},
+		LintResults: []*apitypes.LintWarningResponse{},
+		Errors:      []string{},
 	}
 
 	if len(resp.Errors) > 0 {
@@ -43,7 +43,7 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 	}
 
 	for _, w := range resp.LintWarnings {
-		httpResp.LintWarnings = append(httpResp.LintWarnings, &apitypes.LintWarningResponse{
+		httpResp.LintResults = append(httpResp.LintResults, &apitypes.LintWarningResponse{
 			Message:  w.Message,
 			Table:    w.Table,
 			Column:   w.Column,

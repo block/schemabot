@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -16,6 +17,7 @@ var previewTime = time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC)
 // SetPreviewMode configures the package to use fixed timestamps for deterministic output.
 func SetPreviewMode() {
 	nowFunc = func() time.Time { return previewTime }
+	ui.NowFunc = func() time.Time { return previewTime }
 }
 
 // PreviewType represents the type of preview to show.

@@ -235,8 +235,19 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
+			name: "apply with allow-unsafe",
+			body: "schemabot apply -e staging --allow-unsafe",
+			expected: CommandResult{
+				Action:      "apply",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+				AllowUnsafe: true,
+			},
+		},
+		{
 			name: "all flags combined",
-			body: "schemabot apply -e production -d payments_db --defer-cutover --enable-revert",
+			body: "schemabot apply -e production -d payments_db --defer-cutover --enable-revert --allow-unsafe",
 			expected: CommandResult{
 				Action:       "apply",
 				Environment:  "production",
@@ -245,6 +256,7 @@ func TestParseCommand(t *testing.T) {
 				IsMention:    true,
 				EnableRevert: true,
 				DeferCutover: true,
+				AllowUnsafe:  true,
 			},
 		},
 	}
