@@ -120,7 +120,7 @@ func TestRenderPlanComment_ShowsUnsafeWarning(t *testing.T) {
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "Unsafe Changes Detected")
+	assert.Contains(t, rendered, "⛔ Unsafe Changes Detected")
 	assert.Contains(t, rendered, "`orders`")
 	assert.Contains(t, rendered, "DROP INDEX without making invisible first")
 	// Plan comment should NOT say "--allow-unsafe enabled" since it wasn't

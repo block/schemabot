@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // LintWarningData represents a structured lint warning for template rendering.
@@ -287,11 +288,12 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUn
 	if allowUnsafe {
 		sb.WriteString("**🚨 Unsafe Changes** (`--allow-unsafe` enabled):\n")
 	} else {
-		sb.WriteString("**⚠️ Unsafe Changes Detected:**\n")
+		sb.WriteString("**⛔ Unsafe Changes Detected:**\n")
 	}
 	for _, c := range changes {
-		if c.Reason != "" {
-			fmt.Fprintf(sb, "- `%s`: %s\n", c.Table, c.Reason)
+		reason := ui.CleanLintReason(c.Reason)
+		if reason != "" {
+			fmt.Fprintf(sb, "- `%s`: %s\n", c.Table, reason)
 		} else {
 			fmt.Fprintf(sb, "- `%s`\n", c.Table)
 		}

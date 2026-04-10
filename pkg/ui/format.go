@@ -171,3 +171,18 @@ func TableStatePriority(taskState string) int {
 		return 2
 	}
 }
+
+// CleanLintReason strips severity prefixes like "[ERROR] linter_name:" from
+// Spirit's raw lint violation strings for cleaner display.
+func CleanLintReason(reason string) string {
+	for _, prefix := range []string{"[ERROR] ", "[WARNING] ", "[INFO] "} {
+		if strings.HasPrefix(reason, prefix) {
+			reason = reason[len(prefix):]
+			if idx := strings.Index(reason, ": "); idx != -1 {
+				reason = reason[idx+2:]
+			}
+			break
+		}
+	}
+	return reason
+}

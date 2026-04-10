@@ -233,7 +233,6 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		data.Changes = append(data.Changes, ksData)
 	}
 
-	// Extract unsafe changes using shared logic
 	unsafeChanges := planResp.UnsafeChanges()
 	if len(unsafeChanges) > 0 {
 		data.HasUnsafeChanges = true

@@ -10,6 +10,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 const minBoxWidth = 45
@@ -407,18 +408,17 @@ func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
 // writeUnsafeChangesList writes the list of unsafe changes, splitting multi-reason entries.
 func writeUnsafeChangesList(changes []UnsafeChange) {
 	for _, c := range changes {
-		if c.Reason != "" {
+		reason := ui.CleanLintReason(c.Reason)
+		if reason != "" {
 			// Split multiple reasons (joined by "; " in the engine)
-			reasons := strings.Split(c.Reason, "; ")
+			reasons := strings.Split(reason, "; ")
 			if len(reasons) > 1 {
-				// Multiple reasons - show table header then indented list
 				fmt.Printf("  • %s:\n", c.Table)
 				for _, r := range reasons {
 					fmt.Printf("      - %s\n", r)
 				}
 			} else {
-				// Single reason - inline format
-				fmt.Printf("  • %s: %s\n", c.Table, c.Reason)
+				fmt.Printf("  • %s: %s\n", c.Table, reason)
 			}
 		} else {
 			fmt.Printf("  • %s: %s\n", c.Table, c.ChangeType)
