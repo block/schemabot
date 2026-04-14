@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 
@@ -56,13 +57,30 @@ type GitHubConfig struct {
 // It actually resolves the private key so that file: or secretsmanager: references that
 // point to non-existent resources cause Configured() to return false instead of crashing.
 func (g *GitHubConfig) Configured() bool {
-	if g.ResolveAppID() == 0 || g.PrivateKey == "" {
+	appID := g.ResolveAppID()
+	if appID == 0 && g.PrivateKey == "" {
+		return false
+	}
+	if appID == 0 {
+		slog.Warn("GitHub App private_key is set but app_id is missing — skipping GitHub setup")
+		return false
+	}
+	if g.PrivateKey == "" {
+		slog.Warn("GitHub App app_id is set but private_key is missing — skipping GitHub setup")
 		return false
 	}
 	// Actually resolve the private key — if the file/secret doesn't exist yet,
 	// treat GitHub as not configured rather than failing startup.
 	pk, err := g.ResolvePrivateKey()
-	return err == nil && pk != ""
+	if err != nil {
+		slog.Warn("GitHub App credentials not resolvable — skipping GitHub setup", "error", err)
+		return false
+	}
+	if pk == "" {
+		slog.Warn("GitHub App private key resolved to empty — skipping GitHub setup")
+		return false
+	}
+	return true
 }
 
 // ResolveAppID resolves the app ID from config (supports secret references),
