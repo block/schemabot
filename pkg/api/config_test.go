@@ -217,6 +217,11 @@ func TestGitHubConfig_Configured(t *testing.T) {
 		g := GitHubConfig{AppID: "123", PrivateKey: "some-key"}
 		assert.True(t, g.Configured())
 	})
+
+	t.Run("not configured when file reference does not exist", func(t *testing.T) {
+		g := GitHubConfig{AppID: "123", PrivateKey: "file:/tmp/nonexistent-key.pem"}
+		assert.False(t, g.Configured())
+	})
 }
 
 func TestGitHubConfig_ResolveAppID(t *testing.T) {

@@ -53,8 +53,16 @@ type GitHubConfig struct {
 }
 
 // Configured returns true if the GitHub App is configured (app ID and private key are set).
+// It actually resolves the private key so that file: or secretsmanager: references that
+// point to non-existent resources cause Configured() to return false instead of crashing.
 func (g *GitHubConfig) Configured() bool {
-	return g.ResolveAppID() != 0 && g.PrivateKey != ""
+	if g.ResolveAppID() == 0 || g.PrivateKey == "" {
+		return false
+	}
+	// Actually resolve the private key — if the file/secret doesn't exist yet,
+	// treat GitHub as not configured rather than failing startup.
+	pk, err := g.ResolvePrivateKey()
+	return err == nil && pk != ""
 }
 
 // ResolveAppID resolves the app ID from config (supports secret references),

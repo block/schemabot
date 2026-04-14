@@ -97,7 +97,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	svc.ConfigureRoutes(mux)
 
 	// Register GitHub webhook handler if GitHub App is configured
-	if serverConfig.GitHub.Configured() {
+	if serverConfig.GitHub.Configured() { //nolint:nestif
 		ghPrivateKey, err := serverConfig.GitHub.ResolvePrivateKey()
 		if err != nil {
 			return fmt.Errorf("resolve GitHub private key: %w", err)
@@ -114,6 +114,8 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 		webhookHandler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger)
 		mux.Handle("POST /webhook", webhookHandler)
 		logger.Info("GitHub webhook endpoint registered", "app_id", appID)
+	} else if serverConfig.GitHub.PrivateKey != "" {
+		logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled")
 	}
 
 	// Create server
