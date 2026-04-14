@@ -291,6 +291,44 @@ func TestEngine_Plan_NewTable(t *testing.T) {
 	assert.True(t, found, "expected CREATE TABLE statement, got: %v", result.FlatDDL())
 }
 
+func TestEngine_Plan_LintViolationMapping(t *testing.T) {
+	dsn, _ := setupTestMySQL(t)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	// Plan with a TIMESTAMP column which triggers the Y2038 overflow linter
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"events.sql": `CREATE TABLE events (
+				id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+		}),
+		Credentials: &engine.Credentials{
+			DSN: dsn,
+		},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges)
+
+	// Verify lint warnings are populated with correct fields
+	require.NotEmpty(t, result.LintWarnings, "expected lint warnings for TIMESTAMP column")
+
+	var found bool
+	for _, w := range result.LintWarnings {
+		if w.Table == "events" && strings.Contains(w.Message, "TIMESTAMP") {
+			found = true
+			assert.NotEmpty(t, w.Linter, "Linter name should be populated")
+			assert.Contains(t, []string{"error", "warning", "info"}, w.Severity,
+				"Severity should be a normalized lowercase string")
+			break
+		}
+	}
+	assert.True(t, found, "expected a TIMESTAMP-related lint warning for 'events' table, got: %v", result.LintWarnings)
+}
+
 func TestEngine_Plan_MissingCredentials(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{Logger: logger})

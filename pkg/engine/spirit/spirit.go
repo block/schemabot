@@ -271,10 +271,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}
 
 		// Error-severity violations mark the change as unsafe
-		if errors := pc.Errors(); len(errors) > 0 {
+		if errViolations := pc.Errors(); len(errViolations) > 0 {
 			change.IsUnsafe = true
-			msgs := make([]string, len(errors))
-			for i, v := range errors {
+			msgs := make([]string, len(errViolations))
+			for i, v := range errViolations {
 				msgs[i] = v.Message
 			}
 			change.UnsafeReason = strings.Join(msgs, "; ")
