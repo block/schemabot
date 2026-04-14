@@ -278,7 +278,7 @@ CREATE TABLE %s (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     price_cents BIGINT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 `, tableName))
 
@@ -299,7 +299,7 @@ func TestLocal_Plan_AddIndex(t *testing.T) {
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			name VARCHAR(255) NOT NULL,
 			category VARCHAR(100),
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)
 	`, tableName))
 
@@ -309,7 +309,7 @@ CREATE TABLE %s (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     category VARCHAR(100),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_category (category)
 );
 `, tableName))
@@ -330,7 +330,7 @@ func TestLocal_Plan_UnsafeChanges(t *testing.T) {
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			email VARCHAR(255) NOT NULL,
 			legacy_field VARCHAR(100),
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)
 	`, tableName))
 
@@ -339,7 +339,7 @@ func TestLocal_Plan_UnsafeChanges(t *testing.T) {
 CREATE TABLE %s (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     email VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 `, tableName))
 
@@ -366,7 +366,7 @@ func TestLocal_Plan_NamespaceSubdirectory(t *testing.T) {
 CREATE TABLE %s (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 `, tableName))
 
@@ -414,7 +414,7 @@ CREATE TABLE %s (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     weight_grams INT DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 `, tableName))
 
@@ -737,7 +737,7 @@ func TestLocal_DeferCutover_FullWorkflow(t *testing.T) {
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			customer_id BIGINT NOT NULL,
 			amount_cents BIGINT NOT NULL,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)
 	`, tableName))
 	require.NoError(t, err, "create table")
@@ -756,7 +756,7 @@ CREATE TABLE %s (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     customer_id BIGINT NOT NULL,
     amount_cents BIGINT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_customer (customer_id)
 );
 `, tableName))
@@ -852,7 +852,7 @@ func TestLocal_StopStart_FullWorkflow(t *testing.T) {
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			event_type VARCHAR(100) NOT NULL,
 			payload TEXT,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)
 	`, tableName))
 	require.NoError(t, err, "create table")
@@ -870,7 +870,7 @@ CREATE TABLE %s (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     event_type VARCHAR(100) NOT NULL,
     payload TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_event_type (event_type),
     INDEX idx_created (created_at)
 );
@@ -933,7 +933,7 @@ func TestLocal_StopStart_MultiTable_ResumeAll(t *testing.T) {
 				id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 				name VARCHAR(255) NOT NULL,
 				amount BIGINT NOT NULL,
-				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+				created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 			)
 		`, tbl))
 		require.NoErrorf(t, err, "create table %s", tbl)
@@ -953,7 +953,7 @@ CREATE TABLE %s (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     amount BIGINT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_name (name)
 );
 `, tbl))
@@ -1066,7 +1066,7 @@ func TestLocal_Volume_DuringApply(t *testing.T) {
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			name VARCHAR(255) NOT NULL,
 			value DECIMAL(20, 4),
-			recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)
 	`, tableName))
 	require.NoError(t, err, "create table")
@@ -1084,7 +1084,7 @@ CREATE TABLE %s (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     value DECIMAL(20, 4),
-    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_name (name),
     INDEX idx_recorded (recorded_at)
 );
@@ -1151,7 +1151,7 @@ func TestLocal_Progress_DuringApply(t *testing.T) {
 			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 			level VARCHAR(20) NOT NULL,
 			message TEXT,
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)
 	`, tableName))
 	require.NoError(t, err, "create table")
@@ -1169,7 +1169,7 @@ CREATE TABLE %s (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     level VARCHAR(20) NOT NULL,
     message TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_level (level)
 );
 `, tableName))

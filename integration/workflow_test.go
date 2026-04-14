@@ -396,7 +396,7 @@ CREATE TABLE orders (
 	user_id BIGINT NOT NULL,
 	total_amount DECIMAL(10, 2) NOT NULL,
 	status VARCHAR(50) NOT NULL DEFAULT 'pending',
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`
 		planResp := planAndApply(t, currentSchema, 101)
 
@@ -422,7 +422,7 @@ CREATE TABLE orders (
 	user_id BIGINT NOT NULL,
 	total_amount DECIMAL(10, 2) NOT NULL,
 	status VARCHAR(50) NOT NULL DEFAULT 'pending',
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	notes TEXT
 );`
 		planResp := planAndApply(t, currentSchema, 102)
@@ -454,7 +454,7 @@ CREATE TABLE orders (
 	user_id BIGINT NOT NULL,
 	total_amount DECIMAL(10, 2) NOT NULL,
 	status VARCHAR(50) NOT NULL DEFAULT 'pending',
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	notes TEXT,
 	shipping_address VARCHAR(500)
 );`
@@ -479,7 +479,7 @@ CREATE TABLE customers (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	name VARCHAR(255) NOT NULL,
 	email VARCHAR(255) NOT NULL,
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`
 		planResp := planAndApply(t, currentSchema, 104)
 
@@ -515,7 +515,7 @@ CREATE TABLE orders (
 	user_id BIGINT NOT NULL,
 	total_amount DECIMAL(10, 2) NOT NULL,
 	status VARCHAR(50) NOT NULL DEFAULT 'pending',
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	shipping_address VARCHAR(500)
 );`
 		planResp := planAndApply(t, currentSchema, 105)
@@ -788,7 +788,7 @@ func TestCLI_PlanApply(t *testing.T) {
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     email VARCHAR(255) NOT NULL,
     name VARCHAR(100),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uk_email (email)
 );`
 	require.NoError(t, os.WriteFile(schemaDir+"/users.sql", []byte(usersSchema), 0644), "write schema file")
@@ -1036,7 +1036,7 @@ CREATE TABLE users (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	email VARCHAR(255) NOT NULL,
 	name VARCHAR(100),
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`
 		planResp, states := planAndApplyWithProgress(t, currentSchema, 201)
 
@@ -1086,7 +1086,7 @@ CREATE TABLE users (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	email VARCHAR(255) NOT NULL,
 	name VARCHAR(100),
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	INDEX idx_email (email)
 );`
 		planResp, states := planAndApplyWithProgress(t, currentSchema, 202)
@@ -1114,7 +1114,7 @@ CREATE TABLE users (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	email VARCHAR(255) NOT NULL,
 	name VARCHAR(100),
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	INDEX idx_email (email),
 	status VARCHAR(20) DEFAULT 'active'
 );`
@@ -1144,7 +1144,7 @@ CREATE TABLE users (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	email VARCHAR(255) NOT NULL,
 	name VARCHAR(100),
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	INDEX idx_email (email),
 	status VARCHAR(20) DEFAULT 'active',
 	INDEX idx_name (name)
@@ -1171,7 +1171,7 @@ CREATE TABLE users (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	email VARCHAR(255) NOT NULL,
 	name VARCHAR(100),
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	INDEX idx_email (email),
 	status VARCHAR(20) DEFAULT 'active'
 );`
@@ -1198,7 +1198,7 @@ CREATE TABLE users (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	email VARCHAR(255) NOT NULL,
 	name VARCHAR(200),
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	INDEX idx_email (email),
 	status VARCHAR(20) DEFAULT 'active'
 );`
@@ -1235,7 +1235,7 @@ func TestFullWorkflow_Spirit_MySQLFailure(t *testing.T) {
 CREATE TABLE orders (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	user_id BIGINT NOT NULL,
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (user_id) REFERENCES users(id)
 );`
 
@@ -1328,7 +1328,7 @@ func TestFullWorkflow_Spirit_PartialFailure(t *testing.T) {
 CREATE TABLE aaa_first (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	name VARCHAR(100) NOT NULL,
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`,
 		"bbb_fails.sql": `
 CREATE TABLE bbb_fails (
@@ -1340,7 +1340,7 @@ CREATE TABLE bbb_fails (
 CREATE TABLE ccc_cancelled (
 	id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
 	message TEXT,
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );`,
 	}
 

@@ -1030,7 +1030,7 @@ func TestEngine_Apply_StartsGoroutine(t *testing.T) {
 			"apply_test.sql": `CREATE TABLE apply_test (
 				id INT PRIMARY KEY AUTO_INCREMENT,
 				name VARCHAR(100) NOT NULL,
-				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+				created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 			)`,
 		}),
 		Credentials: &engine.Credentials{DSN: dsn},
