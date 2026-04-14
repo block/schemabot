@@ -64,27 +64,27 @@ func TestDecodeResumeState_EmptyFields(t *testing.T) {
 func TestPlanResult_HasErrors(t *testing.T) {
 	tests := []struct {
 		name     string
-		warnings []LintWarning
+		warnings []LintViolation
 		want     bool
 	}{
 		{"nil warnings", nil, false},
-		{"empty warnings", []LintWarning{}, false},
-		{"warning only", []LintWarning{{Severity: "warning"}}, false},
-		{"info only", []LintWarning{{Severity: "info"}}, false},
-		{"error only", []LintWarning{{Severity: "error"}}, true},
-		{"mixed with error", []LintWarning{{Severity: "warning"}, {Severity: "error"}}, true},
-		{"mixed without error", []LintWarning{{Severity: "warning"}, {Severity: "info"}}, false},
+		{"empty warnings", []LintViolation{}, false},
+		{"warning only", []LintViolation{{Severity: "warning"}}, false},
+		{"info only", []LintViolation{{Severity: "info"}}, false},
+		{"error only", []LintViolation{{Severity: "error"}}, true},
+		{"mixed with error", []LintViolation{{Severity: "warning"}, {Severity: "error"}}, true},
+		{"mixed without error", []LintViolation{{Severity: "warning"}, {Severity: "info"}}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := &PlanResult{LintWarnings: tt.warnings}
+			r := &PlanResult{LintViolations: tt.warnings}
 			assert.Equal(t, tt.want, r.HasErrors())
 		})
 	}
 }
 
 func TestPlanResult_Errors(t *testing.T) {
-	r := &PlanResult{LintWarnings: []LintWarning{
+	r := &PlanResult{LintViolations: []LintViolation{
 		{Message: "warn1", Severity: "warning"},
 		{Message: "err1", Severity: "error"},
 		{Message: "info1", Severity: "info"},
@@ -97,7 +97,7 @@ func TestPlanResult_Errors(t *testing.T) {
 }
 
 func TestPlanResult_Warnings(t *testing.T) {
-	r := &PlanResult{LintWarnings: []LintWarning{
+	r := &PlanResult{LintViolations: []LintViolation{
 		{Message: "warn1", Severity: "warning"},
 		{Message: "err1", Severity: "error"},
 		{Message: "info1", Severity: "info"},

@@ -313,11 +313,11 @@ func TestEngine_Plan_LintViolationMapping(t *testing.T) {
 	require.NoError(t, err, "Plan()")
 	require.False(t, result.NoChanges)
 
-	// Verify lint warnings are populated with correct fields
-	require.NotEmpty(t, result.LintWarnings, "expected lint warnings for TIMESTAMP column")
+	// Verify lint violations are populated with correct fields
+	require.NotEmpty(t, result.LintViolations, "expected lint violations for TIMESTAMP column")
 
 	var found bool
-	for _, w := range result.LintWarnings {
+	for _, w := range result.LintViolations {
 		if w.Table == "events" && strings.Contains(w.Message, "TIMESTAMP") {
 			found = true
 			assert.NotEmpty(t, w.Linter, "Linter name should be populated")
@@ -326,7 +326,7 @@ func TestEngine_Plan_LintViolationMapping(t *testing.T) {
 			break
 		}
 	}
-	assert.True(t, found, "expected a TIMESTAMP-related lint warning for 'events' table, got: %v", result.LintWarnings)
+	assert.True(t, found, "expected a TIMESTAMP-related lint warning for 'events' table, got: %v", result.LintViolations)
 }
 
 func TestEngine_Plan_MissingCredentials(t *testing.T) {

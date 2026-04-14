@@ -487,9 +487,9 @@ func (x *SchemaChange) GetMetadata() map[string]string {
 	return nil
 }
 
-// LintWarning represents a schema linting violation.
+// LintViolation represents a schema linting violation.
 // Violations with severity "error" block apply unless --allow-unsafe is passed.
-type LintWarning struct {
+type LintViolation struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Message       string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
 	Table         string                 `protobuf:"bytes,2,opt,name=table,proto3" json:"table,omitempty"`
@@ -501,20 +501,20 @@ type LintWarning struct {
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *LintWarning) Reset() {
-	*x = LintWarning{}
+func (x *LintViolation) Reset() {
+	*x = LintViolation{}
 	mi := &file_tern_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *LintWarning) String() string {
+func (x *LintViolation) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*LintWarning) ProtoMessage() {}
+func (*LintViolation) ProtoMessage() {}
 
-func (x *LintWarning) ProtoReflect() protoreflect.Message {
+func (x *LintViolation) ProtoReflect() protoreflect.Message {
 	mi := &file_tern_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -526,47 +526,47 @@ func (x *LintWarning) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use LintWarning.ProtoReflect.Descriptor instead.
-func (*LintWarning) Descriptor() ([]byte, []int) {
+// Deprecated: Use LintViolation.ProtoReflect.Descriptor instead.
+func (*LintViolation) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{4}
 }
 
-func (x *LintWarning) GetMessage() string {
+func (x *LintViolation) GetMessage() string {
 	if x != nil {
 		return x.Message
 	}
 	return ""
 }
 
-func (x *LintWarning) GetTable() string {
+func (x *LintViolation) GetTable() string {
 	if x != nil {
 		return x.Table
 	}
 	return ""
 }
 
-func (x *LintWarning) GetColumn() string {
+func (x *LintViolation) GetColumn() string {
 	if x != nil {
 		return x.Column
 	}
 	return ""
 }
 
-func (x *LintWarning) GetLinter() string {
+func (x *LintViolation) GetLinter() string {
 	if x != nil {
 		return x.Linter
 	}
 	return ""
 }
 
-func (x *LintWarning) GetFixType() string {
+func (x *LintViolation) GetFixType() string {
 	if x != nil {
 		return x.FixType
 	}
 	return ""
 }
 
-func (x *LintWarning) GetSeverity() string {
+func (x *LintViolation) GetSeverity() string {
 	if x != nil {
 		return x.Severity
 	}
@@ -574,16 +574,16 @@ func (x *LintWarning) GetSeverity() string {
 }
 
 // PlanResponse contains the generated schema change plan.
-// Lint warnings with severity "error" block apply unless --allow-unsafe.
+// Lint violations with severity "error" block apply unless --allow-unsafe.
 type PlanResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	PlanId        string                 `protobuf:"bytes,1,opt,name=plan_id,json=planId,proto3" json:"plan_id,omitempty"`
-	Engine        Engine                 `protobuf:"varint,2,opt,name=engine,proto3,enum=tern.v1.Engine" json:"engine,omitempty"`
-	Changes       []*SchemaChange        `protobuf:"bytes,3,rep,name=changes,proto3" json:"changes,omitempty"`
-	LintWarnings  []*LintWarning         `protobuf:"bytes,4,rep,name=lint_warnings,json=lintWarnings,proto3" json:"lint_warnings,omitempty"`
-	Errors        []string               `protobuf:"bytes,5,rep,name=errors,proto3" json:"errors,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	PlanId         string                 `protobuf:"bytes,1,opt,name=plan_id,json=planId,proto3" json:"plan_id,omitempty"`
+	Engine         Engine                 `protobuf:"varint,2,opt,name=engine,proto3,enum=tern.v1.Engine" json:"engine,omitempty"`
+	Changes        []*SchemaChange        `protobuf:"bytes,3,rep,name=changes,proto3" json:"changes,omitempty"`
+	LintViolations []*LintViolation       `protobuf:"bytes,4,rep,name=lint_violations,json=lintViolations,proto3" json:"lint_violations,omitempty"`
+	Errors         []string               `protobuf:"bytes,5,rep,name=errors,proto3" json:"errors,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *PlanResponse) Reset() {
@@ -637,9 +637,9 @@ func (x *PlanResponse) GetChanges() []*SchemaChange {
 	return nil
 }
 
-func (x *PlanResponse) GetLintWarnings() []*LintWarning {
+func (x *PlanResponse) GetLintViolations() []*LintViolation {
 	if x != nil {
-		return x.LintWarnings
+		return x.LintViolations
 	}
 	return nil
 }
@@ -2189,19 +2189,19 @@ const file_tern_proto_rawDesc = "" +
 	"\bmetadata\x18\x03 \x03(\v2#.tern.v1.SchemaChange.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa4\x01\n" +
-	"\vLintWarning\x12\x18\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa6\x01\n" +
+	"\rLintViolation\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage\x12\x14\n" +
 	"\x05table\x18\x02 \x01(\tR\x05table\x12\x16\n" +
 	"\x06column\x18\x03 \x01(\tR\x06column\x12\x16\n" +
 	"\x06linter\x18\x04 \x01(\tR\x06linter\x12\x19\n" +
 	"\bfix_type\x18\x05 \x01(\tR\afixType\x12\x1a\n" +
-	"\bseverity\x18\x06 \x01(\tR\bseverity\"\xd4\x01\n" +
+	"\bseverity\x18\x06 \x01(\tR\bseverity\"\xda\x01\n" +
 	"\fPlanResponse\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12'\n" +
 	"\x06engine\x18\x02 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +
-	"\achanges\x18\x03 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x129\n" +
-	"\rlint_warnings\x18\x04 \x03(\v2\x14.tern.v1.LintWarningR\flintWarnings\x12\x16\n" +
+	"\achanges\x18\x03 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x12?\n" +
+	"\x0flint_violations\x18\x04 \x03(\v2\x16.tern.v1.LintViolationR\x0elintViolations\x12\x16\n" +
 	"\x06errors\x18\x05 \x03(\tR\x06errors\"\xe3\x03\n" +
 	"\fApplyRequest\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12<\n" +
@@ -2393,7 +2393,7 @@ var file_tern_proto_goTypes = []any{
 	(*PlanRequest)(nil),        // 4: tern.v1.PlanRequest
 	(*TableChange)(nil),        // 5: tern.v1.TableChange
 	(*SchemaChange)(nil),       // 6: tern.v1.SchemaChange
-	(*LintWarning)(nil),        // 7: tern.v1.LintWarning
+	(*LintViolation)(nil),      // 7: tern.v1.LintViolation
 	(*PlanResponse)(nil),       // 8: tern.v1.PlanResponse
 	(*ApplyRequest)(nil),       // 9: tern.v1.ApplyRequest
 	(*ApplyResponse)(nil),      // 10: tern.v1.ApplyResponse
@@ -2430,7 +2430,7 @@ var file_tern_proto_depIdxs = []int32{
 	31, // 4: tern.v1.SchemaChange.metadata:type_name -> tern.v1.SchemaChange.MetadataEntry
 	0,  // 5: tern.v1.PlanResponse.engine:type_name -> tern.v1.Engine
 	6,  // 6: tern.v1.PlanResponse.changes:type_name -> tern.v1.SchemaChange
-	7,  // 7: tern.v1.PlanResponse.lint_warnings:type_name -> tern.v1.LintWarning
+	7,  // 7: tern.v1.PlanResponse.lint_violations:type_name -> tern.v1.LintViolation
 	32, // 8: tern.v1.ApplyRequest.options:type_name -> tern.v1.ApplyRequest.OptionsEntry
 	33, // 9: tern.v1.ApplyRequest.schema_files:type_name -> tern.v1.ApplyRequest.SchemaFilesEntry
 	5,  // 10: tern.v1.ApplyRequest.ddl_changes:type_name -> tern.v1.TableChange

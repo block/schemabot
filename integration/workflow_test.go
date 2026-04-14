@@ -173,10 +173,10 @@ func flatTablesFromPlan(planResp map[string]any) []any {
 	return tables
 }
 
-// hasErrorSeverityWarning checks if any lint_warnings in the plan response
+// hasErrorSeverityWarning checks if any lint_violations in the plan response
 // have severity "error". This replaces the old has_unsafe_changes field.
 func hasErrorSeverityWarning(planResp map[string]any) bool {
-	warnings, ok := planResp["lint_warnings"].([]any)
+	warnings, ok := planResp["lint_violations"].([]any)
 	if !ok {
 		return false
 	}
@@ -654,8 +654,8 @@ CREATE TABLE users (
 		// Verify has error-severity lint warnings (replaces has_unsafe_changes)
 		assert.True(t, hasErrorSeverityWarning(planResp), "expected error-severity lint warning for DROP COLUMN")
 
-		// Verify lint_warnings contains the unsafe warning with error severity
-		warnings, _ := planResp["lint_warnings"].([]any)
+		// Verify lint_violations contains the unsafe warning with error severity
+		warnings, _ := planResp["lint_violations"].([]any)
 		foundUnsafe := false
 		for _, w := range warnings {
 			warning := w.(map[string]any)
@@ -664,7 +664,7 @@ CREATE TABLE users (
 				t.Logf("Found error-severity warning: %v", warning["message"])
 			}
 		}
-		assert.True(t, foundUnsafe, "expected lint_warnings to contain error-severity warning")
+		assert.True(t, foundUnsafe, "expected lint_violations to contain error-severity warning")
 
 		// Verify the table change has is_unsafe=true
 		tables := flatTablesFromPlan(planResp)
@@ -702,8 +702,8 @@ CREATE TABLE users (
 		// Verify has error-severity lint warnings (replaces has_unsafe_changes)
 		assert.True(t, hasErrorSeverityWarning(planResp), "expected error-severity lint warning for DROP TABLE")
 
-		// Verify lint_warnings contains the unsafe warning with error severity
-		warnings, _ := planResp["lint_warnings"].([]any)
+		// Verify lint_violations contains the unsafe warning with error severity
+		warnings, _ := planResp["lint_violations"].([]any)
 		foundUnsafe := false
 		for _, w := range warnings {
 			warning := w.(map[string]any)
@@ -712,7 +712,7 @@ CREATE TABLE users (
 				t.Logf("Found error-severity warning: %v", warning["message"])
 			}
 		}
-		assert.True(t, foundUnsafe, "expected lint_warnings to contain error-severity warning")
+		assert.True(t, foundUnsafe, "expected lint_violations to contain error-severity warning")
 
 		// Verify the table change has is_unsafe=true
 		tables := flatTablesFromPlan(planResp)

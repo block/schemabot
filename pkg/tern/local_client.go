@@ -281,10 +281,10 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		changes = append(changes, protoSC)
 	}
 
-	// Convert lint warnings to proto
-	warnings := make([]*ternv1.LintWarning, len(result.LintWarnings))
-	for i, w := range result.LintWarnings {
-		warnings[i] = &ternv1.LintWarning{
+	// Convert lint violations to proto
+	warnings := make([]*ternv1.LintViolation, len(result.LintViolations))
+	for i, w := range result.LintViolations {
+		warnings[i] = &ternv1.LintViolation{
 			Table:    w.Table,
 			Column:   w.Column,
 			Linter:   w.Linter,
@@ -294,10 +294,10 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	}
 
 	return &ternv1.PlanResponse{
-		PlanId:       result.PlanID,
-		Engine:       ternv1.Engine_ENGINE_SPIRIT,
-		Changes:      changes,
-		LintWarnings: warnings,
+		PlanId:         result.PlanID,
+		Engine:         ternv1.Engine_ENGINE_SPIRIT,
+		Changes:        changes,
+		LintViolations: warnings,
 	}, nil
 }
 

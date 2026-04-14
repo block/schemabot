@@ -325,12 +325,12 @@ func WriteOptions(deferCutover bool) {
 	}
 }
 
-// LintWarning represents a lint warning.
-// LintWarning is a type alias for the shared lint warning type.
-type LintWarning = apitypes.LintWarning
+// LintViolation represents a lint warning.
+// LintViolation is a type alias for the shared lint warning type.
+type LintViolation = apitypes.LintViolation
 
-// WriteLintWarnings writes lint warnings if any.
-func WriteLintWarnings(warnings []LintWarning) {
+// WriteLintViolations writes lint violations if any.
+func WriteLintViolations(warnings []LintViolation) {
 	if len(warnings) == 0 {
 		return
 	}

@@ -8,8 +8,8 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
-// LintWarningData represents a structured lint warning for template rendering.
-type LintWarningData struct {
+// LintViolationData represents a structured lint warning for template rendering.
+type LintViolationData struct {
 	Message    string
 	Table      string
 	LinterName string
@@ -30,9 +30,9 @@ type PlanCommentData struct {
 	RequestedBy string // Empty means auto-generated
 	IsMySQL     bool
 
-	Changes      []KeyspaceChangeData
-	LintWarnings []LintWarningData
-	Errors       []string
+	Changes        []KeyspaceChangeData
+	LintViolations []LintViolationData
+	Errors         []string
 
 	// Unsafe change tracking
 	HasUnsafeChanges bool
@@ -103,9 +103,9 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeUnsafeWarning(&sb, data.UnsafeChanges, data.AllowUnsafe)
 	}
 
-	// Lint warnings
-	if len(data.LintWarnings) > 0 {
-		writeLintWarnings(&sb, data.LintWarnings)
+	// Lint violations
+	if len(data.LintViolations) > 0 {
+		writeLintViolations(&sb, data.LintViolations)
 	}
 
 	// Errors
@@ -301,7 +301,7 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUn
 	sb.WriteString("\n")
 }
 
-func writeLintWarnings(sb *strings.Builder, warnings []LintWarningData) {
+func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	sb.WriteString("\u26a0\ufe0f **Lint Warnings**:\n")
 	for _, w := range warnings {
 		warningText := w.Message
@@ -428,9 +428,9 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, isM
 		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.AllowUnsafe)
 	}
 
-	// Lint warnings
-	if len(plan.LintWarnings) > 0 {
-		writeLintWarnings(sb, plan.LintWarnings)
+	// Lint violations
+	if len(plan.LintViolations) > 0 {
+		writeLintViolations(sb, plan.LintViolations)
 	}
 
 	// Errors

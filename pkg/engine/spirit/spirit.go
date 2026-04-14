@@ -257,7 +257,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}
 
 	// Convert PlannedChanges to engine types
-	var lintWarnings []engine.LintWarning
+	var lintViolations []engine.LintViolation
 	changes := make([]engine.TableChange, 0, len(plan.Changes))
 	for _, pc := range plan.Changes {
 		op, _, err := ddl.ClassifyStatementAST(pc.Statement)
@@ -282,9 +282,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 
 		changes = append(changes, change)
 
-		// Collect lint warnings from all severity levels
+		// Collect lint violations from all severity levels
 		for _, v := range pc.Violations {
-			lintWarnings = append(lintWarnings, engine.LintWarning{
+			lintViolations = append(lintViolations, engine.LintViolation{
 				Table:    pc.TableName,
 				Linter:   v.Linter.Name(),
 				Message:  v.Message,
@@ -322,7 +322,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	return &engine.PlanResult{
 		PlanID:         fmt.Sprintf("plan-%d", time.Now().UnixNano()),
 		Changes:        schemaChanges,
-		LintWarnings:   lintWarnings,
+		LintViolations: lintViolations,
 		OriginalSchema: originalSchema,
 	}, nil
 }

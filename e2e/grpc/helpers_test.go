@@ -105,11 +105,11 @@ func grpcDecodeJSON(t *testing.T, resp *http.Response, v any) {
 // =============================================================================
 
 type grpcPlanResponse struct {
-	PlanID       string             `json:"plan_id"`
-	Engine       string             `json:"engine"`
-	Changes      []grpcSchemaChange `json:"changes"`
-	LintWarnings []grpcLintWarning  `json:"lint_warnings"`
-	Errors       []string           `json:"errors"`
+	PlanID         string              `json:"plan_id"`
+	Engine         string              `json:"engine"`
+	Changes        []grpcSchemaChange  `json:"changes"`
+	LintViolations []grpcLintViolation `json:"lint_violations"`
+	Errors         []string            `json:"errors"`
 }
 
 // FlatTables returns a flat list of all table changes across all namespaces.
@@ -121,7 +121,7 @@ func (r grpcPlanResponse) FlatTables() []grpcTableChange {
 	return tables
 }
 
-type grpcLintWarning struct {
+type grpcLintViolation struct {
 	Message  string `json:"message"`
 	Table    string `json:"table"`
 	Severity string `json:"severity"`
