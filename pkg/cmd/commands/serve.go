@@ -97,24 +97,11 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	svc.ConfigureRoutes(mux)
 
 	// Register GitHub webhook handler if GitHub App is configured
-	if serverConfig.GitHub.Configured() {
-		ghPrivateKey, err := serverConfig.GitHub.ResolvePrivateKey()
-		if err != nil {
-			return fmt.Errorf("resolve GitHub private key: %w", err)
-		}
-		ghWebhookSecret, err := serverConfig.GitHub.ResolveWebhookSecret()
-		if err != nil {
-			return fmt.Errorf("resolve GitHub webhook secret: %w", err)
-		}
-		if ghWebhookSecret == "" {
-			return fmt.Errorf("GitHub App is configured but webhook secret is empty — set github.webhook_secret to secure the /webhook endpoint")
-		}
-		appID := serverConfig.GitHub.ResolveAppID()
-		ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger)
-		webhookHandler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger)
-		mux.Handle("POST /webhook", webhookHandler)
-		logger.Info("GitHub webhook endpoint registered", "app_id", appID)
+	webhookHandler, err := buildWebhookHandler(serverConfig, svc, logger)
+	if err != nil {
+		return err
 	}
+	mux.Handle("POST /webhook", webhookHandler)
 
 	// Create server
 	server := &http.Server{
@@ -207,6 +194,37 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 	}()
 
 	return grpcSrv, nil
+}
+
+func buildWebhookHandler(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (http.Handler, error) {
+	if !serverConfig.GitHub.Configured() {
+		if serverConfig.GitHub.PrivateKey != "" {
+			logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled")
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"GitHub App credentials not available — webhook endpoint is disabled"}`)) //nolint:errcheck
+		}), nil
+	}
+
+	ghPrivateKey, err := serverConfig.GitHub.ResolvePrivateKey()
+	if err != nil {
+		return nil, fmt.Errorf("resolve GitHub private key: %w", err)
+	}
+	ghWebhookSecret, err := serverConfig.GitHub.ResolveWebhookSecret()
+	if err != nil {
+		return nil, fmt.Errorf("resolve GitHub webhook secret: %w", err)
+	}
+	if ghWebhookSecret == "" {
+		return nil, fmt.Errorf("GitHub App is configured but webhook secret is empty — set github.webhook_secret to secure the /webhook endpoint")
+	}
+
+	appID := serverConfig.GitHub.ResolveAppID()
+	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger)
+	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger)
+	logger.Info("GitHub webhook endpoint registered", "app_id", appID)
+	return handler, nil
 }
 
 func getEnv(key, defaultValue string) string {
