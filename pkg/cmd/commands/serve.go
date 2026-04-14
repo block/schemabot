@@ -114,8 +114,15 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 		webhookHandler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger)
 		mux.Handle("POST /webhook", webhookHandler)
 		logger.Info("GitHub webhook endpoint registered", "app_id", appID)
-	} else if serverConfig.GitHub.PrivateKey != "" {
-		logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled")
+	} else {
+		if serverConfig.GitHub.PrivateKey != "" {
+			logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled")
+		}
+		mux.Handle("POST /webhook", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error":"GitHub App credentials not available — webhook endpoint is disabled"}`))
+		}))
 	}
 
 	// Create server
