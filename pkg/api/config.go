@@ -59,6 +59,7 @@ type GitHubConfig struct {
 func (g *GitHubConfig) Configured() bool {
 	appID := g.ResolveAppID()
 	if appID == 0 && g.PrivateKey == "" {
+		slog.Info("GitHub App not configured — skipping GitHub setup")
 		return false
 	}
 	if appID == 0 {
