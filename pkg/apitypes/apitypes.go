@@ -78,14 +78,14 @@ type VolumeRequest struct {
 
 // PlanResponse is the HTTP response for POST /api/plan.
 type PlanResponse struct {
-	PlanID       string                  `json:"plan_id"`
-	Database     string                  `json:"database,omitempty"`
-	DatabaseType string                  `json:"database_type,omitempty"`
-	Environment  string                  `json:"environment,omitempty"`
-	Engine       string                  `json:"engine"`
-	Changes      []*SchemaChangeResponse `json:"changes"`
-	LintResults  []*LintWarningResponse  `json:"lint_warnings"`
-	Errors       []string                `json:"errors"`
+	PlanID       string                   `json:"plan_id"`
+	Database     string                   `json:"database,omitempty"`
+	DatabaseType string                   `json:"database_type,omitempty"`
+	Environment  string                   `json:"environment,omitempty"`
+	Engine       string                   `json:"engine"`
+	Changes      []*SchemaChangeResponse  `json:"changes"`
+	LintResults  []*LintViolationResponse `json:"lint_violations"`
+	Errors       []string                 `json:"errors"`
 }
 
 // HasErrors returns true if any lint result has error severity.
@@ -130,23 +130,23 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	return changes
 }
 
-// LintWarning represents a lint warning extracted from a plan response.
-type LintWarning struct {
+// LintViolation represents a lint warning extracted from a plan response.
+type LintViolation struct {
 	Message string
 	Table   string
 	Linter  string
 }
 
-// LintWarnings returns non-error lint results (warning and info severity).
+// LintViolations returns non-error lint results (warning and info severity).
 // Error-severity results represent unsafe/blocking changes and are shown
 // separately via UnsafeChanges().
-func (r *PlanResponse) LintWarnings() []LintWarning {
-	var warnings []LintWarning
+func (r *PlanResponse) LintViolations() []LintViolation {
+	var warnings []LintViolation
 	for _, w := range r.LintResults {
 		if w.Severity == "error" {
 			continue
 		}
-		warnings = append(warnings, LintWarning{
+		warnings = append(warnings, LintViolation{
 			Message: w.Message,
 			Table:   w.Table,
 			Linter:  w.Linter,
@@ -156,13 +156,13 @@ func (r *PlanResponse) LintWarnings() []LintWarning {
 }
 
 // LintErrors returns error-severity lint results (unsafe/blocking changes).
-func (r *PlanResponse) LintErrors() []LintWarning {
-	var warnings []LintWarning
+func (r *PlanResponse) LintErrors() []LintViolation {
+	var warnings []LintViolation
 	for _, w := range r.LintResults {
 		if w.Severity != "error" {
 			continue
 		}
-		warnings = append(warnings, LintWarning{
+		warnings = append(warnings, LintViolation{
 			Message: w.Message,
 			Table:   w.Table,
 			Linter:  w.Linter,
@@ -191,8 +191,8 @@ type TableChangeResponse struct {
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
 func (t *TableChangeResponse) GetTableName() string { return t.TableName }
 
-// LintWarningResponse represents a lint warning in the HTTP response.
-type LintWarningResponse struct {
+// LintViolationResponse represents a lint warning in the HTTP response.
+type LintViolationResponse struct {
 	Message  string `json:"message"`
 	Table    string `json:"table,omitempty"`
 	Column   string `json:"column,omitempty"`

@@ -39,9 +39,9 @@ func TestPlanResponse_UnsafeChanges_None(t *testing.T) {
 	assert.Empty(t, resp.UnsafeChanges())
 }
 
-func TestPlanResponse_LintWarnings(t *testing.T) {
+func TestPlanResponse_LintViolations(t *testing.T) {
 	resp := &PlanResponse{
-		LintResults: []*LintWarningResponse{
+		LintResults: []*LintViolationResponse{
 			{Message: "DROP TABLE", Table: "users", Linter: "unsafe", Severity: "error"},
 			{Message: "invisible index", Table: "items", Linter: "invisible_index_before_drop", Severity: "error"},
 			{Message: "INT PK", Table: "orders", Linter: "primary_key", Severity: "warning"},
@@ -49,7 +49,7 @@ func TestPlanResponse_LintWarnings(t *testing.T) {
 		},
 	}
 
-	warnings := resp.LintWarnings()
+	warnings := resp.LintViolations()
 	require.Len(t, warnings, 2)
 	assert.Equal(t, "primary_key", warnings[0].Linter)
 	assert.Equal(t, "allow_charset", warnings[1].Linter)
@@ -57,7 +57,7 @@ func TestPlanResponse_LintWarnings(t *testing.T) {
 
 func TestPlanResponse_LintErrors(t *testing.T) {
 	resp := &PlanResponse{
-		LintResults: []*LintWarningResponse{
+		LintResults: []*LintViolationResponse{
 			{Message: "DROP TABLE", Table: "users", Linter: "unsafe", Severity: "error"},
 			{Message: "invisible index", Table: "items", Linter: "invisible_index_before_drop", Severity: "error"},
 			{Message: "INT PK", Table: "orders", Linter: "primary_key", Severity: "warning"},
@@ -70,20 +70,20 @@ func TestPlanResponse_LintErrors(t *testing.T) {
 	assert.Equal(t, "invisible_index_before_drop", errors[1].Linter)
 }
 
-func TestPlanResponse_LintWarnings_Empty(t *testing.T) {
+func TestPlanResponse_LintViolations_Empty(t *testing.T) {
 	resp := &PlanResponse{}
-	assert.Empty(t, resp.LintWarnings())
+	assert.Empty(t, resp.LintViolations())
 	assert.Empty(t, resp.LintErrors())
 }
 
 func TestPlanResponse_HasErrors(t *testing.T) {
 	resp := &PlanResponse{
-		LintResults: []*LintWarningResponse{
+		LintResults: []*LintViolationResponse{
 			{Severity: "warning"},
 		},
 	}
 	assert.False(t, resp.HasErrors())
 
-	resp.LintResults = append(resp.LintResults, &LintWarningResponse{Severity: "error"})
+	resp.LintResults = append(resp.LintResults, &LintViolationResponse{Severity: "error"})
 	assert.True(t, resp.HasErrors())
 }

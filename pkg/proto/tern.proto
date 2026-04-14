@@ -264,9 +264,9 @@ message SchemaChange {
   map<string, string> metadata = 3; // Engine-specific data (e.g., "vschema" → diff)
 }
 
-// LintWarning represents a schema linting violation.
+// LintViolation represents a schema linting violation.
 // Violations with severity "error" block apply unless --allow-unsafe is passed.
-message LintWarning {
+message LintViolation {
   string message = 1;
   string table = 2;
   string column = 3;
@@ -276,12 +276,12 @@ message LintWarning {
 }
 
 // PlanResponse contains the generated schema change plan.
-// Lint warnings with severity "error" block apply unless --allow-unsafe.
+// Lint violations with severity "error" block apply unless --allow-unsafe.
 message PlanResponse {
   string plan_id = 1;
   Engine engine = 2;
   repeated SchemaChange changes = 3;
-  repeated LintWarning lint_warnings = 4;
+  repeated LintViolation lint_violations = 4;
   repeated string errors = 5;
 }
 

@@ -257,7 +257,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}
 
 	// Convert PlannedChanges to engine types
-	var lintWarnings []engine.LintWarning
+	var lintViolations []engine.LintViolation
 	changes := make([]engine.TableChange, 0, len(plan.Changes))
 	for _, pc := range plan.Changes {
 		op, _, err := ddl.ClassifyStatementAST(pc.Statement)
@@ -271,34 +271,24 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}
 
 		// Error-severity violations mark the change as unsafe
-		if len(pc.Errors) > 0 {
+		if errViolations := pc.Errors(); len(errViolations) > 0 {
 			change.IsUnsafe = true
-			change.UnsafeReason = strings.Join(pc.Errors, "; ")
+			msgs := make([]string, len(errViolations))
+			for i, v := range errViolations {
+				msgs[i] = v.Message
+			}
+			change.UnsafeReason = strings.Join(msgs, "; ")
 		}
 
 		changes = append(changes, change)
 
-		// Collect lint warnings from all severity levels
-		for _, msg := range pc.Errors {
-			lintWarnings = append(lintWarnings, engine.LintWarning{
+		// Collect lint violations from all severity levels
+		for _, v := range pc.Violations {
+			lintViolations = append(lintViolations, engine.LintViolation{
 				Table:    pc.TableName,
-				Linter:   "unsafe",
-				Message:  msg,
-				Severity: "error",
-			})
-		}
-		for _, msg := range pc.Warnings {
-			lintWarnings = append(lintWarnings, engine.LintWarning{
-				Table:    pc.TableName,
-				Message:  msg,
-				Severity: "warning",
-			})
-		}
-		for _, msg := range pc.Infos {
-			lintWarnings = append(lintWarnings, engine.LintWarning{
-				Table:    pc.TableName,
-				Message:  msg,
-				Severity: "info",
+				Linter:   v.Linter.Name(),
+				Message:  v.Message,
+				Severity: strings.ToLower(v.Severity.String()),
 			})
 		}
 	}
@@ -332,7 +322,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	return &engine.PlanResult{
 		PlanID:         fmt.Sprintf("plan-%d", time.Now().UnixNano()),
 		Changes:        schemaChanges,
-		LintWarnings:   lintWarnings,
+		LintViolations: lintViolations,
 		OriginalSchema: originalSchema,
 	}, nil
 }

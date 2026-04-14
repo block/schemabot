@@ -16,7 +16,7 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 		PlanID:      resp.PlanId,
 		Engine:      engineName(resp.Engine),
 		Changes:     []*apitypes.SchemaChangeResponse{},
-		LintResults: []*apitypes.LintWarningResponse{},
+		LintResults: []*apitypes.LintViolationResponse{},
 		Errors:      []string{},
 	}
 
@@ -42,8 +42,8 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 		httpResp.Changes = append(httpResp.Changes, apiSC)
 	}
 
-	for _, w := range resp.LintWarnings {
-		httpResp.LintResults = append(httpResp.LintResults, &apitypes.LintWarningResponse{
+	for _, w := range resp.LintViolations {
+		httpResp.LintResults = append(httpResp.LintResults, &apitypes.LintViolationResponse{
 			Message:  w.Message,
 			Table:    w.Table,
 			Column:   w.Column,

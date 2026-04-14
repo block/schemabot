@@ -69,7 +69,7 @@ func TestRenderRollbackPlanComment_Vitess(t *testing.T) {
 	assert.Contains(t, rendered, "schemabot rollback-confirm -e staging")
 }
 
-func TestRenderRollbackPlanComment_WithLintWarnings(t *testing.T) {
+func TestRenderRollbackPlanComment_WithLintViolations(t *testing.T) {
 	data := PlanCommentData{
 		Database:    "testapp",
 		Environment: "staging",
@@ -81,7 +81,7 @@ func TestRenderRollbackPlanComment_WithLintWarnings(t *testing.T) {
 				Statements: []string{"ALTER TABLE `users` DROP INDEX `idx_email`"},
 			},
 		},
-		LintWarnings: []LintWarningData{
+		LintViolations: []LintViolationData{
 			{Message: "Dropping index may impact queries", Table: "users"},
 		},
 	}

@@ -103,7 +103,7 @@ type PlanResult struct {
 
 	// Lint results from schema analysis. Violations with Severity "error" block
 	// apply unless overridden with --allow-unsafe.
-	LintWarnings []LintWarning
+	LintViolations []LintViolation
 
 	// OriginalSchema contains the DB schema state at plan time (before applying).
 	// Maps table name -> CREATE TABLE statement.
@@ -114,7 +114,7 @@ type PlanResult struct {
 // HasErrors returns true if any lint warning has error severity.
 // Error-severity violations block apply unless overridden with --allow-unsafe.
 func (r *PlanResult) HasErrors() bool {
-	for _, w := range r.LintWarnings {
+	for _, w := range r.LintViolations {
 		if w.Severity == "error" {
 			return true
 		}
@@ -122,10 +122,10 @@ func (r *PlanResult) HasErrors() bool {
 	return false
 }
 
-// Errors returns only the error-severity lint warnings (blocking violations).
-func (r *PlanResult) Errors() []LintWarning {
-	var errors []LintWarning
-	for _, w := range r.LintWarnings {
+// Errors returns only the error-severity lint violations (blocking violations).
+func (r *PlanResult) Errors() []LintViolation {
+	var errors []LintViolation
+	for _, w := range r.LintViolations {
 		if w.Severity == "error" {
 			errors = append(errors, w)
 		}
@@ -133,10 +133,10 @@ func (r *PlanResult) Errors() []LintWarning {
 	return errors
 }
 
-// Warnings returns only the non-error lint warnings (warning + info severity).
-func (r *PlanResult) Warnings() []LintWarning {
-	var warnings []LintWarning
-	for _, w := range r.LintWarnings {
+// Warnings returns only the non-error lint violations (warning + info severity).
+func (r *PlanResult) Warnings() []LintViolation {
+	var warnings []LintViolation
+	for _, w := range r.LintViolations {
 		if w.Severity != "error" {
 			warnings = append(warnings, w)
 		}
@@ -171,8 +171,8 @@ type SchemaChange struct {
 	Metadata     map[string]string // Engine-specific data (e.g., "vschema" → diff string for Vitess)
 }
 
-// LintWarning represents a lint finding from schema analysis.
-type LintWarning struct {
+// LintViolation represents a lint finding from schema analysis.
+type LintViolation struct {
 	Table    string // Table name affected
 	Column   string // Column name if applicable
 	Linter   string // Name of the linter (e.g., "unsafe", "primary_key")

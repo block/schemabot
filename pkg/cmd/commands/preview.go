@@ -62,7 +62,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	case templates.PreviewStatusList, templates.PreviewStatusHistory:
 		templates.PreviewCLIOutput(previewType)
 	// Lint and unsafe types
-	case templates.PreviewLintWarnings, templates.PreviewUnsafeBlocked,
+	case templates.PreviewLintViolations, templates.PreviewUnsafeBlocked,
 		templates.PreviewUnsafeAllowed, templates.PreviewLintAll:
 		templates.PreviewCLIOutput(previewType)
 	// Comment template types
@@ -180,7 +180,7 @@ Status:
   status_history        Database apply history
 
 Lint and Unsafe:
-  lint_warnings         Lint warnings output
+  lint_violations         Lint violations output
   unsafe_blocked        Unsafe changes blocked (need --allow-unsafe)
   unsafe_allowed        Unsafe changes with --allow-unsafe enabled
   lint_all              Show all lint/unsafe previews
@@ -196,11 +196,11 @@ Log Output Mode (-o log):
   log_all               Show all log output previews
 
 Comment Templates (GitHub PR comments):
-  comment_plan                  Plan comment with DDL changes + lint warnings
+  comment_plan                  Plan comment with DDL changes + lint violations
   comment_plan_empty            Plan comment with no changes
   comment_multi_env             Multi-env plan (identical plans, deduplicated)
   comment_multi_env_diff        Multi-env plan (different plans per environment)
-  comment_multi_env_lint        Multi-env plan with lint warnings
+  comment_multi_env_lint        Multi-env plan with lint violations
   comment_help                  Help command reference comment
   comment_errors                All error comment templates
   comment_unsafe_blocked        Unsafe changes blocked (no --allow-unsafe)

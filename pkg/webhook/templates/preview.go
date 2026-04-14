@@ -13,7 +13,7 @@ const (
 	PreviewErrorMiddleFailed = "lock wait timeout exceeded; try restarting transaction"
 )
 
-// PreviewCommentPlan renders a sample plan comment with DDL changes and lint warnings.
+// PreviewCommentPlan renders a sample plan comment with DDL changes and lint violations.
 func PreviewCommentPlan() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:    "testapp",
@@ -31,7 +31,7 @@ func PreviewCommentPlan() string {
 				},
 			},
 		},
-		LintWarnings: []LintWarningData{
+		LintViolations: []LintViolationData{
 			{Message: "New column uses floating-point data type", Table: "orders", LinterName: "has_float"},
 			{Message: "Column added without DEFAULT value", Table: "users", LinterName: "no_default"},
 		},
@@ -466,10 +466,10 @@ func PreviewCommentMultiEnvPlan() string {
 }
 
 // PreviewCommentMultiEnvPlanLint renders a sample multi-environment plan comment
-// with lint warnings included in each environment's plan.
+// with lint violations included in each environment's plan.
 func PreviewCommentMultiEnvPlanLint() string {
 	changes := samplePlanChanges()
-	lintWarnings := []LintWarningData{
+	lintViolations := []LintViolationData{
 		{Message: "Primary key uses signed integer type (should be UNSIGNED)", Table: "orders", LinterName: "primary_key"},
 		{Message: "Column uses utf8 charset (should be utf8mb4)", Table: "users", LinterName: "allow_charset"},
 	}
@@ -480,8 +480,8 @@ func PreviewCommentMultiEnvPlanLint() string {
 		RequestedBy:  "",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
-			"staging":    {Database: "testapp", Environment: "staging", IsMySQL: true, Changes: changes, LintWarnings: lintWarnings},
-			"production": {Database: "testapp", Environment: "production", IsMySQL: true, Changes: changes, LintWarnings: lintWarnings},
+			"staging":    {Database: "testapp", Environment: "staging", IsMySQL: true, Changes: changes, LintViolations: lintViolations},
+			"production": {Database: "testapp", Environment: "production", IsMySQL: true, Changes: changes, LintViolations: lintViolations},
 		},
 		Errors: map[string]string{},
 	})

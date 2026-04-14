@@ -51,7 +51,7 @@ func TestDeployRequestDiffCreateTable(t *testing.T) {
 	branchName := createBranchWithDDL(t, ctx, "diff-ct",
 		map[string][]string{
 			"testapp_sharded": {
-				"CREATE TABLE diff_new_table (id bigint NOT NULL PRIMARY KEY, value varchar(255), created_at timestamp DEFAULT CURRENT_TIMESTAMP)",
+				"CREATE TABLE diff_new_table (id bigint NOT NULL PRIMARY KEY, value varchar(255), created_at datetime DEFAULT CURRENT_TIMESTAMP)",
 			},
 		},
 		nil,

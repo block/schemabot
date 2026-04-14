@@ -3494,7 +3494,7 @@ Tables are being renamed atomically...
 
 ```
 
-Lint warnings: Non-blocking warnings during plan/apply
+Lint violations: Non-blocking warnings during plan/apply
 
 ⚠️  Lint Warnings:
   - [orders] has_float: New column uses floating-point data type

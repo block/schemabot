@@ -159,8 +159,8 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		commentData.Changes = append(commentData.Changes, nsData)
 	}
 
-	for _, w := range planResp.LintWarnings() {
-		commentData.LintWarnings = append(commentData.LintWarnings, templates.LintWarningData{
+	for _, w := range planResp.LintViolations() {
+		commentData.LintViolations = append(commentData.LintViolations, templates.LintViolationData{
 			Message: w.Message,
 			Table:   w.Table,
 		})

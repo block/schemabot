@@ -806,7 +806,7 @@ func TestE2EAutoPlan(t *testing.T) {
 	}
 }
 
-func TestE2EAutoPlanWithLintWarnings(t *testing.T) {
+func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	dbName := "webhook_autoplan_lint"
 	svc := setupE2EService(t, dbName)
 
@@ -844,15 +844,15 @@ func TestE2EAutoPlanWithLintWarnings(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
-	// Wait for the plan comment — should include lint warnings from LintSchema
+	// Wait for the plan comment — should include lint violations from LintSchema
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Schema Change Plan")
 		assert.Contains(t, body, "CREATE TABLE")
-		assert.Contains(t, body, "Lint Warnings", "plan comment should include lint warnings section")
+		assert.Contains(t, body, "Lint Warnings", "plan comment should include lint violations section")
 		assert.Contains(t, body, "bad_table", "lint warning should reference the table name")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for auto-plan comment with lint warnings")
+		t.Fatal("timed out waiting for auto-plan comment with lint violations")
 	}
 
 	// Verify check run was created

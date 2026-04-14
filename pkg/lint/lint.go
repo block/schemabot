@@ -223,11 +223,11 @@ func (l *Linter) convertViolation(v spiritlint.Violation) Result {
 	}
 }
 
-// ToEngineWarnings converts lint Results to engine.LintWarning format.
-func ToEngineWarnings(results []Result) []engine.LintWarning {
-	warnings := make([]engine.LintWarning, len(results))
+// ToEngineWarnings converts lint Results to engine.LintViolation format.
+func ToEngineWarnings(results []Result) []engine.LintViolation {
+	warnings := make([]engine.LintViolation, len(results))
 	for i, r := range results {
-		warnings[i] = engine.LintWarning{
+		warnings[i] = engine.LintViolation{
 			Table:    r.Table,
 			Column:   r.Column,
 			Linter:   r.Linter,

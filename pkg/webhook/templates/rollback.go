@@ -37,9 +37,9 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	// Unsafe warning — rollback typically produces DROP operations
 	sb.WriteString("> **Warning**: Rollback may include destructive changes (e.g., DROP INDEX, DROP COLUMN). These will be applied automatically.\n\n")
 
-	// Lint warnings
-	if len(data.LintWarnings) > 0 {
-		writeLintWarnings(&sb, data.LintWarnings)
+	// Lint violations
+	if len(data.LintViolations) > 0 {
+		writeLintViolations(&sb, data.LintViolations)
 	}
 
 	// Errors

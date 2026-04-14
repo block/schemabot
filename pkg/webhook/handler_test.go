@@ -404,11 +404,11 @@ func TestWebhookPREditIgnored(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "action ignored")
 }
 
-func TestWebhookPlanWithLintWarnings(t *testing.T) {
-	// Verify that lint warnings from LintSchema are rendered in the plan comment.
+func TestWebhookPlanWithLintViolations(t *testing.T) {
+	// Verify that lint violations from LintSchema are rendered in the plan comment.
 	// This tests the template rendering path that the handler uses when posting
 	// plan comments — both single-env and multi-env.
-	t.Run("single env plan with lint warnings", func(t *testing.T) {
+	t.Run("single env plan with lint violations", func(t *testing.T) {
 		data := templates.PlanCommentData{
 			Database:    "testapp",
 			Environment: "staging",
@@ -422,7 +422,7 @@ func TestWebhookPlanWithLintWarnings(t *testing.T) {
 					},
 				},
 			},
-			LintWarnings: []templates.LintWarningData{
+			LintViolations: []templates.LintViolationData{
 				{Message: "Primary key uses signed integer type", Table: "bad_table", LinterName: "primary_key"},
 				{Message: "Column uses utf8 charset", Table: "users", LinterName: "allow_charset"},
 			},
@@ -435,7 +435,7 @@ func TestWebhookPlanWithLintWarnings(t *testing.T) {
 		assert.Contains(t, rendered, "CREATE TABLE")
 	})
 
-	t.Run("multi env plan with lint warnings", func(t *testing.T) {
+	t.Run("multi env plan with lint violations", func(t *testing.T) {
 		changes := []templates.KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -444,7 +444,7 @@ func TestWebhookPlanWithLintWarnings(t *testing.T) {
 				},
 			},
 		}
-		lintWarnings := []templates.LintWarningData{
+		lintViolations := []templates.LintViolationData{
 			{Message: "Primary key uses signed integer type", Table: "bad_table", LinterName: "primary_key"},
 		}
 
@@ -454,8 +454,8 @@ func TestWebhookPlanWithLintWarnings(t *testing.T) {
 			RequestedBy:  "testuser",
 			Environments: []string{"staging", "production"},
 			Plans: map[string]*templates.PlanCommentData{
-				"staging":    {Database: "testapp", Environment: "staging", IsMySQL: true, Changes: changes, LintWarnings: lintWarnings},
-				"production": {Database: "testapp", Environment: "production", IsMySQL: true, Changes: changes, LintWarnings: lintWarnings},
+				"staging":    {Database: "testapp", Environment: "staging", IsMySQL: true, Changes: changes, LintViolations: lintViolations},
+				"production": {Database: "testapp", Environment: "production", IsMySQL: true, Changes: changes, LintViolations: lintViolations},
 			},
 			Errors: map[string]string{},
 		}

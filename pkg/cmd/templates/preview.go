@@ -87,10 +87,10 @@ const (
 	PreviewStatusHistory PreviewType = "status_history" // Database apply history
 
 	// Lint and unsafe previews
-	PreviewLintWarnings  PreviewType = "lint_warnings"  // Lint warnings output
-	PreviewUnsafeBlocked PreviewType = "unsafe_blocked" // Unsafe changes blocked
-	PreviewUnsafeAllowed PreviewType = "unsafe_allowed" // Unsafe changes with --allow-unsafe
-	PreviewLintAll       PreviewType = "lint_all"       // All lint/unsafe previews
+	PreviewLintViolations PreviewType = "lint_violations" // Lint violations output
+	PreviewUnsafeBlocked  PreviewType = "unsafe_blocked"  // Unsafe changes blocked
+	PreviewUnsafeAllowed  PreviewType = "unsafe_allowed"  // Unsafe changes with --allow-unsafe
+	PreviewLintAll        PreviewType = "lint_all"        // All lint/unsafe previews
 
 	// Log output mode previews (-o log)
 	PreviewLogSmall    PreviewType = "log_small"    // Small/instant tables (start + complete only)
@@ -103,11 +103,11 @@ const (
 	PreviewLogDetailed PreviewType = "log_detailed" // Detailed with task_id and all fields
 
 	// Comment template previews (GitHub PR comments)
-	PreviewCommentPlan                PreviewType = "comment_plan"                  // Plan comment with DDL changes + lint warnings
+	PreviewCommentPlan                PreviewType = "comment_plan"                  // Plan comment with DDL changes + lint violations
 	PreviewCommentPlanEmpty           PreviewType = "comment_plan_empty"            // Plan comment with no changes
 	PreviewCommentMultiEnv            PreviewType = "comment_multi_env"             // Multi-env plan (identical, deduplicated)
 	PreviewCommentMultiEnvDiff        PreviewType = "comment_multi_env_diff"        // Multi-env plan (different per env)
-	PreviewCommentMultiEnvLint        PreviewType = "comment_multi_env_lint"        // Multi-env plan with lint warnings
+	PreviewCommentMultiEnvLint        PreviewType = "comment_multi_env_lint"        // Multi-env plan with lint violations
 	PreviewCommentVitessPlan          PreviewType = "comment_vitess_plan"           // Vitess plan with keyspaces + VSchema
 	PreviewCommentVitessApplyPlan     PreviewType = "comment_vitess_apply_plan"     // Locked Vitess apply-plan with options
 	PreviewCommentMySQLMultiSchema    PreviewType = "comment_mysql_multi_schema"    // MySQL plan with multiple schema names
@@ -237,8 +237,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewStatusListOutput()
 	case PreviewStatusHistory:
 		previewStatusHistoryOutput()
-	case PreviewLintWarnings:
-		previewLintWarningsOutput()
+	case PreviewLintViolations:
+		previewLintViolationsOutput()
 	case PreviewUnsafeBlocked:
 		previewUnsafeBlockedOutput()
 	case PreviewUnsafeAllowed:
@@ -459,9 +459,9 @@ func samplePlanChanges() []DDLChange {
 	}
 }
 
-// samplePlanLintWarnings returns reusable lint warnings for plan preview functions.
-func samplePlanLintWarnings() []LintWarning {
-	return []LintWarning{
+// samplePlanLintViolations returns reusable lint violations for plan preview functions.
+func samplePlanLintViolations() []LintViolation {
+	return []LintViolation{
 		{Message: "has_float: New column uses floating-point data type", Table: "orders", Linter: "has_float"},
 		{Message: "no_default: Column added without DEFAULT value", Table: "users", Linter: "no_default"},
 	}
@@ -477,7 +477,7 @@ func previewPlanOutput() {
 
 	changes := samplePlanChanges()
 	WriteSQLChanges(changes)
-	WriteLintWarnings(samplePlanLintWarnings())
+	WriteLintViolations(samplePlanLintViolations())
 	WritePlanSummary(changes)
 	WriteOptions(true) // Show defer cutover option
 }
@@ -566,7 +566,7 @@ func previewMultiEnvPlanDiffOutput() {
 }
 
 func previewMultiEnvPlanLintOutput() {
-	// Multi-env identical with lint warnings
+	// Multi-env identical with lint violations
 	WritePlanHeader(PlanHeaderData{
 		Database:   "testapp",
 		SchemaName: "testapp",
@@ -574,7 +574,7 @@ func previewMultiEnvPlanLintOutput() {
 	})
 	changes := samplePlanChanges()
 	WriteSQLChanges(changes)
-	WriteLintWarnings(samplePlanLintWarnings())
+	WriteLintViolations(samplePlanLintViolations())
 	WritePlanSummary(changes)
 }
 
@@ -782,15 +782,15 @@ func previewStatusHistoryOutput() {
 // Lint and Unsafe Previews
 // =============================================================================
 
-func previewLintWarningsOutput() {
-	fmt.Println("Lint warnings: Non-blocking warnings during plan/apply")
+func previewLintViolationsOutput() {
+	fmt.Println("Lint violations: Non-blocking warnings during plan/apply")
 	fmt.Println()
 
-	warnings := []LintWarning{
+	warnings := []LintViolation{
 		{Message: "has_float: New column uses floating-point data type", Table: "orders", Linter: "has_float"},
 		{Message: "no_default: Column added without DEFAULT value", Table: "users", Linter: "no_default"},
 	}
-	WriteLintWarnings(warnings)
+	WriteLintViolations(warnings)
 }
 
 func previewUnsafeBlockedOutput() {
@@ -821,7 +821,7 @@ func previewLintAllOutput() {
 		name string
 		fn   func()
 	}{
-		{"LINT WARNINGS", previewLintWarningsOutput},
+		{"LINT WARNINGS", previewLintViolationsOutput},
 		{"UNSAFE CHANGES BLOCKED", previewUnsafeBlockedOutput},
 		{"UNSAFE CHANGES ALLOWED", previewUnsafeAllowedOutput},
 	}

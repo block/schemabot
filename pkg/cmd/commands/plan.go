@@ -183,10 +183,10 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteUnsafeChangesWarning(unsafeChanges)
 	}
 
-	// Show non-unsafe lint warnings with ⚠️
-	lintWarnings := result.LintWarnings()
-	if len(lintWarnings) > 0 {
-		templates.WriteLintWarnings(lintWarnings)
+	// Show non-unsafe lint violations with ⚠️
+	lintViolations := result.LintViolations()
+	if len(lintViolations) > 0 {
+		templates.WriteLintViolations(lintViolations)
 	}
 
 	// Write summary line at the end
