@@ -271,34 +271,24 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}
 
 		// Error-severity violations mark the change as unsafe
-		if len(pc.Errors) > 0 {
+		if errors := pc.Errors(); len(errors) > 0 {
 			change.IsUnsafe = true
-			change.UnsafeReason = strings.Join(pc.Errors, "; ")
+			msgs := make([]string, len(errors))
+			for i, v := range errors {
+				msgs[i] = v.Message
+			}
+			change.UnsafeReason = strings.Join(msgs, "; ")
 		}
 
 		changes = append(changes, change)
 
 		// Collect lint warnings from all severity levels
-		for _, msg := range pc.Errors {
+		for _, v := range pc.Violations {
 			lintWarnings = append(lintWarnings, engine.LintWarning{
 				Table:    pc.TableName,
-				Linter:   "unsafe",
-				Message:  msg,
-				Severity: "error",
-			})
-		}
-		for _, msg := range pc.Warnings {
-			lintWarnings = append(lintWarnings, engine.LintWarning{
-				Table:    pc.TableName,
-				Message:  msg,
-				Severity: "warning",
-			})
-		}
-		for _, msg := range pc.Infos {
-			lintWarnings = append(lintWarnings, engine.LintWarning{
-				Table:    pc.TableName,
-				Message:  msg,
-				Severity: "info",
+				Linter:   v.Linter.Name(),
+				Message:  v.Message,
+				Severity: strings.ToLower(v.Severity.String()),
 			})
 		}
 	}
