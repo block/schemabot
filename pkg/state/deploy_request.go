@@ -21,7 +21,9 @@ var DeployRequest = struct {
 	InProgressRevertVSchema string
 	CompleteRevert          string
 	CompleteRevertError     string
+	Cancelled               string
 	Error                   string
+	Failed                  string
 }{
 	Pending:                 "pending",
 	Ready:                   "ready",
@@ -41,5 +43,7 @@ var DeployRequest = struct {
 	InProgressRevertVSchema: "in_progress_revert_vschema",
 	CompleteRevert:          "complete_revert",
 	CompleteRevertError:     "complete_revert_error",
+	Cancelled:               "cancelled",
 	Error:                   "error",
+	Failed:                  "failed",
 }

@@ -81,8 +81,12 @@ type Credentials struct {
 	TokenValue   string // Service token value
 	MainBranch   string // Main branch name (default: "main")
 
-	// Connection DSN (for vtgate or mysql)
+	// DSN is the primary connection endpoint (vtgate MySQL DSN, direct MySQL DSN, etc.)
 	DSN string
+
+	// Metadata holds engine-specific key-value pairs. Examples:
+	//   "tls_name" — registered MySQL TLS config name for branch connections
+	Metadata map[string]string
 }
 
 // PlanRequest contains the input for computing a schema change plan.
@@ -202,6 +206,13 @@ type ApplyRequest struct {
 	Options     map[string]string  // Options like "defer_cutover", "enable_revert"
 	ResumeState *ResumeState       // Migration context (fresh) or full resume state (restart)
 	Credentials *Credentials       // Resolved credentials (from discovery)
+
+	// OnStateChange is called by the engine to persist ResumeState at key milestones
+	// during Apply (e.g., after branch creation, after deploy request creation).
+	// This enables crash recovery: if the worker dies mid-Apply, the tern layer can
+	// resume from the last persisted state instead of starting over.
+	// Nil means no persistence (state is only returned at the end of Apply).
+	OnStateChange func(state *ResumeState)
 }
 
 // FlatDDL returns all DDL statements across all namespaces in the apply request.
@@ -309,10 +320,24 @@ type ControlResult struct {
 	ResumeState *ResumeState
 }
 
-// VolumeRequest adjusts the schema change speed.
+// VolumeRequest adjusts the schema change speed. Volume is a 1-11 scale where
+// 1 = maximum throttle (least production impact) and 11 = no throttle (fastest).
+//
+// The same volume number has different effects per engine:
+//   - Spirit: controls thread count (1-16+) and chunk timing. Higher volume =
+//     more parallel copy threads = faster but more load. State is in-process
+//     and lost on worker crash (restarts with defaults).
+//   - PlanetScale/Vitess: controls a server-side rejection throttle ratio
+//     (0.0-0.95). Online DDL runs on a single thread per shard; the throttle
+//     ratio determines what fraction of write requests are rejected to limit
+//     replication lag impact. State is server-side and survives worker crashes.
+//
+// The scale provides a consistent user interface across engines, but the
+// underlying mechanisms are fundamentally different (concurrency control
+// vs rejection-based throttling).
 type VolumeRequest struct {
 	Database    string       // Target database (engines track by database)
-	Volume      int32        // 1-11
+	Volume      int32        // 1 (max throttle) to 11 (no throttle)
 	ResumeState *ResumeState // State for querying progress
 	Credentials *Credentials // Resolved credentials (from discovery)
 }
