@@ -514,9 +514,9 @@ resource "aws_secretsmanager_secret" "github_app" {
 resource "aws_secretsmanager_secret_version" "github_app" {
   secret_id = aws_secretsmanager_secret.github_app.id
   secret_string = jsonencode({
-    app_id         = "0"
-    private_key    = ""
-    webhook_secret = ""
+    "app-id"         = "0"
+    "private-key"    = ""
+    "webhook-secret" = ""
   })
 
   # Credentials are managed by setup-github-app.sh via AWS CLI, not Terraform
@@ -848,9 +848,9 @@ output "config_yaml" {
       dsn: "secretsmanager:${aws_secretsmanager_secret.storage_dsn.name}#dsn"
 
     github:
-      app_id: "secretsmanager:${aws_secretsmanager_secret.github_app.name}#app_id"
-      private_key: "secretsmanager:${aws_secretsmanager_secret.github_app.name}#private_key"
-      webhook_secret: "secretsmanager:${aws_secretsmanager_secret.github_app.name}#webhook_secret"
+      app-id: "secretsmanager:${aws_secretsmanager_secret.github_app.name}#app-id"
+      private-key: "secretsmanager:${aws_secretsmanager_secret.github_app.name}#private-key"
+      webhook-secret: "secretsmanager:${aws_secretsmanager_secret.github_app.name}#webhook-secret"
 
     databases:
       testapp:

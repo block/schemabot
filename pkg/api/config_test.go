@@ -197,6 +197,32 @@ repos:
 	assert.Error(t, err, "expected error for invalid config")
 }
 
+func TestGitHubConfig_YAMLKeys(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root:pass@tcp(localhost:3306)/testapp"
+github:
+  app-id: "123456"
+  private-key: "my-private-key"
+  webhook-secret: "my-webhook-secret"
+`
+	err := os.WriteFile(configPath, []byte(content), 0644)
+	require.NoError(t, err)
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+
+	assert.Equal(t, "123456", cfg.GitHub.AppID)
+	assert.Equal(t, "my-private-key", cfg.GitHub.PrivateKey)
+	assert.Equal(t, "my-webhook-secret", cfg.GitHub.WebhookSecret)
+}
+
 func TestGitHubConfig_Configured(t *testing.T) {
 	t.Run("not configured when empty", func(t *testing.T) {
 		g := GitHubConfig{}
