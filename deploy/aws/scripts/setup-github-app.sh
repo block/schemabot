@@ -14,8 +14,8 @@ GITHUB_APP_SECRET_ID="${GITHUB_APP_SECRET_ID:-}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --profile)    AWS_PROFILE="$2"; shift 2 ;;
-        --secret-id)  GITHUB_APP_SECRET_ID="$2"; shift 2 ;;
+        --profile)    AWS_PROFILE="${2:?--profile requires a value}"; shift 2 ;;
+        --secret-id)  GITHUB_APP_SECRET_ID="${2:?--secret-id requires a value}"; shift 2 ;;
         --deploy)     DEPLOY=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
