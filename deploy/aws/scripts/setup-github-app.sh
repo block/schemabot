@@ -61,7 +61,7 @@ aws secretsmanager put-secret-value \
         --arg id "$APP_ID" \
         --arg pk "$PRIVATE_KEY" \
         --arg ws "$WEBHOOK_SECRET" \
-        '{app_id: $id, private_key: $pk, webhook_secret: $ws}')" \
+        '{"app-id": $id, "private-key": $pk, "webhook-secret": $ws}')" \
     --region "$REGION" \
     --output text > /dev/null
 

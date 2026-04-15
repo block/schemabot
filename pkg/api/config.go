@@ -41,15 +41,15 @@ type GitHubConfig struct {
 	// AppID is the GitHub App's numeric ID.
 	// Supports secret references: env:VAR, file:/path, secretsmanager:name#key.
 	// Falls back to GITHUB_APP_ID environment variable.
-	AppID string `yaml:"app_id"`
+	AppID string `yaml:"app-id"`
 
 	// PrivateKey is the PEM-encoded private key for the GitHub App.
 	// Supports secret references: env:VAR, file:/path, secretsmanager:name#key.
-	PrivateKey string `yaml:"private_key"`
+	PrivateKey string `yaml:"private-key"`
 
 	// WebhookSecret is the HMAC secret for validating webhook signatures.
 	// Supports secret references: env:VAR, file:/path, secretsmanager:name#key.
-	WebhookSecret string `yaml:"webhook_secret"`
+	WebhookSecret string `yaml:"webhook-secret"`
 }
 
 // Configured returns true if the GitHub App is configured (app ID and private key are set).
