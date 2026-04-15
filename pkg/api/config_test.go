@@ -223,6 +223,204 @@ github:
 	assert.Equal(t, "my-webhook-secret", cfg.GitHub.WebhookSecret)
 }
 
+func TestStorageDSN_StructuredFields(t *testing.T) {
+	cfg := &ServerConfig{
+		Storage: StorageConfig{
+			Host:     "myhost.example.com",
+			Port:     "3307",
+			Username: "admin",
+			Password: "s3cret",
+			Database: "schemabot",
+		},
+		TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+	}
+	require.NoError(t, cfg.Validate())
+
+	dsn, err := cfg.StorageDSN()
+	require.NoError(t, err)
+	assert.Equal(t, "admin:s3cret@tcp(myhost.example.com:3307)/schemabot?parseTime=true", dsn)
+}
+
+func TestStorageDSN_StructuredFieldsDefaultPort(t *testing.T) {
+	cfg := &ServerConfig{
+		Storage: StorageConfig{
+			Host:     "myhost.example.com",
+			Username: "admin",
+			Password: "s3cret",
+			Database: "schemabot",
+		},
+		TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+	}
+	require.NoError(t, cfg.Validate())
+
+	dsn, err := cfg.StorageDSN()
+	require.NoError(t, err)
+	assert.Equal(t, "admin:s3cret@tcp(myhost.example.com:3306)/schemabot?parseTime=true", dsn)
+}
+
+func TestStorageDSN_StructuredFieldsWithSecretRefs(t *testing.T) {
+	t.Setenv("TEST_DB_HOST", "resolved-host.example.com")
+	t.Setenv("TEST_DB_PASS", "resolved-pass")
+
+	cfg := &ServerConfig{
+		Storage: StorageConfig{
+			Host:     "env:TEST_DB_HOST",
+			Username: "admin",
+			Password: "env:TEST_DB_PASS",
+			Database: "schemabot",
+		},
+		TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+	}
+	require.NoError(t, cfg.Validate())
+
+	dsn, err := cfg.StorageDSN()
+	require.NoError(t, err)
+	assert.Equal(t, "admin:resolved-pass@tcp(resolved-host.example.com:3306)/schemabot?parseTime=true", dsn)
+}
+
+func TestStorageDSN_DSNTakesPrecedence(t *testing.T) {
+	cfg := &ServerConfig{
+		Storage: StorageConfig{
+			DSN: "root:pass@tcp(localhost:3306)/mydb",
+		},
+		TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+	}
+	require.NoError(t, cfg.Validate())
+
+	dsn, err := cfg.StorageDSN()
+	require.NoError(t, err)
+	assert.Equal(t, "root:pass@tcp(localhost:3306)/mydb", dsn)
+}
+
+func TestStorageDSN_FallbackToEnvVar(t *testing.T) {
+	t.Setenv("MYSQL_DSN", "root:envpass@tcp(envhost:3306)/envdb")
+
+	cfg := &ServerConfig{
+		Storage:         StorageConfig{},
+		TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+	}
+
+	dsn, err := cfg.StorageDSN()
+	require.NoError(t, err)
+	assert.Equal(t, "root:envpass@tcp(envhost:3306)/envdb", dsn)
+}
+
+func TestStorageDSN_NothingConfigured(t *testing.T) {
+	t.Setenv("MYSQL_DSN", "")
+
+	cfg := &ServerConfig{
+		Storage:         StorageConfig{},
+		TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+	}
+
+	dsn, err := cfg.StorageDSN()
+	require.NoError(t, err)
+	assert.Empty(t, dsn)
+}
+
+func TestStorageDSN_StructuredFieldsEmptyPassword(t *testing.T) {
+	cfg := &ServerConfig{
+		Storage: StorageConfig{
+			Host:     "myhost.example.com",
+			Username: "admin",
+			Password: "",
+			Database: "schemabot",
+		},
+		TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+	}
+	require.NoError(t, cfg.Validate())
+
+	dsn, err := cfg.StorageDSN()
+	require.NoError(t, err)
+	assert.Equal(t, "admin@tcp(myhost.example.com:3306)/schemabot?parseTime=true", dsn)
+}
+
+func TestStorageDSN_StructuredFieldsFromYAML(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := `
+storage:
+  host: "db.example.com"
+  port: "3307"
+  username: "schemabot"
+  password: "env:TEST_YAML_PASS"
+  database: "schemabot"
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root:pass@tcp(localhost:3306)/testapp"
+`
+	t.Setenv("TEST_YAML_PASS", "yaml-resolved-pass")
+	err := os.WriteFile(configPath, []byte(content), 0644)
+	require.NoError(t, err)
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+
+	dsn, err := cfg.StorageDSN()
+	require.NoError(t, err)
+	assert.Equal(t, "schemabot:yaml-resolved-pass@tcp(db.example.com:3307)/schemabot?parseTime=true", dsn)
+}
+
+func TestStorageConfig_Validate_MutuallyExclusive(t *testing.T) {
+	cfg := &ServerConfig{
+		Storage: StorageConfig{
+			DSN:  "root:pass@tcp(localhost:3306)/mydb",
+			Host: "localhost",
+		},
+		TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+	}
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not both")
+}
+
+func TestStorageConfig_Validate_RequiredFields(t *testing.T) {
+	t.Run("missing host", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Storage:         StorageConfig{Username: "admin", Database: "db"},
+			TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+		}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "host")
+	})
+
+	t.Run("missing username", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Storage:         StorageConfig{Host: "localhost", Database: "db"},
+			TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+		}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "username")
+	})
+
+	t.Run("missing database", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Storage:         StorageConfig{Host: "localhost", Username: "admin"},
+			TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+		}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "database")
+	})
+
+	t.Run("missing multiple", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Storage:         StorageConfig{Password: "pass"},
+			TernDeployments: TernConfig{"default": {"prod": "localhost:9090"}},
+		}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "host")
+		assert.Contains(t, err.Error(), "username")
+		assert.Contains(t, err.Error(), "database")
+	})
+}
+
 func TestGitHubConfig_Configured(t *testing.T) {
 	t.Run("not configured when empty", func(t *testing.T) {
 		g := GitHubConfig{}

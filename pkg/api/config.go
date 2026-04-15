@@ -4,7 +4,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
+
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
@@ -106,10 +110,36 @@ func (g *GitHubConfig) ResolveWebhookSecret() (string, error) {
 }
 
 // StorageConfig configures SchemaBot's internal storage database.
+// Use either DSN (a complete connection string) or the individual fields
+// (Host, Username, Password, Database, Port) to build the DSN at runtime.
+// The individual fields are useful when credentials come from different
+// sources (e.g., RDS-managed passwords in a separate secret).
+// All fields support secret resolution prefixes (env:, file:, secretsmanager:).
 type StorageConfig struct {
 	// DSN is the MySQL connection string for SchemaBot's internal database.
 	// Can be a direct DSN or a reference (e.g., "env:MYSQL_DSN" to read from env var).
+	// Mutually exclusive with the individual connection fields below.
 	DSN string `yaml:"dsn"`
+
+	// Host is the database hostname or IP address.
+	Host string `yaml:"host"`
+
+	// Port is the database port (default: 3306).
+	Port string `yaml:"port"`
+
+	// Username is the database user.
+	Username string `yaml:"username"`
+
+	// Password is the database password.
+	Password string `yaml:"password"`
+
+	// Database is the database name.
+	Database string `yaml:"database"`
+}
+
+// hasConnectionFields returns true if any individual connection field is set.
+func (s *StorageConfig) hasConnectionFields() bool {
+	return s.Host != "" || s.Port != "" || s.Username != "" || s.Password != "" || s.Database != ""
 }
 
 // DatabaseConfig holds configuration for a registered database.
@@ -174,6 +204,28 @@ func LoadServerConfigFromFile(path string) (*ServerConfig, error) {
 
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
+	// Validate storage config: use either "dsn" or individual connection fields, not both.
+	if c.Storage.DSN != "" && c.Storage.hasConnectionFields() {
+		return fmt.Errorf("storage: set either 'dsn' or individual connection fields (host, username, password, database), not both")
+	}
+	if c.Storage.hasConnectionFields() {
+		required := map[string]string{
+			"host":     c.Storage.Host,
+			"username": c.Storage.Username,
+			"database": c.Storage.Database,
+		}
+		var missing []string
+		for name, val := range required {
+			if val == "" {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			sort.Strings(missing)
+			return fmt.Errorf("storage: required fields missing: %s", strings.Join(missing, ", "))
+		}
+	}
+
 	// Either Databases (local mode) or TernDeployments (gRPC mode) must be configured
 	if len(c.Databases) == 0 && len(c.TernDeployments) == 0 {
 		return fmt.Errorf("either databases or tern_deployments is required")
@@ -253,8 +305,62 @@ func (c *ServerConfig) TernDeployment(repo string) string {
 }
 
 // StorageDSN returns the resolved storage DSN.
-// It handles special prefixes (env:, file:) to read from various sources.
-// Falls back to MYSQL_DSN environment variable if not configured.
+// If DSN is set, it is resolved directly (supports env:, file:, secretsmanager: prefixes).
+// Otherwise, individual connection fields are resolved and assembled into a DSN.
+// Falls back to MYSQL_DSN environment variable when neither DSN nor individual fields are set.
 func (c *ServerConfig) StorageDSN() (string, error) {
-	return secrets.Resolve(c.Storage.DSN, "MYSQL_DSN")
+	if c.Storage.DSN != "" {
+		return secrets.Resolve(c.Storage.DSN, "MYSQL_DSN")
+	}
+
+	// No individual fields set either — fall back to MYSQL_DSN env var.
+	if !c.Storage.hasConnectionFields() {
+		return secrets.Resolve("", "MYSQL_DSN")
+	}
+
+	host, err := secrets.Resolve(c.Storage.Host, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve storage host: %w", err)
+	}
+	if host == "" {
+		return "", fmt.Errorf("storage host resolved to empty")
+	}
+
+	port := DefaultMySQLPort
+	if c.Storage.Port != "" {
+		port, err = secrets.Resolve(c.Storage.Port, "")
+		if err != nil {
+			return "", fmt.Errorf("resolve storage port: %w", err)
+		}
+	}
+
+	username, err := secrets.Resolve(c.Storage.Username, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve storage username: %w", err)
+	}
+	if username == "" {
+		return "", fmt.Errorf("storage username resolved to empty")
+	}
+
+	password, err := secrets.Resolve(c.Storage.Password, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve storage password: %w", err)
+	}
+
+	database, err := secrets.Resolve(c.Storage.Database, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve storage database: %w", err)
+	}
+	if database == "" {
+		return "", fmt.Errorf("storage database resolved to empty")
+	}
+
+	mysqlCfg := mysql.NewConfig()
+	mysqlCfg.User = username
+	mysqlCfg.Passwd = password
+	mysqlCfg.Net = "tcp"
+	mysqlCfg.Addr = host + ":" + port
+	mysqlCfg.DBName = database
+	mysqlCfg.ParseTime = true
+	return mysqlCfg.FormatDSN(), nil
 }

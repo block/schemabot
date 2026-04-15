@@ -60,8 +60,13 @@ type TernConfig map[string]TernEndpoints
 // TernEndpoints maps environment name to gRPC address (host:port).
 type TernEndpoints map[string]string
 
-// DefaultDeployment is the deployment key used for single-deployment deployments.
-const DefaultDeployment = "default"
+const (
+	// DefaultDeployment is the deployment key used for single-deployment deployments.
+	DefaultDeployment = "default"
+
+	// DefaultMySQLPort is the default port for MySQL connections.
+	DefaultMySQLPort = "3306"
+)
 
 // Endpoint returns the Tern endpoint for the given deployment and environment.
 // For single-deployment deployments, use DefaultDeployment ("default") as the deployment.
