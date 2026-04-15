@@ -1467,6 +1467,7 @@ const DefaultVolume int32 = 2
 
 // volumeToThrottleRatio converts volume (1-11) to a PlanetScale throttle ratio.
 // Lower volume = more throttling. DefaultVolume (2) maps to 0.85.
+// See engine.VolumeRequest for how volume semantics differ between engines.
 var volumeThrottleMap = [12]float64{
 	0:  0.95, // unused (volume is 1-indexed)
 	1:  0.95, // max throttle

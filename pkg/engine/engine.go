@@ -320,10 +320,24 @@ type ControlResult struct {
 	ResumeState *ResumeState
 }
 
-// VolumeRequest adjusts the schema change speed.
+// VolumeRequest adjusts the schema change speed. Volume is a 1-11 scale where
+// 1 = maximum throttle (least production impact) and 11 = no throttle (fastest).
+//
+// The same volume number has different effects per engine:
+//   - Spirit: controls thread count (1-16+) and chunk timing. Higher volume =
+//     more parallel copy threads = faster but more load. State is in-process
+//     and lost on worker crash (restarts with defaults).
+//   - PlanetScale/Vitess: controls a server-side rejection throttle ratio
+//     (0.0-0.95). Online DDL runs on a single thread per shard; the throttle
+//     ratio determines what fraction of write requests are rejected to limit
+//     replication lag impact. State is server-side and survives worker crashes.
+//
+// The scale provides a consistent user interface across engines, but the
+// underlying mechanisms are fundamentally different (concurrency control
+// vs rejection-based throttling).
 type VolumeRequest struct {
 	Database    string       // Target database (engines track by database)
-	Volume      int32        // 1-11
+	Volume      int32        // 1 (max throttle) to 11 (no throttle)
 	ResumeState *ResumeState // State for querying progress
 	Credentials *Credentials // Resolved credentials (from discovery)
 }
