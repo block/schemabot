@@ -322,6 +322,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 				Repository:      plan.Repository,
 				PullRequest:     plan.PullRequest,
 				Environment:     req.Environment,
+				Deployment:      deployment,
 				Caller:          req.Caller,
 				InstallationID:  req.InstallationID,
 				ExternalID:      resp.ApplyId,

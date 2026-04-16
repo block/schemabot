@@ -161,7 +161,7 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+appDBName)
 	require.NoError(t, err, "create app database")
 	defer func() {
-		_, _ = targetDB.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+appDBName) //nolint:usetesting // cleanup
+		_, _ = targetDB.ExecContext(context.WithoutCancel(t.Context()), "DROP DATABASE IF EXISTS "+appDBName)
 	}()
 
 	appDSN := strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
@@ -467,4 +467,115 @@ func TestGRPC_TargetInPlanRequest(t *testing.T) {
 	grpcResp, err := grpcClient.Plan(t.Context(), ternReq)
 	require.NoError(t, err, "gRPC Plan with target")
 	assert.NotEmpty(t, grpcResp.PlanId, "gRPC plan with target should return plan_id")
+}
+
+// TestGRPC_Deployment_StoredOnApply verifies that when a plan/apply request
+// includes a deployment field, the deployment is persisted on the apply record.
+func TestGRPC_Deployment_StoredOnApply(t *testing.T) {
+	ctx := t.Context()
+
+	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	require.NoError(t, err, "open target db")
+	defer utils.CloseAndLog(targetDB)
+
+	appDBName := fmt.Sprintf("deploy_%d", time.Now().UnixNano()%100000)
+	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+appDBName)
+	require.NoError(t, err, "create app database")
+	defer func() {
+		_, _ = targetDB.ExecContext(context.WithoutCancel(t.Context()), "DROP DATABASE IF EXISTS "+appDBName)
+	}()
+
+	appDSN := strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	ternGRPCAddr, err := startTernGRPC(ctx, appDSN, ternStorageDSN)
+	require.NoError(t, err, "start tern grpc")
+
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err, "open schemabot db")
+	defer utils.CloseAndLog(schemabotDB)
+	schemabotStorage := schemabotmysql.New(schemabotDB)
+
+	ternClient, err := tern.NewGRPCClient(tern.Config{Address: ternGRPCAddr})
+	require.NoError(t, err, "create tern client")
+	defer utils.CloseAndLog(ternClient)
+
+	// Configure with a named deployment (not "default")
+	serverConfig := &schemabotapi.ServerConfig{
+		TernDeployments: schemabotapi.TernConfig{
+			"us-west": {"staging": ternGRPCAddr},
+		},
+	}
+	svc := schemabotapi.New(schemabotStorage, serverConfig, map[string]tern.Client{
+		"us-west/staging": ternClient,
+	}, logger)
+	defer utils.CloseAndLog(svc)
+
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "localhost:0")
+	require.NoError(t, err, "listen")
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer utils.CloseAndLog(server)
+	schemabotAddr := listener.Addr().String()
+	time.Sleep(50 * time.Millisecond)
+
+	// Plan with explicit deployment
+	schemaSQL := "CREATE TABLE widgets (\n\tid BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,\n\tname VARCHAR(255) NOT NULL\n);"
+	planReq := map[string]any{
+		"database":    appDBName,
+		"environment": "staging",
+		"type":        "mysql",
+		"deployment":  "us-west",
+		"schema_files": map[string]any{
+			"default": map[string]any{
+				"files": map[string]string{"widgets.sql": schemaSQL},
+			},
+		},
+		"repository":   "test/deployment",
+		"pull_request": 1,
+	}
+	planBody, _ := json.Marshal(planReq)
+	planHTTPReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+schemabotAddr+"/api/plan", bytes.NewReader(planBody))
+	planHTTPReq.Header.Set("Content-Type", "application/json")
+	planResp, err := http.DefaultClient.Do(planHTTPReq)
+	require.NoError(t, err, "POST /api/plan")
+	t.Cleanup(func() { utils.CloseAndLog(planResp.Body) })
+	if planResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(planResp.Body)
+		require.Failf(t, "plan failed", "(%d): %s", planResp.StatusCode, body)
+	}
+	var planResult map[string]any
+	require.NoError(t, json.NewDecoder(planResp.Body).Decode(&planResult), "decode plan response")
+	planID, ok := planResult["plan_id"].(string)
+	require.True(t, ok && planID != "", "plan response missing plan_id: %v", planResult)
+
+	// Apply with explicit deployment
+	applyReq := map[string]any{
+		"plan_id":     planID,
+		"environment": "staging",
+		"deployment":  "us-west",
+	}
+	applyBody, _ := json.Marshal(applyReq)
+	applyHTTPReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+schemabotAddr+"/api/apply", bytes.NewReader(applyBody))
+	applyHTTPReq.Header.Set("Content-Type", "application/json")
+	applyResp, err := http.DefaultClient.Do(applyHTTPReq)
+	require.NoError(t, err, "POST /api/apply")
+	t.Cleanup(func() { utils.CloseAndLog(applyResp.Body) })
+	if applyResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(applyResp.Body)
+		require.Failf(t, "apply failed", "(%d): %s", applyResp.StatusCode, body)
+	}
+	var applyResult map[string]any
+	require.NoError(t, json.NewDecoder(applyResp.Body).Decode(&applyResult), "decode apply response")
+	require.Equal(t, true, applyResult["accepted"], "apply not accepted: %v", applyResult)
+	applyID, ok := applyResult["apply_id"].(string)
+	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResult)
+
+	// Verify deployment is stored on the apply record
+	storedApply, err := schemabotStorage.Applies().GetByApplyIdentifier(ctx, applyID)
+	require.NoError(t, err, "get apply by identifier")
+	require.NotNil(t, storedApply, "apply %s not found in storage", applyID)
+	assert.Equal(t, "us-west", storedApply.Deployment, "deployment should be stored on the apply")
 }

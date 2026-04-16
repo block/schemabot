@@ -3,6 +3,8 @@
 package commands
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -38,5 +40,19 @@ func TestLoadCLIConfig_WithoutEnvironments(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "testapp", cfg.Database)
+	assert.Empty(t, cfg.Deployment, "deployment should be empty when not specified")
 	assert.Equal(t, "testapp", cfg.GetTarget("staging"), "no environments falls back to database name")
+}
+
+func TestLoadCLIConfig_WithDeployment(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\ndeployment: us-west\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "users.sql"), []byte("CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY);"), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+
+	assert.Equal(t, "mydb", cfg.Database)
+	assert.Equal(t, "us-west", cfg.Deployment)
 }

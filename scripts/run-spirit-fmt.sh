@@ -49,23 +49,48 @@ if [ ${#PATHS[@]} -eq 0 ]; then
     PATHS=("pkg/schema/mysql")
 fi
 
-# Ensure spirit binary is available.
+# Minimum spirit version required for the fmt command.
+SPIRIT_MIN_VERSION="0.12.0"
+
+# Check if a spirit binary supports the fmt command (introduced in v0.12.0).
+spirit_has_fmt() {
+    "$1" fmt --help &>/dev/null 2>&1
+}
+
+# Ensure spirit binary is available with fmt support.
 ensure_spirit() {
     # Check PATH (includes hermit-managed binaries if activated).
-    if command -v spirit &>/dev/null; then
+    if command -v spirit &>/dev/null && spirit_has_fmt "$(command -v spirit)"; then
         return
     fi
     # Check repo-local hermit bin directory.
-    if [ -x "./bin/spirit" ]; then
+    if [ -x "./bin/spirit" ] && spirit_has_fmt "./bin/spirit"; then
         export PATH="./bin:$PATH"
         return
     fi
-    echo "ERROR: spirit not found."
+    # Check go install location.
+    local gobin
+    gobin="$(go env GOBIN)"
+    if [ -z "$gobin" ]; then
+        gobin="$(go env GOPATH | cut -d: -f1)/bin"
+    fi
+    if [ -x "$gobin/spirit" ] && spirit_has_fmt "$gobin/spirit"; then
+        export PATH="$gobin:$PATH"
+        return
+    fi
+    # Auto-install via go install.
+    echo "spirit >= $SPIRIT_MIN_VERSION not found, installing via go install..."
+    go install "github.com/block/spirit/cmd/spirit@v${SPIRIT_MIN_VERSION}" 2>&1
+    if [ -x "$gobin/spirit" ] && spirit_has_fmt "$gobin/spirit"; then
+        export PATH="$gobin:$PATH"
+        return
+    fi
+    echo "ERROR: spirit >= $SPIRIT_MIN_VERSION not found."
     echo ""
     echo "Install via one of:"
-    echo "  brew install block/tap/spirit      # macOS"
+    echo "  brew install block/tap/spirit      # macOS (once v$SPIRIT_MIN_VERSION is published)"
     echo "  hermit install spirit              # if using hermit"
-    echo "  go install github.com/block/spirit/cmd/spirit@v0.12.0"
+    echo "  go install github.com/block/spirit/cmd/spirit@v$SPIRIT_MIN_VERSION"
     exit 1
 }
 

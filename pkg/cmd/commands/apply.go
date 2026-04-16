@@ -87,7 +87,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	}
 
 	// Step 1: Generate plan
-	opts := client.PlanOptions{Target: cfg.GetTarget(cmd.Environment)}
+	opts := client.PlanOptions{Target: cfg.GetTarget(cmd.Environment), Deployment: cfg.Deployment}
 	planResult, err := client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, opts)
 	if err != nil {
 		return err
