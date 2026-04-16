@@ -77,6 +77,7 @@ const (
 type CLIConfig struct {
 	Database     string                   `yaml:"database"`
 	Type         string                   `yaml:"type"`
+	Deployment   string                   `yaml:"deployment,omitempty"`
 	Environments ghclient.EnvironmentList `yaml:"environments,omitempty"`
 	SchemaDir    string                   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
 }

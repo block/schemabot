@@ -344,7 +344,8 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 
 	// Check gRPC mode config (TernDeployments)
 	if len(environments) == 0 && len(s.config.TernDeployments) > 0 {
-		deployment := s.resolveDeployment(database, "")
+		deploymentParam := r.URL.Query().Get("deployment")
+		deployment := s.resolveDeployment(database, deploymentParam)
 		if endpoints, ok := s.config.TernDeployments[deployment]; ok {
 			for env := range endpoints {
 				environments = append(environments, env)
@@ -353,7 +354,22 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 	}
 
 	if len(environments) == 0 {
-		s.writeError(w, http.StatusNotFound, "database not found: "+database)
+		available := make([]string, 0, len(s.config.TernDeployments))
+		for name := range s.config.TernDeployments {
+			available = append(available, name)
+		}
+		sort.Strings(available)
+		s.logger.Warn("no environments found for database",
+			"database", database,
+			"available_deployments", available)
+		if len(available) > 0 {
+			s.writeError(w, http.StatusNotFound,
+				fmt.Sprintf("no environments found for database %q — no matching deployment (available: %v). "+
+					"Add a 'deployment' field to schemabot.yaml or configure a 'default' deployment on the server.", database, available))
+		} else {
+			s.writeError(w, http.StatusNotFound,
+				fmt.Sprintf("no environments found for database %q — no databases or deployments configured on this server", database))
+		}
 		return
 	}
 

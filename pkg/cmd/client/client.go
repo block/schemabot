@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/user"
 	"path"
@@ -38,11 +39,15 @@ func ResolveEndpoint(flag string, configEndpoint ...string) string {
 }
 
 // GetEnvironments fetches the list of environments for a database from the API.
-func GetEnvironments(endpoint, database string) ([]string, error) {
+func GetEnvironments(endpoint, database, deployment string) ([]string, error) {
 	var result struct {
 		Environments []string `json:"environments"`
 	}
-	if err := doGetInto(endpoint, fmt.Sprintf("/api/databases/%s/environments", database), &result); err != nil {
+	path := fmt.Sprintf("/api/databases/%s/environments", url.PathEscape(database))
+	if deployment != "" {
+		path += "?" + url.Values{"deployment": {deployment}}.Encode()
+	}
+	if err := doGetInto(endpoint, path, &result); err != nil {
 		return nil, err
 	}
 	return result.Environments, nil
@@ -50,7 +55,8 @@ func GetEnvironments(endpoint, database string) ([]string, error) {
 
 // PlanOptions holds optional parameters for CallPlanAPI.
 type PlanOptions struct {
-	Target string
+	Target     string
+	Deployment string
 }
 
 // CallPlanAPI calls the plan API by reading .sql files from schemaDir.
@@ -80,8 +86,13 @@ func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schema
 		prVal := int32(pr)
 		req.PullRequest = &prVal
 	}
-	if len(opts) > 0 && opts[0].Target != "" {
-		req.Target = opts[0].Target
+	if len(opts) > 0 {
+		if opts[0].Target != "" {
+			req.Target = opts[0].Target
+		}
+		if opts[0].Deployment != "" {
+			req.Deployment = opts[0].Deployment
+		}
 	}
 	var result apitypes.PlanResponse
 	if err := doPostInto(endpoint, "/api/plan", req, &result); err != nil {
@@ -112,8 +123,13 @@ func CallApplyAPI(endpoint, planID, database, environment, caller string, option
 		Caller:      caller,
 		Options:     options,
 	}
-	if len(opts) > 0 && opts[0].Target != "" {
-		req.Target = opts[0].Target
+	if len(opts) > 0 {
+		if opts[0].Target != "" {
+			req.Target = opts[0].Target
+		}
+		if opts[0].Deployment != "" {
+			req.Deployment = opts[0].Deployment
+		}
 	}
 	var result apitypes.ApplyResponse
 	if err := doPostInto(endpoint, "/api/apply", req, &result); err != nil {
