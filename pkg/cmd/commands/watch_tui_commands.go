@@ -246,7 +246,7 @@ func isTableStopped(status string) bool {
 // Note: stopTriggered alone does NOT count — we wait for the backend to confirm
 // the stop so the progress data reflects the true final state of each table.
 func (m WatchModel) isEffectivelyStopped() bool {
-	if state.IsState(m.state, StateStopped) {
+	if state.IsState(m.state, state.Apply.Stopped) {
 		return true
 	}
 	// Check if any table is stopped (backend may not have updated apply state yet)

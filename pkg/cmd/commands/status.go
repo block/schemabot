@@ -84,7 +84,7 @@ func showApplyByID(endpoint, applyID string, outputJSON bool) error {
 	}
 
 	// Use the existing progress display
-	if result.State == "" || state.IsState(result.State, StateNoActiveChange) {
+	if result.State == "" || state.IsState(result.State, state.NoActiveChange) {
 		fmt.Printf("No schema change found for apply '%s'\n", applyID)
 		return nil
 	}

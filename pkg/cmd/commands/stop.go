@@ -35,19 +35,19 @@ func (cmd *StopCmd) Run(g *Globals) error {
 	}
 
 	curState := result.State
-	if state.IsState(curState, StateNoActiveChange) || curState == "" {
+	if state.IsState(curState, state.NoActiveChange) || curState == "" {
 		fmt.Printf("No active schema change for database '%s' environment '%s'\n", cmd.Database, cmd.Environment)
 		return nil
 	}
-	if state.IsState(curState, StateCompleted) {
+	if state.IsState(curState, state.Apply.Completed) {
 		fmt.Println("Schema change already complete - nothing to stop")
 		return nil
 	}
-	if state.IsState(curState, StateStopped) {
+	if state.IsState(curState, state.Apply.Stopped) {
 		fmt.Println("Schema change already stopped")
 		return nil
 	}
-	if !state.IsState(curState, StateRunning, StateCuttingOver, StateWaitingForCutover, StatePending) {
+	if !state.IsState(curState, state.Apply.Running, state.Apply.CuttingOver, state.Apply.WaitingForCutover, state.Apply.Pending) {
 		return fmt.Errorf("cannot stop schema change in state: %s", curState)
 	}
 

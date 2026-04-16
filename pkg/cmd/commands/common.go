@@ -59,20 +59,6 @@ func (cf *ControlFlags) RequireApplyID() error {
 // and no additional "Error:" message should be printed.
 var ErrSilent = errors.New("silent error")
 
-// API state constants (proto enum string representations)
-const (
-	StateNoActiveChange    = "STATE_NO_ACTIVE_CHANGE"
-	StatePending           = "STATE_PENDING"
-	StateCompleted         = "STATE_COMPLETED"
-	StateFailed            = "STATE_FAILED"
-	StateRunning           = "STATE_RUNNING"
-	StateWaitingForCutover = "STATE_WAITING_FOR_CUTOVER"
-	StateCuttingOver       = "STATE_CUTTING_OVER"
-	StateStopped           = "STATE_STOPPED"
-	StateRevertWindow      = "STATE_REVERT_WINDOW"
-	StateReverted          = "STATE_REVERTED"
-)
-
 // CLIConfig represents the schemabot.yaml configuration file for CLI commands.
 type CLIConfig struct {
 	Database     string                   `yaml:"database"`

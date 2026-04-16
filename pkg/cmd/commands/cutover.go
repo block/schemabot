@@ -27,7 +27,7 @@ func (cmd *CutoverCmd) Run(g *Globals) error {
 	// Check current state first
 	result, err := client.GetProgress(ep, cmd.Database, cmd.Environment)
 	if err == nil {
-		if state.IsState(result.State, StateCompleted) {
+		if state.IsState(result.State, state.Apply.Completed) {
 			fmt.Println("✓ Schema change already complete")
 			tables := ddl.FilterInternalTablesTyped(result.Tables)
 			if len(tables) > 0 {
