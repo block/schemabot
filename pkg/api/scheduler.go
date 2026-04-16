@@ -96,8 +96,8 @@ func (s *Service) resumeInProgressApplies(ctx context.Context) {
 			"state", apply.State,
 			"last_heartbeat", apply.UpdatedAt)
 
-		// Get Tern client for this database/environment
-		deployment := s.resolveDeployment(apply.Database, "")
+		// Get Tern client using the deployment stored on the apply.
+		deployment := s.resolveDeployment(apply.Database, apply.Deployment)
 		client, err := s.TernClient(deployment, apply.Environment)
 		if err != nil {
 			s.logger.Error("recovery worker: failed to get client",

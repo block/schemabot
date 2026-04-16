@@ -3,7 +3,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -222,42 +221,6 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/settings", s.handleSettingsSet)
 
 	// GitHub webhook endpoint — registered externally via RegisterWebhook
-}
-
-// decodeRequest decodes a JSON request body, validates that database is set,
-// defaults environment to "staging" if empty, resolves the deployment, and
-// returns the matching Tern client. Returns false if an error HTTP response
-// was already written.
-func (s *Service) decodeRequest(w http.ResponseWriter, r *http.Request, dest any,
-	database, deployment, environment *string) (tern.Client, bool) {
-
-	if err := json.NewDecoder(r.Body).Decode(dest); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
-		return nil, false
-	}
-
-	if *database == "" {
-		s.writeError(w, http.StatusBadRequest, "database is required")
-		return nil, false
-	}
-	if *environment == "" {
-		*environment = "staging"
-	}
-
-	dep := s.resolveDeployment(*database, *deployment)
-
-	client, err := s.TernClient(dep, *environment)
-	if err != nil {
-		s.logger.Error("failed to create Tern client",
-			"deployment", dep,
-			"environment", *environment,
-			"error", err,
-		)
-		s.writeError(w, http.StatusInternalServerError, "failed to initialize database client")
-		return nil, false
-	}
-
-	return client, true
 }
 
 // resolveApplyID translates a SchemaBot apply_identifier into the ID that the

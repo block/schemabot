@@ -84,16 +84,21 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 // GetProgress fetches the current progress for a database from its tern client.
 // This is used by the webhook handler to populate table-level progress in PR comments.
 func (s *Service) GetProgress(ctx context.Context, database, environment string) (*apitypes.ProgressResponse, error) {
-	deployment := s.resolveDeployment(database, "")
+	ternApplyID, activeApply, err := s.findActiveApplyID(ctx, database, environment)
+	if err != nil {
+		return nil, fmt.Errorf("resolve active apply for %s: %w", database, err)
+	}
+
+	// Use deployment from the stored apply if available.
+	var storedDeployment string
+	if activeApply != nil {
+		storedDeployment = activeApply.Deployment
+	}
+	deployment := s.resolveDeployment(database, storedDeployment)
 
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {
 		return nil, fmt.Errorf("get tern client for %s/%s: %w", database, environment, err)
-	}
-
-	ternApplyID, activeApply, err := s.findActiveApplyID(ctx, database, environment)
-	if err != nil {
-		return nil, fmt.Errorf("resolve active apply for %s: %w", database, err)
 	}
 
 	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
@@ -154,8 +159,9 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Use the deployment stored on the apply if available, otherwise resolve from request.
-	deployment := r.URL.Query().Get("deployment")
+	// Deployment is a plan-time decision stored on the apply record.
+	// Use the stored deployment if an apply exists, otherwise fall back to default resolution.
+	var deployment string
 	if activeApply != nil && activeApply.Deployment != "" {
 		deployment = activeApply.Deployment
 	}
@@ -224,8 +230,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Active apply — call Tern for live progress.
-	deployment := s.resolveDeployment(apply.Database, "")
+	// Active apply — use the deployment stored on the apply record.
+	deployment := s.resolveDeployment(apply.Database, apply.Deployment)
 
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
@@ -524,7 +530,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 // per-table state into local task records. Called once for gRPC-mode applies
 // with stale task state; subsequent reads are served from local storage.
 func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
-	deployment := s.resolveDeployment(apply.Database, "")
+	deployment := s.resolveDeployment(apply.Database, apply.Deployment)
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
 		return fmt.Errorf("get tern client: %w", err)

@@ -69,7 +69,11 @@ ensure_spirit() {
         return
     fi
     # Check go install location.
-    local gobin="${GOBIN:-$(go env GOPATH)/bin}"
+    local gobin
+    gobin="$(go env GOBIN)"
+    if [ -z "$gobin" ]; then
+        gobin="$(go env GOPATH | cut -d: -f1)/bin"
+    fi
     if [ -x "$gobin/spirit" ] && spirit_has_fmt "$gobin/spirit"; then
         export PATH="$gobin:$PATH"
         return
