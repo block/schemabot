@@ -116,16 +116,18 @@ jobs:
       - name: Package and push Helm chart
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          # Chart.yaml is the source of truth for version and appVersion.
-          # Validate that the tag matches what's committed.
+          # appVersion tracks the application release. Validate the tag matches.
+          # Chart version is independent — it tracks chart template changes.
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          CHART_VERSION=$(grep '^version:' charts/schemabot/Chart.yaml | awk '{print $2}')
-          if [ "$TAG_VERSION" != "$CHART_VERSION" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match Chart.yaml version ${CHART_VERSION}. Bump Chart.yaml before tagging."
+          APP_VERSION=$(grep '^appVersion:' charts/schemabot/Chart.yaml | awk '{print $2}' | tr -d '"')
+          APP_VERSION="${APP_VERSION#v}"
+          if [ "$TAG_VERSION" != "$APP_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Chart.yaml appVersion ${APP_VERSION}. Update appVersion before tagging."
             exit 1
           fi
 
-          # Package and push
+          # Package using the tag version so the published chart matches the release.
+          CHART_VERSION=$(grep '^version:' charts/schemabot/Chart.yaml | awk '{print $2}')
           helm package charts/schemabot --destination ./build
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
           helm push ./build/schemabot-${CHART_VERSION}.tgz oci://ghcr.io/block/charts
