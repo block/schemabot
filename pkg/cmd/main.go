@@ -22,6 +22,8 @@ var (
 type CLI struct {
 	commands.Globals
 
+	VersionFlag kong.VersionFlag `name:"version" help:"Show version information"`
+
 	Plan      commands.PlanCmd      `cmd:"" help:"Create a schema change plan"`
 	Apply     commands.ApplyCmd     `cmd:"" help:"Apply schema changes"`
 	Progress  commands.ProgressCmd  `cmd:"" help:"Get schema change progress"`
@@ -47,6 +49,7 @@ func main() {
 		kong.Name("schemabot"),
 		kong.Description("Declarative schema GitOps orchestrator"),
 		kong.UsageOnError(),
+		kong.Vars{"version": fmt.Sprintf("%s (commit: %s)", version, commit)},
 	)
 
 	cli.Version = version
