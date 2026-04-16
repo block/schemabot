@@ -112,7 +112,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		// During cutover, ignore all keyboard input except q to force quit
-		isCuttingOver := state.IsState(m.state, StateCuttingOver) || m.cutoverTriggered
+		isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
 
 		// Handle volume mode inputs
 		if m.volumeMode {
@@ -136,19 +136,19 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			// Stop the schema change if running and not already stopped/stopping
-			if state.IsState(m.state, StateRunning, StateWaitingForCutover) && !m.stopTriggered {
+			if state.IsState(m.state, state.Apply.Running, state.Apply.WaitingForCutover) && !m.stopTriggered {
 				m.stopTriggered = true
 				return m, m.triggerStop()
 			}
 		case "v":
 			// Enter volume mode (only when running)
-			if state.IsState(m.state, StateRunning) && !isCuttingOver {
+			if state.IsState(m.state, state.Apply.Running) && !isCuttingOver {
 				m.volumeMode = true
 				return m, nil
 			}
 		case "enter":
 			// Trigger cutover if waiting and not already triggered
-			if state.IsState(m.state, StateWaitingForCutover) && m.allowCutover && !m.cutoverTriggered {
+			if state.IsState(m.state, state.Apply.WaitingForCutover) && m.allowCutover && !m.cutoverTriggered {
 				m.cutoverTriggered = true
 				return m, m.triggerCutover()
 			}
@@ -188,15 +188,15 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Check for terminal states
-		if state.IsState(m.state, StateCompleted, StateFailed) {
+		if state.IsState(m.state, state.Apply.Completed, state.Apply.Failed) {
 			return m, tea.Quit
 		}
 		// Also quit on stopped state
-		if state.IsState(m.state, StateStopped) {
+		if state.IsState(m.state, state.Apply.Stopped) {
 			return m, tea.Quit
 		}
 		// Quit if no active schema change
-		if state.IsState(m.state, StateNoActiveChange) {
+		if state.IsState(m.state, state.NoActiveChange) {
 			return m, tea.Quit
 		}
 
@@ -262,10 +262,10 @@ func runWatchModel(model WatchModel) error {
 
 	// The TUI view already displays errors inline, so return ErrSilent
 	// to exit with code 1 without printing the error again.
-	if m.errorMsg != "" && !state.IsState(m.state, StateCompleted) {
+	if m.errorMsg != "" && !state.IsState(m.state, state.Apply.Completed) {
 		return ErrSilent
 	}
-	if state.IsState(m.state, StateFailed) {
+	if state.IsState(m.state, state.Apply.Failed) {
 		return ErrSilent
 	}
 

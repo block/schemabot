@@ -51,18 +51,18 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	active, err := client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
 	if err != nil {
 		// Ignore errors - progress API may fail if no schema change exists
-	} else if active != nil && active.State != "" && active.State != "STATE_NO_ACTIVE_CHANGE" {
+	} else if active != nil && active.State != "" && !state.IsState(active.State, state.NoActiveChange) {
 		progressCmd := fmt.Sprintf("schemabot status %s", active.ApplyID)
 		if active.ApplyID == "" {
 			progressCmd = fmt.Sprintf("schemabot progress -d %s -e %s", cfg.Database, cmd.Environment)
 		}
 		var stateMsg string
 		switch {
-		case state.IsState(active.State, StateWaitingForCutover):
+		case state.IsState(active.State, state.Apply.WaitingForCutover):
 			stateMsg = "A schema change is waiting for cutover."
-		case state.IsState(active.State, StateRunning):
+		case state.IsState(active.State, state.Apply.Running):
 			stateMsg = "A schema change is already running."
-		case state.IsState(active.State, StateCuttingOver):
+		case state.IsState(active.State, state.Apply.CuttingOver):
 			stateMsg = "A schema change is currently cutting over."
 		}
 		if stateMsg != "" {
@@ -74,7 +74,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 			fmt.Println()
 			fmt.Println(stateMsg)
 			fmt.Println()
-			if state.IsState(active.State, StateWaitingForCutover) {
+			if state.IsState(active.State, state.Apply.WaitingForCutover) {
 				if active.ApplyID != "" {
 					fmt.Printf("To trigger cutover:  schemabot cutover --apply-id %s\n", active.ApplyID)
 				} else {
@@ -306,7 +306,7 @@ func WatchApplyProgressAfterCutover(endpoint, database, environment string) erro
 		}
 
 		// Check for terminal states
-		if state.IsState(curState, StateCompleted) {
+		if state.IsState(curState, state.Apply.Completed) {
 			// Show green completion bar
 			for _, tbl := range tables {
 				bar := ui.ProgressBarComplete()
@@ -316,14 +316,14 @@ func WatchApplyProgressAfterCutover(endpoint, database, environment string) erro
 			return nil
 		}
 
-		if state.IsState(curState, StateFailed) {
+		if state.IsState(curState, state.Apply.Failed) {
 			if result.ErrorMessage != "" {
 				return fmt.Errorf("cutover failed: %s", result.ErrorMessage)
 			}
 			return fmt.Errorf("cutover failed")
 		}
 
-		if state.IsState(curState, StateStopped) {
+		if state.IsState(curState, state.Apply.Stopped) {
 			return fmt.Errorf("schema change was stopped during cutover")
 		}
 
@@ -476,7 +476,7 @@ func watchApplyProgressLog(endpoint, database, environment string, heartbeatInte
 			}
 		}
 
-		if state.IsState(curState, StateNoActiveChange) {
+		if state.IsState(curState, state.NoActiveChange) {
 			log.emit("msg", "No active schema change")
 			return nil
 		}
@@ -546,24 +546,24 @@ func watchApplyProgressLog(endpoint, database, environment string, heartbeatInte
 		if globalNorm != lastGlobalState {
 			// Emit global state changes that aren't covered by per-table events
 			switch {
-			case state.IsState(curState, StateWaitingForCutover) && lastGlobalState != "":
+			case state.IsState(curState, state.Apply.WaitingForCutover) && lastGlobalState != "":
 				log.emit("msg", "Waiting for cutover")
-			case state.IsState(curState, StateCuttingOver):
+			case state.IsState(curState, state.Apply.CuttingOver):
 				log.emit("msg", "Cutting over")
 			}
 			lastGlobalState = globalNorm
 		}
 
 		// Terminal states — emit summary and exit
-		if state.IsState(curState, StateCompleted) {
+		if state.IsState(curState, state.Apply.Completed) {
 			log.emitApplySummary("completed", tableStates, applyStart, "")
 			return nil
 		}
-		if state.IsState(curState, StateFailed) {
+		if state.IsState(curState, state.Apply.Failed) {
 			log.emitApplySummary("failed", tableStates, applyStart, result.ErrorMessage)
 			return ErrSilent
 		}
-		if state.IsState(curState, StateStopped) {
+		if state.IsState(curState, state.Apply.Stopped) {
 			log.emitApplySummary("stopped", tableStates, applyStart, "")
 			return nil
 		}
@@ -705,16 +705,16 @@ func watchApplyProgressJSON(endpoint, database, environment string) error {
 		}
 
 		// Check for terminal states
-		if state.IsState(curState, StateCompleted) {
+		if state.IsState(curState, state.Apply.Completed) {
 			return nil
 		}
-		if state.IsState(curState, StateFailed) {
+		if state.IsState(curState, state.Apply.Failed) {
 			return ErrSilent
 		}
-		if state.IsState(curState, StateStopped) {
+		if state.IsState(curState, state.Apply.Stopped) {
 			return nil
 		}
-		if state.IsState(curState, StateNoActiveChange) {
+		if state.IsState(curState, state.NoActiveChange) {
 			return nil
 		}
 

@@ -31,18 +31,18 @@ func (cmd *StartCmd) Run(g *Globals) error {
 	}
 
 	curState := result.State
-	if state.IsState(curState, StateCompleted) {
+	if state.IsState(curState, state.Apply.Completed) {
 		fmt.Println("Schema change already complete - nothing to start")
 		return nil
 	}
-	if state.IsState(curState, StateRunning, StateCuttingOver) {
+	if state.IsState(curState, state.Apply.Running, state.Apply.CuttingOver) {
 		fmt.Println("Schema change already running")
 		if cmd.Watch {
 			return WatchApplyProgress(ep, cmd.Database, cmd.Environment, true)
 		}
 		return nil
 	}
-	if !state.IsState(curState, StateStopped) {
+	if !state.IsState(curState, state.Apply.Stopped) {
 		return fmt.Errorf("cannot start schema change in state: %s (expected STOPPED)", curState)
 	}
 

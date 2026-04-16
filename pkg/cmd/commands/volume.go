@@ -35,14 +35,14 @@ func (cmd *VolumeCmd) Run(g *Globals) error {
 	}
 
 	curState := result.State
-	if state.IsState(curState, StateCompleted) {
+	if state.IsState(curState, state.Apply.Completed) {
 		fmt.Println("Schema change already complete - cannot adjust volume")
 		return nil
 	}
-	if state.IsState(curState, StateFailed) {
+	if state.IsState(curState, state.Apply.Failed) {
 		return fmt.Errorf("schema change failed - cannot adjust volume")
 	}
-	if !state.IsState(curState, StateRunning, StateCuttingOver, StateWaitingForCutover, StateStopped) {
+	if !state.IsState(curState, state.Apply.Running, state.Apply.CuttingOver, state.Apply.WaitingForCutover, state.Apply.Stopped) {
 		return fmt.Errorf("cannot adjust volume in state: %s", curState)
 	}
 

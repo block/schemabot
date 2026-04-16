@@ -27,7 +27,7 @@ func (m WatchModel) View() string {
 	}
 
 	// Handle no active schema change
-	if state.IsState(m.state, StateNoActiveChange) {
+	if state.IsState(m.state, state.NoActiveChange) {
 		return "No active schema change for this database.\n"
 	}
 
@@ -55,12 +55,12 @@ func (m WatchModel) progressView() string {
 	case m.volumeChanging:
 		// Volume change in progress
 		b.WriteString(m.spinner.View() + fmt.Sprintf("Changing volume to %d...\n", m.volumePending))
-	case m.stopTriggered && !state.IsState(m.state, StateStopped):
+	case m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped):
 		// Stop has been triggered but state hasn't updated yet
 		b.WriteString(m.spinner.View() + "Stopping...\n")
 	case effectivelyStopped:
 		// Don't show status line - stopped message comes after tables
-	case state.IsState(m.state, StateRunning) && !m.cutoverTriggered:
+	case state.IsState(m.state, state.Apply.Running) && !m.cutoverTriggered:
 		// Find overall ETA and check if any table is actually copying rows
 		eta := ""
 		hasRowCopy := false
@@ -79,17 +79,17 @@ func (m WatchModel) progressView() string {
 			b.WriteString(m.spinner.View() + "Running...")
 		}
 		b.WriteString("\n")
-	case state.IsState(m.state, StateWaitingForCutover):
+	case state.IsState(m.state, state.Apply.WaitingForCutover):
 		if m.cutoverTriggered {
 			b.WriteString(m.spinner.View() + "Cutover triggered, waiting for completion...\n")
 		}
-	case state.IsState(m.state, StateCuttingOver):
+	case state.IsState(m.state, state.Apply.CuttingOver):
 		b.WriteString(m.spinner.View() + "Cutting over...\n")
-	case state.IsState(m.state, StateCompleted):
+	case state.IsState(m.state, state.Apply.Completed):
 		// No status line for completed - just show completion message after tables
-	case state.IsState(m.state, StateStopped):
+	case state.IsState(m.state, state.Apply.Stopped):
 		// No status line - show stopped message after tables
-	case state.IsState(m.state, StatePending):
+	case state.IsState(m.state, state.Apply.Pending):
 		b.WriteString(m.spinner.View() + "Starting...\n")
 	}
 
@@ -103,10 +103,10 @@ func (m WatchModel) progressView() string {
 	}
 
 	// Footer based on state
-	isCuttingOver := state.IsState(m.state, StateCuttingOver) || m.cutoverTriggered
+	isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
 
 	switch {
-	case state.IsState(m.state, StateCompleted):
+	case state.IsState(m.state, state.Apply.Completed):
 		b.WriteString("\n\n")
 		b.WriteString(templates.FormatApplyComplete())
 		b.WriteString("\n")
@@ -125,7 +125,7 @@ func (m WatchModel) progressView() string {
 		dimStyle := lipgloss.NewStyle().Faint(true)
 		b.WriteString(dimStyle.Render("Cutover in progress - please wait..."))
 		b.WriteString("\n")
-	case state.IsState(m.state, StateWaitingForCutover):
+	case state.IsState(m.state, state.Apply.WaitingForCutover):
 		b.WriteString("\n\n")
 		b.WriteString("Row copy complete. All data has been copied and new writes\n")
 		b.WriteString("continue to be replicated to keep the shadow table in sync.\n\n")
@@ -139,7 +139,7 @@ func (m WatchModel) progressView() string {
 			}
 			b.WriteString("Watching for cutover... (ESC to detach)\n")
 		}
-	case state.IsState(m.state, StateRunning):
+	case state.IsState(m.state, state.Apply.Running):
 		b.WriteString("\n\n")
 		if m.volumeMode {
 			// Volume mode - show volume adjustment UI
@@ -193,19 +193,19 @@ func (m WatchModel) renderTable(t tableProgress) string {
 	// Overall state takes priority to ensure consistent display during transitions
 	switch {
 	// Terminal states - check overall state first
-	case state.IsState(m.state, StateCompleted):
+	case state.IsState(m.state, state.Apply.Completed):
 		bar := ui.ProgressBarComplete()
 		fmt.Fprintf(&b, "%*s: %s ✓ Complete\n", m.maxTableNameLen, t.Name, bar)
 		writeDDL()
 
 	// Stopped state - show tables with their actual status
 	// Tables that completed before the stop should show as complete, not stopped
-	case m.isEffectivelyStopped() && !state.IsState(m.state, StateCompleted):
+	case m.isEffectivelyStopped() && !state.IsState(m.state, state.Apply.Completed):
 		switch {
-		case state.IsState(t.Status, StateCompleted):
+		case state.IsState(t.Status, state.Apply.Completed):
 			bar := ui.ProgressBarComplete()
 			fmt.Fprintf(&b, "%*s: %s ✓ Complete\n", m.maxTableNameLen, t.Name, bar)
-		case state.IsState(t.Status, StateFailed):
+		case state.IsState(t.Status, state.Apply.Failed):
 			bar := ui.ProgressBarFailed(t.Percent)
 			fmt.Fprintf(&b, "%*s: %s ❌ Failed\n", m.maxTableNameLen, t.Name, bar)
 		default:
@@ -224,38 +224,38 @@ func (m WatchModel) renderTable(t tableProgress) string {
 
 	// Cutover states - all tables show same state during cutover
 	// Also handle when cutover has been triggered but state hasn't updated yet
-	case state.IsState(m.state, StateCuttingOver) || (m.cutoverTriggered && !state.IsState(m.state, StateCompleted)):
+	case state.IsState(m.state, state.Apply.CuttingOver) || (m.cutoverTriggered && !state.IsState(m.state, state.Apply.Completed)):
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(&b, "%*s: %s 🔄 Cutting over...\n", m.maxTableNameLen, t.Name, bar)
 		writeDDL()
 
-	case state.IsState(m.state, StateWaitingForCutover):
+	case state.IsState(m.state, state.Apply.WaitingForCutover):
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(&b, "%*s: %s ⏸️ Waiting for cutover\n", m.maxTableNameLen, t.Name, bar)
 		writeDDL()
 
 	// Per-table states - check individual table status
-	case state.IsState(t.Status, StateCompleted):
+	case state.IsState(t.Status, state.Apply.Completed):
 		bar := ui.ProgressBarComplete()
 		fmt.Fprintf(&b, "%*s: %s ✓ Complete\n", m.maxTableNameLen, t.Name, bar)
 		writeDDL()
 
-	case state.IsState(t.Status, StateWaitingForCutover):
+	case state.IsState(t.Status, state.Apply.WaitingForCutover):
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(&b, "%*s: %s ⏸️ Waiting for cutover\n", m.maxTableNameLen, t.Name, bar)
 		writeDDL()
 
-	case state.IsState(t.Status, StateCuttingOver):
+	case state.IsState(t.Status, state.Apply.CuttingOver):
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(&b, "%*s: %s 🔄 Cutting over...\n", m.maxTableNameLen, t.Name, bar)
 		writeDDL()
 
-	case state.IsState(t.Status, StatePending):
+	case state.IsState(t.Status, state.Apply.Pending):
 		bar := ui.ProgressBarRowCopy(0)
 		fmt.Fprintf(&b, "%*s: %s queued\n", m.maxTableNameLen, t.Name, bar)
 		writeDDL()
 
-	case state.IsState(t.Status, StateStopped):
+	case state.IsState(t.Status, state.Apply.Stopped):
 		if t.Percent > 0 {
 			bar := ui.ProgressBarStopped(t.Percent)
 			fmt.Fprintf(&b, "%*s: %s ⏹️ Stopped\n", m.maxTableNameLen, t.Name, bar)
@@ -264,7 +264,7 @@ func (m WatchModel) renderTable(t tableProgress) string {
 		}
 		writeDDL()
 
-	case state.IsState(t.Status, StateFailed):
+	case state.IsState(t.Status, state.Apply.Failed):
 		bar := ui.ProgressBarFailed(t.Percent)
 		fmt.Fprintf(&b, "%*s: %s ❌ Failed\n", m.maxTableNameLen, t.Name, bar)
 		writeDDL()

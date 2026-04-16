@@ -39,13 +39,13 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	active, err := client.CheckActiveSchemaChange(ep, database, environment)
 	if err != nil {
 		// Ignore errors - progress API may fail if no schema change exists
-	} else if active != nil && active.State != "" && active.State != "STATE_NO_ACTIVE_CHANGE" {
+	} else if active != nil && active.State != "" && !state.IsState(active.State, state.NoActiveChange) {
 		switch {
-		case state.IsState(active.State, StateWaitingForCutover):
+		case state.IsState(active.State, state.Apply.WaitingForCutover):
 			return fmt.Errorf("cannot rollback: a schema change is waiting for cutover")
-		case state.IsState(active.State, StateRunning):
+		case state.IsState(active.State, state.Apply.Running):
 			return fmt.Errorf("cannot rollback: a schema change is already running")
-		case state.IsState(active.State, StateCuttingOver):
+		case state.IsState(active.State, state.Apply.CuttingOver):
 			return fmt.Errorf("cannot rollback: a schema change is currently cutting over")
 		}
 	}
