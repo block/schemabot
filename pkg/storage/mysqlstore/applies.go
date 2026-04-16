@@ -15,7 +15,7 @@ import (
 
 // applyColumns lists all columns for SELECT queries.
 const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, database_type,
-	repository, pull_request, environment, caller, installation_id, external_id, engine,
+	repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
 	state, error_message, options,
 	created_at, started_at, completed_at, updated_at`
 
@@ -35,12 +35,12 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
-			repository, pull_request, environment, caller, installation_id, external_id, engine,
+			repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
 			state, error_message, options
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		apply.ApplyIdentifier, apply.LockID, apply.PlanID, apply.Database, apply.DatabaseType,
-		apply.Repository, apply.PullRequest, apply.Environment, apply.Caller, apply.InstallationID, apply.ExternalID, apply.Engine,
+		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, apply.Engine,
 		apply.State, apply.ErrorMessage, string(options),
 	)
 	if err != nil {
@@ -325,7 +325,7 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 	err := s.Scan(
 		&apply.ID, &apply.ApplyIdentifier, &apply.LockID, &apply.PlanID,
 		&apply.Database, &apply.DatabaseType,
-		&apply.Repository, &apply.PullRequest, &apply.Environment,
+		&apply.Repository, &apply.PullRequest, &apply.Environment, &apply.Deployment,
 		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &apply.Engine,
 		&apply.State, &apply.ErrorMessage, &options,
 		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt,

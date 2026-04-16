@@ -259,6 +259,10 @@ type Apply struct {
 	// Environment is "staging" or "production".
 	Environment string
 
+	// Deployment is the Tern deployment name used for this apply.
+	// Empty for local mode (no Tern routing needed).
+	Deployment string
+
 	// Caller identifies who initiated this apply.
 	// For CLI: "cli:user@hostname", for PR: "repo#pr"
 	Caller string

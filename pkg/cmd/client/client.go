@@ -156,7 +156,7 @@ func GetProgress(endpoint, database, environment string) (*apitypes.ProgressResp
 // GetProgressCtx is like GetProgress but accepts a context for timeout/cancellation control.
 func GetProgressCtx(ctx context.Context, endpoint, database, environment string) (*apitypes.ProgressResponse, error) {
 	var result apitypes.ProgressResponse
-	if err := doGetIntoCtx(ctx, endpoint, fmt.Sprintf("/api/progress/%s?environment=%s", database, environment), &result); err != nil {
+	if err := doGetIntoCtx(ctx, endpoint, fmt.Sprintf("/api/progress/%s?environment=%s", url.PathEscape(database), url.QueryEscape(environment)), &result); err != nil {
 		return nil, err
 	}
 	return &result, nil

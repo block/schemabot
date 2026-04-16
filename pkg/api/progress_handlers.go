@@ -127,16 +127,9 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deployment := s.resolveDeployment(database, r.URL.Query().Get("deployment"))
 	environment := r.URL.Query().Get("environment")
 	if environment == "" {
 		environment = "staging"
-	}
-
-	client, err := s.TernClient(deployment, environment)
-	if err != nil {
-		s.writeError(w, http.StatusNotFound, err.Error())
-		return
 	}
 
 	// Resolve the Tern-facing apply_id. Prefer explicit apply_id query param
@@ -150,7 +143,6 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ternApplyID = resolved
-		// Look up the apply for metadata overlay.
 		activeApply, _ = s.storage.Applies().GetByApplyIdentifier(r.Context(), qApplyID)
 	} else {
 		var err error
@@ -160,6 +152,19 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusInternalServerError, "failed to resolve active apply: "+err.Error())
 			return
 		}
+	}
+
+	// Use the deployment stored on the apply if available, otherwise resolve from request.
+	deployment := r.URL.Query().Get("deployment")
+	if activeApply != nil && activeApply.Deployment != "" {
+		deployment = activeApply.Deployment
+	}
+	deployment = s.resolveDeployment(database, deployment)
+
+	client, err := s.TernClient(deployment, environment)
+	if err != nil {
+		s.writeError(w, http.StatusNotFound, err.Error())
+		return
 	}
 
 	resp, err := client.Progress(r.Context(), &ternv1.ProgressRequest{

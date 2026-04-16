@@ -8,6 +8,7 @@ CREATE TABLE `applies` (
   `repository` varchar(255) NOT NULL,
   `pull_request` int unsigned NOT NULL,
   `environment` varchar(50) NOT NULL,
+  `deployment` varchar(255) NOT NULL DEFAULT '',
   `caller` varchar(255) NOT NULL DEFAULT '',
   `installation_id` bigint NOT NULL DEFAULT '0',
   `external_id` varchar(255) NOT NULL DEFAULT '',
