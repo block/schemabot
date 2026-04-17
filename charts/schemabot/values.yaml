@@ -18,6 +18,7 @@ serviceAccount:
 service:
   type: ClusterIP
   port: 8080
+  annotations: {}
 
 # SchemaBot config file contents. Rendered into a ConfigMap and mounted
 # at /config/config.yaml. See docs/configuration.md for all options.
@@ -75,8 +76,11 @@ resources:
     cpu: 1000m
     memory: 512Mi
 
-# Pod annotations (e.g., Istio sidecar config, Datadog).
+# Pod annotations (e.g., Istio sidecar config).
 podAnnotations: {}
+
+# Pod labels (e.g., Datadog unified service tagging).
+podLabels: {}
 
 # Node selector, tolerations, affinity.
 nodeSelector: {}
