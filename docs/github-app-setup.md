@@ -215,6 +215,32 @@ schemabot plan -d mydb          # Plan for a specific database (multi-db repos)
 
 GitHub credentials (`private_key`, `webhook_secret`) are configured in the YAML config file using secret references, not environment variables. This keeps all configuration in one place and supports any secret backend.
 
+## Webhook Ingress
+
+GitHub needs to reach SchemaBot's `POST /webhook` endpoint over the public internet. If your deployment already has a public URL (e.g., AWS App Runner, a VM with a public IP), set the GitHub App's **Webhook URL** directly:
+
+```
+https://your-schemabot-host/webhook
+```
+
+See [deploy/aws/](../deploy/aws/) for a complete example using App Runner.
+
+If SchemaBot runs on Kubernetes, pods aren't publicly accessible by default. You'll need an ingress path — for example, an API Gateway or reverse proxy in front of an internal load balancer, or an ingress controller like nginx or Traefik with a route to `/webhook`.
+
+For local development and PR testing, [smee.io](https://smee.io) can proxy GitHub webhooks to your machine — [recommended by GitHub](https://docs.github.com/en/webhooks/using-webhooks/handling-webhook-deliveries#setup) for webhook development. This lets you test the full PR workflow (comment `schemabot plan`, receive webhook, process command) without deploying anything:
+
+1. Visit https://smee.io and create a new channel
+2. Temporarily set the GitHub App's **Webhook URL** to the smee channel URL
+3. Run the smee client locally:
+   ```bash
+   npx smee-client --url https://smee.io/your-channel --target http://localhost:8080/webhook
+   ```
+4. Switch the webhook URL back to your production endpoint when done
+
+### IP Allowlisting
+
+GitHub publishes its webhook source IPs at https://api.github.com/meta (the `hooks` field). Restricting your webhook endpoint to these CIDRs is recommended as defense-in-depth. SchemaBot always validates webhook signatures via HMAC-SHA256 when `webhook_secret` is configured (see below), so IP allowlisting provides an additional layer of protection.
+
 ## Webhook Signature Validation
 
 If `webhook_secret` is set in the config, SchemaBot validates the `X-Hub-Signature-256` header on every webhook request using HMAC-SHA256. Requests with invalid or missing signatures are rejected with HTTP 401.
