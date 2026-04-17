@@ -20,6 +20,9 @@ spec:
         {{- end }}
       labels:
         {{- include "schemabot.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "schemabot.serviceAccountName" . }}
       securityContext:
