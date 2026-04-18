@@ -118,6 +118,18 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 	}
 }
 
+// TernDeployment returns the Tern deployment name for the given repository.
+// In gRPC mode (TernDeployments configured), this reads the repo-specific
+// mapping from server config, falling back to DefaultDeployment.
+// In local mode (no TernDeployments), returns empty string so that
+// resolveDeployment can derive the deployment from the database name.
+func (s *Service) TernDeployment(repo string) string {
+	if len(s.config.TernDeployments) == 0 {
+		return ""
+	}
+	return s.config.TernDeployment(repo)
+}
+
 // TernClient returns the Tern client for the given deployment and environment.
 // Clients are created lazily on first use, so Tern connection failures only
 // affect requests to that specific deployment/environment rather than blocking
