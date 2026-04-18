@@ -119,8 +119,14 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 }
 
 // TernDeployment returns the Tern deployment name for the given repository.
-// This delegates to the server config's repo-specific mapping.
+// In gRPC mode (TernDeployments configured), this reads the repo-specific
+// mapping from server config, falling back to DefaultDeployment.
+// In local mode (no TernDeployments), returns empty string so that
+// resolveDeployment can derive the deployment from the database name.
 func (s *Service) TernDeployment(repo string) string {
+	if len(s.config.TernDeployments) == 0 {
+		return ""
+	}
 	return s.config.TernDeployment(repo)
 }
 
