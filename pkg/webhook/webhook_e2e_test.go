@@ -1061,6 +1061,112 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	return svc
 }
 
+// TestE2EPlanUsesRepoDeployment verifies that the webhook plan handler routes
+// to the correct Tern deployment based on the repo's default_tern_deployment config.
+func TestE2EPlanUsesRepoDeployment(t *testing.T) {
+	dbName := "webhook_repo_deployment"
+	ctx := t.Context()
+
+	// Create the app database on the target
+	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	require.NoError(t, err)
+	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+dbName+"`")
+	require.NoError(t, err)
+	_ = targetDB.Close()
+
+	t.Cleanup(func() {
+		db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+		if err == nil {
+			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+dbName+"`")
+			_ = db.Close()
+		}
+	})
+
+	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = schemabotDB.Close() })
+
+	st := mysqlstore.New(schemabotDB)
+
+	// Clean up stale data
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", dbName)
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", dbName)
+
+	localClient, err := tern.NewLocalClient(tern.LocalConfig{
+		Database:  dbName,
+		Type:      "mysql",
+		TargetDSN: appDSN,
+	}, st, logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = localClient.Close() })
+
+	// Configure service in gRPC mode: no Databases, only TernDeployments + Repos.
+	// The tern client is registered under "team-a/staging" — NOT "default/staging".
+	// If the webhook handler doesn't set Deployment from the Repos config,
+	// resolveDeployment falls back to "default" and TernClient lookup fails.
+	serverConfig := &api.ServerConfig{
+		TernDeployments: api.TernConfig{
+			"team-a": api.TernEndpoints{
+				"staging": "localhost:9999", // address not dialed; pre-injected client is used instead
+			},
+		},
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {
+				DefaultTernDeployment: "team-a",
+			},
+		},
+	}
+
+	svc := api.New(st, serverConfig, map[string]tern.Client{
+		"team-a/staging": localClient,
+	}, logger)
+	t.Cleanup(func() { _ = svc.Close() })
+
+	// Set up fake GitHub API
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan generated successfully")
+
+	// Verify plan comment was posted with the expected DDL
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## MySQL Schema Change Plan")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
+	}
+}
+
 // --- Container helpers (matches e2e/setup_test.go patterns) ---
 
 func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS *embed.FS) (testcontainers.Container, error) {

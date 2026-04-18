@@ -118,6 +118,12 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 	}
 }
 
+// TernDeployment returns the Tern deployment name for the given repository.
+// This delegates to the server config's repo-specific mapping.
+func (s *Service) TernDeployment(repo string) string {
+	return s.config.TernDeployment(repo)
+}
+
 // TernClient returns the Tern client for the given deployment and environment.
 // Clients are created lazily on first use, so Tern connection failures only
 // affect requests to that specific deployment/environment rather than blocking
