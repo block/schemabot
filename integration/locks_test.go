@@ -729,6 +729,125 @@ CREATE TABLE users (
 	})
 }
 
+// TestCLI_Locking_NoLockBypassesLocking tests that --no-lock allows apply even when
+// another user holds the lock, and that no lock is acquired by the caller.
+func TestCLI_Locking_NoLockBypassesLocking(t *testing.T) {
+	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
+
+	dbName := fmt.Sprintf("lock_nolock_%d", time.Now().UnixNano())
+
+	schemabotAddr := startSchemaBotLocalDB(t, dbName)
+
+	endpoint := "http://" + schemabotAddr
+
+	schemaDir := newSchemaDirForDB(t, dbName)
+	writeFile(t, filepath.Join(schemaDir, "users.sql"), `
+CREATE TABLE users (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL
+);
+`)
+
+	// Another user holds the lock
+	t.Run("other_user_acquires_lock", func(t *testing.T) {
+		resp, err := acquireLockViaAPI(t, endpoint, dbName, "mysql", "cli:otheruser@othermachine", "", 0)
+		require.NoError(t, err, "acquire lock via API")
+		require.Equal(t, 200, resp.StatusCode, "expected 200, got %d", resp.StatusCode)
+		_ = resp.Body.Close()
+	})
+
+	t.Run("apply_with_no_lock_bypasses_lock", func(t *testing.T) {
+		out := runCLIInDir(t, binPath, schemaDir, "apply",
+			"-s", ".",
+			"-e", "staging",
+			"--endpoint", endpoint,
+			"-y",
+			"--watch=false",
+			"--no-lock",
+		)
+		// Should not show lock conflict
+		assert.NotContains(t, stripANSI(out), "Database Locked")
+		// Should show the no-lock warning
+		assertContains(t, out, "--no-lock")
+		// Should proceed with apply
+		assertContains(t, out, "Apply started")
+		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+	})
+
+	t.Run("original_lock_still_held", func(t *testing.T) {
+		// The other user's lock should still be in place (--no-lock doesn't touch it)
+		out := runCLI(t, binPath, "locks", "--endpoint", endpoint)
+		assertContains(t, out, dbName)
+		assertContains(t, out, "otheruser")
+	})
+
+	// Cleanup
+	t.Run("cleanup", func(t *testing.T) {
+		runCLI(t, binPath, "unlock", "-d", dbName, "-t", "mysql", "--endpoint", endpoint, "--force")
+	})
+}
+
+// TestCLI_Locking_NoLockStillBlockedByActiveApply tests that --no-lock does not bypass
+// the active schema change check. If an apply is already running (or waiting for cutover),
+// a second apply with --no-lock is still blocked by the progress API check.
+func TestCLI_Locking_NoLockStillBlockedByActiveApply(t *testing.T) {
+	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
+
+	dbName := fmt.Sprintf("lock_nolock_active_%d", time.Now().UnixNano())
+
+	schemabotAddr := startSchemaBotLocalDB(t, dbName)
+
+	endpoint := "http://" + schemabotAddr
+
+	schemaDir := newSchemaDirForDB(t, dbName)
+	writeFile(t, filepath.Join(schemaDir, "users.sql"), `
+CREATE TABLE users (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(255) NOT NULL,
+    INDEX idx_email (email)
+);
+`)
+
+	// Start an apply with --defer-cutover so it stays in "waiting for cutover" state
+	t.Run("first_apply_deferred", func(t *testing.T) {
+		out := runCLIInDir(t, binPath, schemaDir, "apply",
+			"-s", ".",
+			"-e", "staging",
+			"--endpoint", endpoint,
+			"-y",
+			"--watch=false",
+			"--defer-cutover",
+			"--no-lock",
+		)
+		assertContains(t, out, "Apply started")
+		waitForStateDB(t, endpoint, dbName, "waiting_for_cutover", 30*time.Second)
+	})
+
+	// Second apply with --no-lock should still be blocked by the active schema change
+	t.Run("second_apply_blocked_by_active_change", func(t *testing.T) {
+		_, err := runCLIWithErrorInDir(t, binPath, schemaDir, "apply",
+			"-s", ".",
+			"-e", "staging",
+			"--endpoint", endpoint,
+			"-y",
+			"--watch=false",
+			"--no-lock",
+		)
+		assert.Error(t, err, "expected second apply to fail due to active schema change")
+	})
+
+	// Cleanup: cutover to complete the deferred apply
+	t.Run("cleanup", func(t *testing.T) {
+		runCLIInDir(t, binPath, schemaDir, "cutover",
+			"-d", dbName,
+			"-e", "staging",
+			"--endpoint", endpoint,
+			"--watch=false",
+		)
+		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+	})
+}
+
 // TestCLI_Locking_SameEnvDifferentOwners tests lock blocking for same environment, different owners.
 func TestCLI_Locking_SameEnvDifferentOwners(t *testing.T) {
 	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
