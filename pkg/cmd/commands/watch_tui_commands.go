@@ -36,13 +36,7 @@ func (m WatchModel) tick() tea.Cmd {
 
 func (m WatchModel) fetchProgress() tea.Cmd {
 	return func() tea.Msg {
-		var result *apitypes.ProgressResponse
-		var err error
-		if m.applyID != "" {
-			result, err = client.GetProgressByApplyID(m.endpoint, m.applyID)
-		} else {
-			result, err = client.GetProgress(m.endpoint, m.database, m.environment)
-		}
+		result, err := client.GetProgress(m.endpoint, m.applyID)
 		if err != nil {
 			return progressMsg{
 				errorMsg:  err.Error(),

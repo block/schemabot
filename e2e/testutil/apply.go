@@ -45,7 +45,7 @@ func ApplySchemaAndWait(t *testing.T, endpoint, database, dbType, env string, sc
 	require.NoError(t, err, "apply API call")
 	require.True(t, applyResp.Accepted, "apply not accepted: %s", applyResp.ErrorMessage)
 
-	WaitForStateByApplyID(t, endpoint, applyResp.ApplyID, state.Apply.Completed, timeout)
+	WaitForState(t, endpoint, applyResp.ApplyID, state.Apply.Completed, timeout)
 	return applyResp.ApplyID
 }
 

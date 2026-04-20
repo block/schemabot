@@ -262,38 +262,33 @@ const (
 	OutputFormatJSON        OutputFormat = "json"
 )
 
-// WatchApplyProgress polls the progress API until the schema change completes.
-// If allowCutoverPrompt is true, prompts for interactive cutover when waiting.
-func WatchApplyProgress(endpoint, database, environment string, allowCutoverPrompt bool) error {
-	return WatchApplyProgressWithFormat(endpoint, database, environment, allowCutoverPrompt, OutputFormatInteractive, 0)
-}
-
-// WatchApplyProgressWithFormat polls the progress API with the specified output format.
-// logHeartbeat controls the interval between progress heartbeats in log mode (0 = default 10s).
-func WatchApplyProgressWithFormat(endpoint, database, environment string, allowCutoverPrompt bool, format OutputFormat, logHeartbeat time.Duration) error {
+// WatchApplyProgressWithFormat polls the progress API by apply ID with the
+// specified output format. logHeartbeat controls the interval between progress
+// heartbeats in log mode (0 = default 10s).
+func WatchApplyProgressWithFormat(endpoint, applyID string, allowCutoverPrompt bool, format OutputFormat, logHeartbeat time.Duration) error {
 	// Use log format for CI/server environments
 	if format == OutputFormatLog {
 		if logHeartbeat <= 0 {
 			logHeartbeat = logHeartbeatDefault
 		}
-		return watchApplyProgressLog(endpoint, database, environment, logHeartbeat)
+		return watchApplyProgressLog(endpoint, applyID, logHeartbeat)
 	}
 	if format == OutputFormatJSON {
-		return watchApplyProgressJSON(endpoint, database, environment)
+		return watchApplyProgressJSON(endpoint, applyID)
 	}
 
 	// Interactive format: use Bubbletea TUI
-	return WatchApplyProgressTUI(endpoint, database, environment, allowCutoverPrompt)
+	return WatchApplyProgressByApplyID(endpoint, applyID, allowCutoverPrompt)
 }
 
 // WatchApplyProgressAfterCutover polls the progress API after cutover has been triggered.
 // It waits for completion without showing the "waiting for cutover" instructions.
-func WatchApplyProgressAfterCutover(endpoint, database, environment string) error {
+func WatchApplyProgressAfterCutover(endpoint, applyID string) error {
 	maxTableNameLen := 0
 	headerPrinted := false
 
 	for {
-		result, err := client.GetProgress(endpoint, database, environment)
+		result, err := client.GetProgress(endpoint, applyID)
 		if err != nil {
 			return err
 		}
@@ -456,7 +451,7 @@ func logfmtEscape(b []byte, val string) []byte {
 //   - Progress heartbeats fire after 2s (first) then every --log-heartbeat interval (default 10s), only during row copy.
 //   - Small/instant tables only get start + complete lines — no progress noise.
 //   - A summary line is emitted on terminal states.
-func watchApplyProgressLog(endpoint, database, environment string, heartbeatInterval time.Duration) error {
+func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Duration) error {
 	log := &logEmitter{}
 	tableStates := make(map[string]*tableLogState)
 	var lastGlobalState string
@@ -464,7 +459,7 @@ func watchApplyProgressLog(endpoint, database, environment string, heartbeatInte
 	pollInterval := 500 * time.Millisecond
 
 	for {
-		result, err := client.GetProgress(endpoint, database, environment)
+		result, err := client.GetProgress(endpoint, applyID)
 		if err != nil {
 			return err
 		}
@@ -693,9 +688,9 @@ func isActiveStatus(status string) bool {
 }
 
 // watchApplyProgressJSON outputs JSON lines for programmatic consumption.
-func watchApplyProgressJSON(endpoint, database, environment string) error {
+func watchApplyProgressJSON(endpoint, applyID string) error {
 	for {
-		result, err := client.GetProgress(endpoint, database, environment)
+		result, err := client.GetProgress(endpoint, applyID)
 		if err != nil {
 			return err
 		}

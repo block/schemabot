@@ -148,27 +148,13 @@ func CallCutoverAPI(endpoint, database, environment, applyID string) (*apitypes.
 	return &result, nil
 }
 
-// GetProgress fetches progress for a schema change.
-func GetProgress(endpoint, database, environment string) (*apitypes.ProgressResponse, error) {
-	return GetProgressCtx(context.Background(), endpoint, database, environment)
+// GetProgress fetches progress for a schema change by apply ID.
+func GetProgress(endpoint, applyID string) (*apitypes.ProgressResponse, error) {
+	return GetProgressCtx(context.Background(), endpoint, applyID)
 }
 
 // GetProgressCtx is like GetProgress but accepts a context for timeout/cancellation control.
-func GetProgressCtx(ctx context.Context, endpoint, database, environment string) (*apitypes.ProgressResponse, error) {
-	var result apitypes.ProgressResponse
-	if err := doGetIntoCtx(ctx, endpoint, fmt.Sprintf("/api/progress/%s?environment=%s", url.PathEscape(database), url.QueryEscape(environment)), &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
-// GetProgressByApplyID fetches progress for a schema change by apply ID.
-func GetProgressByApplyID(endpoint, applyID string) (*apitypes.ProgressResponse, error) {
-	return GetProgressByApplyIDCtx(context.Background(), endpoint, applyID)
-}
-
-// GetProgressByApplyIDCtx is like GetProgressByApplyID but accepts a context for timeout/cancellation control.
-func GetProgressByApplyIDCtx(ctx context.Context, endpoint, applyID string) (*apitypes.ProgressResponse, error) {
+func GetProgressCtx(ctx context.Context, endpoint, applyID string) (*apitypes.ProgressResponse, error) {
 	var result apitypes.ProgressResponse
 	if err := doGetIntoCtx(ctx, endpoint, fmt.Sprintf("/api/progress/apply/%s", applyID), &result); err != nil {
 		return nil, err
@@ -197,15 +183,16 @@ type ActiveSchemaChange struct {
 }
 
 func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSchemaChange, error) {
-	result, err := GetProgress(endpoint, database, environment)
-	if err != nil {
+	var result apitypes.ProgressResponse
+	path := fmt.Sprintf("/api/progress/%s?environment=%s", url.PathEscape(database), url.QueryEscape(environment))
+	if err := doGetInto(endpoint, path, &result); err != nil {
 		if IsNotFound(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
 
-	if result.State == "" {
+	if result.State == "" || strings.EqualFold(result.State, "no_active_change") {
 		return nil, nil
 	}
 	return &ActiveSchemaChange{State: result.State, ApplyID: result.ApplyID}, nil

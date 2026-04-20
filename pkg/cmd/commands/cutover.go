@@ -25,7 +25,7 @@ func (cmd *CutoverCmd) Run(g *Globals) error {
 	}
 
 	// Check current state first
-	result, err := client.GetProgress(ep, cmd.Database, cmd.Environment)
+	result, err := client.GetProgress(ep, cmd.ApplyID)
 	if err == nil {
 		if state.IsState(result.State, state.Apply.Completed) {
 			fmt.Println("✓ Schema change already complete")
@@ -66,5 +66,5 @@ func (cmd *CutoverCmd) Run(g *Globals) error {
 	}
 
 	// Watch progress until completion - cutover already triggered, so skip waiting instructions
-	return WatchApplyProgressAfterCutover(ep, cmd.Database, cmd.Environment)
+	return WatchApplyProgressAfterCutover(ep, cmd.ApplyID)
 }

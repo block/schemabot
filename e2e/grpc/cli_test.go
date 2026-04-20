@@ -18,8 +18,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestGRPCCLI_Progress_NoActiveChange verifies that progress shows "No active schema change" when idle.
-func TestGRPCCLI_Progress_NoActiveChange(t *testing.T) {
+// TestGRPCCLI_Status_NoActiveChange verifies that status shows the database when idle.
+func TestGRPCCLI_Status_NoActiveChange(t *testing.T) {
 	bin := grpcCLIBuildOrFind(t)
 	endpoint := grpcSchemabotURL(t)
 
@@ -34,13 +34,11 @@ func TestGRPCCLI_Progress_NoActiveChange(t *testing.T) {
 			`CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL);`, tableName),
 	})
 
-	out := e2eutil.RunCLIInDir(t, bin, schemaDir, "progress",
+	out := e2eutil.RunCLIInDir(t, bin, schemaDir, "status",
 		"--database", "testapp",
-		"-e", "staging",
 		"--endpoint", endpoint,
-		"--watch=false",
 	)
-	e2eutil.AssertContains(t, out, "No active schema change")
+	e2eutil.AssertContains(t, out, "testapp")
 }
 
 // TestGRPCCLI_PlanApply_AddColumn tests a full plan -> apply -> progress -> verify workflow via CLI.
@@ -79,9 +77,10 @@ func TestGRPCCLI_PlanApply_AddColumn(t *testing.T) {
 		"--watch=false",
 	)
 	e2eutil.AssertContains(t, out, "Apply started")
+	applyID := parseApplyID(t, out)
 
-	// Wait for completion via CLI progress polling
-	testutil.WaitForState(t, endpoint, "testapp", "staging", state.Apply.Completed, 3*time.Minute)
+	// Wait for completion via apply ID progress polling
+	testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, 3*time.Minute)
 
 	// Verify column exists via direct MySQL
 	assert.True(t, grpcColumnExists(t, "staging", tableName, "email"),
@@ -151,14 +150,13 @@ func TestGRPCCLI_DeferCutover(t *testing.T) {
 	applyID := parseApplyID(t, out)
 
 	// Wait for waiting_for_cutover or completed (Spirit may be too fast)
-	finalState := testutil.WaitForAnyState(t, endpoint, "testapp", "staging",
+	finalState := testutil.WaitForAnyState(t, endpoint, applyID,
 		[]string{state.Apply.WaitingForCutover, state.Apply.Completed}, 3*time.Minute)
 
 	if strings.Contains(finalState, state.Apply.WaitingForCutover) {
 		// Verify progress shows waiting
 		out = e2eutil.RunCLIInDir(t, bin, schemaDir, "progress",
-			"--database", "testapp",
-			"-e", "staging",
+			applyID,
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -173,7 +171,7 @@ func TestGRPCCLI_DeferCutover(t *testing.T) {
 		e2eutil.AssertContains(t, out, "Cutover requested")
 
 		// Wait for completion
-		testutil.WaitForState(t, endpoint, "testapp", "staging", state.Apply.Completed, 2*time.Minute)
+		testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, 2*time.Minute)
 	}
 
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
@@ -212,13 +210,12 @@ func TestGRPCCLI_StopStart(t *testing.T) {
 	applyID := parseApplyID(t, out)
 
 	// Wait for it to be running (not just planned)
-	testutil.WaitForAnyState(t, endpoint, "testapp", "staging",
+	testutil.WaitForAnyState(t, endpoint, applyID,
 		[]string{state.Apply.Running, state.Apply.Completed}, 60*time.Second)
 
 	// Check if already completed -- Spirit may be too fast
 	progOut, _ := e2eutil.RunCLIWithErrorInDir(t, bin, schemaDir, "progress",
-		"--database", "testapp",
-		"-e", "staging",
+		applyID,
 		"--endpoint", endpoint,
 		"--watch=false",
 	)
@@ -230,12 +227,11 @@ func TestGRPCCLI_StopStart(t *testing.T) {
 		)
 
 		// Wait for stopped state
-		testutil.WaitForState(t, endpoint, "testapp", "staging", state.Apply.Stopped, 30*time.Second)
+		testutil.WaitForState(t, endpoint, applyID, state.Apply.Stopped, 30*time.Second)
 
 		// Verify progress shows stopped
 		out = e2eutil.RunCLIInDir(t, bin, schemaDir, "progress",
-			"--database", "testapp",
-			"-e", "staging",
+			applyID,
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -250,7 +246,7 @@ func TestGRPCCLI_StopStart(t *testing.T) {
 	}
 
 	// Wait for completion
-	testutil.WaitForState(t, endpoint, "testapp", "staging", state.Apply.Completed, 5*time.Minute)
+	testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, 5*time.Minute)
 
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
 }
@@ -288,13 +284,12 @@ func TestGRPCCLI_Volume(t *testing.T) {
 	applyID := parseApplyID(t, out)
 
 	// Wait for running state
-	testutil.WaitForAnyState(t, endpoint, "testapp", "staging",
+	testutil.WaitForAnyState(t, endpoint, applyID,
 		[]string{state.Apply.Running, state.Apply.Completed}, 60*time.Second)
 
 	// Try to adjust volume (may fail if Spirit completed too fast -- that's OK)
 	progOut, _ := e2eutil.RunCLIWithErrorInDir(t, bin, schemaDir, "progress",
-		"--database", "testapp",
-		"-e", "staging",
+		applyID,
 		"--endpoint", endpoint,
 		"--watch=false",
 	)
@@ -312,7 +307,7 @@ func TestGRPCCLI_Volume(t *testing.T) {
 	}
 
 	// Wait for completion
-	testutil.WaitForState(t, endpoint, "testapp", "staging", state.Apply.Completed, 5*time.Minute)
+	testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, 5*time.Minute)
 
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
 }
@@ -347,8 +342,8 @@ func TestGRPCCLI_Progress_ByApplyID(t *testing.T) {
 	applyID := parseApplyID(t, out)
 	t.Logf("captured apply ID: %s", applyID)
 
-	// Wait for completion via database/environment polling
-	testutil.WaitForState(t, endpoint, "testapp", "staging", state.Apply.Completed, 3*time.Minute)
+	// Wait for completion via apply ID polling
+	testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, 3*time.Minute)
 
 	// Now fetch progress by apply ID
 	out = e2eutil.RunCLIInDir(t, bin, schemaDir, "progress",
@@ -398,9 +393,10 @@ func TestGRPCCLI_PlanApply_Production(t *testing.T) {
 		"--watch=false",
 	)
 	e2eutil.AssertContains(t, out, "Apply started")
+	applyID := parseApplyID(t, out)
 
-	// Wait for completion via CLI
-	testutil.WaitForState(t, endpoint, "testapp", "production", state.Apply.Completed, 3*time.Minute)
+	// Wait for completion via apply ID polling
+	testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, 3*time.Minute)
 
 	// Verify column exists via direct MySQL
 	assert.True(t, grpcColumnExists(t, "production", tableName, colName),

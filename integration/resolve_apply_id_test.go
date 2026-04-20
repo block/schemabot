@@ -174,7 +174,7 @@ func TestResolveApplyID_ControlOperations(t *testing.T) {
 	})
 
 	// 9. Wait for completion.
-	waitForState(t, baseURL, appDBName, "staging", "completed", 3*time.Minute)
+	waitForState(t, baseURL, applyIdentifier, "completed", 3*time.Minute)
 
 	// 10. Verify the table was actually created.
 	testdbDSN := strings.Replace(targetDSN, "/target_test", "/testdb", 1)

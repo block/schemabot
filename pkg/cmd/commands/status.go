@@ -70,7 +70,7 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 
 // showApplyByID shows details for a specific apply by its ID.
 func showApplyByID(endpoint, applyID string, outputJSON bool) error {
-	result, err := client.GetProgressByApplyID(endpoint, applyID)
+	result, err := client.GetProgress(endpoint, applyID)
 	if err != nil {
 		if client.IsNotFound(err) {
 			fmt.Printf("No schema change found for apply '%s'\n", applyID)

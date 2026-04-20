@@ -7,7 +7,8 @@ import (
 	"github.com/block/schemabot/pkg/cmd/templates"
 )
 
-// ProgressCmd gets schema change progress for a database.
+// ProgressCmd watches schema change progress for a specific apply.
+// Use "schemabot status -d <database> -e <env>" to check what's active on a database.
 type ProgressCmd struct {
 	ControlFlags
 	Watch bool `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
@@ -16,12 +17,7 @@ type ProgressCmd struct {
 // Run executes the progress command.
 func (cmd *ProgressCmd) Run(g *Globals) error {
 	if cmd.ApplyID == "" {
-		if cmd.Database == "" {
-			return fmt.Errorf("--database is required (or use --apply-id)")
-		}
-		if cmd.Environment == "" {
-			return fmt.Errorf("--environment is required (or use --apply-id)")
-		}
+		return fmt.Errorf("--apply-id is required (use 'schemabot status -d <database>' to find active applies)")
 	}
 
 	ep, err := g.Resolve()
@@ -29,34 +25,16 @@ func (cmd *ProgressCmd) Run(g *Globals) error {
 		return err
 	}
 
-	// Apply ID path
-	if cmd.ApplyID != "" {
-		if cmd.Watch {
-			return WatchApplyProgressByApplyID(ep, cmd.ApplyID, true)
-		}
-
-		result, err := client.GetProgressByApplyID(ep, cmd.ApplyID)
-		if err != nil {
-			return err
-		}
-
-		data := templates.ParseProgressResponse(result)
-		templates.WriteProgress(data)
-		return nil
-	}
-
-	// Database + environment path
 	if cmd.Watch {
-		return WatchApplyProgress(ep, cmd.Database, cmd.Environment, true)
+		return WatchApplyProgressByApplyID(ep, cmd.ApplyID, true)
 	}
 
-	result, err := client.GetProgress(ep, cmd.Database, cmd.Environment)
+	result, err := client.GetProgress(ep, cmd.ApplyID)
 	if err != nil {
 		return err
 	}
 
 	data := templates.ParseProgressResponse(result)
 	templates.WriteProgress(data)
-
 	return nil
 }

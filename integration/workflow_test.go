@@ -253,7 +253,7 @@ func TestFullWorkflow_Spirit_PlanApplyVerify(t *testing.T) {
 	t.Log("Apply accepted", "apply_id", applyID)
 
 	// Wait for this specific apply to complete
-	waitForStateByApplyID(t, "http://"+ts.Addr, applyID, "completed", 10*time.Second)
+	waitForState(t, "http://"+ts.Addr, applyID, "completed", 10*time.Second)
 
 	// Step 3: Verify the table exists in the target database
 	targetConn, err := sql.Open("mysql", appDSN)
@@ -359,7 +359,7 @@ func TestFullWorkflow_Spirit_DDLScenarios(t *testing.T) {
 		require.NotEmpty(t, applyID, "apply response missing apply_id: %v", applyResp)
 
 		// Wait for this specific apply to complete (not just any apply for the database).
-		waitForStateByApplyID(t, "http://"+ts.Addr, applyID, "completed", 10*time.Second)
+		waitForState(t, "http://"+ts.Addr, applyID, "completed", 10*time.Second)
 		return planResp
 	}
 
@@ -856,7 +856,7 @@ func TestCLI_PlanApply(t *testing.T) {
 		require.NotEmpty(t, applyID, "apply response missing apply_id")
 
 		// Step 3: Wait for this specific apply to complete
-		waitForStateByApplyID(t, endpoint, applyID, "completed", 30*time.Second)
+		waitForState(t, endpoint, applyID, "completed", 30*time.Second)
 
 		// Step 4: Verify table was created
 		var tableName string
