@@ -29,14 +29,15 @@ type WatchModel struct {
 	currentVolume int // Current volume (1-11)
 
 	// UI state
-	detached       bool
-	quitting       bool
-	spinner        spinner.Model
-	startedAt      time.Time
-	initialized    bool
-	volumeMode     bool // True when in volume adjustment mode
-	volumePending  int  // Pending volume change (0 = none)
-	volumeChanging bool // True while volume change is in progress
+	detached          bool
+	quitting          bool
+	spinner           spinner.Model
+	startedAt         time.Time
+	initialized       bool
+	volumeMode        bool // True when in volume adjustment mode
+	volumePending     int  // Pending volume change (0 = none)
+	volumeChanging    bool // True while volume change is in progress
+	consecutiveErrors int  // Consecutive fetch failures (drives backoff)
 }
 
 // tableProgress represents progress for a single table.
@@ -54,11 +55,17 @@ type tableProgress struct {
 // Messages
 type tickMsg time.Time
 
+// Error codes for progressMsg.errorCode.
+const (
+	errRetryable = "retryable" // 5xx, connection refused, timeout — retry with backoff
+	errPermanent = "permanent" // 4xx: bad request, not found — don't retry
+)
+
 type progressMsg struct {
 	state       string
 	tables      []tableProgress
-	errorMsg    string
-	fetchErr    bool // true when the API call itself failed (connection, timeout, HTTP error)
+	errorMsg    string // Human-readable error message
+	errorCode   string // "" on success, errRetryable or errPermanent on fetch failure
 	volume      int
 	applyID     string // Populated from progress responses
 	database    string // Populated from apply-id progress responses
@@ -159,15 +166,22 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchProgress(), m.tick())
 
 	case progressMsg:
-		// API call failed (connection refused, timeout, HTTP error, bad JSON).
-		// Preserve last known state and tables, show the error, keep polling.
-		// Don't mark as initialized or set a terminal state — we don't know
-		// whether the apply succeeded, failed, or is still running.
-		if msg.fetchErr {
+		switch msg.errorCode {
+		case errRetryable:
+			// 5xx, connection refused, timeout, DNS failure.
+			// Preserve last known state and tables, keep polling with backoff.
+			m.consecutiveErrors++
 			m.errorMsg = msg.errorMsg
 			return m, nil
+		case errPermanent:
+			// 4xx: bad request, not found, etc. Retrying won't help.
+			m.errorMsg = msg.errorMsg
+			m.initialized = true
+			return m, tea.Quit
 		}
 
+		m.consecutiveErrors = 0
+		m.errorMsg = ""
 		m.state = msg.state
 		// Preserve last known tables during volume change to avoid visual reset
 		if !m.volumeChanging || len(m.tables) == 0 {

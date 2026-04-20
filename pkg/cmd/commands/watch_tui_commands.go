@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -18,8 +19,21 @@ import (
 
 // Commands (async operations)
 
+// pollInterval is the base polling interval between progress fetches.
+const pollInterval = 2 * time.Second
+
+// maxPollInterval is the ceiling for exponential backoff on consecutive errors.
+const maxPollInterval = 30 * time.Second
+
 func (m WatchModel) tick() tea.Cmd {
-	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+	d := pollInterval
+	if m.consecutiveErrors > 0 {
+		d = pollInterval << min(m.consecutiveErrors, 4) // 4s, 8s, 16s, 32→30s cap
+		if d > maxPollInterval {
+			d = maxPollInterval
+		}
+	}
+	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
 }
@@ -34,7 +48,12 @@ func (m WatchModel) fetchProgress() tea.Cmd {
 			result, err = client.GetProgress(m.endpoint, m.database, m.environment)
 		}
 		if err != nil {
-			return progressMsg{errorMsg: err.Error(), fetchErr: true}
+			code := errRetryable
+			var apiErr *client.APIError
+			if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+				code = errPermanent
+			}
+			return progressMsg{errorMsg: err.Error(), errorCode: code}
 		}
 
 		return parseProgressResult(result)

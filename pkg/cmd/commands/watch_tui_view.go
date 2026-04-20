@@ -21,15 +21,20 @@ func (m WatchModel) View() string {
 		return ""
 	}
 
-	// Show spinner until we have data. If there's a connection error,
+	// Show spinner until we have data. If there's a fetch error,
 	// display it below the spinner so the user knows why it's still loading.
 	if !m.initialized {
 		s := m.spinner.View() + "Loading...\n"
 		if m.errorMsg != "" {
-			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-			s += errStyle.Render("Error: "+m.errorMsg) + "\n"
+			s += m.fetchErrorLine()
 		}
 		return s
+	}
+
+	// Permanent API error (4xx). Show the error and exit.
+	if m.errorMsg != "" && m.state == "" {
+		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+		return errStyle.Render("Error: "+m.errorMsg) + "\n"
 	}
 
 	// Handle no active schema change
@@ -157,15 +162,25 @@ func (m WatchModel) progressView() string {
 		b.WriteString("\n")
 	}
 
-	// Error message if present
-	if m.errorMsg != "" {
+	// Fetch error during active progress (mid-flight). State and tables are
+	// preserved from the last successful poll; the error tells the user
+	// the server is currently unreachable.
+	if m.errorMsg != "" && m.consecutiveErrors > 0 {
 		b.WriteString("\n")
-		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-		b.WriteString(errStyle.Render("Error: " + m.errorMsg))
-		b.WriteString("\n")
+		b.WriteString(m.fetchErrorLine())
 	}
 
 	return b.String()
+}
+
+// fetchErrorLine formats the fetch error with consecutive failure count.
+func (m WatchModel) fetchErrorLine() string {
+	errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	label := "Error"
+	if m.consecutiveErrors > 1 {
+		label = fmt.Sprintf("Error (attempt %d)", m.consecutiveErrors)
+	}
+	return errStyle.Render(label+": "+m.errorMsg) + "\n"
 }
 
 // renderTable renders a single table's progress.

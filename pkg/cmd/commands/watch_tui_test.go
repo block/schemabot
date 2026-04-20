@@ -28,7 +28,7 @@ func TestFetchProgress_ServerReturns500_ReturnsError(t *testing.T) {
 	pmsg, ok := msg.(progressMsg)
 	require.True(t, ok, "expected progressMsg, got %T", msg)
 	assert.Empty(t, pmsg.state, "fetchProgress should not set state on error")
-	assert.True(t, pmsg.fetchErr, "fetchProgress should set fetchErr on HTTP error")
+	assert.Equal(t, errRetryable, pmsg.errorCode, "5xx should be classified as transient")
 	assert.Contains(t, pmsg.errorMsg, "500")
 }
 
@@ -46,7 +46,7 @@ func TestFetchProgress_ServerReturnsNoActiveChange(t *testing.T) {
 	pmsg, ok := msg.(progressMsg)
 	require.True(t, ok, "expected progressMsg, got %T", msg)
 	assert.Equal(t, state.NoActiveChange, pmsg.state)
-	assert.False(t, pmsg.fetchErr, "successful response should not set fetchErr")
+	assert.Empty(t, pmsg.errorCode, "successful response should not set errorCode")
 	assert.Empty(t, pmsg.errorMsg)
 }
 
@@ -99,11 +99,11 @@ func TestWatchModel_MidFlightError_PreservesLastState(t *testing.T) {
 	assert.True(t, m.initialized)
 	assert.Equal(t, state.Apply.Running, m.state)
 
-	// Second: server crashes — API call fails (fetchErr distinguishes this
+	// Second: server crashes — API call fails (errorCode distinguishes this
 	// from a server response that happens to have an empty state).
 	errorMsg := progressMsg{
-		errorMsg: "500: connection refused",
-		fetchErr: true,
+		errorMsg:  "500: connection refused",
+		errorCode: errRetryable,
 	}
 	updated, cmd := m.Update(errorMsg)
 	m = updated.(WatchModel)
@@ -136,8 +136,8 @@ func TestWatchModel_ConnectionError_CanEscape(t *testing.T) {
 	// User should be able to ESC out of the loading+error state.
 	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
 
-	// Simulate fetch error (API call failed).
-	updated, _ := m.Update(progressMsg{errorMsg: "connection refused", fetchErr: true})
+	// Simulate transient fetch error (API call failed).
+	updated, _ := m.Update(progressMsg{errorMsg: "connection refused", errorCode: errRetryable})
 	m = updated.(WatchModel)
 	assert.False(t, m.initialized)
 
@@ -165,6 +165,63 @@ func TestWatchModel_ServerErrorWithState_TreatedAsRealResponse(t *testing.T) {
 	assert.Equal(t, state.Apply.Failed, model.state)
 	assert.Contains(t, model.errorMsg, "checksum mismatch")
 	assert.NotNil(t, cmd, "terminal state should return tea.Quit")
+}
+
+func TestFetchProgress_ServerReturns404_PermanentError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = fmt.Fprint(w, `{"error":"apply not found"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	m := NewWatchModel(srv.URL, "testdb", "staging", false)
+	cmd := m.fetchProgress()
+	msg := cmd()
+
+	pmsg, ok := msg.(progressMsg)
+	require.True(t, ok, "expected progressMsg, got %T", msg)
+	assert.Equal(t, errPermanent, pmsg.errorCode, "4xx should be classified as permanent")
+	assert.Contains(t, pmsg.errorMsg, "apply not found")
+}
+
+func TestWatchModel_PermanentError_QuitsImmediately(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+
+	msg := progressMsg{
+		errorMsg:  "apply not found",
+		errorCode: errPermanent,
+	}
+	updated, cmd := m.Update(msg)
+	model := updated.(WatchModel)
+
+	assert.True(t, model.initialized, "permanent error should mark as initialized so view renders")
+	assert.Contains(t, model.errorMsg, "apply not found")
+	assert.NotNil(t, cmd, "permanent error should return tea.Quit")
+
+	view := model.View()
+	assert.Contains(t, view, "apply not found")
+	assert.NotContains(t, view, "Loading")
+}
+
+func TestWatchModel_ConsecutiveErrors_IncrementCounter(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+
+	// Three consecutive transient errors.
+	for i := 1; i <= 3; i++ {
+		updated, cmd := m.Update(progressMsg{
+			errorMsg:  "connection refused",
+			errorCode: errRetryable,
+		})
+		m = updated.(WatchModel)
+		assert.Equal(t, i, m.consecutiveErrors)
+		assert.Nil(t, cmd)
+	}
+
+	// Successful poll resets the counter.
+	updated, _ := m.Update(progressMsg{state: state.Apply.Running})
+	m = updated.(WatchModel)
+	assert.Equal(t, 0, m.consecutiveErrors)
+	assert.Empty(t, m.errorMsg, "error should be cleared on success")
 }
 
 func TestGetProgress_ServerReturns500_CLIReturnsError(t *testing.T) {
