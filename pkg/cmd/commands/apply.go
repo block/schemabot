@@ -27,12 +27,20 @@ type ApplyCmd struct {
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
 	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
 	Yield        bool          `help:"Yield lock after successful completion"`
+	NoLock       bool          `help:"Don't hold a database lock during the operation" name:"no-lock"`
 	Output       OutputFormat  `short:"o" help:"Output format" default:"interactive" enum:"interactive,log,json"`
 	LogHeartbeat time.Duration `help:"Interval between progress heartbeats in log mode" default:"10s" name:"log-heartbeat"`
 }
 
 // Run executes the apply command.
 func (cmd *ApplyCmd) Run(g *Globals) error {
+	if cmd.NoLock && cmd.Force {
+		return fmt.Errorf("--force requires locking to break an existing lock; remove --no-lock to use it")
+	}
+	if cmd.NoLock && cmd.Yield {
+		return fmt.Errorf("--yield requires locking to release after completion; remove --no-lock to use it")
+	}
+
 	// Load config from schema directory
 	cfg, err := LoadCLIConfig(cmd.SchemaDir)
 	if err != nil {
@@ -113,8 +121,8 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir)
 	}
 
-	// Check lock availability before showing plan (unless --force will break it anyway)
-	if !cmd.Force {
+	// Check lock availability before showing plan (unless --force will break it anyway or --no-lock skips locking)
+	if !cmd.NoLock && !cmd.Force {
 		existingLock, err := client.GetLock(ep, cfg.Database, cfg.Type)
 		if err != nil {
 			return fmt.Errorf("check lock: %w", err)
@@ -159,46 +167,48 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Step 4: Acquire lock and apply the plan
 
-	// If --force, break any existing lock first
-	if cmd.Force {
-		existingLock, err := client.GetLock(ep, cfg.Database, cfg.Type)
-		if err != nil {
-			return fmt.Errorf("check existing lock: %w", err)
-		}
-		if existingLock != nil && existingLock.Owner != owner {
-			if err := client.ForceReleaseLock(ep, cfg.Database, cfg.Type); err != nil {
-				return fmt.Errorf("force release lock: %w", err)
+	if !cmd.NoLock {
+		// If --force, break any existing lock first
+		if cmd.Force {
+			existingLock, err := client.GetLock(ep, cfg.Database, cfg.Type)
+			if err != nil {
+				return fmt.Errorf("check existing lock: %w", err)
 			}
-			templates.WriteLockForceReleased(cfg.Database, cfg.Type, existingLock.Owner)
+			if existingLock != nil && existingLock.Owner != owner {
+				if err := client.ForceReleaseLock(ep, cfg.Database, cfg.Type); err != nil {
+					return fmt.Errorf("force release lock: %w", err)
+				}
+				templates.WriteLockForceReleased(cfg.Database, cfg.Type, existingLock.Owner)
+			}
 		}
-	}
 
-	// Acquire the lock
-	_, err = client.AcquireLock(ep, cfg.Database, cfg.Type, owner, cmd.Repository, cmd.PullRequest)
-	if errors.Is(err, client.ErrLockHeld) {
-		// Lock is held by someone else - show conflict message
-		existingLock, getErr := client.GetLock(ep, cfg.Database, cfg.Type)
-		if getErr != nil || existingLock == nil {
-			return fmt.Errorf("database is locked by another user")
+		// Acquire the lock
+		_, err = client.AcquireLock(ep, cfg.Database, cfg.Type, owner, cmd.Repository, cmd.PullRequest)
+		if errors.Is(err, client.ErrLockHeld) {
+			// Lock is held by someone else - show conflict message
+			existingLock, getErr := client.GetLock(ep, cfg.Database, cfg.Type)
+			if getErr != nil || existingLock == nil {
+				return fmt.Errorf("database is locked by another user")
+			}
+			templates.WriteLockConflict(templates.LockConflictData{
+				Database:     cfg.Database,
+				DatabaseType: cfg.Type,
+				Owner:        existingLock.Owner,
+				Repository:   existingLock.Repository,
+				PullRequest:  existingLock.PullRequest,
+				CreatedAt:    existingLock.CreatedAt,
+			})
+			return fmt.Errorf("database is locked")
 		}
-		templates.WriteLockConflict(templates.LockConflictData{
+		if err != nil {
+			return fmt.Errorf("acquire lock: %w", err)
+		}
+		templates.WriteLockAcquired(templates.LockData{
 			Database:     cfg.Database,
 			DatabaseType: cfg.Type,
-			Owner:        existingLock.Owner,
-			Repository:   existingLock.Repository,
-			PullRequest:  existingLock.PullRequest,
-			CreatedAt:    existingLock.CreatedAt,
+			Owner:        owner,
 		})
-		return fmt.Errorf("database is locked")
 	}
-	if err != nil {
-		return fmt.Errorf("acquire lock: %w", err)
-	}
-	templates.WriteLockAcquired(templates.LockData{
-		Database:     cfg.Database,
-		DatabaseType: cfg.Type,
-		Owner:        owner,
-	})
 
 	fmt.Println("\nApplying changes...")
 
@@ -207,7 +217,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	}
 
 	// Yield lock if requested and apply was successful
-	if cmd.Yield {
+	if cmd.Yield && !cmd.NoLock {
 		if err := client.ReleaseLock(ep, cfg.Database, cfg.Type, owner); err != nil {
 			fmt.Printf("Warning: failed to release lock: %v\n", err)
 		} else {
