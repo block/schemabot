@@ -129,9 +129,13 @@ func resolveEndpoint(endpoint, profile string, database ...string) (string, erro
 	// Skip if an explicit endpoint is provided — that always wins.
 	activeProfile := profile
 	if activeProfile == "" && endpoint == "" {
-		cfg, err := client.LoadConfig()
-		if err == nil && cfg.DefaultProfile == LocalProfile {
-			activeProfile = LocalProfile
+		if envProfile := os.Getenv("SCHEMABOT_PROFILE"); envProfile != "" {
+			activeProfile = envProfile
+		} else {
+			cfg, err := client.LoadConfig()
+			if err == nil && cfg.DefaultProfile != "" {
+				activeProfile = cfg.DefaultProfile
+			}
 		}
 	}
 
@@ -369,7 +373,7 @@ func printWatchInstructions(applyID, database, environment string) {
 func tryLocalMode(database string) (string, error) {
 	cfg, err := local.LoadCLIConfig()
 	if err != nil {
-		return "", nil
+		return "", fmt.Errorf("load local config: %w", err)
 	}
 	if len(cfg.Local) == 0 {
 		return "", nil
@@ -378,14 +382,16 @@ func tryLocalMode(database string) (string, error) {
 	// If a specific database is given, check it exists in local config.
 	// If no database given, use any local database (for commands like status, locks).
 	var db local.LocalDatabase
-	if database != "" {
-		found, ok := cfg.Local[database]
+	selectedDB := database
+	if selectedDB != "" {
+		found, ok := cfg.Local[selectedDB]
 		if !ok {
 			return "", nil
 		}
 		db = found
 	} else {
-		for _, found := range cfg.Local {
+		for name, found := range cfg.Local {
+			selectedDB = name
 			db = found
 			break
 		}
@@ -398,7 +404,7 @@ func tryLocalMode(database string) (string, error) {
 		if env.DSN != "" {
 			resolved, resolveErr := secrets.Resolve(env.DSN, "")
 			if resolveErr != nil {
-				return "", fmt.Errorf("resolve DSN for %s/%s: %w", database, envName, resolveErr)
+				return "", fmt.Errorf("resolve DSN for %s/%s: %w", selectedDB, envName, resolveErr)
 			}
 			env.DSN = resolved
 		}
@@ -406,5 +412,5 @@ func tryLocalMode(database string) (string, error) {
 	}
 
 	ctx := context.Background()
-	return local.EnsureRunning(ctx, database, resolvedDB)
+	return local.EnsureRunning(ctx, selectedDB, resolvedDB)
 }

@@ -15,7 +15,7 @@ import (
 
 	"database/sql"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/spirit/pkg/utils"
@@ -51,6 +51,20 @@ func GetStorageDSN() string {
 	return "root@tcp(" + defaultMySQLAddr + ")/" + StorageDatabase + "?parseTime=true"
 }
 
+// RedactedStorageDSN returns a display-safe version of the storage DSN
+// with the password masked. Used for status output.
+func RedactedStorageDSN() string {
+	dsn := GetStorageDSN()
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "(configured via SCHEMABOT_LOCAL_STORAGE_DSN)"
+	}
+	if cfg.Passwd != "" {
+		cfg.Passwd = "***"
+	}
+	return cfg.FormatDSN()
+}
+
 // getServerDSN returns the DSN for bootstrapping (no database selected).
 func getServerDSN() string {
 	if dsn := os.Getenv("SCHEMABOT_LOCAL_STORAGE_DSN"); dsn != "" {
@@ -61,18 +75,15 @@ func getServerDSN() string {
 }
 
 // stripDatabaseFromDSN removes the database name from a DSN, keeping auth and params.
+// Uses mysql.ParseDSN to handle all DSN formats correctly (including unix socket paths).
 func stripDatabaseFromDSN(dsn string) string {
-	// DSN format: user:pass@tcp(host:port)/dbname?params
-	slashIdx := strings.LastIndex(dsn, "/")
-	if slashIdx < 0 {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		slog.Warn("failed to parse DSN, returning as-is", "error", err)
 		return dsn
 	}
-	// Keep everything before the slash + the slash, drop dbname but keep ?params
-	rest := dsn[slashIdx+1:]
-	if qIdx := strings.Index(rest, "?"); qIdx >= 0 {
-		return dsn[:slashIdx+1] + rest[qIdx:]
-	}
-	return dsn[:slashIdx+1]
+	cfg.DBName = ""
+	return cfg.FormatDSN()
 }
 
 // EnsureRunning checks if the local server is running and starts it if not.
@@ -196,13 +207,20 @@ func killStaleServer() {
 
 // findProcessOnPort returns the PID of the process listening on the given port,
 // or 0 if no process is found. Uses lsof (macOS/Linux only).
+// Restricts to LISTEN state to avoid matching client connections.
 func findProcessOnPort(port string) int {
-	out, err := exec.CommandContext(context.Background(), "lsof", "-ti", "tcp:"+port).Output()
+	out, err := exec.CommandContext(context.Background(), "lsof", "-ti", "tcp:"+port, "-sTCP:LISTEN").Output()
 	if err != nil {
 		return 0
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	// lsof may return multiple lines; take only the first PID.
+	line := strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0]
+	if line == "" {
+		return 0
+	}
+	pid, err := strconv.Atoi(line)
 	if err != nil {
+		slog.Debug("failed to parse PID from lsof output", "output", line, "error", err)
 		return 0
 	}
 	return pid
@@ -222,16 +240,22 @@ func isProcessRunning(pid int) bool {
 // and accessible with the storage DSN.
 func checkLocalMySQL(ctx context.Context) error {
 	serverDSN := getServerDSN()
+	addr := defaultMySQLAddr
+	// Parse the DSN to get the actual address for error messages.
+	if cfg, err := mysql.ParseDSN(serverDSN); err == nil && cfg.Addr != "" {
+		addr = cfg.Addr
+	}
+
 	db, err := sql.Open("mysql", serverDSN)
 	if err != nil {
-		return fmt.Errorf("local mode requires MySQL on localhost:3306 — is MySQL running?\n\n  Install: https://dev.mysql.com/downloads/ or `brew install mysql`\n  Start:   mysql.server start")
+		return fmt.Errorf("local mode requires MySQL on %s — is MySQL running?\n\n  Install: https://dev.mysql.com/downloads/ or `brew install mysql`\n  Start:   mysql.server start", addr)
 	}
 	defer utils.CloseAndLog(db)
 	if err := db.PingContext(ctx); err != nil {
 		if strings.Contains(err.Error(), "Access denied") {
-			return fmt.Errorf("local mode cannot connect to MySQL: %w\n\nSchemaBot connects as root with no password for local storage.\nCheck your MySQL user configuration or grant access", err)
+			return fmt.Errorf("local mode cannot connect to MySQL at %s: %w\n\nCheck your MySQL user configuration or override with SCHEMABOT_LOCAL_STORAGE_DSN", addr, err)
 		}
-		return fmt.Errorf("local mode requires MySQL on localhost:3306 — is MySQL running?\n\n  Install: https://dev.mysql.com/downloads/ or `brew install mysql`\n  Start:   mysql.server start")
+		return fmt.Errorf("local mode requires MySQL on %s — is MySQL running?\n\n  Install: https://dev.mysql.com/downloads/ or `brew install mysql`\n  Start:   mysql.server start", addr)
 	}
 	return nil
 }

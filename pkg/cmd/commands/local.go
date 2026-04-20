@@ -22,7 +22,7 @@ func (cmd *LocalStatusCmd) Run(g *Globals) error {
 	if local.IsRunning(ctx) {
 		pid := local.ReadPID()
 		fmt.Printf("Local server: running (PID %d, port %s)\n", pid, local.GetServerPort())
-		fmt.Printf("Storage: localhost:3306/%s\n", local.StorageDatabase)
+		fmt.Printf("Storage: %s\n", local.RedactedStorageDSN())
 		fmt.Printf("Logs: ~/.schemabot/server.log\n")
 	} else {
 		fmt.Println("Local server: not running")

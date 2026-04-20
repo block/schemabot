@@ -17,7 +17,7 @@ Use the CLI to manage schema changes on any MySQL database you can connect to. T
 
 ```bash
 # Install
-go install github.com/block/schemabot@latest
+go install github.com/block/schemabot/pkg/cmd@latest
 
 # Start local mysql on port 3306 if not running
 brew install mysql && mysql.server start
