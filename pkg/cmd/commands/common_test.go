@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/e2eutil"
 )
 
@@ -55,4 +56,103 @@ func TestLoadCLIConfig_WithDeployment(t *testing.T) {
 
 	assert.Equal(t, "mydb", cfg.Database)
 	assert.Equal(t, "us-west", cfg.Deployment)
+}
+
+func TestResolveEndpoint_ExplicitEndpoint(t *testing.T) {
+	ep, err := resolveEndpoint("http://myserver:8080", "", "mydb")
+	require.NoError(t, err)
+	assert.Equal(t, "http://myserver:8080", ep)
+}
+
+func TestResolveEndpoint_ExplicitProfile(t *testing.T) {
+	// Set up a temp config with a profile
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	configDir := filepath.Join(tmpDir, ".schemabot")
+	require.NoError(t, os.MkdirAll(configDir, 0700))
+
+	cfg := &client.Config{
+		Profiles: map[string]client.Profile{
+			"staging": {Endpoint: "http://staging:8080"},
+		},
+	}
+	require.NoError(t, client.SaveConfig(cfg))
+
+	ep, err := resolveEndpoint("", "staging", "mydb")
+	require.NoError(t, err)
+	assert.Equal(t, "http://staging:8080", ep)
+}
+
+func TestResolveEndpoint_DefaultProfileLocal(t *testing.T) {
+	// Set up config with default_profile: local and a local database
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	configDir := filepath.Join(tmpDir, ".schemabot")
+	require.NoError(t, os.MkdirAll(configDir, 0700))
+
+	// Write config with default_profile: local
+	configContent := "default_profile: local\nprofiles:\n  staging:\n    endpoint: http://staging:8080\n"
+	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(configContent), 0600))
+
+	// resolveEndpoint with no explicit flags should detect local profile.
+	// No local databases configured, so it errors with a local-mode-specific message.
+	_, err := resolveEndpoint("", "", "testdb")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "local mode")
+}
+
+func TestResolveEndpoint_ProfileLocalExplicit(t *testing.T) {
+	// --profile local should trigger local mode even if default profile is different
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	configDir := filepath.Join(tmpDir, ".schemabot")
+	require.NoError(t, os.MkdirAll(configDir, 0700))
+
+	cfg := &client.Config{
+		DefaultProfile: "staging",
+		Profiles: map[string]client.Profile{
+			"staging": {Endpoint: "http://staging:8080"},
+		},
+	}
+	require.NoError(t, client.SaveConfig(cfg))
+
+	// --profile local, even though default is staging
+	_, err := resolveEndpoint("", "local", "testdb")
+	// Should attempt local mode, not use the staging endpoint
+	assert.NotContains(t, err.Error(), "staging")
+}
+
+func TestResolveEndpoint_EndpointOverridesLocalProfile(t *testing.T) {
+	// Explicit --endpoint should override everything, even if default is local
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	configDir := filepath.Join(tmpDir, ".schemabot")
+	require.NoError(t, os.MkdirAll(configDir, 0700))
+
+	configContent := "default_profile: local\n"
+	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.yaml"), []byte(configContent), 0600))
+
+	ep, err := resolveEndpoint("http://explicit:9090", "", "mydb")
+	require.NoError(t, err)
+	assert.Equal(t, "http://explicit:9090", ep)
+}
+
+func TestResolveEndpoint_ProfileOverridesDefaultLocal(t *testing.T) {
+	// --profile staging overrides default_profile: local
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+	configDir := filepath.Join(tmpDir, ".schemabot")
+	require.NoError(t, os.MkdirAll(configDir, 0700))
+
+	cfg := &client.Config{
+		DefaultProfile: "local",
+		Profiles: map[string]client.Profile{
+			"staging": {Endpoint: "http://staging:8080"},
+		},
+	}
+	require.NoError(t, client.SaveConfig(cfg))
+
+	ep, err := resolveEndpoint("", "staging", "mydb")
+	require.NoError(t, err)
+	assert.Equal(t, "http://staging:8080", ep)
 }

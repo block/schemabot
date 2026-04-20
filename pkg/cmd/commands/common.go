@@ -3,6 +3,7 @@ package commands
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/local"
+	"github.com/block/schemabot/pkg/secrets"
 )
 
 // Globals holds flags shared by all commands.
@@ -30,8 +33,9 @@ type Globals struct {
 }
 
 // Resolve resolves the API endpoint from the global flags.
-func (g *Globals) Resolve() (string, error) {
-	return resolveEndpoint(g.Endpoint, g.Profile)
+// Pass an optional database name to enable local mode detection.
+func (g *Globals) Resolve(database ...string) (string, error) {
+	return resolveEndpoint(g.Endpoint, g.Profile, database...)
 }
 
 // ControlFlags holds flags for commands that target a specific schema change.
@@ -112,16 +116,52 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	return &cfg, nil
 }
 
-// resolveEndpoint resolves the API endpoint from explicit flag or profile config.
-func resolveEndpoint(endpoint, profile string) (string, error) {
+// LocalProfile is the reserved profile name that triggers local mode.
+// Use `--profile local` or set `default_profile: local` in config.
+const LocalProfile = "local"
+
+// resolveEndpoint resolves the SchemaBot API endpoint.
+// Local mode activates when:
+//   - --profile local (or default_profile: local)
+//   - No explicit endpoint/profile and the database is in the local config section
+func resolveEndpoint(endpoint, profile string, database ...string) (string, error) {
+	// Resolve which profile is active (explicit flag, env var, or default).
+	// Skip if an explicit endpoint is provided — that always wins.
+	activeProfile := profile
+	if activeProfile == "" && endpoint == "" {
+		cfg, err := client.LoadConfig()
+		if err == nil && cfg.DefaultProfile == LocalProfile {
+			activeProfile = LocalProfile
+		}
+	}
+
+	// Local mode: explicit --profile local, or database found in local config
+	if activeProfile == LocalProfile || (endpoint == "" && profile == "" && len(database) > 0 && database[0] != "") {
+		db := ""
+		if len(database) > 0 {
+			db = database[0]
+		}
+		localEP, err := tryLocalMode(db)
+		if err != nil {
+			return "", err
+		}
+		if localEP != "" {
+			return localEP, nil
+		}
+		if activeProfile == LocalProfile {
+			return "", fmt.Errorf("local mode: no databases configured — run 'schemabot pull' first")
+		}
+	}
+
 	ep, err := client.ResolveEndpointWithProfile(endpoint, profile)
 	if err != nil {
 		return "", fmt.Errorf("resolve endpoint: %w", err)
 	}
-	if ep == "" {
-		return "", fmt.Errorf("no endpoint configured (run 'schemabot configure' to set up a profile)")
+	if ep != "" {
+		return ep, nil
 	}
-	return ep, nil
+
+	return "", fmt.Errorf("no endpoint configured — run 'schemabot pull' to set up local mode, or 'schemabot configure' for a remote server")
 }
 
 // resolveApplyID resolves an apply ID to database and environment by calling the progress API.
@@ -244,7 +284,7 @@ func autoResolveApplyID(applyID *string, progressResult *apitypes.ProgressRespon
 // common control command flags (endpoint, profile, applyID, database, environment).
 // Returns the resolved endpoint.
 func resolveControlFlags(endpoint, profile string, applyID, database, environment *string) (string, error) {
-	ep, err := resolveEndpoint(endpoint, profile)
+	ep, err := resolveEndpoint(endpoint, profile, *database)
 	if err != nil {
 		return "", err
 	}
@@ -321,4 +361,50 @@ func printWatchInstructions(applyID, database, environment string) {
 	} else {
 		fmt.Printf("To watch and manage: schemabot progress -d %s -e %s\n", database, environment)
 	}
+}
+
+// tryLocalMode checks if the given database (or any database if empty) is
+// configured in the local section of ~/.schemabot/config.yaml. If so, ensures
+// the background server is running and returns the endpoint.
+func tryLocalMode(database string) (string, error) {
+	cfg, err := local.LoadCLIConfig()
+	if err != nil {
+		return "", nil
+	}
+	if len(cfg.Local) == 0 {
+		return "", nil
+	}
+
+	// If a specific database is given, check it exists in local config.
+	// If no database given, use any local database (for commands like status, locks).
+	var db local.LocalDatabase
+	if database != "" {
+		found, ok := cfg.Local[database]
+		if !ok {
+			return "", nil
+		}
+		db = found
+	} else {
+		for _, found := range cfg.Local {
+			db = found
+			break
+		}
+	}
+
+	// Resolve secret refs in all environment DSNs
+	resolvedDB := db
+	resolvedDB.Environments = make(map[string]local.LocalEnvironment, len(db.Environments))
+	for envName, env := range db.Environments {
+		if env.DSN != "" {
+			resolved, resolveErr := secrets.Resolve(env.DSN, "")
+			if resolveErr != nil {
+				return "", fmt.Errorf("resolve DSN for %s/%s: %w", database, envName, resolveErr)
+			}
+			env.DSN = resolved
+		}
+		resolvedDB.Environments[envName] = env
+	}
+
+	ctx := context.Background()
+	return local.EnsureRunning(ctx, database, resolvedDB)
 }

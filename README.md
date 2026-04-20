@@ -11,6 +11,32 @@ SchemaBot provides a fully interactive CLI for planning, applying, and monitorin
 
 ![SchemaBot CLI Demo](./docs/assets/cli-demo.gif)
 
+### Quick start
+
+Use the CLI to manage schema changes on any MySQL database you can connect to. The `--dsn` flag accepts any MySQL connection string — local, remote, RDS, etc. Schema changes are applied online using [Spirit](https://github.com/block/spirit) — reads and writes continue uninterrupted during the change.
+
+```bash
+# Install
+go install github.com/block/schemabot@latest
+
+# Start local mysql on port 3306 if not running
+brew install mysql && mysql.server start
+
+# Ensure $GOPATH/bin is on your PATH
+export PATH="$PATH:$(go env GOPATH)/bin"
+
+# Pull your existing schema into a declarative schema directory
+schemabot pull --dsn "root@tcp(localhost:3306)/mydb" -e staging -o ./schema
+
+# Edit a .sql file, then plan and apply
+schemabot plan -s ./schema -e staging
+schemabot apply -s ./schema -e staging
+```
+
+A background server auto-starts on first use and stores state in `_schemabot` on your local MySQL.
+
+This quickstart runs entirely on your machine. For GitHub PR integration, long-running schema changes, or managing lots of databases at scale, deploy SchemaBot as a server — see [deploy/](./deploy/) for sample code and [GitHub App setup](./docs/github-app-setup.md) (docs are still a work in progress).
+
 ## PR Demo
 
 _Coming soon_
@@ -53,7 +79,9 @@ SchemaBot handles the full lifecycle:
 
 Simple changes (e.g., adding a column) use instant DDL and complete in milliseconds. Operations that require a row copy (e.g., adding an index) run online without blocking reads or writes.
 
-## Quick Start
+## Docker demo
+
+Create a Docker environment that runs schemabot server and test databases
 
 ```bash
 make demo    # Start services, apply schema, seed data
