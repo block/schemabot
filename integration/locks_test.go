@@ -798,15 +798,41 @@ func TestCLI_Locking_NoLockStillBlockedByActiveApply(t *testing.T) {
 	endpoint := "http://" + schemabotAddr
 
 	schemaDir := newSchemaDirForDB(t, dbName)
-	writeFile(t, filepath.Join(schemaDir, "users.sql"), `
-CREATE TABLE users (
+
+	// Step 1: Create the base table (completes instantly, no Spirit row-copy)
+	writeFile(t, filepath.Join(schemaDir, "orders.sql"), `
+CREATE TABLE orders (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    email VARCHAR(255) NOT NULL,
-    INDEX idx_email (email)
+    user_id BIGINT NOT NULL,
+    total_cents BIGINT NOT NULL
 );
 `)
 
-	// Start an apply with --defer-cutover so it stays in "waiting for cutover" state
+	t.Run("setup_base_schema", func(t *testing.T) {
+		out := runCLIInDir(t, binPath, schemaDir, "apply",
+			"-s", ".",
+			"-e", "staging",
+			"--endpoint", endpoint,
+			"-y",
+			"--watch=false",
+			"--no-lock",
+		)
+		assertContains(t, out, "Apply started")
+		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+	})
+
+	// Step 2: ALTER TABLE with --defer-cutover so Spirit pauses at cutover
+	writeFile(t, filepath.Join(schemaDir, "orders.sql"), `
+CREATE TABLE orders (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    total_cents BIGINT NOT NULL,
+    INDEX idx_user_id (user_id)
+);
+`)
+
+	var applyID string
+
 	t.Run("first_apply_deferred", func(t *testing.T) {
 		out := runCLIInDir(t, binPath, schemaDir, "apply",
 			"-s", ".",
@@ -818,10 +844,11 @@ CREATE TABLE users (
 			"--no-lock",
 		)
 		assertContains(t, out, "Apply started")
+		applyID = parseApplyID(t, out)
 		waitForStateDB(t, endpoint, dbName, "waiting_for_cutover", 30*time.Second)
 	})
 
-	// Second apply with --no-lock should still be blocked by the active schema change
+	// Step 3: Second apply with --no-lock should still be blocked by the active schema change
 	t.Run("second_apply_blocked_by_active_change", func(t *testing.T) {
 		out, err := runCLIWithErrorInDir(t, binPath, schemaDir, "apply",
 			"-s", ".",
@@ -838,8 +865,7 @@ CREATE TABLE users (
 	// Cleanup: cutover to complete the deferred apply
 	t.Run("cleanup", func(t *testing.T) {
 		runCLIInDir(t, binPath, schemaDir, "cutover",
-			"-d", dbName,
-			"-e", "staging",
+			applyID,
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
