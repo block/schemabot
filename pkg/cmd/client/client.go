@@ -443,10 +443,10 @@ func ReleaseLock(endpoint, database, dbType, owner string) error {
 	if err != nil {
 		var apiErr *APIError
 		if errors.As(err, &apiErr) {
-			if apiErr.StatusCode == http.StatusForbidden {
+			if apiErr.Status == http.StatusForbidden {
 				return ErrLockNotOwned
 			}
-			if apiErr.StatusCode == http.StatusNotFound {
+			if apiErr.Status == http.StatusNotFound {
 				return ErrLockNotFound
 			}
 		}

@@ -31,7 +31,7 @@ func (m WatchModel) View() string {
 		return s
 	}
 
-	// Permanent API error (4xx). Show the error and exit.
+	// Permanent fetch error (not_found, invalid_request, etc.). Show and exit.
 	if m.errorMsg != "" && m.state == "" {
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 		return errStyle.Render("Error: "+m.errorMsg) + "\n"

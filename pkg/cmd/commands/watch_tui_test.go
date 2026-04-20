@@ -28,7 +28,8 @@ func TestFetchProgress_ServerReturns500_ReturnsError(t *testing.T) {
 	pmsg, ok := msg.(progressMsg)
 	require.True(t, ok, "expected progressMsg, got %T", msg)
 	assert.Empty(t, pmsg.state, "fetchProgress should not set state on error")
-	assert.Equal(t, errRetryable, pmsg.errorCode, "5xx should be classified as transient")
+	assert.True(t, pmsg.failed, "should be a fetch error")
+	assert.False(t, pmsg.retryable, "5xx without error code should not be retryable")
 	assert.Contains(t, pmsg.errorMsg, "500")
 }
 
@@ -46,17 +47,17 @@ func TestFetchProgress_ServerReturnsNoActiveChange(t *testing.T) {
 	pmsg, ok := msg.(progressMsg)
 	require.True(t, ok, "expected progressMsg, got %T", msg)
 	assert.Equal(t, state.NoActiveChange, pmsg.state)
-	assert.Empty(t, pmsg.errorCode, "successful response should not set errorCode")
+	assert.False(t, pmsg.retryable, "successful response should not be marked retryable")
 	assert.Empty(t, pmsg.errorMsg)
 }
 
-func TestWatchModel_FirstPollError_ShowsLoadingWithError(t *testing.T) {
-	// First poll fails (server 500 before any successful poll).
-	// TUI should stay in loading state with the error visible, not show
-	// "No active schema change" or assume the apply failed.
+func TestWatchModel_FirstPollRetryableError_ShowsLoadingWithError(t *testing.T) {
+	// First poll fails with a retryable error (engine unavailable).
+	// TUI should stay in loading state with the error visible.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = fmt.Fprint(w, "progress endpoint not implemented")
+		_, _ = fmt.Fprint(w, `{"error":"progress failed: rpc timeout","error_code":"engine_unavailable"}`)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -69,17 +70,38 @@ func TestWatchModel_FirstPollError_ShowsLoadingWithError(t *testing.T) {
 
 	assert.False(t, model.initialized,
 		"should not be initialized — we haven't gotten a real response yet")
-	assert.Contains(t, model.errorMsg, "500")
+	assert.Contains(t, model.errorMsg, "rpc timeout")
 
 	view := model.View()
 	assert.NotContains(t, view, "No active schema change")
 	assert.Contains(t, view, "Loading",
 		"should still show loading spinner")
-	assert.Contains(t, view, "500",
-		"should show the connection error")
+	assert.Contains(t, view, "rpc timeout",
+		"should show the error")
 
-	// Should keep polling — the server may recover.
-	assert.Nil(t, retCmd, "should return nil cmd to continue polling")
+	assert.Nil(t, retCmd, "retryable error should return nil cmd (tick loop handles retry)")
+}
+
+func TestWatchModel_FirstPollPermanentError_QuitsWithError(t *testing.T) {
+	// First poll fails with a permanent error (not found).
+	// TUI should show the error and quit.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = fmt.Fprint(w, `{"error":"apply not found: abc123","error_code":"not_found"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	m := NewWatchModel(srv.URL, "testdb", "staging", false)
+	cmd := m.fetchProgress()
+	msg := cmd()
+
+	updated, retCmd := m.Update(msg)
+	model := updated.(WatchModel)
+
+	assert.True(t, model.initialized, "permanent error should mark initialized for view rendering")
+	assert.Contains(t, model.errorMsg, "apply not found")
+	assert.NotNil(t, retCmd, "permanent error should return tea.Quit")
 }
 
 func TestWatchModel_MidFlightError_PreservesLastState(t *testing.T) {
@@ -99,11 +121,12 @@ func TestWatchModel_MidFlightError_PreservesLastState(t *testing.T) {
 	assert.True(t, m.initialized)
 	assert.Equal(t, state.Apply.Running, m.state)
 
-	// Second: server crashes — API call fails (errorCode distinguishes this
+	// Second: server crashes — API call fails (retryable flag distinguishes this
 	// from a server response that happens to have an empty state).
 	errorMsg := progressMsg{
 		errorMsg:  "500: connection refused",
-		errorCode: errRetryable,
+		failed:    true,
+		retryable: true,
 	}
 	updated, cmd := m.Update(errorMsg)
 	m = updated.(WatchModel)
@@ -137,7 +160,7 @@ func TestWatchModel_ConnectionError_CanEscape(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
 
 	// Simulate transient fetch error (API call failed).
-	updated, _ := m.Update(progressMsg{errorMsg: "connection refused", errorCode: errRetryable})
+	updated, _ := m.Update(progressMsg{errorMsg: "connection refused", failed: true, retryable: true})
 	m = updated.(WatchModel)
 	assert.False(t, m.initialized)
 
@@ -168,6 +191,7 @@ func TestWatchModel_ServerErrorWithState_TreatedAsRealResponse(t *testing.T) {
 }
 
 func TestFetchProgress_ServerReturns404_PermanentError(t *testing.T) {
+	// 404 without error_code — falls back to status code classification.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = fmt.Fprint(w, `{"error":"apply not found"}`)
@@ -180,16 +204,81 @@ func TestFetchProgress_ServerReturns404_PermanentError(t *testing.T) {
 
 	pmsg, ok := msg.(progressMsg)
 	require.True(t, ok, "expected progressMsg, got %T", msg)
-	assert.Equal(t, errPermanent, pmsg.errorCode, "4xx should be classified as permanent")
+	assert.False(t, pmsg.retryable, "4xx should not be retryable")
 	assert.Contains(t, pmsg.errorMsg, "apply not found")
+}
+
+func TestFetchProgress_ErrorCodeClassification(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		body      string
+		retryable bool
+	}{
+		{
+			name:      "engine_unavailable is retryable",
+			status:    http.StatusInternalServerError,
+			body:      `{"error":"progress failed: rpc timeout","error_code":"engine_unavailable"}`,
+			retryable: true,
+		},
+		{
+			name:      "storage_error is retryable",
+			status:    http.StatusInternalServerError,
+			body:      `{"error":"failed to get apply: connection lost","error_code":"storage_error"}`,
+			retryable: true,
+		},
+		{
+			name:      "not_found is permanent",
+			status:    http.StatusNotFound,
+			body:      `{"error":"apply not found: abc123","error_code":"not_found"}`,
+			retryable: false,
+		},
+		{
+			name:      "deployment_not_found is permanent",
+			status:    http.StatusNotFound,
+			body:      `{"error":"no deployment configured","error_code":"deployment_not_found"}`,
+			retryable: false,
+		},
+		{
+			name:      "invalid_request is permanent",
+			status:    http.StatusBadRequest,
+			body:      `{"error":"database is required","error_code":"invalid_request"}`,
+			retryable: false,
+		},
+		{
+			name:      "no error_code treated as permanent",
+			status:    http.StatusInternalServerError,
+			body:      `{"error":"internal server error"}`,
+			retryable: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				_, _ = fmt.Fprint(w, tt.body)
+			}))
+			t.Cleanup(srv.Close)
+
+			m := NewWatchModel(srv.URL, "testdb", "staging", false)
+			cmd := m.fetchProgress()
+			msg := cmd()
+
+			pmsg, ok := msg.(progressMsg)
+			require.True(t, ok, "expected progressMsg, got %T", msg)
+			assert.Equal(t, tt.retryable, pmsg.retryable)
+		})
+	}
 }
 
 func TestWatchModel_PermanentError_QuitsImmediately(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
 
 	msg := progressMsg{
-		errorMsg:  "apply not found",
-		errorCode: errPermanent,
+		errorMsg: "apply not found",
+		failed:   true,
 	}
 	updated, cmd := m.Update(msg)
 	model := updated.(WatchModel)
@@ -210,7 +299,8 @@ func TestWatchModel_ConsecutiveErrors_IncrementCounter(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		updated, cmd := m.Update(progressMsg{
 			errorMsg:  "connection refused",
-			errorCode: errRetryable,
+			failed:    true,
+			retryable: true,
 		})
 		m = updated.(WatchModel)
 		assert.Equal(t, i, m.consecutiveErrors)
@@ -222,6 +312,18 @@ func TestWatchModel_ConsecutiveErrors_IncrementCounter(t *testing.T) {
 	m = updated.(WatchModel)
 	assert.Equal(t, 0, m.consecutiveErrors)
 	assert.Empty(t, m.errorMsg, "error should be cleared on success")
+}
+
+func TestFetchProgress_ConnectionRefused_RetryableConnectionError(t *testing.T) {
+	// Server is not listening — connection refused.
+	m := NewWatchModel("http://127.0.0.1:1", "testdb", "staging", false)
+	cmd := m.fetchProgress()
+	msg := cmd()
+
+	pmsg, ok := msg.(progressMsg)
+	require.True(t, ok, "expected progressMsg, got %T", msg)
+	assert.True(t, pmsg.retryable, "connection errors should be retryable")
+	assert.Contains(t, pmsg.errorMsg, "cannot connect")
 }
 
 func TestGetProgress_ServerReturns500_CLIReturnsError(t *testing.T) {

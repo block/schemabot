@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -28,10 +27,7 @@ const maxPollInterval = 30 * time.Second
 func (m WatchModel) tick() tea.Cmd {
 	d := pollInterval
 	if m.consecutiveErrors > 0 {
-		d = pollInterval << min(m.consecutiveErrors, 4) // 4s, 8s, 16s, 32→30s cap
-		if d > maxPollInterval {
-			d = maxPollInterval
-		}
+		d = min(pollInterval<<min(m.consecutiveErrors, 4), maxPollInterval)
 	}
 	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return tickMsg(t)
@@ -48,12 +44,11 @@ func (m WatchModel) fetchProgress() tea.Cmd {
 			result, err = client.GetProgress(m.endpoint, m.database, m.environment)
 		}
 		if err != nil {
-			code := errRetryable
-			var apiErr *client.APIError
-			if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
-				code = errPermanent
+			return progressMsg{
+				errorMsg:  err.Error(),
+				failed:    true,
+				retryable: isRetryableFetchError(err),
 			}
-			return progressMsg{errorMsg: err.Error(), errorCode: code}
 		}
 
 		return parseProgressResult(result)

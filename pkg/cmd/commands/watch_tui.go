@@ -1,12 +1,15 @@
 package commands
 
 import (
+	"errors"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -55,17 +58,29 @@ type tableProgress struct {
 // Messages
 type tickMsg time.Time
 
-// Error codes for progressMsg.errorCode.
-const (
-	errRetryable = "retryable" // 5xx, connection refused, timeout — retry with backoff
-	errPermanent = "permanent" // 4xx: bad request, not found — don't retry
-)
+// isRetryableFetchError reports whether a fetch error is retryable.
+//
+//   - ConnectionError (server unreachable): always retryable.
+//   - APIError with error code: classified by apitypes.IsRetryableErrorCode.
+//   - APIError without error code, or unknown error types: permanent.
+func isRetryableFetchError(err error) bool {
+	var connErr *client.ConnectionError
+	if errors.As(err, &connErr) {
+		return true
+	}
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode != "" {
+		return apitypes.IsRetryableErrorCode(apiErr.ErrorCode)
+	}
+	return false
+}
 
 type progressMsg struct {
 	state       string
 	tables      []tableProgress
 	errorMsg    string // Human-readable error message
-	errorCode   string // "" on success, errRetryable or errPermanent on fetch failure
+	failed      bool   // true when the API call didn't return usable progress data
+	retryable   bool   // when failed, whether the TUI should keep polling
 	volume      int
 	applyID     string // Populated from progress responses
 	database    string // Populated from apply-id progress responses
@@ -166,15 +181,15 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchProgress(), m.tick())
 
 	case progressMsg:
-		switch msg.errorCode {
-		case errRetryable:
-			// 5xx, connection refused, timeout, DNS failure.
+		if msg.failed && msg.retryable {
+			// Transient error (connection refused, timeout, engine_unavailable).
 			// Preserve last known state and tables, keep polling with backoff.
 			m.consecutiveErrors++
 			m.errorMsg = msg.errorMsg
 			return m, nil
-		case errPermanent:
-			// 4xx: bad request, not found, etc. Retrying won't help.
+		}
+		if msg.failed && !msg.retryable {
+			// Permanent error (not_found, invalid_request, deployment_not_found).
 			m.errorMsg = msg.errorMsg
 			m.initialized = true
 			return m, tea.Quit
