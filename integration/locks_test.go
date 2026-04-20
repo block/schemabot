@@ -767,8 +767,6 @@ CREATE TABLE users (
 		)
 		// Should not show lock conflict
 		assert.NotContains(t, stripANSI(out), "Database Locked")
-		// Should show the no-lock warning
-		assertContains(t, out, "--no-lock")
 		// Should proceed with apply
 		assertContains(t, out, "Apply started")
 		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)

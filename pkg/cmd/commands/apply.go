@@ -160,9 +160,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Step 4: Acquire lock and apply the plan
 
-	if cmd.NoLock {
-		fmt.Printf("\n%sWarning: --no-lock skips lock acquisition. Cross-environment lock protection is disabled.%s\n", templates.ANSIYellow, templates.ANSIReset)
-	} else {
+	if !cmd.NoLock {
 		// If --force, break any existing lock first
 		if cmd.Force {
 			existingLock, err := client.GetLock(ep, cfg.Database, cfg.Type)
