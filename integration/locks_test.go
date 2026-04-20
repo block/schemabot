@@ -74,12 +74,10 @@ CREATE TABLE users (
 		)
 		assertContains(t, out, "Lock acquired")
 		assertContains(t, out, dbName)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	t.Run("locks_shows_acquired_lock", func(t *testing.T) {
-		// Wait for apply to complete first
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
-
 		// Lock should still be held after apply completes (default behavior)
 		out := runCLI(t, binPath, "locks", "--endpoint", endpoint)
 		assertContains(t, out, dbName)
@@ -115,7 +113,7 @@ CREATE TABLE users (
 			"--watch=false",
 		)
 		assertContains(t, out, "Lock acquired")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	// Modify schema for second apply
@@ -145,7 +143,7 @@ CREATE TABLE users (
 		)
 		// Same owner can re-acquire the lock (idempotent)
 		assertContains(t, out, "Lock acquired")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 }
 
@@ -177,7 +175,7 @@ CREATE TABLE users (
 			"--watch=false",
 		)
 		assertContains(t, out, "Lock acquired")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	// Modify schema
@@ -202,7 +200,7 @@ CREATE TABLE users (
 		// Should show lock acquired (after force release)
 		assertContains(t, out, "Lock acquired")
 		assertContains(t, out, "Apply started")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 }
 
@@ -301,7 +299,7 @@ CREATE TABLE users (
 			"--watch=false",
 		)
 		assertContains(t, out, "Lock acquired")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	t.Run("unlock_releases_lock", func(t *testing.T) {
@@ -359,7 +357,7 @@ CREATE TABLE users (
 			"--watch=false",
 		)
 		assertContains(t, out, "Lock acquired")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	t.Run("unlock_force_releases_any_lock", func(t *testing.T) {
@@ -416,7 +414,7 @@ CREATE TABLE users (
 			"--watch=false",
 		)
 		assertContains(t, out, "Lock acquired")
-		waitForStateDB(t, endpoint, dbName1, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	t.Run("locks_shows_our_lock", func(t *testing.T) {
@@ -524,7 +522,7 @@ CREATE TABLE users (
 		assertContains(t, out, "Force released lock")
 		assertContains(t, out, "block/myrepo#123")
 		assertContains(t, out, "Lock acquired")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	// Cleanup
@@ -644,16 +642,14 @@ CREATE TABLE users (
 		assertContains(t, out, "users")
 	})
 
-	t.Run("progress_works_while_locked", func(t *testing.T) {
-		// Progress should work even when database is locked by another user
-		out := runCLIInDir(t, binPath, schemaDir, "progress",
+	t.Run("status_works_while_locked", func(t *testing.T) {
+		// Status should work even when database is locked by another user
+		out := runCLIInDir(t, binPath, schemaDir, "status",
 			"--database", dbName,
-			"-e", "staging",
 			"--endpoint", endpoint,
-			"--watch=false",
 		)
-		// Progress should succeed and show no active schema change
-		assertContains(t, out, "No active schema change")
+		// Status should succeed and show the database name
+		assertContains(t, out, dbName)
 	})
 
 	t.Run("locks_works_while_locked", func(t *testing.T) {
@@ -769,7 +765,7 @@ CREATE TABLE users (
 		assert.NotContains(t, stripANSI(out), "Database Locked")
 		// Should proceed with apply
 		assertContains(t, out, "Apply started")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	t.Run("original_lock_still_held", func(t *testing.T) {
@@ -818,7 +814,7 @@ CREATE TABLE orders (
 			"--no-lock",
 		)
 		assertContains(t, out, "Apply started")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	// Step 2: ALTER TABLE with --defer-cutover so Spirit pauses at cutover
@@ -845,7 +841,7 @@ CREATE TABLE orders (
 		)
 		assertContains(t, out, "Apply started")
 		applyID = parseApplyID(t, out)
-		waitForStateDB(t, endpoint, dbName, "waiting_for_cutover", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "waiting_for_cutover", 30*time.Second)
 	})
 
 	// Step 3: Second apply with --no-lock should still be blocked by the active schema change
@@ -869,7 +865,7 @@ CREATE TABLE orders (
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForState(t, endpoint, applyID, "completed", 30*time.Second)
 	})
 }
 
@@ -995,7 +991,7 @@ CREATE TABLE users (
 			"--watch=false",
 		)
 		assertContains(t, out, "Lock acquired")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	t.Run("lock_held_after_staging_apply", func(t *testing.T) {
@@ -1027,7 +1023,7 @@ CREATE TABLE users (
 		// Same owner re-acquires lock (idempotent)
 		assertContains(t, out, "Lock acquired")
 		assertContains(t, out, "Apply started")
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	// Cleanup

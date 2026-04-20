@@ -24,7 +24,7 @@ func (cmd *StopCmd) Run(g *Globals) error {
 	}
 
 	// Check current state first
-	result, err := client.GetProgress(ep, cmd.Database, cmd.Environment)
+	result, err := client.GetProgress(ep, cmd.ApplyID)
 	if err != nil {
 		// Check if this is a "not found" error - likely means no active schema change
 		if client.IsNotFound(err) {

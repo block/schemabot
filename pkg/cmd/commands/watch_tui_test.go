@@ -333,7 +333,7 @@ func TestGetProgress_ServerReturns500_CLIReturnsError(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := client.GetProgress(srv.URL, "testdb", "staging")
+	_, err := client.GetProgress(srv.URL, "test-apply-id")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "500")
 }

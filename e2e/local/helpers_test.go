@@ -16,7 +16,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/e2eutil"
 	"github.com/block/schemabot/pkg/state"
@@ -122,14 +121,13 @@ func findModuleRoot(t *testing.T, start string) string {
 	}
 }
 
-func waitForTableInProgress(t *testing.T, binPath, schemaDir, endpoint, dbName, env, tableName string, timeout time.Duration) {
+func waitForTableInProgress(t *testing.T, binPath, schemaDir, endpoint, applyID, tableName string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var lastOut string
 	for time.Now().Before(deadline) {
 		out, _ := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "progress",
-			"--database", dbName,
-			"-e", env,
+			applyID,
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -151,14 +149,22 @@ func ensureNoActiveChange(t *testing.T, endpoint string) {
 	deadline := time.Now().Add(30 * time.Second)
 	var lastState string
 	for time.Now().Before(deadline) {
-		result, err := testutil.FetchProgress(endpoint, "testapp", "staging")
+		result, err := client.GetStatus(endpoint)
 		if err != nil {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		s := result.State
+		// Check if any apply is active for testapp/staging
+		s := state.NoActiveChange
+		var applyID string
+		for _, a := range result.Applies {
+			if a.Database == "testapp" && a.Environment == "staging" {
+				s = a.State
+				applyID = a.ApplyID
+				break
+			}
+		}
 		lastState = s
-		applyID := result.ApplyID
 
 		if s == state.NoActiveChange || s == state.Apply.Completed {
 			return

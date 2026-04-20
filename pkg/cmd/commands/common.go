@@ -127,7 +127,7 @@ func resolveEndpoint(endpoint, profile string) (string, error) {
 // resolveApplyID resolves an apply ID to database and environment by calling the progress API.
 // Returns (database, environment, error).
 func resolveApplyID(endpoint, applyID string) (string, string, error) {
-	result, err := client.GetProgressByApplyID(endpoint, applyID)
+	result, err := client.GetProgress(endpoint, applyID)
 	if err != nil {
 		if client.IsNotFound(err) {
 			return "", "", fmt.Errorf("no schema change found for apply ID '%s'", applyID)
@@ -307,7 +307,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	}
 
 	fmt.Println("Watching progress...")
-	if err := WatchApplyProgressWithFormat(ep, database, environment, true, format, logHeartbeat); err != nil {
+	if err := WatchApplyProgressWithFormat(ep, applyID, true, format, logHeartbeat); err != nil {
 		return applyID, err
 	}
 

@@ -374,10 +374,10 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResp)
 
 	// Step 3: Wait for the apply to complete
-	waitForStateByApplyID(t, "http://"+schemabotAddr, applyID, "completed", 15*time.Second)
+	waitForState(t, "http://"+schemabotAddr, applyID, "completed", 15*time.Second)
 
 	// Step 4: Wait for the local apply record to be updated by pollForCompletion.
-	// waitForStateByApplyID polls the HTTP API (which calls remote Tern's Progress
+	// waitForState polls the HTTP API (which calls remote Tern's Progress
 	// RPC), but the local storage update happens asynchronously in the poller goroutine.
 	var storedApply *storage.Apply
 	deadline := time.Now().Add(5 * time.Second)

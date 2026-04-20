@@ -29,7 +29,7 @@ func (cmd *VolumeCmd) Run(g *Globals) error {
 	}
 
 	// Check current state first
-	result, err := client.GetProgress(ep, cmd.Database, cmd.Environment)
+	result, err := client.GetProgress(ep, cmd.ApplyID)
 	if err != nil {
 		return fmt.Errorf("get progress: %w", err)
 	}
@@ -66,5 +66,5 @@ func (cmd *VolumeCmd) Run(g *Globals) error {
 		return nil
 	}
 
-	return WatchApplyProgress(ep, cmd.Database, cmd.Environment, true)
+	return WatchApplyProgressByApplyID(ep, cmd.ApplyID, true)
 }

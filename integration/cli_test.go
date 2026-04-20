@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	schemabotapi "github.com/block/schemabot/pkg/api"
-	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -82,13 +83,11 @@ CREATE TABLE users (
 		assertContains(t, out, "CREATE TABLE")
 	})
 
-	t.Run("progress_no_active_change", func(t *testing.T) {
-		// Progress for a database with no active schema change
-		// Note: progress command requires --database and -e flags
-		// Note: --watch=false to avoid polling forever
-		out := runCLIInDir(t, binPath, schemaDir, "progress", "--database", "testdb", "-e", "staging", "--endpoint", endpoint, "--watch=false")
-		// Should indicate no active schema change
-		assertContains(t, out, "No active schema change")
+	t.Run("status_no_active_change", func(t *testing.T) {
+		// Status for a database — shows apply history (empty when no applies have run).
+		out := runCLIInDir(t, binPath, schemaDir, "status", "--database", "testdb", "--endpoint", endpoint)
+		// Should show the database name in the output (even if empty history).
+		assertContains(t, out, "testdb")
 	})
 }
 
@@ -123,12 +122,9 @@ CREATE TABLE products (
 		assertContains(t, out, "CREATE TABLE")
 	})
 
-	t.Run("progress_no_active_change", func(t *testing.T) {
-		// Note: progress command requires --database and -e flags
-		// Note: --watch=false to avoid polling forever
-		out := runCLIInDir(t, binPath, schemaDir, "progress", "--database", "testdb", "-e", "staging", "--endpoint", endpoint, "--watch=false")
-		// Should indicate no active schema change
-		assertContains(t, out, "No active schema change")
+	t.Run("status_no_active_change", func(t *testing.T) {
+		out := runCLIInDir(t, binPath, schemaDir, "status", "--database", "testdb", "--endpoint", endpoint)
+		assertContains(t, out, "testdb")
 	})
 
 	t.Run("apply_accepted", func(t *testing.T) {
@@ -144,7 +140,7 @@ CREATE TABLE products (
 		// Human-readable output format
 		assertContains(t, out, "MySQL Schema Change Apply")
 		assertContains(t, out, "Apply started")
-		waitForStateDB(t, endpoint, "testdb", "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 }
 
@@ -183,7 +179,7 @@ CREATE TABLE orders (
 		assertContains(t, out, "Apply started")
 
 		// Wait for completion
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	// Add an index to trigger a schema change
@@ -225,11 +221,10 @@ CREATE TABLE orders (
 
 	t.Run("progress_shows_waiting_for_cutover", func(t *testing.T) {
 		// Wait for WAITING_FOR_CUTOVER state
-		waitForStateDB(t, endpoint, dbName, "waiting_for_cutover", 30*time.Second)
+		waitForState(t, endpoint, applyID, "waiting_for_cutover", 30*time.Second)
 
 		out := runCLIInDir(t, binPath, schemaDir, "progress",
-			"--database", dbName,
-			"-e", "staging",
+			applyID,
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -245,14 +240,13 @@ CREATE TABLE orders (
 		assertContains(t, out, "Cutover requested")
 
 		// Wait for completion
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForState(t, endpoint, applyID, "completed", 30*time.Second)
 	})
 
 	t.Run("progress_shows_completed_after_cutover", func(t *testing.T) {
 		// After cutover completes, progress shows the completed state
 		out := runCLIInDir(t, binPath, schemaDir, "progress",
-			"--database", dbName,
-			"-e", "staging",
+			applyID,
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -303,7 +297,7 @@ CREATE TABLE items (
 	t.Logf("captured apply ID: %s", applyID)
 
 	// Wait for completion
-	waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+	waitForState(t, endpoint, applyID, "completed", 30*time.Second)
 
 	// Fetch progress by apply ID
 	out = runCLIInDir(t, binPath, schemaDir, "progress",
@@ -402,7 +396,7 @@ CREATE TABLE accounts (
 		assertContains(t, out, "--allow-unsafe enabled")
 
 		// Wait for completion
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
 
 	t.Run("plan_shows_no_changes_after_apply", func(t *testing.T) {
@@ -593,7 +587,7 @@ CREATE TABLE items (
 
 	// Wait for running state (copy phase started)
 	t.Run("wait_for_running", func(t *testing.T) {
-		waitForAnyStateDB(t, endpoint, dbName,
+		waitForAnyStateByApplyID(t, endpoint, applyID,
 			[]string{"running", "waiting_for_cutover"}, 30*time.Second)
 	})
 
@@ -606,14 +600,13 @@ CREATE TABLE items (
 		assertContains(t, out, "Schema change stopped")
 
 		// Wait for stopped state
-		waitForStateDB(t, endpoint, dbName, "stopped", 30*time.Second)
+		waitForState(t, endpoint, applyID, "stopped", 30*time.Second)
 	})
 
 	// Verify progress shows stopped state
 	t.Run("progress_shows_stopped", func(t *testing.T) {
 		out := runCLIInDir(t, binPath, schemaDir, "progress",
-			"--database", dbName,
-			"-e", "staging",
+			applyID,
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -632,7 +625,7 @@ CREATE TABLE items (
 
 	// Wait for waiting_for_cutover (copy complete) or running
 	t.Run("wait_for_copy_complete", func(t *testing.T) {
-		waitForStateDB(t, endpoint, dbName, "waiting_for_cutover", 60*time.Second)
+		waitForState(t, endpoint, applyID, "waiting_for_cutover", 60*time.Second)
 	})
 
 	// Cutover to complete the change
@@ -647,7 +640,7 @@ CREATE TABLE items (
 
 	// Wait for completion
 	t.Run("wait_for_complete", func(t *testing.T) {
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForState(t, endpoint, applyID, "completed", 30*time.Second)
 	})
 
 	// Verify the schema change was applied
@@ -751,7 +744,7 @@ CREATE TABLE items (
 	})
 
 	t.Run("wait_for_running", func(t *testing.T) {
-		waitForAnyStateDB(t, endpoint, dbName,
+		waitForAnyStateByApplyID(t, endpoint, applyID,
 			[]string{"running", "waiting_for_cutover"}, 30*time.Second)
 	})
 
@@ -762,7 +755,7 @@ CREATE TABLE items (
 			"--endpoint", endpoint,
 		)
 		assertContains(t, out, "Schema change stopped")
-		waitForStateDB(t, endpoint, dbName, "stopped", 30*time.Second)
+		waitForState(t, endpoint, applyID, "stopped", 30*time.Second)
 	})
 
 	// Start using positional apply_id
@@ -776,7 +769,7 @@ CREATE TABLE items (
 	})
 
 	t.Run("wait_for_cutover", func(t *testing.T) {
-		waitForStateDB(t, endpoint, dbName, "waiting_for_cutover", 60*time.Second)
+		waitForState(t, endpoint, applyID, "waiting_for_cutover", 60*time.Second)
 	})
 
 	t.Run("cutover", func(t *testing.T) {
@@ -789,17 +782,10 @@ CREATE TABLE items (
 	})
 
 	t.Run("wait_for_complete", func(t *testing.T) {
-		waitForStateDB(t, endpoint, dbName, "completed", 30*time.Second)
+		waitForState(t, endpoint, applyID, "completed", 30*time.Second)
 	})
 
 	t.Log("Stop/start by apply-id completed successfully")
-}
-
-// waitForStateDB polls the progress API until the expected state is reached or timeout.
-// expectedState should be the normalized state name (e.g., "completed", "running", "stopped").
-func waitForStateDB(t *testing.T, endpoint, dbName, expectedState string, timeout time.Duration) {
-	t.Helper()
-	waitForState(t, endpoint, dbName, "staging", expectedState, timeout)
 }
 
 // waitForApplyFromOutput parses an apply_id from CLI output and waits for the
@@ -808,13 +794,29 @@ func waitForStateDB(t *testing.T, endpoint, dbName, expectedState string, timeou
 func waitForApplyFromOutput(t *testing.T, endpoint, cliOutput, expectedState string, timeout time.Duration) {
 	t.Helper()
 	applyID := parseApplyID(t, cliOutput)
-	waitForStateByApplyID(t, endpoint, applyID, expectedState, timeout)
+	waitForState(t, endpoint, applyID, expectedState, timeout)
 }
 
-// waitForAnyStateDB polls the progress API until any of the expected states is reached or timeout.
-func waitForAnyStateDB(t *testing.T, endpoint, dbName string, expectedStates []string, timeout time.Duration) {
+// waitForAnyStateByApplyID polls the progress API until any of the expected states is reached or timeout.
+func waitForAnyStateByApplyID(t *testing.T, endpoint, applyID string, expectedStates []string, timeout time.Duration) {
 	t.Helper()
-	waitForAnyState(t, endpoint, dbName, "staging", expectedStates, timeout)
+	normalized := make([]string, len(expectedStates))
+	for i, s := range expectedStates {
+		normalized[i] = state.NormalizeState(s)
+	}
+	deadline := time.Now().Add(timeout)
+	var lastState string
+	for time.Now().Before(deadline) {
+		s, err := fetchProgressState(endpoint, applyID)
+		if err == nil {
+			lastState = s
+			if slices.Contains(normalized, s) {
+				return
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	require.Failf(t, "timeout", "timeout waiting for apply %s state %v, last state: %q", applyID, expectedStates, lastState)
 }
 
 // startSchemaBotLocal starts a SchemaBot server with embedded LocalClient (no gRPC).
@@ -1239,6 +1241,7 @@ CREATE TABLE items (
 );
 `)
 
+	var applyID string
 	t.Run("apply_schema_change", func(t *testing.T) {
 		out := runCLIInDir(t, binPath, schemaDir, "apply",
 			"-s", ".",
@@ -1248,16 +1251,8 @@ CREATE TABLE items (
 			"--watch=false",
 		)
 		assertContains(t, out, "Apply started")
-		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
-	})
-
-	// Step 3: Get the apply ID, then rollback
-	var applyID string
-	t.Run("get_apply_id", func(t *testing.T) {
-		result, err := client.GetProgressCtx(t.Context(), endpoint, dbName, "staging")
-		require.NoError(t, err)
-		require.NotEmpty(t, result.ApplyID, "expected apply ID from progress API")
-		applyID = result.ApplyID
+		applyID = parseApplyID(t, out)
+		waitForState(t, endpoint, applyID, "completed", 30*time.Second)
 	})
 
 	t.Run("rollback_to_original", func(t *testing.T) {

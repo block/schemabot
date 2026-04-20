@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/e2e/testutil"
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/e2eutil"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -427,7 +428,7 @@ CREATE TABLE %s (
 	)
 	e2eutil.AssertContains(t, out, "Apply started")
 
-	testutil.WaitForStateByApplyID(t, endpoint, e2eutil.ParseApplyID(t, out), state.Apply.Completed, 10*time.Second)
+	testutil.WaitForState(t, endpoint, e2eutil.ParseApplyID(t, out), state.Apply.Completed, 10*time.Second)
 
 	var count int
 	err := db.QueryRowContext(t.Context(), `
@@ -506,7 +507,7 @@ CREATE TABLE %s (
 	)
 	e2eutil.AssertContains(t, out, "Apply started")
 
-	testutil.WaitForStateByApplyID(t, endpoint, e2eutil.ParseApplyID(t, out), state.Apply.Completed, 10*time.Second)
+	testutil.WaitForState(t, endpoint, e2eutil.ParseApplyID(t, out), state.Apply.Completed, 10*time.Second)
 }
 
 func TestLocal_Apply_DropIndexBlockedWithoutFlag(t *testing.T) {
@@ -593,7 +594,7 @@ CREATE TABLE %s (
 	// Should succeed with --allow-unsafe
 	e2eutil.AssertContains(t, out, "Apply started")
 
-	testutil.WaitForStateByApplyID(t, endpoint, e2eutil.ParseApplyID(t, out), state.Apply.Completed, 10*time.Second)
+	testutil.WaitForState(t, endpoint, e2eutil.ParseApplyID(t, out), state.Apply.Completed, 10*time.Second)
 
 	// Verify index was actually dropped
 	db := openTestappStaging(t)
@@ -704,7 +705,7 @@ CREATE TABLE %s (
 	// Should succeed with --allow-unsafe
 	e2eutil.AssertContains(t, out, "Apply started")
 
-	testutil.WaitForStateByApplyID(t, endpoint, e2eutil.ParseApplyID(t, out), state.Apply.Completed, 10*time.Second)
+	testutil.WaitForState(t, endpoint, e2eutil.ParseApplyID(t, out), state.Apply.Completed, 10*time.Second)
 
 	// Verify test table was actually dropped
 	db := openTestappStaging(t)
@@ -773,10 +774,10 @@ CREATE TABLE %s (
 		applyID = extractApplyID(t, out)
 	})
 
-	waitForTableInProgress(t, binPath, schemaDir, endpoint, "testapp", "staging", tableName, 10*time.Second)
+	waitForTableInProgress(t, binPath, schemaDir, endpoint, applyID, tableName, 10*time.Second)
 
 	t.Run("wait_for_cutover_ready", func(t *testing.T) {
-		testutil.WaitForAnyState(t, endpoint, "testapp", "staging", []string{state.Apply.WaitingForCutover, state.Apply.Completed}, 10*time.Second)
+		testutil.WaitForAnyState(t, endpoint, applyID, []string{state.Apply.WaitingForCutover, state.Apply.Completed}, 10*time.Second)
 	})
 
 	t.Run("trigger_cutover", func(t *testing.T) {
@@ -879,7 +880,7 @@ CREATE TABLE %s (
 	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "apply", "-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "--defer-cutover", "--watch=false", "-o", "json")
 	applyID := extractApplyID(t, out)
 
-	waitForTableInProgress(t, binPath, schemaDir, endpoint, "testapp", "staging", tableName, 10*time.Second)
+	waitForTableInProgress(t, binPath, schemaDir, endpoint, applyID, tableName, 10*time.Second)
 	waitForApplyAnyState(t, endpoint, applyID, []string{state.Apply.Running, state.Apply.WaitingForCutover, state.Apply.Completed}, 10*time.Second)
 
 	applyState, _ := fetchApplyState(endpoint, applyID)
@@ -1093,12 +1094,12 @@ CREATE TABLE %s (
 	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "apply", "-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "--defer-cutover", "--watch=false", "-o", "json")
 	applyID := extractApplyID(t, out)
 
-	waitForTableInProgress(t, binPath, schemaDir, endpoint, "testapp", "staging", tableName, 10*time.Second)
-	testutil.WaitForAnyState(t, endpoint, "testapp", "staging", []string{state.Apply.Running, state.Apply.WaitingForCutover, state.Apply.Completed}, 10*time.Second)
+	waitForTableInProgress(t, binPath, schemaDir, endpoint, applyID, tableName, 10*time.Second)
+	testutil.WaitForAnyState(t, endpoint, applyID, []string{state.Apply.Running, state.Apply.WaitingForCutover, state.Apply.Completed}, 10*time.Second)
 
 	// Try volume adjustment while copy is in progress (not when waiting for cutover)
 	// Volume adjustment during "Waiting for cutover" stops but can't restart properly
-	prog, _ := testutil.FetchProgress(endpoint, "testapp", "staging")
+	prog, _ := testutil.FetchProgress(endpoint, applyID)
 	if prog != nil && prog.State == state.Apply.Running {
 		volumeOut, volumeErr := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "volume", applyID, "-v", "8", "--endpoint", endpoint, "--watch=false")
 		if volumeErr == nil {
@@ -1119,8 +1120,7 @@ CREATE TABLE %s (
 func TestLocal_Progress_Help(t *testing.T) {
 	binPath := buildCLI(t)
 	out := runCLI(t, binPath, "progress", "--help")
-	e2eutil.AssertContains(t, out, "--database")
-	e2eutil.AssertContains(t, out, "--environment")
+	e2eutil.AssertContains(t, out, "apply-id")
 	e2eutil.AssertContains(t, out, "--endpoint")
 	e2eutil.AssertContains(t, out, "watch")
 }
@@ -1130,10 +1130,15 @@ func TestLocal_Progress_NoActiveChange(t *testing.T) {
 
 	ensureNoActiveChange(t, endpoint)
 
-	prog, err := testutil.FetchProgress(endpoint, "testapp", "staging")
-	require.NoError(t, err, "fetch progress state")
-	assert.Truef(t, prog.State == state.Apply.Completed || prog.State == state.NoActiveChange,
-		"expected state 'completed' or 'no_active_change', got: %s", prog.State)
+	result, err := client.GetStatus(endpoint)
+	require.NoError(t, err, "get status")
+	// After clearing state, there should be no active applies for this database.
+	for _, a := range result.Applies {
+		if a.Database == "testapp" && a.Environment == "staging" {
+			assert.Truef(t, state.IsTerminalApplyState(a.State),
+				"expected terminal state, got: %s", a.State)
+		}
+	}
 }
 
 func TestLocal_Progress_DuringApply(t *testing.T) {
@@ -1177,20 +1182,20 @@ CREATE TABLE %s (
 	applyOut := e2eutil.RunCLIInDir(t, binPath, schemaDir, "apply", "-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "--defer-cutover", "--watch=false", "-o", "json")
 	applyID := extractApplyID(t, applyOut)
 
-	waitForTableInProgress(t, binPath, schemaDir, endpoint, "testapp", "staging", tableName, 10*time.Second)
-	testutil.WaitForAnyState(t, endpoint, "testapp", "staging", []string{state.Apply.Running, state.Apply.WaitingForCutover, state.Apply.Completed}, 10*time.Second)
+	waitForTableInProgress(t, binPath, schemaDir, endpoint, applyID, tableName, 10*time.Second)
+	testutil.WaitForAnyState(t, endpoint, applyID, []string{state.Apply.Running, state.Apply.WaitingForCutover, state.Apply.Completed}, 10*time.Second)
 
-	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "progress", "--database", "testapp", "-e", "staging", "--endpoint", endpoint, "--watch=false")
+	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "progress", applyID, "--endpoint", endpoint, "--watch=false")
 	e2eutil.AssertContains(t, out, tableName)
 
-	prog, _ := testutil.FetchProgress(endpoint, "testapp", "staging")
+	prog, _ := testutil.FetchProgress(endpoint, applyID)
 	if prog == nil || prog.State != state.Apply.Completed {
-		testutil.WaitForAnyState(t, endpoint, "testapp", "staging", []string{state.Apply.WaitingForCutover, state.Apply.Completed}, 10*time.Second)
+		testutil.WaitForAnyState(t, endpoint, applyID, []string{state.Apply.WaitingForCutover, state.Apply.Completed}, 10*time.Second)
 
-		prog, _ = testutil.FetchProgress(endpoint, "testapp", "staging")
+		prog, _ = testutil.FetchProgress(endpoint, applyID)
 		if prog != nil && prog.State == state.Apply.WaitingForCutover {
 			e2eutil.RunCLIInDir(t, binPath, schemaDir, "cutover", applyID, "--endpoint", endpoint, "--watch=false")
-			testutil.WaitForStateByApplyID(t, endpoint, applyID, state.Apply.Completed, 10*time.Second)
+			testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, 10*time.Second)
 		}
 	}
 }

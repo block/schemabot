@@ -37,7 +37,7 @@ func extractApplyID(t *testing.T, output string) string {
 func fetchApplyState(endpoint, applyID string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), testutil.ProgressTimeout)
 	defer cancel()
-	result, err := client.GetProgressByApplyIDCtx(ctx, endpoint, applyID)
+	result, err := client.GetProgressCtx(ctx, endpoint, applyID)
 	if err != nil {
 		return "", err
 	}
@@ -51,7 +51,7 @@ func waitForApplyState(t *testing.T, endpoint, applyID, expectedState string, ti
 	var lastState, lastError string
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(t.Context(), testutil.ProgressTimeout)
-		result, err := client.GetProgressByApplyIDCtx(ctx, endpoint, applyID)
+		result, err := client.GetProgressCtx(ctx, endpoint, applyID)
 		cancel()
 		if err == nil {
 			lastState = state.NormalizeState(result.State)
