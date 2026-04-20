@@ -34,6 +34,13 @@ type ApplyCmd struct {
 
 // Run executes the apply command.
 func (cmd *ApplyCmd) Run(g *Globals) error {
+	if cmd.NoLock && cmd.Force {
+		return fmt.Errorf("--no-lock and --force are mutually exclusive")
+	}
+	if cmd.NoLock && cmd.Yield {
+		return fmt.Errorf("--no-lock and --yield are mutually exclusive")
+	}
+
 	// Load config from schema directory
 	cfg, err := LoadCLIConfig(cmd.SchemaDir)
 	if err != nil {

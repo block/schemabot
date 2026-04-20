@@ -823,7 +823,7 @@ CREATE TABLE users (
 
 	// Second apply with --no-lock should still be blocked by the active schema change
 	t.Run("second_apply_blocked_by_active_change", func(t *testing.T) {
-		_, err := runCLIWithErrorInDir(t, binPath, schemaDir, "apply",
+		out, err := runCLIWithErrorInDir(t, binPath, schemaDir, "apply",
 			"-s", ".",
 			"-e", "staging",
 			"--endpoint", endpoint,
@@ -832,6 +832,7 @@ CREATE TABLE users (
 			"--no-lock",
 		)
 		assert.Error(t, err, "expected second apply to fail due to active schema change")
+		assertContains(t, out, "Schema Change In Progress")
 	})
 
 	// Cleanup: cutover to complete the deferred apply
