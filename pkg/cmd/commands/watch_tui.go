@@ -158,6 +158,15 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchProgress(), m.tick())
 
 	case progressMsg:
+		// Connection error: the server didn't respond (empty state + error).
+		// Preserve last known state and tables, show the error, keep polling.
+		// Don't mark as initialized or set a terminal state — we don't know
+		// whether the apply succeeded, failed, or is still running.
+		if msg.errorMsg != "" && msg.state == "" {
+			m.errorMsg = msg.errorMsg
+			return m, nil
+		}
+
 		m.state = msg.state
 		// Preserve last known tables during volume change to avoid visual reset
 		if !m.volumeChanging || len(m.tables) == 0 {

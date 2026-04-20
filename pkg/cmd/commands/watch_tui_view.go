@@ -21,9 +21,15 @@ func (m WatchModel) View() string {
 		return ""
 	}
 
-	// Show nothing until we have data
+	// Show spinner until we have data. If there's a connection error,
+	// display it below the spinner so the user knows why it's still loading.
 	if !m.initialized {
-		return m.spinner.View() + "Loading...\n"
+		s := m.spinner.View() + "Loading...\n"
+		if m.errorMsg != "" {
+			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+			s += errStyle.Render("Error: "+m.errorMsg) + "\n"
+		}
+		return s
 	}
 
 	// Handle no active schema change
