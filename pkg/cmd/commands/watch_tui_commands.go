@@ -34,7 +34,7 @@ func (m WatchModel) fetchProgress() tea.Cmd {
 			result, err = client.GetProgress(m.endpoint, m.database, m.environment)
 		}
 		if err != nil {
-			return progressMsg{errorMsg: err.Error()}
+			return progressMsg{errorMsg: err.Error(), fetchErr: true}
 		}
 
 		return parseProgressResult(result)

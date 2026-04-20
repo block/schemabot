@@ -28,6 +28,7 @@ func TestFetchProgress_ServerReturns500_ReturnsError(t *testing.T) {
 	pmsg, ok := msg.(progressMsg)
 	require.True(t, ok, "expected progressMsg, got %T", msg)
 	assert.Empty(t, pmsg.state, "fetchProgress should not set state on error")
+	assert.True(t, pmsg.fetchErr, "fetchProgress should set fetchErr on HTTP error")
 	assert.Contains(t, pmsg.errorMsg, "500")
 }
 
@@ -45,6 +46,7 @@ func TestFetchProgress_ServerReturnsNoActiveChange(t *testing.T) {
 	pmsg, ok := msg.(progressMsg)
 	require.True(t, ok, "expected progressMsg, got %T", msg)
 	assert.Equal(t, state.NoActiveChange, pmsg.state)
+	assert.False(t, pmsg.fetchErr, "successful response should not set fetchErr")
 	assert.Empty(t, pmsg.errorMsg)
 }
 
@@ -97,9 +99,11 @@ func TestWatchModel_MidFlightError_PreservesLastState(t *testing.T) {
 	assert.True(t, m.initialized)
 	assert.Equal(t, state.Apply.Running, m.state)
 
-	// Second: server crashes, returns error with empty state.
+	// Second: server crashes — API call fails (fetchErr distinguishes this
+	// from a server response that happens to have an empty state).
 	errorMsg := progressMsg{
 		errorMsg: "500: connection refused",
+		fetchErr: true,
 	}
 	updated, cmd := m.Update(errorMsg)
 	m = updated.(WatchModel)
@@ -132,8 +136,8 @@ func TestWatchModel_ConnectionError_CanEscape(t *testing.T) {
 	// User should be able to ESC out of the loading+error state.
 	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
 
-	// Simulate connection error.
-	updated, _ := m.Update(progressMsg{errorMsg: "connection refused"})
+	// Simulate fetch error (API call failed).
+	updated, _ := m.Update(progressMsg{errorMsg: "connection refused", fetchErr: true})
 	m = updated.(WatchModel)
 	assert.False(t, m.initialized)
 
@@ -142,6 +146,25 @@ func TestWatchModel_ConnectionError_CanEscape(t *testing.T) {
 	m = updated.(WatchModel)
 	assert.True(t, m.detached)
 	assert.NotNil(t, cmd, "ESC should return tea.Quit")
+}
+
+func TestWatchModel_ServerErrorWithState_TreatedAsRealResponse(t *testing.T) {
+	// Server returns a real response with state=failed and an error message.
+	// This is NOT a fetch error — it's a valid API response indicating the
+	// apply failed. The TUI should update state normally (and quit on terminal state).
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+
+	msg := progressMsg{
+		state:    state.Apply.Failed,
+		errorMsg: "engine error: checksum mismatch",
+	}
+	updated, cmd := m.Update(msg)
+	model := updated.(WatchModel)
+
+	assert.True(t, model.initialized, "should be initialized from real response")
+	assert.Equal(t, state.Apply.Failed, model.state)
+	assert.Contains(t, model.errorMsg, "checksum mismatch")
+	assert.NotNil(t, cmd, "terminal state should return tea.Quit")
 }
 
 func TestGetProgress_ServerReturns500_CLIReturnsError(t *testing.T) {

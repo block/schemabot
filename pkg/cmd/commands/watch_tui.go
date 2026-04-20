@@ -58,6 +58,7 @@ type progressMsg struct {
 	state       string
 	tables      []tableProgress
 	errorMsg    string
+	fetchErr    bool // true when the API call itself failed (connection, timeout, HTTP error)
 	volume      int
 	applyID     string // Populated from progress responses
 	database    string // Populated from apply-id progress responses
@@ -158,11 +159,11 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchProgress(), m.tick())
 
 	case progressMsg:
-		// Connection error: the server didn't respond (empty state + error).
+		// API call failed (connection refused, timeout, HTTP error, bad JSON).
 		// Preserve last known state and tables, show the error, keep polling.
 		// Don't mark as initialized or set a terminal state — we don't know
 		// whether the apply succeeded, failed, or is still running.
-		if msg.errorMsg != "" && msg.state == "" {
+		if msg.fetchErr {
 			m.errorMsg = msg.errorMsg
 			return m, nil
 		}
