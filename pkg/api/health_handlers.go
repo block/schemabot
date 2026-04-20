@@ -3,6 +3,8 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+
+	"github.com/block/schemabot/pkg/apitypes"
 )
 
 func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -46,7 +48,13 @@ func (s *Service) writeJSON(w http.ResponseWriter, status int, v any) {
 	}
 }
 
-// writeError writes a JSON error response.
+// writeError writes a JSON error response without an error code.
 func (s *Service) writeError(w http.ResponseWriter, status int, message string) {
-	s.writeJSON(w, status, map[string]string{"error": message})
+	s.writeJSON(w, status, apitypes.ErrorResponse{Error: message})
+}
+
+// writeErrorCode writes a JSON error response with an error code.
+// Clients should match on error_code rather than parsing the error message.
+func (s *Service) writeErrorCode(w http.ResponseWriter, status int, code, message string) {
+	s.writeJSON(w, status, apitypes.ErrorResponse{Error: message, ErrorCode: code})
 }

@@ -7,18 +7,37 @@ package apitypes
 // Error Codes
 // =============================================================================
 
-// Machine-readable error codes returned in API responses. Clients should
-// match on these constants rather than parsing error_message strings.
+// Error codes returned in API responses. Clients should match on these
+// constants rather than parsing error_message strings or HTTP status codes.
+// Use IsRetryableErrorCode to determine whether a given code is retryable.
 const (
-	// ErrCodeStateSyncFailed indicates the operation succeeded on the backend
-	// but local state synchronization failed. Status and progress endpoints
-	// may show stale state until the next recovery cycle.
-	ErrCodeStateSyncFailed = "state_sync_failed"
-
-	// ErrCodeEngineError indicates the schema change engine (Spirit, PlanetScale)
-	// encountered a failure during execution.
-	ErrCodeEngineError = "engine_error"
+	ErrCodeInvalidRequest     = "invalid_request"      // Malformed request (missing params, bad values)
+	ErrCodeNotFound           = "not_found"            // Resource doesn't exist (unknown apply ID, database)
+	ErrCodeDeploymentNotFound = "deployment_not_found" // No tern deployment configured for database/environment
+	ErrCodeEngineError        = "engine_error"         // Schema change engine failure during execution
+	ErrCodeStorageError       = "storage_error"        // Storage backend (MySQL) read/write failure
+	ErrCodeEngineUnavailable  = "engine_unavailable"   // Schema change engine (Tern) unreachable or RPC error
+	ErrCodeStateSyncFailed    = "state_sync_failed"    // Operation succeeded but local state sync failed
 )
+
+var retryableErrorCodes = map[string]bool{
+	ErrCodeStorageError:      true,
+	ErrCodeEngineUnavailable: true,
+	ErrCodeStateSyncFailed:   true,
+}
+
+// IsRetryableErrorCode reports whether the given API error code represents a
+// transient failure that clients should retry with backoff.
+func IsRetryableErrorCode(code string) bool {
+	return retryableErrorCodes[code]
+}
+
+// ErrorResponse is the standard error response body for non-200 HTTP responses.
+// All error endpoints return this shape.
+type ErrorResponse struct {
+	Error     string `json:"error"`
+	ErrorCode string `json:"error_code"`
+}
 
 // =============================================================================
 // Request Types

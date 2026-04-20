@@ -14,7 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// deriveErrorCode returns a machine-readable error code based on apply state
+// deriveErrorCode returns an error code based on apply state
 // and error message. Returns empty string when no error code applies.
 func deriveErrorCode(applyState, errorMessage string) string {
 	if errorMessage != "" && state.IsState(applyState, state.Apply.Failed) {
@@ -128,7 +128,7 @@ func (s *Service) GetProgress(ctx context.Context, database, environment string)
 func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 	database := r.PathValue("database")
 	if database == "" {
-		s.writeError(w, http.StatusBadRequest, "database is required")
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "database is required")
 		return
 	}
 
@@ -144,7 +144,7 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 	if qApplyID := r.URL.Query().Get("apply_id"); qApplyID != "" {
 		resolved, err := s.resolveApplyID(r.Context(), qApplyID)
 		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, "failed to resolve apply_id: "+err.Error())
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to resolve apply_id: "+err.Error())
 			return
 		}
 		ternApplyID = resolved
@@ -153,8 +153,8 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 		var err error
 		ternApplyID, activeApply, err = s.findActiveApplyID(r.Context(), database, environment)
 		if err != nil {
-			s.logger.Error("failed to resolve active apply", "database", database, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "failed to resolve active apply: "+err.Error())
+			s.logger.Error("failed to look up active apply from storage", "database", database, "environment", environment, "error", err)
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to look up active apply: "+err.Error())
 			return
 		}
 	}
@@ -169,7 +169,7 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, err.Error())
+		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound, err.Error())
 		return
 	}
 
@@ -179,7 +179,7 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.logger.Error("progress failed", "database", database, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "progress failed: "+err.Error())
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeEngineUnavailable, "progress failed: "+err.Error())
 		return
 	}
 
@@ -202,7 +202,7 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request) {
 	applyID := r.PathValue("apply_id")
 	if applyID == "" {
-		s.writeError(w, http.StatusBadRequest, "apply_id is required")
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply_id is required")
 		return
 	}
 
@@ -210,11 +210,11 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	apply, err := s.storage.Applies().GetByApplyIdentifier(r.Context(), applyID)
 	if err != nil {
 		s.logger.Error("failed to get apply", "apply_id", applyID, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "failed to get apply: "+err.Error())
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to get apply: "+err.Error())
 		return
 	}
 	if apply == nil {
-		s.writeError(w, http.StatusNotFound, "apply not found: "+applyID)
+		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, "apply not found: "+applyID)
 		return
 	}
 
@@ -222,8 +222,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	if state.IsTerminalApplyState(apply.State) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
-			s.logger.Error("local progress failed", "apply_id", applyID, "error", err)
-			s.writeError(w, http.StatusInternalServerError, "progress failed: "+err.Error())
+			s.logger.Error("failed to read tasks from storage for terminal apply", "apply_id", applyID, "error", err)
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
 		s.writeJSON(w, http.StatusOK, httpResp)
@@ -235,7 +235,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		s.writeError(w, http.StatusNotFound, err.Error())
+		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound, err.Error())
 		return
 	}
 
@@ -251,7 +251,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	})
 	if err != nil {
 		s.logger.Error("progress failed", "apply_id", applyID, "database", apply.Database, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "progress failed: "+err.Error())
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeEngineUnavailable, "progress failed: "+err.Error())
 		return
 	}
 

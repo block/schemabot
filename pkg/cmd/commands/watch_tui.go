@@ -1,12 +1,15 @@
 package commands
 
 import (
+	"errors"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -29,14 +32,15 @@ type WatchModel struct {
 	currentVolume int // Current volume (1-11)
 
 	// UI state
-	detached       bool
-	quitting       bool
-	spinner        spinner.Model
-	startedAt      time.Time
-	initialized    bool
-	volumeMode     bool // True when in volume adjustment mode
-	volumePending  int  // Pending volume change (0 = none)
-	volumeChanging bool // True while volume change is in progress
+	detached          bool
+	quitting          bool
+	spinner           spinner.Model
+	startedAt         time.Time
+	initialized       bool
+	volumeMode        bool // True when in volume adjustment mode
+	volumePending     int  // Pending volume change (0 = none)
+	volumeChanging    bool // True while volume change is in progress
+	consecutiveErrors int  // Consecutive fetch failures (drives backoff)
 }
 
 // tableProgress represents progress for a single table.
@@ -54,10 +58,29 @@ type tableProgress struct {
 // Messages
 type tickMsg time.Time
 
+// isRetryableFetchError reports whether a fetch error is retryable.
+//
+//   - ConnectionError (server unreachable): always retryable.
+//   - APIError with error code: classified by apitypes.IsRetryableErrorCode.
+//   - APIError without error code, or unknown error types: permanent.
+func isRetryableFetchError(err error) bool {
+	var connErr *client.ConnectionError
+	if errors.As(err, &connErr) {
+		return true
+	}
+	var apiErr *client.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode != "" {
+		return apitypes.IsRetryableErrorCode(apiErr.ErrorCode)
+	}
+	return false
+}
+
 type progressMsg struct {
 	state       string
 	tables      []tableProgress
-	errorMsg    string
+	errorMsg    string // Human-readable error message
+	failed      bool   // true when the API call didn't return usable progress data
+	retryable   bool   // when failed, whether the TUI should keep polling
 	volume      int
 	applyID     string // Populated from progress responses
 	database    string // Populated from apply-id progress responses
@@ -158,6 +181,22 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.fetchProgress(), m.tick())
 
 	case progressMsg:
+		if msg.failed && msg.retryable {
+			// Transient error (connection refused, timeout, engine_unavailable).
+			// Preserve last known state and tables, keep polling with backoff.
+			m.consecutiveErrors++
+			m.errorMsg = msg.errorMsg
+			return m, nil
+		}
+		if msg.failed && !msg.retryable {
+			// Permanent error (not_found, invalid_request, deployment_not_found).
+			m.errorMsg = msg.errorMsg
+			m.initialized = true
+			return m, tea.Quit
+		}
+
+		m.consecutiveErrors = 0
+		m.errorMsg = ""
 		m.state = msg.state
 		// Preserve last known tables during volume change to avoid visual reset
 		if !m.volumeChanging || len(m.tables) == 0 {

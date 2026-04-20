@@ -16,10 +16,11 @@ import (
 // Uses a 30s timeout to avoid hanging indefinitely on network stalls.
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
-// APIError represents an error response from the API with an HTTP status code.
+// APIError represents an error response from the API.
 type APIError struct {
-	StatusCode int
-	Message    string
+	Status    int    // HTTP status code (e.g., 404, 500)
+	ErrorCode string // Error code from API response (e.g., "not_found", "storage_error")
+	Message   string
 }
 
 func (e *APIError) Error() string {
@@ -29,7 +30,7 @@ func (e *APIError) Error() string {
 // IsNotFound reports whether the error is a 404 from the API.
 func IsNotFound(err error) bool {
 	var apiErr *APIError
-	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
 }
 
 // doGetInto sends a GET request and unmarshals the JSON response into result.
@@ -56,10 +57,7 @@ func doGetIntoCtx(ctx context.Context, endpoint, path string, result any) error 
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    FormatAPIError(resp.StatusCode, respBody),
-		}
+		return parseAPIError(resp.StatusCode, respBody)
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
@@ -92,10 +90,7 @@ func doSendBody(endpoint, method, path string, body any) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    FormatAPIError(resp.StatusCode, respBody),
-		}
+		return parseAPIError(resp.StatusCode, respBody)
 	}
 	return nil
 }
@@ -124,10 +119,7 @@ func doPostInto(endpoint, path string, body any, result any) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    FormatAPIError(resp.StatusCode, respBody),
-		}
+		return parseAPIError(resp.StatusCode, respBody)
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
@@ -136,18 +128,55 @@ func doPostInto(endpoint, path string, body any, result any) error {
 	return nil
 }
 
-// FormatConnectionError returns a user-friendly error for connection failures.
+// parseAPIError builds an APIError from a non-200 HTTP response, extracting
+// the error_code if present in the JSON body.
+func parseAPIError(statusCode int, body []byte) *APIError {
+	apiErr := &APIError{
+		Status:  statusCode,
+		Message: FormatAPIError(statusCode, body),
+	}
+	var resp struct {
+		ErrorCode string `json:"error_code"`
+	}
+	if json.Unmarshal(body, &resp) == nil && resp.ErrorCode != "" {
+		apiErr.ErrorCode = resp.ErrorCode
+	}
+	return apiErr
+}
+
+// ConnectionError represents a client-side failure to reach the server
+// (connection refused, DNS resolution, timeout). Distinct from APIError,
+// which means the server responded with a non-200 status.
+type ConnectionError struct {
+	Endpoint string
+	Err      error
+}
+
+func (e *ConnectionError) Error() string {
+	return e.message()
+}
+
+func (e *ConnectionError) Unwrap() error {
+	return e.Err
+}
+
+func (e *ConnectionError) message() string {
+	msg := e.Err.Error()
+	if strings.Contains(msg, "connection refused") {
+		return fmt.Sprintf("cannot connect to %s (is the server running?)", e.Endpoint)
+	}
+	if strings.Contains(msg, "no such host") {
+		return fmt.Sprintf("cannot resolve host: %s", e.Endpoint)
+	}
+	if strings.Contains(msg, "timeout") {
+		return fmt.Sprintf("connection timeout: %s", e.Endpoint)
+	}
+	return fmt.Sprintf("connection failed: %s", e.Endpoint)
+}
+
+// FormatConnectionError returns a ConnectionError wrapping the underlying cause.
 func FormatConnectionError(endpoint string, err error) error {
-	if strings.Contains(err.Error(), "connection refused") {
-		return fmt.Errorf("cannot connect to %s (is the server running?)", endpoint)
-	}
-	if strings.Contains(err.Error(), "no such host") {
-		return fmt.Errorf("cannot resolve host: %s", endpoint)
-	}
-	if strings.Contains(err.Error(), "timeout") {
-		return fmt.Errorf("connection timeout: %s", endpoint)
-	}
-	return fmt.Errorf("connection failed: %s", endpoint)
+	return &ConnectionError{Endpoint: endpoint, Err: err}
 }
 
 // FormatAPIError returns a user-friendly error message from an API response.
