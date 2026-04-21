@@ -38,11 +38,12 @@ func generateTLSBundle(dir string, mtls bool) (*TLSBundle, error) {
 		return nil, fmt.Errorf("generate CA key: %w", err)
 	}
 
+	now := time.Now()
 	caTemplate := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{Organization: []string{"LocalScale"}, CommonName: "LocalScale CA"},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(24 * time.Hour),
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		IsCA:                  true,
 		BasicConstraintsValid: true,
@@ -67,7 +68,7 @@ func generateTLSBundle(dir string, mtls bool) (*TLSBundle, error) {
 	serverTemplate := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
 		Subject:      pkix.Name{Organization: []string{"LocalScale"}, CommonName: "localhost"},
-		NotBefore:    time.Now(),
+		NotBefore:    now.Add(-time.Hour),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
@@ -120,7 +121,7 @@ func generateTLSBundle(dir string, mtls bool) (*TLSBundle, error) {
 		clientTemplate := &x509.Certificate{
 			SerialNumber: big.NewInt(3),
 			Subject:      pkix.Name{Organization: []string{"LocalScale"}, CommonName: "localscale-client"},
-			NotBefore:    time.Now(),
+			NotBefore:    now.Add(-time.Hour),
 			NotAfter:     time.Now().Add(24 * time.Hour),
 			KeyUsage:     x509.KeyUsageDigitalSignature,
 			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
@@ -160,7 +161,7 @@ func generateTLSBundle(dir string, mtls bool) (*TLSBundle, error) {
 }
 
 func writePEM(path, blockType string, data []byte) error {
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}

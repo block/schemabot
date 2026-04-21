@@ -54,7 +54,7 @@ type ContainerConfig struct {
 	Orgs                 map[string]ContainerOrgConfig `json:"organizations"`
 	ListenAddr           string                        `json:"listen_addr"`
 	RevertWindowDuration string                        `json:"revert_window_duration,omitempty"`
-	BranchTLSMode        string                        `json:"branch_tls_mode,omitempty"` // "none", "tls" (default), "mtls"
+	BranchTLSMode        string                        `json:"branch_tls_mode,omitempty"` // "none" (default), "tls", "mtls"
 	ProxyHost            string                        `json:"proxy_host"`
 	ProxyPortStart       int                           `json:"proxy_port_start"`
 	ProxyPortEnd         int                           `json:"proxy_port_end"`
