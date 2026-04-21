@@ -2,6 +2,7 @@ package localscale
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -403,7 +404,11 @@ func (s *Server) handleCreateBranchPassword(w http.ResponseWriter, r *http.Reque
 		upstreamDSN = fmt.Sprintf("%s@tcp(%s)/", managedMySQLTCPUser, backend.mysqlTCPAddr)
 		proxyBranch = branch
 	}
-	proxy, err := newBranchProxy(r.Context(), listenAddr, upstreamDSN, proxyBranch, keyspaces, s.logger)
+	var branchTLS *tls.Config
+	if s.tlsBundle != nil {
+		branchTLS = s.tlsBundle.TLSConfig
+	}
+	proxy, err := newBranchProxy(r.Context(), listenAddr, upstreamDSN, proxyBranch, keyspaces, s.logger, branchTLS)
 	if err != nil {
 		if s.portAlloc != nil {
 			// Return port to pool on failure.

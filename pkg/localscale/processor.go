@@ -37,7 +37,11 @@ var terminalDeployStates = map[string]bool{
 // the previous approach of deriving state lazily on each GET request.
 func (s *Server) runStateProcessor(ctx context.Context) {
 	defer close(s.processorDone)
-	ticker := time.NewTicker(processorTickInterval)
+	tickInterval := s.processorTickInterval
+	if tickInterval <= 0 {
+		tickInterval = defaultProcessorTickInterval
+	}
+	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -137,7 +141,15 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 		case dr.Queued, dr.InProgress, dr.InProgressCutover:
 			// DDL phase: derive state from Vitess migrations
 			if r.migrationContext == "" {
-				s.logger.Warn("processor: deploy request has no migration context", "number", r.number, "state", r.deployState)
+				// VSchema-only deploys have no migration context. If VSchema is
+				// already applied and we're in cutover, transition to complete.
+				if r.vschemaApplied && r.deployState == dr.InProgressCutover {
+					if err := s.updateDeployState(ctx, r.number, dr.CompletePendingRevert); err != nil {
+						s.logger.Error("processor: failed to complete vschema-only deploy", "number", r.number, "error", err)
+					}
+				} else {
+					s.logger.Warn("processor: deploy request has no migration context", "number", r.number, "state", r.deployState)
+				}
 				continue
 			}
 			migrations := s.getMigrationInfos(ctx, backend, r.migrationContext)

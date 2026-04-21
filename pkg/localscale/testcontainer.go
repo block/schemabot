@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -53,6 +54,7 @@ type ContainerConfig struct {
 	Orgs                 map[string]ContainerOrgConfig `json:"organizations"`
 	ListenAddr           string                        `json:"listen_addr"`
 	RevertWindowDuration string                        `json:"revert_window_duration,omitempty"`
+	BranchTLSMode        string                        `json:"branch_tls_mode,omitempty"` // "none", "tls" (default), "mtls"
 	ProxyHost            string                        `json:"proxy_host"`
 	ProxyPortStart       int                           `json:"proxy_port_start"`
 	ProxyPortEnd         int                           `json:"proxy_port_end"`
@@ -75,7 +77,8 @@ type ContainerOrgConfig struct {
 
 // ContainerDatabaseConfig holds keyspaces for a database in container config.
 type ContainerDatabaseConfig struct {
-	Keyspaces []ContainerKeyspaceConfig `json:"keyspaces"`
+	Keyspaces       []ContainerKeyspaceConfig `json:"keyspaces"`
+	RequireApproval bool                      `json:"require_approval,omitempty"`
 }
 
 // ContainerKeyspaceConfig describes a keyspace in container config.
@@ -360,7 +363,49 @@ func (c *LocalScaleContainer) BranchDBQuery(ctx context.Context, branch, keyspac
 	return c.postAdminResult(ctx, "/admin/branch-db-query", body)
 }
 
+// TLSCerts fetches the TLS certificate contents from the container. Returns
+// the CA cert, client cert, and client key as PEM strings. Only populated when
+// BranchTLSMode is "tls" or "mtls".
+type TLSCerts struct {
+	CACert     string `json:"ca_cert"`
+	ClientCert string `json:"client_cert"`
+	ClientKey  string `json:"client_key"`
+}
+
+// GetTLSCerts fetches TLS certificate contents from the container's admin API.
+func (c *LocalScaleContainer) GetTLSCerts(ctx context.Context) (*TLSCerts, error) {
+	resp, err := c.getAdmin(ctx, "/admin/tls-certs")
+	if err != nil {
+		return nil, err
+	}
+	var certs TLSCerts
+	if err := json.Unmarshal(resp, &certs); err != nil {
+		return nil, fmt.Errorf("parse TLS certs response: %w", err)
+	}
+	return &certs, nil
+}
+
 // postAdmin sends a POST request to an admin endpoint and checks for success.
+func (c *LocalScaleContainer) getAdmin(ctx context.Context, path string) (json.RawMessage, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request for %s: %w", path, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response from %s: %w", path, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s returned %d: %s", path, resp.StatusCode, body)
+	}
+	return body, nil
+}
+
 func (c *LocalScaleContainer) postAdmin(ctx context.Context, path string, body any) error {
 	var bodyReader *bytes.Reader
 	if body != nil {
