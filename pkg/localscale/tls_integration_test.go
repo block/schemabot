@@ -11,11 +11,11 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
+	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/localscale"
 	"github.com/block/schemabot/pkg/psclient"
@@ -102,7 +102,7 @@ func TestMTLS_BranchConnection(t *testing.T) {
 		pw.Username, pw.PlainText, pw.Hostname)
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err)
-	defer db.Close()
+	defer utils.CloseAndLog(db)
 
 	err = db.PingContext(ctx)
 	require.NoError(t, err, "should connect to branch via mTLS")
