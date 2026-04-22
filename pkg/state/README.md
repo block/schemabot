@@ -32,7 +32,8 @@ stateDiagram-v2
     pending --> running
     running --> completed
     running --> failed
-    running --> stopped : resumable (engine-dependent)
+    running --> stopped : resumable (Spirit only)
+    running --> cancelled : permanent (PlanetScale only)
     running --> waiting_for_cutover : atomic mode
     running --> revert_window : PlanetScale only
 
@@ -45,6 +46,8 @@ stateDiagram-v2
 
 - `waiting_for_cutover`/`cutting_over`: Only with `--defer-cutover` or atomic mode (Spirit)
 - `revert_window`: Only with `--enable-revert`. Spirit auto-advances through it; PlanetScale holds until expiry or user action. Maps from PlanetScale's `complete_pending_revert` deploy state
+- `stopped`: Spirit only — resumable via `schemabot start`. Spirit checkpoints progress for resume.
+- `cancelled`: PlanetScale only — permanent. Cancels the deploy request; the underlying Vitess migrations are cancelled. Not resumable — start a new apply instead.
 
 ## Task states
 
@@ -116,6 +119,51 @@ stateDiagram-v2
 
 7 core states from `schema.OnlineDDLStatus` plus derived `ready_to_complete`.
 
+### Shard lifecycle
+
+Each shard executes the same DDL independently via vreplication (or instant DDL). Key behavior:
+
+- **All shards copy independently.** Each shard has its own `rows_copied`, `table_rows`, `progress` (0-100), and `eta_seconds`. Shards progress at different rates.
+- **`ready_to_complete` is a flag, not a state.** A migration stays in `running` state with `ready_to_complete=1` when its row copy is done and vreplication lag is within threshold. SchemaBot normalizes `running + ready_to_complete` to `waiting_for_cutover`.
+- **Cutover is per-shard.** Each shard attempts cutover independently with its own `cutover_attempts` counter. PlanetScale's deploy request layer coordinates when to trigger cutover across all shards, but the actual table swap happens per-shard.
+- **`postpone_completion` defers cutover.** PlanetScale uses `postpone_completion=1` so shards stay in `running` (with `ready_to_complete=1`) until an explicit `CompleteMigration` operation is performed. PlanetScale's deploy request triggers this automatically when all shards are ready. With `--defer-cutover`, SchemaBot holds here until the user runs `schemabot cutover`.
+- **Cutover retries with backoff.** When cutover fails (e.g., MDL lock timeout), `cutover_attempts` increments and vreplication restarts. Vitess uses exponential backoff between attempts. `force_cutover` bypasses backoff and kills competing locks.
+- **Instant DDL skips vreplication.** With `--prefer-instant-ddl`, Vitess attempts `ALGORITHM=INSTANT` for eligible ALTER TABLE operations (e.g., adding a nullable column). The ALTER executes as a metadata-only change — no row copy, no cutover. Not all ALTERs support instant; unsupported ones fall back to vreplication. CREATE TABLE and DROP TABLE also execute without vreplication (they're inherently fast), but they are not "instant DDL" in the MySQL sense.
+- **Revert depends on the operation type.** CREATE TABLE can be reverted (Vitess renames the table away, preserving data). DROP TABLE can be reverted (Vitess renames instead of dropping, so the table can be renamed back). ALTER TABLE via VReplication can be reverted near-instantly — Vitess resumes VReplication from the cut-over GTID position, catching up only the changelog since completion. Instant DDL ALTERs cannot be reverted (no shadow table exists). Revert window is controlled by artifact retention (default 24h in Vitess, 30min in PlanetScale's deploy request layer).
+- **`postpone_completion` behaves differently by operation type.** For ALTER TABLE, the migration reaches `running` with `ready_to_complete=1` but defers cutover. For CREATE/DROP TABLE, the migration stays in `queued` and is never scheduled until `COMPLETE` is issued.
+- **Shard states are cohesive.** Because `postpone_completion` requires all shards to reach `ready_to_complete` before cutover, only a few state combinations appear in practice: (1) all shards `running` at different percentages, (2) some `running` + some `waiting_for_cutover`, (3) all `waiting_for_cutover`, (4) all `cutting_over`, (5) all `complete`. You never see `complete` mixed with `running`, or `cutting_over` mixed with `running`.
+- **Auto-retry on vttablet failure.** If a migration fails due to a vttablet crash (not a DDL error), Vitess auto-retries once per shard. The migration goes back to `queued` and starts fresh — there is no mechanism to resume a broken migration. See [Managed Online Schema Changes: auto-retry](https://vitess.io/docs/user-guides/schema-changes/managed-online-schema-changes/#auto-retry-after-failure).
+
+### Vitess state → SchemaBot state mapping
+
+| Vitess migration state | `ready_to_complete` | SchemaBot normalized state |
+|---|---|---|
+| `queued` / `ready` | - | `pending` |
+| `running` | `0` | `running` (copying rows) |
+| `running` | `1` | `waiting_for_cutover` |
+| `complete` | - | `completed` |
+| `failed` | - | `failed` |
+| `cancelled` | - | `cancelled` |
+
+### PlanetScale deploy request states
+
+The deploy request (DR) is the aggregate state across all keyspaces:
+
+```
+pending → ready → queued → submitting → in_progress → complete
+                                       → in_progress_cutover → complete_pending_revert → complete
+                                       → complete (instant DDL, skips in_progress)
+```
+
+- `pending`/`ready` can bounce during DR validation
+- `queued` is brief (~seconds), often missed by polling
+- `in_progress` = vreplication shards are copying
+- `in_progress_cutover` = table swap phase across shards
+- `complete_pending_revert` = 30-min revert window (vreplication only)
+- `complete` = done, deploy request can be closed
+
+The DR state may trail Vitess migration completion — the PlanetScale control plane reconciles after all shards report complete.
+
 ## Normalization
 
 `NormalizeTaskStatus()` maps raw engine states → Task constants. It imports
@@ -169,6 +217,28 @@ The rendering layer (`WriteProgress`) uses normalized states to select progress 
 | Failed | Red | `🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed` |
 
 Bars are 20 squares wide; filled squares represent percent complete. Defined in `pkg/cmd/templates/progress_render.go`.
+
+### Shard rendering
+
+For Vitess tables, per-shard progress is rendered below the table progress bar. Each shard has a status symbol and detail line. Implemented in `pkg/cmd/templates/progress_shard.go`.
+
+| Symbol | Color | Shard state | Detail |
+|--------|-------|-------------|--------|
+| ✓ | Green | `completed` | Total rows |
+| ◉ | Cyan | `running` (copying) | Percent, rows copied/total, ETA |
+| ● | Yellow | `waiting_for_cutover` | "ready for cutover" |
+| ● | Yellow | `cutting_over` | "cutting over" |
+| ○ | Dim | `pending` | "queued" |
+| ✗ | Red | `failed` | "failed" |
+
+**Collapsed view for large shard counts (>8 shards):**
+- Failed, waiting-for-cutover, and cutting-over shards are always shown
+- Up to 5 copying shards are shown, sorted by lowest percent complete (most behind first)
+- Remaining shards are summarized: "... N more copying shards" and "... N more shards (M complete, K queued)"
+
+**Cutover attempts:** When shards have `cutover_attempts > 0`, the total is shown in the shard summary (e.g., "cutover attempts: 3"). This indicates previous cutover failures with exponential backoff in progress.
+
+**Summary line:** `Shards: N (M complete, K copying, J queued)` — uses "copying" not "running" for user clarity.
 
 ## Comment states
 

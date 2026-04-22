@@ -107,11 +107,9 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 		}
 
 		if ns.VSchemaChanged && !isMySQL {
-			fmt.Println("  VSchema:")
+			fmt.Println("  ~ VSchema:")
 			if ns.VSchemaDiff != "" {
-				for line := range strings.SplitSeq(ns.VSchemaDiff, "\n") {
-					fmt.Printf("    %s\n", colorizeDiffLine(line))
-				}
+				writeVSchemaDiff(ns.VSchemaDiff, "    ")
 				fmt.Println()
 			}
 		}
@@ -160,9 +158,16 @@ func WriteSQLChanges(changes []DDLChange) {
 	combined := combineAlterStatements(changes)
 	for i, change := range combined {
 		symbol := changeSymbol(change.ChangeType)
-		formatted := FormatSQL(ddl.FormatDDL(change.DDL))
-		fmt.Printf("  %s %s\n", symbol, formatted)
-		// Add blank line between statements
+		formatted := ddl.FormatDDL(change.DDL)
+		lines := strings.Split(formatted, "\n")
+		// First line gets the symbol prefix
+		fmt.Printf("  %s %s\n", symbol, FormatSQL(lines[0]))
+		// Continuation lines indented to align with the DDL text
+		for _, line := range lines[1:] {
+			if line != "" {
+				fmt.Printf("    %s\n", FormatSQL(line))
+			}
+		}
 		if i < len(combined)-1 {
 			fmt.Println()
 		}
@@ -314,23 +319,80 @@ func WritePlanSummary(changes []DDLChange) {
 	fmt.Println() // Blank line after summary for separation
 }
 
+// VSchemaChange represents a VSchema diff for a keyspace.
+type VSchemaChange struct {
+	Keyspace string
+	Diff     string
+}
+
+// WritePlanSummaryWithVSchema writes a single plan summary line including VSchema changes.
+func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchemaChange) {
+	creates := 0
+	alters := 0
+	drops := 0
+	for _, c := range ddlChanges {
+		switch strings.ToUpper(c.ChangeType) {
+		case "CHANGE_TYPE_CREATE", "CREATE":
+			creates++
+		case "CHANGE_TYPE_ALTER", "ALTER":
+			alters++
+		case "CHANGE_TYPE_DROP", "DROP":
+			drops++
+		}
+	}
+
+	var parts []string
+	if creates > 0 {
+		word := "table"
+		if creates > 1 {
+			word = "tables"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s to create", creates, word))
+	}
+	if alters > 0 {
+		word := "table"
+		if alters > 1 {
+			word = "tables"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s to alter", alters, word))
+	}
+	if drops > 0 {
+		word := "table"
+		if drops > 1 {
+			word = "tables"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s to drop", drops, word))
+	}
+	if len(vschemaChanges) > 0 {
+		word := "VSchema change"
+		if len(vschemaChanges) > 1 {
+			word = "VSchema changes"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", len(vschemaChanges), word))
+	}
+
+	if len(parts) > 0 {
+		fmt.Printf("📋 **Plan**: %s\n", strings.Join(parts, ", "))
+		fmt.Println()
+	}
+}
+
 // WriteOptions writes the options section if any flags are set.
-func WriteOptions(deferCutover bool) {
+func WriteOptions(deferCutover bool, skipRevert bool) {
 	var options []string
 	if deferCutover {
 		options = append(options, "⏸️ Defer Cutover")
+	}
+	if skipRevert {
+		options = append(options, "⏩ Revert Window Disabled")
 	}
 	if len(options) > 0 {
 		fmt.Printf("Options: %s\n", strings.Join(options, " | "))
 	}
 }
 
-// LintViolation represents a lint warning.
-// LintViolation is a type alias for the shared lint warning type.
-type LintViolation = apitypes.LintViolation
-
 // WriteLintViolations writes lint violations if any.
-func WriteLintViolations(warnings []LintViolation) {
+func WriteLintViolations(warnings []apitypes.LintViolationResponse) {
 	if len(warnings) == 0 {
 		return
 	}

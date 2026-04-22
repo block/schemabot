@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/templates"
 	"github.com/block/schemabot/pkg/ddl"
-	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // PlanCmd creates a schema change plan from schema files.
@@ -96,14 +100,7 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 		break
 	}
 
-	isMySQL := engine != ternv1.Engine_ENGINE_PLANETSCALE.String()
-
-	// Header
-	templates.WritePlanHeader(templates.PlanHeaderData{
-		Database:   database,
-		SchemaName: filepath.Base(schemaDir),
-		IsMySQL:    isMySQL,
-	})
+	isMySQL := !state.IsPlanetScaleEngine(engine)
 
 	// Sort environments: staging first, production second, then alphabetically
 	envOrder := make([]string, 0, len(results))
@@ -123,15 +120,31 @@ func outputMultiEnvPlanResult(results map[string]*apitypes.PlanResponse, databas
 	plansIdentical := bothConfigured && stagingHasChanges && productionHasChanges &&
 		planFingerprint(stagingResult) == planFingerprint(productionResult)
 
-	if plansIdentical {
-		// Combined section for identical plans — no header needed, just show once
-		writeEnvPlan(stagingResult)
-	} else {
-		// Render separate sections for each environment
+	// Header box (title + database only, environment shown below)
+	templates.WritePlanHeader(templates.PlanHeaderData{
+		Database:   database,
+		SchemaName: filepath.Base(schemaDir),
+		IsMySQL:    isMySQL,
+	})
+
+	switch {
+	case len(envOrder) == 1:
+		// Single environment
+		templates.WriteEnvironmentHeader(envOrder[0])
+		writeEnvPlan(results[envOrder[0]])
+	case plansIdentical:
+		// Same plan across all environments
+		var titled []string
 		for _, env := range envOrder {
-			result := results[env]
+			titled = append(titled, cases.Title(language.English).String(env))
+		}
+		fmt.Printf("  %s%s%s\n\n", templates.ANSIBold, strings.Join(titled, " & "), templates.ANSIReset)
+		writeEnvPlan(stagingResult)
+	default:
+		// Different plans — per-env sections
+		for _, env := range envOrder {
 			templates.WriteEnvironmentHeader(env)
-			writeEnvPlan(result)
+			writeEnvPlan(results[env])
 		}
 	}
 }
@@ -156,25 +169,76 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		return
 	}
 
-	// Check if there are any changes
+	// Collect VSchema changes from metadata
+	var vschemaChanges []templates.VSchemaChange
+	for _, sc := range result.Changes {
+		if diff, ok := sc.Metadata["vschema"]; ok && diff != "" {
+			vschemaChanges = append(vschemaChanges, templates.VSchemaChange{
+				Keyspace: sc.Namespace,
+				Diff:     diff,
+			})
+		}
+	}
+
+	// Check if there are any changes (DDL or VSchema)
 	tables := result.FlatTables()
-	if len(tables) == 0 {
+	if len(tables) == 0 && len(vschemaChanges) == 0 {
 		templates.WriteNoChanges()
 		return
 	}
 
-	// Collect DDL changes (filter out internal Spirit tables)
-	var changes []templates.DDLChange
+	// Collect DDL changes (filter out internal Spirit tables), grouped by namespace
+	namespaceMap := make(map[string][]templates.DDLChange)
 	for _, tbl := range ddl.FilterInternalTablesTyped(tables) {
-		changes = append(changes, templates.DDLChange{
+		ns := tbl.Namespace
+		if ns == "" {
+			ns = result.Database
+		}
+		namespaceMap[ns] = append(namespaceMap[ns], templates.DDLChange{
 			ChangeType: tbl.ChangeType,
 			TableName:  tbl.TableName,
 			DDL:        tbl.DDL,
 		})
 	}
 
-	// Write SQL changes with symbols
-	templates.WriteSQLChanges(changes)
+	// Flatten all changes for summary/lint
+	var allChanges []templates.DDLChange
+	for _, c := range namespaceMap {
+		allChanges = append(allChanges, c...)
+	}
+
+	// Build VSchema diff map by keyspace for merging into namespace changes
+	vsDiffByKS := make(map[string]string)
+	for _, vc := range vschemaChanges {
+		vsDiffByKS[vc.Keyspace] = vc.Diff
+	}
+
+	// Render DDL + VSchema changes grouped by namespace/keyspace
+	isVitess := state.IsPlanetScaleEngine(result.Engine)
+	if len(allChanges) > 0 || len(vschemaChanges) > 0 {
+		// Collect all namespaces (from DDL and VSchema)
+		allNamespaces := make(map[string]bool)
+		for ns := range namespaceMap {
+			allNamespaces[ns] = true
+		}
+		for _, vc := range vschemaChanges {
+			allNamespaces[vc.Keyspace] = true
+		}
+
+		var nsChanges []templates.NamespaceChange
+		for ns := range allNamespaces {
+			nc := templates.NamespaceChange{
+				Namespace: ns,
+				Changes:   namespaceMap[ns],
+			}
+			if diff, ok := vsDiffByKS[ns]; ok {
+				nc.VSchemaChanged = true
+				nc.VSchemaDiff = diff
+			}
+			nsChanges = append(nsChanges, nc)
+		}
+		templates.WriteNamespaceChanges(nsChanges, !isVitess, result.Database)
+	}
 
 	// Check for unsafe changes and show with ⛔ (error level)
 	// Skip in apply context — apply shows its own 🚨 warning via WriteUnsafeWarningAllowed
@@ -184,21 +248,34 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	}
 
 	// Show non-unsafe lint violations with ⚠️
-	lintViolations := result.LintViolations()
+	lintViolations := result.LintNonErrors()
 	if len(lintViolations) > 0 {
 		templates.WriteLintViolations(lintViolations)
 	}
 
-	// Write summary line at the end
-	templates.WritePlanSummary(changes)
+	// Write summary
+	switch {
+	case len(vschemaChanges) > 0:
+		templates.WritePlanSummaryWithVSchema(allChanges, vschemaChanges)
+	default:
+		templates.WritePlanSummary(allChanges)
+	}
 }
 
-// hasResultChanges returns true if the result has schema changes.
+// hasResultChanges returns true if the result has schema changes (DDL or VSchema).
 func hasResultChanges(result *apitypes.PlanResponse) bool {
 	if result == nil {
 		return false
 	}
-	return len(result.FlatTables()) > 0
+	if len(result.FlatTables()) > 0 {
+		return true
+	}
+	for _, sc := range result.Changes {
+		if sc.Metadata["vschema"] != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // sortEnvironments sorts environments with staging first, production second, then alphabetically.
@@ -254,16 +331,16 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 // OutputPlanResult prints the plan result in a format similar to PR comments.
 func OutputPlanResult(result *apitypes.PlanResponse, database, environment, schemaDir string, isApply bool) {
 	// Determine engine type for header
-	isMySQL := result.Engine != ternv1.Engine_ENGINE_PLANETSCALE.String()
+	isMySQL := !state.IsPlanetScaleEngine(result.Engine)
 
-	// Header
+	// Header box + environment
 	templates.WritePlanHeader(templates.PlanHeaderData{
-		Database:    database,
-		SchemaName:  filepath.Base(schemaDir),
-		Environment: environment,
-		IsMySQL:     isMySQL,
-		IsApply:     isApply,
+		Database:   database,
+		SchemaName: filepath.Base(schemaDir),
+		IsMySQL:    isMySQL,
+		IsApply:    isApply,
 	})
+	templates.WriteEnvironmentHeader(environment)
 
 	// Body (shared with writeEnvPlan)
 	writePlanBody(result, isApply)

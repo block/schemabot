@@ -49,7 +49,7 @@ func TestPlanResponse_LintViolations(t *testing.T) {
 		},
 	}
 
-	warnings := resp.LintViolations()
+	warnings := resp.LintNonErrors()
 	require.Len(t, warnings, 2)
 	assert.Equal(t, "primary_key", warnings[0].Linter)
 	assert.Equal(t, "allow_charset", warnings[1].Linter)
@@ -72,7 +72,7 @@ func TestPlanResponse_LintErrors(t *testing.T) {
 
 func TestPlanResponse_LintViolations_Empty(t *testing.T) {
 	resp := &PlanResponse{}
-	assert.Empty(t, resp.LintViolations())
+	assert.Empty(t, resp.LintNonErrors())
 	assert.Empty(t, resp.LintErrors())
 }
 

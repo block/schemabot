@@ -100,7 +100,7 @@ func buildCheckRunSummary(planResp *apitypes.PlanResponse) string {
 		fmt.Fprintf(&sb, "- `%s` (%s)\n", table.TableName, table.ChangeType)
 	}
 
-	if lintViolations := planResp.LintViolations(); len(lintViolations) > 0 {
+	if lintViolations := planResp.LintNonErrors(); len(lintViolations) > 0 {
 		fmt.Fprintf(&sb, "\n**%d lint warning(s)**\n", len(lintViolations))
 	}
 

@@ -706,21 +706,21 @@ That command wasn't recognized. Available commands:
 ╰─────────────────────────────────────────────╯
 
   + CREATE TABLE `users` (
-    `id` bigint NOT NULL AUTO_INCREMENT,
-    `email` varchar(255) NOT NULL,
-    `created_at` timestamp DEFAULT current_timestamp(),
-    PRIMARY KEY(`id`),
-    INDEX `idx_email`(`email`)
-);
+        `id` bigint NOT NULL AUTO_INCREMENT,
+        `email` varchar(255) NOT NULL,
+        `created_at` timestamp DEFAULT current_timestamp(),
+        PRIMARY KEY(`id`),
+        INDEX `idx_email`(`email`)
+    );
 
   + CREATE TABLE `orders` (
-    `id` bigint NOT NULL AUTO_INCREMENT,
-    `user_id` bigint NOT NULL,
-    `total_cents` bigint NOT NULL,
-    `status` varchar(50) NOT NULL DEFAULT 'pending',
-    PRIMARY KEY(`id`),
-    INDEX `idx_user_id`(`user_id`)
-);
+        `id` bigint NOT NULL AUTO_INCREMENT,
+        `user_id` bigint NOT NULL,
+        `total_cents` bigint NOT NULL,
+        `status` varchar(50) NOT NULL DEFAULT 'pending',
+        PRIMARY KEY(`id`),
+        INDEX `idx_user_id`(`user_id`)
+    );
 
   ~ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
@@ -769,10 +769,7 @@ Options: ⏸️ Defer Cutover
 
   Keyspace: commerce
 
-  VSchema:
-    --- a/commerce.json
-    +++ b/commerce.json
-    @@ -12,6 +12,10 @@
+  ~ VSchema:
            "auto_increment": {
              "column": "id",
              "sequence": "orders_seq"
@@ -785,22 +782,22 @@ Options: ⏸️ Defer Cutover
        }
 
   ~ ALTER TABLE `orders`
-    ADD COLUMN `region` varchar(50) NOT NULL DEFAULT '',
-    ADD INDEX `idx_region`(`region`);
+        ADD COLUMN `region` varchar(50) NOT NULL DEFAULT '',
+        ADD INDEX `idx_region`(`region`);
 
 
   Keyspace: customer
 
   + CREATE TABLE `addresses` (
-    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-    `customer_id` bigint NOT NULL,
-    `street` varchar(255) NOT NULL,
-    `city` varchar(100) NOT NULL,
-    PRIMARY KEY(`id`),
-    INDEX `idx_customer_id`(`customer_id`)
-) ENGINE InnoDB,
-  CHARSET utf8mb4,
-  COLLATE utf8mb4_0900_ai_ci;
+        `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+        `customer_id` bigint NOT NULL,
+        `street` varchar(255) NOT NULL,
+        `city` varchar(100) NOT NULL,
+        PRIMARY KEY(`id`),
+        INDEX `idx_customer_id`(`customer_id`)
+    ) ENGINE InnoDB,
+      CHARSET utf8mb4,
+      COLLATE utf8mb4_0900_ai_ci;
 
 📋 Plan: 1 table to create, 1 table to alter
 
@@ -821,21 +818,21 @@ Options: ⏸️ Defer Cutover
 ╰─────────────────────────────────────────────╯
 
   + CREATE TABLE `users` (
-    `id` bigint NOT NULL AUTO_INCREMENT,
-    `email` varchar(255) NOT NULL,
-    `created_at` timestamp DEFAULT current_timestamp(),
-    PRIMARY KEY(`id`),
-    INDEX `idx_email`(`email`)
-);
+        `id` bigint NOT NULL AUTO_INCREMENT,
+        `email` varchar(255) NOT NULL,
+        `created_at` timestamp DEFAULT current_timestamp(),
+        PRIMARY KEY(`id`),
+        INDEX `idx_email`(`email`)
+    );
 
   + CREATE TABLE `orders` (
-    `id` bigint NOT NULL AUTO_INCREMENT,
-    `user_id` bigint NOT NULL,
-    `total_cents` bigint NOT NULL,
-    `status` varchar(50) NOT NULL DEFAULT 'pending',
-    PRIMARY KEY(`id`),
-    INDEX `idx_user_id`(`user_id`)
-);
+        `id` bigint NOT NULL AUTO_INCREMENT,
+        `user_id` bigint NOT NULL,
+        `total_cents` bigint NOT NULL,
+        `status` varchar(50) NOT NULL DEFAULT 'pending',
+        PRIMARY KEY(`id`),
+        INDEX `idx_user_id`(`user_id`)
+    );
 
   ~ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
@@ -864,21 +861,21 @@ Staging
 Production
 
   + CREATE TABLE `users` (
-    `id` bigint NOT NULL AUTO_INCREMENT,
-    `email` varchar(255) NOT NULL,
-    `created_at` timestamp DEFAULT current_timestamp(),
-    PRIMARY KEY(`id`),
-    INDEX `idx_email`(`email`)
-);
+        `id` bigint NOT NULL AUTO_INCREMENT,
+        `email` varchar(255) NOT NULL,
+        `created_at` timestamp DEFAULT current_timestamp(),
+        PRIMARY KEY(`id`),
+        INDEX `idx_email`(`email`)
+    );
 
   + CREATE TABLE `orders` (
-    `id` bigint NOT NULL AUTO_INCREMENT,
-    `user_id` bigint NOT NULL,
-    `total_cents` bigint NOT NULL,
-    `status` varchar(50) NOT NULL DEFAULT 'pending',
-    PRIMARY KEY(`id`),
-    INDEX `idx_user_id`(`user_id`)
-);
+        `id` bigint NOT NULL AUTO_INCREMENT,
+        `user_id` bigint NOT NULL,
+        `total_cents` bigint NOT NULL,
+        `status` varchar(50) NOT NULL DEFAULT 'pending',
+        PRIMARY KEY(`id`),
+        INDEX `idx_user_id`(`user_id`)
+    );
 
   ~ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
@@ -901,21 +898,21 @@ Production
 ╰─────────────────────────────────────────────╯
 
   + CREATE TABLE `users` (
-    `id` bigint NOT NULL AUTO_INCREMENT,
-    `email` varchar(255) NOT NULL,
-    `created_at` timestamp DEFAULT current_timestamp(),
-    PRIMARY KEY(`id`),
-    INDEX `idx_email`(`email`)
-);
+        `id` bigint NOT NULL AUTO_INCREMENT,
+        `email` varchar(255) NOT NULL,
+        `created_at` timestamp DEFAULT current_timestamp(),
+        PRIMARY KEY(`id`),
+        INDEX `idx_email`(`email`)
+    );
 
   + CREATE TABLE `orders` (
-    `id` bigint NOT NULL AUTO_INCREMENT,
-    `user_id` bigint NOT NULL,
-    `total_cents` bigint NOT NULL,
-    `status` varchar(50) NOT NULL DEFAULT 'pending',
-    PRIMARY KEY(`id`),
-    INDEX `idx_user_id`(`user_id`)
-);
+        `id` bigint NOT NULL AUTO_INCREMENT,
+        `user_id` bigint NOT NULL,
+        `total_cents` bigint NOT NULL,
+        `status` varchar(50) NOT NULL DEFAULT 'pending',
+        PRIMARY KEY(`id`),
+        INDEX `idx_user_id`(`user_id`)
+    );
 
   ~ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
@@ -2332,7 +2329,7 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 ### CLI Output
 
 <details>
-<summary><a name="single-table-running"></a><strong>Single Table: Running</strong></summary>
+<summary><a name="mysql-single-table-running"></a><strong>MySQL: Single Table Running</strong></summary>
 
 ```
 
@@ -2341,41 +2338,39 @@ Single table progress (default):
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:25:00 UTC  │
 │  Duration:  5m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
-    Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
+  ── testapp ──
+    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+      Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
 
 
 ```
 </details>
 
 <details>
-<summary><a name="single-table-completed"></a><strong>Single Table: Completed</strong></summary>
+<summary><a name="mysql-single-table-completed"></a><strong>MySQL: Single Table Completed</strong></summary>
 
 ```
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Completed            │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  11m 30s              │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  order_items: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `order_items` ADD INDEX `idx_product_id` (`product_id`)
+  ── testapp ──
+    order_items: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `order_items` ADD INDEX `idx_product_id`(`product_id`);
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ✓ Apply complete!
 
@@ -2383,14 +2378,13 @@ Table Progress:
 </details>
 
 <details>
-<summary><a name="single-table-failed"></a><strong>Single Table: Failed</strong></summary>
+<summary><a name="mysql-single-table-failed"></a><strong>MySQL: Single Table Failed</strong></summary>
 
 ```
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Failed               │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:22:00 UTC  │
 │  Duration:  7m 50s               │
 └──────────────────────────────────┘
@@ -2398,9 +2392,9 @@ Table Progress:
   lock wait timeout exceeded; try restarting transaction
 
 
-Table Progress:
-  users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+  ── testapp ──
+    users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -2410,26 +2404,25 @@ The new apply will only process tables that haven't completed.
 </details>
 
 <details>
-<summary><a name="single-table-stopped"></a><strong>Single Table: Stopped</strong></summary>
+<summary><a name="mysql-single-table-stopped"></a><strong>MySQL: Single Table Stopped</strong></summary>
 
 ```
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Stopped              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:27:00 UTC  │
 │  Duration:  3m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
-    Rows: 156,342 / 397,453
+  ── testapp ──
+    users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+      Rows: 156,342 / 397,453
 
-  orders: ⏹️ Stopped (not started)
-    ALTER TABLE `orders` ADD INDEX `idx_total_cents` (`total_cents`)
+    orders: ⏹️ Stopped (not started)
+      ALTER TABLE `orders` ADD INDEX `idx_total_cents`(`total_cents`);
 
 
 Stopped. Use 'schemabot start --apply-id <apply_id>' to resume from checkpoint.
@@ -2438,25 +2431,24 @@ Stopped. Use 'schemabot start --apply-id <apply_id>' to resume from checkpoint.
 </details>
 
 <details>
-<summary><a name="single-table-waiting-for-cutover"></a><strong>Single Table: Waiting For Cutover</strong></summary>
+<summary><a name="mysql-single-table-waiting-for-cutover"></a><strong>MySQL: Single Table Waiting For Cutover</strong></summary>
 
 ```
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Waiting for cutover  │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:20:00 UTC  │
 │  Duration:  10m                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  order_items: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-    ALTER TABLE `order_items` ADD INDEX `idx_product_id` (`product_id`)
+  ── testapp ──
+    order_items: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+      ALTER TABLE `order_items` ADD INDEX `idx_product_id`(`product_id`);
 
-  users: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Row copy complete. All data has been copied and new writes
 continue to be replicated to keep the shadow table in sync.
@@ -2481,32 +2473,31 @@ Watching for cutover... (Ctrl+C to detach)
 </details>
 
 <details>
-<summary><a name="single-table-cutting-over"></a><strong>Single Table: Cutting Over</strong></summary>
+<summary><a name="mysql-single-table-cutting-over"></a><strong>MySQL: Single Table Cutting Over</strong></summary>
 
 ```
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Cutting over         │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  12m                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  order_items: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
-    ALTER TABLE `order_items` ADD INDEX `idx_product_id` (`product_id`)
+  ── testapp ──
+    order_items: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+      ALTER TABLE `order_items` ADD INDEX `idx_product_id`(`product_id`);
 
-  users: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 ```
 </details>
 
 <details>
-<summary><a name="multitable-all-pending"></a><strong>Multi-table: All Pending</strong></summary>
+<summary><a name="mysql-multitable-all-pending"></a><strong>MySQL: Multi-table All Pending</strong></summary>
 
 ```
 
@@ -2515,28 +2506,26 @@ Sequential mode: Just started (all tables pending)
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Pending              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:29:50 UTC  │
 │  Duration:  10s                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: ⏳ Queued
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: ⏳ Queued
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  orders: ⏳ Queued
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: ⏳ Queued
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: ⏳ Queued
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⏳ Queued
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 ```
 </details>
 
 <details>
-<summary><a name="multitable-first-table-running"></a><strong>Multi-table: First Table Running</strong></summary>
+<summary><a name="mysql-multitable-first-table-running"></a><strong>MySQL: Multi-table First Table Running</strong></summary>
 
 ```
 
@@ -2545,29 +2534,27 @@ Sequential mode: First table running, others queued
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:25:00 UTC  │
 │  Duration:  5m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
-    Rows: 875,000 / 2,500,000 · ETA: 8m 30s
+    users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+      Rows: 875,000 / 2,500,000 · ETA: 8m 30s
 
-  orders: ⏳ Queued
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: ⏳ Queued
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: ⏳ Queued
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⏳ Queued
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 ```
 </details>
 
 <details>
-<summary><a name="multitable-second-table-running"></a><strong>Multi-table: Second Table Running</strong></summary>
+<summary><a name="mysql-multitable-second-table-running"></a><strong>MySQL: Multi-table Second Table Running</strong></summary>
 
 ```
 
@@ -2576,29 +2563,27 @@ Sequential mode: First complete, second running
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  12m                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
-    Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
+    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+      Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
 
-  products: ⏳ Queued
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⏳ Queued
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 ```
 </details>
 
 <details>
-<summary><a name="multitable-third-table-running"></a><strong>Multi-table: Third Table Running</strong></summary>
+<summary><a name="mysql-multitable-third-table-running"></a><strong>MySQL: Multi-table Third Table Running</strong></summary>
 
 ```
 
@@ -2607,29 +2592,27 @@ Sequential mode: First two complete, third running
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:10:00 UTC  │
 │  Duration:  20m                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80%
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
-    Rows: 160,000 / 200,000 · ETA: 2m 45s
+    products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80%
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+      Rows: 160,000 / 200,000 · ETA: 2m 45s
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
 
 ```
 </details>
 
 <details>
-<summary><a name="multitable-all-completed"></a><strong>Multi-table: All Completed</strong></summary>
+<summary><a name="mysql-multitable-all-completed"></a><strong>MySQL: Multi-table All Completed</strong></summary>
 
 ```
 
@@ -2638,21 +2621,19 @@ Sequential mode: All tables completed successfully
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Completed            │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:05:00 UTC  │
 │  Duration:  24m 30s              │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 ✓ Apply complete!
 
@@ -2660,7 +2641,7 @@ Table Progress:
 </details>
 
 <details>
-<summary><a name="multitable-first-table-failed"></a><strong>Multi-table: First Table Failed</strong></summary>
+<summary><a name="mysql-multitable-first-table-failed"></a><strong>MySQL: Multi-table First Table Failed</strong></summary>
 
 ```
 
@@ -2669,7 +2650,6 @@ Sequential mode: First table failed (others cancelled)
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Failed               │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:22:00 UTC  │
 │  Duration:  7m 30s               │
 └──────────────────────────────────┘
@@ -2677,15 +2657,14 @@ Sequential mode: First table failed (others cancelled)
   lock wait timeout exceeded; try restarting transaction
 
 
-Table Progress:
-  users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  orders: ⊘ Cancelled (not started)
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: ⊘ Cancelled (not started)
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: ⊘ Cancelled (not started)
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⊘ Cancelled (not started)
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -2695,7 +2674,7 @@ The new apply will only process tables that haven't completed.
 </details>
 
 <details>
-<summary><a name="multitable-middle-table-failed"></a><strong>Multi-table: Middle Table Failed</strong></summary>
+<summary><a name="mysql-multitable-middle-table-failed"></a><strong>MySQL: Multi-table Middle Table Failed</strong></summary>
 
 ```
 
@@ -2704,7 +2683,6 @@ Sequential mode: Middle table failed
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Failed               │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:12:00 UTC  │
 │  Duration:  17m 30s              │
 └──────────────────────────────────┘
@@ -2712,15 +2690,14 @@ Sequential mode: Middle table failed
   Lost connection to MySQL server during query (MySQL error 2013)
 
 
-Table Progress:
-  orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  products: ⊘ Cancelled (not started)
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⊘ Cancelled (not started)
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -2730,7 +2707,7 @@ The new apply will only process tables that haven't completed.
 </details>
 
 <details>
-<summary><a name="multitable-stopped"></a><strong>Multi-table: Stopped</strong></summary>
+<summary><a name="mysql-multitable-stopped"></a><strong>MySQL: Multi-table Stopped</strong></summary>
 
 ```
 
@@ -2739,24 +2716,695 @@ Sequential mode: User stopped mid-apply
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Stopped              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:25:00 UTC  │
 │  Duration:  5m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42%
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
-    Rows: 112,045 / 266,383
+    orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42%
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+      Rows: 112,045 / 266,383
 
-  products: ⏹️ Stopped (not started)
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⏹️ Stopped (not started)
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Use 'schemabot start' to resume from checkpoint.
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-creating-branch"></a><strong>Vitess: Creating Branch</strong></summary>
+
+```
+
+┌────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6  │
+│  Database:     myapp               │
+│  Environment:  staging             │
+│  State:        Creating branch     │
+└────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    users: ⏳ Queued
+      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-applying-branch-changes"></a><strong>Vitess: Applying Branch Changes</strong></summary>
+
+```
+
+┌────────────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6          │
+│  Database:     myapp                       │
+│  Environment:  staging                     │
+│  State:        Applying changes to branch  │
+│  Branch:       schemabot-myapp-28471035    │
+└────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    users: ⏳ Queued
+      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-creating-deploy-request"></a><strong>Vitess: Creating Deploy Request</strong></summary>
+
+```
+
+┌──────────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6        │
+│  Database:     myapp                     │
+│  Environment:  staging                   │
+│  State:        Creating deploy request   │
+│  Branch:       schemabot-myapp-28471035  │
+└──────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    users: ⏳ Queued
+      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-running"></a><strong>Vitess: Running</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Running                                                      │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
+│  Started:         Jan 15 14:29:30 UTC                                          │
+│  Duration:        30s                                                          │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    users: Running...
+      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-completed"></a><strong>Vitess: Completed</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Completed                                                    │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
+│  Started:         Jan 15 14:28:30 UTC                                          │
+│  Duration:        1m 30s                                                       │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-failed"></a><strong>Vitess: Failed</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Failed                                                       │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
+│  Started:         Jan 15 14:29:00 UTC                                          │
+│  Duration:        1m                                                           │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+  deploy request #42 failed during preparation (state: error)
+
+
+  ── myapp_sharded ──
+    users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+To recover: Fix the issue above, then run a new apply.
+The new apply will only process tables that haven't completed.
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-waiting-for-cutover"></a><strong>Vitess: Waiting For Cutover</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     production                                                   │
+│  State:           Waiting for cutover                                          │
+│  Options:         ⏸️ Defer Cutover                                             │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/49  │
+│  Started:         Jan 15 14:27:00 UTC                                          │
+│  Duration:        3m                                                           │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+
+    Shards: 2 (2 ready for cutover)
+      ● -80: ready for cutover
+      ● 80-: ready for cutover
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-cutting-over"></a><strong>Vitess: Cutting Over</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     production                                                   │
+│  State:           Cutting over                                                 │
+│  Options:         ⏸️ Defer Cutover                                             │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/49  │
+│  Started:         Jan 15 14:26:00 UTC                                          │
+│  Duration:        4m                                                           │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+
+    Shards: 2 (2 cutting over)
+      ● -80: cutting over
+      ● 80-: cutting over
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-cancelled"></a><strong>Vitess: Cancelled</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Cancelled                                                    │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/50  │
+│  Started:         Jan 15 14:28:00 UTC                                          │
+│  Duration:        2m                                                           │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    orders: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⊘ Cancelled at 30%
+      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+
+    Shards: 2 (2 cancelled)
+      ○ -80: cancelled
+      ○ 80-: cancelled
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-large-shard-count-256-shards"></a><strong>Vitess: Large Shard Count (256 Shards)</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                              │
+│  Database:        commerce                                                        │
+│  Environment:     production                                                      │
+│  State:           Running                                                         │
+│  Branch:          schemabot-commerce-99182746                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/commerce/deploy-requests/28  │
+│  Started:         Jan 15 14:18:00 UTC                                             │
+│  Duration:        12m                                                             │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── commerce_sharded ──
+    transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 57%
+      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+      Rows: 110,573,340 / 193,280,000 · ETA: 4m 40s
+
+    Shards: 256 (30 ready for cutover, 226 copying)
+      ● -01: ready for cutover
+      ● 01-02: ready for cutover
+      ● 02-03: ready for cutover
+      ... 27 more ready for cutover
+      ◉ ff-: 10% (101,000/1,010,000 rows) ETA 4m 40s
+      ◉ fe-ff: 10% (100,800/1,008,000 rows) ETA 4m 40s
+      ◉ fd-fe: 11% (110,660/1,006,000 rows) ETA 4m 38s
+      ◉ fc-fd: 11% (110,440/1,004,000 rows) ETA 4m 38s
+      ◉ fb-fc: 12% (120,240/1,002,000 rows) ETA 4m 36s
+      ... 221 more copying shards
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-many-keyspaces-33-keyspaces"></a><strong>Vitess: Many Keyspaces (33 Keyspaces)</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                              │
+│  Database:        commerce                                                        │
+│  Environment:     production                                                      │
+│  State:           Running                                                         │
+│  Branch:          schemabot-commerce-99182746                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/commerce/deploy-requests/29  │
+│  Started:         Jan 15 14:22:00 UTC                                             │
+│  Duration:        8m                                                              │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── commerce_sharded ──
+    transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 67%
+      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+      Rows: 29,435,000 / 43,360,000 · ETA: 2m 37s
+
+    Shards: 32 (12 ready for cutover, 20 copying)
+      ● -08: ready for cutover
+      ● 08-10: ready for cutover
+      ● 10-18: ready for cutover
+      ... 9 more ready for cutover
+      ◉ f8-: 23% (347,300/1,510,000 rows) ETA 2m 37s
+      ◉ f0-f8: 26% (390,000/1,500,000 rows) ETA 2m 34s
+      ◉ e8-f0: 29% (432,100/1,490,000 rows) ETA 2m 31s
+      ◉ e0-e8: 32% (473,600/1,480,000 rows) ETA 2m 28s
+      ◉ d8-e0: 35% (514,500/1,470,000 rows) ETA 2m 25s
+      ... 15 more copying shards
+
+  ── commerce_001 ──
+    transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+
+
+  ── commerce_002 ──
+    transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+
+
+  ── commerce_003 ──
+    transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+
+
+  ── commerce_004 ──
+    transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+
+
+  ── commerce_005 ──
+    transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+
+
+  ... and 27 more keyspaces (all completed)
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-vschemaonly-update"></a><strong>Vitess: Vschema-only Update</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Running                                                      │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/43  │
+│  Started:         Jan 15 14:29:50 UTC                                          │
+│  Duration:        10s                                                          │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    ~ VSchema: Applying...
+      + "xxhash": {"type": "xxhash"}
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-multikeyspace"></a><strong>Vitess: Multi-keyspace</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Running                                                      │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/44  │
+│  Started:         Jan 15 14:29:40 UTC                                          │
+│  Duration:        20s                                                          │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_unsharded ──
+    orders_seq: Running...
+      CREATE TABLE `orders_seq` (
+          `id` int unsigned NOT NULL DEFAULT '0',
+          `next_id` bigint unsigned,
+          `cache` bigint unsigned,
+          PRIMARY KEY(`id`)
+      ) ENGINE InnoDB;
+
+
+  ── myapp_sharded ──
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-ddl--vschema"></a><strong>Vitess: DDL + VSchema</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Running                                                      │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/45  │
+│  Started:         Jan 15 14:29:45 UTC                                          │
+│  Duration:        15s                                                          │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    ~ VSchema: Applying...
+      + "users": {"column_vindexes": [{"column": "id", "name": "hash"}]}
+
+    users: Running...
+      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-shard-progress"></a><strong>Vitess: Shard Progress</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Running                                                      │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/46  │
+│  Started:         Jan 15 14:29:15 UTC                                          │
+│  Duration:        45s                                                          │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70%
+      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+      Rows: 2,800,000 / 4,000,000 · ETA: 2m 0s
+
+    Shards: 2 (2 copying)
+      ◉ -80: 95% (2,000,000/2,100,000 rows) ETA 10s
+      ◉ 80-: 42% (800,000/1,900,000 rows) ETA 2m 0s
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-cutover-retry"></a><strong>Vitess: Cutover Retry</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     production                                                   │
+│  State:           Running                                                      │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/51  │
+│  Started:         Jan 15 14:25:00 UTC                                          │
+│  Duration:        5m                                                           │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+
+    Shards: 2 (2 ready for cutover)
+      ● -80: ready for cutover
+      ● 80-: ready for cutover
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-plan-ddl--vschema"></a><strong>Vitess: Plan (DDL + VSchema)</strong></summary>
+
+```
+
+Vitess plan: DDL + VSchema changes in a sharded keyspace
+(schemabot plan -s examples/vitess/schema -e staging)
+
+╭─────────────────────────────────────────────╮
+│  Vitess Schema Change Plan                  │
+│                                             │
+│  Database: testapp-vitess                   │
+│  Environment: staging                       │
+╰─────────────────────────────────────────────╯
+
+
+  Keyspace: testapp_sharded
+
+  ~ VSchema:
+       },
+       "tables": {
+         "users": {
+    +      "column_vindexes": [
+    +        {"column": "id", "name": "hash"}
+    +      ]
+    +    },
+    +    "user_preferences": {
+    +      "column_vindexes": [
+    +        {"column": "user_id", "name": "hash"}
+    +      ]
+         }
+       }
+     }
+
+  + CREATE TABLE `user_preferences` (
+        `id` bigint NOT NULL AUTO_INCREMENT,
+        `user_id` bigint NOT NULL,
+        `key` varchar(255) NOT NULL,
+        `value` text,
+        PRIMARY KEY(`id`),
+        INDEX `idx_user_id`(`user_id`)
+    );
+
+  ~ ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
+
+📋 **Plan**: 1 table to create, 1 table to alter, 1 VSchema change
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-plan-vschemaonly"></a><strong>Vitess: Plan (Vschema-only)</strong></summary>
+
+```
+
+Vitess plan: VSchema-only update (no table DDL changes)
+(schemabot plan -s examples/vitess/schema -e staging)
+
+╭─────────────────────────────────────────────╮
+│  Vitess Schema Change Plan                  │
+│                                             │
+│  Database: testapp-vitess                   │
+│  Environment: staging                       │
+╰─────────────────────────────────────────────╯
+
+
+  Keyspace: testapp_sharded
+
+  ~ VSchema:
+     {
+       "sharded": true,
+       "vindexes": {
+    -    "hash": {"type": "hash"}
+    +    "hash": {"type": "hash"},
+    +    "lookup_email": {
+    +      "type": "consistent_lookup",
+    +      "params": {"table": "users_email_idx", "from": "email", "to": "user_id"}
+    +    }
+       },
+       "tables": {
+
+📋 **Plan**: 1 VSchema change
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-plan-multikeyspace"></a><strong>Vitess: Plan (Multi-keyspace)</strong></summary>
+
+```
+
+Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
+(schemabot plan -s examples/vitess/schema -e staging)
+
+╭─────────────────────────────────────────────╮
+│  Vitess Schema Change Plan                  │
+│                                             │
+│  Database: testapp-vitess                   │
+│  Environment: staging                       │
+╰─────────────────────────────────────────────╯
+
+
+  Keyspace: testapp_sharded
+
+  ~ VSchema:
+       "vindexes": {
+    -    "hash": {"type": "hash"}
+    +    "hash": {"type": "hash"},
+    +    "lookup_email": {
+    +      "type": "consistent_lookup",
+    +      "params": {"table": "users_email_idx", "from": "email", "to": "user_id"}
+    +    }
+       },
+
+  ~ ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
+
+  ~ ALTER TABLE `orders` ADD INDEX `idx_status_created`(`status`, `created_at`);
+
+
+  Keyspace: testapp
+
+  ~ VSchema:
+     {
+    -  "tables": {}
+    +  "tables": {
+    +    "users_email_idx": {},
+    +    "users_seq": {"type": "sequence"},
+    +    "orders_seq": {"type": "sequence"}
+    +  }
+     }
+
+  + CREATE TABLE `users_email_idx` (
+        `email` varchar(255) NOT NULL,
+        `user_id` bigint NOT NULL,
+        PRIMARY KEY(`email`, `user_id`)
+    );
+
+📋 **Plan**: 1 table to create, 2 tables to alter, 2 VSchema changes
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-instant-ddl"></a><strong>Vitess: Instant DDL</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Completed                                                    │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/47  │
+│  Started:         Jan 15 14:29:57 UTC                                          │
+│  Duration:        3s                                                           │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-revert-window"></a><strong>Vitess: Revert Window</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:           apply-a1b2c3d4e5f6                                           │
+│  Database:           myapp                                                        │
+│  Environment:        production                                                   │
+│  State:              Revert window                                                │
+│  Branch:             schemabot-myapp-28471035                                     │
+│  Deploy Request:     https://app.planetscale.com/my-org/myapp/deploy-requests/48  │
+│  Started:            Jan 15 14:28:00 UTC                                          │
+│  Duration:           30s                                                          │
+│  Revert expires in:  28m 29s                                                      │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+    orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+
 
 ```
 </details>
@@ -2772,22 +3420,21 @@ Apply watch mode: Running with footer controls
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:22:00 UTC  │
 │  Duration:  8m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
-    Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+  ── testapp ──
+    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+      Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 
-  products: ⏳ Queued
-    ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+    products: ⏳ Queued
+      ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
-  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ESC detach • s stop • v volume
 
@@ -2802,21 +3449,20 @@ ESC detach • s stop • v volume
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Completed            │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  11m 30s              │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ── testapp ──
+    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
-  products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+    products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ✓ Apply complete!
 
@@ -2850,22 +3496,21 @@ Checkpoint saved. Use 'schemabot start --apply-id apply-a1b2c3d4e5f67890' to res
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Stopped              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:22:00 UTC  │
 │  Duration:  8m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
-    Rows: 156,342 / 397,453
+  ── testapp ──
+    users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+      Rows: 156,342 / 397,453
 
-  products: ⏹️ Stopped (not started)
-    ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+    products: ⏹️ Stopped (not started)
+      ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
-  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 
 ```
@@ -2898,22 +3543,21 @@ Resuming from checkpoint...
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:22:00 UTC  │
 │  Duration:  8m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 40%
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
-    Rows: 158,000 / 397,453 · ETA: 8m 0s
+  ── testapp ──
+    users: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 40%
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+      Rows: 158,000 / 397,453 · ETA: 8m 0s
 
-  products: ⏳ Queued
-    ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+    products: ⏳ Queued
+      ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
-  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ESC detach • s stop • v volume
 
@@ -3018,21 +3662,19 @@ Sequential mode: Just started (all tables pending)
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Pending              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:29:50 UTC  │
 │  Duration:  10s                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: ⏳ Queued
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: ⏳ Queued
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  orders: ⏳ Queued
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: ⏳ Queued
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: ⏳ Queued
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⏳ Queued
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 ```
@@ -3048,22 +3690,20 @@ Sequential mode: First table running, others queued
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:25:00 UTC  │
 │  Duration:  5m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
-    Rows: 875,000 / 2,500,000 · ETA: 8m 30s
+    users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+      Rows: 875,000 / 2,500,000 · ETA: 8m 30s
 
-  orders: ⏳ Queued
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: ⏳ Queued
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: ⏳ Queued
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⏳ Queued
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 ```
@@ -3079,22 +3719,20 @@ Sequential mode: First complete, second running
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  12m                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
-    Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
+    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+      Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
 
-  products: ⏳ Queued
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⏳ Queued
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 ```
@@ -3110,22 +3748,20 @@ Sequential mode: First two complete, third running
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:10:00 UTC  │
 │  Duration:  20m                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80%
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
-    Rows: 160,000 / 200,000 · ETA: 2m 45s
+    products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80%
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+      Rows: 160,000 / 200,000 · ETA: 2m 45s
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
 
 ```
@@ -3141,21 +3777,19 @@ Sequential mode: All tables completed successfully
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Completed            │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:05:00 UTC  │
 │  Duration:  24m 30s              │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 ✓ Apply complete!
 
@@ -3172,7 +3806,6 @@ Sequential mode: First table failed (others cancelled)
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Failed               │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:22:00 UTC  │
 │  Duration:  7m 30s               │
 └──────────────────────────────────┘
@@ -3180,15 +3813,14 @@ Sequential mode: First table failed (others cancelled)
   lock wait timeout exceeded; try restarting transaction
 
 
-Table Progress:
-  users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  orders: ⊘ Cancelled (not started)
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: ⊘ Cancelled (not started)
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: ⊘ Cancelled (not started)
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⊘ Cancelled (not started)
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -3207,7 +3839,6 @@ Sequential mode: Middle table failed
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Failed               │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:12:00 UTC  │
 │  Duration:  17m 30s              │
 └──────────────────────────────────┘
@@ -3215,15 +3846,14 @@ Sequential mode: Middle table failed
   Lost connection to MySQL server during query (MySQL error 2013)
 
 
-Table Progress:
-  orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  products: ⊘ Cancelled (not started)
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⊘ Cancelled (not started)
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -3242,22 +3872,20 @@ Sequential mode: User stopped mid-apply
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Stopped              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:25:00 UTC  │
 │  Duration:  5m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42%
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
-    Rows: 112,045 / 266,383
+    orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42%
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+      Rows: 112,045 / 266,383
 
-  products: ⏹️ Stopped (not started)
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⏹️ Stopped (not started)
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Use 'schemabot start' to resume from checkpoint.
 ```
@@ -3275,24 +3903,22 @@ Atomic mode (--defer-cutover): All tables copy rows, then cutover together
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:22:00 UTC  │
 │  Duration:  8m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72%
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
-    Rows: 1,800,000 / 2,500,000 · ETA: 3m 15s
+    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72%
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+      Rows: 1,800,000 / 2,500,000 · ETA: 3m 15s
 
-  products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45%
-    ALTER TABLE `products` ADD INDEX `idx_category` (`category`)
-    Rows: 450,000 / 1,000,000 · ETA: 6m 20s
+    products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45%
+      ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
+      Rows: 450,000 / 1,000,000 · ETA: 6m 20s
 
-  users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 89%
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
-    Rows: 6,400,000 / 7,200,000 · ETA: 1m 45s
+    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 89%
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+      Rows: 6,400,000 / 7,200,000 · ETA: 1m 45s
 
 All tables copy rows simultaneously. Cutover happens atomically
 after all tables complete row copy.
@@ -3311,15 +3937,13 @@ Defer cutover: Single table waiting
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Waiting for cutover  │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:20:00 UTC  │
 │  Duration:  10m                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  users: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Row copy complete. All data has been copied and new writes
 continue to be replicated to keep the shadow table in sync.
@@ -3339,21 +3963,19 @@ Atomic mode (--defer-cutover): All tables waiting for cutover
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Waiting for cutover  │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:15:00 UTC  │
 │  Duration:  15m                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-    ALTER TABLE `products` ADD INDEX `idx_category` (`category`)
+    products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+      ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
 
-  users: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Row copy complete for all tables. New writes continue to be
 replicated to keep shadow tables in sync.
@@ -3374,21 +3996,19 @@ Defer cutover: Sequential mode, first complete, second waiting
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Waiting for cutover  │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  12m                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: ⏳ Queued
-    ALTER TABLE `products` ADD COLUMN `weight_grams` INT DEFAULT 0
+    products: ⏳ Queued
+      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Row copy complete for current table. Press Enter to cutover
 and start the next table (or Ctrl+C to detach): _
@@ -3407,24 +4027,22 @@ Defer cutover: Stopped by user (s)
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Stopped              │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:22:00 UTC  │
 │  Duration:  8m                   │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72%
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
-    Rows: 1,800,000 / 2,500,000
+    orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72%
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+      Rows: 1,800,000 / 2,500,000
 
-  products: 🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 45%
-    ALTER TABLE `products` ADD INDEX `idx_category` (`category`)
-    Rows: 450,000 / 1,000,000
+    products: 🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 45%
+      ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
+      Rows: 450,000 / 1,000,000
 
-  users: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜ ⏹️ Stopped at 89%
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
-    Rows: 6,400,000 / 7,200,000
+    users: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜ ⏹️ Stopped at 89%
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+      Rows: 6,400,000 / 7,200,000
 
 Use 'schemabot start --apply-id <apply_id>' to resume.
 
@@ -3466,21 +4084,19 @@ Defer cutover: Cutting over in progress
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Cutting over         │
-│  Engine:    Spirit               │
 │  Started:   Jan 15 14:15:00 UTC  │
 │  Duration:  15m                  │
 └──────────────────────────────────┘
 
 
-Table Progress:
-  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
-    ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)
+    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-  products: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
-    ALTER TABLE `products` ADD INDEX `idx_category` (`category`)
+    products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+      ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
 
-  users: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
-    ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Cutover in progress. This typically completes within seconds.
 Tables are being renamed atomically...
