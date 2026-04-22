@@ -33,6 +33,22 @@ var sqlKeywords = []string{
 
 // FormatSQL applies syntax highlighting to a SQL statement.
 // Keywords are highlighted in blue, table name in magenta.
+// IndentSQL formats and indents a SQL statement for display.
+// Multi-line statements have each line indented with the given prefix.
+func IndentSQL(sql, indent string) string {
+	formatted := FormatSQL(sql)
+	lines := strings.Split(formatted, "\n")
+	if len(lines) <= 1 {
+		return indent + formatted
+	}
+	for i, line := range lines {
+		if line != "" {
+			lines[i] = indent + line
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func FormatSQL(sql string) string {
 	result := sql
 

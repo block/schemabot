@@ -87,7 +87,7 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	}
 
 	// Show options if any flags are set
-	templates.WriteOptions(cmd.DeferCutover)
+	templates.WriteOptions(cmd.DeferCutover, false)
 
 	// Step 3: Prompt for confirmation (unless auto-approve)
 	if !cmd.AutoApprove {
@@ -137,6 +137,6 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying rollback...")
 
-	_, err = applyAndWatch(ep, planResult, database, environment, owner, "rollback", cmd.DeferCutover, cmd.Watch, OutputFormatInteractive, 0)
+	_, err = applyAndWatch(ep, planResult, database, environment, owner, "rollback", cmd.DeferCutover, false, cmd.Watch, OutputFormatInteractive, 0)
 	return err
 }

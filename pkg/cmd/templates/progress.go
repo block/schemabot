@@ -6,9 +6,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
+
+// Indentation for progress rendering.
+// indentContent is the indentation for DDL, rows, and status lines under a table name.
+var indentContent = strings.Repeat(" ", 6)
+
+// writeKeyspaceHeader renders a keyspace divider line.
+func writeKeyspaceHeader(ns string) {
+	fmt.Printf("\n  %s── %s ──%s\n", ANSIBold, ns, ANSIReset)
+}
 
 // nowFunc returns the current time. Overridden in previews for deterministic output.
 var nowFunc = time.Now
@@ -43,8 +53,25 @@ func WriteProgress(data ProgressData) {
 	if data.PullRequestURL != "" {
 		rows = append(rows, BoxRow{"PR", data.PullRequestURL})
 	}
-	if data.Engine != "" {
-		rows = append(rows, BoxRow{"Engine", data.Engine})
+	if len(data.Options) > 0 {
+		var opts []string
+		if data.Options["defer_cutover"] == "true" {
+			opts = append(opts, "⏸️ Defer Cutover")
+		}
+		if data.Options["skip_revert"] == "true" {
+			opts = append(opts, "⏩ Revert Window Disabled")
+		}
+		if len(opts) > 0 {
+			rows = append(rows, BoxRow{"Options", strings.Join(opts, " | ")})
+		}
+	}
+	if data.Metadata != nil {
+		if branch := data.Metadata["branch_name"]; branch != "" {
+			rows = append(rows, BoxRow{"Branch", branch})
+		}
+		if url := data.Metadata["deploy_request_url"]; url != "" {
+			rows = append(rows, BoxRow{"Deploy Request", url})
+		}
 	}
 	if data.StartedAt != "" {
 		if started, err := time.Parse(time.RFC3339, data.StartedAt); err == nil {
@@ -54,6 +81,18 @@ func WriteProgress(data ProgressData) {
 	dur := formatApplyDuration(data.StartedAt, data.CompletedAt)
 	if dur != "-" {
 		rows = append(rows, BoxRow{"Duration", dur})
+	}
+	// Show revert window remaining time. The server provides revert_expires_at
+	// in metadata based on its configured revert window duration (default 30min).
+	if state.IsState(data.State, state.Apply.RevertWindow) {
+		if expiresStr := data.Metadata["revert_expires_at"]; expiresStr != "" {
+			if expires, err := time.Parse(time.RFC3339, expiresStr); err == nil {
+				remaining := time.Until(expires)
+				if remaining > 0 {
+					rows = append(rows, BoxRow{"Revert expires in", FormatDurationSeconds(int64(remaining.Seconds()))})
+				}
+			}
+		}
 	}
 
 	WriteBox(rows, "State", colorFn)
@@ -73,15 +112,39 @@ func WriteProgress(data ProgressData) {
 		}
 	}
 
-	// Table progress (sorted: active first, terminal last)
+	// Table progress (sorted: active first, sharded before unsharded, terminal last)
 	if len(activeTables) > 0 {
 		sort.SliceStable(activeTables, func(i, j int) bool {
-			return ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[i].Status)) <
-				ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[j].Status))
+			pi := ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[i].Status))
+			pj := ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[j].Status))
+			if pi != pj {
+				return pi < pj
+			}
+			// Within the same priority, sharded tables (have shards) sort first
+			si := len(activeTables[i].Shards) > 0
+			sj := len(activeTables[j].Shards) > 0
+			if si != sj {
+				return si
+			}
+			return false
 		})
-		fmt.Println("\nTable Progress:")
+
+		// Show keyspace headers for Vitess tables (any table with a namespace)
+		hasNamespaces := false
 		for _, t := range activeTables {
-			writeTableProgress(t)
+			if t.Namespace != "" {
+				hasNamespaces = true
+				break
+			}
+		}
+
+		if hasNamespaces {
+			writeNamespacedTables(activeTables)
+		} else {
+			fmt.Println()
+			for _, t := range activeTables {
+				writeTableProgress(t)
+			}
 		}
 	}
 
@@ -91,11 +154,154 @@ func WriteProgress(data ProgressData) {
 	}
 }
 
+// writeNamespacedTables renders tables grouped by keyspace, collapsing
+// keyspaces where all tables share the same terminal status.
+// This prevents a wall of "✓ Complete" lines for 30+ unsharded keyspaces.
+func writeNamespacedTables(tables []TableProgress) {
+	type nsEntry struct {
+		namespace string
+		tables    []TableProgress
+	}
+
+	// Group tables by namespace, preserving order of first appearance.
+	var ordered []nsEntry
+	nsIndex := make(map[string]int)
+	for _, t := range tables {
+		ns := t.Namespace
+		if ns == "" {
+			ns = "(default)"
+		}
+		// Strip namespace prefix from VSchema task names (e.g., "VSchema: myapp_sharded" → "VSchema")
+		// since the keyspace header already provides context.
+		if strings.HasPrefix(t.TableName, "vschema:") || strings.HasPrefix(t.TableName, "VSchema:") {
+			parts := strings.SplitN(t.TableName, ": ", 2)
+			if len(parts) == 2 {
+				t.TableName = "VSchema"
+			}
+		}
+		if idx, ok := nsIndex[ns]; ok {
+			ordered[idx].tables = append(ordered[idx].tables, t)
+		} else {
+			nsIndex[ns] = len(ordered)
+			ordered = append(ordered, nsEntry{namespace: ns, tables: []TableProgress{t}})
+		}
+	}
+
+	// Collapse consecutive terminal keyspaces with identical single-table status.
+	type renderGroup struct {
+		namespaces []string
+		tables     []TableProgress
+		collapsed  bool
+	}
+	var groups []renderGroup
+	for _, entry := range ordered {
+		canCollapse := len(entry.tables) == 1 &&
+			state.IsTerminalApplyState(entry.tables[0].Status) &&
+			len(entry.tables[0].Shards) == 0
+
+		// Try to merge with previous group
+		if canCollapse && len(groups) > 0 {
+			prev := &groups[len(groups)-1]
+			if prev.collapsed && len(prev.tables) == 1 &&
+				prev.tables[0].TableName == entry.tables[0].TableName &&
+				prev.tables[0].Status == entry.tables[0].Status {
+				prev.namespaces = append(prev.namespaces, entry.namespace)
+				continue
+			}
+		}
+
+		groups = append(groups, renderGroup{
+			namespaces: []string{entry.namespace},
+			tables:     entry.tables,
+			collapsed:  canCollapse,
+		})
+	}
+
+	for _, g := range groups {
+		if g.collapsed && len(g.namespaces) > 1 {
+			const maxShown = 5
+			for i, ns := range g.namespaces {
+				if i >= maxShown {
+					fmt.Printf("\n  %s... and %d more keyspaces (all %s)%s\n",
+						ANSIDim, len(g.namespaces)-maxShown, g.tables[0].Status, ANSIReset)
+					break
+				}
+				writeKeyspaceHeader(ns)
+				writeTableProgress(g.tables[0])
+			}
+		} else {
+			writeKeyspaceHeader(g.namespaces[0])
+			// Render VSchema tasks first, then DDL tables
+			for _, t := range g.tables {
+				if isVSchemaTask(t) {
+					writeVSchemaProgress(t)
+				}
+			}
+			for _, t := range g.tables {
+				if !isVSchemaTask(t) {
+					writeTableProgress(t)
+				}
+			}
+		}
+	}
+}
+
+// isVSchemaTask returns true if this is a synthetic VSchema update task.
+func isVSchemaTask(t TableProgress) bool {
+	return t.TableName == "VSchema" || strings.HasPrefix(t.TableName, "vschema:") || strings.HasPrefix(t.TableName, "VSchema:")
+}
+
+// writeVSchemaProgress renders a VSchema update without a progress bar.
+// The DDL field contains a VSchema diff (not SQL), so we render it with
+// diff coloring via colorizeDiffLine, stripping ---/+++/@@ headers.
+func writeVSchemaProgress(t TableProgress) {
+	label := vschemaStatusLabel(state.NormalizeState(t.Status))
+	fmt.Printf("    ~ VSchema: %s\n", label)
+	if t.DDL != "" {
+		writeVSchemaDiff(t.DDL, indentContent)
+	}
+	fmt.Println()
+}
+
+// writeVSchemaDiff renders a VSchema diff with colorized +/- lines,
+// stripping ---/+++/@@ headers. Shared between plan and progress views.
+func writeVSchemaDiff(diff, indent string) {
+	for line := range strings.SplitSeq(strings.TrimRight(diff, "\n"), "\n") {
+		if strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "@@") {
+			continue
+		}
+		fmt.Printf("%s%s\n", indent, colorizeDiffLine(line))
+	}
+}
+
+// vschemaStatusLabel maps a task status to a VSchema-specific display label.
+func vschemaStatusLabel(status string) string {
+	switch status {
+	case state.Apply.Pending:
+		return "Pending"
+	case state.Apply.Running:
+		return "Applying..."
+	case state.Apply.Completed:
+		return ANSIGreen + "Applied" + ANSIReset
+	case state.Apply.Failed:
+		return ANSIRed + "Failed" + ANSIReset
+	case state.Apply.RevertWindow:
+		return ANSIYellow + "Applied (pending revert)" + ANSIReset
+	default:
+		return status
+	}
+}
+
 // writeFailureGuidance prints remediation instructions for failed applies.
 func writeFailureGuidance() {
 	fmt.Println()
 	fmt.Printf("%sTo recover:%s Fix the issue above, then run a new apply.\n", ANSIBold, ANSIReset)
 	fmt.Printf("The new apply will only process tables that haven't completed.\n")
+}
+
+// writeShardSummary renders per-shard progress using the detailed shard renderer.
+func writeShardSummary(shards []ShardProgress) {
+	writeShardProgress(shards)
 }
 
 // FormatProgressState formats the state for display with color.
@@ -107,6 +313,12 @@ func FormatProgressState(s string) string {
 		return "No active schema change"
 	case state.Apply.Pending:
 		return "⏳ Starting..."
+	case state.Apply.CreatingBranch:
+		return ANSICyan + "🔄 Creating branch..." + ANSIReset
+	case state.Apply.ApplyingBranchChanges:
+		return ANSICyan + "🔄 Applying changes to branch..." + ANSIReset
+	case state.Apply.CreatingDeployRequest:
+		return ANSICyan + "🔄 Creating deploy request..." + ANSIReset
 	case "idle":
 		return "Idle"
 	case state.Apply.Running:
@@ -121,6 +333,8 @@ func FormatProgressState(s string) string {
 		return ANSIRed + "✗ Failed" + ANSIReset
 	case state.Apply.Stopped:
 		return ANSIYellow + "⏸️  Stopped" + ANSIReset
+	case state.Apply.Cancelled:
+		return ANSIRed + "🚫 Cancelled" + ANSIReset
 	default:
 		return s
 	}
@@ -132,53 +346,66 @@ func FormatProgressState(s string) string {
 //	DDL statement (indented below)
 //	Rows: X / Y (if applicable)
 func writeTableProgress(t TableProgress) {
+	defer writeShardSummary(t.Shards)
 	// Handle special states first - all use format: tablename: [bar] [status]
 	switch t.Status {
 	case state.Apply.Pending:
 		// Pending = queued, not yet started
-		fmt.Printf("  %s: ⏳ Queued\n", t.TableName)
+		fmt.Printf("    %s: ⏳ Queued\n", t.TableName)
 		if t.DDL != "" {
-			fmt.Printf("    %s\n", FormatSQL(t.DDL))
+			fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 		}
 		fmt.Println()
 		return
 	case state.Apply.Completed:
 		bar := ui.ProgressBarComplete()
-		fmt.Printf("  %s: %s ✓ Complete\n", t.TableName, bar)
+		fmt.Printf("    %s: %s ✓ Complete\n", t.TableName, bar)
 		if t.DDL != "" {
-			fmt.Printf("    %s\n", FormatSQL(t.DDL))
+			fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 		}
 		fmt.Println()
 		return
 	case state.Apply.WaitingForCutover:
-		bar := ui.ProgressBarWaitingCutover()
-		fmt.Printf("  %s: %s Waiting for cutover\n", t.TableName, bar)
+		bar := ui.ProgressBarRowCopy(100) // blue — in progress, row copy done
+		fmt.Printf("    %s: %s Waiting for cutover\n", t.TableName, bar)
 		if t.DDL != "" {
-			fmt.Printf("    %s\n", FormatSQL(t.DDL))
+			fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 		}
 		fmt.Println()
 		return
 	case state.Apply.CuttingOver:
-		bar := ui.ProgressBarWaitingCutover()
-		fmt.Printf("  %s: %s 🔄 Cutting over...\n", t.TableName, bar)
+		bar := ui.ProgressBarRowCopy(100) // blue — still in progress
+		fmt.Printf("    %s: %s 🔄 Cutting over...\n", t.TableName, bar)
 		if t.DDL != "" {
-			fmt.Printf("    %s\n", FormatSQL(t.DDL))
+			fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 		}
 		fmt.Println()
 		return
 	case state.Apply.Failed:
 		bar := ui.ProgressBarFailed(t.PercentComplete)
-		fmt.Printf("  %s: %s ❌ Failed\n", t.TableName, bar)
+		fmt.Printf("    %s: %s ❌ Failed\n", t.TableName, bar)
 		if t.DDL != "" {
-			fmt.Printf("    %s\n", FormatSQL(t.DDL))
+			fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 		}
 		fmt.Println()
 		return
-	case TaskCancelled:
-		// Cancelled = task was never executed due to earlier failure
-		fmt.Printf("  %s: ⊘ Cancelled (not started)\n", t.TableName)
+	case state.Apply.RevertWindow:
+		bar := ui.ProgressBarWaitingCutover() // yellow — complete but revert available
+		fmt.Printf("    %s: %s ✓ Complete (pending revert)\n", t.TableName, bar)
 		if t.DDL != "" {
-			fmt.Printf("    %s\n", FormatSQL(t.DDL))
+			fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
+		}
+		fmt.Println()
+		return
+	case state.Apply.Cancelled:
+		if t.PercentComplete > 0 {
+			bar := ui.ProgressBarFailed(t.PercentComplete)
+			fmt.Printf("    %s: %s ⊘ Cancelled at %d%%\n", t.TableName, bar, t.PercentComplete)
+		} else {
+			fmt.Printf("    %s: ⊘ Cancelled (not started)\n", t.TableName)
+		}
+		if t.DDL != "" {
+			fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 		}
 		fmt.Println()
 		return
@@ -188,18 +415,18 @@ func writeTableProgress(t TableProgress) {
 		switch {
 		case t.PercentComplete >= 100:
 			// At 100% = was waiting for cutover when stopped
-			fmt.Printf("  %s: %s ⏹️ Stopped (was waiting for cutover)\n", t.TableName, bar)
+			fmt.Printf("    %s: %s ⏹️ Stopped (was waiting for cutover)\n", t.TableName, bar)
 		case t.PercentComplete > 0:
 			stoppedPercent := min(t.PercentComplete, 100)
-			fmt.Printf("  %s: %s ⏹️ Stopped at %d%%\n", t.TableName, bar, stoppedPercent)
+			fmt.Printf("    %s: %s ⏹️ Stopped at %d%%\n", t.TableName, bar, stoppedPercent)
 		default:
-			fmt.Printf("  %s: ⏹️ Stopped (not started)\n", t.TableName)
+			fmt.Printf("    %s: ⏹️ Stopped (not started)\n", t.TableName)
 		}
 		if t.DDL != "" {
-			fmt.Printf("    %s\n", FormatSQL(t.DDL))
+			fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 		}
 		if t.RowsTotal > 0 && t.PercentComplete > 0 {
-			fmt.Printf("    Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
+			fmt.Printf("      Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
 		}
 		fmt.Println()
 		return
@@ -211,24 +438,24 @@ func writeTableProgress(t TableProgress) {
 		if info := ParseSpiritProgress(t.ProgressDetail); info != nil {
 			// Parsed successfully - show emoji progress bar with structured data
 			bar := ui.ProgressBarRowCopy(info.Percent)
-			fmt.Printf("  %s: %s %d%%\n", t.TableName, bar, info.Percent)
+			fmt.Printf("    %s: %s %d%%\n", t.TableName, bar, info.Percent)
 			if t.DDL != "" {
-				fmt.Printf("    %s\n", FormatSQL(t.DDL))
+				fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 			}
 			// Rows and ETA on same line
 			if info.ETA != "" && info.ETA != "TBD" {
-				fmt.Printf("    Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal), info.ETA)
+				fmt.Printf(indentContent+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal), info.ETA)
 			} else {
-				fmt.Printf("    Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal))
+				fmt.Printf(indentContent+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal))
 			}
 			if info.State != "" && info.State != "copyRows" {
-				fmt.Printf("    Status: %s\n", info.State)
+				fmt.Printf(indentContent+"Status: %s\n", info.State)
 			}
 		} else {
 			// Can't parse - show raw detail
-			fmt.Printf("  %s:\n", t.TableName)
+			fmt.Printf("    %s:\n", t.TableName)
 			if t.DDL != "" {
-				fmt.Printf("    %s\n", FormatSQL(t.DDL))
+				fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 			}
 			fmt.Printf("    %s\n", t.ProgressDetail)
 		}
@@ -236,28 +463,28 @@ func writeTableProgress(t TableProgress) {
 		// Row copy in progress — show progress bar with structured fields
 		bar := ui.ProgressBarRowCopy(t.PercentComplete)
 		displayPercent := min(t.PercentComplete, 100)
-		fmt.Printf("  %s: %s %d%%\n", t.TableName, bar, displayPercent)
+		fmt.Printf("    %s: %s %d%%\n", t.TableName, bar, displayPercent)
 
 		if t.DDL != "" {
-			fmt.Printf("    %s\n", FormatSQL(t.DDL))
+			fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 		}
 
 		// Rows and ETA on same line
 		if t.ETASeconds > 0 {
-			fmt.Printf("    Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatETA(t.ETASeconds))
+			fmt.Printf(indentContent+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatETA(t.ETASeconds))
 		} else {
-			fmt.Printf("    Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
+			fmt.Printf("      Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
 		}
 
 		statusLower := strings.ToLower(t.Status)
 		if statusLower != "" && statusLower != "running" && statusLower != "row_copy" {
-			fmt.Printf("    Status: %s\n", t.Status)
+			fmt.Printf(indentContent+"Status: %s\n", t.Status)
 		}
 	default:
 		// No row copy data yet (initializing or instant DDL) — just show running state
-		fmt.Printf("  %s: Running...\n", t.TableName)
+		fmt.Printf("    %s: Running...\n", t.TableName)
 		if t.DDL != "" {
-			fmt.Printf("    %s\n", FormatSQL(t.DDL))
+			fmt.Printf("%s\n", IndentSQL(ddl.FormatDDL(t.DDL), indentContent))
 		}
 	}
 
@@ -527,6 +754,14 @@ func StateLabel(s string) string {
 		return "Stopped"
 	case state.Apply.Pending:
 		return "Pending"
+	case state.Apply.Cancelled:
+		return "Cancelled"
+	case state.Apply.CreatingBranch:
+		return "Creating branch"
+	case state.Apply.ApplyingBranchChanges:
+		return "Applying changes to branch"
+	case state.Apply.CreatingDeployRequest:
+		return "Creating deploy request"
 	case state.Apply.RevertWindow:
 		return "Revert window"
 	case state.Apply.Reverted:
@@ -549,8 +784,12 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIYellow)
 	case state.Apply.Stopped:
 		return colorWrap(ANSIOrange)
+	case state.Apply.Cancelled:
+		return colorWrap(ANSIRed)
 	case state.Apply.Pending:
 		return colorWrap(ANSIDim)
+	case state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest:
+		return colorWrap(ANSICyan)
 	case state.Apply.Reverted:
 		return colorWrap(ANSIRed)
 	case state.Apply.RevertWindow:

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -24,6 +26,7 @@ type ApplyCmd struct {
 	AutoApprove  bool          `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 	Watch        bool          `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
 	DeferCutover bool          `help:"Defer cutover until manual trigger (use 'schemabot cutover')" name:"defer-cutover"`
+	SkipRevert   bool          `help:"Skip revert window after completion (Vitess only)" name:"skip-revert"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
 	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
 	Yield        bool          `help:"Yield lock after successful completion"`
@@ -101,6 +104,11 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return err
 	}
 
+	// Validate engine-specific options
+	if cmd.SkipRevert && planResult.Engine != "" && !state.IsPlanetScaleEngine(planResult.Engine) {
+		return fmt.Errorf("--skip-revert is only relevant for Vitess/PlanetScale databases")
+	}
+
 	// Check for errors
 	if len(planResult.Errors) > 0 {
 		fmt.Println("Errors:")
@@ -110,8 +118,17 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return fmt.Errorf("plan has errors")
 	}
 
-	// Check if there are any changes
-	if len(planResult.FlatTables()) == 0 {
+	// Check if there are any changes (DDL or VSchema)
+	hasChanges := len(planResult.FlatTables()) > 0
+	if !hasChanges {
+		for _, sc := range planResult.Changes {
+			if sc.Metadata["vschema"] != "" {
+				hasChanges = true
+				break
+			}
+		}
+	}
+	if !hasChanges {
 		fmt.Println("No changes. Your schema is up-to-date.")
 		return nil
 	}
@@ -149,7 +166,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	}
 
 	// Show options if any flags are set
-	templates.WriteOptions(cmd.DeferCutover)
+	templates.WriteOptions(cmd.DeferCutover, cmd.SkipRevert)
 
 	// Step 3: Prompt for confirmation (unless auto-approve)
 	if !cmd.AutoApprove {
@@ -212,7 +229,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying changes...")
 
-	if _, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.Watch, cmd.Output, cmd.LogHeartbeat, opts); err != nil {
+	if _, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.SkipRevert, cmd.Watch, cmd.Output, cmd.LogHeartbeat, opts); err != nil {
 		return err
 	}
 
@@ -367,37 +384,93 @@ type tableLogState struct {
 	heartbeatCount int       // number of progress heartbeats emitted
 }
 
+// ANSI color codes for log output.
+const (
+	ansiReset  = "\033[0m"
+	ansiBold   = "\033[1m"
+	ansiDim    = "\033[2m"
+	ansiRed    = "\033[31m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+	ansiCyan   = "\033[36m"
+)
+
 // logEmitter writes structured logfmt lines with an apply_id prefix.
 type logEmitter struct {
-	applyID string
-	nowFunc func() time.Time // if set, used instead of time.Now for timestamps
+	applyID          string
+	deployRequestURL string           // emitted once when first seen
+	nowFunc          func() time.Time // override for testing/preview; defaults to time.Now().UTC()
 }
 
-// now returns the current time, using nowFunc if set.
-func (e *logEmitter) now() time.Time {
-	if e.nowFunc != nil {
-		return e.nowFunc()
+// msgColor returns the ANSI color for a log message based on its content.
+func msgColor(msg string) string {
+	switch {
+	case strings.Contains(msg, "complete"), strings.Contains(msg, "completed"):
+		return ansiGreen
+	case strings.Contains(msg, "failed"), strings.Contains(msg, "stopped"):
+		return ansiRed
+	case strings.Contains(msg, "started"), strings.Contains(msg, "Cutting"):
+		return ansiYellow
+	default:
+		return ""
 	}
-	return time.Now()
 }
 
-// emit writes a structured log line: timestamp apply_id=... key=value...
+// kvColor returns the ANSI color for a key-value pair based on the key name.
+func kvColor(key string) string {
+	switch key {
+	case "table", "keyspace":
+		return ansiCyan
+	case "progress", "rows", "eta", "duration":
+		return ansiBold
+	case "status":
+		return ansiYellow
+	case "error":
+		return ansiRed
+	default:
+		return ansiDim
+	}
+}
+
+// emit writes a colored structured log line: timestamp apply_id=... key=value...
 func (e *logEmitter) emit(kvs ...string) {
-	ts := e.now().UTC().Format(time.RFC3339)
-	var line []byte
-	line = append(line, ts...)
-
-	// Always include apply_id if known
-	if e.applyID != "" {
-		line = append(line, " apply_id="...)
-		line = append(line, e.applyID...)
+	now := time.Now().UTC()
+	if e.nowFunc != nil {
+		now = e.nowFunc()
 	}
+	ts := now.Format("15:04:05")
+	var line []byte
+	line = append(line, ansiDim...)
+	line = append(line, ts...)
+	line = append(line, ansiReset...)
 
 	for i := 0; i+1 < len(kvs); i += 2 {
+		key, val := kvs[i], kvs[i+1]
+		// Skip noisy fields that aren't useful for human readers
+		if key == "task_id" {
+			continue
+		}
+		// apply_id is emitted once at start, not on every line
+		if key == "apply_id" && e.applyID != "" {
+			continue
+		}
 		line = append(line, ' ')
-		line = append(line, kvs[i]...)
+		if key == "msg" {
+			// Message is rendered as just the value, with color
+			c := msgColor(val)
+			if c != "" {
+				line = append(line, c...)
+			}
+			line = append(line, val...)
+			if c != "" {
+				line = append(line, ansiReset...)
+			}
+			continue
+		}
+		c := kvColor(key)
+		line = append(line, c...)
+		line = append(line, key...)
 		line = append(line, '=')
-		val := kvs[i+1]
 		if logfmtNeedsQuoting(val) {
 			line = append(line, '"')
 			line = logfmtEscape(line, val)
@@ -405,6 +478,7 @@ func (e *logEmitter) emit(kvs ...string) {
 		} else {
 			line = append(line, val...)
 		}
+		line = append(line, ansiReset...)
 	}
 	fmt.Println(string(line))
 }
@@ -420,6 +494,24 @@ func logfmtNeedsQuoting(s string) bool {
 		}
 	}
 	return false
+}
+
+// collapseDDL collapses a multi-line DDL statement into a single line for log output.
+func collapseDDL(ddl string) string {
+	var b strings.Builder
+	b.Grow(len(ddl))
+	prevSpace := false
+	for _, c := range ddl {
+		if c == '\n' || c == '\r' || c == '\t' {
+			c = ' '
+		}
+		if c == ' ' && prevSpace {
+			continue
+		}
+		prevSpace = c == ' '
+		b.WriteRune(c)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // logfmtEscape appends val to b, escaping backslashes, quotes, and control characters.
@@ -455,7 +547,10 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 	log := &logEmitter{}
 	tableStates := make(map[string]*tableLogState)
 	var lastGlobalState string
+	var lastSummary string
 	var applyStart time.Time
+	var revertWindowStart time.Time
+	var lastRevertHeartbeat time.Time
 	pollInterval := 500 * time.Millisecond
 
 	for {
@@ -468,7 +563,16 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 
 		// Capture apply ID and start time from first response
 		if log.applyID == "" && result.ApplyID != "" {
+			// Emit once before setting — subsequent lines filter apply_id
+			log.emit("msg", "Apply started", "apply_id", result.ApplyID)
 			log.applyID = result.ApplyID
+		}
+		// Emit deploy request URL once when it first appears
+		if log.deployRequestURL == "" {
+			if url := result.Metadata["deploy_request_url"]; url != "" {
+				log.deployRequestURL = url
+				log.emit("msg", "Deploy request", "url", url)
+			}
 		}
 		if applyStart.IsZero() {
 			if result.StartedAt != "" {
@@ -482,6 +586,12 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 		}
 
 		if state.IsState(curState, state.NoActiveChange) {
+			// The background poller may not have updated task states yet.
+			// Keep polling unless we've already seen a terminal state.
+			if !state.IsTerminalApplyState(lastGlobalState) {
+				time.Sleep(pollInterval)
+				continue
+			}
 			log.emit("msg", "No active schema change")
 			return nil
 		}
@@ -503,12 +613,13 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 				ts.announced = true
 				ts.taskID = tbl.TaskID
 				ts.lastEmit = time.Now()
-				kvs := []string{"msg", "Table started", "table", tbl.TableName}
-				if tbl.TaskID != "" {
-					kvs = append(kvs, "task_id", tbl.TaskID)
+				msg := "Table started"
+				if isVSchemaTask(tbl) {
+					msg = "VSchema update started"
 				}
+				kvs := tableKVs(msg, tbl, ts)
 				if tbl.DDL != "" {
-					kvs = append(kvs, "ddl", tbl.DDL)
+					kvs = append(kvs, "ddl", collapseDDL(tbl.DDL))
 				}
 				log.emit(kvs...)
 
@@ -530,9 +641,10 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 				continue
 			}
 
-			// Time-based heartbeat only during row copy (running state with row data).
-			// First heartbeat fires quickly (2s) to confirm progress; subsequent ones at --log-heartbeat interval.
-			if tbl.RowsTotal > 0 && tblStatus == state.Apply.Running {
+			// Time-based heartbeat during active execution.
+			// With row data: shows rows copied / total. Without: just status confirmation.
+			// First heartbeat fires quickly (2s); subsequent at --log-heartbeat interval.
+			if tblStatus == state.Apply.Running {
 				interval := heartbeatInterval
 				if ts.heartbeatCount == 0 {
 					interval = logFirstHeartbeat
@@ -540,9 +652,21 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 				if time.Since(ts.lastEmit) >= interval {
 					ts.lastEmit = time.Now()
 					ts.heartbeatCount++
-					log.emitProgressHeartbeat(tbl, ts)
+					if tbl.RowsTotal > 0 {
+						log.emitProgressHeartbeat(tbl, ts)
+					} else {
+						kvs := append(tableKVs("Table running", tbl, ts), "status", "in progress")
+						kvs = appendShardSummary(kvs, tbl.Shards)
+						log.emit(kvs...)
+					}
 				}
 			}
+		}
+
+		// Emit engine status messages (e.g., "Creating branch sb-...")
+		if result.Summary != "" && result.Summary != lastSummary {
+			lastSummary = result.Summary
+			log.emit("msg", result.Summary)
 		}
 
 		// Detect global state transitions
@@ -555,8 +679,25 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 				log.emit("msg", "Waiting for cutover")
 			case state.IsState(curState, state.Apply.CuttingOver):
 				log.emit("msg", "Cutting over")
+			case state.IsState(curState, state.Apply.RevertWindow):
+				revertWindowStart = time.Now()
+				lastRevertHeartbeat = time.Now()
+				log.emit("msg", "Revert window open — run 'schemabot revert' to undo or 'schemabot skip-revert' to finalize")
 			}
 			lastGlobalState = globalNorm
+		}
+
+		// Revert window heartbeat — emit elapsed time every heartbeat interval
+		if state.IsState(curState, state.Apply.RevertWindow) && !revertWindowStart.IsZero() {
+			if time.Since(lastRevertHeartbeat) >= heartbeatInterval {
+				lastRevertHeartbeat = time.Now()
+				elapsed := ui.FormatHumanDuration(time.Since(revertWindowStart))
+				if result.Metadata["revert_skipped"] == "true" {
+					log.emit("msg", "Finalizing", "elapsed", elapsed)
+				} else {
+					log.emit("msg", "Revert window open", "elapsed", elapsed)
+				}
+			}
 		}
 
 		// Terminal states — emit summary and exit
@@ -586,32 +727,95 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 
 // tableKVs returns the common key-value pairs for a table log line (table name + task_id if known).
 func tableKVs(msg string, tbl *apitypes.TableProgressResponse, ts *tableLogState) []string {
-	kvs := []string{"msg", msg, "table", tbl.TableName}
+	kvs := []string{"msg", msg}
+	if isVSchemaTask(tbl) {
+		// VSchema tasks use keyspace as the identifier, not "table"
+		kvs = append(kvs, "keyspace", tbl.Keyspace)
+	} else {
+		kvs = append(kvs, "table", tbl.TableName)
+	}
 	taskID := ts.taskID
 	if taskID == "" {
-		taskID = tbl.TaskID // fall back to current response
+		taskID = tbl.TaskID
 	}
 	if taskID != "" {
 		kvs = append(kvs, "task_id", taskID)
 	}
+	if !isVSchemaTask(tbl) && tbl.Keyspace != "" {
+		kvs = append(kvs, "keyspace", tbl.Keyspace)
+	}
 	return kvs
+}
+
+// appendShardSummary appends shard progress info to a log line's key-value pairs.
+// For small shard counts, lists each shard. For large counts, shows a summary.
+func appendShardSummary(kvs []string, shards []*apitypes.ShardProgressResponse) []string {
+	if len(shards) == 0 {
+		return kvs
+	}
+
+	kvs = append(kvs, "shards", fmt.Sprintf("%d", len(shards)))
+
+	// Summarize by status
+	counts := make(map[string]int)
+	for _, s := range shards {
+		counts[s.Status]++
+	}
+
+	var parts []string
+	for status, count := range counts {
+		parts = append(parts, fmt.Sprintf("%s=%d", status, count))
+	}
+	sort.Strings(parts)
+	kvs = append(kvs, "shard_status", strings.Join(parts, ","))
+
+	return kvs
+}
+
+// isVSchemaTask returns true if this is a synthetic VSchema update task.
+func isVSchemaTask(tbl *apitypes.TableProgressResponse) bool {
+	return strings.HasPrefix(tbl.TableName, "vschema:")
 }
 
 // emitTableStateChange emits a log line for a table state transition.
 func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, tblStatus string, ts *tableLogState) {
-	dur := ui.FormatHumanDuration(e.now().Sub(ts.startedAt))
+	dur := ui.FormatHumanDuration(time.Since(ts.startedAt))
+	vs := isVSchemaTask(tbl)
 
 	switch tblStatus {
 	case state.Apply.Completed:
-		kvs := tableKVs("Table complete", tbl, ts)
-		e.emit(append(kvs, "duration", dur)...)
+		msg := "Table complete"
+		if vs {
+			msg = "VSchema update complete"
+		}
+		kvs := tableKVs(msg, tbl, ts)
+		kvs = append(kvs, "duration", dur)
+		kvs = appendShardSummary(kvs, tbl.Shards)
+		e.emit(kvs...)
+	case state.Apply.RevertWindow:
+		msg := "Table deployed — revert window open"
+		if vs {
+			msg = "VSchema deployed — revert window open"
+		}
+		kvs := tableKVs(msg, tbl, ts)
+		kvs = append(kvs, "duration", dur)
+		kvs = appendShardSummary(kvs, tbl.Shards)
+		e.emit(kvs...)
 	case state.Apply.Failed:
-		kvs := tableKVs("Table failed", tbl, ts)
+		msg := "Table failed"
+		if vs {
+			msg = "VSchema update failed"
+		}
+		kvs := tableKVs(msg, tbl, ts)
 		e.emit(append(kvs, "duration", dur)...)
 	case state.Apply.WaitingForCutover:
-		e.emit(tableKVs("Waiting for cutover", tbl, ts)...)
+		kvs := tableKVs("Waiting for cutover", tbl, ts)
+		kvs = appendShardSummary(kvs, tbl.Shards)
+		e.emit(kvs...)
 	case state.Apply.CuttingOver:
-		e.emit(tableKVs("Cutting over", tbl, ts)...)
+		kvs := tableKVs("Cutting over", tbl, ts)
+		kvs = appendShardSummary(kvs, tbl.Shards)
+		e.emit(kvs...)
 	case state.Apply.Stopped:
 		kvs := tableKVs("Table stopped", tbl, ts)
 		if tbl.PercentComplete > 0 {
@@ -620,7 +824,9 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 		e.emit(kvs...)
 	default:
 		kvs := tableKVs("Table status changed", tbl, ts)
-		e.emit(append(kvs, "status", tblStatus)...)
+		kvs = append(kvs, "status", tblStatus)
+		kvs = appendShardSummary(kvs, tbl.Shards)
+		e.emit(kvs...)
 	}
 }
 
@@ -642,6 +848,7 @@ func (e *logEmitter) emitProgressHeartbeat(tbl *apitypes.TableProgressResponse, 
 		kvs = append(kvs, "eta", ui.FormatETA(tbl.ETASeconds))
 	}
 
+	kvs = appendShardSummary(kvs, tbl.Shards)
 	e.emit(kvs...)
 }
 
@@ -659,13 +866,16 @@ func (e *logEmitter) emitApplySummary(outcome string, tableStates map[string]*ta
 		}
 	}
 
-	dur := ui.FormatHumanDuration(e.now().Sub(applyStart))
+	dur := ui.FormatHumanDuration(time.Since(applyStart))
 
+	total := succeeded + failed + stopped
 	kvs := []string{
 		"msg", "Apply " + outcome,
 		"duration", dur,
-		"succeeded", fmt.Sprintf("%d", succeeded),
-		"failed", fmt.Sprintf("%d", failed),
+		"tables", fmt.Sprintf("%d/%d succeeded", succeeded, total),
+	}
+	if failed > 0 {
+		kvs = append(kvs, "failed", fmt.Sprintf("%d", failed))
 	}
 	if stopped > 0 {
 		kvs = append(kvs, "stopped", fmt.Sprintf("%d", stopped))
@@ -680,7 +890,7 @@ func (e *logEmitter) emitApplySummary(outcome string, tableStates map[string]*ta
 // isActiveStatus returns true if the table status represents an active (non-terminal) state.
 func isActiveStatus(status string) bool {
 	switch status {
-	case state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped:
+	case state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Reverted, state.Apply.RevertWindow:
 		return false
 	default:
 		return true

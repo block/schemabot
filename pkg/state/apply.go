@@ -6,6 +6,12 @@ import "strings"
 
 // Apply holds the apply-level state machine constants.
 // An apply is a single schema change operation stored in the applies table.
+//
+// The state machine is a union across all engines. Some states are only valid
+// for specific engines (e.g., CreatingBranch and RevertWindow are PlanetScale-only,
+// Stopped with resume is Spirit-only). Each engine uses the subset that applies
+// to its lifecycle. Consumers (CLI, TUI, PR templates) handle all states via
+// switch/case with a default fallback for unknown states.
 var Apply = struct {
 	Pending           string
 	Running           string
@@ -15,7 +21,15 @@ var Apply = struct {
 	Completed         string
 	Failed            string
 	Stopped           string
+	Cancelled         string
 	Reverted          string
+
+	// PlanetScale-specific states for the branch/deploy lifecycle.
+	// These are set on the apply record during engine setup so the
+	// progress handler and CLI can show what's happening.
+	CreatingBranch        string
+	ApplyingBranchChanges string
+	CreatingDeployRequest string
 }{
 	Pending:           "pending",
 	Running:           "running",
@@ -25,7 +39,12 @@ var Apply = struct {
 	Completed:         "completed",
 	Failed:            "failed",
 	Stopped:           "stopped",
+	Cancelled:         "cancelled",
 	Reverted:          "reverted",
+
+	CreatingBranch:        "creating_branch",
+	ApplyingBranchChanges: "applying_branch_changes",
+	CreatingDeployRequest: "creating_deploy_request",
 }
 
 // DeriveApplyState determines the overall Apply state from individual Task states.
@@ -56,6 +75,9 @@ func DeriveApplyState(taskStates []string) string {
 
 	if counts[Apply.Failed] > 0 {
 		return Apply.Failed
+	}
+	if counts[Apply.Cancelled] > 0 {
+		return Apply.Cancelled
 	}
 	if counts[Apply.Stopped] > 0 {
 		return Apply.Stopped
@@ -101,10 +123,10 @@ func normalizeApplyState(raw string) string {
 		return Apply.Failed
 	case "STOPPED":
 		return Apply.Stopped
+	case "CANCELLED":
+		return Apply.Cancelled
 	case "REVERTED":
 		return Apply.Reverted
-	case "CANCELLED":
-		return Apply.Failed
 	default:
 		return Apply.Pending
 	}
@@ -128,9 +150,16 @@ func IsState(s string, expected ...string) bool {
 // where no further processing will occur.
 func IsTerminalApplyState(s string) bool {
 	switch s {
-	case Apply.Completed, Apply.Failed, Apply.Stopped, Apply.Reverted:
+	case Apply.Completed, Apply.Failed, Apply.Stopped, Apply.Cancelled, Apply.Reverted:
 		return true
 	default:
 		return false
 	}
+}
+
+// IsPlanetScaleEngine returns true if the engine string indicates PlanetScale/Vitess.
+// Handles display names ("PlanetScale"), storage constants ("planetscale"),
+// and proto enum strings ("ENGINE_PLANETSCALE").
+func IsPlanetScaleEngine(engine string) bool {
+	return strings.EqualFold(engine, "planetscale") || strings.EqualFold(engine, "ENGINE_PLANETSCALE")
 }

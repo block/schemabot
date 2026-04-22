@@ -117,6 +117,70 @@ func (r *PlanResponse) HasErrors() bool {
 	return false
 }
 
+// UnsafeChange represents a table change that is potentially destructive.
+type UnsafeChange struct {
+	Table      string
+	Reason     string
+	DDL        string
+	ChangeType string
+}
+
+// UnsafeChanges returns all table changes marked as unsafe across all namespaces.
+func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
+	var result []UnsafeChange
+	for _, sc := range r.Changes {
+		for _, t := range sc.TableChanges {
+			if t.IsUnsafe {
+				result = append(result, UnsafeChange{
+					Table:      t.TableName,
+					Reason:     t.UnsafeReason,
+					DDL:        t.DDL,
+					ChangeType: t.ChangeType,
+				})
+			}
+		}
+	}
+	return result
+}
+
+// LintWarnings returns lint results with warning severity.
+func (r *PlanResponse) LintWarnings() []LintViolationResponse {
+	var result []LintViolationResponse
+	for _, w := range r.LintResults {
+		if w.Severity == "warning" {
+			result = append(result, *w)
+		}
+	}
+	return result
+}
+
+// LintInfos returns lint results with info severity.
+func (r *PlanResponse) LintInfos() []LintViolationResponse {
+	var result []LintViolationResponse
+	for _, w := range r.LintResults {
+		if w.Severity == "info" {
+			result = append(result, *w)
+		}
+	}
+	return result
+}
+
+// LintNonErrors returns lint results that don't block the apply (warning + info).
+func (r *PlanResponse) LintNonErrors() []LintViolationResponse {
+	return append(r.LintWarnings(), r.LintInfos()...)
+}
+
+// LintErrors returns lint results with error severity.
+func (r *PlanResponse) LintErrors() []LintViolationResponse {
+	var result []LintViolationResponse
+	for _, w := range r.LintResults {
+		if w.Severity == "error" {
+			result = append(result, *w)
+		}
+	}
+	return result
+}
+
 // FlatTables returns a flat list of all table changes across all namespaces.
 func (r *PlanResponse) FlatTables() []*TableChangeResponse {
 	var tables []*TableChangeResponse
@@ -124,70 +188,6 @@ func (r *PlanResponse) FlatTables() []*TableChangeResponse {
 		tables = append(tables, sc.TableChanges...)
 	}
 	return tables
-}
-
-// UnsafeChange represents a destructive schema change extracted from a plan.
-type UnsafeChange struct {
-	Table      string
-	Reason     string
-	ChangeType string
-}
-
-// UnsafeChanges extracts all table changes marked as unsafe (DROP TABLE, DROP COLUMN, etc.).
-func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
-	var changes []UnsafeChange
-	for _, tbl := range r.FlatTables() {
-		if !tbl.IsUnsafe {
-			continue
-		}
-		changes = append(changes, UnsafeChange{
-			Table:      tbl.TableName,
-			Reason:     tbl.UnsafeReason,
-			ChangeType: tbl.ChangeType,
-		})
-	}
-	return changes
-}
-
-// LintViolation represents a lint warning extracted from a plan response.
-type LintViolation struct {
-	Message string
-	Table   string
-	Linter  string
-}
-
-// LintViolations returns non-error lint results (warning and info severity).
-// Error-severity results represent unsafe/blocking changes and are shown
-// separately via UnsafeChanges().
-func (r *PlanResponse) LintViolations() []LintViolation {
-	var warnings []LintViolation
-	for _, w := range r.LintResults {
-		if w.Severity == "error" {
-			continue
-		}
-		warnings = append(warnings, LintViolation{
-			Message: w.Message,
-			Table:   w.Table,
-			Linter:  w.Linter,
-		})
-	}
-	return warnings
-}
-
-// LintErrors returns error-severity lint results (unsafe/blocking changes).
-func (r *PlanResponse) LintErrors() []LintViolation {
-	var warnings []LintViolation
-	for _, w := range r.LintResults {
-		if w.Severity != "error" {
-			continue
-		}
-		warnings = append(warnings, LintViolation{
-			Message: w.Message,
-			Table:   w.Table,
-			Linter:  w.Linter,
-		})
-	}
-	return warnings
 }
 
 // SchemaChangeResponse groups changes for a single namespace.
@@ -210,7 +210,7 @@ type TableChangeResponse struct {
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
 func (t *TableChangeResponse) GetTableName() string { return t.TableName }
 
-// LintViolationResponse represents a lint warning in the HTTP response.
+// LintViolationResponse represents a lint violation in the HTTP response.
 type LintViolationResponse struct {
 	Message  string `json:"message"`
 	Table    string `json:"table,omitempty"`
@@ -274,22 +274,39 @@ type ProgressResponse struct {
 	Tables       []*TableProgressResponse `json:"tables,omitempty"`
 	ErrorCode    string                   `json:"error_code,omitempty"`
 	ErrorMessage string                   `json:"error_message,omitempty"`
-	Summary      string                   `json:"summary,omitempty"` // Combined status with ETA
-	Volume       int32                    `json:"volume,omitempty"`  // Current volume setting (1-11)
+	Summary      string                   `json:"summary,omitempty"`  // Combined status with ETA
+	Volume       int32                    `json:"volume,omitempty"`   // Current volume setting (1-11)
+	Options      map[string]string        `json:"options,omitempty"`  // Apply options (defer_cutover, enable_revert, etc.)
+	Metadata     map[string]string        `json:"metadata,omitempty"` // Engine-specific data
 }
 
 // TableProgressResponse represents progress for a single table.
 type TableProgressResponse struct {
-	TableName       string `json:"table_name"`
-	DDL             string `json:"ddl"`
+	TableName       string                   `json:"table_name"`
+	DDL             string                   `json:"ddl"`
+	Keyspace        string                   `json:"keyspace,omitempty"`
+	Status          string                   `json:"status"`
+	RowsCopied      int64                    `json:"rows_copied"`
+	RowsTotal       int64                    `json:"rows_total"`
+	PercentComplete int32                    `json:"percent_complete"`
+	ETASeconds      int64                    `json:"eta_seconds,omitempty"`
+	IsInstant       bool                     `json:"is_instant,omitempty"`
+	ProgressDetail  string                   `json:"progress_detail,omitempty"`
+	TaskID          string                   `json:"task_id,omitempty"`
+	StartedAt       string                   `json:"started_at,omitempty"`
+	CompletedAt     string                   `json:"completed_at,omitempty"`
+	Shards          []*ShardProgressResponse `json:"shards,omitempty"`
+}
+
+// ShardProgressResponse contains per-shard progress for Vitess schema changes.
+type ShardProgressResponse struct {
+	Shard           string `json:"shard"`
 	Status          string `json:"status"`
 	RowsCopied      int64  `json:"rows_copied"`
 	RowsTotal       int64  `json:"rows_total"`
-	PercentComplete int32  `json:"percent_complete"`
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
-	IsInstant       bool   `json:"is_instant,omitempty"`
-	ProgressDetail  string `json:"progress_detail,omitempty"` // e.g., "12.5% copyRows ETA 1h 30m"
-	TaskID          string `json:"task_id,omitempty"`
+	PercentComplete int32  `json:"percent_complete"`
+	CutoverAttempts int32  `json:"cutover_attempts,omitempty"`
 }
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.

@@ -27,11 +27,14 @@ type ProgressData struct {
 	StartedAt      string // RFC3339 format
 	CompletedAt    string // RFC3339 format
 	Tables         []TableProgress
+	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
+	Metadata       map[string]string // Engine metadata (e.g., deploy_request_url, branch_name)
 }
 
 // TableProgress represents progress for a single table schema change.
 type TableProgress struct {
 	TableName       string
+	Namespace       string // Keyspace (Vitess) or schema name (MySQL)
 	DDL             string
 	Status          string
 	RowsCopied      int64
@@ -40,6 +43,30 @@ type TableProgress struct {
 	ETASeconds      int64
 	IsInstant       bool
 	ProgressDetail  string // e.g., Spirit: "12.5% copyRows ETA 1h 30m"
+	Shards          []ShardProgress
+}
+
+// ShardProgress contains per-shard progress for template rendering.
+type ShardProgress struct {
+	Shard           string
+	Status          string
+	RowsCopied      int64
+	RowsTotal       int64
+	ETASeconds      int64
+	PercentComplete int
+	CutoverAttempts int
+}
+
+// ShardCounts holds aggregated shard status counts.
+type ShardCounts struct {
+	Total             int
+	Complete          int
+	Running           int
+	WaitingForCutover int
+	CuttingOver       int
+	Queued            int
+	Failed            int
+	Cancelled         int
 }
 
 // SpiritProgressInfo contains parsed Spirit progress information.
@@ -99,11 +126,14 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		ErrorMessage: result.ErrorMessage,
 		StartedAt:    result.StartedAt,
 		CompletedAt:  result.CompletedAt,
+		Options:      result.Options,
+		Metadata:     result.Metadata,
 	}
 
 	for _, tbl := range result.Tables {
 		tp := TableProgress{
 			TableName:       tbl.TableName,
+			Namespace:       tbl.Keyspace,
 			DDL:             tbl.DDL,
 			Status:          state.NormalizeState(tbl.Status),
 			RowsCopied:      tbl.RowsCopied,
@@ -112,6 +142,17 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			ETASeconds:      tbl.ETASeconds,
 			IsInstant:       tbl.IsInstant,
 			ProgressDetail:  tbl.ProgressDetail,
+		}
+		for _, sh := range tbl.Shards {
+			tp.Shards = append(tp.Shards, ShardProgress{
+				Shard:           sh.Shard,
+				Status:          state.NormalizeShardStatus(sh.Status),
+				RowsCopied:      sh.RowsCopied,
+				RowsTotal:       sh.RowsTotal,
+				ETASeconds:      sh.ETASeconds,
+				PercentComplete: int(sh.PercentComplete),
+				CutoverAttempts: int(sh.CutoverAttempts),
+			})
 		}
 		data.Tables = append(data.Tables, tp)
 	}

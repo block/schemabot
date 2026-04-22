@@ -249,7 +249,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 	}
 
 	// Add lint violations (error-severity results are shown via UnsafeChanges instead)
-	for _, w := range planResp.LintViolations() {
+	for _, w := range planResp.LintNonErrors() {
 		data.LintViolations = append(data.LintViolations, templates.LintViolationData{
 			Message: w.Message,
 			Table:   w.Table,

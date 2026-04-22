@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
@@ -158,7 +159,13 @@ const (
 func PreviewCLIOutput(previewType PreviewType) {
 	switch previewType {
 	case PreviewPlan:
+		fmt.Println("=== MySQL Plan ===")
+		fmt.Println()
 		previewPlanOutput()
+		fmt.Println()
+		fmt.Println("=== Vitess Plan ===")
+		fmt.Println()
+		previewVitessPlanOutput()
 	case PreviewProgress:
 		previewProgressOutput()
 	case PreviewWaitingForCutover:
@@ -460,8 +467,8 @@ func samplePlanChanges() []DDLChange {
 }
 
 // samplePlanLintViolations returns reusable lint violations for plan preview functions.
-func samplePlanLintViolations() []LintViolation {
-	return []LintViolation{
+func samplePlanLintViolations() []apitypes.LintViolationResponse {
+	return []apitypes.LintViolationResponse{
 		{Message: "has_float: New column uses floating-point data type", Table: "orders", Linter: "has_float"},
 		{Message: "no_default: Column added without DEFAULT value", Table: "users", Linter: "no_default"},
 	}
@@ -479,7 +486,7 @@ func previewPlanOutput() {
 	WriteSQLChanges(changes)
 	WriteLintViolations(samplePlanLintViolations())
 	WritePlanSummary(changes)
-	WriteOptions(true) // Show defer cutover option
+	WriteOptions(true, false) // Show defer cutover option
 }
 
 func previewVitessPlanOutput() {
@@ -786,7 +793,7 @@ func previewLintViolationsOutput() {
 	fmt.Println("Lint violations: Non-blocking warnings during plan/apply")
 	fmt.Println()
 
-	warnings := []LintViolation{
+	warnings := []apitypes.LintViolationResponse{
 		{Message: "has_float: New column uses floating-point data type", Table: "orders", Linter: "has_float"},
 		{Message: "no_default: Column added without DEFAULT value", Table: "users", Linter: "no_default"},
 	}
@@ -1067,22 +1074,45 @@ func previewCLIApplyAllOutput() {
 		name string
 		fn   func()
 	}{
-		// Single table (matches PR single_* previews)
-		{"SINGLE TABLE: RUNNING", previewProgressOutput},
-		{"SINGLE TABLE: COMPLETED", previewCompletedOutput},
-		{"SINGLE TABLE: FAILED", previewFailedOutput},
-		{"SINGLE TABLE: STOPPED", previewStoppedOutput},
-		{"SINGLE TABLE: WAITING FOR CUTOVER", previewWaitingForCutoverOutput},
-		{"SINGLE TABLE: CUTTING OVER", previewCuttingOverOutput},
-		// Multi-table sequential (matches PR multi-table progression)
-		{"MULTI-TABLE: ALL PENDING", previewSeqPendingOutput},
-		{"MULTI-TABLE: FIRST TABLE RUNNING", previewSeqFirstRunOutput},
-		{"MULTI-TABLE: SECOND TABLE RUNNING", previewSeqSecondRunOutput},
-		{"MULTI-TABLE: THIRD TABLE RUNNING", previewSeqThirdRunOutput},
-		{"MULTI-TABLE: ALL COMPLETED", previewSeqAllDoneOutput},
-		{"MULTI-TABLE: FIRST TABLE FAILED", previewSeqFirstFailOutput},
-		{"MULTI-TABLE: MIDDLE TABLE FAILED", previewSeqMidFailOutput},
-		{"MULTI-TABLE: STOPPED", previewSeqStoppedOutput},
+		// MySQL: single table
+		{"MYSQL: SINGLE TABLE RUNNING", previewProgressOutput},
+		{"MYSQL: SINGLE TABLE COMPLETED", previewCompletedOutput},
+		{"MYSQL: SINGLE TABLE FAILED", previewFailedOutput},
+		{"MYSQL: SINGLE TABLE STOPPED", previewStoppedOutput},
+		{"MYSQL: SINGLE TABLE WAITING FOR CUTOVER", previewWaitingForCutoverOutput},
+		{"MYSQL: SINGLE TABLE CUTTING OVER", previewCuttingOverOutput},
+		// MySQL: multi-table sequential
+		{"MYSQL: MULTI-TABLE ALL PENDING", previewSeqPendingOutput},
+		{"MYSQL: MULTI-TABLE FIRST TABLE RUNNING", previewSeqFirstRunOutput},
+		{"MYSQL: MULTI-TABLE SECOND TABLE RUNNING", previewSeqSecondRunOutput},
+		{"MYSQL: MULTI-TABLE THIRD TABLE RUNNING", previewSeqThirdRunOutput},
+		{"MYSQL: MULTI-TABLE ALL COMPLETED", previewSeqAllDoneOutput},
+		{"MYSQL: MULTI-TABLE FIRST TABLE FAILED", previewSeqFirstFailOutput},
+		{"MYSQL: MULTI-TABLE MIDDLE TABLE FAILED", previewSeqMidFailOutput},
+		{"MYSQL: MULTI-TABLE STOPPED", previewSeqStoppedOutput},
+		// Vitess: PlanetScale lifecycle
+		{"VITESS: CREATING BRANCH", previewCreatingBranchOutput},
+		{"VITESS: APPLYING BRANCH CHANGES", previewApplyingBranchChangesOutput},
+		{"VITESS: CREATING DEPLOY REQUEST", previewCreatingDeployRequestOutput},
+		{"VITESS: RUNNING", previewVitessRunningOutput},
+		{"VITESS: COMPLETED", previewVitessCompletedOutput},
+		{"VITESS: FAILED", previewVitessFailedOutput},
+		{"VITESS: WAITING FOR CUTOVER", previewVitessWaitingForCutoverOutput},
+		{"VITESS: CUTTING OVER", previewVitessCuttingOverOutput},
+		{"VITESS: CANCELLED", previewVitessCancelledOutput},
+		{"VITESS: LARGE SHARD COUNT (256 shards)", previewVitessLargeShardCountOutput},
+		{"VITESS: MANY KEYSPACES (33 keyspaces)", previewVitessManyKeyspacesOutput},
+		{"VITESS: VSCHEMA-ONLY UPDATE", previewVitessVSchemaOnlyOutput},
+		{"VITESS: MULTI-KEYSPACE", previewVitessMultiKeyspaceOutput},
+		{"VITESS: DDL + VSCHEMA", previewVitessDDLWithVSchemaOutput},
+		{"VITESS: SHARD PROGRESS", previewVitessShardProgressOutput},
+		{"VITESS: CUTOVER RETRY", previewVitessCutoverRetryOutput},
+		// Vitess: plan rendering
+		{"VITESS: PLAN (DDL + VSCHEMA)", previewVSchemaPlanOutput},
+		{"VITESS: PLAN (VSCHEMA-ONLY)", previewVSchemaOnlyOutput},
+		{"VITESS: PLAN (MULTI-KEYSPACE)", previewMultiKeyspacePlanOutput},
+		{"VITESS: INSTANT DDL", previewVitessInstantDDLOutput},
+		{"VITESS: REVERT WINDOW", previewVitessRevertWindowOutput},
 		// CLI-only: interactive commands
 		{"APPLY WATCH MODE", previewApplyWatchOutput},
 		{"STOP COMMAND", previewStopCommandOutput},

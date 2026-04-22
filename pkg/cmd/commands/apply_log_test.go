@@ -2,10 +2,9 @@ package commands
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"os"
-	"strings"
+	"regexp"
 	"testing"
 	"time"
 
@@ -34,6 +33,14 @@ func captureOutput(t *testing.T, fn func()) string {
 	_, err = io.Copy(&buf, r)
 	require.NoError(t, err)
 	return buf.String()
+}
+
+// ansiPattern matches ANSI escape sequences.
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// stripANSI removes all ANSI escape sequences from a string.
+func stripANSI(s string) string {
+	return ansiPattern.ReplaceAllString(s, "")
 }
 
 func TestLogfmtNeedsQuoting(t *testing.T) {
@@ -70,25 +77,19 @@ func TestLogfmtEscape(t *testing.T) {
 }
 
 func TestLogEmitter_Emit(t *testing.T) {
-	t.Run("with apply ID", func(t *testing.T) {
+	t.Run("message rendered without key prefix", func(t *testing.T) {
 		e := &logEmitter{applyID: "apply-abc123"}
 		output := captureOutput(t, func() {
 			e.emit("msg", "Test message", "key", "value")
 		})
+		plain := stripANSI(output)
 
-		assert.Contains(t, output, "apply_id=apply-abc123")
-		assert.Contains(t, output, "msg=")
-		assert.Contains(t, output, "key=value")
-	})
-
-	t.Run("without apply ID", func(t *testing.T) {
-		e := &logEmitter{}
-		output := captureOutput(t, func() {
-			e.emit("msg", "Test message")
-		})
-
-		assert.NotContains(t, output, "apply_id=")
-		assert.Contains(t, output, "msg=")
+		assert.Contains(t, plain, "Test message")
+		assert.Contains(t, plain, "key=value")
+		// apply_id is filtered from colored output
+		assert.NotContains(t, plain, "apply_id=")
+		// msg is not emitted as a key=value pair
+		assert.NotContains(t, plain, "msg=")
 	})
 
 	t.Run("values with spaces are quoted", func(t *testing.T) {
@@ -96,21 +97,30 @@ func TestLogEmitter_Emit(t *testing.T) {
 		output := captureOutput(t, func() {
 			e.emit("msg", "Table started", "ddl", "ALTER TABLE `users` ADD COLUMN name VARCHAR(255)")
 		})
+		plain := stripANSI(output)
 
-		assert.Contains(t, output, `ddl="ALTER TABLE`)
+		assert.Contains(t, plain, `ddl="ALTER TABLE`)
 	})
 
-	t.Run("timestamp prefix", func(t *testing.T) {
+	t.Run("timestamp prefix is HH:MM:SS", func(t *testing.T) {
 		e := &logEmitter{}
 		output := captureOutput(t, func() {
 			e.emit("msg", "test")
 		})
+		plain := stripANSI(output)
 
-		// Should start with an RFC3339 timestamp
-		parts := strings.SplitN(output, " ", 2)
-		require.Len(t, parts, 2)
-		_, err := time.Parse(time.RFC3339, parts[0])
-		assert.NoError(t, err, "first token should be RFC3339 timestamp, got: %s", parts[0])
+		// Should start with an HH:MM:SS timestamp
+		require.Regexp(t, `^\d{2}:\d{2}:\d{2} `, plain)
+	})
+
+	t.Run("contains ANSI color codes", func(t *testing.T) {
+		e := &logEmitter{}
+		output := captureOutput(t, func() {
+			e.emit("msg", "Table complete", "table", "users")
+		})
+
+		// Raw output should contain ANSI escape sequences
+		assert.Contains(t, output, "\033[")
 	})
 }
 
@@ -126,39 +136,39 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 			name:       "completed",
 			status:     state.Apply.Completed,
 			wantMsg:    "Table complete",
-			wantFields: []string{"table=users", "task_id=task-abc", "duration="},
+			wantFields: []string{"table=users", "duration="},
 		},
 		{
 			name:       "failed",
 			status:     state.Apply.Failed,
 			wantMsg:    "Table failed",
-			wantFields: []string{"table=users", "task_id=task-abc", "duration="},
+			wantFields: []string{"table=users", "duration="},
 		},
 		{
 			name:       "waiting for cutover",
 			status:     state.Apply.WaitingForCutover,
 			wantMsg:    "Waiting for cutover",
-			wantFields: []string{"table=users", "task_id=task-abc"},
+			wantFields: []string{"table=users"},
 		},
 		{
 			name:       "cutting over",
 			status:     state.Apply.CuttingOver,
 			wantMsg:    "Cutting over",
-			wantFields: []string{"table=users", "task_id=task-abc"},
+			wantFields: []string{"table=users"},
 		},
 		{
 			name:       "stopped with progress",
 			status:     state.Apply.Stopped,
 			pct:        45,
 			wantMsg:    "Table stopped",
-			wantFields: []string{"table=users", "task_id=task-abc", "progress=45%"},
+			wantFields: []string{"table=users", "progress=45%"},
 		},
 		{
 			name:       "stopped without progress",
 			status:     state.Apply.Stopped,
 			pct:        0,
 			wantMsg:    "Table stopped",
-			wantFields: []string{"table=users", "task_id=task-abc"},
+			wantFields: []string{"table=users"},
 		},
 	}
 
@@ -174,11 +184,14 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 			output := captureOutput(t, func() {
 				e.emitTableStateChange(tbl, tt.status, ts)
 			})
+			plain := stripANSI(output)
 
-			assert.Contains(t, output, fmt.Sprintf(`msg="%s"`, tt.wantMsg))
+			assert.Contains(t, plain, tt.wantMsg)
 			for _, field := range tt.wantFields {
-				assert.Contains(t, output, field)
+				assert.Contains(t, plain, field)
 			}
+			// task_id is filtered from output
+			assert.NotContains(t, plain, "task_id=")
 		})
 	}
 }
@@ -198,13 +211,13 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		output := captureOutput(t, func() {
 			e.emitProgressHeartbeat(tbl, ts)
 		})
+		plain := stripANSI(output)
 
-		assert.Contains(t, output, `msg="Copying rows"`)
-		assert.Contains(t, output, "table=orders")
-		assert.Contains(t, output, "task_id=task-orders-1")
-		assert.Contains(t, output, "progress=45%")
-		assert.Contains(t, output, "rows=99,450/221,000")
-		assert.Contains(t, output, "eta=")
+		assert.Contains(t, plain, "Copying rows")
+		assert.Contains(t, plain, "table=orders")
+		assert.Contains(t, plain, "progress=45%")
+		assert.Contains(t, plain, "rows=99,450/221,000")
+		assert.Contains(t, plain, "eta=")
 	})
 
 	t.Run("with ETA from ETASeconds", func(t *testing.T) {
@@ -222,12 +235,12 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		output := captureOutput(t, func() {
 			e.emitProgressHeartbeat(tbl, ts)
 		})
+		plain := stripANSI(output)
 
-		assert.Contains(t, output, "table=products")
-		assert.Contains(t, output, "task_id=task-products-1")
-		assert.Contains(t, output, "progress=20%")
-		assert.Contains(t, output, "rows=10,000/50,000")
-		assert.Contains(t, output, "eta=")
+		assert.Contains(t, plain, "table=products")
+		assert.Contains(t, plain, "progress=20%")
+		assert.Contains(t, plain, "rows=10,000/50,000")
+		assert.Contains(t, plain, "eta=")
 	})
 
 	t.Run("clamps percent to 100", func(t *testing.T) {
@@ -243,11 +256,12 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		output := captureOutput(t, func() {
 			e.emitProgressHeartbeat(tbl, ts)
 		})
+		plain := stripANSI(output)
 
-		assert.Contains(t, output, "progress=100%")
+		assert.Contains(t, plain, "progress=100%")
 	})
 
-	t.Run("no task_id when absent", func(t *testing.T) {
+	t.Run("no task_id in output", func(t *testing.T) {
 		e := &logEmitter{}
 		ts := &tableLogState{}
 		tbl := &apitypes.TableProgressResponse{
@@ -260,8 +274,9 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		output := captureOutput(t, func() {
 			e.emitProgressHeartbeat(tbl, ts)
 		})
+		plain := stripANSI(output)
 
-		assert.NotContains(t, output, "task_id=")
+		assert.NotContains(t, plain, "task_id=")
 	})
 }
 
@@ -277,12 +292,13 @@ func TestLogEmitter_EmitApplySummary(t *testing.T) {
 		output := captureOutput(t, func() {
 			e.emitApplySummary("completed", tableStates, time.Now().Add(-2*time.Minute), "")
 		})
+		plain := stripANSI(output)
 
-		assert.Contains(t, output, `msg="Apply completed"`)
-		assert.Contains(t, output, "succeeded=3")
-		assert.Contains(t, output, "failed=0")
-		assert.NotContains(t, output, "stopped=")
-		assert.NotContains(t, output, "error=")
+		assert.Contains(t, plain, "Apply completed")
+		assert.Contains(t, plain, `tables="3/3 succeeded"`)
+		assert.NotContains(t, plain, "failed=")
+		assert.NotContains(t, plain, "stopped=")
+		assert.NotContains(t, plain, "error=")
 	})
 
 	t.Run("mixed results", func(t *testing.T) {
@@ -295,11 +311,12 @@ func TestLogEmitter_EmitApplySummary(t *testing.T) {
 		output := captureOutput(t, func() {
 			e.emitApplySummary("failed", tableStates, time.Now().Add(-30*time.Second), "schema change failed: syntax error")
 		})
+		plain := stripANSI(output)
 
-		assert.Contains(t, output, `msg="Apply failed"`)
-		assert.Contains(t, output, "succeeded=1")
-		assert.Contains(t, output, "failed=1")
-		assert.Contains(t, output, `error="schema change failed: syntax error"`)
+		assert.Contains(t, plain, "Apply failed")
+		assert.Contains(t, plain, `tables="1/2 succeeded"`)
+		assert.Contains(t, plain, "failed=1")
+		assert.Contains(t, plain, `error="schema change failed: syntax error"`)
 	})
 
 	t.Run("with stopped tables", func(t *testing.T) {
@@ -313,10 +330,11 @@ func TestLogEmitter_EmitApplySummary(t *testing.T) {
 		output := captureOutput(t, func() {
 			e.emitApplySummary("stopped", tableStates, time.Now(), "")
 		})
+		plain := stripANSI(output)
 
-		assert.Contains(t, output, `msg="Apply stopped"`)
-		assert.Contains(t, output, "succeeded=1")
-		assert.Contains(t, output, "stopped=2")
+		assert.Contains(t, plain, "Apply stopped")
+		assert.Contains(t, plain, `tables="1/3 succeeded"`)
+		assert.Contains(t, plain, "stopped=2")
 	})
 }
 
@@ -351,4 +369,27 @@ func TestTableKVs(t *testing.T) {
 		kvs := tableKVs("Test", tbl, ts)
 		assert.Equal(t, []string{"msg", "Test", "table", "users"}, kvs)
 	})
+}
+
+func TestCollapseDDL(t *testing.T) {
+	t.Run("collapses multi-line CREATE TABLE", func(t *testing.T) {
+		ddl := "CREATE TABLE `orders_seq` (\n    `id` int unsigned NOT NULL DEFAULT '0',\n    `next_id` bigint unsigned,\n    PRIMARY KEY (`id`)\n) ENGINE InnoDB"
+		got := collapseDDL(ddl)
+		assert.Equal(t, "CREATE TABLE `orders_seq` ( `id` int unsigned NOT NULL DEFAULT '0', `next_id` bigint unsigned, PRIMARY KEY (`id`) ) ENGINE InnoDB", got)
+	})
+
+	t.Run("single-line DDL unchanged", func(t *testing.T) {
+		ddl := "ALTER TABLE `users` ADD COLUMN email VARCHAR(255)"
+		assert.Equal(t, ddl, collapseDDL(ddl))
+	})
+}
+
+func TestMsgColor(t *testing.T) {
+	assert.Equal(t, ansiGreen, msgColor("Table complete"))
+	assert.Equal(t, ansiGreen, msgColor("Apply completed"))
+	assert.Equal(t, ansiRed, msgColor("Table failed"))
+	assert.Equal(t, ansiRed, msgColor("Table stopped"))
+	assert.Equal(t, ansiYellow, msgColor("Table started"))
+	assert.Equal(t, ansiYellow, msgColor("Cutting over"))
+	assert.Equal(t, "", msgColor("Copying rows"))
 }
