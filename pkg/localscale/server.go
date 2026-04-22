@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -62,14 +63,15 @@ type databaseBackend struct {
 	mysqlTCPAddr     string             // MySQL TCP address (host:port) for branch proxy upstream (managed mode only)
 	managed          *managedCluster    // non-nil if this backend was started by LocalScale
 	shardCounts      map[string]int     // keyspace → number of shards (from config)
+	requireApproval  bool               // reject deploys unless approved (per-database setting)
 }
 
 const (
 	// defaultRevertWindowDuration is how long the revert window stays open after a deploy completes.
 	defaultRevertWindowDuration = 30 * time.Minute
 
-	// processorTickInterval is how often the background state processor polls for active deploy requests.
-	processorTickInterval = 500 * time.Millisecond
+	// defaultProcessorTickInterval is how often the background state processor polls for active deploy requests.
+	defaultProcessorTickInterval = 500 * time.Millisecond
 )
 
 // Server is a fake PlanetScale HTTP API server backed by one or more vtcombo instances.
@@ -101,14 +103,19 @@ type Server struct {
 	// that routes queries to the correct Vitess cluster.
 	edgeAddrs map[string]string
 
+	// tlsBundle holds the self-signed CA and server certs for branch proxy TLS.
+	// When set, branch proxies require TLS connections, matching PlanetScale.
+	tlsBundle *TLSBundle
+
 	// shutdownCtx is cancelled when Close() is called, allowing background
 	// goroutines with artificial delays to exit promptly during shutdown.
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 
 	// Artificial delays for realistic demo rendering.
-	branchCreationDelay time.Duration
-	deployRequestDelay  time.Duration
+	branchCreationDelay   time.Duration
+	deployRequestDelay    time.Duration
+	processorTickInterval time.Duration
 }
 
 // OrgConfig holds the databases for a single organization.
@@ -118,7 +125,8 @@ type OrgConfig struct {
 
 // DatabaseConfig holds connection parameters for a single database (one vtcombo instance).
 type DatabaseConfig struct {
-	Keyspaces []KeyspaceConfig // keyspaces in this database
+	Keyspaces       []KeyspaceConfig // keyspaces in this database
+	RequireApproval bool             // require approval before deploying (rejects deploys with "must be approved")
 }
 
 // KeyspaceConfig describes a keyspace and its sharding.
@@ -140,10 +148,18 @@ type Config struct {
 	ProxyHost          string // Bind host for branch proxies (default: "0.0.0.0" standalone, "127.0.0.1" test)
 	ProxyAdvertiseHost string // Override host in password responses (default: derived from request Host header)
 	ProxyPortRange     [2]int // [start, end] port range (default: [19100, 19199] standalone, [0,0] = OS-assigned test)
+	// BranchTLSMode controls TLS on branch proxy endpoints, matching PlanetScale behavior.
+	//   - "none" (default): plain TCP
+	//   - "tls": server-side TLS with self-signed certs (matches vanilla PlanetScale)
+	//   - "mtls": mutual TLS — server cert + client cert required
+	// The CA cert path is available via TLSCACertPath() for client config.
+	// Client cert/key paths are available via TLSClientCertPath()/TLSClientKeyPath() for mTLS.
+	BranchTLSMode string
 	// Artificial delays for realistic demo rendering. Zero means no delay.
-	BranchCreationDelay time.Duration // Delay before branch snapshot starts
-	DeployRequestDelay  time.Duration // Delay before deploy request diff computation starts
-	Logger              *slog.Logger
+	BranchCreationDelay   time.Duration // Delay before branch snapshot starts
+	DeployRequestDelay    time.Duration // Delay before deploy request diff computation starts
+	ProcessorTickInterval time.Duration // How often the state processor polls (default 500ms)
+	Logger                *slog.Logger
 }
 
 // New creates a new LocalScale server and starts it on a random port.
@@ -235,6 +251,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 				mysqlTCPAddr:     mc.mysqlTCPAddr,
 				managed:          mc,
 				shardCounts:      shardCounts,
+				requireApproval:  dbCfg.RequireApproval,
 			}
 		}
 	}
@@ -297,20 +314,41 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	s := &Server{
-		backends:             backends,
-		metadataDB:           metadataDB,
-		branchDSNBase:        branchDSNBase,
-		logger:               cfg.Logger,
-		revertWindowDuration: revertWindow,
-		defaultThrottleRatio: cfg.DefaultThrottleRatio,
-		branchCreationDelay:  cfg.BranchCreationDelay,
-		deployRequestDelay:   cfg.DeployRequestDelay,
-		proxies:              make(map[string]*branchProxy),
-		proxyHost:            proxyHost,
-		proxyAdvertiseHost:   proxyAdvertiseHost,
-		portAlloc:            pa,
-		shutdownCtx:          shutdownCtx,
-		shutdownCancel:       shutdownCancel,
+		backends:              backends,
+		metadataDB:            metadataDB,
+		branchDSNBase:         branchDSNBase,
+		logger:                cfg.Logger,
+		revertWindowDuration:  revertWindow,
+		defaultThrottleRatio:  cfg.DefaultThrottleRatio,
+		branchCreationDelay:   cfg.BranchCreationDelay,
+		deployRequestDelay:    cfg.DeployRequestDelay,
+		processorTickInterval: cfg.ProcessorTickInterval,
+		proxies:               make(map[string]*branchProxy),
+		proxyHost:             proxyHost,
+		proxyAdvertiseHost:    proxyAdvertiseHost,
+		portAlloc:             pa,
+		shutdownCtx:           shutdownCtx,
+		shutdownCancel:        shutdownCancel,
+	}
+
+	// Generate TLS certificates for branch proxies when TLS is enabled.
+	tlsMode := cfg.BranchTLSMode
+	if tlsMode == "" {
+		tlsMode = "none"
+	}
+	if tlsMode != "none" {
+		tlsDir, err := os.MkdirTemp("", "localscale-tls-*")
+		if err != nil {
+			s.Close()
+			return nil, fmt.Errorf("create TLS temp dir: %w", err)
+		}
+		bundle, err := generateTLSBundle(tlsDir, tlsMode == "mtls")
+		if err != nil {
+			s.Close()
+			return nil, fmt.Errorf("generate TLS bundle: %w", err)
+		}
+		s.tlsBundle = bundle
+		cfg.Logger.Info("generated TLS certificates for branch proxies", "mode", tlsMode, "ca", bundle.CAPath)
 	}
 
 	// Create metadata tables
@@ -345,7 +383,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		}
 		// Empty branch name + nil keyspaces = pure passthrough (no DB name rewriting).
 		edgeDSN := fmt.Sprintf("root@tcp(%s)/", backend.vtgateMySQLAddr)
-		proxy, err := newBranchProxy(ctx, listenAddr, edgeDSN, "", nil, cfg.Logger)
+		proxy, err := newBranchProxy(ctx, listenAddr, edgeDSN, "", nil, cfg.Logger, nil)
 		if err != nil {
 			s.Close()
 			return nil, fmt.Errorf("start edge proxy for %s/%s: %w", key.org, key.database, err)
@@ -407,6 +445,33 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 }
 
 // URL returns the base URL of the fake API server for use with ps.WithBaseURL().
+// TLSCACertPath returns the path to the CA certificate PEM file for branch
+// proxy TLS verification. Clients use this to verify the server certificate.
+func (s *Server) TLSCACertPath() string {
+	if s.tlsBundle == nil {
+		return ""
+	}
+	return s.tlsBundle.CAPath
+}
+
+// TLSClientCertPath returns the path to the client certificate PEM file.
+// Only populated in mTLS mode.
+func (s *Server) TLSClientCertPath() string {
+	if s.tlsBundle == nil {
+		return ""
+	}
+	return s.tlsBundle.ClientCertPath
+}
+
+// TLSClientKeyPath returns the path to the client private key PEM file.
+// Only populated in mTLS mode.
+func (s *Server) TLSClientKeyPath() string {
+	if s.tlsBundle == nil {
+		return ""
+	}
+	return s.tlsBundle.ClientKeyPath
+}
+
 func (s *Server) URL() string {
 	return s.baseURL
 }
@@ -963,6 +1028,35 @@ func (s *Server) handleBranchDBQuery(w http.ResponseWriter, r *http.Request) err
 	return nil
 }
 
+// handleGetTLSCerts returns the TLS certificate paths and contents for branch
+// proxy connections. Used by integration tests to configure RegisterMTLS.
+func (s *Server) handleGetTLSCerts(w http.ResponseWriter, _ *http.Request) error {
+	if s.tlsBundle == nil {
+		return newHTTPError(http.StatusNotFound, "TLS not enabled (BranchTLSMode is none)")
+	}
+	resp := map[string]string{
+		"ca_cert_path": s.tlsBundle.CAPath,
+	}
+	if s.tlsBundle.ClientCertPath != "" {
+		resp["client_cert_path"] = s.tlsBundle.ClientCertPath
+		resp["client_key_path"] = s.tlsBundle.ClientKeyPath
+	}
+	// Include cert contents so container clients don't need volume mounts.
+	if ca, err := os.ReadFile(s.tlsBundle.CAPath); err == nil {
+		resp["ca_cert"] = string(ca)
+	}
+	if s.tlsBundle.ClientCertPath != "" {
+		if cert, err := os.ReadFile(s.tlsBundle.ClientCertPath); err == nil {
+			resp["client_cert"] = string(cert)
+		}
+		if key, err := os.ReadFile(s.tlsBundle.ClientKeyPath); err == nil {
+			resp["client_key"] = string(key)
+		}
+	}
+	s.writeJSON(w, resp)
+	return nil
+}
+
 // handleError wraps an error-returning handler so it can be used with http.ServeMux.
 // If the handler returns an *httpError, the response uses its status code; otherwise 500.
 func (s *Server) handleError(fn func(http.ResponseWriter, *http.Request) error) http.HandlerFunc {
@@ -988,6 +1082,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/metadata-query", s.handleError(s.handleMetadataQuery))
 	mux.HandleFunc("POST /admin/reset-state", s.handleError(s.handleResetState))
 	mux.HandleFunc("POST /admin/branch-db-query", s.handleError(s.handleBranchDBQuery))
+	mux.HandleFunc("GET /admin/tls-certs", s.handleError(s.handleGetTLSCerts))
 
 	// Keyspace and schema endpoints
 	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/keyspaces", s.handleError(s.handleListKeyspaces))
@@ -1014,6 +1109,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Deploy request CRUD endpoints
 	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/deploy-requests/{number}", s.handleError(s.handleGetDeployRequest))
+	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/deploy-requests", s.handleError(s.handleListDeployRequests))
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests", s.handleError(s.handleCreateDeployRequest))
 
 	// Catch-all for unimplemented PlanetScale API endpoints.

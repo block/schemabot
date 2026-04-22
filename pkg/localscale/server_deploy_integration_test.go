@@ -25,6 +25,7 @@ var drState = state.DeployRequest
 // TestDeployRequestDiffNoChanges verifies that CreateDeployRequest returns no_changes
 // when branch schema matches main schema (no DDL applied to branch).
 func TestDeployRequestDiffNoChanges(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
 	branchName := createBranch(t, ctx, "no-changes")
 
@@ -47,6 +48,7 @@ func TestDeployRequestDiffNoChanges(t *testing.T) {
 // TestDeployRequestDiffCreateTable verifies the schema differ produces correct
 // DDL for CREATE TABLE operations and deploys them successfully.
 func TestDeployRequestDiffCreateTable(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
 	branchName := createBranchWithDDL(t, ctx, "diff-ct",
 		map[string][]string{
@@ -73,6 +75,7 @@ func TestDeployRequestDiffCreateTable(t *testing.T) {
 // TestBranchDatabaseCleanupOnSkipRevert verifies that branch databases are dropped
 // after skip-revert closes the revert window.
 func TestBranchDatabaseCleanupOnSkipRevert(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
 	branchName := createBranchWithDDL(t, ctx, "cleanup",
 		map[string][]string{
@@ -118,6 +121,7 @@ func TestBranchDatabaseCleanupOnSkipRevert(t *testing.T) {
 // TestBranchVSchemaSnapshotAndDiff verifies VSchema snapshot at branch creation
 // and VSchema diff at deploy request creation.
 func TestBranchVSchemaSnapshotAndDiff(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
 	branchName := createBranch(t, ctx, "vschema-diff")
 
@@ -155,6 +159,7 @@ func TestBranchVSchemaSnapshotAndDiff(t *testing.T) {
 // TestStateValidation verifies that control operations fail on deploy requests
 // in various terminal/non-actionable states (ready, complete, cancelled).
 func TestStateValidation(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	tests := []struct {
 		name    string
 		ddlCol  string
@@ -251,6 +256,7 @@ func TestStateValidation(t *testing.T) {
 
 // TestMultiKeyspaceDDLDeploy verifies DDL changes across both keyspaces in a single deploy.
 func TestMultiKeyspaceDDLDeploy(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
 
 	// Cancel any pending Vitess migrations from earlier tests to avoid
@@ -282,6 +288,7 @@ func TestMultiKeyspaceDDLDeploy(t *testing.T) {
 
 // TestBranchDDLError verifies that invalid DDL fails via MySQL connection and the branch recovers.
 func TestBranchDDLError(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
 	branchName := createBranch(t, ctx, "ddl-error")
 
@@ -316,6 +323,7 @@ func TestBranchDDLError(t *testing.T) {
 
 // TestThrottleRatioBoundary verifies throttle ratio boundary validation.
 func TestThrottleRatioBoundary(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
 	branchName := createBranchWithDDL(t, ctx, "throttle-bounds",
 		map[string][]string{
@@ -377,6 +385,7 @@ func TestThrottleRatioBoundary(t *testing.T) {
 // the configured RevertWindowDuration (5s in test config), transitioning from
 // complete_pending_revert to complete without manual intervention.
 func TestRevertWindowExpiration(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
@@ -434,6 +443,7 @@ func TestRevertWindowExpiration(t *testing.T) {
 // TestDeployRequestPendingToReady verifies that CreateDeployRequest returns "pending"
 // immediately and asynchronously transitions to "ready" when changes are detected.
 func TestDeployRequestPendingToReady(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
@@ -473,6 +483,7 @@ func TestDeployRequestPendingToReady(t *testing.T) {
 // TestDeployRequestPendingToNoChanges verifies that CreateDeployRequest returns "pending"
 // and transitions to "no_changes" when branch matches main.
 func TestDeployRequestPendingToNoChanges(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
@@ -500,8 +511,10 @@ func TestDeployRequestPendingToNoChanges(t *testing.T) {
 // TestDeploySubmittingToQueued verifies that DeployDeployRequest returns "submitting"
 // immediately and asynchronously transitions to "queued" after DDL submission.
 func TestDeploySubmittingToQueued(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
+	cleanupActiveDeployRequests(t, ctx)
 
 	cancelAllVitessMigrations(t, ctx)
 
@@ -536,8 +549,10 @@ func TestDeploySubmittingToQueued(t *testing.T) {
 // TestCancelInProgressToCompleteCancel verifies that cancelling an in-progress deploy
 // transitions through in_progress_cancel → complete_cancel via the state processor.
 func TestCancelInProgressToCompleteCancel(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
+	cleanupActiveDeployRequests(t, ctx)
 
 	cancelAllVitessMigrations(t, ctx)
 
@@ -580,8 +595,10 @@ func TestCancelInProgressToCompleteCancel(t *testing.T) {
 // TestRevertWithVSchemaTransitionalState verifies that reverting a VSchema-only deploy
 // transitions through in_progress_revert_vschema.
 func TestRevertWithVSchemaTransitionalState(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
+	cleanupActiveDeployRequests(t, ctx)
 
 	// Apply VSchema-only change
 	branchName := createBranchWithDDL(t, ctx, "revert-vschema",
@@ -620,8 +637,10 @@ func TestRevertWithVSchemaTransitionalState(t *testing.T) {
 // TestCompleteRevertError verifies that a failed revert produces the complete_revert_error state
 // instead of complete_error.
 func TestCompleteRevertError(t *testing.T) {
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
+	cleanupActiveDeployRequests(t, ctx)
 
 	cancelAllVitessMigrations(t, ctx)
 

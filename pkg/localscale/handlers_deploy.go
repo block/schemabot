@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/spirit/pkg/utils"
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 )
 
@@ -54,11 +55,12 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 		return newHTTPError(http.StatusNotFound, "branch not found: %s", body.Branch)
 	}
 
-	// Insert deploy request in "pending" state — diff computation happens in background.
+	// Insert deploy request with atomically computed sequential number.
 	result, err := s.metadataDB.ExecContext(r.Context(),
-		`INSERT INTO localscale_deploy_requests (org, database_name, token_name, branch, into_branch, auto_cutover, ddl_statements, deployment_state)
-		 VALUES (?, ?, ?, ?, ?, ?, '{}', ?)`,
-		org, database, tokenName, body.Branch, body.IntoBranch, body.AutoCutover, dr.Pending,
+		`INSERT INTO localscale_deploy_requests (number, org, database_name, token_name, branch, into_branch, auto_cutover, ddl_statements, deployment_state)
+		 SELECT COALESCE(MAX(number), 0) + 1, ?, ?, ?, ?, ?, ?, '{}', ?
+		 FROM localscale_deploy_requests WHERE database_name = ?`,
+		org, database, tokenName, body.Branch, body.IntoBranch, body.AutoCutover, dr.Pending, database,
 	)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "insert deploy request: %v", err)
@@ -69,17 +71,12 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 		return newHTTPError(http.StatusInternalServerError, "get deploy request id: %v", err)
 	}
 
-	// Assign the next sequential number for this database.
+	// Read back the assigned number.
 	var number uint64
-	err = s.metadataDB.QueryRowContext(r.Context(),
-		"SELECT COALESCE(MAX(number), 0) + 1 FROM localscale_deploy_requests WHERE database_name = ?", database,
-	).Scan(&number)
-	if err != nil {
-		return newHTTPError(http.StatusInternalServerError, "compute deploy request number: %v", err)
-	}
-	if _, err := s.metadataDB.ExecContext(r.Context(),
-		"UPDATE localscale_deploy_requests SET number = ? WHERE id = ?", number, id); err != nil {
-		return newHTTPError(http.StatusInternalServerError, "set deploy request number: %v", err)
+	if err := s.metadataDB.QueryRowContext(r.Context(),
+		"SELECT number FROM localscale_deploy_requests WHERE id = ?", id,
+	).Scan(&number); err != nil {
+		return newHTTPError(http.StatusInternalServerError, "read deploy request number: %v", err)
 	}
 
 	// Return immediately with "pending" — background goroutine will compute diff
@@ -153,6 +150,15 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 
 	if deployState == dr.Pending {
 		return newHTTPError(http.StatusConflict, "deploy request is still being prepared")
+	}
+
+	// Simulate PlanetScale's approval requirement when configured per-database.
+	backend, backendErr := s.backendFor(org, database)
+	if backendErr != nil {
+		return newHTTPError(http.StatusNotFound, "%v", backendErr)
+	}
+	if backend.requireApproval {
+		return newHTTPError(http.StatusForbidden, "Deploy request must be approved before deploying.")
 	}
 
 	if deployed {
@@ -245,6 +251,45 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 		}
 	})
 
+	return nil
+}
+
+func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request) error {
+	org := r.PathValue("org")
+	database := r.PathValue("db")
+
+	rows, err := s.metadataDB.QueryContext(r.Context(),
+		`SELECT number, branch, into_branch, deployment_state, instant_ddl_eligible
+		 FROM localscale_deploy_requests ORDER BY number DESC`)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "query deploy requests: %v", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var results []map[string]any
+	for rows.Next() {
+		var number int64
+		var branch, intoBranch, state string
+		var instantEligible bool
+		if err := rows.Scan(&number, &branch, &intoBranch, &state, &instantEligible); err != nil {
+			return newHTTPError(http.StatusInternalServerError, "scan deploy request: %v", err)
+		}
+		results = append(results, map[string]any{
+			"number":           number,
+			"branch":           branch,
+			"into_branch":      intoBranch,
+			"deployment_state": state,
+			"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
+			"deployment": map[string]any{
+				"instant_ddl_eligible": instantEligible,
+			},
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return newHTTPError(http.StatusInternalServerError, "iterate deploy requests: %v", err)
+	}
+
+	s.writeJSON(w, map[string]any{"data": results})
 	return nil
 }
 

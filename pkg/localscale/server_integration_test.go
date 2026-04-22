@@ -52,6 +52,10 @@ func TestMain(m *testing.M) {
 					{Name: "testapp", Shards: 1},
 					{Name: "testapp_sharded", Shards: 2},
 				}},
+				"approvaldb": {
+					Keyspaces:       []localscale.ContainerKeyspaceConfig{{Name: "testkeyspace", Shards: 1}},
+					RequireApproval: true,
+				},
 			}},
 		},
 		RevertWindowDuration: "5s",
@@ -441,6 +445,32 @@ func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantSt
 	}
 	require.Failf(t, "deploy state timeout", "deploy %d: expected one of %v, last state was %q", number, wantStates, lastState)
 	return nil
+}
+
+// cleanupActiveDeployRequests skips-revert or cancels any active deploy requests
+// so the next test isn't blocked by the gated deployment check.
+func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
+	t.Helper()
+	// Scan all deploy requests and skip-revert or cancel any that are active
+	for i := uint64(1); i <= 100; i++ {
+		dr, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+			Organization: testOrg, Database: testDB, Number: i,
+		})
+		if err != nil {
+			break // no more deploy requests
+		}
+		switch dr.DeploymentState {
+		case "complete_pending_revert":
+			_, _ = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
+				Organization: testOrg, Database: testDB, Number: i,
+			})
+		case "queued", "in_progress", "pending_cutover", "in_progress_cutover", "submitting":
+			_, _ = testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
+				Organization: testOrg, Database: testDB, Number: i,
+			})
+		}
+	}
+	time.Sleep(time.Second) // let state transitions settle
 }
 
 // cancelAllVitessMigrations cancels all pending Vitess migrations across keyspaces.

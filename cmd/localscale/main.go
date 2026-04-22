@@ -28,18 +28,21 @@ type configFile struct {
 				Name   string `json:"name"`
 				Shards int    `json:"shards"`
 			} `json:"keyspaces"`
+			RequireApproval bool `json:"require_approval,omitempty"`
 		} `json:"databases"`
 	} `json:"organizations"`
-	ListenAddr           string  `json:"listen_addr"`
-	SchemaDir            string  `json:"schema_dir"`
-	RevertWindowDuration string  `json:"revert_window_duration,omitempty"`
-	DefaultThrottleRatio float64 `json:"default_throttle_ratio,omitempty"`
-	ProxyHost            string  `json:"proxy_host,omitempty"`
-	ProxyAdvertiseHost   string  `json:"proxy_advertise_host,omitempty"`
-	ProxyPortStart       int     `json:"proxy_port_start,omitempty"`
-	ProxyPortEnd         int     `json:"proxy_port_end,omitempty"`
-	BranchCreationDelay  string  `json:"branch_creation_delay,omitempty"`
-	DeployRequestDelay   string  `json:"deploy_request_delay,omitempty"`
+	ListenAddr            string  `json:"listen_addr"`
+	SchemaDir             string  `json:"schema_dir"`
+	RevertWindowDuration  string  `json:"revert_window_duration,omitempty"`
+	DefaultThrottleRatio  float64 `json:"default_throttle_ratio,omitempty"`
+	ProxyHost             string  `json:"proxy_host,omitempty"`
+	ProxyAdvertiseHost    string  `json:"proxy_advertise_host,omitempty"`
+	ProxyPortStart        int     `json:"proxy_port_start,omitempty"`
+	ProxyPortEnd          int     `json:"proxy_port_end,omitempty"`
+	BranchTLSMode         string  `json:"branch_tls_mode,omitempty"`
+	BranchCreationDelay   string  `json:"branch_creation_delay,omitempty"`
+	DeployRequestDelay    string  `json:"deploy_request_delay,omitempty"`
+	ProcessorTickInterval string  `json:"processor_tick_interval,omitempty"`
 }
 
 func main() {
@@ -79,7 +82,8 @@ func main() {
 				})
 			}
 			databases[dbName] = localscale.DatabaseConfig{
-				Keyspaces: keyspaces,
+				Keyspaces:       keyspaces,
+				RequireApproval: db.RequireApproval,
 			}
 		}
 		orgs[name] = localscale.OrgConfig{Databases: databases}
@@ -88,20 +92,23 @@ func main() {
 	revertWindow := parseDuration(cf.RevertWindowDuration, "revert_window_duration")
 	branchCreationDelay := parseDuration(cf.BranchCreationDelay, "branch_creation_delay")
 	deployRequestDelay := parseDuration(cf.DeployRequestDelay, "deploy_request_delay")
+	processorTickInterval := parseDuration(cf.ProcessorTickInterval, "processor_tick_interval")
 
 	ctx := context.Background()
 
 	server, err := localscale.New(ctx, localscale.Config{
-		Orgs:                 orgs,
-		ListenAddr:           cf.ListenAddr,
-		RevertWindowDuration: revertWindow,
-		DefaultThrottleRatio: cf.DefaultThrottleRatio,
-		ProxyHost:            cf.ProxyHost,
-		ProxyAdvertiseHost:   cf.ProxyAdvertiseHost,
-		ProxyPortRange:       [2]int{cf.ProxyPortStart, cf.ProxyPortEnd},
-		BranchCreationDelay:  branchCreationDelay,
-		DeployRequestDelay:   deployRequestDelay,
-		Logger:               logger,
+		Orgs:                  orgs,
+		ListenAddr:            cf.ListenAddr,
+		RevertWindowDuration:  revertWindow,
+		DefaultThrottleRatio:  cf.DefaultThrottleRatio,
+		ProxyHost:             cf.ProxyHost,
+		ProxyAdvertiseHost:    cf.ProxyAdvertiseHost,
+		BranchTLSMode:         cf.BranchTLSMode,
+		ProxyPortRange:        [2]int{cf.ProxyPortStart, cf.ProxyPortEnd},
+		BranchCreationDelay:   branchCreationDelay,
+		DeployRequestDelay:    deployRequestDelay,
+		ProcessorTickInterval: processorTickInterval,
+		Logger:                logger,
 	})
 	if err != nil {
 		logger.Error("failed to start localscale", "error", err)
@@ -110,10 +117,14 @@ func main() {
 
 	// Apply VSchema files from schema_dir if set
 	if cf.SchemaDir != "" {
+		logger.Info("seeding VSchema from schema_dir", "schema_dir", cf.SchemaDir)
 		if err := applyVSchemas(ctx, server.URL(), orgs, cf.SchemaDir, logger); err != nil {
-			logger.Error("failed to apply vschemas", "error", err)
+			logger.Error("failed to apply vschemas", "schema_dir", cf.SchemaDir, "error", err)
 			os.Exit(1)
 		}
+		logger.Info("VSchema seeding complete")
+	} else {
+		logger.Info("no schema_dir configured, skipping VSchema seeding")
 	}
 
 	logger.Info("localscale running", "url", server.URL(), "orgs", len(orgs))

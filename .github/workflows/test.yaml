@@ -112,31 +112,34 @@ jobs:
             ~/.cache/go-build
           key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-
-      - name: "Restore Vitess binaries"
+      - name: "Restore LocalScale binaries"
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
         with:
           path: |
             bin/vtcombo-linux
             bin/mysqlctl-linux
-          key: vitess-bins-${{ hashFiles('go.sum') }}
+            bin/localscale-linux
+          key: localscale-bins-${{ hashFiles('go.sum', 'cmd/localscale/**', 'pkg/localscale/**') }}
+          restore-keys: localscale-bins-
       - name: "Build LocalScale image"
         run: |
-          CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux ./cmd/localscale &
+          [ -f bin/localscale-linux ] || CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux ./cmd/localscale &
           [ -f bin/vtcombo-linux ] || CGO_ENABLED=0 GOOS=linux go build -o bin/vtcombo-linux vitess.io/vitess/go/cmd/vtcombo &
           [ -f bin/mysqlctl-linux ] || CGO_ENABLED=0 GOOS=linux go build -o bin/mysqlctl-linux vitess.io/vitess/go/cmd/mysqlctl &
           wait
           scripts/copy-vitess-config.sh
           docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
-      - name: "Save Vitess binaries"
+      - name: "Save LocalScale binaries"
         if: env.SAVE_CACHE == 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
         with:
           path: |
             bin/vtcombo-linux
             bin/mysqlctl-linux
-          key: vitess-bins-${{ hashFiles('go.sum') }}
+            bin/localscale-linux
+          key: localscale-bins-${{ hashFiles('go.sum', 'cmd/localscale/**', 'pkg/localscale/**') }}
       - name: "Test"
-        run: go test -tags=integration -timeout=15m -count=1 -v ./pkg/localscale/... 2>&1 | tee /dev/stderr | tail -50
+        run: go test -tags=integration -timeout=8m -count=1 -v ./pkg/localscale/... 2>&1 | tee /dev/stderr | tail -50
 
   e2e:
     name: "E2E Tests"

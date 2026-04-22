@@ -17,6 +17,7 @@ package localscale
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -77,7 +78,7 @@ type branchProxy struct {
 	connWg      sync.WaitGroup // tracks in-flight connections
 }
 
-func newBranchProxy(ctx context.Context, listenAddr, upstreamDSN string, branchName string, keyspaces []string, logger *slog.Logger) (*branchProxy, error) {
+func newBranchProxy(ctx context.Context, listenAddr, upstreamDSN string, branchName string, keyspaces []string, logger *slog.Logger, tlsCfg *tls.Config) (*branchProxy, error) {
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", listenAddr, err)
@@ -95,11 +96,21 @@ func newBranchProxy(ctx context.Context, listenAddr, upstreamDSN string, branchN
 		}
 	}
 
+	// Configure the go-mysql protocol server. When TLS is configured, use
+	// NewServer with the TLS config so the server advertises TLS capability
+	// and performs STARTTLS during the MySQL handshake.
+	var mysqlSrv *server.Server
+	if tlsCfg != nil {
+		mysqlSrv = server.NewServer("8.0.35-localscale", 255, "mysql_native_password", nil, tlsCfg)
+	} else {
+		mysqlSrv = server.NewDefaultServer()
+	}
+
 	p := &branchProxy{
 		listener:    ln,
 		upstreamDSN: upstreamDSN,
 		dbMap:       dbMap,
-		mysqlServer: server.NewDefaultServer(),
+		mysqlServer: mysqlSrv,
 		logger:      logger,
 		done:        make(chan struct{}),
 	}
@@ -216,6 +227,17 @@ func mapKeys(m map[string]string) []string {
 
 func (h *branchHandler) HandleQuery(query string) (*gomysql.Result, error) {
 	ctx := context.Background()
+
+	// Intercept USE statements and route through UseDB for database name rewriting.
+	trimmed := strings.TrimSpace(query)
+	if len(trimmed) > 4 && strings.EqualFold(trimmed[:4], "USE ") {
+		db := strings.TrimSpace(trimmed[4:])
+		db = strings.Trim(db, "`")
+		if err := h.UseDB(db); err != nil {
+			return nil, err
+		}
+		return &gomysql.Result{}, nil
+	}
 
 	// Route SELECT/SHOW to QueryContext, everything else to ExecContext.
 	if isReadQuery(query) {
