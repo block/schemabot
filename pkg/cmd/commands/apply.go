@@ -47,7 +47,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return err
 	}
 
-	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
+	ep, err := resolveEndpoint(g.Endpoint, g.Profile, cfg.Database)
 	if err != nil {
 		return err
 	}

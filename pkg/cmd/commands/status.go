@@ -18,7 +18,7 @@ type StatusCmd struct {
 
 // Run executes the status command.
 func (cmd *StatusCmd) Run(g *Globals) error {
-	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
+	ep, err := resolveEndpoint(g.Endpoint, g.Profile, cmd.Database)
 	if err != nil {
 		return err
 	}

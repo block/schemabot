@@ -33,19 +33,12 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		return err
 	}
 
-	ep, err := client.ResolveEndpointWithProfile(g.Endpoint, g.Profile)
+	ep, err := resolveEndpoint(g.Endpoint, g.Profile, cfg.Database)
 	if err != nil {
 		if cmd.JSON {
 			return client.ExitWithJSON("config_error", err.Error())
 		}
-		return fmt.Errorf("resolve endpoint: %w", err)
-	}
-	if ep == "" {
-		errMsg := "no endpoint configured (run 'schemabot configure' to set up a profile)"
-		if cmd.JSON {
-			return client.ExitWithJSON("invalid_request", errMsg)
-		}
-		return fmt.Errorf("%s", errMsg)
+		return err
 	}
 
 	// If environment is not specified, get all environments and plan for each
