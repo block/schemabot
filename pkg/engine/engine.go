@@ -75,17 +75,12 @@ type Drainer interface {
 // Credentials contains the resolved credentials for accessing a database.
 // These are populated by the service layer from discovery before calling the engine.
 type Credentials struct {
-	// PlanetScale-specific
-	Organization string // PlanetScale organization name
-	TokenName    string // Service token name
-	TokenValue   string // Service token value
-	MainBranch   string // Main branch name (default: "main")
-
 	// DSN is the primary connection endpoint (vtgate MySQL DSN, direct MySQL DSN, etc.)
 	DSN string
 
-	// Metadata holds engine-specific key-value pairs. Examples:
-	//   "tls_name" — registered MySQL TLS config name for branch connections
+	// Metadata holds engine-specific key-value pairs.
+	// PlanetScale: "organization", "token_name", "token_value", "main_branch"
+	// Spirit: (none currently)
 	Metadata map[string]string
 }
 

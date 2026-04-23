@@ -49,20 +49,27 @@ func waitForApplyState(t *testing.T, endpoint, applyID, expectedState string, ti
 	expected := strings.ToLower(expectedState)
 	deadline := time.Now().Add(timeout)
 	var lastState, lastError string
+	start := time.Now()
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(t.Context(), testutil.ProgressTimeout)
 		result, err := client.GetProgressCtx(ctx, endpoint, applyID)
 		cancel()
 		if err == nil {
-			lastState = state.NormalizeState(result.State)
+			newState := state.NormalizeState(result.State)
+			if newState != lastState {
+				t.Logf("waitForApplyState: %s state=%s (elapsed=%s)", applyID, newState, time.Since(start))
+			}
+			lastState = newState
 			lastError = result.ErrorMessage
 			if lastState == expected {
 				return
 			}
+		} else {
+			t.Logf("waitForApplyState: %s poll error: %v (elapsed=%s)", applyID, err, time.Since(start))
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	require.Failf(t, "timeout", "timeout waiting for apply %s state %q, last API state: %q, error: %q", applyID, expectedState, lastState, lastError)
+	require.Failf(t, "timeout", "timeout waiting for apply %s state %q after %s, last API state: %q, error: %q", applyID, expectedState, time.Since(start), lastState, lastError)
 }
 
 func waitForApplyAnyState(t *testing.T, endpoint, applyID string, expectedStates []string, timeout time.Duration) string {

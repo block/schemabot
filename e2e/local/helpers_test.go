@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -209,10 +210,9 @@ func ensureNoActiveChange(t *testing.T, endpoint string) {
 }
 
 func clearSchemaBotState(t *testing.T) {
-	if t != nil {
-		t.Helper()
-	}
+	t.Helper()
 	clearSchemaBotStateImpl()
+	resetLocalScaleState(t)
 }
 
 func clearSchemaBotStateImpl() {
@@ -243,6 +243,51 @@ func clearSchemaBotStateImpl() {
 		_, _ = db.ExecContext(context.Background(), "DELETE FROM `"+table+"`")
 	}
 	log.Printf("Cleared %d schemabot state tables", len(tables))
+}
+
+// localscaleMetadataQuery sends a query to the LocalScale metadata endpoint.
+// Returns an error instead of failing — callers decide how to handle.
+func localscaleMetadataQuery(query string) error {
+	localscaleURL := os.Getenv("LOCALSCALE_URL")
+	if localscaleURL == "" {
+		return fmt.Errorf("LOCALSCALE_URL not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	body := strings.NewReader(fmt.Sprintf(`{"query":%q}`, query))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, localscaleURL+"/admin/metadata-query", body)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+const resetDeployRequestsQuery = "UPDATE localscale_deploy_requests SET deployment_state = 'complete', deployed = FALSE, cancelled = TRUE WHERE deployment_state != 'complete'"
+
+// resetLocalScaleState clears LocalScale deploy request state via the metadata-query
+// admin endpoint. Marks all deploy requests as closed (not DELETE — preserves the
+// auto-increment counter so new deploy requests get unique numbers, which ensures
+// unique migration_context values for SHOW VITESS_MIGRATIONS discovery).
+func resetLocalScaleState(t *testing.T) {
+	t.Helper()
+	err := localscaleMetadataQuery(resetDeployRequestsQuery)
+	require.NoError(t, err, "reset LocalScale deploy requests")
+}
+
+// resetLocalScaleStateOrFatal is the TestMain variant (no *testing.T).
+func resetLocalScaleStateOrFatal() {
+	if err := localscaleMetadataQuery(resetDeployRequestsQuery); err != nil {
+		log.Fatalf("reset LocalScale deploy requests: %v", err)
+	}
 }
 
 func uniqueTableName(prefix string) string {

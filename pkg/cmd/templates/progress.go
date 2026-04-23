@@ -274,6 +274,7 @@ func FormatNamespacedTables(tables []TableProgress) string {
 	return b.String()
 }
 
+// writeNamespacedTables renders tables grouped by keyspace to stdout.
 // isVSchemaTask returns true if this is a synthetic VSchema update task.
 func isVSchemaTask(t TableProgress) bool {
 	return t.TableName == "VSchema" || strings.HasPrefix(t.TableName, "vschema:") || strings.HasPrefix(t.TableName, "VSchema:")
@@ -306,6 +307,7 @@ func FormatVSchemaDiff(diff, indent string) string {
 	return b.String()
 }
 
+// writeVSchemaDiff renders a VSchema diff to stdout.
 // vschemaStatusLabel maps a task status to a VSchema-specific display label.
 func vschemaStatusLabel(status string) string {
 	switch status {
@@ -538,6 +540,7 @@ func FormatTableProgress(t TableProgress) string {
 	return b.String()
 }
 
+// writeTableProgress writes progress for a single table to stdout.
 // StopData contains data for rendering stop command output.
 type StopData struct {
 	Database       string

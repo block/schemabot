@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"sync/atomic"
 
 	mysql "github.com/go-sql-driver/mysql"
 )
@@ -12,6 +13,10 @@ import (
 // mtlsConfigName is the Go MySQL driver TLS config name registered by RegisterMTLS.
 // Used for all PlanetScale MySQL connections (branches and vtgate).
 const mtlsConfigName = "planetscale"
+
+// mtlsRegistered tracks whether RegisterMTLS has been called.
+// Accessed from multiple goroutines (branch apply + vtgate progress polling).
+var mtlsRegistered atomic.Bool
 
 // TLSConfigName returns the Go MySQL driver TLS config name registered by
 // RegisterMTLS. Use this in DSN strings (e.g., "user:pass@tcp(host)/?tls=<name>")
@@ -72,5 +77,6 @@ func RegisterMTLS(cfg MTLSConfig) error {
 	if err := mysql.RegisterTLSConfig(mtlsConfigName, tlsCfg); err != nil {
 		return fmt.Errorf("register TLS config: %w", err)
 	}
+	mtlsRegistered.Store(true)
 	return nil
 }

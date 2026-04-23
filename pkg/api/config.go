@@ -133,6 +133,31 @@ type EnvironmentConfig struct {
 
 	// TokenSecretRef is the reference to the PlanetScale API token secret.
 	TokenSecretRef string `yaml:"token_secret_ref,omitempty"`
+
+	// RevertWindowDuration is how long to keep the revert window open after a
+	// PlanetScale deploy completes (e.g., "30m", "1h"). Defaults to 30m if empty.
+	RevertWindowDuration string `yaml:"revert_window_duration,omitempty"`
+
+	// APIURL is the PlanetScale API base URL (e.g., "http://localscale:8080").
+	// DSN is the vtgate MySQL endpoint for schema queries and SHOW VITESS_MIGRATIONS.
+	APIURL string `yaml:"api_url,omitempty"`
+
+	// TLS configures MySQL TLS for branch connections.
+	// When set, registers a named TLS config with the Go MySQL driver.
+	// Omit for LocalScale (no TLS) or set for real PlanetScale (mTLS with CA bundle).
+	TLS *TLSConfig `yaml:"tls,omitempty"`
+}
+
+// TLSConfig holds TLS certificate paths for MySQL connections to PlanetScale branches.
+type TLSConfig struct {
+	// CABundle is the path to the CA certificate bundle (PEM).
+	CABundle string `yaml:"ca_bundle"`
+
+	// ClientCert is the path to the client certificate (PEM).
+	ClientCert string `yaml:"client_cert,omitempty"`
+
+	// ClientKey is the path to the client private key (PEM).
+	ClientKey string `yaml:"client_key,omitempty"`
 }
 
 // RepoConfig holds configuration for a specific repository.

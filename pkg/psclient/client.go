@@ -37,6 +37,9 @@ type PSClient interface {
 	RevertDeployRequest(ctx context.Context, req *ps.RevertDeployRequestRequest) (*ps.DeployRequest, error)
 	SkipRevertDeployRequest(ctx context.Context, req *ps.SkipRevertDeployRequestRequest) (*ps.DeployRequest, error)
 
+	// ListDeployRequests lists all deploy requests for a database.
+	ListDeployRequests(ctx context.Context, req *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error)
+
 	// ThrottleDeployRequest sets the throttle ratio for a running deploy request.
 	// This controls the speed of the online DDL copy phase (0.0 = full speed,
 	// 0.95 = max throttle). The PlanetScale API supports this endpoint but the
@@ -156,6 +159,10 @@ func (w *psClientWrapper) RevertDeployRequest(ctx context.Context, req *ps.Rever
 
 func (w *psClientWrapper) SkipRevertDeployRequest(ctx context.Context, req *ps.SkipRevertDeployRequestRequest) (*ps.DeployRequest, error) {
 	return w.client.DeployRequests.SkipRevertDeploy(ctx, req)
+}
+
+func (w *psClientWrapper) ListDeployRequests(ctx context.Context, req *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error) {
+	return w.client.DeployRequests.List(ctx, req)
 }
 
 // ThrottleDeployRequest sets the throttle ratio via a raw HTTP PUT.

@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
 
@@ -303,6 +305,30 @@ func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeControlError(w, "skip-revert", req.Database, err)
 		return
+	}
+
+	// Record skip-revert on VitessApplyData for progress visibility
+	if resp.Accepted && req.ApplyID != "" && s.storage != nil && s.storage.Applies() != nil {
+		if apply, _ := s.storage.Applies().GetByApplyIdentifier(r.Context(), req.ApplyID); apply != nil {
+			if apply.Engine == storage.EnginePlanetScale {
+				now := time.Now()
+				if vad, err := s.storage.VitessApplyData().GetByApplyID(r.Context(), apply.ID); err == nil {
+					vad.RevertSkippedAt = &now
+					if err := s.storage.VitessApplyData().Save(r.Context(), vad); err != nil {
+						s.logger.Error("failed to save vitess apply data", "apply_id", apply.ID, "error", err)
+					}
+				}
+			}
+			if err := s.storage.ApplyLogs().Append(r.Context(), &storage.ApplyLog{
+				ApplyID:   apply.ID,
+				Level:     storage.LogLevelInfo,
+				EventType: storage.LogEventSkipRevertTriggered,
+				Source:    storage.LogSourceSchemaBot,
+				Message:   "Skip-revert triggered by user",
+			}); err != nil {
+				s.logger.Error("failed to append apply log", "apply_id", apply.ID, "error", err)
+			}
+		}
 	}
 
 	s.writeJSON(w, http.StatusOK, &apitypes.ControlResponse{

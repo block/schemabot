@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"time"
@@ -78,7 +79,7 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 	}
 
 	for _, t := range resp.Tables {
-		httpResp.Tables = append(httpResp.Tables, &apitypes.TableProgressResponse{
+		tpr := &apitypes.TableProgressResponse{
 			TableName:       t.TableName,
 			Keyspace:        t.Namespace,
 			ChangeType:      changeTypeToString(t.ChangeType),
@@ -91,7 +92,23 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 			IsInstant:       t.IsInstant,
 			ProgressDetail:  t.ProgressDetail,
 			TaskID:          t.TaskId,
-		})
+		}
+		for _, sh := range t.Shards {
+			var pct int32
+			if sh.RowsTotal > 0 {
+				pct = int32(sh.RowsCopied * 100 / sh.RowsTotal)
+			}
+			tpr.Shards = append(tpr.Shards, &apitypes.ShardProgressResponse{
+				Shard:           sh.Shard,
+				Status:          state.NormalizeShardStatus(sh.Status),
+				RowsCopied:      sh.RowsCopied,
+				RowsTotal:       sh.RowsTotal,
+				ETASeconds:      sh.EtaSeconds,
+				PercentComplete: pct,
+				CutoverAttempts: sh.CutoverAttempts,
+			})
+		}
+		httpResp.Tables = append(httpResp.Tables, tpr)
 	}
 
 	return httpResp
@@ -131,10 +148,8 @@ func (s *Service) GetProgress(ctx context.Context, database, environment string)
 
 	if activeApply != nil {
 		httpResp.ApplyID = activeApply.ApplyIdentifier
-		opts := storage.ParseApplyOptions(activeApply.Options)
-		if opts.Volume > 0 {
-			httpResp.Volume = int32(opts.Volume)
-		}
+		overlayApplyOptions(httpResp, activeApply)
+		s.overlayVitessMetadata(ctx, httpResp, activeApply)
 	}
 
 	return httpResp, nil
@@ -148,6 +163,7 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.logger.Info("progress by database", "database", database)
 	environment := r.URL.Query().Get("environment")
 	if environment == "" {
 		environment = "staging"
@@ -204,10 +220,8 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 	// Overlay apply metadata from storage.
 	if activeApply != nil {
 		httpResp.ApplyID = activeApply.ApplyIdentifier
-		opts := storage.ParseApplyOptions(activeApply.Options)
-		if opts.Volume > 0 {
-			httpResp.Volume = int32(opts.Volume)
-		}
+		overlayApplyOptions(httpResp, activeApply)
+		s.overlayVitessMetadata(r.Context(), httpResp, activeApply)
 	}
 
 	s.writeJSON(w, http.StatusOK, httpResp)
@@ -221,6 +235,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply_id is required")
 		return
 	}
+
+	s.logger.Info("progress by apply-id", "apply_id", applyID)
 
 	// Look up the apply by its external identifier
 	apply, err := s.storage.Applies().GetByApplyIdentifier(r.Context(), applyID)
@@ -248,12 +264,17 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 
 	// Active apply — use the deployment stored on the apply record.
 	deployment := s.resolveDeployment(apply.Database, apply.Deployment)
+	s.logger.Debug("progress by apply-id: resolving client", "apply_id", applyID, "database", apply.Database, "deployment", deployment, "environment", apply.Environment)
 
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound, err.Error())
+		s.logger.Error("no tern client for active apply — server is misconfigured",
+			"apply_id", applyID, "database", apply.Database, "deployment", deployment, "environment", apply.Environment, "error", err)
+		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
+			fmt.Sprintf("no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config", apply.Database, deployment, apply.Environment))
 		return
 	}
+	s.logger.Debug("progress by apply-id: got client", "apply_id", applyID, "is_remote", client.IsRemote())
 
 	// Resolve to the Tern-facing ID: external_id (remote engine's apply identifier) or apply_identifier (local mode).
 	ternApplyID := apply.ApplyIdentifier
@@ -280,7 +301,12 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		httpResp.PullRequest = fmt.Sprintf("https://github.com/%s/pull/%d", apply.Repository, apply.PullRequest)
 	}
 
-	// Use apply record as source of truth for timestamps
+	// Re-read the apply record — the tern client's Progress call may have
+	// updated state and timestamps (e.g., CompletedAt set when engine reports
+	// terminal state).
+	if freshApply, err := s.storage.Applies().GetByApplyIdentifier(r.Context(), applyID); err == nil && freshApply != nil {
+		apply = freshApply
+	}
 	if apply.StartedAt != nil {
 		httpResp.StartedAt = apply.StartedAt.Format(time.RFC3339)
 	}
@@ -288,13 +314,60 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		httpResp.CompletedAt = apply.CompletedAt.Format(time.RFC3339)
 	}
 
-	// Add volume from apply options
-	opts := storage.ParseApplyOptions(apply.Options)
-	if opts.Volume > 0 {
-		httpResp.Volume = int32(opts.Volume)
+	overlayApplyOptions(httpResp, apply)
+
+	s.overlayVitessMetadata(r.Context(), httpResp, apply)
+
+	// Overlay per-table timestamps from task records. The proto response
+	// doesn't carry task timestamps, but storage has them from engine
+	// progress polling (e.g., SHOW VITESS_MIGRATIONS started_timestamp).
+	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
+		taskByTable := make(map[string]*storage.Task, len(tasks))
+		for _, t := range tasks {
+			taskByTable[t.TableName] = t
+		}
+		for _, tpr := range httpResp.Tables {
+			if task, ok := taskByTable[tpr.TableName]; ok {
+				if task.StartedAt != nil && tpr.StartedAt == "" {
+					tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
+				}
+				if task.CompletedAt != nil && tpr.CompletedAt == "" {
+					tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
+				}
+			}
+		}
 	}
 
 	s.writeJSON(w, http.StatusOK, httpResp)
+}
+
+// overlayVitessMetadata loads VitessApplyData for the given apply and merges
+// engine-specific metadata (deploy request URL, revert status) into the response.
+func (s *Service) overlayVitessMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply) {
+	if apply == nil {
+		slog.Warn("overlayVitessMetadata: no apply record")
+		return
+	}
+	if apply.Engine != storage.EnginePlanetScale {
+		return
+	}
+	vad, err := s.storage.VitessApplyData().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		slog.Error("overlayVitessMetadata: failed to load vitess apply data", "apply_id", apply.ApplyIdentifier, "error", err)
+		return
+	}
+	if resp.Metadata == nil {
+		resp.Metadata = make(map[string]string)
+	}
+	if vad.BranchName != "" {
+		resp.Metadata["branch_name"] = vad.BranchName
+	}
+	if vad.DeployRequestURL != "" {
+		resp.Metadata["deploy_request_url"] = vad.DeployRequestURL
+	}
+	if vad.RevertSkippedAt != nil {
+		resp.Metadata["revert_skipped"] = "true"
+	}
 }
 
 // handleDatabaseHistory handles GET /api/history/{database} requests.
@@ -521,13 +594,11 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 		httpResp.ErrorCode = deriveErrorCode(apply.State, apply.ErrorMessage)
 		httpResp.ErrorMessage = apply.ErrorMessage
 	}
-	opts := storage.ParseApplyOptions(apply.Options)
-	if opts.Volume > 0 {
-		httpResp.Volume = int32(opts.Volume)
-	}
+	overlayApplyOptions(httpResp, apply)
+	s.overlayVitessMetadata(ctx, httpResp, apply)
 
 	for _, task := range tasks {
-		httpResp.Tables = append(httpResp.Tables, &apitypes.TableProgressResponse{
+		tpr := &apitypes.TableProgressResponse{
 			TableName:       task.TableName,
 			ChangeType:      task.DDLAction,
 			DDL:             task.DDL,
@@ -537,7 +608,14 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			PercentComplete: int32(task.ProgressPercent),
 			IsInstant:       task.IsInstant,
 			TaskID:          task.TaskIdentifier,
-		})
+		}
+		if task.StartedAt != nil {
+			tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
+		}
+		if task.CompletedAt != nil {
+			tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
+		}
+		httpResp.Tables = append(httpResp.Tables, tpr)
 	}
 
 	return httpResp, nil
@@ -593,4 +671,25 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 	s.logger.Info("synced stale task records from Tern",
 		"apply_id", apply.ApplyIdentifier, "synced", synced, "total", len(tasks))
 	return nil
+}
+
+// overlayApplyOptions populates volume and options on the response from the apply record.
+func overlayApplyOptions(resp *apitypes.ProgressResponse, apply *storage.Apply) {
+	opts := storage.ParseApplyOptions(apply.Options)
+	if opts.Volume > 0 {
+		resp.Volume = int32(opts.Volume)
+	}
+	optMap := make(map[string]string)
+	if opts.DeferCutover {
+		optMap["defer_cutover"] = "true"
+	}
+	if opts.SkipRevert {
+		optMap["skip_revert"] = "true"
+	}
+	if opts.AllowUnsafe {
+		optMap["allow_unsafe"] = "true"
+	}
+	if len(optMap) > 0 {
+		resp.Options = optMap
+	}
 }

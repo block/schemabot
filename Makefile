@@ -323,7 +323,7 @@ endif
 	wait $$MYSQL_PID
 	@echo "Running e2e tests..."
 	@E2E_SCHEMABOT_URL=http://localhost:14370 \
-	E2E_LOCALSCALE_URL=http://localhost:14374 \
+	LOCALSCALE_URL=http://localhost:14374 \
 	E2E_MYSQL_DSN="root:testpassword@tcp(localhost:14371)/schemabot" \
 	E2E_TESTAPP_STAGING_DSN="root:testpassword@tcp(localhost:14372)/testapp" \
 	E2E_TESTAPP_PRODUCTION_DSN="root:testpassword@tcp(localhost:14373)/testapp" \

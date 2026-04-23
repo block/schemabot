@@ -3,10 +3,17 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
+	"time"
+
+	gomysql "github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/state"
@@ -138,6 +145,19 @@ func (s *Service) TernDeployment(repo string) string {
 //
 // The method first checks for config-based database registration (local mode),
 // then falls back to TernDeployments (gRPC mode).
+// RegisterTernClient registers a tern client for the given deployment and
+// environment. This allows embedders to add clients dynamically as they
+// are created (e.g., lazily per-cluster).
+func (s *Service) RegisterTernClient(deployment, environment string, client tern.Client) {
+	if deployment == "" {
+		deployment = DefaultDeployment
+	}
+	key := deployment + "/" + environment
+	s.ternMu.Lock()
+	defer s.ternMu.Unlock()
+	s.ternClients[key] = client
+}
+
 func (s *Service) TernClient(deployment, environment string) (tern.Client, error) {
 	if deployment == "" {
 		deployment = DefaultDeployment
@@ -161,16 +181,60 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 				return nil, fmt.Errorf("resolve DSN for %s: %w", key, err)
 			}
 
+			// Resolve PlanetScale token if configured
+			var tokenName, tokenValue string
+			if envConfig.TokenSecretRef != "" {
+				token, err := secrets.Resolve(envConfig.TokenSecretRef, "")
+				if err != nil {
+					return nil, fmt.Errorf("resolve token for %s: %w", key, err)
+				}
+				parts := strings.SplitN(token, ":", 2)
+				if len(parts) == 2 {
+					tokenName, tokenValue = parts[0], parts[1]
+				}
+			}
+
+			// Register TLS config for PlanetScale MySQL connections if configured
+			var tlsName string
+			if envConfig.TLS != nil {
+				tlsName, err = registerTLSConfig(key, envConfig.TLS)
+				if err != nil {
+					return nil, fmt.Errorf("register TLS for %s: %w", key, err)
+				}
+			}
+
 			// LocalClient uses SchemaBot's storage directly
+			var revertWindow time.Duration
+			if envConfig.RevertWindowDuration != "" {
+				if d, err := time.ParseDuration(envConfig.RevertWindowDuration); err == nil {
+					revertWindow = d
+				}
+			}
+			metadata := map[string]string{
+				"organization": envConfig.Organization,
+				"token_name":   tokenName,
+				"token_value":  tokenValue,
+			}
+			if tlsName != "" {
+				metadata["tls_name"] = tlsName
+			}
+			if revertWindow > 0 {
+				metadata["revert_window_duration"] = revertWindow.String()
+			}
+			if envConfig.APIURL != "" {
+				metadata["api_url"] = envConfig.APIURL
+			}
 			client, err := tern.NewLocalClient(tern.LocalConfig{
 				Database:  deployment,
 				Type:      dbConfig.Type,
 				TargetDSN: targetDSN,
+				Metadata:  metadata,
 			}, s.storage, s.logger)
 			if err != nil {
 				return nil, fmt.Errorf("create local tern client for %s: %w", key, err)
 			}
 			s.ternClients[key] = client
+			s.logger.Info("created local tern client", "key", key, "type", dbConfig.Type, "deployment", deployment)
 			return client, nil
 		}
 	}
@@ -195,7 +259,97 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	return client, nil
 }
 
-// ConfigureRoutes registers HTTP handlers on the given mux.
+// =============================================================================
+// Exported Handlers
+// =============================================================================
+//
+// Public HTTP handler methods that delegate to the internal handlers. These
+// allow embedders to register individual SchemaBot routes on their own mux
+// while using the OSS handler logic, preventing behavior drift.
+
+// HandleProgressByApplyID is the HTTP handler for GET /api/progress/apply/{apply_id}.
+func (s *Service) HandleProgressByApplyID(w http.ResponseWriter, r *http.Request) {
+	s.handleProgressByApplyID(w, r)
+}
+
+// HandleProgress is the HTTP handler for GET /api/progress/{database}.
+// Returns progress for the active apply on the given database/environment.
+func (s *Service) HandleProgress(w http.ResponseWriter, r *http.Request) {
+	s.handleProgress(w, r)
+}
+
+// HandleStatus is the HTTP handler for GET /api/status.
+// Returns recent applies across all databases.
+func (s *Service) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	s.handleStatus(w, r)
+}
+
+// HandleDatabaseHistory is the HTTP handler for GET /api/history/{database}.
+// Returns apply history for a specific database.
+func (s *Service) HandleDatabaseHistory(w http.ResponseWriter, r *http.Request) {
+	s.handleDatabaseHistory(w, r)
+}
+
+// HandleLogs is the HTTP handler for GET /api/logs/{database}.
+func (s *Service) HandleLogs(w http.ResponseWriter, r *http.Request) {
+	s.handleLogs(w, r)
+}
+
+// HandleLogsWithoutDatabase is the HTTP handler for GET /api/logs.
+func (s *Service) HandleLogsWithoutDatabase(w http.ResponseWriter, r *http.Request) {
+	s.handleLogsWithoutDatabase(w, r)
+}
+
+// HandlePlan is the HTTP handler for POST /api/plan.
+func (s *Service) HandlePlan(w http.ResponseWriter, r *http.Request) {
+	s.handlePlan(w, r)
+}
+
+// HandleApply is the HTTP handler for POST /api/apply.
+func (s *Service) HandleApply(w http.ResponseWriter, r *http.Request) {
+	s.handleApply(w, r)
+}
+
+// HandleCutover is the HTTP handler for POST /api/cutover.
+func (s *Service) HandleCutover(w http.ResponseWriter, r *http.Request) {
+	s.handleCutover(w, r)
+}
+
+// HandleStop is the HTTP handler for POST /api/stop.
+func (s *Service) HandleStop(w http.ResponseWriter, r *http.Request) {
+	s.handleStop(w, r)
+}
+
+// HandleStart is the HTTP handler for POST /api/start.
+func (s *Service) HandleStart(w http.ResponseWriter, r *http.Request) {
+	s.handleStart(w, r)
+}
+
+// HandleVolume is the HTTP handler for POST /api/volume.
+func (s *Service) HandleVolume(w http.ResponseWriter, r *http.Request) {
+	s.handleVolume(w, r)
+}
+
+// HandleRevert is the HTTP handler for POST /api/revert.
+func (s *Service) HandleRevert(w http.ResponseWriter, r *http.Request) {
+	s.handleRevert(w, r)
+}
+
+// HandleSkipRevert is the HTTP handler for POST /api/skip-revert.
+func (s *Service) HandleSkipRevert(w http.ResponseWriter, r *http.Request) {
+	s.handleSkipRevert(w, r)
+}
+
+// HandleRollbackPlan is the HTTP handler for POST /api/rollback/plan.
+func (s *Service) HandleRollbackPlan(w http.ResponseWriter, r *http.Request) {
+	s.handleRollbackPlan(w, r)
+}
+
+// =============================================================================
+// Route Registration
+// =============================================================================
+
+// ConfigureRoutes registers all HTTP API routes on the given mux.
 func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	// Health endpoints
 	mux.HandleFunc("GET /health", s.handleHealth)
@@ -326,4 +480,41 @@ func (s *Service) Close() error {
 		return fmt.Errorf("close errors: %v", errs)
 	}
 	return nil
+}
+
+// registerTLSConfig registers a named TLS config with the Go MySQL driver.
+// Returns the config name to use in DSN parameters (tls=<name>).
+func registerTLSConfig(name string, cfg *TLSConfig) (string, error) {
+	if cfg.CABundle == "" {
+		return "", fmt.Errorf("tls.ca_bundle is required")
+	}
+
+	caPEM, err := os.ReadFile(cfg.CABundle)
+	if err != nil {
+		return "", fmt.Errorf("read CA bundle %s: %w", cfg.CABundle, err)
+	}
+	rootPool := x509.NewCertPool()
+	if !rootPool.AppendCertsFromPEM(caPEM) {
+		return "", fmt.Errorf("failed to parse CA bundle %s", cfg.CABundle)
+	}
+
+	tlsCfg := &tls.Config{
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS12,
+	}
+
+	// Client certificate is optional (mTLS).
+	if cfg.ClientCert != "" && cfg.ClientKey != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
+		if err != nil {
+			return "", fmt.Errorf("load client cert/key: %w", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+
+	tlsName := "schemabot-" + name
+	if err := gomysql.RegisterTLSConfig(tlsName, tlsCfg); err != nil {
+		return "", fmt.Errorf("register TLS config %s: %w", tlsName, err)
+	}
+	return tlsName, nil
 }

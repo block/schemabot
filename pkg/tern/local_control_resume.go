@@ -113,7 +113,9 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		apply.State = state.Apply.Completed
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
-		_ = c.storage.Applies().Update(ctx, apply)
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
+		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"All tasks already completed on resume (re-plan shows no changes)", apply.State, state.Apply.Completed)
 
@@ -142,7 +144,9 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 
 		apply.State = state.Apply.Running
 		apply.UpdatedAt = now
-		_ = c.storage.Applies().Update(ctx, apply)
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+		}
 
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Resume requested (sequential): %d tasks to resume, %d already completed", len(resumeTasks), completedCount), oldApplyState, state.Apply.Running)
@@ -386,7 +390,9 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 
 	apply.State = state.Apply.Running
 	apply.UpdatedAt = now
-	_ = c.storage.Applies().Update(ctx, apply)
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+	}
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 		logMessage, oldApplyState, state.Apply.Running)
@@ -394,7 +400,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	stopHeartbeat := c.startApplyHeartbeat(context.Background(), apply)
 	go func() {
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(context.Background(), apply, tasks, creds)
+		c.pollForCompletionAtomic(context.Background(), apply, tasks, creds, nil)
 	}()
 	return nil
 }
@@ -414,7 +420,9 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 			"apply_id", apply.ApplyIdentifier)
 		apply.State = state.Apply.Failed
 		apply.ErrorMessage = "no tasks found during recovery"
-		_ = c.storage.Applies().Update(ctx, apply)
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
+		}
 		return nil
 	}
 
@@ -426,7 +434,9 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 			"plan_id", apply.PlanID)
 		apply.State = state.Apply.Failed
 		apply.ErrorMessage = "plan not found during recovery"
-		_ = c.storage.Applies().Update(ctx, apply)
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
+		}
 		return nil
 	}
 
@@ -456,7 +466,9 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		apply.State = state.Apply.Completed
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
-		_ = c.storage.Applies().Update(ctx, apply)
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
+		}
 		return nil
 	}
 
@@ -476,7 +488,9 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		now := time.Now()
 		apply.State = state.Apply.Running
 		apply.UpdatedAt = now
-		_ = c.storage.Applies().Update(ctx, apply)
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+		}
 
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"Apply resumed from checkpoint (sequential)", "", state.Apply.Running)
