@@ -113,25 +113,25 @@ func TestGenerateBranchName(t *testing.T) {
 			name:     "basic",
 			database: "mydb",
 			planID:   "plan-12345678",
-			expected: "tern-mydb-12345678",
+			expected: "schemabot-mydb-12345678",
 		},
 		{
 			name:     "underscores replaced",
 			database: "my_cool_db",
 			planID:   "plan-abcdefgh",
-			expected: "tern-my-cool-db-abcdefgh",
+			expected: "schemabot-my-cool-db-abcdefgh",
 		},
 		{
 			name:     "long database name truncated",
 			database: "this_is_a_very_long_database_name",
 			planID:   "plan-xyz12345",
-			expected: "tern-this-is-a-very-long--xyz12345",
+			expected: "schemabot-this-is-a-very-long--xyz12345",
 		},
 		{
 			name:     "short plan ID",
 			database: "db",
 			planID:   "abc",
-			expected: "tern-db-abc",
+			expected: "schemabot-db-abc",
 		},
 	}
 
@@ -145,14 +145,14 @@ func TestGenerateBranchName(t *testing.T) {
 
 func TestPSMetadataEncodeDecode(t *testing.T) {
 	original := &psMetadata{
-		BranchName:       "tern-mydb-12345678",
+		BranchName:       "schemabot-mydb-12345678",
 		DeployRequestID:  42,
 		DeployRequestURL: "https://app.planetscale.com/org/db/deploy-requests/42",
 	}
 
 	encoded, err := encodePSMetadata(original)
 	require.NoError(t, err)
-	assert.Contains(t, encoded, "tern-mydb-12345678")
+	assert.Contains(t, encoded, "schemabot-mydb-12345678")
 	assert.Contains(t, encoded, "42")
 
 	decoded, err := decodePSMetadata(encoded)

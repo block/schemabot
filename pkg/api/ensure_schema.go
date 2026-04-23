@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/block/spirit/pkg/table"
@@ -33,10 +34,30 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
 	defer cancel()
 
+	// Diagnostic preamble: log the actual database target and current state
+	// before doing any work. This is critical for debugging bootstrap issues
+	// in embedded environments (e.g., Tern) where the DSN is constructed
+	// dynamically and we need to confirm we're hitting the right database.
+	if diag, err := diagnoseStorageTarget(ctx, dsn); err != nil {
+		logger.Warn("storage target diagnostic failed", "error", err)
+	} else {
+		logger.Info("EnsureSchema storage target",
+			"hostname", diag.hostname,
+			"database", diag.database,
+			"existing_tables", diag.tableCount,
+			"table_names", diag.tableNames,
+		)
+	}
+
 	schemaFiles, err := readEmbeddedSchemaFiles()
 	if err != nil {
 		return err
 	}
+	logger.Info("loaded embedded storage schema files",
+		"namespace_count", len(schemaFiles),
+		"file_count", countSchemaFiles(schemaFiles),
+		"files", schemaFileNames(schemaFiles),
+	)
 
 	// Clean up stale Spirit internal tables before planning. These are
 	// leftover from a previous interrupted schema change (e.g., pod killed
@@ -67,7 +88,7 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 		return fmt.Errorf("plan schema: %w", err)
 	}
 	if planResult.NoChanges {
-		logger.Info("storage schema up-to-date", "tables", len(planResult.OriginalSchema))
+		logger.Info("storage schema up-to-date")
 		return nil
 	}
 
@@ -162,6 +183,9 @@ func readEmbeddedSchemaFiles() (schema.SchemaFiles, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read schema directory: %w", err)
 	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("read schema directory: no embedded schema files found in mysql/")
+	}
 
 	files := make(map[string]string)
 	for _, entry := range entries {
@@ -178,6 +202,77 @@ func readEmbeddedSchemaFiles() (schema.SchemaFiles, error) {
 	return schema.SchemaFiles{
 		"schemabot": &schema.Namespace{Files: files},
 	}, nil
+}
+
+func countSchemaFiles(schemaFiles schema.SchemaFiles) int {
+	total := 0
+	for _, namespace := range schemaFiles {
+		if namespace == nil {
+			continue
+		}
+		total += len(namespace.Files)
+	}
+	return total
+}
+
+func schemaFileNames(schemaFiles schema.SchemaFiles) []string {
+	names := make([]string, 0)
+	for namespaceName, namespace := range schemaFiles {
+		if namespace == nil {
+			continue
+		}
+		for fileName := range namespace.Files {
+			names = append(names, namespaceName+"/"+fileName)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+type storageDiagnostic struct {
+	hostname   string
+	database   string
+	tableCount int
+	tableNames []string
+}
+
+// diagnoseStorageTarget connects to the DSN and queries the actual database
+// identity and existing table state. Used for diagnostic logging only.
+func diagnoseStorageTarget(ctx context.Context, dsn string) (*storageDiagnostic, error) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	defer utils.CloseAndLog(db)
+
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+
+	var diag storageDiagnostic
+	if err := db.QueryRowContext(ctx, "SELECT @@hostname, DATABASE()").Scan(&diag.hostname, &diag.database); err != nil {
+		return nil, fmt.Errorf("query hostname and database: %w", err)
+	}
+
+	rows, err := db.QueryContext(ctx, "SHOW TABLES")
+	if err != nil {
+		return nil, fmt.Errorf("show tables: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan table name: %w", err)
+		}
+		diag.tableNames = append(diag.tableNames, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate tables: %w", err)
+	}
+	diag.tableCount = len(diag.tableNames)
+
+	return &diag, nil
 }
 
 // ensureSchemaLockName is the MySQL advisory lock name used to serialize
@@ -250,16 +345,33 @@ func cleanStaleSpiritTables(ctx context.Context, dsn string, logger *slog.Logger
 		return fmt.Errorf("load schema: %w", err)
 	}
 
+	var staleCount int
+	tableNames := make([]string, len(tables))
+	for i, t := range tables {
+		tableNames[i] = t.Name
+	}
+	logger.Info("cleanStaleSpiritTables loaded schema",
+		"total_tables", len(tables),
+		"table_names", tableNames,
+	)
+
 	for _, t := range tables {
 		if !ddl.IsSpiritInternalTable(t.Name) {
 			continue
 		}
+		staleCount++
 		logger.Info("cleaning up stale Spirit temporary table from previous schema change",
 			"table", t.Name,
 		)
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS `%s`", t.Name)); err != nil {
 			return fmt.Errorf("drop stale Spirit table %s: %w", t.Name, err)
 		}
+	}
+
+	if staleCount == 0 {
+		logger.Info("no stale Spirit tables found")
+	} else {
+		logger.Info("cleaned stale Spirit tables", "dropped", staleCount)
 	}
 
 	return nil

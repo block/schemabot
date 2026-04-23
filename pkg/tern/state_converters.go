@@ -1,8 +1,10 @@
 package tern
 
 import (
+	"encoding/json"
 	"maps"
 	"sort"
+	"time"
 
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -190,4 +192,43 @@ func protoToSchemaFiles(sf map[string]*ternv1.SchemaFiles) schema.SchemaFiles {
 		result[ns] = &schema.Namespace{Files: files}
 	}
 	return result
+}
+
+// planToSchemaFiles converts a stored plan's namespace data to engine SchemaFiles.
+// Used by executeApplyAtomic to pass VSchema files to the engine.
+func planToSchemaFiles(plan *storage.Plan) schema.SchemaFiles {
+	if plan == nil || len(plan.Namespaces) == 0 {
+		return nil
+	}
+	result := make(schema.SchemaFiles, len(plan.Namespaces))
+	for ns, nsData := range plan.Namespaces {
+		files := make(map[string]string)
+		if len(nsData.VSchema) > 0 {
+			files["vschema.json"] = string(nsData.VSchema)
+		}
+		if len(files) > 0 {
+			result[ns] = &schema.Namespace{Files: files}
+		}
+	}
+	return result
+}
+
+// psMetadataForStorage is a subset of the PlanetScale engine's metadata
+// used for storing deploy request tracking data.
+type psMetadataForStorage struct {
+	BranchName       string     `json:"branch_name"`
+	DeployRequestID  uint64     `json:"deploy_request_id"`
+	DeployRequestURL string     `json:"deploy_request_url,omitempty"`
+	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
+}
+
+func decodePSMetadataForStorage(s string) (*psMetadataForStorage, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var m psMetadataForStorage
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
 }

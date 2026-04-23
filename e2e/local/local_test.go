@@ -36,6 +36,8 @@ import (
 func TestMain(m *testing.M) {
 	// Clean up SchemaBot's state tables to ensure fresh state
 	clearSchemaBotStateImpl()
+	// Clear LocalScale deploy requests to prevent stale deploys from blocking tests
+	resetLocalScaleStateOrFatal()
 
 	// Clean up any leftover tables from previous runs in testapp database
 	// Keep only the base fixture tables (users, orders, products) that are part of the testapp schema

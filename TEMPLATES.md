@@ -538,7 +538,7 @@ schemabot apply -e production
 | `schemabot rollback <apply-id>` | Generate a rollback plan |
 | `schemabot rollback-confirm <apply-id>` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `--defer-cutover`, `--allow-unsafe`, `--enable-revert` (Vitess)
+**Options**: `-e <env>` environment, `-d <db>` database, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply` → `apply-confirm`
 
@@ -685,7 +685,7 @@ That command wasn't recognized. Available commands:
 | `schemabot rollback <apply-id>` | Generate a rollback plan |
 | `schemabot rollback-confirm <apply-id>` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `--defer-cutover`, `--allow-unsafe`, `--enable-revert` (Vitess)
+**Options**: `-e <env>` environment, `-d <db>` database, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
 
 **Quick start**: `plan` → `apply` → `apply-confirm`
 </details>

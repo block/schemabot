@@ -69,6 +69,7 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, database string) bool {
 	eng := c.getEngine()
 	if eng == nil {
+		c.logger.Error("tryResolveStaleTask: engine is nil", "database", database)
 		return false
 	}
 
@@ -174,7 +175,9 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 	oldState := task.State
 	task.State = newState
 	task.UpdatedAt = time.Now()
-	_ = c.storage.Tasks().Update(ctx, task)
+	if err := c.storage.Tasks().Update(ctx, task); err != nil {
+		c.logger.Error("failed to update task state", "task_id", task.TaskIdentifier, "state", newState, "error", err)
+	}
 	if logMsg != "" && applyID > 0 {
 		taskID := task.ID
 		c.logApplyEvent(ctx, applyID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
@@ -189,8 +192,23 @@ func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Tas
 		task.State = state.Task.Running
 		task.StartedAt = &now
 		task.UpdatedAt = now
-		_ = c.storage.Tasks().Update(ctx, task)
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			c.logger.Error("failed to update task state", "task_id", task.TaskIdentifier, "state", state.Task.Running, "error", err)
+		}
 	}
+}
+
+// runWithRecovery wraps an apply function with panic recovery so a single panic
+// doesn't crash the entire process. On panic, all tasks and the apply are marked failed.
+func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			errMsg := fmt.Sprintf("panic in apply goroutine: %v", r)
+			c.logger.Error(errMsg, "apply_id", apply.ApplyIdentifier)
+			c.failApplyWithTasks(ctx, apply, tasks, errMsg)
+		}
+	}()
+	fn()
 }
 
 // executeApplyAtomic runs all DDLs in one Spirit call for atomic cutover (--defer-cutover).
@@ -208,8 +226,15 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 	}
 
 	// Log atomic mode start
+	deferCutover := options["defer_cutover"] == "true"
+	var modeDesc string
+	if deferCutover {
+		modeDesc = "atomic mode (defer-cutover)"
+	} else {
+		modeDesc = "atomic mode"
+	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Starting atomic mode (defer-cutover) with %d tables: %v", len(tasks), tableNames), "", "")
+		fmt.Sprintf("Starting %s with %d tables: %v", modeDesc, len(tasks), tableNames), "", "")
 
 	eng := c.getEngine()
 	defer c.setupSpiritLogging(ctx, apply, tasks)()
@@ -218,26 +243,110 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		"Calling engine.Apply for all tables", "", "")
 
-	// Build per-table changes for the engine
-	var tableChanges []engine.TableChange
-	for _, t := range tasks {
-		tableChanges = append(tableChanges, engine.TableChange{
-			Table: t.TableName,
-			DDL:   t.DDL,
-		})
+	// Build per-namespace changes from the plan. For Vitess databases, each
+	// namespace is a keyspace (e.g., "testapp", "testapp_sharded"). For MySQL,
+	// there's typically one namespace ("default" or the database name).
+	var changes []engine.SchemaChange
+	c.logger.Info("building changes from plan", "namespaces", len(plan.Namespaces), "plan_id", plan.PlanIdentifier)
+	if len(plan.Namespaces) > 0 {
+		for namespace, nsData := range plan.Namespaces {
+			var tableChanges []engine.TableChange
+			for _, tc := range nsData.Tables {
+				tableChanges = append(tableChanges, engine.TableChange{
+					Table: tc.Table,
+					DDL:   tc.DDL,
+				})
+			}
+			metadata := make(map[string]string)
+			if len(nsData.VSchema) > 0 {
+				metadata["vschema"] = "true"
+			}
+			changes = append(changes, engine.SchemaChange{
+				Namespace:    namespace,
+				TableChanges: tableChanges,
+				Metadata:     metadata,
+			})
+		}
+	} else {
+		c.failApplyWithTasks(ctx, apply, tasks, "plan has no namespace data")
+		return
+	}
+
+	// For Vitess: set apply state to creating_branch before the engine call.
+	// eng.Apply() blocks during branch creation and deploy request setup, so
+	// this state is what the progress handler returns during that period.
+	if c.config.Type == storage.DatabaseTypeVitess {
+		apply.State = state.Apply.CreatingBranch
+		apply.UpdatedAt = time.Now()
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.CreatingBranch, "error", err)
+		}
+
+		if err := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
+			ApplyID:          apply.ID,
+			MigrationContext: apply.ApplyIdentifier,
+		}); err != nil {
+			c.logger.Error("failed to save vitess apply data", "apply_id", apply.ID, "error", err)
+		}
+	}
+
+	// Mark the apply as started before calling the engine. The engine may run
+	// for a long time (branch creation, DDL application, deploy request) and
+	// started_at should reflect when work actually began, not when it finished.
+	now := time.Now()
+	apply.StartedAt = &now
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to set started_at", "apply_id", apply.ApplyIdentifier, "error", err)
 	}
 
 	// Atomic mode: all DDLs in one engine call. Use the apply identifier as
 	// MigrationContext so all migrations share one context for progress tracking.
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
-		Database: apply.Database,
-		Changes: []engine.SchemaChange{{
-			Namespace:    apply.Database,
-			TableChanges: tableChanges,
-		}},
+		Database:    apply.Database,
+		PlanID:      plan.PlanIdentifier,
+		Changes:     changes,
+		SchemaFiles: planToSchemaFiles(plan),
 		Options:     options,
 		ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
 		Credentials: creds,
+		OnEvent: func(event engine.ApplyEvent) {
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+				event.Message, "", "")
+			// Update apply state to reflect engine setup phases so the
+			// progress handler returns the current phase to the CLI.
+			if newState := deriveApplyPhase(event.Message); newState != "" {
+				apply.State = newState
+				apply.UpdatedAt = time.Now()
+				if err := c.storage.Applies().Update(ctx, apply); err != nil {
+					c.logger.Error("failed to update apply phase", "apply_id", apply.ApplyIdentifier, "state", newState, "error", err)
+				}
+			}
+		},
+		OnStateChange: func(rs *engine.ResumeState) {
+			if rs == nil {
+				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
+				return
+			}
+			meta, err := decodePSMetadataForStorage(rs.Metadata)
+			if err != nil {
+				c.logger.Warn("OnStateChange: failed to decode metadata", "apply_id", apply.ApplyIdentifier, "error", err)
+				return
+			}
+			if meta == nil {
+				c.logger.Warn("OnStateChange: no PS metadata in resume state", "apply_id", apply.ApplyIdentifier)
+				return
+			}
+			if saveErr := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
+				ApplyID:          apply.ID,
+				BranchName:       meta.BranchName,
+				DeployRequestID:  meta.DeployRequestID,
+				MigrationContext: rs.MigrationContext,
+				DeployRequestURL: meta.DeployRequestURL,
+			}); saveErr != nil {
+				c.logger.Warn("OnStateChange: failed to persist resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
+			}
+		},
 	})
 
 	if err != nil {
@@ -257,17 +366,36 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 
 	// All tasks start running together
 	c.markTasksRunning(ctx, tasks)
-	now := time.Now()
 	apply.State = state.Apply.Running
-	apply.StartedAt = &now
-	apply.UpdatedAt = now
-	_ = c.storage.Applies().Update(ctx, apply)
+	apply.UpdatedAt = time.Now()
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+	}
 	c.logger.Info("atomic apply started", "apply_id", apply.ApplyIdentifier, "task_count", len(tasks))
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 		fmt.Sprintf("All %d tables started copying in parallel", len(tasks)), state.Apply.Pending, state.Apply.Running)
 
+	// Store resume state from engine (deploy request ID, migration context)
+	// so progress polling can track the deploy request.
+	var resumeState *engine.ResumeState
+	if result.ResumeState != nil {
+		resumeState = result.ResumeState
+		// Persist to vitess_apply_data for crash recovery and external progress queries.
+		if meta, err := decodePSMetadataForStorage(resumeState.Metadata); meta != nil && err == nil {
+			if saveErr := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
+				ApplyID:          apply.ID,
+				BranchName:       meta.BranchName,
+				DeployRequestID:  meta.DeployRequestID,
+				MigrationContext: resumeState.MigrationContext,
+				DeployRequestURL: meta.DeployRequestURL,
+			}); saveErr != nil {
+				c.logger.Warn("failed to save vitess apply data", "apply_id", apply.ApplyIdentifier, "error", saveErr)
+			}
+		}
+	}
+
 	// Poll for completion - all tasks share the same state
-	c.pollForCompletionAtomic(ctx, apply, tasks, creds)
+	c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState)
 }
 
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
@@ -289,9 +417,9 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	apply.State = state.Apply.Running
 	apply.StartedAt = &now
 	apply.UpdatedAt = now
-	_ = c.storage.Applies().Update(ctx, apply)
-
-	defer c.startApplyHeartbeat(ctx, apply)()
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+	}
 
 	var failedTask *storage.Task
 	var stoppedByUser bool
@@ -419,11 +547,33 @@ func (c *LocalClient) runEngineTask(ctx context.Context, task *storage.Task, pla
 	}
 }
 
+// Timeouts for idle states where user action is expected.
+const (
+	// waitingForCutoverTimeout is how long to wait for a manual cutover trigger
+	// before auto-cancelling the apply.
+	waitingForCutoverTimeout = 14 * 24 * time.Hour
+
+	// defaultRevertWindowDuration is the default revert window period.
+	// 30 minutes matches PlanetScale's default.
+	defaultRevertWindowDuration = 30 * time.Minute
+)
+
 // atomicPollState tracks mutable state across polling ticks in atomic mode.
 type atomicPollState struct {
 	lastTaskState   string
 	lastLoggedState string
 	lastProgressLog time.Time
+
+	// stateEnteredAt tracks when the current waiting state was entered,
+	// used for timeout enforcement on deferred cutover and revert window.
+	stateEnteredAt time.Time
+
+	// revertSkipped is set after SkipRevert is called to prevent repeated calls.
+	revertSkipped bool
+
+	// consecutiveErrors tracks progress poll failures to fail fast when the
+	// engine is unreachable (e.g., branch deleted mid-apply).
+	consecutiveErrors int
 }
 
 // startApplyHeartbeat starts a background goroutine that heartbeats the apply
@@ -449,7 +599,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 }
 
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
-func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials) {
+func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) {
 	eng := c.getEngine()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -461,7 +611,7 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, ps); done {
+			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps); done {
 				return
 			}
 		}
@@ -470,24 +620,41 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 
 // handleAtomicProgressTick processes a single progress poll tick in atomic mode.
 // Returns true when the apply has reached a terminal state.
-func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, ps *atomicPollState) bool {
+func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState) bool {
 	result, err := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    apply.Database,
 		Credentials: creds,
+		ResumeState: resumeState,
 	})
 	if err != nil {
-		c.logger.Warn("progress check failed", "error", err, "apply_id", apply.ApplyIdentifier)
+		ps.consecutiveErrors++
+		c.logger.Warn("progress check failed",
+			"error", err, "apply_id", apply.ApplyIdentifier, "consecutive_errors", ps.consecutiveErrors)
+		if ps.consecutiveErrors >= 10 {
+			c.logger.Error("progress polling failed repeatedly, failing apply",
+				"apply_id", apply.ApplyIdentifier, "consecutive_errors", ps.consecutiveErrors)
+			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
+			return true
+		}
 		return false
+	}
+	ps.consecutiveErrors = 0
+
+	// Update resumeState if the engine returned a newer one (e.g., with
+	// updated metadata like deploy request URL or migration context).
+	if result.ResumeState != nil && resumeState != nil {
+		*resumeState = *result.ResumeState
 	}
 
 	now := time.Now()
 	newState := engineStateToStorage(result.State)
 
-	// Log state transitions
+	// Log state transitions and track when waiting states are entered (for timeouts)
 	if newState != ps.lastTaskState {
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			fmt.Sprintf("State changed to %s", newState), ps.lastTaskState, newState)
 		ps.lastTaskState = newState
+		ps.stateEnteredAt = now
 	}
 
 	// Log progress every 10 seconds
@@ -496,13 +663,70 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// Update all tasks with engine progress
 	c.syncAtomicTaskProgress(ctx, tasks, result, newState, now)
 
+	opts := apply.GetOptions()
+	controlReq := &engine.ControlRequest{
+		Database:    apply.Database,
+		Credentials: creds,
+		ResumeState: resumeState,
+	}
+
 	// Auto-trigger cutover if waiting and not in defer mode
-	if result.State == engine.StateWaitingForCutover && !apply.GetOptions().DeferCutover {
+	if result.State == engine.StateWaitingForCutover && !opts.DeferCutover {
 		c.logger.Info("auto-triggering cutover (not in defer mode)", "apply_id", apply.ApplyIdentifier)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 			"Auto-triggering cutover (defer_cutover not set)", "", "")
-		if _, err := eng.Cutover(ctx, &engine.ControlRequest{Database: apply.Database, Credentials: creds}); err != nil {
+		if _, err := eng.Cutover(ctx, controlReq); err != nil {
 			c.logger.Error("auto-cutover failed", "error", err, "apply_id", apply.ApplyIdentifier)
+		}
+	}
+
+	// Timeout: cancel the apply if waiting for manual cutover too long.
+	if result.State == engine.StateWaitingForCutover && opts.DeferCutover &&
+		!ps.stateEnteredAt.IsZero() && time.Since(ps.stateEnteredAt) > waitingForCutoverTimeout {
+		c.logger.Info("waiting-for-cutover timed out, cancelling apply",
+			"apply_id", apply.ApplyIdentifier, "timeout", waitingForCutoverTimeout)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Waiting for cutover timed out after %s, cancelling", waitingForCutoverTimeout), "", "")
+		if _, err := eng.Stop(ctx, controlReq); err != nil {
+			c.logger.Error("timeout stop failed", "error", err, "apply_id", apply.ApplyIdentifier)
+		}
+	}
+
+	// If --skip-revert was set, auto-skip the revert window immediately.
+	if result.State == engine.StateRevertWindow && opts.SkipRevert && !ps.revertSkipped {
+		c.logger.Info("auto-skipping revert window (--skip-revert)",
+			"apply_id", apply.ApplyIdentifier,
+		)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			"Auto-skipping revert window (--skip-revert)", "", "")
+		_, err := eng.SkipRevert(ctx, controlReq)
+		if err != nil {
+			c.logger.Error("auto-skip revert failed", "error", err, "apply_id", apply.ApplyIdentifier)
+		} else {
+			c.logger.Info("skip-revert triggered", "apply_id", apply.ApplyIdentifier, "reason", "--skip-revert")
+			c.markRevertSkipped(ctx, apply)
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
+			"Skip-revert triggered (--skip-revert)", state.Apply.RevertWindow, "")
+		ps.revertSkipped = true
+	}
+
+	// Revert window enabled (default): auto-skip based on deployed_at + configured duration.
+	// Falls back to stateEnteredAt if deployed_at is unavailable.
+	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped {
+		revertDeadline := c.revertWindowDeadline(result.ResumeState, ps.stateEnteredAt)
+		if !revertDeadline.IsZero() && now.After(revertDeadline) {
+			c.logger.Info("revert window expired, skipping", "apply_id", apply.ApplyIdentifier, "deadline", revertDeadline)
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+				"Revert window expired, finalizing", "", "")
+			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
+				c.logger.Error("revert window timeout skip failed", "error", err, "apply_id", apply.ApplyIdentifier)
+			} else {
+				c.markRevertSkipped(ctx, apply)
+				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
+					"Revert window expired, skip-revert triggered", state.Apply.RevertWindow, "")
+			}
+			ps.revertSkipped = true
 		}
 	}
 
@@ -512,15 +736,58 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	if result.State.IsTerminal() {
 		apply.CompletedAt = &now
-		_ = c.storage.Applies().Update(ctx, apply)
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+		}
 		c.logger.Info("atomic apply completed", "apply_id", apply.ApplyIdentifier, "state", result.State, "task_count", len(tasks))
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Apply completed with state: %s", result.State), ps.lastTaskState, apply.State)
 		return true
 	}
 
-	_ = c.storage.Applies().Update(ctx, apply)
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+	}
 	return false
+}
+
+// markRevertSkipped sets RevertSkippedAt on the VitessApplyData record so
+// progress consumers know finalization is in progress.
+func (c *LocalClient) markRevertSkipped(ctx context.Context, apply *storage.Apply) {
+	now := time.Now()
+	if vad, err := c.storage.VitessApplyData().GetByApplyID(ctx, apply.ID); err == nil {
+		vad.RevertSkippedAt = &now
+		if saveErr := c.storage.VitessApplyData().Save(ctx, vad); saveErr != nil {
+			c.logger.Warn("failed to save revert_skipped_at", "apply_id", apply.ApplyIdentifier, "error", saveErr)
+		}
+	}
+}
+
+// revertWindowDuration returns the configured revert window duration,
+// falling back to PlanetScale's default of 30 minutes.
+func (c *LocalClient) revertWindowDuration() time.Duration {
+	if s := c.config.Metadata["revert_window_duration"]; s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultRevertWindowDuration
+}
+
+// revertWindowDeadline computes when the revert window expires.
+// Uses deployed_at from engine metadata (accurate to PlanetScale's clock) plus
+// the configured revert period. Falls back to stateEnteredAt if metadata is unavailable.
+func (c *LocalClient) revertWindowDeadline(resumeState *engine.ResumeState, stateEnteredAt time.Time) time.Time {
+	duration := c.revertWindowDuration()
+	if resumeState != nil && resumeState.Metadata != "" {
+		if meta, err := decodePSMetadataForStorage(resumeState.Metadata); err == nil && meta != nil && meta.DeployedAt != nil {
+			return meta.DeployedAt.Add(duration)
+		}
+	}
+	if !stateEnteredAt.IsZero() {
+		return stateEnteredAt.Add(duration)
+	}
+	return time.Time{}
 }
 
 // logAtomicProgress logs per-table progress to apply_logs every 10 seconds.
@@ -553,14 +820,27 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 	}
 
 	for _, task := range tasks {
-		if result.State.IsTerminal() {
-			task.CompletedAt = &now
-		}
 		if tp, ok := tableProgress[task.TableName]; ok {
 			task.RowsCopied = tp.RowsCopied
 			task.RowsTotal = tp.RowsTotal
 			task.ProgressPercent = tp.Progress
 			task.ETASeconds = int(tp.ETASeconds)
+			// Use engine-reported timestamps (from SHOW VITESS_MIGRATIONS) if available.
+			if tp.StartedAt != nil && task.StartedAt == nil {
+				task.StartedAt = tp.StartedAt
+			}
+			if tp.CompletedAt != nil && task.CompletedAt == nil {
+				task.CompletedAt = tp.CompletedAt
+			}
+		}
+		// For tasks transitioning to a non-pending state without a started_at
+		// (e.g., instant DDL where SHOW VITESS_MIGRATIONS has no timestamp),
+		// use the current time.
+		if task.StartedAt == nil && newState != state.Task.Pending {
+			task.StartedAt = &now
+		}
+		if result.State.IsTerminal() && task.CompletedAt == nil {
+			task.CompletedAt = &now
 		}
 		c.transitionTaskState(ctx, task, 0, newState, "")
 	}
@@ -653,18 +933,37 @@ func (c *LocalClient) markTaskFailed(ctx context.Context, task *storage.Task, er
 }
 
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.
+// If the apply is already in a terminal state (e.g., cancelled by Stop()), the
+// apply state is not overwritten.
 func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
 	now := time.Now()
 	for _, task := range tasks {
-		task.ErrorMessage = errMsg
+		if state.IsTerminalTaskState(task.State) {
+			continue
+		}
+		if task.ErrorMessage == "" {
+			task.ErrorMessage = errMsg
+		}
 		task.CompletedAt = &now
 		c.transitionTaskState(ctx, task, 0, state.Task.Failed, "")
 	}
+
+	// Re-read the apply from storage — Stop() may have already set a terminal
+	// state (e.g., cancelled) between when the engine error occurred and now.
+	fresh, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err == nil && fresh != nil && state.IsTerminalApplyState(fresh.State) {
+		c.logger.Debug("apply already in terminal state, not overwriting",
+			"apply_id", apply.ApplyIdentifier, "state", fresh.State)
+		return
+	}
+
 	apply.State = state.Apply.Failed
 	apply.ErrorMessage = errMsg
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
-	_ = c.storage.Applies().Update(ctx, apply)
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
+	}
 }
 
 // finalizeSequentialApply updates the apply state based on sequential task outcomes.
@@ -688,7 +987,9 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		apply.CompletedAt = &now
 	}
 	apply.UpdatedAt = now
-	_ = c.storage.Applies().Update(ctx, apply)
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+	}
 }
 
 // deriveOverallState determines the overall state from a list of tasks.
@@ -741,7 +1042,8 @@ func deriveOverallState(tasks []*storage.Task) string {
 		return state.Task.Stopped
 	}
 	if hasFailed || hasCancelled {
-		// CANCELLED implies a prior task failed, so overall state is FAILED
+		// Cancelled implies a prior task failed (sequential mode), so overall is failed.
+		// For Vitess cancellation (user-initiated), the apply state is set directly.
 		return state.Task.Failed
 	}
 	if hasCompleted {
@@ -750,4 +1052,17 @@ func deriveOverallState(tasks []*storage.Task) string {
 
 	// Fallback to first task's state
 	return tasks[0].State
+}
+
+// deriveApplyPhase maps an engine lifecycle event message to a PlanetScale
+// apply phase state. Returns empty string if the event doesn't trigger a
+// state transition.
+func deriveApplyPhase(message string) string {
+	if strings.Contains(message, "Branch") && strings.Contains(message, "ready") {
+		return state.Apply.ApplyingBranchChanges
+	}
+	if strings.Contains(message, "DDL changes to branch") {
+		return state.Apply.CreatingDeployRequest
+	}
+	return ""
 }

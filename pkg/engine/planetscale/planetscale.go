@@ -457,6 +457,7 @@ func decodePSMetadata(s string) (*psMetadata, error) {
 type Engine struct {
 	clientFunc func(tokenName, tokenValue string) (psclient.PSClient, error)
 	linter     *lint.Linter
+	logger     *slog.Logger
 
 	vtgateDBsMu sync.Mutex
 	vtgateDBs   map[string]*sql.DB // dsn -> cached *sql.DB
@@ -466,13 +467,17 @@ type Engine struct {
 // Compile-time check that Engine implements the interface.
 var _ engine.Engine = (*Engine)(nil)
 
-// New creates a new PlanetScale engine.
-func New() *Engine {
+// New creates a new PlanetScale engine with the given logger.
+func New(logger *slog.Logger) *Engine {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Engine{
 		clientFunc: func(tokenName, tokenValue string) (psclient.PSClient, error) {
 			return psclient.NewPSClient(tokenName, tokenValue)
 		},
 		linter:    lint.New(),
+		logger:    logger,
 		vtgateDBs: make(map[string]*sql.DB),
 	}
 }
@@ -480,10 +485,14 @@ func New() *Engine {
 // NewWithClient creates a new PlanetScale engine with a custom client factory.
 // Use this when the default PlanetScale SDK client needs to be replaced (e.g.,
 // pointing at a different API base URL or using custom authentication).
-func NewWithClient(clientFunc func(tokenName, tokenValue string) (psclient.PSClient, error)) *Engine {
+func NewWithClient(logger *slog.Logger, clientFunc func(tokenName, tokenValue string) (psclient.PSClient, error)) *Engine {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Engine{
 		clientFunc: clientFunc,
 		linter:     lint.New(),
+		logger:     logger,
 		vtgateDBs:  make(map[string]*sql.DB),
 	}
 }
@@ -498,35 +507,70 @@ func (e *Engine) getClient(creds *engine.Credentials) (psclient.PSClient, error)
 	if creds == nil {
 		return nil, fmt.Errorf("credentials required")
 	}
-	if creds.TokenName == "" || creds.TokenValue == "" {
+	if credTokenName(creds) == "" || credTokenValue(creds) == "" {
 		return nil, fmt.Errorf("token credentials required")
 	}
-	return e.clientFunc(creds.TokenName, creds.TokenValue)
+	return e.clientFunc(credTokenName(creds), credTokenValue(creds))
 }
 
 // getVtgateDB returns a cached *sql.DB for the given DSN, creating one if needed.
+// If RegisterMTLS has been called, the mTLS config is applied automatically.
 func (e *Engine) getVtgateDB(ctx context.Context, dsn string) (*sql.DB, error) {
+	// Apply mTLS before cache lookup so the cache key matches the actual connection.
+	if mtlsRegistered.Load() {
+		mysqlCfg, err := mysql.ParseDSN(dsn)
+		if err != nil {
+			return nil, fmt.Errorf("parse vtgate DSN: %w", err)
+		}
+		mysqlCfg.TLSConfig = mtlsConfigName
+		dsn = mysqlCfg.FormatDSN()
+	}
+
 	e.vtgateDBsMu.Lock()
 	defer e.vtgateDBsMu.Unlock()
 	if db, ok := e.vtgateDBs[dsn]; ok {
 		return db, nil
 	}
+
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open vtgate: %w", err)
 	}
 	if err := db.PingContext(ctx); err != nil {
 		utils.CloseAndLog(db)
-		return nil, fmt.Errorf("ping vtgate: %w", err)
+		return nil, fmt.Errorf("vtgate connection failed (check DSN and network access): %w", err)
 	}
 	e.vtgateDBs[dsn] = db
 	return db, nil
 }
 
 // mainBranch returns the main branch name from credentials, defaulting to "main".
+// Credential helpers — read PlanetScale-specific values from Metadata.
+
+func credOrg(creds *engine.Credentials) string {
+	if creds != nil {
+		return creds.Metadata["organization"]
+	}
+	return ""
+}
+
+func credTokenName(creds *engine.Credentials) string {
+	if creds != nil {
+		return creds.Metadata["token_name"]
+	}
+	return ""
+}
+
+func credTokenValue(creds *engine.Credentials) string {
+	if creds != nil {
+		return creds.Metadata["token_value"]
+	}
+	return ""
+}
+
 func mainBranch(creds *engine.Credentials) string {
-	if creds != nil && creds.MainBranch != "" {
-		return creds.MainBranch
+	if creds != nil && creds.Metadata["main_branch"] != "" {
+		return creds.Metadata["main_branch"]
 	}
 	return "main"
 }
@@ -537,7 +581,7 @@ func mainBranch(creds *engine.Credentials) string {
 // For each keyspace in the schema files, it fetches the current schema from PlanetScale
 // and uses Spirit's PlanChanges to diff and lint in a single pass.
 func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
-	slog.Info("computing plan",
+	e.logger.Info("computing plan",
 		"database", req.Database,
 		"schema_files", len(req.SchemaFiles),
 	)
@@ -547,7 +591,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("get planetscale client: %w", err)
 	}
 
-	org := req.Credentials.Organization
+	org := credOrg(req.Credentials)
 	branch := mainBranch(req.Credentials)
 
 	// Fetch current schema from PlanetScale per keyspace
@@ -600,7 +644,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				Keyspace:     keyspace,
 			})
 			if fetchErr != nil {
-				slog.Warn("failed to fetch current VSchema, treating as empty",
+				e.logger.Warn("failed to fetch current VSchema, treating as empty",
 					"keyspace", keyspace, "error", fetchErr)
 			}
 			currentVSchemaRaw := ""
@@ -648,7 +692,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 					Table:    pc.TableName,
 					Linter:   v.Linter.Name(),
 					Message:  v.Message,
-					Severity: v.Severity.String(),
+					Severity: strings.ToLower(v.Severity.String()),
 				})
 			}
 		}
@@ -680,7 +724,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 // Creates a PlanetScale branch, applies DDL via MySQL connection to the branch,
 // then creates and starts a deploy request.
 func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
-	slog.Info("applying plan",
+	e.logger.Info("applying plan",
 		"plan_id", req.PlanID,
 		"database", req.Database,
 	)
@@ -690,12 +734,27 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return nil, fmt.Errorf("get planetscale client: %w", err)
 	}
 
-	org := req.Credentials.Organization
+	org := credOrg(req.Credentials)
 	main := mainBranch(req.Credentials)
 
 	// Check if resuming
 	if req.ResumeState != nil && req.ResumeState.Metadata != "" {
 		return e.resumeApply(ctx, client, org, req)
+	}
+
+	// emitEvent logs a lifecycle event and sends it to the caller for apply_logs recording.
+	emitEvent := func(message string, metadata map[string]string) {
+		attrs := []any{"database", req.Database}
+		for k, v := range metadata {
+			attrs = append(attrs, k, v)
+		}
+		e.logger.Info(message, attrs...)
+		if req.OnEvent != nil {
+			req.OnEvent(engine.ApplyEvent{
+				Message:  message,
+				Metadata: metadata,
+			})
+		}
 	}
 
 	// Track in-flight apply metadata for progress queries during setup.
@@ -714,7 +773,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 		encoded, err := encodePSMetadata(meta)
 		if err != nil {
-			slog.Warn("failed to encode apply metadata for persistence", "error", err)
+			e.logger.Warn("failed to encode apply metadata for persistence", "error", err)
 			return
 		}
 		req.OnStateChange(&engine.ResumeState{
@@ -726,9 +785,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Create a new branch
 	branchName := generateBranchName(req.Database, req.PlanID)
 	persistState(&psMetadata{BranchName: branchName})
+	emitEvent(fmt.Sprintf("Creating branch %s", branchName), map[string]string{"branch": branchName})
 
 	branchStart := time.Now()
-	branch, err := e.createBranch(ctx, client, org, req.Database, branchName, main)
+	_, err = e.createBranch(ctx, client, org, req.Database, branchName, main)
 	if err != nil {
 		return nil, fmt.Errorf("create branch: %w", err)
 	}
@@ -737,7 +797,8 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
 		return nil, fmt.Errorf("wait for branch: %w", err)
 	}
-	slog.Info("branch ready", "branch", branch.Name, "org", org, "database", req.Database, "elapsed", time.Since(branchStart).Round(time.Second))
+	elapsed := time.Since(branchStart).Round(time.Second)
+	emitEvent(fmt.Sprintf("Branch %s ready (%s)", branchName, elapsed), map[string]string{"branch": branchName})
 
 	// Get branch credentials to apply DDL via MySQL
 	pwCtx, pwCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -755,9 +816,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	// Apply DDL and VSchema changes to all keyspaces concurrently
-	if err := e.applyChangesToBranch(ctx, req.Changes, req.SchemaFiles, password, req.Credentials.Metadata["tls_name"], client, org, req.Database, branchName); err != nil {
+	if err := e.applyChangesToBranch(ctx, req.Changes, req.SchemaFiles, password, client, org, req.Database, branchName); err != nil {
 		return nil, fmt.Errorf("apply changes to branch: %w", err)
 	}
+	ddlCount := 0
+	for _, sc := range req.Changes {
+		ddlCount += len(sc.TableChanges)
+	}
+	emitEvent(fmt.Sprintf("Applied %d DDL changes to branch %s", ddlCount, branchName), map[string]string{"branch": branchName})
 
 	// Capture existing migration_contexts before deploy so we can discover the new one
 	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
@@ -773,6 +839,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
+	emitEvent(fmt.Sprintf("Deploy request #%d created", dr.Number), map[string]string{
+		"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
+		"deploy_request_url": dr.HtmlURL,
+		"branch":             branchName,
+	})
 	persistState(&psMetadata{
 		BranchName:       branchName,
 		DeployRequestID:  dr.Number,
@@ -789,37 +860,43 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return nil, fmt.Errorf("deploy request #%d failed during preparation (state: %s)", dr.Number, dr.DeploymentState)
 	}
 	if dr.DeploymentState == deployState.NoChanges {
-		slog.Info("deploy request: no changes", "number", dr.Number, "elapsed", time.Since(drStart).Round(time.Second))
+		emitEvent(fmt.Sprintf("Deploy request #%d: no changes detected", dr.Number), map[string]string{
+			"deploy_request_id": fmt.Sprintf("%d", dr.Number),
+		})
 		return &engine.ApplyResult{Message: "no changes detected"}, nil
 	}
 
 	// Determine instant DDL eligibility
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	enableRevert := req.Options["enable_revert"] == "true"
-	useInstant := instantEligible && !deferCutover && !enableRevert
+	skipRevert := req.Options["skip_revert"] == "true"
+	useInstant := instantEligible && !deferCutover && skipRevert
 
-	slog.Info("deploy request ready",
-		"number", dr.Number,
-		"url", dr.HtmlURL,
-		"state", dr.DeploymentState,
-		"defer_cutover", deferCutover,
-		"instant_ddl_eligible", instantEligible,
-		"instant_ddl", useInstant,
-		"elapsed", time.Since(drStart).Round(time.Second),
-	)
+	drElapsed := time.Since(drStart).Round(time.Second)
+	emitEvent(fmt.Sprintf("Deploy request #%d ready (%s)", dr.Number, drElapsed), map[string]string{
+		"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
+		"deploy_request_url": dr.HtmlURL,
+		"instant_ddl":        fmt.Sprintf("%t", useInstant),
+	})
 
 	// Deploy (starts the schema change)
+	drNumber := dr.Number
 	dr, err = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
 		Organization: org,
 		Database:     req.Database,
-		Number:       dr.Number,
+		Number:       drNumber,
 		InstantDDL:   useInstant,
 	})
 	if err != nil {
+		if strings.Contains(err.Error(), "approved") {
+			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", drNumber)
+		}
 		return nil, fmt.Errorf("deploy deploy request: %w", err)
 	}
 
-	slog.Info("deployed deploy request", "number", dr.Number, "instant_ddl", useInstant)
+	emitEvent(fmt.Sprintf("Deploy request #%d deployed", dr.Number), map[string]string{
+		"deploy_request_id": fmt.Sprintf("%d", dr.Number),
+		"instant_ddl":       fmt.Sprintf("%t", useInstant),
+	})
 
 	// Discover migration_context by diffing current SHOW VITESS_MIGRATIONS against
 	// the pre-deploy baseline. Retries because Vitess may not have created migrations
@@ -858,9 +935,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 // applyChangesToBranch applies DDL and VSchema changes to all keyspaces concurrently.
 // Each keyspace gets its own MySQL connection and runs independently. Transient
 // failures are retried up to 3 times per keyspace.
-func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, tlsName string, client psclient.PSClient, org, database, branchName string) error {
+func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
 	if len(changes) == 0 {
-		slog.Debug("no changes to apply to branch", "branch", branchName)
+		e.logger.Debug("no changes to apply to branch", "branch", branchName)
 		return nil
 	}
 
@@ -868,16 +945,16 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 	g.SetLimit(maxConcurrentKeyspaces)
 	for _, sc := range changes {
 		g.Go(func() error {
-			return e.applyKeyspaceChanges(gCtx, sc, schemaFiles, password, tlsName, client, org, database, branchName)
+			return e.applyKeyspaceChanges(gCtx, sc, schemaFiles, password, client, org, database, branchName)
 		})
 	}
 	return g.Wait()
 }
 
 // applyKeyspaceChanges applies DDL and VSchema for a single keyspace with retries.
-func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, tlsName string, client psclient.PSClient, org, database, branchName string) error {
+func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
 	start := time.Now()
-	slog.Info("applying changes to keyspace",
+	e.logger.Info("applying changes to keyspace",
 		"keyspace", sc.Namespace,
 		"ddl_count", len(sc.TableChanges),
 		"has_vschema", sc.Metadata["vschema"] != "",
@@ -890,56 +967,50 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 			base := time.Duration(attempt) * 2 * time.Second
 			jitter := time.Duration(rand.IntN(1000)) * time.Millisecond
 			delay := base + jitter
-			slog.Warn("retrying keyspace apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
+			e.logger.Warn("retrying keyspace apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
 			time.Sleep(delay)
 		}
 
-		if err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, tlsName, client, org, database, branchName); err != nil {
+		if err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
 			lastErr = err
-			slog.Error("keyspace apply attempt failed", "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
+			e.logger.Error("keyspace apply attempt failed", "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
 			continue
 		}
-		slog.Info("keyspace changes applied", "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
+		e.logger.Info("keyspace changes applied", "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
 		return nil
 	}
 	return fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxRetries, lastErr)
 }
 
 // applyKeyspaceChangesOnce applies VSchema and DDL for a single keyspace in one attempt.
-func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, tlsName string, client psclient.PSClient, org, database, branchName string) error {
+func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
 	// Apply VSchema first — vtgate needs VSchema to route DDL correctly
 	if vschemaContent := getVSchemaContent(sc, schemaFiles); vschemaContent != "" {
 		if err := e.updateBranchVSchema(ctx, client, org, database, branchName, sc.Namespace, vschemaContent); err != nil {
 			return fmt.Errorf("update vschema for %s: %w", sc.Namespace, err)
 		}
-		slog.Info("applied vschema to branch", "keyspace", sc.Namespace, "branch", branchName)
+		e.logger.Info("applied vschema to branch", "keyspace", sc.Namespace, "branch", branchName)
 	}
 
 	if len(sc.TableChanges) == 0 {
-		slog.Debug("no DDL for keyspace, vschema-only", "keyspace", sc.Namespace, "branch", branchName)
+		e.logger.Debug("no DDL for keyspace, vschema-only", "keyspace", sc.Namespace, "branch", branchName)
 		return nil
 	}
 
 	// Build DSN targeting this specific keyspace.
-	// TLS mode is configurable via Credentials.Metadata["tls_name"]:
-	//   - Empty: no TLS (development/testing environments)
-	//   - Named config: registered TLS config with CA bundle + client certs (production)
-	tlsParam := "false"
-	if tlsName != "" {
-		tlsParam = tlsName
+	// TLS is configured automatically when RegisterMTLS has been called.
+	mysqlCfg := mysql.NewConfig()
+	mysqlCfg.User = password.Username
+	mysqlCfg.Passwd = password.PlainText
+	mysqlCfg.Net = "tcp"
+	mysqlCfg.Addr = password.Hostname
+	mysqlCfg.InterpolateParams = true
+	if mtlsRegistered.Load() {
+		mysqlCfg.TLSConfig = mtlsConfigName
 	}
-	cfg := mysql.Config{
-		User:                 password.Username,
-		Passwd:               password.PlainText,
-		Net:                  "tcp",
-		Addr:                 password.Hostname,
-		DBName:               sc.Namespace,
-		TLSConfig:            tlsParam,
-		AllowNativePasswords: true,
-		InterpolateParams:    true,
-	}
+	dsn := mysqlCfg.FormatDSN()
 
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return fmt.Errorf("open branch connection for %s: %w", sc.Namespace, err)
 	}
@@ -949,8 +1020,13 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 		return fmt.Errorf("ping branch for %s: %w", sc.Namespace, err)
 	}
 
+	// USE the keyspace — vtgate branch proxy routes based on the database name.
+	if _, err := db.ExecContext(ctx, "USE `"+sc.Namespace+"`"); err != nil {
+		return fmt.Errorf("use keyspace %s: %w", sc.Namespace, err)
+	}
+
 	for _, tc := range sc.TableChanges {
-		slog.Info("applying DDL to branch",
+		e.logger.Info("applying DDL to branch",
 			"keyspace", sc.Namespace,
 			"table", tc.Table,
 			"operation", tc.Operation,
@@ -980,7 +1056,7 @@ func getVSchemaContent(sc engine.SchemaChange, schemaFiles schema.SchemaFiles) s
 // updateBranchVSchema updates the VSchema for a keyspace on a branch
 // using the PlanetScale SDK's UpdateKeyspaceVSchema endpoint.
 func (e *Engine) updateBranchVSchema(ctx context.Context, client psclient.PSClient, org, database, branch, keyspace, vschemaJSON string) error {
-	slog.Info("updating VSchema on branch",
+	e.logger.Info("updating VSchema on branch",
 		"branch", branch,
 		"keyspace", keyspace,
 	)
@@ -1060,7 +1136,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("decode resume state: %w", err)
 	}
 
-	slog.Info("resuming apply",
+	e.logger.Info("resuming apply",
 		"branch", meta.BranchName,
 		"deploy_request", meta.DeployRequestID,
 	)
@@ -1070,7 +1146,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		dr, err := e.getDeployRequest(ctx, client, org, req.Database, meta.DeployRequestID)
 		if err != nil {
 			// Deploy request may have been cleaned up — start fresh.
-			slog.Warn("deploy request not found on resume, starting fresh",
+			e.logger.Warn("deploy request not found on resume, starting fresh",
 				"deploy_request", meta.DeployRequestID, "error", err)
 			req.ResumeState = nil
 			return e.Apply(ctx, req)
@@ -1079,7 +1155,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		// If the deploy request failed, start fresh with a new branch rather
 		// than resuming a broken deploy.
 		if dr.DeploymentState == deployState.Error || dr.DeploymentState == deployState.CompleteError {
-			slog.Warn("deploy request in error state on resume, starting fresh",
+			e.logger.Warn("deploy request in error state on resume, starting fresh",
 				"deploy_request", meta.DeployRequestID, "state", dr.DeploymentState)
 			req.ResumeState = nil
 			return e.Apply(ctx, req)
@@ -1104,12 +1180,12 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// the deploy request was created. Diff the branch against desired schema
 	// to find DDL that wasn't applied before the crash, then apply only the
 	// missing changes.
-	slog.Info("resuming from branch (no deploy request yet)", "branch", meta.BranchName)
+	e.logger.Info("resuming from branch (no deploy request yet)", "branch", meta.BranchName)
 
 	// Check if the branch still exists — it may have been deleted by TTL
 	// between the crash and recovery. If so, start fresh.
 	if err := e.waitForBranchReady(ctx, client, org, req.Database, meta.BranchName); err != nil {
-		slog.Warn("branch no longer available on resume, starting fresh", "branch", meta.BranchName, "error", err)
+		e.logger.Warn("branch no longer available on resume, starting fresh", "branch", meta.BranchName, "error", err)
 		req.ResumeState = nil
 		return e.Apply(ctx, req)
 	}
@@ -1121,7 +1197,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	}
 
 	if len(remainingChanges) > 0 {
-		slog.Info("applying remaining DDL on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
+		e.logger.Info("applying remaining DDL on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
 		resumePwCtx, resumePwCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer resumePwCancel()
 
@@ -1131,11 +1207,11 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		if err != nil {
 			return nil, fmt.Errorf("create branch password on resume: %w", err)
 		}
-		if err := e.applyChangesToBranch(ctx, remainingChanges, req.SchemaFiles, password, req.Credentials.Metadata["tls_name"], client, org, req.Database, meta.BranchName); err != nil {
+		if err := e.applyChangesToBranch(ctx, remainingChanges, req.SchemaFiles, password, client, org, req.Database, meta.BranchName); err != nil {
 			return nil, fmt.Errorf("apply remaining DDL on resume: %w", err)
 		}
 	} else {
-		slog.Info("all DDL already applied on branch", "branch", meta.BranchName)
+		e.logger.Info("all DDL already applied on branch", "branch", meta.BranchName)
 	}
 
 	// VSchema may not have been applied before the crash — re-apply
@@ -1185,8 +1261,8 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 
 	// Deploy
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	enableRevert := req.Options["enable_revert"] == "true"
-	useInstant := instantEligible && !deferCutover && !enableRevert
+	skipRevert := req.Options["skip_revert"] == "true"
+	useInstant := instantEligible && !deferCutover && skipRevert
 
 	dr, err = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
 		Organization: org, Database: req.Database, Number: dr.Number, InstantDDL: useInstant,
@@ -1195,7 +1271,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("deploy on resume: %w", err)
 	}
 
-	slog.Info("resumed and deployed", "number", dr.Number, "branch", meta.BranchName)
+	e.logger.Info("resumed and deployed", "number", dr.Number, "branch", meta.BranchName)
 	return &engine.ApplyResult{
 		Accepted: true,
 		Message:  fmt.Sprintf("Resumed and deployed request #%d", dr.Number),
@@ -1235,7 +1311,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		return nil, fmt.Errorf("get planetscale client: %w", err)
 	}
 
-	dr, err := e.getDeployRequest(ctx, client, req.Credentials.Organization, req.Database, meta.DeployRequestID)
+	dr, err := e.getDeployRequest(ctx, client, credOrg(req.Credentials), req.Database, meta.DeployRequestID)
 	if err != nil {
 		return nil, fmt.Errorf("get deploy request: %w", err)
 	}
@@ -1261,19 +1337,24 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		ResumeState: req.ResumeState,
 	}
 
-	// Enrich with per-shard progress from SHOW VITESS_MIGRATIONS if available.
-	if req.Credentials.DSN != "" {
-		migCtx := req.ResumeState.MigrationContext
-		if migCtx == "" {
-			slog.Warn("no schema change context captured, skipping per-shard progress")
-			return result, nil
-		}
-		tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, migCtx)
-		if len(tables) > 0 {
-			result.Tables = tables
-			if overallProgress > 0 {
-				result.Progress = overallProgress
-			}
+	// Enrich with per-shard progress from SHOW VITESS_MIGRATIONS.
+	// Requires a vtgate DSN (Credentials.DSN) and a migration context
+	// (from VitessApplyData) to query per-shard state.
+	if req.Credentials.DSN == "" {
+		e.logger.Info("no vtgate DSN configured, skipping per-shard progress",
+			"database", req.Database)
+		return result, nil
+	}
+	if req.ResumeState == nil || req.ResumeState.MigrationContext == "" {
+		e.logger.Warn("no migration context for per-shard progress — VitessApplyData may not be saved yet",
+			"database", req.Database, "has_resume_state", req.ResumeState != nil)
+		return result, nil
+	}
+	tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
+	if len(tables) > 0 {
+		result.Tables = tables
+		if overallProgress > 0 {
+			result.Progress = overallProgress
 		}
 	}
 
@@ -1295,7 +1376,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	}
 
 	_, err = client.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
-		Organization: req.Credentials.Organization,
+		Organization: credOrg(req.Credentials),
 		Database:     req.Database,
 		Number:       meta.DeployRequestID,
 	})
@@ -1305,7 +1386,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 
 	return &engine.ControlResult{
 		Accepted:    true,
-		Message:     "Schema change stopped",
+		Message:     "Deploy request cancelled",
 		ResumeState: req.ResumeState,
 	}, nil
 }
@@ -1328,7 +1409,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	}
 
 	dr, err := client.ApplyDeployRequest(ctx, &ps.ApplyDeployRequestRequest{
-		Organization: req.Credentials.Organization,
+		Organization: credOrg(req.Credentials),
 		Database:     req.Database,
 		Number:       meta.DeployRequestID,
 	})
@@ -1356,7 +1437,7 @@ func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engin
 	}
 
 	dr, err := client.RevertDeployRequest(ctx, &ps.RevertDeployRequestRequest{
-		Organization: req.Credentials.Organization,
+		Organization: credOrg(req.Credentials),
 		Database:     req.Database,
 		Number:       meta.DeployRequestID,
 	})
@@ -1384,7 +1465,7 @@ func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*e
 	}
 
 	dr, err := client.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
-		Organization: req.Credentials.Organization,
+		Organization: credOrg(req.Credentials),
 		Database:     req.Database,
 		Number:       meta.DeployRequestID,
 	})
@@ -1438,12 +1519,12 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 	}
 
 	if req.Volume < 1 || req.Volume > 11 {
-		slog.Warn("volume out of range, clamping to [1, 11]", "requested", req.Volume)
+		e.logger.Warn("volume out of range, clamping to [1, 11]", "requested", req.Volume)
 	}
 	ratio := volumeToThrottleRatio(req.Volume)
 
 	err = client.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  req.Credentials.Organization,
+		Organization:  credOrg(req.Credentials),
 		Database:      req.Database,
 		Number:        meta.DeployRequestID,
 		ThrottleRatio: ratio,
@@ -1506,19 +1587,19 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 
 	branch := mainBranch(creds)
 	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
-		Organization: creds.Organization,
+		Organization: credOrg(creds),
 		Database:     database,
 		Branch:       branch,
 	})
 	if err != nil {
-		slog.Warn("captureExistingContexts: failed to list keyspaces", "error", err)
+		e.logger.Warn("captureExistingContexts: failed to list keyspaces", "error", err)
 		return existing
 	}
 
 	for _, ks := range keyspaces {
 		rows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, "")
 		if err != nil {
-			slog.Debug("capture existing contexts: query failed", "keyspace", ks.Name, "error", err)
+			e.logger.Debug("capture existing contexts: query failed", "keyspace", ks.Name, "error", err)
 			continue
 		}
 		for _, r := range rows {
@@ -1528,7 +1609,7 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 		}
 	}
 
-	slog.Info("captured schema change context baseline", "count", len(existing))
+	e.logger.Info("captured schema change context baseline", "count", len(existing))
 	return existing
 }
 
@@ -1536,38 +1617,38 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 // deploying by comparing current contexts against the pre-deploy baseline.
 func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]bool) string {
 	if creds.DSN == "" {
-		slog.Debug("skipping schema change context discovery, no DSN configured")
+		e.logger.Debug("skipping schema change context discovery, no DSN configured")
 		return ""
 	}
 
-	slog.Info("discovering schema change context", "database", database, "baseline_count", len(existingContexts))
+	e.logger.Info("discovering schema change context", "database", database, "baseline_count", len(existingContexts))
 
 	branch := mainBranch(creds)
 	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
-		Organization: creds.Organization,
+		Organization: credOrg(creds),
 		Database:     database,
 		Branch:       branch,
 	})
 	if err != nil {
-		slog.Warn("failed to list keyspaces for schema change context discovery", "error", err)
+		e.logger.Warn("failed to list keyspaces for schema change context discovery", "error", err)
 		return ""
 	}
 
 	for _, ks := range keyspaces {
 		rows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, "")
 		if err != nil {
-			slog.Debug("failed to query schema changes for keyspace", "keyspace", ks.Name, "error", err)
+			e.logger.Debug("failed to query schema changes for keyspace", "keyspace", ks.Name, "error", err)
 			continue
 		}
 		for _, r := range rows {
 			if r.MigrationContext != "" && !existingContexts[r.MigrationContext] {
-				slog.Info("discovered schema change context", "context", r.MigrationContext)
+				e.logger.Info("discovered schema change context", "context", r.MigrationContext)
 				return r.MigrationContext
 			}
 		}
 	}
 
-	slog.Warn("schema change context not discovered yet")
+	e.logger.Warn("schema change context not discovered yet")
 	return ""
 }
 
@@ -1586,6 +1667,9 @@ type vitessMigrationRow struct {
 	RowsCopied       int64
 	TableRows        int64
 	IsImmediate      bool
+	CutoverAttempts  int
+	StartedAt        *time.Time
+	CompletedAt      *time.Time
 }
 
 // queryVitessMigrations queries SHOW VITESS_MIGRATIONS across all keyspaces via vtgate
@@ -1593,12 +1677,12 @@ type vitessMigrationRow struct {
 func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, migrationContext string) ([]engine.TableProgress, int) {
 	branch := mainBranch(creds)
 	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
-		Organization: creds.Organization,
+		Organization: credOrg(creds),
 		Database:     database,
 		Branch:       branch,
 	})
 	if err != nil {
-		slog.Warn("queryVitessMigrations: failed to list keyspaces", "error", err)
+		e.logger.Warn("queryVitessMigrations: failed to list keyspaces", "error", err)
 		return nil, 0
 	}
 
@@ -1606,7 +1690,7 @@ func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSCl
 	for _, ks := range keyspaces {
 		rows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, migrationContext)
 		if err != nil {
-			slog.Warn("queryVitessMigrations: query failed", "keyspace", ks.Name, "error", err)
+			e.logger.Error("per-shard progress query failed", "keyspace", ks.Name, "database", database, "error", err)
 			continue
 		}
 		allRows = append(allRows, rows...)
@@ -1667,7 +1751,7 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 			colPtrs[i] = &colValues[i]
 		}
 		if err := rows.Scan(colPtrs...); err != nil {
-			slog.Debug("scan vitess_migrations row", "keyspace", keyspace, "error", err)
+			e.logger.Debug("scan vitess_migrations row", "keyspace", keyspace, "error", err)
 			continue
 		}
 		colMap := make(map[string]string)
@@ -1689,24 +1773,34 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 			IsImmediate:      colMap["is_immediate_operation"] == "1",
 		}
 		if v, err := strconv.Atoi(colMap["progress"]); err != nil && colMap["progress"] != "" {
-			slog.Debug("parse vitess_migrations field", "field", "progress", "value", colMap["progress"], "error", err)
+			e.logger.Debug("parse vitess_migrations field", "field", "progress", "value", colMap["progress"], "error", err)
 		} else {
 			row.Progress = v
 		}
 		if v, err := parseInt64(colMap["eta_seconds"]); err != nil {
-			slog.Debug("parse vitess_migrations field", "field", "eta_seconds", "value", colMap["eta_seconds"], "error", err)
+			e.logger.Debug("parse vitess_migrations field", "field", "eta_seconds", "value", colMap["eta_seconds"], "error", err)
 		} else {
 			row.ETASeconds = v
 		}
 		if v, err := parseInt64(colMap["rows_copied"]); err != nil {
-			slog.Debug("parse vitess_migrations field", "field", "rows_copied", "value", colMap["rows_copied"], "error", err)
+			e.logger.Debug("parse vitess_migrations field", "field", "rows_copied", "value", colMap["rows_copied"], "error", err)
 		} else {
 			row.RowsCopied = v
 		}
 		if v, err := parseInt64(colMap["table_rows"]); err != nil {
-			slog.Debug("parse vitess_migrations field", "field", "table_rows", "value", colMap["table_rows"], "error", err)
+			e.logger.Debug("parse vitess_migrations field", "field", "table_rows", "value", colMap["table_rows"], "error", err)
 		} else {
 			row.TableRows = v
+		}
+		if v, err := parseInt64(colMap["cutover_attempts"]); err == nil {
+			row.CutoverAttempts = int(v)
+		}
+
+		if ts, parseErr := time.Parse("2006-01-02 15:04:05", colMap["started_timestamp"]); parseErr == nil {
+			row.StartedAt = &ts
+		}
+		if ts, parseErr := time.Parse("2006-01-02 15:04:05", colMap["completed_timestamp"]); parseErr == nil {
+			row.CompletedAt = &ts
 		}
 
 		result = append(result, row)
@@ -1746,6 +1840,9 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 		tableRows       int64
 		etaSeconds      int64
 		isImmediate     bool
+		cutoverAttempts int
+		startedAt       *time.Time
+		completedAt     *time.Time
 	}
 
 	tableShards := make(map[tableKey][]shardData)
@@ -1765,6 +1862,9 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 			tableRows:       r.TableRows,
 			etaSeconds:      r.ETASeconds,
 			isImmediate:     r.IsImmediate,
+			cutoverAttempts: r.CutoverAttempts,
+			startedAt:       r.StartedAt,
+			completedAt:     r.CompletedAt,
 		})
 	}
 
@@ -1781,6 +1881,9 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 
 		var tblRowsCopied, tblTableRows, maxETA int64
 		var tblProgress int
+		var tblStartedAt *time.Time
+		var latestCompletedAt *time.Time
+		allShardsCompleted := true
 		shardProgress := make([]engine.ShardProgress, len(shards))
 		isInstant := true
 
@@ -1795,6 +1898,16 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 			if !sh.isImmediate {
 				isInstant = false
 			}
+			// Table started_at = earliest shard started_at
+			if sh.startedAt != nil && (tblStartedAt == nil || sh.startedAt.Before(*tblStartedAt)) {
+				tblStartedAt = sh.startedAt
+			}
+			// Track latest completed_at across shards
+			if sh.completedAt == nil {
+				allShardsCompleted = false
+			} else if latestCompletedAt == nil || sh.completedAt.After(*latestCompletedAt) {
+				latestCompletedAt = sh.completedAt
+			}
 
 			// Resolve effective shard state: running + ready_to_complete = ready_to_complete
 			shardState := sh.status
@@ -1803,12 +1916,13 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 			}
 
 			shardProgress[i] = engine.ShardProgress{
-				Shard:      sh.shard,
-				State:      shardState,
-				Progress:   sh.progress,
-				RowsCopied: sh.rowsCopied,
-				RowsTotal:  sh.tableRows,
-				ETASeconds: sh.etaSeconds,
+				Shard:           sh.shard,
+				State:           shardState,
+				Progress:        sh.progress,
+				RowsCopied:      sh.rowsCopied,
+				RowsTotal:       sh.tableRows,
+				ETASeconds:      sh.etaSeconds,
+				CutoverAttempts: sh.cutoverAttempts,
 			}
 
 			tableState = resolveTableState(tableState, shardState)
@@ -1823,15 +1937,23 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 		totalRowsCopied += tblRowsCopied
 		totalTableRows += tblTableRows
 
+		// Table completed_at is only set when all shards have completed.
+		var tblCompletedAt *time.Time
+		if allShardsCompleted {
+			tblCompletedAt = latestCompletedAt
+		}
+
 		tables = append(tables, engine.TableProgress{
-			Table:      key.table,
-			State:      tableState,
-			Progress:   tblProgress,
-			RowsCopied: tblRowsCopied,
-			RowsTotal:  tblTableRows,
-			ETASeconds: maxETA,
-			Shards:     shardProgress,
-			IsInstant:  isInstant,
+			Table:       key.table,
+			State:       tableState,
+			Progress:    tblProgress,
+			RowsCopied:  tblRowsCopied,
+			RowsTotal:   tblTableRows,
+			ETASeconds:  maxETA,
+			Shards:      shardProgress,
+			IsInstant:   isInstant,
+			StartedAt:   tblStartedAt,
+			CompletedAt: tblCompletedAt,
 		})
 	}
 
@@ -1965,7 +2087,7 @@ func (e *Engine) createBranch(ctx context.Context, client psclient.PSClient, org
 	if err != nil {
 		// Idempotent: if branch exists, return it
 		if strings.Contains(err.Error(), "Name has already been taken") {
-			slog.Info("branch already exists, reusing", "branch", branchName)
+			e.logger.Info("branch already exists, reusing", "branch", branchName)
 			return client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
 				Organization: org,
 				Database:     database,
@@ -1984,6 +2106,7 @@ func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClien
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	var consecutiveErrors int
 	for {
 		select {
 		case <-ctx.Done():
@@ -1995,9 +2118,15 @@ func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClien
 				Branch:       branchName,
 			})
 			if err != nil {
-				slog.Warn("error checking branch status", "error", err)
+				consecutiveErrors++
+				e.logger.Warn("error checking branch status",
+					"branch", branchName, "error", err, "consecutive_errors", consecutiveErrors)
+				if consecutiveErrors >= 5 {
+					return fmt.Errorf("branch %s not reachable after %d attempts: %w", branchName, consecutiveErrors, err)
+				}
 				continue
 			}
+			consecutiveErrors = 0
 			if branch.Ready {
 				return nil
 			}
@@ -2034,7 +2163,7 @@ func generateBranchName(database, planID string) string {
 	if len(shortID) > 8 {
 		shortID = shortID[len(shortID)-8:]
 	}
-	return fmt.Sprintf("tern-%s-%s", sanitized, shortID)
+	return fmt.Sprintf("schemabot-%s-%s", sanitized, shortID)
 }
 
 // --- Deploy state mapping ---

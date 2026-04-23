@@ -236,11 +236,6 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	if options == nil {
 		options = make(map[string]string)
 	}
-	options["environment"] = req.Environment
-	if req.Caller != "" {
-		options["caller"] = req.Caller
-	}
-
 	applyTarget := req.Target
 	if applyTarget == "" {
 		applyTarget = plan.Database
@@ -253,6 +248,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		DdlChanges:  storageToProtoTableChanges(plan.FlatDDLChanges()),
 		Environment: req.Environment,
 		Target:      applyTarget,
+		Caller:      req.Caller,
 	}
 
 	resp, err := client.Apply(ctx, ternReq)

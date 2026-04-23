@@ -276,7 +276,7 @@ func PreviewCommentApplyPlan() string {
 	})
 }
 
-// PreviewCommentApplyPlanOptions renders a locked apply-plan with options (defer cutover, enable revert).
+// PreviewCommentApplyPlanOptions renders a locked apply-plan with options (defer cutover, skip revert).
 func PreviewCommentApplyPlanOptions() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",

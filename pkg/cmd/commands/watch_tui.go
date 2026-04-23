@@ -324,6 +324,9 @@ func WatchApplyProgressByApplyID(endpoint, applyID string, allowCutover bool) er
 	return runWatchModel(model)
 }
 
+// drainStdin discards any pending bytes on stdin so that leftover input
+// from a prior prompt (e.g., confirmation "yes" + key repeat) doesn't
+// leak into the Bubbletea event loop.
 // runWatchModel runs a WatchModel and returns the result.
 func runWatchModel(model WatchModel) error {
 	// Don't use alt-screen - render inline for seamless experience
