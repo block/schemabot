@@ -167,6 +167,11 @@ func (m WatchModel) progressView() string {
 			b.WriteString(m.formatFooter())
 		}
 		b.WriteString("\n")
+	case state.IsState(m.state, state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest):
+		b.WriteString("\n\n")
+		dimStyle := lipgloss.NewStyle().Faint(true)
+		b.WriteString(dimStyle.Render("ESC to detach"))
+		b.WriteString("\n")
 	}
 
 	// Fetch error during active progress (mid-flight). State and tables are
