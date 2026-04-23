@@ -241,13 +241,13 @@ CREATE TABLE `addresses` (
 📋 **Plan**: **2** tables to create, **2** vschema updates
 
 
-**Options**: ⏸️ Defer Cutover | ⏪ Enable Revert
+**Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
 
 ---
 
 💡 **To apply** all schema changes from this PR, comment:
 ```
-schemabot apply-confirm -e staging --defer-cutover --enable-revert
+schemabot apply-confirm -e staging --defer-cutover --skip-revert
 ```
 
 🔓 To discard this plan and unlock, comment:
@@ -1344,13 +1344,13 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
-**Options**: ⏸️ Defer Cutover | ⏪ Enable Revert
+**Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
 
 ---
 
 💡 **To apply** all schema changes from this PR, comment:
 ```
-schemabot apply-confirm -e staging --defer-cutover --enable-revert
+schemabot apply-confirm -e staging --defer-cutover --skip-revert
 ```
 
 🔓 To discard this plan and unlock, comment:
@@ -1441,13 +1441,13 @@ CREATE TABLE `addresses` (
 📋 **Plan**: **2** tables to create, **2** vschema updates
 
 
-**Options**: ⏸️ Defer Cutover | ⏪ Enable Revert
+**Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
 
 ---
 
 💡 **To apply** all schema changes from this PR, comment:
 ```
-schemabot apply-confirm -e staging --defer-cutover --enable-revert
+schemabot apply-confirm -e staging --defer-cutover --skip-revert
 ```
 
 🔓 To discard this plan and unlock, comment:

@@ -169,7 +169,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	commentData.LockOwner = lockOwner
 	commentData.LockAcquired = time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
 	commentData.DeferCutover = result.DeferCutover
-	commentData.EnableRevert = result.EnableRevert
+	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
 
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
@@ -282,8 +282,8 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	if result.DeferCutover {
 		options["defer_cutover"] = "true"
 	}
-	if result.EnableRevert {
-		options["enable_revert"] = "true"
+	if result.SkipRevert {
+		options["skip_revert"] = "true"
 	}
 	if result.AllowUnsafe {
 		options["allow_unsafe"] = "true"

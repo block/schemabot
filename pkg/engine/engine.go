@@ -203,7 +203,7 @@ type ApplyRequest struct {
 	Database    string             // Target database
 	Changes     []SchemaChange     // Per-namespace changes to apply (DDL + files from plan)
 	SchemaFiles schema.SchemaFiles // Full declarative schema files (for engines that apply whole files)
-	Options     map[string]string  // Options like "defer_cutover", "enable_revert"
+	Options     map[string]string  // Options like "defer_cutover", "skip_revert"
 	ResumeState *ResumeState       // Migration context (fresh) or full resume state (restart)
 	Credentials *Credentials       // Resolved credentials (from discovery)
 
@@ -213,6 +213,18 @@ type ApplyRequest struct {
 	// resume from the last persisted state instead of starting over.
 	// Nil means no persistence (state is only returned at the end of Apply).
 	OnStateChange func(state *ResumeState)
+
+	// OnEvent is called by the engine to emit structured lifecycle events during Apply.
+	// These events are recorded in apply_logs so operators can see intermediate progress
+	// (e.g., branch created, DDL applied, deploy request opened). Nil means no event
+	// recording — the engine still logs via slog regardless.
+	OnEvent func(event ApplyEvent)
+}
+
+// ApplyEvent represents a structured lifecycle event emitted by an engine during Apply.
+type ApplyEvent struct {
+	Message  string            // Human-readable description (e.g., "Branch schemabot-mydb-123 created")
+	Metadata map[string]string // Structured data (e.g., branch name, deploy request URL)
 }
 
 // FlatDDL returns all DDL statements across all namespaces in the apply request.
@@ -270,16 +282,19 @@ type TableProgress struct {
 	IsInstant      bool            // True if using instant DDL
 	ProgressDetail string          // Human-readable progress (e.g., Spirit: "12.5% copyRows ETA 1h 30m")
 	DDL            string          // The DDL statement being applied
+	StartedAt      *time.Time      // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
+	CompletedAt    *time.Time      // When execution completed (from engine)
 }
 
 // ShardProgress tracks progress for a single shard.
 type ShardProgress struct {
-	Shard      string // Shard name (e.g., "-80", "80-")
-	State      string // Migration state
-	Progress   int    // 0-100 percent
-	RowsCopied int64
-	RowsTotal  int64
-	ETASeconds int64
+	Shard           string // Shard name (e.g., "-80", "80-")
+	State           string // Migration state
+	Progress        int    // 0-100 percent
+	RowsCopied      int64
+	RowsTotal       int64
+	ETASeconds      int64
+	CutoverAttempts int // Number of cutover attempts (0 if never attempted)
 }
 
 // State represents the overall schema change state.

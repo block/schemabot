@@ -25,16 +25,17 @@ type mockStorage struct {
 	pingErr error
 }
 
-func (m *mockStorage) Locks() storage.LockStore                 { return nil }
-func (m *mockStorage) Plans() storage.PlanStore                 { return nil }
-func (m *mockStorage) Applies() storage.ApplyStore              { return nil }
-func (m *mockStorage) Tasks() storage.TaskStore                 { return nil }
-func (m *mockStorage) ApplyLogs() storage.ApplyLogStore         { return nil }
-func (m *mockStorage) ApplyComments() storage.ApplyCommentStore { return nil }
-func (m *mockStorage) Checks() storage.CheckStore               { return nil }
-func (m *mockStorage) Settings() storage.SettingsStore          { return nil }
-func (m *mockStorage) Ping(ctx context.Context) error           { return m.pingErr }
-func (m *mockStorage) Close() error                             { return nil }
+func (m *mockStorage) Locks() storage.LockStore                      { return nil }
+func (m *mockStorage) Plans() storage.PlanStore                      { return nil }
+func (m *mockStorage) Applies() storage.ApplyStore                   { return nil }
+func (m *mockStorage) Tasks() storage.TaskStore                      { return nil }
+func (m *mockStorage) ApplyLogs() storage.ApplyLogStore              { return nil }
+func (m *mockStorage) ApplyComments() storage.ApplyCommentStore      { return nil }
+func (m *mockStorage) VitessApplyData() storage.VitessApplyDataStore { return nil }
+func (m *mockStorage) Checks() storage.CheckStore                    { return nil }
+func (m *mockStorage) Settings() storage.SettingsStore               { return nil }
+func (m *mockStorage) Ping(ctx context.Context) error                { return m.pingErr }
+func (m *mockStorage) Close() error                                  { return nil }
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {

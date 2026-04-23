@@ -41,7 +41,7 @@ type PlanCommentData struct {
 
 	// Options
 	DeferCutover bool
-	EnableRevert bool
+	SkipRevert   bool
 
 	// Lock state (set when rendering apply-plan comments)
 	IsLocked     bool
@@ -129,8 +129,8 @@ func RenderPlanComment(data PlanCommentData) string {
 		if data.DeferCutover {
 			applyConfirmCmd += " --defer-cutover"
 		}
-		if data.EnableRevert {
-			applyConfirmCmd += " --enable-revert"
+		if data.SkipRevert {
+			applyConfirmCmd += " --skip-revert"
 		}
 		writeApplyHint(&sb, applyConfirmCmd)
 		sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
@@ -167,8 +167,8 @@ func writeOptions(sb *strings.Builder, data PlanCommentData) {
 	if data.DeferCutover {
 		opts = append(opts, "⏸️ Defer Cutover")
 	}
-	if data.EnableRevert {
-		opts = append(opts, "⏪ Enable Revert")
+	if data.SkipRevert {
+		opts = append(opts, "⏩ Skip Revert")
 	}
 	if len(opts) > 0 {
 		fmt.Fprintf(sb, "\n**Options**: %s\n", strings.Join(opts, " | "))

@@ -73,43 +73,55 @@ func (Engine) EnumDescriptor() ([]byte, []int) {
 type State int32
 
 const (
-	State_STATE_NO_ACTIVE_CHANGE    State = 0
-	State_STATE_PENDING             State = 1
-	State_STATE_RUNNING             State = 2
-	State_STATE_WAITING_FOR_CUTOVER State = 3
-	State_STATE_CUTTING_OVER        State = 4
-	State_STATE_REVERT_WINDOW       State = 5
-	State_STATE_COMPLETED           State = 6
-	State_STATE_FAILED              State = 7
-	State_STATE_STOPPED             State = 8
-	State_STATE_REVERTED            State = 9
+	State_STATE_NO_ACTIVE_CHANGE        State = 0
+	State_STATE_PENDING                 State = 1
+	State_STATE_RUNNING                 State = 2
+	State_STATE_WAITING_FOR_CUTOVER     State = 3
+	State_STATE_CUTTING_OVER            State = 4
+	State_STATE_REVERT_WINDOW           State = 5
+	State_STATE_COMPLETED               State = 6
+	State_STATE_FAILED                  State = 7
+	State_STATE_STOPPED                 State = 8
+	State_STATE_REVERTED                State = 9
+	State_STATE_CANCELLED               State = 10
+	State_STATE_CREATING_BRANCH         State = 11
+	State_STATE_APPLYING_BRANCH_CHANGES State = 12
+	State_STATE_CREATING_DEPLOY_REQUEST State = 13
 )
 
 // Enum value maps for State.
 var (
 	State_name = map[int32]string{
-		0: "STATE_NO_ACTIVE_CHANGE",
-		1: "STATE_PENDING",
-		2: "STATE_RUNNING",
-		3: "STATE_WAITING_FOR_CUTOVER",
-		4: "STATE_CUTTING_OVER",
-		5: "STATE_REVERT_WINDOW",
-		6: "STATE_COMPLETED",
-		7: "STATE_FAILED",
-		8: "STATE_STOPPED",
-		9: "STATE_REVERTED",
+		0:  "STATE_NO_ACTIVE_CHANGE",
+		1:  "STATE_PENDING",
+		2:  "STATE_RUNNING",
+		3:  "STATE_WAITING_FOR_CUTOVER",
+		4:  "STATE_CUTTING_OVER",
+		5:  "STATE_REVERT_WINDOW",
+		6:  "STATE_COMPLETED",
+		7:  "STATE_FAILED",
+		8:  "STATE_STOPPED",
+		9:  "STATE_REVERTED",
+		10: "STATE_CANCELLED",
+		11: "STATE_CREATING_BRANCH",
+		12: "STATE_APPLYING_BRANCH_CHANGES",
+		13: "STATE_CREATING_DEPLOY_REQUEST",
 	}
 	State_value = map[string]int32{
-		"STATE_NO_ACTIVE_CHANGE":    0,
-		"STATE_PENDING":             1,
-		"STATE_RUNNING":             2,
-		"STATE_WAITING_FOR_CUTOVER": 3,
-		"STATE_CUTTING_OVER":        4,
-		"STATE_REVERT_WINDOW":       5,
-		"STATE_COMPLETED":           6,
-		"STATE_FAILED":              7,
-		"STATE_STOPPED":             8,
-		"STATE_REVERTED":            9,
+		"STATE_NO_ACTIVE_CHANGE":        0,
+		"STATE_PENDING":                 1,
+		"STATE_RUNNING":                 2,
+		"STATE_WAITING_FOR_CUTOVER":     3,
+		"STATE_CUTTING_OVER":            4,
+		"STATE_REVERT_WINDOW":           5,
+		"STATE_COMPLETED":               6,
+		"STATE_FAILED":                  7,
+		"STATE_STOPPED":                 8,
+		"STATE_REVERTED":                9,
+		"STATE_CANCELLED":               10,
+		"STATE_CREATING_BRANCH":         11,
+		"STATE_APPLYING_BRANCH_CHANGES": 12,
+		"STATE_CREATING_DEPLOY_REQUEST": 13,
 	}
 )
 
@@ -668,7 +680,9 @@ type ApplyRequest struct {
 	Environment string `protobuf:"bytes,7,opt,name=environment,proto3" json:"environment,omitempty"`
 	// Opaque identifier for endpoint discovery (e.g., database identifier).
 	// Forwarded to Tern for provider-based resolution. Defaults to database if empty.
-	Target        string `protobuf:"bytes,8,opt,name=target,proto3" json:"target,omitempty"`
+	Target string `protobuf:"bytes,8,opt,name=target,proto3" json:"target,omitempty"`
+	// Caller identity (e.g., "cli:user@hostname", "webhook:repo#pr").
+	Caller        string `protobuf:"bytes,9,opt,name=caller,proto3" json:"caller,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -755,6 +769,13 @@ func (x *ApplyRequest) GetEnvironment() string {
 func (x *ApplyRequest) GetTarget() string {
 	if x != nil {
 		return x.Target
+	}
+	return ""
+}
+
+func (x *ApplyRequest) GetCaller() string {
+	if x != nil {
+		return x.Caller
 	}
 	return ""
 }
@@ -2202,7 +2223,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x06engine\x18\x02 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +
 	"\achanges\x18\x03 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x12?\n" +
 	"\x0flint_violations\x18\x04 \x03(\v2\x16.tern.v1.LintViolationR\x0elintViolations\x12\x16\n" +
-	"\x06errors\x18\x05 \x03(\tR\x06errors\"\xe3\x03\n" +
+	"\x06errors\x18\x05 \x03(\tR\x06errors\"\xfb\x03\n" +
 	"\fApplyRequest\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12<\n" +
 	"\aoptions\x18\x02 \x03(\v2\".tern.v1.ApplyRequest.OptionsEntryR\aoptions\x12I\n" +
@@ -2212,7 +2233,8 @@ const file_tern_proto_rawDesc = "" +
 	"\vddl_changes\x18\x06 \x03(\v2\x14.tern.v1.TableChangeR\n" +
 	"ddlChanges\x12 \n" +
 	"\venvironment\x18\a \x01(\tR\venvironment\x12\x16\n" +
-	"\x06target\x18\b \x01(\tR\x06target\x1a:\n" +
+	"\x06target\x18\b \x01(\tR\x06target\x12\x16\n" +
+	"\x06caller\x18\t \x01(\tR\x06caller\x1a:\n" +
 	"\fOptionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aT\n" +
@@ -2337,7 +2359,7 @@ const file_tern_proto_rawDesc = "" +
 	"new_volume\x18\x04 \x01(\x05R\tnewVolume*3\n" +
 	"\x06Engine\x12\x11\n" +
 	"\rENGINE_SPIRIT\x10\x00\x12\x16\n" +
-	"\x12ENGINE_PLANETSCALE\x10\x01*\xe7\x01\n" +
+	"\x12ENGINE_PLANETSCALE\x10\x01*\xdd\x02\n" +
 	"\x05State\x12\x1a\n" +
 	"\x16STATE_NO_ACTIVE_CHANGE\x10\x00\x12\x11\n" +
 	"\rSTATE_PENDING\x10\x01\x12\x11\n" +
@@ -2348,7 +2370,12 @@ const file_tern_proto_rawDesc = "" +
 	"\x0fSTATE_COMPLETED\x10\x06\x12\x10\n" +
 	"\fSTATE_FAILED\x10\a\x12\x11\n" +
 	"\rSTATE_STOPPED\x10\b\x12\x12\n" +
-	"\x0eSTATE_REVERTED\x10\t*h\n" +
+	"\x0eSTATE_REVERTED\x10\t\x12\x13\n" +
+	"\x0fSTATE_CANCELLED\x10\n" +
+	"\x12\x19\n" +
+	"\x15STATE_CREATING_BRANCH\x10\v\x12!\n" +
+	"\x1dSTATE_APPLYING_BRANCH_CHANGES\x10\f\x12!\n" +
+	"\x1dSTATE_CREATING_DEPLOY_REQUEST\x10\r*h\n" +
 	"\n" +
 	"ChangeType\x12\x15\n" +
 	"\x11CHANGE_TYPE_OTHER\x10\x00\x12\x16\n" +

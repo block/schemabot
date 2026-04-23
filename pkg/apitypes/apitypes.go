@@ -276,7 +276,7 @@ type ProgressResponse struct {
 	ErrorMessage string                   `json:"error_message,omitempty"`
 	Summary      string                   `json:"summary,omitempty"`  // Combined status with ETA
 	Volume       int32                    `json:"volume,omitempty"`   // Current volume setting (1-11)
-	Options      map[string]string        `json:"options,omitempty"`  // Apply options (defer_cutover, enable_revert, etc.)
+	Options      map[string]string        `json:"options,omitempty"`  // Apply options (defer_cutover, skip_revert, etc.)
 	Metadata     map[string]string        `json:"metadata,omitempty"` // Engine-specific data
 }
 

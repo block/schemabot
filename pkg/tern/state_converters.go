@@ -32,6 +32,8 @@ func taskStateToApplyState(ts string) string {
 		return state.Apply.Stopped
 	case state.Task.Reverted:
 		return state.Apply.Reverted
+	case state.Task.Cancelled:
+		return state.Apply.Cancelled
 	default:
 		return state.Apply.Pending
 	}
@@ -82,8 +84,16 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_FAILED
 	case state.Task.Stopped:
 		return ternv1.State_STATE_STOPPED
+	case state.Task.Cancelled:
+		return ternv1.State_STATE_CANCELLED
 	case state.Task.Reverted:
 		return ternv1.State_STATE_REVERTED
+	case state.Apply.CreatingBranch:
+		return ternv1.State_STATE_CREATING_BRANCH
+	case state.Apply.ApplyingBranchChanges:
+		return ternv1.State_STATE_APPLYING_BRANCH_CHANGES
+	case state.Apply.CreatingDeployRequest:
+		return ternv1.State_STATE_CREATING_DEPLOY_REQUEST
 	default:
 		// Unknown task state — return PENDING as a safe default so clients
 		// continue polling rather than assuming no change is active.
@@ -142,8 +152,16 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.Failed
 	case ternv1.State_STATE_STOPPED:
 		return state.Apply.Stopped
+	case ternv1.State_STATE_CANCELLED:
+		return state.Apply.Cancelled
 	case ternv1.State_STATE_REVERTED:
 		return state.Apply.Reverted
+	case ternv1.State_STATE_CREATING_BRANCH:
+		return state.Apply.CreatingBranch
+	case ternv1.State_STATE_APPLYING_BRANCH_CHANGES:
+		return state.Apply.ApplyingBranchChanges
+	case ternv1.State_STATE_CREATING_DEPLOY_REQUEST:
+		return state.Apply.CreatingDeployRequest
 	default:
 		return ""
 	}
@@ -153,7 +171,8 @@ func ProtoStateToStorage(ps ternv1.State) string {
 func isTerminalProtoState(ps ternv1.State) bool {
 	switch ps {
 	case ternv1.State_STATE_COMPLETED, ternv1.State_STATE_FAILED,
-		ternv1.State_STATE_STOPPED, ternv1.State_STATE_REVERTED:
+		ternv1.State_STATE_STOPPED, ternv1.State_STATE_CANCELLED,
+		ternv1.State_STATE_REVERTED:
 		return true
 	default:
 		return false

@@ -205,7 +205,9 @@ func TestApplyStore_UpdateNonExistent(t *testing.T) {
 		State: state.Apply.Running,
 	}
 
-	require.ErrorIs(t, store.Applies().Update(ctx, apply), storage.ErrApplyNotFound)
+	// Update on a non-existent row is a no-op (0 rows affected), not an error.
+	// MySQL UPDATE with WHERE id=? succeeds even when no row matches.
+	require.NoError(t, store.Applies().Update(ctx, apply))
 }
 
 func TestApplyStore_GetInProgress(t *testing.T) {
@@ -337,7 +339,7 @@ func TestApplyStore_Options(t *testing.T) {
 	apply.SetOptions(storage.ApplyOptions{
 		AllowUnsafe:  true,
 		DeferCutover: true,
-		EnableRevert: false,
+		SkipRevert:   false,
 		Volume:       5,
 	})
 
@@ -351,7 +353,7 @@ func TestApplyStore_Options(t *testing.T) {
 	opts := retrieved.GetOptions()
 	assert.True(t, opts.AllowUnsafe)
 	assert.True(t, opts.DeferCutover)
-	assert.False(t, opts.EnableRevert)
+	assert.False(t, opts.SkipRevert)
 	assert.Equal(t, 5, opts.Volume)
 }
 
@@ -381,7 +383,7 @@ func TestApplyStore_AllFields(t *testing.T) {
 	apply.SetOptions(storage.ApplyOptions{
 		AllowUnsafe:  true,
 		DeferCutover: true,
-		EnableRevert: true,
+		SkipRevert:   true,
 	})
 
 	id, err := store.Applies().Create(ctx, apply)
@@ -420,7 +422,7 @@ func TestApplyStore_AllFields(t *testing.T) {
 	opts := retrieved.GetOptions()
 	assert.True(t, opts.AllowUnsafe)
 	assert.True(t, opts.DeferCutover)
-	assert.True(t, opts.EnableRevert)
+	assert.True(t, opts.SkipRevert)
 }
 
 // Helper functions
