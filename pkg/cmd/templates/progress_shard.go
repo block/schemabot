@@ -9,29 +9,38 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
+// Shard indentation constants (derived from indentContent in progress.go).
+var (
+	indentShardHeader = indentContent + "• "   // Shards: header with bullet
+	indentShardLine   = indentContent + "    " // individual shard lines
+	indentShardMore   = indentContent + "    " // "... N more" lines
+)
+
 // maxShardDetail is the maximum number of individual shard lines to render.
 // Beyond this, only non-terminal (copying/queued/failed) shards are shown
 // with a collapsed summary for complete shards.
 const maxShardDetail = 8
 
-// writeShardProgress renders per-shard progress for a Vitess table.
+// FormatShardProgress returns per-shard progress for a Vitess table as a string.
 // For large shard counts (>maxShardDetail), only shows non-terminal shards
 // plus a collapsed count for complete/queued shards.
-func writeShardProgress(shards []ShardProgress) {
+func FormatShardProgress(shards []ShardProgress) string {
 	if len(shards) == 0 {
-		return
+		return ""
 	}
+
+	var b strings.Builder
 
 	c := CountShardsByStatus(shards)
 	parts := FormatShardSummaryParts(c, false)
-	fmt.Printf("    %sShards: %d (%s)%s\n", ANSIDim, len(shards), strings.Join(parts, ", "), ANSIReset)
+	fmt.Fprintf(&b, indentShardHeader+"%sShards: %d (%s)%s\n", ANSIDim, len(shards), strings.Join(parts, ", "), ANSIReset)
 
 	// For small shard counts, show all shards
 	if len(shards) <= maxShardDetail {
 		for _, s := range shards {
-			writeShardLine(s)
+			b.WriteString(formatShardLine(s))
 		}
-		return
+		return b.String()
 	}
 
 	// For large shard counts: show failed first (always), then a sample
@@ -41,11 +50,9 @@ func writeShardProgress(shards []ShardProgress) {
 	// Always show failed shards (they need attention). Limit other non-copying
 	// shards to avoid a wall of identical "ready for cutover" lines.
 	const maxNonCopyingShown = 3
-	var shownCount int
 	for _, s := range shards {
 		if s.Status == state.Task.Failed {
-			writeShardLine(s)
-			shownCount++
+			b.WriteString(formatShardLine(s))
 		}
 	}
 	var waitingCount, cuttingCount int
@@ -53,24 +60,22 @@ func writeShardProgress(shards []ShardProgress) {
 		switch s.Status {
 		case state.Task.WaitingForCutover:
 			if waitingCount < maxNonCopyingShown {
-				writeShardLine(s)
-				shownCount++
+				b.WriteString(formatShardLine(s))
 			}
 			waitingCount++
 		case state.Task.CuttingOver:
 			if cuttingCount < maxNonCopyingShown {
-				writeShardLine(s)
-				shownCount++
+				b.WriteString(formatShardLine(s))
 			}
 			cuttingCount++
 		}
 	}
 	if waitingCount > maxNonCopyingShown {
-		fmt.Printf("      %s... %d more ready for cutover%s\n",
+		fmt.Fprintf(&b, indentShardMore+"%s... %d more ready for cutover%s\n",
 			ANSIDim, waitingCount-maxNonCopyingShown, ANSIReset)
 	}
 	if cuttingCount > maxNonCopyingShown {
-		fmt.Printf("      %s... %d more cutting over%s\n",
+		fmt.Fprintf(&b, indentShardMore+"%s... %d more cutting over%s\n",
 			ANSIDim, cuttingCount-maxNonCopyingShown, ANSIReset)
 	}
 
@@ -89,31 +94,32 @@ func writeShardProgress(shards []ShardProgress) {
 		if i >= maxCopyingShown {
 			break
 		}
-		writeShardLine(s)
-		shownCount++
+		b.WriteString(formatShardLine(s))
 	}
 	if len(copying) > maxCopyingShown {
-		fmt.Printf("      %s... %d more copying shards%s\n",
+		fmt.Fprintf(&b, indentShardMore+"%s... %d more copying shards%s\n",
 			ANSIDim, len(copying)-maxCopyingShown, ANSIReset)
 	}
 
 	// Summarize remaining shards not individually shown
 	if c.Complete > 0 || c.Queued > 0 {
-		var parts []string
+		var remainParts []string
 		if c.Complete > 0 {
-			parts = append(parts, fmt.Sprintf("%d complete", c.Complete))
+			remainParts = append(remainParts, fmt.Sprintf("%d complete", c.Complete))
 		}
 		if c.Queued > 0 {
-			parts = append(parts, fmt.Sprintf("%d queued", c.Queued))
+			remainParts = append(remainParts, fmt.Sprintf("%d queued", c.Queued))
 		}
-		fmt.Printf("      %s... %s%s\n", ANSIDim, strings.Join(parts, ", "), ANSIReset)
+		fmt.Fprintf(&b, indentShardMore+"%s... %s%s\n", ANSIDim, strings.Join(remainParts, ", "), ANSIReset)
 	}
+
+	return b.String()
 }
 
-func writeShardLine(s ShardProgress) {
+func formatShardLine(s ShardProgress) string {
 	switch s.Status {
 	case state.Task.Completed:
-		fmt.Printf("      %s✓ %s%s: %s rows\n", ANSIGreen, s.Shard, ANSIReset, ui.FormatNumber(s.RowsTotal))
+		return fmt.Sprintf(indentShardLine+"%s✓ %s%s: %s rows\n", ANSIGreen, s.Shard, ANSIReset, ui.FormatNumber(s.RowsTotal))
 	case state.Task.Running:
 		pct := s.PercentComplete
 		if pct == 0 && s.RowsTotal > 0 {
@@ -123,17 +129,17 @@ func writeShardLine(s ShardProgress) {
 		if s.ETASeconds > 0 {
 			detail += fmt.Sprintf(" ETA %s", FormatDurationSeconds(s.ETASeconds))
 		}
-		fmt.Printf("      %s◉ %s%s: %s\n", ANSICyan, s.Shard, ANSIReset, detail)
+		return fmt.Sprintf(indentShardLine+"%s◉ %s%s: %s\n", ANSICyan, s.Shard, ANSIReset, detail)
 	case state.Task.WaitingForCutover:
-		fmt.Printf("      %s● %s%s: ready for cutover\n", ANSIYellow, s.Shard, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s● %s%s: ready for cutover\n", ANSIYellow, s.Shard, ANSIReset)
 	case state.Task.CuttingOver:
-		fmt.Printf("      %s● %s%s: cutting over\n", ANSIYellow, s.Shard, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s● %s%s: cutting over\n", ANSIYellow, s.Shard, ANSIReset)
 	case state.Task.Pending:
-		fmt.Printf("      %s○ %s: queued%s\n", ANSIDim, s.Shard, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s○ %s: queued%s\n", ANSIDim, s.Shard, ANSIReset)
 	case state.Task.Failed:
-		fmt.Printf("      %s✗ %s%s: failed\n", ANSIRed, s.Shard, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s✗ %s%s: failed\n", ANSIRed, s.Shard, ANSIReset)
 	default:
-		fmt.Printf("      %s○ %s: %s%s\n", ANSIDim, s.Shard, s.Status, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s○ %s: %s%s\n", ANSIDim, s.Shard, s.Status, ANSIReset)
 	}
 }
 

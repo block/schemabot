@@ -2344,9 +2344,10 @@ Single table progress (default):
 
 
   ── testapp ──
-    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-      Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
+
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+       • Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
 
 
 ```
@@ -2366,11 +2367,12 @@ Single table progress (default):
 
 
   ── testapp ──
-    order_items: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `order_items` ADD INDEX `idx_product_id`(`product_id`);
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ order_items: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `order_items` ADD INDEX `idx_product_id`(`product_id`);
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ✓ Apply complete!
 
@@ -2393,8 +2395,9 @@ Single table progress (default):
 
 
   ── testapp ──
-    users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
+     ~ users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -2417,12 +2420,13 @@ The new apply will only process tables that haven't completed.
 
 
   ── testapp ──
-    users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-      Rows: 156,342 / 397,453
 
-    orders: ⏹️ Stopped (not started)
-      ALTER TABLE `orders` ADD INDEX `idx_total_cents`(`total_cents`);
+     ~ users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+       • Rows: 156,342 / 397,453
+
+     ~ orders: ⏹️ Stopped (not started)
+       ALTER TABLE `orders` ADD INDEX `idx_total_cents`(`total_cents`);
 
 
 Stopped. Use 'schemabot start --apply-id <apply_id>' to resume from checkpoint.
@@ -2444,11 +2448,12 @@ Stopped. Use 'schemabot start --apply-id <apply_id>' to resume from checkpoint.
 
 
   ── testapp ──
-    order_items: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
-      ALTER TABLE `order_items` ADD INDEX `idx_product_id`(`product_id`);
 
-    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ order_items: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `order_items` ADD INDEX `idx_product_id`(`product_id`);
+
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Row copy complete. All data has been copied and new writes
 continue to be replicated to keep the shadow table in sync.
@@ -2486,11 +2491,12 @@ Watching for cutover... (Ctrl+C to detach)
 
 
   ── testapp ──
-    order_items: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
-      ALTER TABLE `order_items` ADD INDEX `idx_product_id`(`product_id`);
 
-    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ order_items: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+       ALTER TABLE `order_items` ADD INDEX `idx_product_id`(`product_id`);
+
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 ```
@@ -2511,14 +2517,14 @@ Sequential mode: Just started (all tables pending)
 └──────────────────────────────────┘
 
 
-    users: ⏳ Queued
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: ⏳ Queued
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-    orders: ⏳ Queued
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: ⏳ Queued
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: ⏳ Queued
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 ```
@@ -2539,15 +2545,15 @@ Sequential mode: First table running, others queued
 └──────────────────────────────────┘
 
 
-    users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-      Rows: 875,000 / 2,500,000 · ETA: 8m 30s
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+       • Rows: 875,000 / 2,500,000 · ETA: 8m 30s
 
-    orders: ⏳ Queued
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: ⏳ Queued
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: ⏳ Queued
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 ```
@@ -2568,15 +2574,15 @@ Sequential mode: First complete, second running
 └──────────────────────────────────┘
 
 
-    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
-      Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+       • Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
 
-    products: ⏳ Queued
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 ```
@@ -2597,15 +2603,15 @@ Sequential mode: First two complete, third running
 └──────────────────────────────────┘
 
 
-    products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80%
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
-      Rows: 160,000 / 200,000 · ETA: 2m 45s
+     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80%
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+       • Rows: 160,000 / 200,000 · ETA: 2m 45s
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
 
 ```
@@ -2626,14 +2632,14 @@ Sequential mode: All tables completed successfully
 └──────────────────────────────────┘
 
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 ✓ Apply complete!
 
@@ -2657,14 +2663,14 @@ Sequential mode: First table failed (others cancelled)
   lock wait timeout exceeded; try restarting transaction
 
 
-    users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-    orders: ⊘ Cancelled (not started)
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: ⊘ Cancelled (not started)
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: ⊘ Cancelled (not started)
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⊘ Cancelled (not started)
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -2690,14 +2696,14 @@ Sequential mode: Middle table failed
   Lost connection to MySQL server during query (MySQL error 2013)
 
 
-    orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-    products: ⊘ Cancelled (not started)
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⊘ Cancelled (not started)
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -2721,15 +2727,15 @@ Sequential mode: User stopped mid-apply
 └──────────────────────────────────┘
 
 
-    orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42%
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
-      Rows: 112,045 / 266,383
+     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42%
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+       • Rows: 112,045 / 266,383
 
-    products: ⏹️ Stopped (not started)
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⏹️ Stopped (not started)
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Use 'schemabot start' to resume from checkpoint.
 
@@ -2750,8 +2756,9 @@ Use 'schemabot start' to resume from checkpoint.
 
 
   ── myapp_sharded ──
-    users: ⏳ Queued
-      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+     ~ users: ⏳ Queued
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
 ```
@@ -2772,8 +2779,9 @@ Use 'schemabot start' to resume from checkpoint.
 
 
   ── myapp_sharded ──
-    users: ⏳ Queued
-      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+     ~ users: ⏳ Queued
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
 ```
@@ -2794,9 +2802,36 @@ Use 'schemabot start' to resume from checkpoint.
 
 
   ── myapp_sharded ──
-    users: ⏳ Queued
-      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
+     ~ users: ⏳ Queued
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-staging-schema-changes-0-with-shards"></a><strong>Vitess: Staging Schema Changes (0% With Shards)</strong></summary>
+
+```
+
+┌─────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6   │
+│  Database:     myapp                │
+│  Environment:  staging              │
+│  State:        Running              │
+│  Started:      Jan 15 14:29:15 UTC  │
+│  Duration:     45s                  │
+└─────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+
+     ~ customers: Staging schema changes...
+       ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
+       • Shards: 2 (2 copying)
+           ◉ -80: 0% (0/60,483,380 rows)
+           ◉ 80-: 0% (0/64,277,080 rows)
 
 ```
 </details>
@@ -2819,8 +2854,9 @@ Use 'schemabot start' to resume from checkpoint.
 
 
   ── myapp_sharded ──
-    users: Running...
-      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+     ~ users: Running...
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
 ```
@@ -2844,8 +2880,9 @@ Use 'schemabot start' to resume from checkpoint.
 
 
   ── myapp_sharded ──
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
 ```
@@ -2871,8 +2908,9 @@ Use 'schemabot start' to resume from checkpoint.
 
 
   ── myapp_sharded ──
-    users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+     ~ users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -2900,12 +2938,13 @@ The new apply will only process tables that haven't completed.
 
 
   ── myapp_sharded ──
-    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
-      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
-    Shards: 2 (2 ready for cutover)
-      ● -80: ready for cutover
-      ● 80-: ready for cutover
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+
+       • Shards: 2 (2 ready for cutover)
+           ● -80: ready for cutover
+           ● 80-: ready for cutover
 
 ```
 </details>
@@ -2929,12 +2968,13 @@ The new apply will only process tables that haven't completed.
 
 
   ── myapp_sharded ──
-    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
-      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
-    Shards: 2 (2 cutting over)
-      ● -80: cutting over
-      ● 80-: cutting over
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+       ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+
+       • Shards: 2 (2 cutting over)
+           ● -80: cutting over
+           ● 80-: cutting over
 
 ```
 </details>
@@ -2957,12 +2997,13 @@ The new apply will only process tables that haven't completed.
 
 
   ── myapp_sharded ──
-    orders: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⊘ Cancelled at 30%
-      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
-    Shards: 2 (2 cancelled)
-      ○ -80: cancelled
-      ○ 80-: cancelled
+     ~ orders: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⊘ Cancelled at 30%
+       ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+
+       • Shards: 2 (2 cancelled)
+           ○ -80: cancelled
+           ○ 80-: cancelled
 
 ```
 </details>
@@ -2985,21 +3026,21 @@ The new apply will only process tables that haven't completed.
 
 
   ── commerce_sharded ──
-    transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 57%
-      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
-      Rows: 110,573,340 / 193,280,000 · ETA: 4m 40s
 
-    Shards: 256 (30 ready for cutover, 226 copying)
-      ● -01: ready for cutover
-      ● 01-02: ready for cutover
-      ● 02-03: ready for cutover
-      ... 27 more ready for cutover
-      ◉ ff-: 10% (101,000/1,010,000 rows) ETA 4m 40s
-      ◉ fe-ff: 10% (100,800/1,008,000 rows) ETA 4m 40s
-      ◉ fd-fe: 11% (110,660/1,006,000 rows) ETA 4m 38s
-      ◉ fc-fd: 11% (110,440/1,004,000 rows) ETA 4m 38s
-      ◉ fb-fc: 12% (120,240/1,002,000 rows) ETA 4m 36s
-      ... 221 more copying shards
+     ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 57%
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       • Rows: 110,573,340 / 193,280,000 · ETA: 4m 40s
+       • Shards: 256 (30 ready for cutover, 226 copying)
+           ● -01: ready for cutover
+           ● 01-02: ready for cutover
+           ● 02-03: ready for cutover
+           ... 27 more ready for cutover
+           ◉ ff-: 10% (101,000/1,010,000 rows) ETA 4m 40s
+           ◉ fe-ff: 10% (100,800/1,008,000 rows) ETA 4m 40s
+           ◉ fd-fe: 11% (110,660/1,006,000 rows) ETA 4m 38s
+           ◉ fc-fd: 11% (110,440/1,004,000 rows) ETA 4m 38s
+           ◉ fb-fc: 12% (120,240/1,002,000 rows) ETA 4m 36s
+           ... 221 more copying shards
 
 ```
 </details>
@@ -3022,45 +3063,50 @@ The new apply will only process tables that haven't completed.
 
 
   ── commerce_sharded ──
-    transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 67%
-      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
-      Rows: 29,435,000 / 43,360,000 · ETA: 2m 37s
 
-    Shards: 32 (12 ready for cutover, 20 copying)
-      ● -08: ready for cutover
-      ● 08-10: ready for cutover
-      ● 10-18: ready for cutover
-      ... 9 more ready for cutover
-      ◉ f8-: 23% (347,300/1,510,000 rows) ETA 2m 37s
-      ◉ f0-f8: 26% (390,000/1,500,000 rows) ETA 2m 34s
-      ◉ e8-f0: 29% (432,100/1,490,000 rows) ETA 2m 31s
-      ◉ e0-e8: 32% (473,600/1,480,000 rows) ETA 2m 28s
-      ◉ d8-e0: 35% (514,500/1,470,000 rows) ETA 2m 25s
-      ... 15 more copying shards
+     ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 67%
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       • Rows: 29,435,000 / 43,360,000 · ETA: 2m 37s
+       • Shards: 32 (12 ready for cutover, 20 copying)
+           ● -08: ready for cutover
+           ● 08-10: ready for cutover
+           ● 10-18: ready for cutover
+           ... 9 more ready for cutover
+           ◉ f8-: 23% (347,300/1,510,000 rows) ETA 2m 37s
+           ◉ f0-f8: 26% (390,000/1,500,000 rows) ETA 2m 34s
+           ◉ e8-f0: 29% (432,100/1,490,000 rows) ETA 2m 31s
+           ◉ e0-e8: 32% (473,600/1,480,000 rows) ETA 2m 28s
+           ◉ d8-e0: 35% (514,500/1,470,000 rows) ETA 2m 25s
+           ... 15 more copying shards
 
   ── commerce_001 ──
-    transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+
+     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
 
 
   ── commerce_002 ──
-    transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+
+     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
 
 
   ── commerce_003 ──
-    transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+
+     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
 
 
   ── commerce_004 ──
-    transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+
+     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
 
 
   ── commerce_005 ──
-    transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+
+     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
 
 
   ... and 27 more keyspaces (all completed)
@@ -3086,8 +3132,9 @@ The new apply will only process tables that haven't completed.
 
 
   ── myapp_sharded ──
+
     ~ VSchema: Applying...
-      + "xxhash": {"type": "xxhash"}
+       + "xxhash": {"type": "xxhash"}
 
 
 ```
@@ -3111,18 +3158,20 @@ The new apply will only process tables that haven't completed.
 
 
   ── myapp_unsharded ──
-    orders_seq: Running...
-      CREATE TABLE `orders_seq` (
-          `id` int unsigned NOT NULL DEFAULT '0',
-          `next_id` bigint unsigned,
-          `cache` bigint unsigned,
-          PRIMARY KEY(`id`)
-      ) ENGINE InnoDB;
+
+     ~ orders_seq: Running...
+       CREATE TABLE `orders_seq` (
+           `id` int unsigned NOT NULL DEFAULT '0',
+           `next_id` bigint unsigned,
+           `cache` bigint unsigned,
+           PRIMARY KEY(`id`)
+       ) ENGINE InnoDB;
 
 
   ── myapp_sharded ──
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
 ```
@@ -3146,11 +3195,12 @@ The new apply will only process tables that haven't completed.
 
 
   ── myapp_sharded ──
-    ~ VSchema: Applying...
-      + "users": {"column_vindexes": [{"column": "id", "name": "hash"}]}
 
-    users: Running...
-      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+    ~ VSchema: Applying...
+       + "users": {"column_vindexes": [{"column": "id", "name": "hash"}]}
+
+     ~ users: Running...
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
 ```
@@ -3174,13 +3224,13 @@ The new apply will only process tables that haven't completed.
 
 
   ── myapp_sharded ──
-    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70%
-      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
-      Rows: 2,800,000 / 4,000,000 · ETA: 2m 0s
 
-    Shards: 2 (2 copying)
-      ◉ -80: 95% (2,000,000/2,100,000 rows) ETA 10s
-      ◉ 80-: 42% (800,000/1,900,000 rows) ETA 2m 0s
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70%
+       ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+       • Rows: 2,800,000 / 4,000,000 · ETA: 2m 0s
+       • Shards: 2 (2 copying)
+           ◉ -80: 95% (2,000,000/2,100,000 rows) ETA 10s
+           ◉ 80-: 42% (800,000/1,900,000 rows) ETA 2m 0s
 
 ```
 </details>
@@ -3203,12 +3253,13 @@ The new apply will only process tables that haven't completed.
 
 
   ── myapp_sharded ──
-    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
-      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
-    Shards: 2 (2 ready for cutover)
-      ● -80: ready for cutover
-      ● 80-: ready for cutover
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+
+       • Shards: 2 (2 ready for cutover)
+           ● -80: ready for cutover
+           ● 80-: ready for cutover
 
 ```
 </details>
@@ -3376,8 +3427,9 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 
 
   ── myapp_sharded ──
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
 ```
@@ -3402,8 +3454,9 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 
 
   ── myapp_sharded ──
-    orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
-      ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
+
+     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ✓ Complete (pending revert)
+       ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
 
 ```
@@ -3426,15 +3479,16 @@ Apply watch mode: Running with footer controls
 
 
   ── testapp ──
-    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-      Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 
-    products: ⏳ Queued
-      ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+       • Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 
-    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ESC detach • s stop • v volume
 
@@ -3455,14 +3509,15 @@ ESC detach • s stop • v volume
 
 
   ── testapp ──
-    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
-    products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ✓ Apply complete!
 
@@ -3502,15 +3557,16 @@ Checkpoint saved. Use 'schemabot start --apply-id apply-a1b2c3d4e5f67890' to res
 
 
   ── testapp ──
-    users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-      Rows: 156,342 / 397,453
 
-    products: ⏹️ Stopped (not started)
-      ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+     ~ users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+       • Rows: 156,342 / 397,453
 
-    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+     ~ products: ⏹️ Stopped (not started)
+       ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 
 ```
@@ -3549,15 +3605,16 @@ Resuming from checkpoint...
 
 
   ── testapp ──
-    users: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 40%
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-      Rows: 158,000 / 397,453 · ETA: 8m 0s
 
-    products: ⏳ Queued
-      ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 40%
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+       • Rows: 158,000 / 397,453 · ETA: 8m 0s
 
-    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ESC detach • s stop • v volume
 
@@ -3667,14 +3724,14 @@ Sequential mode: Just started (all tables pending)
 └──────────────────────────────────┘
 
 
-    users: ⏳ Queued
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: ⏳ Queued
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-    orders: ⏳ Queued
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: ⏳ Queued
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: ⏳ Queued
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 ```
@@ -3695,15 +3752,15 @@ Sequential mode: First table running, others queued
 └──────────────────────────────────┘
 
 
-    users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-      Rows: 875,000 / 2,500,000 · ETA: 8m 30s
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+       • Rows: 875,000 / 2,500,000 · ETA: 8m 30s
 
-    orders: ⏳ Queued
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: ⏳ Queued
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: ⏳ Queued
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 ```
@@ -3724,15 +3781,15 @@ Sequential mode: First complete, second running
 └──────────────────────────────────┘
 
 
-    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
-      Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+       • Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
 
-    products: ⏳ Queued
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
 ```
@@ -3753,15 +3810,15 @@ Sequential mode: First two complete, third running
 └──────────────────────────────────┘
 
 
-    products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80%
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
-      Rows: 160,000 / 200,000 · ETA: 2m 45s
+     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80%
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+       • Rows: 160,000 / 200,000 · ETA: 2m 45s
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
 
 ```
@@ -3782,14 +3839,14 @@ Sequential mode: All tables completed successfully
 └──────────────────────────────────┘
 
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-    orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 ✓ Apply complete!
 
@@ -3813,14 +3870,14 @@ Sequential mode: First table failed (others cancelled)
   lock wait timeout exceeded; try restarting transaction
 
 
-    users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-    orders: ⊘ Cancelled (not started)
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: ⊘ Cancelled (not started)
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: ⊘ Cancelled (not started)
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⊘ Cancelled (not started)
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -3846,14 +3903,14 @@ Sequential mode: Middle table failed
   Lost connection to MySQL server during query (MySQL error 2013)
 
 
-    orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-    products: ⊘ Cancelled (not started)
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⊘ Cancelled (not started)
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -3877,15 +3934,15 @@ Sequential mode: User stopped mid-apply
 └──────────────────────────────────┘
 
 
-    orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42%
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
-      Rows: 112,045 / 266,383
+     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42%
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+       • Rows: 112,045 / 266,383
 
-    products: ⏹️ Stopped (not started)
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⏹️ Stopped (not started)
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Use 'schemabot start' to resume from checkpoint.
 ```
@@ -3908,17 +3965,17 @@ Atomic mode (--defer-cutover): All tables copy rows, then cutover together
 └──────────────────────────────────┘
 
 
-    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72%
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
-      Rows: 1,800,000 / 2,500,000 · ETA: 3m 15s
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72%
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+       • Rows: 1,800,000 / 2,500,000 · ETA: 3m 15s
 
-    products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45%
-      ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
-      Rows: 450,000 / 1,000,000 · ETA: 6m 20s
+     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45%
+       ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
+       • Rows: 450,000 / 1,000,000 · ETA: 6m 20s
 
-    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 89%
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-      Rows: 6,400,000 / 7,200,000 · ETA: 1m 45s
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 89%
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+       • Rows: 6,400,000 / 7,200,000 · ETA: 1m 45s
 
 All tables copy rows simultaneously. Cutover happens atomically
 after all tables complete row copy.
@@ -3942,8 +3999,8 @@ Defer cutover: Single table waiting
 └──────────────────────────────────┘
 
 
-    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Row copy complete. All data has been copied and new writes
 continue to be replicated to keep the shadow table in sync.
@@ -3968,14 +4025,14 @@ Atomic mode (--defer-cutover): All tables waiting for cutover
 └──────────────────────────────────┘
 
 
-    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
-      ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
+     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
 
-    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Row copy complete for all tables. New writes continue to be
 replicated to keep shadow tables in sync.
@@ -4001,14 +4058,14 @@ Defer cutover: Sequential mode, first complete, second waiting
 └──────────────────────────────────┘
 
 
-    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: ⏳ Queued
-      ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
-    users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Row copy complete for current table. Press Enter to cutover
 and start the next table (or Ctrl+C to detach): _
@@ -4032,17 +4089,17 @@ Defer cutover: Stopped by user (s)
 └──────────────────────────────────┘
 
 
-    orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72%
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
-      Rows: 1,800,000 / 2,500,000
+     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72%
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+       • Rows: 1,800,000 / 2,500,000
 
-    products: 🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 45%
-      ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
-      Rows: 450,000 / 1,000,000
+     ~ products: 🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 45%
+       ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
+       • Rows: 450,000 / 1,000,000
 
-    users: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜ ⏹️ Stopped at 89%
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-      Rows: 6,400,000 / 7,200,000
+     ~ users: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜ ⏹️ Stopped at 89%
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+       • Rows: 6,400,000 / 7,200,000
 
 Use 'schemabot start --apply-id <apply_id>' to resume.
 
@@ -4089,14 +4146,14 @@ Defer cutover: Cutting over in progress
 └──────────────────────────────────┘
 
 
-    orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
-      ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-    products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
-      ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
+     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+       ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
 
-    users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
-      ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Cutover in progress. This typically completes within seconds.
 Tables are being renamed atomically...

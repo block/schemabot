@@ -35,6 +35,7 @@ type ProgressData struct {
 type TableProgress struct {
 	TableName       string
 	Namespace       string // Keyspace (Vitess) or schema name (MySQL)
+	ChangeType      string // create, alter, drop
 	DDL             string
 	Status          string
 	RowsCopied      int64
@@ -134,6 +135,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		tp := TableProgress{
 			TableName:       tbl.TableName,
 			Namespace:       tbl.Keyspace,
+			ChangeType:      tbl.ChangeType,
 			DDL:             tbl.DDL,
 			Status:          state.NormalizeState(tbl.Status),
 			RowsCopied:      tbl.RowsCopied,

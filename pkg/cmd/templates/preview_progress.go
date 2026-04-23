@@ -259,6 +259,32 @@ func previewVitessRevertWindowOutput() {
 	WriteProgress(data)
 }
 
+func previewVitessStagingOutput() {
+	data := ProgressData{
+		State:       state.Apply.Running,
+		Engine:      "PlanetScale",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Database:    "myapp",
+		Environment: "staging",
+		StartedAt:   previewTime.Add(-45 * time.Second).Format(time.RFC3339),
+		Tables: []TableProgress{
+			{
+				TableName: "customers", Namespace: "myapp_sharded",
+				DDL:    "ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`)",
+				Status: state.Apply.Running,
+				// RowsTotal > 0 but RowsCopied == 0 triggers "Staging schema changes..."
+				RowsCopied: 0,
+				RowsTotal:  124760460,
+				Shards: []ShardProgress{
+					{Shard: "-80", Status: state.Task.Running, RowsCopied: 0, RowsTotal: 60483380},
+					{Shard: "80-", Status: state.Task.Running, RowsCopied: 0, RowsTotal: 64277080},
+				},
+			},
+		},
+	}
+	WriteProgress(data)
+}
+
 func previewVitessRunningOutput() {
 	data := ProgressData{
 		State:       state.Apply.Running,

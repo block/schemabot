@@ -109,7 +109,7 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 		if ns.VSchemaChanged && !isMySQL {
 			fmt.Println("  ~ VSchema:")
 			if ns.VSchemaDiff != "" {
-				writeVSchemaDiff(ns.VSchemaDiff, "    ")
+				fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, "    "))
 				fmt.Println()
 			}
 		}
@@ -384,7 +384,7 @@ func WriteOptions(deferCutover bool, skipRevert bool) {
 		options = append(options, "⏸️ Defer Cutover")
 	}
 	if skipRevert {
-		options = append(options, "⏩ Revert Window Disabled")
+		options = append(options, "⏩ Skip Revert")
 	}
 	if len(options) > 0 {
 		fmt.Printf("Options: %s\n", strings.Join(options, " | "))

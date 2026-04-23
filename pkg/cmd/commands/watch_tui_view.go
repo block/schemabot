@@ -3,13 +3,12 @@ package commands
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/block/schemabot/pkg/cmd/templates"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
-	"github.com/block/schemabot/pkg/ui"
 )
 
 // View implements tea.Model.
@@ -66,29 +65,17 @@ func (m WatchModel) progressView() string {
 	case m.volumeChanging:
 		// Volume change in progress
 		b.WriteString(m.spinner.View() + fmt.Sprintf("Changing volume to %d...\n", m.volumePending))
-	case m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped):
-		// Stop has been triggered but state hasn't updated yet
-		b.WriteString(m.spinner.View() + "Stopping...\n")
+	case m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled):
+		// Stop/cancel has been triggered but state hasn't updated yet
+		if m.isPlanetScale() {
+			b.WriteString(m.spinner.View() + "Cancelling...\n")
+		} else {
+			b.WriteString(m.spinner.View() + "Stopping...\n")
+		}
 	case effectivelyStopped:
 		// Don't show status line - stopped message comes after tables
 	case state.IsState(m.state, state.Apply.Running) && !m.cutoverTriggered:
-		// Find overall ETA and check if any table is actually copying rows
-		eta := ""
-		hasRowCopy := false
-		for _, t := range tables {
-			if t.RowsTotal > 0 && !isTableComplete(t.Status) {
-				hasRowCopy = true
-				if t.ETA != "" && t.ETA != "TBD" {
-					eta = t.ETA
-				}
-				break
-			}
-		}
-		if hasRowCopy {
-			b.WriteString(m.spinner.View() + templates.FormatStatusLine("Copying rows...", eta))
-		} else {
-			b.WriteString(m.spinner.View() + "Running...")
-		}
+		b.WriteString(m.spinner.View() + "Running...")
 		b.WriteString("\n")
 	case state.IsState(m.state, state.Apply.WaitingForCutover):
 		if m.cutoverTriggered {
@@ -100,18 +87,22 @@ func (m WatchModel) progressView() string {
 		// No status line for completed - just show completion message after tables
 	case state.IsState(m.state, state.Apply.Stopped):
 		// No status line - show stopped message after tables
+	case state.IsState(m.state, state.Apply.CreatingBranch):
+		b.WriteString(m.spinner.View() + "Creating branch..." + m.elapsed() + "\n")
+	case state.IsState(m.state, state.Apply.ApplyingBranchChanges):
+		b.WriteString(m.spinner.View() + "Applying changes to branch..." + m.elapsed() + "\n")
+	case state.IsState(m.state, state.Apply.CreatingDeployRequest):
+		msg := "Creating deploy request..."
+		if m.deployRequestURL != "" {
+			msg = fmt.Sprintf("Deploy request created  %s", m.deployRequestURL)
+		}
+		b.WriteString(m.spinner.View() + msg + m.elapsed() + "\n")
 	case state.IsState(m.state, state.Apply.Pending):
 		b.WriteString(m.spinner.View() + "Starting...\n")
 	}
 
-	// Render each table
-	for i, t := range tables {
-		b.WriteString(m.renderTable(t))
-		// Add spacing between tables (but not after the last one)
-		if i < len(tables)-1 {
-			b.WriteString("\n")
-		}
-	}
+	// Render tables grouped by keyspace
+	m.renderTables(&b, tables)
 
 	// Footer based on state
 	isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
@@ -121,6 +112,18 @@ func (m WatchModel) progressView() string {
 		b.WriteString("\n\n")
 		b.WriteString(templates.FormatApplyComplete())
 		b.WriteString("\n")
+	case state.IsState(m.state, state.Apply.Cancelled):
+		b.WriteString("\n\n")
+		b.WriteString("🚫 Schema change cancelled.\n")
+		b.WriteString("The deploy request has been cancelled. Start a new apply to retry.\n")
+	case state.IsState(m.state, state.Apply.RevertWindow):
+		b.WriteString("\n\n")
+		if m.skipRevertTriggered || (m.metadata != nil && m.metadata["revert_skipped"] == "true") {
+			b.WriteString(m.spinner.View() + "Finalizing — closing revert window...\n")
+		} else {
+			b.WriteString("Schema change deployed. Revert window is open.\n\n")
+			b.WriteString("Press Enter to skip revert or ESC to detach\n")
+		}
 	case effectivelyStopped:
 		b.WriteString("\n\n")
 		b.WriteString(templates.FormatApplyStopped())
@@ -183,141 +186,79 @@ func (m WatchModel) fetchErrorLine() string {
 	return errStyle.Render(label+": "+m.errorMsg) + "\n"
 }
 
-// renderTable renders a single table's progress.
-func (m WatchModel) renderTable(t tableProgress) string {
-	var b strings.Builder
-
-	// Format DDL with multi-line support for multiple clauses
-	ddlFormatted := ddl.FormatDDL(t.DDL)
-
-	// Calculate indentation to align with table name
-	indent := strings.Repeat(" ", m.maxTableNameLen+2) // +2 for ": "
-
-	// Helper to write DDL with proper indentation and syntax highlighting
-	// Truncates if too many lines
-	writeDDL := func() {
-		if ddlFormatted == "" {
-			return
-		}
-		const maxLines = 5
-		lines := strings.Split(ddlFormatted, "\n")
-		for i, line := range lines {
-			if i >= maxLines {
-				fmt.Fprintf(&b, "%s... (%d more clauses)\n", indent, len(lines)-maxLines)
-				break
+// toTemplateTables converts TUI tableProgress slices to template TableProgress
+// so the shared rendering functions can be used.
+func toTemplateTables(tables []tableProgress) []templates.TableProgress {
+	result := make([]templates.TableProgress, len(tables))
+	for i, t := range tables {
+		// Derive table-level ETA from max shard ETA for Vitess tables
+		var etaSeconds int64
+		for _, sh := range t.Shards {
+			if sh.ETASeconds > etaSeconds {
+				etaSeconds = sh.ETASeconds
 			}
-			fmt.Fprintf(&b, "%s%s\n", indent, templates.FormatSQL(line))
+		}
+		tp := templates.TableProgress{
+			TableName:       t.Name,
+			Namespace:       t.Keyspace,
+			DDL:             t.DDL,
+			Status:          state.NormalizeTaskStatus(t.Status),
+			RowsCopied:      t.RowsCopied,
+			RowsTotal:       t.RowsTotal,
+			PercentComplete: t.Percent,
+			ETASeconds:      etaSeconds,
+			ProgressDetail:  t.ProgressDetail,
+		}
+		for _, sh := range t.Shards {
+			tp.Shards = append(tp.Shards, templates.ShardProgress{
+				Shard:      sh.Shard,
+				Status:     state.NormalizeShardStatus(sh.Status),
+				RowsCopied: sh.RowsCopied,
+				RowsTotal:  sh.RowsTotal,
+				ETASeconds: sh.ETASeconds,
+			})
+		}
+		result[i] = tp
+	}
+	return result
+}
+
+// renderTables converts TUI tables to template types and uses the shared
+// FormatNamespacedTables / FormatTableProgress rendering from the CLI templates.
+func (m WatchModel) renderTables(b *strings.Builder, tables []tableProgress) {
+	tplTables := toTemplateTables(tables)
+
+	hasNamespaces := false
+	for _, t := range tplTables {
+		if t.Namespace != "" {
+			hasNamespaces = true
+			break
 		}
 	}
 
-	// Determine display based on overall state first, then table status
-	// Overall state takes priority to ensure consistent display during transitions
-	switch {
-	// Terminal states - check overall state first
-	case state.IsState(m.state, state.Apply.Completed):
-		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(&b, "%*s: %s ✓ Complete\n", m.maxTableNameLen, t.Name, bar)
-		writeDDL()
-
-	// Stopped state - show tables with their actual status
-	// Tables that completed before the stop should show as complete, not stopped
-	case m.isEffectivelyStopped() && !state.IsState(m.state, state.Apply.Completed):
-		switch {
-		case state.IsState(t.Status, state.Apply.Completed):
-			bar := ui.ProgressBarComplete()
-			fmt.Fprintf(&b, "%*s: %s ✓ Complete\n", m.maxTableNameLen, t.Name, bar)
-		case state.IsState(t.Status, state.Apply.Failed):
-			bar := ui.ProgressBarFailed(t.Percent)
-			fmt.Fprintf(&b, "%*s: %s ❌ Failed\n", m.maxTableNameLen, t.Name, bar)
-		default:
-			pct := t.Percent
-			if pct == 0 && t.RowsTotal > 0 {
-				pct = int(float64(t.RowsCopied) / float64(t.RowsTotal) * 100)
-			}
-			bar := ui.ProgressBarStopped(pct)
-			if pct > 0 {
-				fmt.Fprintf(&b, "%*s: %s ⏹️ Stopped at %d%%\n", m.maxTableNameLen, t.Name, bar, pct)
-			} else {
-				fmt.Fprintf(&b, "%*s: %s ⏹️ Stopped\n", m.maxTableNameLen, t.Name, bar)
-			}
+	if hasNamespaces {
+		b.WriteString(templates.FormatNamespacedTables(tplTables))
+	} else {
+		b.WriteString("\n")
+		for _, t := range tplTables {
+			b.WriteString(templates.FormatTableProgress(t))
 		}
-		writeDDL()
-
-	// Cutover states - all tables show same state during cutover
-	// Also handle when cutover has been triggered but state hasn't updated yet
-	case state.IsState(m.state, state.Apply.CuttingOver) || (m.cutoverTriggered && !state.IsState(m.state, state.Apply.Completed)):
-		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(&b, "%*s: %s 🔄 Cutting over...\n", m.maxTableNameLen, t.Name, bar)
-		writeDDL()
-
-	case state.IsState(m.state, state.Apply.WaitingForCutover):
-		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(&b, "%*s: %s ⏸️ Waiting for cutover\n", m.maxTableNameLen, t.Name, bar)
-		writeDDL()
-
-	// Per-table states - check individual table status
-	case state.IsState(t.Status, state.Apply.Completed):
-		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(&b, "%*s: %s ✓ Complete\n", m.maxTableNameLen, t.Name, bar)
-		writeDDL()
-
-	case state.IsState(t.Status, state.Apply.WaitingForCutover):
-		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(&b, "%*s: %s ⏸️ Waiting for cutover\n", m.maxTableNameLen, t.Name, bar)
-		writeDDL()
-
-	case state.IsState(t.Status, state.Apply.CuttingOver):
-		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(&b, "%*s: %s 🔄 Cutting over...\n", m.maxTableNameLen, t.Name, bar)
-		writeDDL()
-
-	case state.IsState(t.Status, state.Apply.Pending):
-		bar := ui.ProgressBarRowCopy(0)
-		fmt.Fprintf(&b, "%*s: %s queued\n", m.maxTableNameLen, t.Name, bar)
-		writeDDL()
-
-	case state.IsState(t.Status, state.Apply.Stopped):
-		if t.Percent > 0 {
-			bar := ui.ProgressBarStopped(t.Percent)
-			fmt.Fprintf(&b, "%*s: %s ⏹️ Stopped\n", m.maxTableNameLen, t.Name, bar)
-		} else {
-			fmt.Fprintf(&b, "%*s: ⏹️ Stopped (not started)\n", m.maxTableNameLen, t.Name)
-		}
-		writeDDL()
-
-	case state.IsState(t.Status, state.Apply.Failed):
-		bar := ui.ProgressBarFailed(t.Percent)
-		fmt.Fprintf(&b, "%*s: %s ❌ Failed\n", m.maxTableNameLen, t.Name, bar)
-		writeDDL()
-
-	default:
-		// Running state - show progress bar with percentage
-		etaSuffix := ""
-		if t.ETA != "" && t.ETA != "TBD" {
-			etaSuffix = fmt.Sprintf(" ETA %s", strings.TrimSpace(t.ETA))
-		}
-
-		if t.RowsTotal > 0 {
-			bar := ui.ProgressBarRowCopy(t.Percent)
-			fmt.Fprintf(&b, "%*s: %s %d%% (%s/%s rows)%s\n",
-				m.maxTableNameLen, t.Name, bar, t.Percent,
-				ui.FormatNumber(t.RowsCopied),
-				ui.FormatNumber(t.RowsTotal),
-				etaSuffix)
-		} else {
-			// No row data yet (initializing or instant DDL) — just show running
-			fmt.Fprintf(&b, "%*s: Running...\n", m.maxTableNameLen, t.Name)
-		}
-		writeDDL()
 	}
-
-	return b.String()
 }
 
 // formatFooter returns the standard footer (no volume shown by default).
 func (m WatchModel) formatFooter() string {
 	dimStyle := lipgloss.NewStyle().Faint(true)
-	return dimStyle.Render("ESC detach • " + templates.StopKeyHint + " • v volume")
+	stopHint := templates.StopKeyHint
+	if m.isPlanetScale() {
+		stopHint = "c cancel"
+	}
+	return dimStyle.Render("ESC detach • " + stopHint + " • v volume")
+}
+
+// isPlanetScale returns true if the current apply is using the PlanetScale engine.
+func (m WatchModel) isPlanetScale() bool {
+	return strings.EqualFold(m.engine, "PlanetScale") || strings.EqualFold(m.engine, "planetscale")
 }
 
 // formatVolumeMode returns the footer when in volume adjustment mode.
@@ -337,6 +278,19 @@ func (m WatchModel) formatVolumeMode() string {
 	return b.String()
 }
 
+// elapsed returns a formatted elapsed time string for the status line.
+// Shows nothing for the first few seconds to avoid visual noise.
+func (m WatchModel) elapsed() string {
+	if m.startedAt.IsZero() {
+		return ""
+	}
+	d := time.Since(m.startedAt).Round(time.Second)
+	if d < 3*time.Second {
+		return ""
+	}
+	return fmt.Sprintf(" (%s)", d)
+}
+
 // detachedView returns the message shown when user detaches.
 func (m WatchModel) detachedView() string {
 	var b strings.Builder
@@ -345,11 +299,11 @@ func (m WatchModel) detachedView() string {
 	b.WriteString("The schema change continues running in the background.\n")
 	b.WriteString("\n")
 	if m.applyID != "" {
-		fmt.Fprintf(&b, "To watch and manage: schemabot progress --apply-id %s\n", m.applyID)
-		fmt.Fprintf(&b, "To stop:             schemabot stop --apply-id %s\n", m.applyID)
+		fmt.Fprintf(&b, "To reattach: schemabot progress %s\n", m.applyID)
+		fmt.Fprintf(&b, "To stop:     schemabot stop %s\n", m.applyID)
 	} else {
-		fmt.Fprintf(&b, "To watch and manage: schemabot progress -d %s -e %s\n", m.database, m.environment)
-		fmt.Fprintf(&b, "To stop:             schemabot stop -d %s -e %s\n", m.database, m.environment)
+		fmt.Fprintf(&b, "To reattach: schemabot progress -d %s -e %s\n", m.database, m.environment)
+		fmt.Fprintf(&b, "To stop:     schemabot stop -d %s -e %s\n", m.database, m.environment)
 	}
 	return b.String()
 }

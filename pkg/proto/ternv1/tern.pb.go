@@ -1031,6 +1031,7 @@ type TableProgress struct {
 	IsInstant       bool                   `protobuf:"varint,10,opt,name=is_instant,json=isInstant,proto3" json:"is_instant,omitempty"`
 	Shards          []*ShardProgress       `protobuf:"bytes,11,rep,name=shards,proto3" json:"shards,omitempty"`
 	ProgressDetail  string                 `protobuf:"bytes,12,opt,name=progress_detail,json=progressDetail,proto3" json:"progress_detail,omitempty"`
+	ChangeType      ChangeType             `protobuf:"varint,13,opt,name=change_type,json=changeType,proto3,enum=tern.v1.ChangeType" json:"change_type,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -1147,6 +1148,13 @@ func (x *TableProgress) GetProgressDetail() string {
 		return x.ProgressDetail
 	}
 	return ""
+}
+
+func (x *TableProgress) GetChangeType() ChangeType {
+	if x != nil {
+		return x.ChangeType
+	}
+	return ChangeType_CHANGE_TYPE_OTHER
 }
 
 // ProgressResponse contains detailed progress information.
@@ -2261,7 +2269,7 @@ const file_tern_proto_rawDesc = "" +
 	"etaSeconds\x12)\n" +
 	"\x10cutover_attempts\x18\x06 \x01(\x05R\x0fcutoverAttempts\x120\n" +
 	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttempt\x12*\n" +
-	"\x11ready_to_complete\x18\b \x01(\bR\x0freadyToComplete\"\x93\x03\n" +
+	"\x11ready_to_complete\x18\b \x01(\bR\x0freadyToComplete\"\xc9\x03\n" +
 	"\rTableProgress\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x1d\n" +
@@ -2280,7 +2288,9 @@ const file_tern_proto_rawDesc = "" +
 	"is_instant\x18\n" +
 	" \x01(\bR\tisInstant\x12.\n" +
 	"\x06shards\x18\v \x03(\v2\x16.tern.v1.ShardProgressR\x06shards\x12'\n" +
-	"\x0fprogress_detail\x18\f \x01(\tR\x0eprogressDetail\"\xc7\x03\n" +
+	"\x0fprogress_detail\x18\f \x01(\tR\x0eprogressDetail\x124\n" +
+	"\vchange_type\x18\r \x01(\x0e2\x13.tern.v1.ChangeTypeR\n" +
+	"changeType\"\xc7\x03\n" +
 	"\x10ProgressResponse\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12$\n" +
 	"\x05state\x18\x02 \x01(\x0e2\x0e.tern.v1.StateR\x05state\x12'\n" +
@@ -2462,37 +2472,38 @@ var file_tern_proto_depIdxs = []int32{
 	33, // 9: tern.v1.ApplyRequest.schema_files:type_name -> tern.v1.ApplyRequest.SchemaFilesEntry
 	5,  // 10: tern.v1.ApplyRequest.ddl_changes:type_name -> tern.v1.TableChange
 	12, // 11: tern.v1.TableProgress.shards:type_name -> tern.v1.ShardProgress
-	1,  // 12: tern.v1.ProgressResponse.state:type_name -> tern.v1.State
-	0,  // 13: tern.v1.ProgressResponse.engine:type_name -> tern.v1.Engine
-	13, // 14: tern.v1.ProgressResponse.tables:type_name -> tern.v1.TableProgress
-	34, // 15: tern.v1.ProgressResponse.metadata:type_name -> tern.v1.ProgressResponse.MetadataEntry
-	3,  // 16: tern.v1.PlanRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
-	3,  // 17: tern.v1.ApplyRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
-	4,  // 18: tern.v1.Tern.Plan:input_type -> tern.v1.PlanRequest
-	9,  // 19: tern.v1.Tern.Apply:input_type -> tern.v1.ApplyRequest
-	11, // 20: tern.v1.Tern.Progress:input_type -> tern.v1.ProgressRequest
-	15, // 21: tern.v1.Tern.Cutover:input_type -> tern.v1.CutoverRequest
-	17, // 22: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
-	19, // 23: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
-	21, // 24: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
-	23, // 25: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
-	25, // 26: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
-	27, // 27: tern.v1.Tern.Volume:input_type -> tern.v1.VolumeRequest
-	8,  // 28: tern.v1.Tern.Plan:output_type -> tern.v1.PlanResponse
-	10, // 29: tern.v1.Tern.Apply:output_type -> tern.v1.ApplyResponse
-	14, // 30: tern.v1.Tern.Progress:output_type -> tern.v1.ProgressResponse
-	16, // 31: tern.v1.Tern.Cutover:output_type -> tern.v1.CutoverResponse
-	18, // 32: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
-	20, // 33: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
-	22, // 34: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
-	24, // 35: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
-	26, // 36: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse
-	28, // 37: tern.v1.Tern.Volume:output_type -> tern.v1.VolumeResponse
-	28, // [28:38] is the sub-list for method output_type
-	18, // [18:28] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	2,  // 12: tern.v1.TableProgress.change_type:type_name -> tern.v1.ChangeType
+	1,  // 13: tern.v1.ProgressResponse.state:type_name -> tern.v1.State
+	0,  // 14: tern.v1.ProgressResponse.engine:type_name -> tern.v1.Engine
+	13, // 15: tern.v1.ProgressResponse.tables:type_name -> tern.v1.TableProgress
+	34, // 16: tern.v1.ProgressResponse.metadata:type_name -> tern.v1.ProgressResponse.MetadataEntry
+	3,  // 17: tern.v1.PlanRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
+	3,  // 18: tern.v1.ApplyRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
+	4,  // 19: tern.v1.Tern.Plan:input_type -> tern.v1.PlanRequest
+	9,  // 20: tern.v1.Tern.Apply:input_type -> tern.v1.ApplyRequest
+	11, // 21: tern.v1.Tern.Progress:input_type -> tern.v1.ProgressRequest
+	15, // 22: tern.v1.Tern.Cutover:input_type -> tern.v1.CutoverRequest
+	17, // 23: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
+	19, // 24: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
+	21, // 25: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
+	23, // 26: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
+	25, // 27: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
+	27, // 28: tern.v1.Tern.Volume:input_type -> tern.v1.VolumeRequest
+	8,  // 29: tern.v1.Tern.Plan:output_type -> tern.v1.PlanResponse
+	10, // 30: tern.v1.Tern.Apply:output_type -> tern.v1.ApplyResponse
+	14, // 31: tern.v1.Tern.Progress:output_type -> tern.v1.ProgressResponse
+	16, // 32: tern.v1.Tern.Cutover:output_type -> tern.v1.CutoverResponse
+	18, // 33: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
+	20, // 34: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
+	22, // 35: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
+	24, // 36: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
+	26, // 37: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse
+	28, // 38: tern.v1.Tern.Volume:output_type -> tern.v1.VolumeResponse
+	29, // [29:39] is the sub-list for method output_type
+	19, // [19:29] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_tern_proto_init() }

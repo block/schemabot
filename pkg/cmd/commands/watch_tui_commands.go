@@ -88,6 +88,25 @@ func (m WatchModel) triggerStop() tea.Cmd {
 	}
 }
 
+func (m WatchModel) triggerSkipRevert() tea.Cmd {
+	return func() tea.Msg {
+		result, err := client.CallSkipRevertAPI(m.endpoint, m.database, m.environment)
+		if err != nil {
+			return stopResultMsg{success: false, err: err}
+		}
+
+		if !result.Accepted {
+			errMsg := result.ErrorMessage
+			if errMsg == "" {
+				errMsg = "skip-revert not accepted"
+			}
+			return stopResultMsg{success: false, err: fmt.Errorf("%s", errMsg)}
+		}
+
+		return stopResultMsg{success: true, message: "Revert window closed"}
+	}
+}
+
 // handleVolumeKeys handles keyboard input when in volume mode.
 func (m WatchModel) handleVolumeKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
@@ -191,6 +210,8 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 		applyID:     result.ApplyID,
 		database:    result.Database,
 		environment: result.Environment,
+		engine:      result.Engine,
+		metadata:    result.Metadata,
 	}
 
 	// Convert tables with internal table filtering and Spirit progress parsing
@@ -198,6 +219,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 	for _, tbl := range filtered {
 		tp := tableProgress{
 			Name:           tbl.TableName,
+			Keyspace:       tbl.Keyspace,
 			DDL:            tbl.DDL,
 			Status:         tbl.Status,
 			RowsCopied:     tbl.RowsCopied,
@@ -212,6 +234,21 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 				tp.RowsTotal = info.RowsTotal
 				tp.ETA = info.ETA
 			}
+		}
+		for _, sh := range tbl.Shards {
+			pct := int(sh.PercentComplete)
+			if pct == 0 && sh.RowsTotal > 0 {
+				pct = int(sh.RowsCopied * 100 / sh.RowsTotal)
+			}
+			tp.Shards = append(tp.Shards, shardProgress{
+				Shard:           sh.Shard,
+				Status:          sh.Status,
+				RowsCopied:      sh.RowsCopied,
+				RowsTotal:       sh.RowsTotal,
+				Percent:         pct,
+				ETASeconds:      sh.ETASeconds,
+				CutoverAttempts: int(sh.CutoverAttempts),
+			})
 		}
 		msg.tables = append(msg.tables, tp)
 	}
@@ -235,11 +272,6 @@ func sortStoppedByProgress(tables []tableProgress) {
 		}
 		return false
 	})
-}
-
-func isTableComplete(status string) bool {
-	upper := strings.ToUpper(status)
-	return upper == "COMPLETED" || upper == "STATE_COMPLETED"
 }
 
 func isTableStopped(status string) bool {

@@ -271,6 +271,9 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	if deferCutover {
 		options["defer_cutover"] = "true"
 	}
+	if skipRevert {
+		options["skip_revert"] = "true"
+	}
 
 	applyResult, err := client.CallApplyAPI(ep, planResult.PlanID, database, environment, caller, options, opts...)
 	if err != nil {
