@@ -390,11 +390,7 @@ func FormatTableProgress(t TableProgress) string {
 		return b.String()
 	case state.Apply.Completed:
 		bar := ui.ProgressBarComplete()
-		if t.IsInstant {
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⚡ Instant\n", t.TableName, bar)
-		} else {
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete\n", t.TableName, bar)
-		}
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete\n", t.TableName, bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
