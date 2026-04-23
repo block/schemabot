@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"google.golang.org/grpc"
 
 	"github.com/block/schemabot/pkg/api"
@@ -117,10 +118,14 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	}
 	mux.Handle("POST /webhook", webhookHandler)
 
+	// Wrap mux with OTel HTTP instrumentation for automatic request
+	// duration, request body size, and response body size metrics.
+	handler := otelhttp.NewHandler(mux, "schemabot")
+
 	// Create server
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
