@@ -470,6 +470,18 @@ func FormatTableProgress(t TableProgress) string {
 		return b.String()
 	}
 
+	// Instant DDL — completed immediately, no row copy
+	if t.IsInstant {
+		bar := ui.ProgressBarComplete()
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⚡ Instant\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
+	}
+
 	// In-progress state - try to parse Spirit's progress detail
 	switch {
 	case t.ProgressDetail != "":

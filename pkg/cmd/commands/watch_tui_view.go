@@ -119,7 +119,11 @@ func (m WatchModel) progressView() string {
 	case state.IsState(m.state, state.Apply.RevertWindow):
 		b.WriteString("\n\n")
 		if m.skipRevertTriggered || (m.metadata != nil && m.metadata["revert_skipped"] == "true") {
-			b.WriteString(m.spinner.View() + "Finalizing — closing revert window...\n")
+			elapsed := ""
+			if !m.skipRevertAt.IsZero() {
+				elapsed = fmt.Sprintf(" (%ds)", int(time.Since(m.skipRevertAt).Seconds()))
+			}
+			b.WriteString(m.spinner.View() + "Finalizing — closing revert window..." + elapsed + "\n")
 		} else {
 			b.WriteString("Schema change deployed. Revert window is open.\n\n")
 			b.WriteString("Press Enter to skip revert or ESC to detach\n")

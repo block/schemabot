@@ -866,10 +866,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return &engine.ApplyResult{Message: "no changes detected"}, nil
 	}
 
-	// Determine instant DDL eligibility
+	// Determine instant DDL eligibility. Prefer instant when PlanetScale reports
+	// it as eligible — instant DDL modifies metadata only (no row copy), so it
+	// completes immediately and has no revert window regardless of skip_revert.
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	skipRevert := req.Options["skip_revert"] == "true"
-	useInstant := instantEligible && !deferCutover && skipRevert
+	useInstant := instantEligible && !deferCutover
 
 	drElapsed := time.Since(drStart).Round(time.Second)
 	emitEvent(fmt.Sprintf("Deploy request #%d ready (%s)", dr.Number, drElapsed), map[string]string{
@@ -1259,10 +1260,9 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		})
 	}
 
-	// Deploy
+	// Deploy — prefer instant when eligible (no row copy, no revert window needed).
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	skipRevert := req.Options["skip_revert"] == "true"
-	useInstant := instantEligible && !deferCutover && skipRevert
+	useInstant := instantEligible && !deferCutover
 
 	dr, err = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
 		Organization: org, Database: req.Database, Number: dr.Number, InstantDDL: useInstant,
@@ -1890,7 +1890,6 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 		// Determine aggregate table state from shard states
 		tableState := state.Vitess.Complete
 		for i, sh := range shards {
-			tblRowsCopied += sh.rowsCopied
 			tblTableRows += sh.tableRows
 			if sh.etaSeconds > maxETA {
 				maxETA = sh.etaSeconds
@@ -1915,11 +1914,24 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 				shardState = state.Vitess.ReadyToComplete
 			}
 
+			shardPct := sh.progress
+			shardCopied := sh.rowsCopied
+			// When a shard is ready for cutover, the copy phase is complete.
+			// Clamp to 100% since Vitess row counts can lag behind slightly.
+			if shardState == state.Vitess.ReadyToComplete || shardState == state.Vitess.Complete {
+				shardPct = 100
+				if sh.tableRows > 0 && shardCopied < sh.tableRows {
+					shardCopied = sh.tableRows
+				}
+			}
+
+			tblRowsCopied += shardCopied
+
 			shardProgress[i] = engine.ShardProgress{
 				Shard:           sh.shard,
 				State:           shardState,
-				Progress:        sh.progress,
-				RowsCopied:      sh.rowsCopied,
+				Progress:        shardPct,
+				RowsCopied:      shardCopied,
 				RowsTotal:       sh.tableRows,
 				ETASeconds:      sh.etaSeconds,
 				CutoverAttempts: sh.cutoverAttempts,

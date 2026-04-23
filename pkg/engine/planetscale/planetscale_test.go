@@ -255,6 +255,56 @@ func TestAggregateShardProgress(t *testing.T) {
 		assert.Equal(t, "items", tables[1].Table)
 		assert.Equal(t, 50, overall) // 150/300
 	})
+
+	t.Run("ready_to_complete clamps progress to 100%", func(t *testing.T) {
+		// Vitess row counts can lag behind (concurrent inserts during copy).
+		// When a shard reaches ready_to_complete, the copy is done — show 100%.
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running", ReadyToComplete: true, Progress: 98, RowsCopied: 9800, TableRows: 10000},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "running", ReadyToComplete: true, Progress: 97, RowsCopied: 9700, TableRows: 10000},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].State)
+		assert.Equal(t, 100, tables[0].Progress)
+		// Each shard should show 100% and clamped rows
+		for _, sh := range tables[0].Shards {
+			assert.Equal(t, 100, sh.Progress, "shard %s should be 100%%", sh.Shard)
+			assert.Equal(t, int64(10000), sh.RowsCopied, "shard %s rows should be clamped", sh.Shard)
+			assert.Equal(t, int64(10000), sh.RowsTotal, "shard %s total", sh.Shard)
+		}
+	})
+
+	t.Run("complete shard clamps progress to 100%", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-", Table: "users", Status: "complete", RowsCopied: 284953, TableRows: 284953},
+		}
+
+		tables, overall := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, 100, tables[0].Progress)
+		assert.Equal(t, 100, tables[0].Shards[0].Progress)
+		assert.Equal(t, 100, overall)
+	})
+
+	t.Run("mixed ready_to_complete and running", func(t *testing.T) {
+		// One shard done, one still copying — table should be running, not ready_to_complete
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running", ReadyToComplete: true, Progress: 99, RowsCopied: 10000, TableRows: 10000},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "running", ReadyToComplete: false, Progress: 50, RowsCopied: 5000, TableRows: 10000},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.Running, tables[0].State)
+		// First shard (ready_to_complete) should be clamped to 100%
+		assert.Equal(t, 100, tables[0].Shards[0].Progress)
+		assert.Equal(t, int64(10000), tables[0].Shards[0].RowsCopied)
+		// Second shard (still running) should show actual progress
+		assert.Equal(t, 50, tables[0].Shards[1].Progress)
+		assert.Equal(t, int64(5000), tables[0].Shards[1].RowsCopied)
+	})
 }
 
 func TestValidateMigrationContext(t *testing.T) {

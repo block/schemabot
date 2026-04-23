@@ -24,6 +24,7 @@ type WatchModel struct {
 	maxTableNameLen     int
 	cutoverTriggered    bool
 	skipRevertTriggered bool
+	skipRevertAt        time.Time // When skip-revert was triggered (for timeout)
 	stopTriggered       bool
 
 	// State from API
@@ -198,6 +199,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Trigger skip-revert if in revert window
 			if state.IsState(m.state, state.Apply.RevertWindow) && !m.skipRevertTriggered {
 				m.skipRevertTriggered = true
+				m.skipRevertAt = time.Now()
 				return m, m.triggerSkipRevert()
 			}
 		}
@@ -223,6 +225,14 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.consecutiveErrors = 0
 		m.errorMsg = ""
 		m.state = msg.state
+
+		// Timeout skip-revert if state hasn't transitioned after 10s.
+		if m.skipRevertTriggered && !m.skipRevertAt.IsZero() &&
+			state.IsState(m.state, state.Apply.RevertWindow) &&
+			time.Since(m.skipRevertAt) > 10*time.Second {
+			m.skipRevertTriggered = false
+			m.errorMsg = "skip-revert timed out — press Enter to retry"
+		}
 		// Preserve last known tables during volume change to avoid visual reset
 		if !m.volumeChanging || len(m.tables) == 0 {
 			m.tables = msg.tables
@@ -284,7 +294,8 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case stopResultMsg:
 		if msg.err != nil {
 			m.errorMsg = msg.err.Error()
-			m.stopTriggered = false // Allow retry
+			m.stopTriggered = false       // Allow retry
+			m.skipRevertTriggered = false // Allow retry
 		} else if msg.message != "" {
 			// Backend returned an informational message (e.g. apply completed before stop)
 			// Clear stop state so the TUI transitions cleanly to the completion view

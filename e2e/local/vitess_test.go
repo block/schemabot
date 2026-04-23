@@ -500,6 +500,18 @@ func TestVitess_Apply_AddColumn_Sharded(t *testing.T) {
 	e2eutil.AssertContains(t, out, "ADD COLUMN")
 	e2eutil.AssertContains(t, out, colName)
 	e2eutil.AssertContains(t, out, "Apply completed")
+
+	// Verify instant DDL was used — ADD COLUMN NULL is instant in MySQL 8.0+.
+	// LocalScale tries ALGORITHM=INSTANT first and Vitess reports is_immediate_operation=1.
+	applyID := extractApplyIDFromLog(out)
+	endpoint := schemabotURL(t)
+	resp, err := client.GetProgress(endpoint, applyID)
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.Tables, "expected table progress")
+	for _, tbl := range resp.Tables {
+		assert.True(t, tbl.IsInstant, "ADD COLUMN NULL should use instant DDL for table %s", tbl.TableName)
+		assert.Equal(t, int32(100), tbl.PercentComplete, "instant DDL should show 100%% for table %s", tbl.TableName)
+	}
 }
 
 func TestVitess_Apply_ConsecutiveApplies(t *testing.T) {
