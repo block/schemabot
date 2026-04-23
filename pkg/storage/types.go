@@ -127,6 +127,14 @@ const (
 	EnginePlanetScale = "planetscale"
 )
 
+// EngineForType returns the engine name for a database type.
+func EngineForType(dbType string) string {
+	if dbType == DatabaseTypeVitess {
+		return EnginePlanetScale
+	}
+	return EngineSpirit
+}
+
 // TableChange represents a DDL change to a single table.
 type TableChange struct {
 	// Namespace is the schema name (MySQL) or keyspace (Vitess).
@@ -314,9 +322,9 @@ type ApplyOptions struct {
 	// Not applicable to direct MySQL DDL.
 	DeferCutover bool `json:"defer_cutover,omitempty"`
 
-	// EnableRevert enables revert window after completion.
-	// Vitess/PlanetScale only - allows rolling back within a time window.
-	EnableRevert bool `json:"enable_revert,omitempty"`
+	// SkipRevert skips the revert window after completion.
+	// Vitess/PlanetScale only — revert window is ON by default.
+	SkipRevert bool `json:"skip_revert,omitempty"`
 
 	// Volume controls schema change aggressiveness (1-11).
 	// Spirit: maps to threads and chunk time
@@ -469,14 +477,15 @@ const (
 
 // ApplyLogEventType constants for categorizing log entries.
 const (
-	LogEventStateTransition  = "state_transition"
-	LogEventTaskUpdate       = "task_update"
-	LogEventStopRequested    = "stop_requested"
-	LogEventStartRequested   = "start_requested"
-	LogEventCutoverTriggered = "cutover_triggered"
-	LogEventError            = "error"
-	LogEventInfo             = "info"
-	LogEventProgress         = "progress"
+	LogEventStateTransition     = "state_transition"
+	LogEventTaskUpdate          = "task_update"
+	LogEventStopRequested       = "stop_requested"
+	LogEventStartRequested      = "start_requested"
+	LogEventCutoverTriggered    = "cutover_triggered"
+	LogEventSkipRevertTriggered = "skip_revert_triggered"
+	LogEventError               = "error"
+	LogEventInfo                = "info"
+	LogEventProgress            = "progress"
 )
 
 // ApplyLogSource constants for identifying the origin of log entries.
@@ -528,4 +537,20 @@ type ApplyLogFilter struct {
 	Level     string // Optional: filter by level
 	EventType string // Optional: filter by event type
 	Limit     int    // Optional: limit results (default 100)
+}
+
+// VitessApplyData holds Vitess-specific data for deploy request tracking.
+// Stored in vitess_apply_data table, one row per apply when database_type = 'vitess'.
+type VitessApplyData struct {
+	ApplyID          int64
+	BranchName       string
+	DeployRequestID  uint64
+	MigrationContext string
+	DeployRequestURL string
+
+	// RevertSkippedAt records when skip-revert was dispatched. Non-nil means
+	// finalization is in progress — the deploy request is transitioning across
+	// shards from complete_pending_revert to complete. On large keyspaces
+	// this can take longer as shards are processed in batches.
+	RevertSkippedAt *time.Time
 }

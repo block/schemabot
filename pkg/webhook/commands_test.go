@@ -46,14 +46,14 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "apply with enable-revert",
-			body: "schemabot apply -e staging --enable-revert",
+			name: "apply with skip-revert",
+			body: "schemabot apply -e staging --skip-revert",
 			expected: CommandResult{
-				Action:       "apply",
-				Environment:  "staging",
-				Found:        true,
-				IsMention:    true,
-				EnableRevert: true,
+				Action:      "apply",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+				SkipRevert:  true,
 			},
 		},
 		{
@@ -247,14 +247,14 @@ func TestParseCommand(t *testing.T) {
 		},
 		{
 			name: "all flags combined",
-			body: "schemabot apply -e production -d payments_db --defer-cutover --enable-revert --allow-unsafe",
+			body: "schemabot apply -e production -d payments_db --defer-cutover --skip-revert --allow-unsafe",
 			expected: CommandResult{
 				Action:       "apply",
 				Environment:  "production",
 				Database:     "payments_db",
 				Found:        true,
 				IsMention:    true,
-				EnableRevert: true,
+				SkipRevert:   true,
 				DeferCutover: true,
 				AllowUnsafe:  true,
 			},

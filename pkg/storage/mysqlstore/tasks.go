@@ -87,7 +87,7 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 
 // Update updates an existing task.
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
-	result, err := s.db.ExecContext(ctx, `
+	_, err := s.db.ExecContext(ctx, `
 		UPDATE tasks SET
 			state = ?, error_message = ?, options = ?,
 			rows_copied = ?, rows_total = ?, progress_percent = ?, eta_seconds = ?,
@@ -99,11 +99,7 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 		task.IsInstant, task.ReadyToComplete, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt,
 		task.ID)
-	if err != nil {
-		return err
-	}
-
-	return checkRowsAffected(result, storage.ErrTaskNotFound)
+	return err
 }
 
 // GetByApplyID returns all tasks for an apply.

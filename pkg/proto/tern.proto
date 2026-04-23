@@ -210,6 +210,10 @@ enum State {
   STATE_FAILED = 7;
   STATE_STOPPED = 8;
   STATE_REVERTED = 9;
+  STATE_CANCELLED = 10;
+  STATE_CREATING_BRANCH = 11;
+  STATE_APPLYING_BRANCH_CHANGES = 12;
+  STATE_CREATING_DEPLOY_REQUEST = 13;
 }
 
 // ChangeType represents the type of DDL change.
@@ -302,6 +306,8 @@ message ApplyRequest {
   // Opaque identifier for endpoint discovery (e.g., database identifier).
   // Forwarded to Tern for provider-based resolution. Defaults to database if empty.
   string target = 8;
+  // Caller identity (e.g., "cli:user@hostname", "webhook:repo#pr").
+  string caller = 9;
 }
 
 // ApplyResponse indicates whether the apply was accepted.

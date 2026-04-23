@@ -56,16 +56,17 @@ type reviewGateMockStorage struct {
 	settings *mockSettingsStore
 }
 
-func (m *reviewGateMockStorage) Locks() storage.LockStore                 { return nil }
-func (m *reviewGateMockStorage) Plans() storage.PlanStore                 { return nil }
-func (m *reviewGateMockStorage) Applies() storage.ApplyStore              { return nil }
-func (m *reviewGateMockStorage) Tasks() storage.TaskStore                 { return nil }
-func (m *reviewGateMockStorage) ApplyLogs() storage.ApplyLogStore         { return nil }
-func (m *reviewGateMockStorage) ApplyComments() storage.ApplyCommentStore { return nil }
-func (m *reviewGateMockStorage) Checks() storage.CheckStore               { return nil }
-func (m *reviewGateMockStorage) Settings() storage.SettingsStore          { return m.settings }
-func (m *reviewGateMockStorage) Ping(_ context.Context) error             { return nil }
-func (m *reviewGateMockStorage) Close() error                             { return nil }
+func (m *reviewGateMockStorage) Locks() storage.LockStore                      { return nil }
+func (m *reviewGateMockStorage) Plans() storage.PlanStore                      { return nil }
+func (m *reviewGateMockStorage) Applies() storage.ApplyStore                   { return nil }
+func (m *reviewGateMockStorage) Tasks() storage.TaskStore                      { return nil }
+func (m *reviewGateMockStorage) ApplyLogs() storage.ApplyLogStore              { return nil }
+func (m *reviewGateMockStorage) ApplyComments() storage.ApplyCommentStore      { return nil }
+func (m *reviewGateMockStorage) VitessApplyData() storage.VitessApplyDataStore { return nil }
+func (m *reviewGateMockStorage) Checks() storage.CheckStore                    { return nil }
+func (m *reviewGateMockStorage) Settings() storage.SettingsStore               { return m.settings }
+func (m *reviewGateMockStorage) Ping(_ context.Context) error                  { return nil }
+func (m *reviewGateMockStorage) Close() error                                  { return nil }
 
 func setupReviewGateHandler(t *testing.T, settings map[string]string) (*Handler, *http.ServeMux) {
 	t.Helper()

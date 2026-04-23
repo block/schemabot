@@ -109,18 +109,14 @@ func (s *applyStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Ap
 
 // Update updates apply state and fields.
 func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
-	result, err := s.db.ExecContext(ctx, `
+	_, err := s.db.ExecContext(ctx, `
 		UPDATE applies
 		SET state = ?, error_message = ?,
 		    external_id = ?, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?
 	`, apply.State, apply.ErrorMessage,
 		apply.ExternalID, apply.StartedAt, apply.CompletedAt, apply.ID)
-	if err != nil {
-		return err
-	}
-
-	return checkRowsAffected(result, storage.ErrApplyNotFound)
+	return err
 }
 
 // GetInProgress returns all applies in non-terminal states.

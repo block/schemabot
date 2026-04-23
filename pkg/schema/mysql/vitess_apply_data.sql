@@ -5,6 +5,7 @@ CREATE TABLE `vitess_apply_data` (
   `deploy_request_id` bigint unsigned DEFAULT NULL,
   `migration_context` varchar(255) DEFAULT NULL,
   `deploy_request_url` varchar(512) DEFAULT NULL,
+  `revert_skipped_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),

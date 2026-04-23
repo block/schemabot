@@ -13,7 +13,7 @@ type CommandParser struct {
 	commandWithoutEnvRegex *regexp.Regexp
 	rollbackRegex          *regexp.Regexp // rollback <apply-id>
 	databaseRegex          *regexp.Regexp
-	enableRevertRegex      *regexp.Regexp
+	skipRevertRegex        *regexp.Regexp
 	deferCutoverRegex      *regexp.Regexp
 	allowUnsafeRegex       *regexp.Regexp
 }
@@ -27,7 +27,7 @@ func NewCommandParser() *CommandParser {
 		commandWithoutEnvRegex: regexp.MustCompile(`(?i)schemabot\s+(plan|apply|apply-confirm|unlock|stop|revert|skip-revert|cutover|rollback|rollback-confirm|fix-lint)\b`),
 		rollbackRegex:          regexp.MustCompile(`(?i)schemabot\s+rollback\s+(apply[_-][a-f0-9]+)`),
 		databaseRegex:          regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
-		enableRevertRegex:      regexp.MustCompile(`(?i)--enable-revert\b`),
+		skipRevertRegex:        regexp.MustCompile(`(?i)--skip-revert\b`),
 		deferCutoverRegex:      regexp.MustCompile(`(?i)--defer-cutover\b`),
 		allowUnsafeRegex:       regexp.MustCompile(`(?i)--allow-unsafe\b`),
 	}
@@ -39,7 +39,7 @@ type CommandResult struct {
 	ApplyID      string // Positional arg for rollback <apply-id>
 	Environment  string
 	Database     string // Optional -d flag value
-	EnableRevert bool
+	SkipRevert   bool
 	DeferCutover bool
 	AllowUnsafe  bool
 	Found        bool
@@ -80,7 +80,7 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 			Environment:  strings.ToLower(matches[2]),
 			Found:        true,
 			IsMention:    true,
-			EnableRevert: p.enableRevertRegex.MatchString(body),
+			SkipRevert:   p.skipRevertRegex.MatchString(body),
 			DeferCutover: p.deferCutoverRegex.MatchString(body),
 			AllowUnsafe:  p.allowUnsafeRegex.MatchString(body),
 		}

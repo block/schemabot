@@ -36,4 +36,7 @@ var (
 
 	// ErrApplyCommentNotFound is returned when an apply comment does not exist.
 	ErrApplyCommentNotFound = errors.New("apply comment not found")
+
+	// ErrVitessApplyDataNotFound is returned when no vitess apply data exists for an apply.
+	ErrVitessApplyDataNotFound = errors.New("vitess apply data not found")
 )
