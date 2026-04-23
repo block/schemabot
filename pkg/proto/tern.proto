@@ -356,6 +356,7 @@ message TableProgress {
   bool is_instant = 10;
   repeated ShardProgress shards = 11;
   string progress_detail = 12;
+  ChangeType change_type = 13;
 }
 
 // ProgressResponse contains detailed progress information.

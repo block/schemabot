@@ -14,6 +14,20 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
+// changeTypeToString converts a proto ChangeType enum to a lowercase string.
+func changeTypeToString(ct ternv1.ChangeType) string {
+	switch ct {
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
+		return "create"
+	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
+		return "alter"
+	case ternv1.ChangeType_CHANGE_TYPE_DROP:
+		return "drop"
+	default:
+		return ""
+	}
+}
+
 // deriveErrorCode returns an error code based on apply state
 // and error message. Returns empty string when no error code applies.
 func deriveErrorCode(applyState, errorMessage string) string {
@@ -66,6 +80,8 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 	for _, t := range resp.Tables {
 		httpResp.Tables = append(httpResp.Tables, &apitypes.TableProgressResponse{
 			TableName:       t.TableName,
+			Keyspace:        t.Namespace,
+			ChangeType:      changeTypeToString(t.ChangeType),
 			DDL:             t.Ddl,
 			Status:          t.Status,
 			RowsCopied:      t.RowsCopied,
@@ -513,6 +529,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	for _, task := range tasks {
 		httpResp.Tables = append(httpResp.Tables, &apitypes.TableProgressResponse{
 			TableName:       task.TableName,
+			ChangeType:      task.DDLAction,
 			DDL:             task.DDL,
 			Status:          task.State,
 			RowsCopied:      task.RowsCopied,

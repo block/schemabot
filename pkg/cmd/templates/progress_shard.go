@@ -9,6 +9,13 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
+// Shard indentation constants (derived from indentContent in progress.go).
+var (
+	indentShardHeader = indentContent + "• "   // Shards: header with bullet
+	indentShardLine   = indentContent + "    " // individual shard lines
+	indentShardMore   = indentContent + "    " // "... N more" lines
+)
+
 // maxShardDetail is the maximum number of individual shard lines to render.
 // Beyond this, only non-terminal (copying/queued/failed) shards are shown
 // with a collapsed summary for complete shards.
@@ -26,7 +33,7 @@ func FormatShardProgress(shards []ShardProgress) string {
 
 	c := CountShardsByStatus(shards)
 	parts := FormatShardSummaryParts(c, false)
-	fmt.Fprintf(&b, "    %sShards: %d (%s)%s\n", ANSIDim, len(shards), strings.Join(parts, ", "), ANSIReset)
+	fmt.Fprintf(&b, indentShardHeader+"%sShards: %d (%s)%s\n", ANSIDim, len(shards), strings.Join(parts, ", "), ANSIReset)
 
 	// For small shard counts, show all shards
 	if len(shards) <= maxShardDetail {
@@ -64,11 +71,11 @@ func FormatShardProgress(shards []ShardProgress) string {
 		}
 	}
 	if waitingCount > maxNonCopyingShown {
-		fmt.Fprintf(&b, "      %s... %d more ready for cutover%s\n",
+		fmt.Fprintf(&b, indentShardMore+"%s... %d more ready for cutover%s\n",
 			ANSIDim, waitingCount-maxNonCopyingShown, ANSIReset)
 	}
 	if cuttingCount > maxNonCopyingShown {
-		fmt.Fprintf(&b, "      %s... %d more cutting over%s\n",
+		fmt.Fprintf(&b, indentShardMore+"%s... %d more cutting over%s\n",
 			ANSIDim, cuttingCount-maxNonCopyingShown, ANSIReset)
 	}
 
@@ -90,7 +97,7 @@ func FormatShardProgress(shards []ShardProgress) string {
 		b.WriteString(formatShardLine(s))
 	}
 	if len(copying) > maxCopyingShown {
-		fmt.Fprintf(&b, "      %s... %d more copying shards%s\n",
+		fmt.Fprintf(&b, indentShardMore+"%s... %d more copying shards%s\n",
 			ANSIDim, len(copying)-maxCopyingShown, ANSIReset)
 	}
 
@@ -103,7 +110,7 @@ func FormatShardProgress(shards []ShardProgress) string {
 		if c.Queued > 0 {
 			remainParts = append(remainParts, fmt.Sprintf("%d queued", c.Queued))
 		}
-		fmt.Fprintf(&b, "      %s... %s%s\n", ANSIDim, strings.Join(remainParts, ", "), ANSIReset)
+		fmt.Fprintf(&b, indentShardMore+"%s... %s%s\n", ANSIDim, strings.Join(remainParts, ", "), ANSIReset)
 	}
 
 	return b.String()
@@ -112,7 +119,7 @@ func FormatShardProgress(shards []ShardProgress) string {
 func formatShardLine(s ShardProgress) string {
 	switch s.Status {
 	case state.Task.Completed:
-		return fmt.Sprintf("      %s✓ %s%s: %s rows\n", ANSIGreen, s.Shard, ANSIReset, ui.FormatNumber(s.RowsTotal))
+		return fmt.Sprintf(indentShardLine+"%s✓ %s%s: %s rows\n", ANSIGreen, s.Shard, ANSIReset, ui.FormatNumber(s.RowsTotal))
 	case state.Task.Running:
 		pct := s.PercentComplete
 		if pct == 0 && s.RowsTotal > 0 {
@@ -122,17 +129,17 @@ func formatShardLine(s ShardProgress) string {
 		if s.ETASeconds > 0 {
 			detail += fmt.Sprintf(" ETA %s", FormatDurationSeconds(s.ETASeconds))
 		}
-		return fmt.Sprintf("      %s◉ %s%s: %s\n", ANSICyan, s.Shard, ANSIReset, detail)
+		return fmt.Sprintf(indentShardLine+"%s◉ %s%s: %s\n", ANSICyan, s.Shard, ANSIReset, detail)
 	case state.Task.WaitingForCutover:
-		return fmt.Sprintf("      %s● %s%s: ready for cutover\n", ANSIYellow, s.Shard, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s● %s%s: ready for cutover\n", ANSIYellow, s.Shard, ANSIReset)
 	case state.Task.CuttingOver:
-		return fmt.Sprintf("      %s● %s%s: cutting over\n", ANSIYellow, s.Shard, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s● %s%s: cutting over\n", ANSIYellow, s.Shard, ANSIReset)
 	case state.Task.Pending:
-		return fmt.Sprintf("      %s○ %s: queued%s\n", ANSIDim, s.Shard, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s○ %s: queued%s\n", ANSIDim, s.Shard, ANSIReset)
 	case state.Task.Failed:
-		return fmt.Sprintf("      %s✗ %s%s: failed\n", ANSIRed, s.Shard, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s✗ %s%s: failed\n", ANSIRed, s.Shard, ANSIReset)
 	default:
-		return fmt.Sprintf("      %s○ %s: %s%s\n", ANSIDim, s.Shard, s.Status, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s○ %s: %s%s\n", ANSIDim, s.Shard, s.Status, ANSIReset)
 	}
 }
 

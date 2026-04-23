@@ -15,34 +15,31 @@ import (
 // indentTable is the prefix for table names. Aligns with keyspace name after "── " in headers.
 const indentTable = "     " // 5 spaces — matches "  ── " in FormatKeyspaceHeader
 
-// formatDDLWithSymbol renders a DDL statement with a Terraform-style change symbol
-// (+ create, ~ alter, - drop) and syntax highlighting, indented under the table name.
-func formatDDLWithSymbol(changeType, rawDDL string) string {
+// progressSymbol returns a Terraform-style prefix for the change type.
+func progressSymbol(changeType string) string {
+	switch strings.ToLower(changeType) {
+	case "create":
+		return "+ "
+	case "drop":
+		return "- "
+	default:
+		return "~ "
+	}
+}
+
+// formatProgressDDL renders a DDL statement with syntax highlighting, indented under the table name.
+func formatProgressDDL(rawDDL string) string {
 	if rawDDL == "" {
 		return ""
 	}
-	symbol := "~"
-	switch strings.ToLower(changeType) {
-	case "create":
-		symbol = "+"
-	case "drop":
-		symbol = "-"
-	}
-	formatted := ddl.FormatDDL(rawDDL)
-	lines := strings.Split(formatted, "\n")
-	var b strings.Builder
-	for i, line := range lines {
-		if i == 0 {
-			fmt.Fprintf(&b, "%s%s %s\n", indentContent, symbol, FormatSQL(line))
-		} else if line != "" {
-			fmt.Fprintf(&b, "%s  %s\n", indentContent, FormatSQL(line))
-		}
-	}
-	return b.String()
+	return IndentSQL(ddl.FormatDDL(rawDDL), indentContent) + "\n"
 }
 
-// indentContent is the indentation for DDL, rows, and status lines under a table name.
+// indentContent is the indentation for DDL lines under a table name.
 var indentContent = strings.Repeat(" ", 7)
+
+// indentDetail is the prefix for Rows/Shards detail lines (one level deeper than DDL, with bullet).
+const indentDetail = "       • " // 7 spaces + bullet + space
 
 // FormatKeyspaceHeader returns a keyspace divider line.
 func FormatKeyspaceHeader(ns string) string {
@@ -382,54 +379,54 @@ func FormatTableProgress(t TableProgress) string {
 	switch t.Status {
 	case state.Apply.Pending:
 		// Pending = queued, not yet started
-		fmt.Fprintf(&b, indentTable+"%s: ⏳ Queued\n", t.TableName)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏳ Queued\n", t.TableName)
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
 	case state.Apply.Completed:
 		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(&b, indentTable+"%s: %s ✓ Complete\n", t.TableName, bar)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
 	case state.Apply.WaitingForCutover:
 		bar := ui.ProgressBarRowCopy(100) // blue — in progress, row copy done
-		fmt.Fprintf(&b, indentTable+"%s: %s Waiting for cutover\n", t.TableName, bar)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Waiting for cutover\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
 	case state.Apply.CuttingOver:
 		bar := ui.ProgressBarRowCopy(100) // blue — still in progress
-		fmt.Fprintf(&b, indentTable+"%s: %s 🔄 Cutting over...\n", t.TableName, bar)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔄 Cutting over...\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
 	case state.Apply.Failed:
 		bar := ui.ProgressBarFailed(t.PercentComplete)
-		fmt.Fprintf(&b, indentTable+"%s: %s ❌ Failed\n", t.TableName, bar)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ❌ Failed\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
 	case state.Apply.RevertWindow:
 		bar := ui.ProgressBarWaitingCutover() // yellow — complete but revert available
-		fmt.Fprintf(&b, indentTable+"%s: %s ✓ Complete (pending revert)\n", t.TableName, bar)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete (pending revert)\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -437,12 +434,12 @@ func FormatTableProgress(t TableProgress) string {
 	case state.Apply.Cancelled:
 		if t.PercentComplete > 0 {
 			bar := ui.ProgressBarFailed(t.PercentComplete)
-			fmt.Fprintf(&b, indentTable+"%s: %s ⊘ Cancelled at %d%%\n", t.TableName, bar, t.PercentComplete)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⊘ Cancelled at %d%%\n", t.TableName, bar, t.PercentComplete)
 		} else {
-			fmt.Fprintf(&b, indentTable+"%s: ⊘ Cancelled (not started)\n", t.TableName)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⊘ Cancelled (not started)\n", t.TableName)
 		}
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -453,18 +450,18 @@ func FormatTableProgress(t TableProgress) string {
 		switch {
 		case t.PercentComplete >= 100:
 			// At 100% = was waiting for cutover when stopped
-			fmt.Fprintf(&b, indentTable+"%s: %s ⏹️ Stopped (was waiting for cutover)\n", t.TableName, bar)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏹️ Stopped (was waiting for cutover)\n", t.TableName, bar)
 		case t.PercentComplete > 0:
 			stoppedPercent := min(t.PercentComplete, 100)
-			fmt.Fprintf(&b, indentTable+"%s: %s ⏹️ Stopped at %d%%\n", t.TableName, bar, stoppedPercent)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏹️ Stopped at %d%%\n", t.TableName, bar, stoppedPercent)
 		default:
-			fmt.Fprintf(&b, indentTable+"%s: ⏹️ Stopped (not started)\n", t.TableName)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏹️ Stopped (not started)\n", t.TableName)
 		}
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 		if t.RowsTotal > 0 && t.PercentComplete > 0 {
-			fmt.Fprintf(&b, "      Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
+			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -477,64 +474,66 @@ func FormatTableProgress(t TableProgress) string {
 		if info := ParseSpiritProgress(t.ProgressDetail); info != nil {
 			// Parsed successfully - show emoji progress bar with structured data
 			bar := ui.ProgressBarRowCopy(info.Percent)
-			fmt.Fprintf(&b, indentTable+"%s: %s %d%%\n", t.TableName, bar, info.Percent)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%\n", t.TableName, bar, info.Percent)
 			if t.DDL != "" {
-				b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+				b.WriteString(formatProgressDDL(t.DDL))
 			}
 			// Rows and ETA on same line
 			if info.ETA != "" && info.ETA != "TBD" {
-				fmt.Fprintf(&b, indentContent+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal), info.ETA)
+				fmt.Fprintf(&b, indentDetail+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal), info.ETA)
 			} else {
-				fmt.Fprintf(&b, indentContent+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal))
+				fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(info.RowsCopied, info.RowsTotal)), ui.FormatNumber(info.RowsTotal))
 			}
 			if info.State != "" && info.State != "copyRows" {
-				fmt.Fprintf(&b, indentContent+"Status: %s\n", info.State)
+				fmt.Fprintf(&b, indentDetail+"Status: %s\n", info.State)
 			}
 		} else {
 			// Can't parse - show raw detail
-			fmt.Fprintf(&b, indentTable+"%s:\n", t.TableName)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s:\n", t.TableName)
 			if t.DDL != "" {
-				b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+				b.WriteString(formatProgressDDL(t.DDL))
 			}
 			fmt.Fprintf(&b, "    %s\n", t.ProgressDetail)
 		}
 	case t.RowsTotal > 0 && t.RowsCopied == 0 && len(t.Shards) > 0:
 		// Staging phase — shards have row totals but no rows copied yet.
 		// Show "Staging schema changes..." instead of a misleading 0% bar.
-		fmt.Fprintf(&b, indentTable+"%s: Staging schema changes...\n", t.TableName)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Staging schema changes...\n", t.TableName)
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 	case t.RowsTotal > 0:
 		// Row copy in progress — show progress bar with structured fields
 		bar := ui.ProgressBarRowCopy(t.PercentComplete)
 		displayPercent := min(t.PercentComplete, 100)
-		fmt.Fprintf(&b, indentTable+"%s: %s %d%%\n", t.TableName, bar, displayPercent)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%\n", t.TableName, bar, displayPercent)
 
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 
 		// Rows and ETA on same line
 		if t.ETASeconds > 0 {
-			fmt.Fprintf(&b, indentContent+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatETA(t.ETASeconds))
+			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatETA(t.ETASeconds))
 		} else {
-			fmt.Fprintf(&b, "      Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
+			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
 		}
 
 		statusLower := strings.ToLower(t.Status)
 		if statusLower != "" && statusLower != "running" && statusLower != "row_copy" {
-			fmt.Fprintf(&b, indentContent+"Status: %s\n", t.Status)
+			fmt.Fprintf(&b, indentDetail+"Status: %s\n", t.Status)
 		}
 	default:
 		// No row copy data yet (initializing or instant DDL) — just show running state
-		fmt.Fprintf(&b, indentTable+"%s: Running...\n", t.TableName)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Running...\n", t.TableName)
 		if t.DDL != "" {
-			b.WriteString(formatDDLWithSymbol(t.ChangeType, t.DDL))
+			b.WriteString(formatProgressDDL(t.DDL))
 		}
 	}
 
-	b.WriteString("\n")
+	if len(t.Shards) == 0 {
+		b.WriteString("\n")
+	}
 	b.WriteString(FormatShardProgress(t.Shards))
 	return b.String()
 }
