@@ -873,7 +873,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	useInstant := instantEligible && !deferCutover
 
 	drElapsed := time.Since(drStart).Round(time.Second)
-	emitEvent(fmt.Sprintf("Deploy request #%d ready (%s)", dr.Number, drElapsed), map[string]string{
+	readyMsg := fmt.Sprintf("Deploy request #%d ready (%s)", dr.Number, drElapsed)
+	if useInstant {
+		readyMsg += " — instant DDL eligible"
+	}
+	emitEvent(readyMsg, map[string]string{
 		"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
 		"deploy_request_url": dr.HtmlURL,
 		"instant_ddl":        fmt.Sprintf("%t", useInstant),

@@ -526,8 +526,11 @@ func FormatTableProgress(t TableProgress) string {
 			fmt.Fprintf(&b, indentDetail+"Status: %s\n", t.Status)
 		}
 	default:
-		// No row copy data yet (initializing or instant DDL) — just show running state
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Running...\n", t.TableName)
+		if t.IsInstant {
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⚡ Applying instantly...\n", t.TableName)
+		} else {
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Running...\n", t.TableName)
+		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
