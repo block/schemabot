@@ -92,6 +92,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
+		RecordPlan(ctx, req.Database, req.Environment, "error")
 		return nil, fmt.Errorf("tern client: %w", err)
 	}
 
@@ -121,8 +122,10 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 
 	resp, err := client.Plan(ctx, ternReq)
 	if err != nil {
+		RecordPlan(ctx, req.Database, req.Environment, "error")
 		return nil, err
 	}
+	RecordPlan(ctx, req.Database, req.Environment, "success")
 
 	s.logger.Info("ExecutePlan: plan response",
 		"plan_id", resp.PlanId,

@@ -92,9 +92,23 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 		defer grpcServer.GracefulStop()
 	}
 
+	// Initialize telemetry (OTel metrics via Prometheus /metrics endpoint)
+	telemetry, err := api.SetupTelemetry(logger)
+	if err != nil {
+		return fmt.Errorf("setup telemetry: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := telemetry.Shutdown(shutdownCtx); err != nil {
+			logger.Error("telemetry shutdown failed", "error", err)
+		}
+	}()
+
 	// Configure routes
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
+	mux.Handle("GET /metrics", telemetry.MetricsHandler)
 
 	// Register GitHub webhook handler if GitHub App is configured
 	webhookHandler, err := buildWebhookHandler(serverConfig, svc, logger)
