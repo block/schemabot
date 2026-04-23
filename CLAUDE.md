@@ -45,7 +45,7 @@ CI mirrors local dev exactly — each job runs the corresponding make target.
 
 - **Always verify the active branch before starting work.** The deployed code may be on a feature branch (e.g., a worktree), not `main`. Before implementing, check which branch has the code you're building on: `git log --oneline <branch> -- <relevant-file>`. Never branch from `main` for features that depend on unreleased work — branch from (or commit directly to) the active development branch.
 - **Never bypass pre-commit hooks.** Do not use `--no-verify` or `core.hooksPath=/dev/null`. If the hook fails, fix the issue.
-- **PR summaries should be concise prose** — a short paragraph describing the what and why, not a bullet list of every change. Do not include test plans or checklists in PR descriptions.
+- **PR summaries should be concise prose** — a short paragraph describing the what and why, not a bullet list of every change. Do not include test plans or checklists in PR descriptions. Never reference internal company details (specific database names, staging environments, team names, internal URLs) in PR titles or descriptions — this is a public OSS repo.
 - **Create PRs in draft mode** (`gh pr create --draft`) by default. The author will mark it ready for review.
 - **After pushing new commits**, check if the PR title and summary need updating to reflect the new changes. If a human has edited the summary, leave it alone.
 - **Never squash after a human has reviewed** (comments or approval) — add new commits so reviewers can see incremental changes. Before human review, squash freely to keep the PR clean.
