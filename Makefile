@@ -19,7 +19,7 @@ else
   GOTEST := go test
 endif
 
-.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-integration test-coverage build install clean proto up up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp progress-testapp seed-testapp seed-testapp-large demo demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc cli fmt-schema fmt-schema-check
+.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -31,13 +31,19 @@ export HELP_HEADER
 
 define DEMO_COMMANDS
 
-  Try these commands:
+  MySQL (Spirit) commands:
     schemabot plan -s examples/mysql/schema/testapp                  Preview DDL
-    schemabot apply -s examples/mysql/schema/testapp -e staging     Execute schema change
-    schemabot progress --database testapp                           Poll progress and ETA
-    schemabot status                                                Show active schema changes
-    schemabot logs --database testapp                               View apply logs
-    schemabot help                                                  See all commands
+    schemabot apply -s examples/mysql/schema/testapp -e staging      Execute schema change
+    schemabot progress --database testapp                            Poll progress and ETA
+
+  Vitess (PlanetScale) commands:
+    schemabot plan -s examples/vitess/schema                         Preview DDL + VSchema
+    schemabot apply -s examples/vitess/schema -e staging             Execute schema change
+    schemabot progress --database testapp-vitess                     Poll progress and ETA
+
+  General:
+    schemabot status                                                 Show active schema changes
+    schemabot help                                                   See all commands
 
   Tail server logs:
     make logs
@@ -50,9 +56,19 @@ define DEMO_READY_MSG
 ============================================
   SCHEMABOT DEMO READY
   SchemaBot API:     http://localhost:13370
-  Staging MySQL:     localhost:13372 (testapp)
-  Production MySQL:  localhost:13373 (testapp)
-  Data: 50 MB per table in each environment
+  LocalScale API:    http://localhost:13374
+
+  MySQL (Spirit):
+    Staging:     localhost:13372 (testapp)
+    Production:  localhost:13373 (testapp)
+    Data: 50 MB per table
+
+  Vitess (PlanetScale via LocalScale):
+    Database:    testapp-vitess
+    Orgs:        localscale-staging, localscale-production
+    Keyspaces:   testapp (unsharded), testapp_sharded (sharded)
+    Data: 200 MB per table (sharded across keyspace shards)
+
 $(DEMO_COMMANDS)
 endef
 export DEMO_READY_MSG
@@ -156,7 +172,7 @@ endif
 	docker compose -f deploy/local/docker-compose.yml up --build
 
 # Start services, apply testapp schema, then show logs (full demo workflow)
-#   make demo              # Start and apply testapp schema (wipes data)
+#   make demo              # Start and apply MySQL + Vitess schema (wipes data)
 #   make demo KEEP_DATA=1  # Restart without wiping data (preserves seeded rows)
 #   make demo SKIP_APPLY=1 # Start server only, skip schema applies (for debugging)
 demo:
@@ -166,20 +182,41 @@ else
 	docker compose -f deploy/local/docker-compose.yml down -v -t 10 2>/dev/null || true
 endif
 	docker rm -f schemabot-mysql-schemabot-1 schemabot-mysql-staging-1 schemabot-mysql-production-1 schemabot-schemabot-1 2>/dev/null || true
-	@# Start MySQL containers first (they take ~13s to init), then build Go in parallel
-	docker compose -f deploy/local/docker-compose.yml up -d mysql-schemabot mysql-staging mysql-production
-	CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd & \
+	@# Build everything in parallel: LocalScale image + Go binaries + start MySQL containers
+	@echo "Building binaries and starting containers in parallel..."
+	@docker compose -f deploy/local/docker-compose.yml up -d mysql-schemabot mysql-staging mysql-production & \
+		$(MAKE) build-localscale-image & \
+		CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd & \
 		go build -ldflags "$(LDFLAGS)" -o bin/schemabot ./pkg/cmd & \
 		wait
 	@$(MAKE) cli
-	cp bin/schemabot-linux deploy/local/schemabot
-	docker compose -f deploy/local/docker-compose.yml up --build -d schemabot
-	@rm -f deploy/local/schemabot
+	cp bin/schemabot-linux deploy/local/schemabot-dev
+	docker compose -f deploy/local/docker-compose.yml up --build -d localscale schemabot
+	@rm -f deploy/local/schemabot-dev
 	@$(MAKE) wait-healthy
+	@$(MAKE) wait-localscale
 ifneq ($(SKIP_APPLY),1)
-	@./bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:13370 -y --allow-unsafe -o log
-	@./bin/schemabot apply -s examples/mysql/schema/testapp -e production --endpoint http://localhost:13370 -y --allow-unsafe -o log
-	@./scripts/seed-large.sh 160 both
+	@trap 'kill 0' INT TERM; \
+	echo "Applying schemas (MySQL + Vitess in parallel, staging → production)..."; \
+	( ./bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:13370 -y --allow-unsafe -o log && \
+	  ./bin/schemabot apply -s examples/mysql/schema/testapp -e production --endpoint http://localhost:13370 -y --allow-unsafe -o log ) & \
+	( for ks in testapp testapp_sharded; do \
+		if [ -f examples/vitess/schema/$$ks/vschema.json ]; then \
+			curl -sf -X POST "http://localhost:13374/admin/seed-vschema" \
+				-H "Content-Type: application/json" \
+				-d "{\"org\":\"localscale-staging\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
+			curl -sf -X POST "http://localhost:13374/admin/seed-vschema" \
+				-H "Content-Type: application/json" \
+				-d "{\"org\":\"localscale-production\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
+		fi; \
+	done && \
+	  ./bin/schemabot apply -s examples/vitess/schema -e staging --endpoint http://localhost:13370 -y -o log && \
+	  ./bin/schemabot apply -s examples/vitess/schema -e production --endpoint http://localhost:13370 -y -o log ) & \
+	wait; \
+	echo "Seeding data (MySQL + Vitess in parallel)..."; \
+	./scripts/seed-large.sh 50 both & \
+	VTGATE_MYSQL_PORT=19101 ./scripts/seed-vitess.sh 200 & \
+	wait
 	@echo "$$DEMO_READY_MSG"
 else
 	@echo "$$DEMO_SKIP_APPLY_MSG"
@@ -197,26 +234,17 @@ wait-healthy:
 	done; \
 	echo "Timeout waiting for SchemaBot"; exit 1
 
-# Plan example schema changes (dry-run)
+# Plan example MySQL schema changes (dry-run)
 #   make plan-testapp              # Plan for staging (default)
 #   make plan-testapp ENV=production
 plan-testapp: build
 	./bin/schemabot plan -s examples/mysql/schema/testapp -e $(or $(ENV),staging) --endpoint http://localhost:13370
 
-# Apply example schema to testapp database using SchemaBot CLI
+# Apply example MySQL schema
 #   make apply-testapp              # Apply to staging (default)
 #   make apply-testapp ENV=production
 apply-testapp: build
 	./bin/schemabot apply -s examples/mysql/schema/testapp -e $(or $(ENV),staging) --endpoint http://localhost:13370 -y --allow-unsafe -o log
-
-# Check migration progress for testapp
-#   make progress-testapp              # Check staging (default)
-#   make progress-testapp ENV=production
-progress-testapp: build
-	./bin/schemabot progress \
-		--database testapp \
-		-e $(or $(ENV),staging) \
-		--endpoint http://localhost:13370
 
 # Seed testapp with large dataset for testing progress rendering
 #   make seed-testapp-large                    # 100 MB per table, staging only
@@ -225,41 +253,43 @@ progress-testapp: build
 seed-testapp-large:
 	@./scripts/seed-large.sh $(or $(TARGET_MB),100) $(or $(ENV),staging)
 
+# Seed Vitess testapp_sharded with data for per-shard progress
+#   make seed-vitess                            # 200 MB per table, staging (default)
+#   make seed-vitess TARGET_MB=500              # 500 MB per table
+#   make seed-vitess ENV=production             # Seed production
+seed-vitess:
+	@./scripts/seed-vitess.sh $(or $(TARGET_MB),200) $(or $(ENV),staging)
+
 # Seed testapp with sample data (10k rows each for users and orders)
 #   make seed-testapp              # Seed both staging and production
 #   make seed-testapp ENV=staging  # Seed staging only
 seed-testapp:
 	@./scripts/seed.sh $(or $(ENV),both)
 
-# Run all e2e tests (local + gRPC) in isolated docker-compose environments.
+# Run all e2e tests (MySQL + Vitess + gRPC) in isolated docker-compose environments.
 test-e2e: test-e2e-local test-e2e-grpc ## Run all e2e tests
 
+# E2E local environment shorthand
+E2E_DC = docker compose -f deploy/e2e/docker-compose.yml
+
 # Run local e2e tests in an isolated environment (no conflicts with make demo)
-# This spins up a separate docker-compose stack on different ports, runs tests, then tears down.
-# Ports: SchemaBot=14370, MySQL-SchemaBot=14371, MySQL-Staging=14372, MySQL-Production=14373
+# Keeps containers alive between runs for fast iteration. Use FRESH=1 to rebuild from scratch.
+# Use `make test-e2e-local-down` to tear down manually.
+# Ports: SchemaBot=14370, MySQL-SchemaBot=14371, MySQL-Staging=14372, MySQL-Production=14373, LocalScale=14374
 test-e2e-local: build ## Run local e2e tests in isolated environment
-	@echo "Starting isolated e2e environment..."
-	CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd
-	cp bin/schemabot-linux deploy/local/schemabot
-	@SCHEMABOT_PORT=14370 \
-	SCHEMABOT_MYSQL_PORT=14371 \
-	STAGING_MYSQL_PORT=14372 \
-	PRODUCTION_MYSQL_PORT=14373 \
-	docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml down -v 2>/dev/null || true
-	@SCHEMABOT_PORT=14370 \
-	SCHEMABOT_MYSQL_PORT=14371 \
-	STAGING_MYSQL_PORT=14372 \
-	PRODUCTION_MYSQL_PORT=14373 \
-	docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml up --build -d || \
-		(echo "docker compose up failed — dumping logs:"; \
-		SCHEMABOT_PORT=14370 SCHEMABOT_MYSQL_PORT=14371 STAGING_MYSQL_PORT=14372 PRODUCTION_MYSQL_PORT=14373 \
-		docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml logs; \
-		SCHEMABOT_PORT=14370 SCHEMABOT_MYSQL_PORT=14371 STAGING_MYSQL_PORT=14372 PRODUCTION_MYSQL_PORT=14373 \
-		docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml down -v; \
-		rm -f deploy/local/schemabot; \
-		exit 1)
-	@rm -f deploy/local/schemabot
-	@echo "Waiting for SchemaBot e2e environment to be healthy..."
+ifeq ($(FRESH),1)
+	@$(E2E_DC) down -v 2>/dev/null || true
+endif
+	@echo "Building binaries..."
+	@(CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd) & \
+		([ -f bin/localscale-linux ] || CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/localscale-linux ./cmd/localscale) & \
+		wait
+	@cp bin/schemabot-linux deploy/local/schemabot-dev
+	@docker build -f deploy/local/Dockerfile.localscale -t localscale:latest . -q
+	@$(E2E_DC) up --build -d mysql-schemabot mysql-staging mysql-production localscale
+	@$(E2E_DC) up --build --force-recreate -d schemabot
+	@rm -f deploy/local/schemabot-dev
+	@echo "Waiting for e2e environment to be healthy..."
 	@for i in $$(seq 1 60); do \
 		if curl -sf http://localhost:14370/health > /dev/null 2>&1; then \
 			echo "SchemaBot e2e environment is healthy"; \
@@ -267,28 +297,49 @@ test-e2e-local: build ## Run local e2e tests in isolated environment
 		fi; \
 		if [ $$i -eq 60 ]; then \
 			echo "Timeout waiting for SchemaBot e2e environment"; \
-			SCHEMABOT_PORT=14370 SCHEMABOT_MYSQL_PORT=14371 STAGING_MYSQL_PORT=14372 PRODUCTION_MYSQL_PORT=14373 \
-			docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml logs; \
-			SCHEMABOT_PORT=14370 SCHEMABOT_MYSQL_PORT=14371 STAGING_MYSQL_PORT=14372 PRODUCTION_MYSQL_PORT=14373 \
-			docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml down -v; \
+			$(E2E_DC) logs; \
 			exit 1; \
 		fi; \
 		sleep 1; \
 	done
-	@echo "Applying testapp schema to e2e environment..."
-	@./bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log
-	@./bin/schemabot apply -s examples/mysql/schema/testapp -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log
+	@echo "Applying schemas (MySQL + Vitess in parallel)..."
+	@( ./bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log && \
+	   ./bin/schemabot apply -s examples/mysql/schema/testapp -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log ) & \
+	MYSQL_PID=$$!; \
+	for ks in testapp testapp_sharded; do \
+		if [ -f examples/vitess/schema/$$ks/vschema.json ]; then \
+			curl -sf -X POST "http://localhost:14374/admin/seed-vschema" \
+				-H "Content-Type: application/json" \
+				-d "{\"org\":\"localscale-staging\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
+			curl -sf -X POST "http://localhost:14374/admin/seed-vschema" \
+				-H "Content-Type: application/json" \
+				-d "{\"org\":\"localscale-production\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
+		fi; \
+	done; \
+	./bin/schemabot apply -s examples/vitess/schema -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
+		(echo "=== LocalScale logs ===" && $(E2E_DC) logs localscale --tail=200 && false); \
+	./bin/schemabot apply -s examples/vitess/schema -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
+		(echo "=== LocalScale logs ===" && $(E2E_DC) logs localscale --tail=200 && false); \
+	wait $$MYSQL_PID
 	@echo "Running e2e tests..."
 	@E2E_SCHEMABOT_URL=http://localhost:14370 \
+	E2E_LOCALSCALE_URL=http://localhost:14374 \
 	E2E_MYSQL_DSN="root:testpassword@tcp(localhost:14371)/schemabot" \
 	E2E_TESTAPP_STAGING_DSN="root:testpassword@tcp(localhost:14372)/testapp" \
 	E2E_TESTAPP_PRODUCTION_DSN="root:testpassword@tcp(localhost:14373)/testapp" \
-	$(GOTEST) -count=1 -timeout=5m -tags=e2e ./e2e/local/... ; \
-	TEST_EXIT_CODE=$$?; \
-	echo "Tearing down e2e environment..."; \
-	SCHEMABOT_PORT=14370 SCHEMABOT_MYSQL_PORT=14371 STAGING_MYSQL_PORT=14372 PRODUCTION_MYSQL_PORT=14373 \
-	docker compose -p schemabot-e2e -f deploy/local/docker-compose.yml down -v; \
-	exit $$TEST_EXIT_CODE
+	$(GOTEST) -count=1 -timeout=10m -tags=e2e $(if $(RUN),-run '$(RUN)') ./e2e/local/...
+
+# Run only MySQL e2e tests (Spirit engine, no LocalScale/vtcombo needed)
+test-e2e-mysql: ## Run MySQL-only e2e tests
+	$(MAKE) test-e2e-local RUN=TestLocal
+
+# Run only Vitess e2e tests (PlanetScale engine, requires LocalScale/vtcombo)
+test-e2e-vitess: ## Run Vitess-only e2e tests
+	$(MAKE) test-e2e-local RUN=TestVitess
+
+# Tear down e2e local environment
+test-e2e-local-down: ## Tear down e2e local environment
+	@$(E2E_DC) down -v
 
 # Run gRPC e2e tests in an isolated environment
 # This spins up SchemaBot + separate Tern services (gRPC mode), runs tests, then tears down.
@@ -306,15 +357,10 @@ E2E_GRPC_ENV := SCHEMABOT_PORT=15370 \
 test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 	@echo "Starting isolated gRPC e2e environment..."
 	CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd
-	cp bin/schemabot-linux deploy/local/schemabot
+	cp bin/schemabot-linux deploy/local/schemabot-dev
 	@$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v 2>/dev/null || true
-	@$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml up --build -d || \
-		(echo "docker compose up failed — dumping logs:"; \
-		$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs; \
-		$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
-		rm -f deploy/local/schemabot; \
-		exit 1)
-	@rm -f deploy/local/schemabot
+	@$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml up --build -d
+	@rm -f deploy/local/schemabot-dev
 	@echo "Waiting for SchemaBot gRPC e2e environment to be healthy..."
 	@for i in $$(seq 1 90); do \
 		if curl -sf http://localhost:15370/health > /dev/null 2>&1; then \
@@ -361,9 +407,9 @@ endif
 		go build -ldflags "$(LDFLAGS)" -o bin/schemabot ./pkg/cmd & \
 		wait
 	@$(MAKE) cli
-	cp bin/schemabot-linux deploy/local/schemabot
+	cp bin/schemabot-linux deploy/local/schemabot-dev
 	docker compose -f deploy/local/docker-compose.grpc.yml up --build -d
-	@rm -f deploy/local/schemabot
+	@rm -f deploy/local/schemabot-dev
 	@$(MAKE) wait-healthy-grpc
 ifneq ($(SKIP_APPLY),1)
 	@./bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:13380 -y --allow-unsafe -o log
@@ -413,13 +459,17 @@ down:
 down-grpc:
 	docker compose -f deploy/local/docker-compose.grpc.yml down
 
-# View local logs
+# View local logs (prettified with colors)
 logs:
+	./scripts/dev-logs.sh
+
+# View local logs (raw)
+logs-raw:
 	docker compose -f deploy/local/docker-compose.yml logs -f
 
-# View gRPC logs
+# View gRPC logs (prettified with colors)
 logs-grpc:
-	docker compose -f deploy/local/docker-compose.grpc.yml logs -f
+	./scripts/dev-logs.sh --grpc
 
 # Build binaries
 build: ## Build the schemabot binary
@@ -470,3 +520,49 @@ fmt-schema-check: ## Check if embedded schema files are canonically formatted (f
 # Test API endpoints
 test-endpoints:
 	@./scripts/test-endpoints.sh
+
+# Build LocalScale Docker image (required for demo-vitess and LocalScale tests)
+# Uses pre-built vttestserver image from GHCR (vtcombo + mysqlctl + MySQL 8.4),
+# only needs to build the localscale binary and layer it on top.
+build-localscale-image: ## Build LocalScale Docker image
+	CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/localscale-linux ./cmd/localscale
+	docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
+
+# Run LocalScale integration tests
+test-localscale: build-localscale-image ## Run LocalScale integration tests
+	$(GOTEST) -tags=integration -timeout=10m ./pkg/localscale/...
+
+# Start LocalScale for testing the PlanetScale engine via CLI
+#   make demo-vitess              # Start LocalScale + SchemaBot
+#   make demo-vitess KEEP_DATA=1  # Restart without wiping data
+demo-vitess: build build-localscale-image ## Start LocalScale demo environment
+ifeq ($(KEEP_DATA),1)
+	docker compose -f deploy/local/docker-compose.yml down -t 10 2>/dev/null || true
+else
+	docker compose -f deploy/local/docker-compose.yml down -v -t 10 2>/dev/null || true
+endif
+	docker compose -f deploy/local/docker-compose.yml up --build -d localscale
+	@$(MAKE) wait-localscale
+	@echo ""
+	@echo "============================================"
+	@echo "  VITESS DEMO READY"
+	@echo "  LocalScale API:      http://localhost:13374"
+	@echo "  Branch proxy ports:  19100-19199"
+	@echo ""
+	@echo "  Test with CLI:"
+	@echo "    bin/schemabot plan -s examples/vitess/schema -e staging --endpoint http://localhost:13370"
+	@echo "    bin/schemabot apply -s examples/vitess/schema -e staging --endpoint http://localhost:13370 -y"
+	@echo "============================================"
+
+# Wait for LocalScale to be healthy (vtcombo startup takes ~30-60s)
+wait-localscale:
+	@echo "Waiting for LocalScale to be healthy..."
+	@for i in $$(seq 1 90); do \
+		if curl -sf http://localhost:13374/health > /dev/null 2>&1; then \
+			echo "LocalScale is healthy"; \
+			exit 0; \
+		fi; \
+		sleep 1; \
+	done; \
+	echo "Timeout waiting for LocalScale"; exit 1
+

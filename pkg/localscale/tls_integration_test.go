@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
@@ -71,6 +72,18 @@ func TestMTLS_BranchConnection(t *testing.T) {
 		ParentBranch: "main",
 	})
 	require.NoError(t, err)
+
+	// Wait for the branch snapshot to complete before requesting credentials.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		br, brErr := client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
+			Organization: "test-org", Database: "testdb", Branch: "tls-test-branch",
+		})
+		if brErr == nil && br.Ready {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 
 	pw, err := client.CreateBranchPassword(ctx, &ps.DatabaseBranchPasswordRequest{
 		Organization: "test-org",

@@ -613,10 +613,26 @@ func branchDBName(branch, keyspace string) string {
 	return fmt.Sprintf("branch_%s_%s", branch, keyspace)
 }
 
-// openBranchDB opens a temporary connection to a branch database in localscale-mysql.
+// openBranchDB opens a temporary connection to a branch database on the correct
+// backend mysqld. Each org/database has its own managed cluster with its own mysqld,
+// so the branch's org/database is looked up from metadata to find the right backend.
 // Callers must close the returned DB when done.
 func (s *Server) openBranchDB(ctx context.Context, branch, keyspace string) (*sql.DB, error) {
-	dsn := s.branchDSNBase + branchDBName(branch, keyspace)
+	// Look up the branch's org/database to find the correct backend mysqld.
+	var org, database string
+	err := s.metadataDB.QueryRowContext(ctx,
+		"SELECT org, database_name FROM localscale_branches WHERE name = ?", branch,
+	).Scan(&org, &database)
+	if err != nil {
+		return nil, fmt.Errorf("look up branch %s: %w", branch, err)
+	}
+
+	backend, err := s.backendFor(org, database)
+	if err != nil {
+		return nil, fmt.Errorf("find backend for branch %s (%s/%s): %w", branch, org, database, err)
+	}
+
+	dsn := backend.mysqlDSNBase + branchDBName(branch, keyspace)
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open branch db %s/%s: %w", branch, keyspace, err)

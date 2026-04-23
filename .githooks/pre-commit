@@ -46,7 +46,7 @@ fi
 # Format embedded schema files if any .sql files changed.
 # Uses local MySQL on :3306 if available, otherwise starts a Docker container.
 # Only formats and re-stages the specific files that were staged.
-SCHEMA_FILES=$(git diff --cached --name-only -- 'pkg/schema/mysql/*.sql')
+SCHEMA_FILES=$(git diff --cached --name-only --diff-filter=d -- 'pkg/schema/mysql/*.sql' 'examples/*/schema/**/*.sql')
 if [ -n "$SCHEMA_FILES" ]; then
     export PATH="$PATH:$HOME/go/bin:/usr/local/go/bin:/opt/homebrew/bin"
     echo "Schema .sql files changed — running spirit fmt..."

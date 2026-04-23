@@ -61,10 +61,10 @@ start_e2e_env() {
 
   # Build linux binary for docker
   CGO_ENABLED=0 GOOS=linux go build -o bin/schemabot-linux ./pkg/cmd
-  cp bin/schemabot-linux deploy/local/schemabot
+  cp bin/schemabot-linux deploy/local/schemabot-dev
 
   docker compose -f "$COMPOSE_FILE" build --quiet
-  rm -f deploy/local/schemabot
+  rm -f deploy/local/schemabot-dev
   docker compose -f "$COMPOSE_FILE" up -d
 
   echo "Waiting for SchemaBot to be healthy..."

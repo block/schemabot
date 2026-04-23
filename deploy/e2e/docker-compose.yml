@@ -1,25 +1,20 @@
-# Local Development: SchemaBot with embedded Tern (local mode).
+# E2E Testing: SchemaBot with embedded Tern (local mode).
 #
-# Usage:
-#   make up         # Start services
-#   make up FRESH=1 # Start fresh (reinitialize databases)
-#   make down       # Stop
-#   make logs       # View logs
+# This is a dedicated docker-compose for e2e tests, isolated from the demo
+# environment at deploy/local/. Uses hardcoded e2e ports and faster LocalScale
+# delays for quick test execution.
 #
-# Endpoints:
-#   SchemaBot API:     http://localhost:13370
-#   SchemaBot MySQL:   localhost:13371 (schemabot storage)
-#   Staging MySQL:     localhost:13372 (testapp database)
-#   Production MySQL:  localhost:13373 (testapp database)
-#   LocalScale API:    http://localhost:13374
+# Ports:
+#   SchemaBot API:     http://localhost:14370
+#   SchemaBot MySQL:   localhost:14371 (schemabot storage)
+#   Staging MySQL:     localhost:14372 (testapp database)
+#   Production MySQL:  localhost:14373 (testapp database)
+#   LocalScale API:    http://localhost:14374
 #   Branch Proxies:    localhost:19100-19199 (vtgate MySQL via branch passwords)
-#
-# For gRPC mode with separate Tern services, see docker-compose.grpc.yml.
-name: schemabot
+name: schemabot-e2e
 
 services:
   # SchemaBot's internal storage database
-  # Note: Schema is applied by SchemaBot on startup via Spirit
   mysql-schemabot:
     image: mysql:8.0
     environment:
@@ -27,47 +22,46 @@ services:
       MYSQL_DATABASE: schemabot
       MYSQL_INITDB_SKIP_TZINFO: "1"
     ports:
-      - "${SCHEMABOT_MYSQL_PORT:-13371}:3306"
+      - "14371:3306"
     volumes:
       - mysql-schemabot-data:/var/lib/mysql
-      - ./mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
+      - ../local/mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptestpassword"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  # Staging MySQL instance (migration target)
-  # Demonstrates separate MySQL instances for staging/production
+  # Staging MySQL instance
   mysql-staging:
     image: mysql:8.0
     environment:
       MYSQL_ROOT_PASSWORD: testpassword
       MYSQL_INITDB_SKIP_TZINFO: "1"
     ports:
-      - "${STAGING_MYSQL_PORT:-13372}:3306"
+      - "14372:3306"
     volumes:
       - mysql-staging-data:/var/lib/mysql
-      - ./mysql-init:/docker-entrypoint-initdb.d:ro
-      - ./mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
+      - ../local/mysql-init:/docker-entrypoint-initdb.d:ro
+      - ../local/mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptestpassword"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  # Production MySQL instance (migration target)
+  # Production MySQL instance
   mysql-production:
     image: mysql:8.0
     environment:
       MYSQL_ROOT_PASSWORD: testpassword
       MYSQL_INITDB_SKIP_TZINFO: "1"
     ports:
-      - "${PRODUCTION_MYSQL_PORT:-13373}:3306"
+      - "14373:3306"
     volumes:
       - mysql-production-data:/var/lib/mysql
-      - ./mysql-init:/docker-entrypoint-initdb.d:ro
-      - ./mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
+      - ../local/mysql-init:/docker-entrypoint-initdb.d:ro
+      - ../local/mysql-init/mysql-config/my.cnf:/etc/mysql/conf.d/schemabot.cnf:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptestpassword"]
       interval: 5s
@@ -75,20 +69,19 @@ services:
       retries: 10
 
   # LocalScale: fake PlanetScale API with managed Vitess (vtcombo) inside.
-  # Two orgs (staging + production), each with testapp + testapp_sharded keyspaces.
-  # No external vttestserver or MySQL needed — everything runs in-process.
+  # Uses e2e config with faster delays (50ms instead of 1s).
   localscale:
     image: localscale:latest
     build:
       context: ../..
       dockerfile: deploy/local/Dockerfile.localscale
     environment:
-      CONFIG_FILE: "/config/localscale.json"
+      CONFIG_FILE: "/config/localscale-e2e.json"
     volumes:
       - ./config:/config:ro
       - localscale-data:/vt/vtdataroot
     ports:
-      - "${LOCALSCALE_PORT:-13374}:8080"
+      - "14374:8080"
       - "19100-19199:19100-19199"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
@@ -99,7 +92,7 @@ services:
 
   schemabot:
     build:
-      context: .
+      context: ../local
       dockerfile: Dockerfile.dev
     environment:
       MYSQL_DSN: "root:testpassword@tcp(mysql-schemabot:3306)/schemabot?parseTime=true&multiStatements=true"
@@ -110,7 +103,7 @@ services:
     volumes:
       - ./config:/config:ro
     ports:
-      - "${SCHEMABOT_PORT:-13370}:8080"
+      - "14370:8080"
     depends_on:
       mysql-schemabot:
         condition: service_healthy

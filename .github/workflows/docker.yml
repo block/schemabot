@@ -110,13 +110,8 @@ jobs:
 
       # LocalScale image — fake PlanetScale API for testing.
       # Published to ghcr.io/block/schemabot/localscale:<sha|latest>
-      - name: "Build LocalScale binaries"
-        run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/localscale-linux ./cmd/localscale &
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/vtcombo-linux vitess.io/vitess/go/cmd/vtcombo &
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/mysqlctl-linux vitess.io/vitess/go/cmd/mysqlctl &
-          wait
-          scripts/copy-vitess-config.sh
+      - name: "Build LocalScale binary"
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/localscale-linux ./cmd/localscale
 
       - name: "Extract LocalScale metadata"
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # docker/metadata-action@v5

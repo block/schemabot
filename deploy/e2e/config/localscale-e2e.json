@@ -1,0 +1,30 @@
+{
+  "organizations": {
+    "localscale-staging": {
+      "databases": {
+        "testapp-vitess": {
+          "keyspaces": [
+            {"name": "testapp", "shards": 1},
+            {"name": "testapp_sharded", "shards": 2}
+          ]
+        }
+      }
+    },
+    "localscale-production": {
+      "databases": {
+        "testapp-vitess": {
+          "keyspaces": [
+            {"name": "testapp", "shards": 1},
+            {"name": "testapp_sharded", "shards": 2}
+          ]
+        }
+      }
+    }
+  },
+  "listen_addr": ":8080",
+  "revert_window_duration": "30m",
+  "default_throttle_ratio": 0.85,
+  "branch_creation_delay": "50ms",
+  "deploy_request_delay": "50ms",
+  "processor_tick_interval": "100ms"
+}

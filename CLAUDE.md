@@ -25,6 +25,8 @@ make lint                 # golangci-lint via Docker
 
 **Detecting flakes:** Use `scripts/test-flaky.sh <TestName> [iterations] [package]` to run a specific test multiple times and confirm stability. Always use this after fixing a flaky test to verify the fix holds (e.g., `scripts/test-flaky.sh TestMultiKeyspaceDDLDeploy 5 ./pkg/localscale/...`).
 
+**Never increase timeouts to fix flakes.** If a test is slow or flaky in CI, find and fix the root cause — don't mask it by increasing deadlines or poll timeouts. Common root causes: resource contention, missing cleanup between tests, container startup races, unbounded retries.
+
 **Never skip tests in CI.** All tests must run in every CI job. If a test fails because of a missing dependency (Docker image, container, service), fix the CI workflow to provide it — don't skip the test. Prefer fixing underlying issues over shortcuts or workarounds.
 
 ## Test Architecture
@@ -138,6 +140,7 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
 - **Use `t.Context()`** instead of `context.Background()` or `context.TODO()` in tests. This ties the context to the test lifecycle — the context is cancelled when the test ends. Test helper functions that need a context must accept `*testing.T` and use `t.Context()` — never `context.Background()`.
 - **Prefer integration tests** with MySQL testcontainers over unit tests when possible.
 - **No `time.Sleep` for readiness waits.** Never use a fixed sleep to wait for a server or service to be ready. Instead, poll with a deadline (e.g., retry a health check endpoint in a loop with a short sleep between attempts). For testcontainers, use built-in wait strategies.
+- **All timeouts must hard-fail.** Every operation in test code must have a bounded timeout (max 30s for any single operation). When a timeout fires, the test must fail immediately with a clear error — never silently continue or hang. No test should ever run longer than 30s for a single operation. Use `context.WithTimeout` and `require.NoError` on the result.
 - **Reduce duplication.** Look for opportunities to extract shared helpers when the same pattern appears 3+ times. In tests, prefer small composable helpers over copy-pasting setup boilerplate.
 
 ### State Comparisons

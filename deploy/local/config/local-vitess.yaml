@@ -1,0 +1,20 @@
+# SchemaBot Configuration — Vitess/PlanetScale via LocalScale
+#
+# Used with `make demo-vitess` for testing the PlanetScale engine
+# against a real Vitess backend (vtcombo) via LocalScale.
+
+storage:
+  dsn: "env:MYSQL_DSN"
+
+databases:
+  testapp-vitess:
+    type: vitess
+    environments:
+      staging:
+        dsn: "http://localscale:8080"
+        organization: "localscale-staging"
+        token_secret_ref: "env:PS_TOKEN"
+      production:
+        dsn: "http://localscale:8080"
+        organization: "localscale-production"
+        token_secret_ref: "env:PS_TOKEN"

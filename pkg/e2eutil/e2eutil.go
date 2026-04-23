@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // BuildCLI builds the SchemaBot CLI binary from pkg and returns the binary path.
@@ -223,22 +224,42 @@ func NewSchemaDirForDB(t *testing.T, dbName string) string {
 	return dir
 }
 
-// RunCLIInDir runs a CLI command in a specific directory using t.Context() and
-// returns combined stdout+stderr. Fails the test on non-zero exit.
+// CLITimeout is the default timeout for CLI commands (30s).
+// Pass a custom timeout via RunCLIInDirWithTimeout for longer operations.
+const CLITimeout = 30 * time.Second
+
+// RunCLIInDir runs a CLI command in a specific directory with the default timeout
+// and returns combined stdout+stderr. Fails the test on non-zero exit.
 func RunCLIInDir(t *testing.T, binPath, dir string, args ...string) string {
 	t.Helper()
-	out, err := RunCLIWithErrorInDir(t, binPath, dir, args...)
+	return RunCLIInDirWithTimeout(t, binPath, dir, CLITimeout, args...)
+}
+
+// RunCLIInDirWithTimeout runs a CLI command with a custom timeout.
+// Fails the test on non-zero exit.
+func RunCLIInDirWithTimeout(t *testing.T, binPath, dir string, timeout time.Duration, args ...string) string {
+	t.Helper()
+	out, err := RunCLIWithErrorInDirTimeout(t, binPath, dir, timeout, args...)
 	if err != nil {
 		t.Fatalf("CLI command failed: %v\nOutput: %s", err, out)
 	}
 	return out
 }
 
-// RunCLIWithErrorInDir runs a CLI command in a specific directory using t.Context()
-// and returns combined stdout+stderr and any error.
+// RunCLIWithErrorInDir runs a CLI command in a specific directory with the default
+// 30s timeout and returns combined stdout+stderr and any error.
 func RunCLIWithErrorInDir(t *testing.T, binPath, dir string, args ...string) (string, error) {
 	t.Helper()
-	cmd := exec.CommandContext(t.Context(), binPath, args...)
+	return RunCLIWithErrorInDirTimeout(t, binPath, dir, CLITimeout, args...)
+}
+
+// RunCLIWithErrorInDirTimeout runs a CLI command with a custom timeout
+// and returns combined stdout+stderr and any error.
+func RunCLIWithErrorInDirTimeout(t *testing.T, binPath, dir string, timeout time.Duration, args ...string) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binPath, args...)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
