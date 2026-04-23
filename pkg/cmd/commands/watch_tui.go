@@ -226,6 +226,12 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.errorMsg = ""
 		m.state = msg.state
 
+		// Preserve last known tables during volume change to avoid visual reset
+		if !m.volumeChanging || len(m.tables) == 0 {
+			m.tables = msg.tables
+		}
+		m.errorMsg = msg.errorMsg
+
 		// Timeout skip-revert if state hasn't transitioned after 10s.
 		if m.skipRevertTriggered && !m.skipRevertAt.IsZero() &&
 			state.IsState(m.state, state.Apply.RevertWindow) &&
@@ -233,11 +239,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.skipRevertTriggered = false
 			m.errorMsg = "skip-revert timed out — press Enter to retry"
 		}
-		// Preserve last known tables during volume change to avoid visual reset
-		if !m.volumeChanging || len(m.tables) == 0 {
-			m.tables = msg.tables
-		}
-		m.errorMsg = msg.errorMsg
 		m.initialized = true
 		// Update volume from API if not pending a change
 		if msg.volume > 0 && m.volumePending == 0 {

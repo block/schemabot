@@ -390,7 +390,11 @@ func FormatTableProgress(t TableProgress) string {
 		return b.String()
 	case state.Apply.Completed:
 		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete\n", t.TableName, bar)
+		if t.IsInstant {
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⚡ Instant\n", t.TableName, bar)
+		} else {
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete\n", t.TableName, bar)
+		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
@@ -464,18 +468,6 @@ func FormatTableProgress(t TableProgress) string {
 		}
 		if t.RowsTotal > 0 && t.PercentComplete > 0 {
 			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
-		}
-		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
-		return b.String()
-	}
-
-	// Instant DDL — completed immediately, no row copy
-	if t.IsInstant {
-		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⚡ Instant\n", t.TableName, bar)
-		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))

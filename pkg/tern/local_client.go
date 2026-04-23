@@ -847,7 +847,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			tp.RowsTotal = t.RowsTotal
 			// Clamp to 100% only for successfully completed tasks — Vitess row
 			// counts can lag slightly due to concurrent inserts during copy.
-			if state.IsState(t.State, state.Apply.Completed) && t.RowsTotal > 0 {
+			if state.IsState(t.State, state.Task.Completed) && t.RowsTotal > 0 {
 				tp.PercentComplete = 100
 				if tp.RowsCopied < tp.RowsTotal {
 					tp.RowsCopied = tp.RowsTotal
