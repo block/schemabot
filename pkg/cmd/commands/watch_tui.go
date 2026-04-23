@@ -16,20 +16,26 @@ import (
 // WatchModel is the Bubbletea model for watching apply progress.
 type WatchModel struct {
 	// Config
-	endpoint         string
-	database         string
-	environment      string
-	applyID          string // When set, fetches progress by apply ID instead of database/environment
-	allowCutover     bool
-	maxTableNameLen  int
-	cutoverTriggered bool
-	stopTriggered    bool
+	endpoint            string
+	database            string
+	environment         string
+	applyID             string // When set, fetches progress by apply ID instead of database/environment
+	allowCutover        bool
+	maxTableNameLen     int
+	cutoverTriggered    bool
+	skipRevertTriggered bool
+	stopTriggered       bool
 
 	// State from API
 	state         string
 	tables        []tableProgress
 	errorMsg      string
 	currentVolume int // Current volume (1-11)
+
+	// Engine metadata
+	engine           string // "Spirit", "PlanetScale", etc.
+	deployRequestURL string
+	metadata         map[string]string // Full metadata from progress response
 
 	// UI state
 	detached          bool
@@ -46,6 +52,7 @@ type WatchModel struct {
 // tableProgress represents progress for a single table.
 type tableProgress struct {
 	Name           string
+	Keyspace       string
 	DDL            string
 	Status         string
 	RowsCopied     int64
@@ -53,6 +60,17 @@ type tableProgress struct {
 	Percent        int
 	ETA            string
 	ProgressDetail string
+	Shards         []shardProgress
+}
+
+type shardProgress struct {
+	Shard           string
+	Status          string
+	RowsCopied      int64
+	RowsTotal       int64
+	Percent         int
+	ETASeconds      int64
+	CutoverAttempts int
 }
 
 // Messages
@@ -82,9 +100,11 @@ type progressMsg struct {
 	failed      bool   // true when the API call didn't return usable progress data
 	retryable   bool   // when failed, whether the TUI should keep polling
 	volume      int
-	applyID     string // Populated from progress responses
-	database    string // Populated from apply-id progress responses
-	environment string // Populated from apply-id progress responses
+	applyID     string            // Populated from progress responses
+	database    string            // Populated from apply-id progress responses
+	environment string            // Populated from apply-id progress responses
+	engine      string            // Engine name (e.g., "Spirit", "PlanetScale")
+	metadata    map[string]string // Engine metadata (e.g., deploy_request_url)
 }
 
 type cutoverResultMsg struct {
@@ -153,12 +173,12 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q":
 			m.quitting = true
 			return m, tea.Quit
-		case "s":
-			// Don't allow stop during cutover
+		case "s", "c":
+			// Don't allow stop/cancel during cutover
 			if isCuttingOver {
 				return m, nil
 			}
-			// Stop the schema change if running and not already stopped/stopping
+			// Stop (Spirit) or cancel (PlanetScale) the schema change
 			if state.IsState(m.state, state.Apply.Running, state.Apply.WaitingForCutover) && !m.stopTriggered {
 				m.stopTriggered = true
 				return m, m.triggerStop()
@@ -174,6 +194,11 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if state.IsState(m.state, state.Apply.WaitingForCutover) && m.allowCutover && !m.cutoverTriggered {
 				m.cutoverTriggered = true
 				return m, m.triggerCutover()
+			}
+			// Trigger skip-revert if in revert window
+			if state.IsState(m.state, state.Apply.RevertWindow) && !m.skipRevertTriggered {
+				m.skipRevertTriggered = true
+				return m, m.triggerSkipRevert()
 			}
 		}
 
@@ -218,6 +243,17 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.environment == "" && msg.environment != "" {
 			m.environment = msg.environment
 		}
+		if m.engine == "" && msg.engine != "" {
+			m.engine = msg.engine
+		}
+		if msg.metadata != nil {
+			m.metadata = msg.metadata
+			if m.deployRequestURL == "" {
+				if url := msg.metadata["deploy_request_url"]; url != "" {
+					m.deployRequestURL = url
+				}
+			}
+		}
 
 		// Calculate max table name length for alignment
 		for _, t := range m.tables {
@@ -230,8 +266,8 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if state.IsState(m.state, state.Apply.Completed, state.Apply.Failed) {
 			return m, tea.Quit
 		}
-		// Also quit on stopped state
-		if state.IsState(m.state, state.Apply.Stopped) {
+		// Also quit on stopped/cancelled state
+		if state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled) {
 			return m, tea.Quit
 		}
 		// Quit if no active schema change

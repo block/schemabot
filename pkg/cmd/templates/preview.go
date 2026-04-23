@@ -1094,6 +1094,7 @@ func previewCLIApplyAllOutput() {
 		{"VITESS: CREATING BRANCH", previewCreatingBranchOutput},
 		{"VITESS: APPLYING BRANCH CHANGES", previewApplyingBranchChangesOutput},
 		{"VITESS: CREATING DEPLOY REQUEST", previewCreatingDeployRequestOutput},
+		{"VITESS: STAGING SCHEMA CHANGES (0% with shards)", previewVitessStagingOutput},
 		{"VITESS: RUNNING", previewVitessRunningOutput},
 		{"VITESS: COMPLETED", previewVitessCompletedOutput},
 		{"VITESS: FAILED", previewVitessFailedOutput},

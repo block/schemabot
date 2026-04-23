@@ -285,6 +285,7 @@ type TableProgressResponse struct {
 	TableName       string                   `json:"table_name"`
 	DDL             string                   `json:"ddl"`
 	Keyspace        string                   `json:"keyspace,omitempty"`
+	ChangeType      string                   `json:"change_type,omitempty"` // create, alter, drop
 	Status          string                   `json:"status"`
 	RowsCopied      int64                    `json:"rows_copied"`
 	RowsTotal       int64                    `json:"rows_total"`
