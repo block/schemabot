@@ -78,7 +78,6 @@ const (
 type Server struct {
 	backends             map[backendKey]*databaseBackend // (org, database) -> backend
 	metadataDB           *sql.DB
-	branchDSNBase        string           // DSN prefix for branch database connections (e.g., "user@unix(socket)/")
 	httpServer           *httptest.Server // used in test mode (ListenAddr == "")
 	standaloneServer     *http.Server     // used in standalone mode (ListenAddr != "")
 	baseURL              string
@@ -275,7 +274,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if firstMC == nil {
 		return nil, fmt.Errorf("at least one database must be configured")
 	}
-	metadataDB, branchDSNBase, err := createManagedMetadataDB(ctx, firstMC.mysqlDSNBase)
+	metadataDB, _, err = createManagedMetadataDB(ctx, firstMC.mysqlDSNBase)
 	if err != nil {
 		return nil, fmt.Errorf("create managed metadata db: %w", err)
 	}
@@ -316,7 +315,6 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	s := &Server{
 		backends:              backends,
 		metadataDB:            metadataDB,
-		branchDSNBase:         branchDSNBase,
 		logger:                cfg.Logger,
 		revertWindowDuration:  revertWindow,
 		defaultThrottleRatio:  cfg.DefaultThrottleRatio,

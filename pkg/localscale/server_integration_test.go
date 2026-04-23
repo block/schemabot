@@ -363,11 +363,9 @@ func verifyColumnNotExists(t *testing.T, table, column string) {
 // branchDatabaseExists checks if a branch database exists in localscale-mysql.
 func branchDatabaseExists(t *testing.T, branch, keyspace string) bool {
 	t.Helper()
-	dbName := fmt.Sprintf("branch_%s_%s", branch, keyspace)
-	result, err := testContainer.MetadataQuery(t.Context(),
-		"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?", dbName)
-	require.NoError(t, err, "check branch database exists")
-	return len(result.Rows) > 0
+	_, err := testContainer.BranchDBQuery(t.Context(), branch, keyspace,
+		"SELECT 1 FROM information_schema.SCHEMATA LIMIT 1")
+	return err == nil
 }
 
 const (
@@ -421,6 +419,7 @@ func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantSt
 	for _, s := range wantStates {
 		wantSet[s] = true
 	}
+	start := time.Now()
 	deadline := time.Now().Add(longPollTimeout)
 	var lastState string
 	for time.Now().Before(deadline) {
@@ -430,6 +429,9 @@ func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantSt
 			Number:       number,
 		})
 		require.NoError(t, err, "GetDeployRequest(%d)", number)
+		if dr.DeploymentState != lastState {
+			t.Logf("deploy %d: %s → %s (%s elapsed)", number, lastState, dr.DeploymentState, time.Since(start).Round(time.Millisecond))
+		}
 		lastState = dr.DeploymentState
 		if wantSet[lastState] {
 			return dr
@@ -451,6 +453,8 @@ func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantSt
 // so the next test isn't blocked by the gated deployment check.
 func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 	t.Helper()
+	start := time.Now()
+	cleaned := 0
 	// Scan all deploy requests and skip-revert or cancel any that are active
 	for i := uint64(1); i <= 100; i++ {
 		dr, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
@@ -464,13 +468,17 @@ func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 			_, _ = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
 				Organization: testOrg, Database: testDB, Number: i,
 			})
+			cleaned++
 		case "queued", "in_progress", "pending_cutover", "in_progress_cutover", "submitting":
 			_, _ = testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
 				Organization: testOrg, Database: testDB, Number: i,
 			})
+			cleaned++
 		}
 	}
-	time.Sleep(time.Second) // let state transitions settle
+	if cleaned > 0 {
+		t.Logf("cleanupActiveDeployRequests: cleaned %d DRs in %s", cleaned, time.Since(start).Round(time.Millisecond))
+	}
 }
 
 // cancelAllVitessMigrations cancels all pending Vitess migrations across keyspaces.

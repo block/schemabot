@@ -90,5 +90,7 @@ terraform.rc
 
 # OS files
 .DS_Store
-deploy/local/schemabot
 .gist-id
+
+# CLI tool configs
+.bk.yaml

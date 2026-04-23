@@ -1,0 +1,2 @@
+database: testapp-vitess
+type: vitess

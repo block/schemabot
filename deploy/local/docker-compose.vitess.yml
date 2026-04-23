@@ -15,7 +15,10 @@ services:
       - --foreign-key-mode=disallow
       - --vtcombo-bind-host=0.0.0.0
       - --gateway-initial-tablet-timeout=5s
-      - --migration-check-interval=5s
+      # How often the online DDL executor polls _vt.vreplication for progress
+      # (rows_copied, state). Default is 60s; 1s gives granular row copy progress
+      # for demo/testing. On real PlanetScale this is managed by the platform.
+      - --migration-check-interval=1s
       - --per-shard-sidecar
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-P", "28003", "--protocol=tcp"]

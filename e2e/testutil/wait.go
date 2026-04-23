@@ -20,6 +20,9 @@ import (
 // ProgressTimeout is the per-request timeout for progress API polling.
 const ProgressTimeout = 5 * time.Second
 
+// PollDeadline is the maximum time to wait when polling for a state transition.
+const PollDeadline = 30 * time.Second
+
 // FetchProgress calls the progress API by apply ID and returns the
 // full ProgressResponse with its State normalized.
 func FetchProgress(endpoint, applyID string) (*apitypes.ProgressResponse, error) {
