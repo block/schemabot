@@ -510,7 +510,8 @@ func TestVitess_Apply_AddColumn_Sharded(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, resp.Tables, "expected table progress")
 	for _, tbl := range resp.Tables {
-		assert.True(t, tbl.IsInstant, "ADD COLUMN NULL should use instant DDL for table %s", tbl.TableName)
+		assert.True(t, tbl.IsInstant, "ADD COLUMN NULL should use instant DDL for table %s (state=%s, percent=%d, rows=%d/%d)",
+			tbl.TableName, tbl.Status, tbl.PercentComplete, tbl.RowsCopied, tbl.RowsTotal)
 		assert.Equal(t, int32(100), tbl.PercentComplete, "instant DDL should show 100%% for table %s", tbl.TableName)
 	}
 }
