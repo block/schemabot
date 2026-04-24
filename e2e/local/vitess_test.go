@@ -502,7 +502,8 @@ func TestVitess_Apply_AddColumn_Sharded(t *testing.T) {
 	e2eutil.AssertContains(t, out, "Apply completed")
 
 	// Verify instant DDL was used — ADD COLUMN NULL is instant in MySQL 8.0+.
-	// LocalScale tries ALGORITHM=INSTANT first and Vitess reports is_immediate_operation=1.
+	// The engine stores InstantDDL in metadata at deploy time and propagates
+	// it to table progress even when SHOW VITESS_MIGRATIONS is unavailable.
 	applyID := extractApplyIDFromLog(out)
 	endpoint := schemabotURL(t)
 	resp, err := client.GetProgress(endpoint, applyID)
