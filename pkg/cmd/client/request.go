@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 // httpClient is the shared HTTP client for all CLI requests.
@@ -147,40 +149,35 @@ func checkNonJSONResponse(resp *http.Response, body []byte, parseErr error) erro
 	return fmt.Errorf("parse response: %w", parseErr)
 }
 
-// stripHTMLTags removes HTML tags and style/script content, returning only visible text.
+// stripHTMLTags extracts visible text from HTML using the x/net/html tokenizer.
+// Skips <style> and <script> content.
 func stripHTMLTags(s string) string {
-	// Remove <style>...</style> and <script>...</script> blocks first
-	for _, tag := range []string{"style", "script"} {
-		for {
-			start := strings.Index(strings.ToLower(s), "<"+tag)
-			if start < 0 {
-				break
-			}
-			end := strings.Index(strings.ToLower(s[start:]), "</"+tag+">")
-			if end < 0 {
-				s = s[:start]
-				break
-			}
-			s = s[:start] + s[start+end+len("</"+tag+">"):]
-		}
-	}
-	// Strip remaining tags
+	tokenizer := html.NewTokenizer(strings.NewReader(s))
 	var b strings.Builder
-	inTag := false
-	for _, r := range s {
-		if r == '<' {
-			inTag = true
-			continue
-		}
-		if r == '>' {
-			inTag = false
-			continue
-		}
-		if !inTag {
-			b.WriteRune(r)
+	skip := false
+	for {
+		tt := tokenizer.Next()
+		switch tt {
+		case html.ErrorToken:
+			return strings.TrimSpace(b.String())
+		case html.StartTagToken:
+			tn, _ := tokenizer.TagName()
+			tag := string(tn)
+			if tag == "style" || tag == "script" {
+				skip = true
+			}
+		case html.EndTagToken:
+			tn, _ := tokenizer.TagName()
+			tag := string(tn)
+			if tag == "style" || tag == "script" {
+				skip = false
+			}
+		case html.TextToken:
+			if !skip {
+				b.Write(tokenizer.Text())
+			}
 		}
 	}
-	return strings.TrimSpace(b.String())
 }
 
 // parseAPIError builds an APIError from a non-200 HTTP response, extracting
