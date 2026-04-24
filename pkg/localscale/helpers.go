@@ -569,10 +569,11 @@ func normalizeJSON(data []byte) string {
 	return string(b)
 }
 
-// checkInstantEligibility tests whether all DDL statements can use ALGORITHM=INSTANT.
-// Creates a temporary database on the metadata MySQL server, copies table schemas
-// from main via vtgate, tests each ALTER with ALGORITHM=INSTANT, and drops the
-// temp database. Returns true only if ALL statements are instant-eligible ALTERs.
+// checkInstantEligibility tests whether all ALTER TABLE statements in a deploy
+// can use ALGORITHM=INSTANT. Creates a temporary scratch database, copies table
+// schemas from main, and tests each ALTER with ALGORITHM=INSTANT. Non-ALTER
+// statements (CREATE/DROP TABLE) are skipped — they don't involve row copy.
+// Returns true when all ALTERs are instant-eligible (or there are no ALTERs).
 func (s *Server) checkInstantEligibility(ctx context.Context, backend *databaseBackend, ddlByKeyspace map[string][]string) bool {
 	scratchDB := fmt.Sprintf("_ls_instant_%d", time.Now().UnixNano()%1000000)
 
@@ -602,12 +603,13 @@ func (s *Server) checkInstantEligibility(ctx context.Context, backend *databaseB
 			}
 		}
 
-		// Test each ALTER with ALGORITHM=INSTANT
+		// Test each ALTER with ALGORITHM=INSTANT.
+		// Non-ALTER statements (CREATE/DROP TABLE) are skipped — they don't
+		// affect instant eligibility since they don't involve row copy.
 		for _, stmt := range stmts {
 			instantStmt := addAlgorithmInstant(stmt)
 			if instantStmt == "" {
-				s.logger.Info("instant check: non-ALTER", "keyspace", keyspace)
-				return false
+				continue // CREATE/DROP TABLE — not relevant to instant eligibility
 			}
 			tableName := extractAlterTableName(stmt)
 			if tableName == "" {
