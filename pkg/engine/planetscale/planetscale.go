@@ -872,6 +872,15 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// completes immediately and has no revert window regardless of skip_revert.
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
 	useInstant := instantEligible && !deferCutover
+	e.logger.Info("instant DDL decision",
+		"database", req.Database,
+		"deploy_request", dr.Number,
+		"has_deployment", dr.Deployment != nil,
+		"instant_eligible", instantEligible,
+		"use_instant", useInstant,
+		"defer_cutover", deferCutover,
+		"deploy_state", dr.DeploymentState,
+	)
 
 	drElapsed := time.Since(drStart).Round(time.Second)
 	readyMsg := fmt.Sprintf("Deploy request #%d ready (%s)", dr.Number, drElapsed)
