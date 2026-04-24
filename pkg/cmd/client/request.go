@@ -61,7 +61,7 @@ func doGetIntoCtx(ctx context.Context, endpoint, path string, result any) error 
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
+		return checkNonJSONResponse(resp, respBody, err)
 	}
 	return nil
 }
@@ -123,9 +123,19 @@ func doPostInto(endpoint, path string, body any, result any) error {
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
+		return checkNonJSONResponse(resp, respBody, err)
 	}
 	return nil
+}
+
+// checkNonJSONResponse provides a clear error when the server returns non-JSON
+// (e.g., an HTML auth page from a proxy). Falls back to the original parse error.
+func checkNonJSONResponse(resp *http.Response, body []byte, parseErr error) error {
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "html") || (len(body) > 0 && body[0] == '<') {
+		return fmt.Errorf("server returned an HTML page instead of JSON — you may need to re-authenticate with the endpoint")
+	}
+	return fmt.Errorf("parse response: %w", parseErr)
 }
 
 // parseAPIError builds an APIError from a non-200 HTTP response, extracting
