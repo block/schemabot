@@ -400,7 +400,6 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
-	spiritlint "github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -545,6 +544,15 @@ func (e *Engine) getVtgateDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
+func (e *Engine) getVtgateKeyspaceDB(ctx context.Context, dsn, keyspace string) (*sql.DB, error) {
+	mysqlCfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse vtgate DSN for keyspace %s: %w", keyspace, err)
+	}
+	mysqlCfg.DBName = keyspace
+	return e.getVtgateDB(ctx, mysqlCfg.FormatDSN())
+}
+
 // mainBranch returns the main branch name from credentials, defaulting to "main".
 // Credential helpers — read PlanetScale-specific values from Metadata.
 
@@ -579,8 +587,8 @@ func mainBranch(creds *engine.Credentials) string {
 // --- Plan ---
 
 // Plan computes the schema changes needed by diffing current schema against desired.
-// For each keyspace in the schema files, it fetches the current schema from PlanetScale
-// and uses Spirit's PlanChanges to diff and lint in a single pass.
+// For each keyspace in the schema files, it fetches the current schema and uses
+// Spirit's PlanChanges to diff and lint in a single pass.
 func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
 	e.logger.Info("computing plan",
 		"database", req.Database,
@@ -595,8 +603,12 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	org := credOrg(req.Credentials)
 	branch := mainBranch(req.Credentials)
 
-	// Fetch current schema from PlanetScale per keyspace
-	currentSchema, err := e.fetchDatabaseSchema(ctx, client, org, req.Database, branch)
+	// Sort keyspaces for deterministic order
+	keyspaces := sortedKeyspaces(req.SchemaFiles)
+
+	// Prefer the PlanetScale schema API when safe schema changes are enabled,
+	// and use vtgate only when they are not.
+	currentSchema, err := e.fetchPlanSchema(ctx, client, org, req.Database, branch, req.Credentials, keyspaces)
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
@@ -605,9 +617,6 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	var changes []engine.SchemaChange
 	var lintViolations []engine.LintViolation
 	originalSchema := make(map[string]string)
-
-	// Sort keyspaces for deterministic order
-	keyspaces := sortedKeyspaces(req.SchemaFiles)
 
 	for _, keyspace := range keyspaces {
 		ns := req.SchemaFiles[keyspace]
@@ -658,7 +667,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}
 
 		// Use Spirit's PlanChanges to diff + lint in one call.
-		plan, planErr := spiritlint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
+		plan, planErr := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
 		if planErr != nil {
 			return nil, fmt.Errorf("plan changes for keyspace %s: %w", keyspace, planErr)
 		}
@@ -1130,7 +1139,7 @@ func (e *Engine) diffBranchForResume(ctx context.Context, client psclient.PSClie
 		}
 
 		// Diff: what DDL is needed to bring branch from current to desired?
-		plan, err := spiritlint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
+		plan, err := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
 		if err != nil {
 			return nil, fmt.Errorf("diff keyspace %s for resume: %w", keyspace, err)
 		}
@@ -2016,6 +2025,7 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 		}
 
 		tables = append(tables, engine.TableProgress{
+			Namespace:   key.keyspace,
 			Table:       key.table,
 			State:       tableState,
 			Progress:    tblProgress,
@@ -2125,6 +2135,45 @@ func (e *Engine) fetchDatabaseSchema(ctx context.Context, client psclient.PSClie
 			tables[i] = table.TableSchema{Name: t.Name, Schema: t.Raw}
 		}
 		result[ks.Name] = tables
+	}
+	return result, nil
+}
+
+func (e *Engine) fetchPlanSchema(ctx context.Context, client psclient.PSClient, org, database, branch string, creds *engine.Credentials, keyspaces []string) (map[string][]table.TableSchema, error) {
+	parent, err := client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
+		Organization: org,
+		Database:     database,
+		Branch:       branch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get branch %s: %w", branch, err)
+	}
+
+	if parent.SafeMigrations {
+		e.logger.Debug("using PlanetScale schema API for plan", "database", database, "branch", branch)
+		return e.fetchDatabaseSchema(ctx, client, org, database, branch)
+	}
+
+	if creds == nil || creds.DSN == "" {
+		return nil, fmt.Errorf("safe schema changes are not enabled on branch %q of database %q and vtgate DSN is not configured", branch, database)
+	}
+
+	e.logger.Info("using vtgate schema for plan because PlanetScale safe schema changes are disabled", "database", database, "branch", branch)
+	return e.fetchVtgateSchema(ctx, creds.DSN, keyspaces)
+}
+
+func (e *Engine) fetchVtgateSchema(ctx context.Context, dsn string, keyspaces []string) (map[string][]table.TableSchema, error) {
+	result := make(map[string][]table.TableSchema, len(keyspaces))
+	for _, keyspace := range keyspaces {
+		db, err := e.getVtgateKeyspaceDB(ctx, dsn, keyspace)
+		if err != nil {
+			return nil, fmt.Errorf("get vtgate connection for keyspace %s: %w", keyspace, err)
+		}
+		tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables)
+		if err != nil {
+			return nil, fmt.Errorf("load schema for keyspace %s: %w", keyspace, err)
+		}
+		result[keyspace] = tables
 	}
 	return result, nil
 }

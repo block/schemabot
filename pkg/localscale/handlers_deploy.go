@@ -59,8 +59,8 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 	result, err := s.metadataDB.ExecContext(r.Context(),
 		`INSERT INTO localscale_deploy_requests (number, org, database_name, token_name, branch, into_branch, auto_cutover, ddl_statements, deployment_state)
 		 SELECT COALESCE(MAX(number), 0) + 1, ?, ?, ?, ?, ?, ?, '{}', ?
-		 FROM localscale_deploy_requests WHERE database_name = ?`,
-		org, database, tokenName, body.Branch, body.IntoBranch, body.AutoCutover, dr.Pending, database,
+		 FROM localscale_deploy_requests WHERE org = ? AND database_name = ?`,
+		org, database, tokenName, body.Branch, body.IntoBranch, body.AutoCutover, dr.Pending, org, database,
 	)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "insert deploy request: %v", err)
@@ -106,7 +106,8 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 		}
 		if err := s.computeDeployRequestDiff(bgCtx, backend, drNumber, org, database, body.Branch); err != nil {
 			s.logger.Error("deploy request diff failed", "number", drNumber, "error", err)
-			if stateErr := s.updateDeployState(bgCtx, drNumber, dr.Error); stateErr != nil {
+			ref := deployRequest{org: org, database: database, number: drNumber}
+			if stateErr := s.updateDeployState(bgCtx, ref, dr.Error); stateErr != nil {
 				s.logger.Error("failed to set error state", "number", drNumber, "error", stateErr)
 			}
 		}
@@ -141,8 +142,10 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	var vschemaDataSQL sql.NullString
 	var autoCutover, deployed bool
 	err = s.metadataDB.QueryRowContext(r.Context(),
-		"SELECT branch, ddl_statements, vschema_data, auto_cutover, deployed, deployment_state FROM localscale_deploy_requests WHERE number = ?",
-		number,
+		`SELECT branch, ddl_statements, vschema_data, auto_cutover, deployed, deployment_state
+		 FROM localscale_deploy_requests
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		org, database, number,
 	).Scan(&branch, &ddlJSON, &vschemaDataSQL, &autoCutover, &deployed, &deployState)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
@@ -171,13 +174,13 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	var prevNumber uint64
 	err = s.metadataDB.QueryRowContext(r.Context(),
 		`SELECT number FROM localscale_deploy_requests
-		 WHERE database_name = ? AND deployed = TRUE AND cancelled = FALSE
+		 WHERE org = ? AND database_name = ? AND deployed = TRUE AND cancelled = FALSE
 		 AND number != ?
 		 ORDER BY number DESC LIMIT 1`,
-		database, number,
+		org, database, number,
 	).Scan(&prevNumber)
 	if err == nil {
-		prevState, stateErr := s.getDeployRequestState(r.Context(), prevNumber)
+		prevState, stateErr := s.getDeployRequestState(r.Context(), deployRequest{org: org, database: database, number: prevNumber})
 		if stateErr == nil && !terminalDeployStates[prevState] {
 			return newHTTPError(http.StatusConflict, "deploy request %d is still active (state: %s)", prevNumber, prevState)
 		}
@@ -200,7 +203,10 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 
 	if totalDDL == 0 && !hasVSchema {
 		if err := s.execLog(r.Context(),
-			"UPDATE localscale_deploy_requests SET deployed = TRUE, deployment_state = ? WHERE number = ?", dr.NoChanges, number,
+			`UPDATE localscale_deploy_requests
+			 SET deployed = TRUE, deployment_state = ?
+			 WHERE org = ? AND database_name = ? AND number = ?`,
+			dr.NoChanges, org, database, number,
 		); err != nil {
 			return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 		}
@@ -213,8 +219,8 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	result, err := s.metadataDB.ExecContext(r.Context(),
 		`UPDATE localscale_deploy_requests
 		 SET deployed = TRUE, migration_context = ?, deployment_state = ?
-		 WHERE number = ? AND deployed = FALSE`,
-		migrationContext, dr.Submitting, number,
+		 WHERE org = ? AND database_name = ? AND number = ? AND deployed = FALSE`,
+		migrationContext, dr.Submitting, org, database, number,
 	)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update deploy request: %v", err)
@@ -234,7 +240,7 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	s.wg.Go(func() {
 		params := deployExecParams{
 			backend:          backend,
-			number:           number,
+			ref:              deployRequest{org: org, database: database, number: number},
 			hasVSchema:       hasVSchema,
 			vschemaData:      vschemaDataSQL.String,
 			totalDDL:         totalDDL,
@@ -245,7 +251,7 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 		}
 		if err := s.executeDeployRequest(s.shutdownCtx, params); err != nil {
 			s.logger.Error("deploy execution failed", "number", number, "error", err)
-			if stateErr := s.updateDeployState(s.shutdownCtx, number, dr.Error); stateErr != nil {
+			if stateErr := s.updateDeployState(s.shutdownCtx, params.ref, dr.Error); stateErr != nil {
 				s.logger.Error("failed to set error state", "number", number, "error", stateErr)
 			}
 		}
@@ -260,7 +266,10 @@ func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request
 
 	rows, err := s.metadataDB.QueryContext(r.Context(),
 		`SELECT number, branch, into_branch, deployment_state, instant_ddl_eligible
-		 FROM localscale_deploy_requests ORDER BY number DESC`)
+		 FROM localscale_deploy_requests
+		 WHERE org = ? AND database_name = ?
+		 ORDER BY number DESC`,
+		org, database)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "query deploy requests: %v", err)
 	}
@@ -305,7 +314,9 @@ func (s *Server) handleGetDeployRequest(w http.ResponseWriter, r *http.Request) 
 	var instantEligible bool
 	err = s.metadataDB.QueryRowContext(r.Context(),
 		`SELECT branch, into_branch, deployment_state, instant_ddl_eligible
-		 FROM localscale_deploy_requests WHERE number = ?`, number,
+		 FROM localscale_deploy_requests
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		org, database, number,
 	).Scan(&branch, &intoBranch, &state, &instantEligible)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
@@ -428,8 +439,8 @@ func (s *Server) computeDeployRequestDiff(ctx context.Context, backend *database
 	if err := s.execLog(ctx,
 		`UPDATE localscale_deploy_requests
 		 SET ddl_statements = ?, vschema_data = ?, instant_ddl_eligible = ?, deployment_state = ?
-		 WHERE number = ?`,
-		string(ddlJSON), vschemaJSON, instantEligible, newState, number,
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		string(ddlJSON), vschemaJSON, instantEligible, newState, org, database, number,
 	); err != nil {
 		return fmt.Errorf("persist diff results for deploy request %d: %w", number, err)
 	}
@@ -440,7 +451,7 @@ func (s *Server) computeDeployRequestDiff(ctx context.Context, backend *database
 // deployExecParams holds the parameters for executeDeployRequest.
 type deployExecParams struct {
 	backend          *databaseBackend
-	number           uint64
+	ref              deployRequest
 	hasVSchema       bool
 	vschemaData      string
 	totalDDL         int
@@ -459,8 +470,8 @@ func (s *Server) executeDeployRequest(ctx context.Context, p deployExecParams) e
 	// the keyspace as unsharded and rejects DDL with "Keyspace does not have
 	// exactly one shard".
 	if p.hasVSchema {
-		if err := s.applyPendingVSchema(ctx, p.backend, p.number, p.vschemaData); err != nil {
-			return fmt.Errorf("apply vschema for deploy request %d: %w", p.number, err)
+		if err := s.applyPendingVSchema(ctx, p.backend, p.ref, p.vschemaData); err != nil {
+			return fmt.Errorf("apply vschema for deploy request %d: %w", p.ref.number, err)
 		}
 	}
 
@@ -472,12 +483,14 @@ func (s *Server) executeDeployRequest(ctx context.Context, p deployExecParams) e
 		} else if len(schemaBefore) > 0 {
 			schemaJSON, err := json.Marshal(schemaBefore)
 			if err != nil {
-				s.logger.Warn("marshal schema_before", "number", p.number, "error", err)
+				s.logger.Warn("marshal schema_before", "number", p.ref.number, "error", err)
 			} else {
 				if err := s.execLog(ctx,
-					"UPDATE localscale_deploy_requests SET schema_before = ? WHERE number = ?",
-					string(schemaJSON), p.number); err != nil {
-					s.logger.Warn("failed to save schema_before snapshot", "number", p.number, "error", err)
+					`UPDATE localscale_deploy_requests
+					 SET schema_before = ?
+					 WHERE org = ? AND database_name = ? AND number = ?`,
+					string(schemaJSON), p.ref.org, p.ref.database, p.ref.number); err != nil {
+					s.logger.Warn("failed to save schema_before snapshot", "number", p.ref.number, "error", err)
 				}
 			}
 		}
@@ -486,14 +499,14 @@ func (s *Server) executeDeployRequest(ctx context.Context, p deployExecParams) e
 		ddlStrategy := buildDDLStrategy(p.instantDDL)
 
 		if err := s.submitOnlineDDL(ctx, p.backend, p.ddlByKeyspace, ddlStrategy, p.migrationContext); err != nil {
-			return fmt.Errorf("submit online DDL for deploy request %d: %w", p.number, err)
+			return fmt.Errorf("submit online DDL for deploy request %d: %w", p.ref.number, err)
 		}
 	}
 
 	// Apply default throttle to the online-ddl app if configured.
 	if s.defaultThrottleRatio > 0 && p.totalDDL > 0 {
-		if err := s.applyThrottle(ctx, p.backend, p.number, s.defaultThrottleRatio); err != nil {
-			s.logger.Warn("default throttle failed", "number", p.number, "error", err)
+		if err := s.applyThrottle(ctx, p.backend, p.ref.number, s.defaultThrottleRatio); err != nil {
+			s.logger.Warn("default throttle failed", "number", p.ref.number, "error", err)
 		}
 	}
 
@@ -503,12 +516,12 @@ func (s *Server) executeDeployRequest(ctx context.Context, p deployExecParams) e
 	if p.totalDDL == 0 {
 		initialState = dr.CompletePendingRevert
 	}
-	if err := s.updateDeployState(ctx, p.number, initialState); err != nil {
-		return fmt.Errorf("update deploy state to %s for deploy request %d: %w", initialState, p.number, err)
+	if err := s.updateDeployState(ctx, p.ref, initialState); err != nil {
+		return fmt.Errorf("update deploy state to %s for deploy request %d: %w", initialState, p.ref.number, err)
 	}
 
 	s.logger.Info("deployed deploy request",
-		"number", p.number,
+		"number", p.ref.number,
 		"ddl_count", p.totalDDL,
 		"has_vschema", p.hasVSchema,
 		"migration_context", p.migrationContext,
@@ -519,10 +532,12 @@ func (s *Server) executeDeployRequest(ctx context.Context, p deployExecParams) e
 }
 
 // The background processor keeps deployment_state up to date.
-func (s *Server) getDeployRequestState(ctx context.Context, number uint64) (string, error) {
+func (s *Server) getDeployRequestState(ctx context.Context, ref deployRequest) (string, error) {
 	var state string
 	err := s.metadataDB.QueryRowContext(ctx,
-		"SELECT deployment_state FROM localscale_deploy_requests WHERE number = ?", number,
+		`SELECT deployment_state FROM localscale_deploy_requests
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		ref.org, ref.database, ref.number,
 	).Scan(&state)
 	return state, err
 }

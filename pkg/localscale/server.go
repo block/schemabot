@@ -64,6 +64,7 @@ type databaseBackend struct {
 	managed          *managedCluster    // non-nil if this backend was started by LocalScale
 	shardCounts      map[string]int     // keyspace → number of shards (from config)
 	requireApproval  bool               // reject deploys unless approved (per-database setting)
+	safeMigrations   bool               // whether main branch reports safe schema changes enabled
 }
 
 const (
@@ -126,6 +127,7 @@ type OrgConfig struct {
 type DatabaseConfig struct {
 	Keyspaces       []KeyspaceConfig // keyspaces in this database
 	RequireApproval bool             // require approval before deploying (rejects deploys with "must be approved")
+	SafeMigrations  *bool            // whether safe schema changes are enabled; nil defaults to true
 }
 
 // KeyspaceConfig describes a keyspace and its sharding.
@@ -213,6 +215,11 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 				shardCounts[ks.Name] = shards
 			}
 
+			safeMigrations := true
+			if dbCfg.SafeMigrations != nil {
+				safeMigrations = *dbCfg.SafeMigrations
+			}
+
 			vtgateDBs := make(map[string]*sql.DB)
 			for _, ks := range dbCfg.Keyspaces {
 				dsn := fmt.Sprintf("root@tcp(%s)/%s", mc.vtgateMySQLAddr, ks.Name)
@@ -251,6 +258,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 				managed:          mc,
 				shardCounts:      shardCounts,
 				requireApproval:  dbCfg.RequireApproval,
+				safeMigrations:   safeMigrations,
 			}
 		}
 	}

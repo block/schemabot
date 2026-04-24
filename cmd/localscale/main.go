@@ -28,7 +28,8 @@ type configFile struct {
 				Name   string `json:"name"`
 				Shards int    `json:"shards"`
 			} `json:"keyspaces"`
-			RequireApproval bool `json:"require_approval,omitempty"`
+			RequireApproval bool  `json:"require_approval,omitempty"`
+			SafeMigrations  *bool `json:"safe_migrations,omitempty"`
 		} `json:"databases"`
 	} `json:"organizations"`
 	ListenAddr            string  `json:"listen_addr"`
@@ -84,6 +85,7 @@ func main() {
 			databases[dbName] = localscale.DatabaseConfig{
 				Keyspaces:       keyspaces,
 				RequireApproval: db.RequireApproval,
+				SafeMigrations:  db.SafeMigrations,
 			}
 		}
 		orgs[name] = localscale.OrgConfig{Databases: databases}

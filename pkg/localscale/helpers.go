@@ -489,20 +489,26 @@ func (s *Server) parseDeployNumber(r *http.Request) (uint64, error) {
 	return number, nil
 }
 
+type deployRequest struct {
+	org      string
+	database string
+	number   uint64
+}
+
 // resolveDeployAction is shared preamble for deploy action handlers: resolves the
 // backend from URL path values and parses the deploy number.
-func (s *Server) resolveDeployAction(r *http.Request) (*databaseBackend, uint64, error) {
+func (s *Server) resolveDeployAction(r *http.Request) (*databaseBackend, deployRequest, error) {
 	org := r.PathValue("org")
 	database := r.PathValue("db")
 	backend, err := s.backendFor(org, database)
 	if err != nil {
-		return nil, 0, newHTTPError(http.StatusNotFound, "%v", err)
+		return nil, deployRequest{}, newHTTPError(http.StatusNotFound, "%v", err)
 	}
 	number, err := s.parseDeployNumber(r)
 	if err != nil {
-		return nil, 0, err // already an *httpError
+		return nil, deployRequest{}, err // already an *httpError
 	}
-	return backend, number, nil
+	return backend, deployRequest{org: org, database: database, number: number}, nil
 }
 
 // deployResponse returns the standard deploy request response map with number, branch, and state.
@@ -522,14 +528,16 @@ type deployRequestInfo struct {
 }
 
 // getDeployRequestInfo fetches common deploy request fields.
-func (s *Server) getDeployRequestInfo(ctx context.Context, number uint64) (*deployRequestInfo, error) {
+func (s *Server) getDeployRequestInfo(ctx context.Context, ref deployRequest) (*deployRequestInfo, error) {
 	var info deployRequestInfo
 	err := s.metadataDB.QueryRowContext(ctx,
-		"SELECT branch, migration_context, deployment_state FROM localscale_deploy_requests WHERE number = ?",
-		number,
+		`SELECT branch, migration_context, deployment_state
+		 FROM localscale_deploy_requests
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		ref.org, ref.database, ref.number,
 	).Scan(&info.branch, &info.migrationContext, &info.deploymentState)
 	if err != nil {
-		return nil, newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
+		return nil, newHTTPError(http.StatusNotFound, "deploy request not found: %d", ref.number)
 	}
 	return &info, nil
 }

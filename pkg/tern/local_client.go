@@ -654,15 +654,21 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			t.State == state.Task.RevertWindow:
 			// Prefer actively running/waiting tasks
 			activeTask = t
-		case t.State == state.Task.Stopped && stoppedTask == nil:
+		case t.State == state.Task.Stopped:
 			// Stopped tasks are resumable — track them separately
-			stoppedTask = t
-		case t.State == state.Task.Pending && pendingTask == nil:
+			if stoppedTask == nil {
+				stoppedTask = t
+			}
+		case t.State == state.Task.Pending:
 			// Track first pending task as fallback
-			pendingTask = t
-		case state.IsTerminalTaskState(t.State) && latestTask == nil:
+			if pendingTask == nil {
+				pendingTask = t
+			}
+		case state.IsTerminalTaskState(t.State):
 			// Track most recent terminal task as final fallback
-			latestTask = t
+			if latestTask == nil {
+				latestTask = t
+			}
 		default:
 			// Unknown/new state — still select as fallback to avoid losing engine context
 			c.logger.Warn("unexpected task state in progress", "task_id", t.TaskIdentifier, "state", t.State)
@@ -779,14 +785,12 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	tables := make([]*ternv1.TableProgress, 0, len(currentApplyTasks))
 	var summary string
 
-	// Build a map of engine table progress by table name for fast lookup
-	engineTableProgress := make(map[string]*engine.TableProgress)
+	// Build a map of engine table progress by namespace/table for fast lookup.
+	// Vitess commonly has the same table name in multiple keyspaces.
+	var engineTableProgress map[string]*engine.TableProgress
 	var errorMessage string
 	if engineResult != nil {
-		for i := range engineResult.Tables {
-			et := &engineResult.Tables[i]
-			engineTableProgress[et.Table] = et
-		}
+		engineTableProgress = indexEngineTableProgress(engineResult.Tables)
 		summary = engineResult.Message
 		errorMessage = engineResult.ErrorMessage
 	}
@@ -802,7 +806,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		}
 
 		// Look up engine progress for this table
-		if et, ok := engineTableProgress[t.TableName]; ok {
+		if et, ok := engineProgressForTask(engineTableProgress, t); ok {
 			// Use live progress from engine (uppercase to match storage convention)
 			tp.Status = strings.ToUpper(et.State)
 			tp.PercentComplete = int32(et.Progress)

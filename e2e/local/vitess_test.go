@@ -422,6 +422,33 @@ func TestVitess_Plan_CreateTable(t *testing.T) {
 	e2eutil.AssertContains(t, out, tableName)
 }
 
+func TestVitess_Plan_UsesSchemaAPIWhenSafeSchemaChangesEnabled(t *testing.T) {
+	vitessAvailable(t)
+	vitessRestoreBaseSchema(t, "api-plan")
+	binPath := buildCLI(t)
+	endpoint := schemabotURL(t)
+
+	colName := fmt.Sprintf("api_plan_col_%d", time.Now().UnixMilli()%100000)
+	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
+		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
+  `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  `+"`email`"+` varchar(255) NOT NULL,
+  `+"`full_name`"+` varchar(255) NULL,
+  `+"`%s`"+` varchar(100) NULL,
+  `+"`created_at`"+` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX `+"`idx_email`"+` (`+"`email`"+`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, colName),
+	}))
+
+	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "plan",
+		"-s", ".", "-e", "api-plan", "--endpoint", endpoint)
+
+	e2eutil.AssertContains(t, out, "ADD COLUMN")
+	e2eutil.AssertContains(t, out, colName)
+	assert.NotContains(t, out, "CREATE TABLE")
+	assert.NotContains(t, out, "vtgate connection failed")
+}
+
 // --- Apply Tests ---
 
 func TestVitess_Apply_CreateTable_Unsharded(t *testing.T) {

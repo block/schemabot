@@ -1,8 +1,10 @@
 package lint
 
 import (
+	"sync"
 	"testing"
 
+	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -139,6 +141,32 @@ func TestLintSchema_InvalidSQL(t *testing.T) {
 		"bad.sql": "CREATE TABLE t1 (",
 	})
 	assert.Error(t, err)
+}
+
+func TestPlanChangesConcurrent(t *testing.T) {
+	current := []table.TableSchema{{
+		Name:   "users",
+		Schema: "CREATE TABLE `users` (`id` bigint NOT NULL, `email` varchar(255) NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB",
+	}}
+	desired := []table.TableSchema{{
+		Name:   "users",
+		Schema: "CREATE TABLE `users` (`id` bigint NOT NULL, `email` varchar(255) NOT NULL, `full_name` varchar(255) NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB",
+	}}
+
+	errs := make(chan error, 32)
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Go(func() {
+			_, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
 }
 
 func TestToEngineWarnings(t *testing.T) {

@@ -179,22 +179,18 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 
 // snapshotEngineProgress captures per-table progress from the engine after stopping.
 func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Engine, creds *engine.Credentials) map[string]*engine.TableProgress {
-	result := make(map[string]*engine.TableProgress)
 	if eng == nil {
 		c.logger.Error("snapshotEngineProgress: engine is nil")
-		return result
+		return nil
 	}
 	progress, _ := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
 	})
 	if progress != nil {
-		for i := range progress.Tables {
-			et := &progress.Tables[i]
-			result[et.Table] = et
-		}
+		return indexEngineTableProgress(progress.Tables)
 	}
-	return result
+	return nil
 }
 
 // markTasksStopped sets all non-terminal targeted tasks to STOPPED, preserving engine progress.
@@ -218,7 +214,7 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 		// Mark as STOPPED — even if Spirit reports per-table IsComplete.
 		// IsComplete means "row copy done", NOT "cutover done". The re-plan
 		// during Start() will detect which tables truly completed.
-		if et, ok := engineProgress[task.TableName]; ok {
+		if et, ok := engineProgressForTask(engineProgress, task); ok {
 			task.RowsCopied = et.RowsCopied
 			task.RowsTotal = et.RowsTotal
 			task.ProgressPercent = et.Progress

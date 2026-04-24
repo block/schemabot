@@ -21,7 +21,6 @@ import (
 	"sync"
 	"time"
 
-	spiritlint "github.com/block/spirit/pkg/lint"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/status"
@@ -244,7 +243,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// Use Spirit's PlanChanges to diff + lint in one call.
 	// This combines DeclarativeToImperative (diff) with RunLinters (lint),
 	// returning per-statement lint results with severity levels.
-	plan, err := spiritlint.PlanChanges(currentSchema, desiredSchemas, nil, e.linter.SpiritConfig())
+	plan, err := lint.PlanChanges(currentSchema, desiredSchemas, nil, e.linter.SpiritConfig())
 	if err != nil {
 		return nil, err
 	}

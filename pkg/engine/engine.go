@@ -267,6 +267,7 @@ type ProgressResult struct {
 
 // TableProgress tracks progress for a single table.
 type TableProgress struct {
+	Namespace      string          // Schema/keyspace name when the engine can distinguish it
 	Table          string          // Table name
 	State          string          // "pending", "copying", "ready", "complete", "failed"
 	Progress       int             // 0-100 percent
