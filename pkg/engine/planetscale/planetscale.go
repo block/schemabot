@@ -390,6 +390,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"sort"
 	"strconv"
@@ -613,103 +614,128 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
 
-	// Diff and lint per keyspace using Spirit's PlanChanges.
+	// Diff and lint per keyspace in parallel using Spirit's PlanChanges.
+	type keyspaceResult struct {
+		change     engine.SchemaChange
+		violations []engine.LintViolation
+		schemas    map[string]string // keyspace.table -> CREATE TABLE
+		hasChanges bool
+	}
+
+	var mu sync.Mutex
+	results := make(map[string]*keyspaceResult, len(keyspaces))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(20)
+
+	for _, keyspace := range keyspaces {
+		ks := keyspace
+		g.Go(func() error {
+			ns := req.SchemaFiles[ks]
+
+			var currentTableSchemas []table.TableSchema
+			schemas := make(map[string]string)
+			if tables, ok := currentSchema[ks]; ok {
+				for _, t := range tables {
+					currentTableSchemas = append(currentTableSchemas, t)
+					schemas[ks+"."+t.Name] = t.Schema
+				}
+			}
+
+			desiredTableSchemas, parseErr := parseDesiredSchemas(ks, ns)
+			if parseErr != nil {
+				return parseErr
+			}
+
+			sc := engine.SchemaChange{
+				Namespace: ks,
+				Metadata:  make(map[string]string),
+			}
+
+			// Diff VSchema
+			if content, ok := ns.Files["vschema.json"]; ok && content != "" {
+				currentVSchema, fetchErr := client.GetKeyspaceVSchema(gCtx, &ps.GetKeyspaceVSchemaRequest{
+					Organization: org,
+					Database:     req.Database,
+					Branch:       branch,
+					Keyspace:     ks,
+				})
+				if fetchErr != nil {
+					e.logger.Warn("failed to fetch current VSchema, treating as empty",
+						"keyspace", ks, "error", fetchErr)
+				}
+				currentVSchemaRaw := ""
+				if currentVSchema != nil {
+					currentVSchemaRaw = currentVSchema.Raw
+				}
+				if VSchemaChanged(currentVSchemaRaw, content) {
+					sc.Metadata["vschema"] = VSchemaDiff(currentVSchemaRaw, content)
+				}
+			}
+
+			plan, planErr := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
+			if planErr != nil {
+				return fmt.Errorf("plan changes for keyspace %s: %w", ks, planErr)
+			}
+
+			var violations []engine.LintViolation
+			for _, pc := range plan.Changes {
+				op, _, classifyErr := ddl.ClassifyStatementAST(pc.Statement)
+				if classifyErr != nil {
+					return fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
+				}
+				change := engine.TableChange{
+					Table:     pc.TableName,
+					Operation: op,
+					DDL:       pc.Statement,
+				}
+				if errViolations := pc.Errors(); len(errViolations) > 0 {
+					change.IsUnsafe = true
+					msgs := make([]string, len(errViolations))
+					for i, v := range errViolations {
+						msgs[i] = v.Message
+					}
+					change.UnsafeReason = strings.Join(msgs, "; ")
+				}
+				sc.TableChanges = append(sc.TableChanges, change)
+
+				for _, v := range pc.Violations {
+					violations = append(violations, engine.LintViolation{
+						Table:    pc.TableName,
+						Linter:   v.Linter.Name(),
+						Message:  v.Message,
+						Severity: strings.ToLower(v.Severity.String()),
+					})
+				}
+			}
+
+			mu.Lock()
+			results[ks] = &keyspaceResult{
+				change:     sc,
+				violations: violations,
+				schemas:    schemas,
+				hasChanges: len(sc.TableChanges) > 0 || sc.Metadata["vschema"] != "",
+			}
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Collect results in deterministic keyspace order
 	var changes []engine.SchemaChange
 	var lintViolations []engine.LintViolation
 	originalSchema := make(map[string]string)
-
-	for _, keyspace := range keyspaces {
-		ns := req.SchemaFiles[keyspace]
-
-		// Build current table schemas for this keyspace
-		var currentTableSchemas []table.TableSchema
-		if tables, ok := currentSchema[keyspace]; ok {
-			for _, t := range tables {
-				currentTableSchemas = append(currentTableSchemas, t)
-				originalSchema[keyspace+"."+t.Name] = t.Schema
-			}
+	for _, ks := range keyspaces {
+		r := results[ks]
+		if r == nil {
+			continue
 		}
-
-		// Build desired table schemas from SQL files
-		desiredTableSchemas, err := parseDesiredSchemas(keyspace, ns)
-		if err != nil {
-			return nil, err
-		}
-		var desiredVSchema string
-		if content, ok := ns.Files["vschema.json"]; ok {
-			desiredVSchema = content
-		}
-
-		sc := engine.SchemaChange{
-			Namespace: keyspace,
-			Metadata:  make(map[string]string),
-		}
-
-		// Diff VSchema if desired VSchema is provided
-		if desiredVSchema != "" {
-			currentVSchema, fetchErr := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
-				Organization: org,
-				Database:     req.Database,
-				Branch:       branch,
-				Keyspace:     keyspace,
-			})
-			if fetchErr != nil {
-				e.logger.Warn("failed to fetch current VSchema, treating as empty",
-					"keyspace", keyspace, "error", fetchErr)
-			}
-			currentVSchemaRaw := ""
-			if currentVSchema != nil {
-				currentVSchemaRaw = currentVSchema.Raw
-			}
-			if VSchemaChanged(currentVSchemaRaw, desiredVSchema) {
-				sc.Metadata["vschema"] = VSchemaDiff(currentVSchemaRaw, desiredVSchema)
-			}
-		}
-
-		// Use Spirit's PlanChanges to diff + lint in one call.
-		plan, planErr := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
-		if planErr != nil {
-			return nil, fmt.Errorf("plan changes for keyspace %s: %w", keyspace, planErr)
-		}
-
-		// Convert PlannedChanges to engine types
-		for _, pc := range plan.Changes {
-			op, _, classifyErr := ddl.ClassifyStatementAST(pc.Statement)
-			if classifyErr != nil {
-				return nil, fmt.Errorf("classify statement in keyspace %s: %w", keyspace, classifyErr)
-			}
-			change := engine.TableChange{
-				Table:     pc.TableName,
-				Operation: op,
-				DDL:       pc.Statement,
-			}
-
-			// Error-severity violations mark the change as unsafe
-			if errViolations := pc.Errors(); len(errViolations) > 0 {
-				change.IsUnsafe = true
-				msgs := make([]string, len(errViolations))
-				for i, v := range errViolations {
-					msgs[i] = v.Message
-				}
-				change.UnsafeReason = strings.Join(msgs, "; ")
-			}
-
-			sc.TableChanges = append(sc.TableChanges, change)
-
-			// Collect all lint violations
-			for _, v := range pc.Violations {
-				lintViolations = append(lintViolations, engine.LintViolation{
-					Table:    pc.TableName,
-					Linter:   v.Linter.Name(),
-					Message:  v.Message,
-					Severity: strings.ToLower(v.Severity.String()),
-				})
-			}
-		}
-
-		// Only include keyspaces with actual changes
-		if len(sc.TableChanges) > 0 || sc.Metadata["vschema"] != "" {
-			changes = append(changes, sc)
+		maps.Copy(originalSchema, r.schemas)
+		lintViolations = append(lintViolations, r.violations...)
+		if r.hasChanges {
+			changes = append(changes, r.change)
 		}
 	}
 
@@ -2163,17 +2189,30 @@ func (e *Engine) fetchPlanSchema(ctx context.Context, client psclient.PSClient, 
 }
 
 func (e *Engine) fetchVtgateSchema(ctx context.Context, dsn string, keyspaces []string) (map[string][]table.TableSchema, error) {
+	var mu sync.Mutex
 	result := make(map[string][]table.TableSchema, len(keyspaces))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(20)
+
 	for _, keyspace := range keyspaces {
-		db, err := e.getVtgateKeyspaceDB(ctx, dsn, keyspace)
-		if err != nil {
-			return nil, fmt.Errorf("get vtgate connection for keyspace %s: %w", keyspace, err)
-		}
-		tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables)
-		if err != nil {
-			return nil, fmt.Errorf("load schema for keyspace %s: %w", keyspace, err)
-		}
-		result[keyspace] = tables
+		ks := keyspace
+		g.Go(func() error {
+			db, err := e.getVtgateKeyspaceDB(gCtx, dsn, ks)
+			if err != nil {
+				return fmt.Errorf("get vtgate connection for keyspace %s: %w", ks, err)
+			}
+			tables, err := table.LoadSchemaFromDB(gCtx, db, table.WithoutUnderscoreTables)
+			if err != nil {
+				return fmt.Errorf("load schema for keyspace %s: %w", ks, err)
+			}
+			mu.Lock()
+			result[ks] = tables
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
