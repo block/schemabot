@@ -863,11 +863,9 @@ Options: ⏸️ Defer Cutover
 ╰─────────────────────────────────────────────╯
 
 Staging
-
 ✓ No schema changes detected.
 
 Production
-
      + users
        CREATE TABLE `users` (
            `id` bigint NOT NULL AUTO_INCREMENT,

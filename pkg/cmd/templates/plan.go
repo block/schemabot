@@ -381,7 +381,7 @@ func WriteLintViolations(warnings []apitypes.LintViolationResponse) {
 // WriteEnvironmentHeader writes an environment section header.
 func WriteEnvironmentHeader(env string) {
 	// Use ANSI bold: \033[1m = bold on, \033[0m = reset
-	fmt.Printf("\033[1m%s\033[0m\n\n", cases.Title(language.English).String(env))
+	fmt.Printf("\033[1m%s\033[0m\n", cases.Title(language.English).String(env))
 }
 
 // WriteNoChanges writes the no changes message.
