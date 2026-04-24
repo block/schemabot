@@ -45,7 +45,7 @@ CI mirrors local dev exactly — each job runs the corresponding make target.
 
 - **Always verify the active branch before starting work.** The deployed code may be on a feature branch (e.g., a worktree), not `main`. Before implementing, check which branch has the code you're building on: `git log --oneline <branch> -- <relevant-file>`. Never branch from `main` for features that depend on unreleased work — branch from (or commit directly to) the active development branch.
 - **Never bypass pre-commit hooks.** Do not use `--no-verify` or `core.hooksPath=/dev/null`. If the hook fails, fix the issue.
-- **PR summaries should be concise prose** — a short paragraph describing the what and why, not a bullet list of every change. Do not include test plans or checklists in PR descriptions.
+- **PR summaries should be concise** — a short paragraph or bullet list highlighting key changes and why, not low-level implementation details. Do not include test plans or checklists. Never reference internal company details (specific database names, staging environments, team names, internal URLs) in PR titles or descriptions — this is a public OSS repo.
 - **Create PRs in draft mode** (`gh pr create --draft`) by default. The author will mark it ready for review.
 - **After pushing new commits**, check if the PR title and summary need updating to reflect the new changes. If a human has edited the summary, leave it alone.
 - **Never squash after a human has reviewed** (comments or approval) — add new commits so reviewers can see incremental changes. Before human review, squash freely to keep the PR clean.
@@ -175,6 +175,7 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
 - Use `status.State.String()` for Spirit state names instead of maintaining a separate mapping function.
 - Use `utils.CloseAndLog(runner)` for Spirit runner cleanup instead of `_ = runner.Close()`.
 - Use `table.LoadSchemaFromDB(ctx, db)` (from `github.com/block/spirit/pkg/table`) to load all table schemas from a database instead of manual `SHOW TABLES` + `SHOW CREATE TABLE` loops. Filter results with `ddl.IsSpiritInternalTable` when Spirit internal tables should be excluded.
+- **Use `statement.New()` for DDL parsing** (from `github.com/block/spirit/pkg/statement`). Never hand-parse ALTER TABLE statements with string splitting — use Spirit's `AbstractStatement` which gives you `Table`, `Alter`, `Type`, and `Schema` fields. Use `statement.Classify()` for lightweight type detection without full parsing.
 
 ### Vitess Dependency
 

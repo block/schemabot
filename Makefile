@@ -282,7 +282,7 @@ ifeq ($(FRESH),1)
 endif
 	@echo "Building binaries..."
 	@(CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd) & \
-		([ -f bin/localscale-linux ] || CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/localscale-linux ./cmd/localscale) & \
+		(CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/localscale-linux ./cmd/localscale) & \
 		wait
 	@cp bin/schemabot-linux deploy/local/schemabot-dev
 	@docker build -f deploy/local/Dockerfile.localscale -t localscale:latest . -q
@@ -565,4 +565,3 @@ wait-localscale:
 		sleep 1; \
 	done; \
 	echo "Timeout waiting for LocalScale"; exit 1
-

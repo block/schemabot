@@ -343,6 +343,7 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 				DeployRequestID:  meta.DeployRequestID,
 				MigrationContext: rs.MigrationContext,
 				DeployRequestURL: meta.DeployRequestURL,
+				IsInstant:        meta.IsInstant,
 			}); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
@@ -382,12 +383,19 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 		resumeState = result.ResumeState
 		// Persist to vitess_apply_data for crash recovery and external progress queries.
 		if meta, err := decodePSMetadataForStorage(resumeState.Metadata); meta != nil && err == nil {
+			c.logger.Info("saving VitessApplyData from apply result",
+				"apply_id", apply.ApplyIdentifier,
+				"is_instant", meta.IsInstant,
+				"deploy_request_id", meta.DeployRequestID,
+				"raw_metadata", resumeState.Metadata[:min(len(resumeState.Metadata), 200)],
+			)
 			if saveErr := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
 				ApplyID:          apply.ID,
 				BranchName:       meta.BranchName,
 				DeployRequestID:  meta.DeployRequestID,
 				MigrationContext: resumeState.MigrationContext,
 				DeployRequestURL: meta.DeployRequestURL,
+				IsInstant:        meta.IsInstant,
 			}); saveErr != nil {
 				c.logger.Warn("failed to save vitess apply data", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
@@ -818,6 +826,12 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 	for _, tp := range result.Tables {
 		tableProgress[tp.Table] = tp
 	}
+	instantFromMetadata := false
+	if result.ResumeState != nil && result.ResumeState.Metadata != "" {
+		if meta, err := decodePSMetadataForStorage(result.ResumeState.Metadata); err == nil && meta != nil {
+			instantFromMetadata = meta.IsInstant
+		}
+	}
 
 	for _, task := range tasks {
 		if tp, ok := tableProgress[task.TableName]; ok {
@@ -825,12 +839,18 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 			task.RowsTotal = tp.RowsTotal
 			task.ProgressPercent = tp.Progress
 			task.ETASeconds = int(tp.ETASeconds)
+			task.IsInstant = tp.IsInstant
 			// Use engine-reported timestamps (from SHOW VITESS_MIGRATIONS) if available.
 			if tp.StartedAt != nil && task.StartedAt == nil {
 				task.StartedAt = tp.StartedAt
 			}
 			if tp.CompletedAt != nil && task.CompletedAt == nil {
 				task.CompletedAt = tp.CompletedAt
+			}
+		} else if instantFromMetadata {
+			task.IsInstant = true
+			if result.State.IsTerminal() {
+				task.ProgressPercent = 100
 			}
 		}
 		// For tasks transitioning to a non-pending state without a started_at

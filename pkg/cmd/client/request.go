@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 // httpClient is the shared HTTP client for all CLI requests.
@@ -61,7 +63,7 @@ func doGetIntoCtx(ctx context.Context, endpoint, path string, result any) error 
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
+		return checkNonJSONResponse(resp, respBody, err)
 	}
 	return nil
 }
@@ -123,9 +125,59 @@ func doPostInto(endpoint, path string, body any, result any) error {
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
-		return fmt.Errorf("parse response: %w", err)
+		return checkNonJSONResponse(resp, respBody, err)
 	}
 	return nil
+}
+
+// checkNonJSONResponse provides a clear error when the server returns non-JSON
+// (e.g., an HTML auth page from a proxy). Falls back to the original parse error.
+func checkNonJSONResponse(resp *http.Response, body []byte, parseErr error) error {
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "html") || (len(body) > 0 && body[0] == '<') {
+		// Extract visible text from HTML for context (strip tags).
+		text := stripHTMLTags(string(body))
+		text = strings.Join(strings.Fields(text), " ") // collapse whitespace
+		if len(text) > 200 {
+			text = text[:200] + "..."
+		}
+		if text != "" {
+			return fmt.Errorf("unexpected response from server (received HTML, expected JSON):\n  %s", text)
+		}
+		return fmt.Errorf("unexpected response from server (received HTML, expected JSON)")
+	}
+	return fmt.Errorf("parse response: %w", parseErr)
+}
+
+// stripHTMLTags extracts visible text from HTML using the x/net/html tokenizer.
+// Skips <style> and <script> content.
+func stripHTMLTags(s string) string {
+	tokenizer := html.NewTokenizer(strings.NewReader(s))
+	var b strings.Builder
+	skip := false
+	for {
+		tt := tokenizer.Next()
+		switch tt {
+		case html.ErrorToken:
+			return strings.TrimSpace(b.String())
+		case html.StartTagToken:
+			tn, _ := tokenizer.TagName()
+			tag := string(tn)
+			if tag == "style" || tag == "script" {
+				skip = true
+			}
+		case html.EndTagToken:
+			tn, _ := tokenizer.TagName()
+			tag := string(tn)
+			if tag == "style" || tag == "script" {
+				skip = false
+			}
+		case html.TextToken:
+			if !skip {
+				b.Write(tokenizer.Text())
+			}
+		}
+	}
 }
 
 // parseAPIError builds an APIError from a non-200 HTTP response, extracting

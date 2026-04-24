@@ -324,20 +324,23 @@ func TestWritePlanHeader_Apply(t *testing.T) {
 
 func TestWriteSQLChanges(t *testing.T) {
 	changes := []templates.DDLChange{
-		{ChangeType: "CREATE", DDL: "CREATE TABLE users (id BIGINT PRIMARY KEY)"},
-		{ChangeType: "ALTER", DDL: "ALTER TABLE orders ADD COLUMN total INT"},
-		{ChangeType: "DROP", DDL: "DROP TABLE legacy"},
+		{ChangeType: "CREATE", TableName: "users", DDL: "CREATE TABLE users (id BIGINT PRIMARY KEY)"},
+		{ChangeType: "ALTER", TableName: "orders", DDL: "ALTER TABLE orders ADD COLUMN total INT"},
+		{ChangeType: "DROP", TableName: "legacy", DDL: "DROP TABLE legacy"},
 	}
 
 	output := captureStdout(func() {
 		templates.WriteSQLChanges(changes)
 	})
 
-	// Check symbols (strip ANSI codes since output is colorized)
+	// Check table names with symbols on their own line, DDL indented below
 	plainOutput := stripAnsi(output)
-	assert.Contains(t, plainOutput, "+ CREATE TABLE", "Expected '+ CREATE TABLE' symbol")
-	assert.Contains(t, plainOutput, "~ ALTER TABLE", "Expected '~ ALTER TABLE' symbol")
-	assert.Contains(t, plainOutput, "- DROP TABLE", "Expected '- DROP TABLE' symbol")
+	assert.Contains(t, plainOutput, "+ users", "Expected '+ users' (create symbol with table name)")
+	assert.Contains(t, plainOutput, "~ orders", "Expected '~ orders' (alter symbol with table name)")
+	assert.Contains(t, plainOutput, "- legacy", "Expected '- legacy' (drop symbol with table name)")
+	assert.Contains(t, plainOutput, "CREATE TABLE", "Expected CREATE TABLE DDL")
+	assert.Contains(t, plainOutput, "ALTER TABLE", "Expected ALTER TABLE DDL")
+	assert.Contains(t, plainOutput, "DROP TABLE", "Expected DROP TABLE DDL")
 }
 
 func TestWritePlanSummary(t *testing.T) {
@@ -503,12 +506,11 @@ func TestWriteMultiTablePlanOutput(t *testing.T) {
 	// Verify database info
 	assert.Contains(t, output, "Database: testapp", "Expected 'Database: testapp'")
 
-	// Verify each table change is shown with correct symbols
-	// Strip ANSI codes since output is colorized
+	// Verify each table name with symbol on its own line
 	plainOutput := stripAnsi(output)
-	assert.Contains(t, plainOutput, "+ CREATE TABLE `users`", "Expected '+ CREATE TABLE `users`' (create symbol)")
-	assert.Contains(t, plainOutput, "+ CREATE TABLE `orders`", "Expected '+ CREATE TABLE `orders`' (create symbol)")
-	assert.Contains(t, plainOutput, "~ ALTER TABLE `products`", "Expected '~ ALTER TABLE `products`' (alter symbol)")
+	assert.Contains(t, plainOutput, "+ users", "Expected '+ users' (create symbol)")
+	assert.Contains(t, plainOutput, "+ orders", "Expected '+ orders' (create symbol)")
+	assert.Contains(t, plainOutput, "~ products", "Expected '~ products' (alter symbol)")
 
 	// Verify summary shows correct counts with proper pluralization
 	assert.Contains(t, output, "2 tables to create", "Expected '2 tables to create' (plural)")

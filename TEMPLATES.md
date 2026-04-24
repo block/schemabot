@@ -705,24 +705,27 @@ That command wasn't recognized. Available commands:
 │  Schema name: testapp                       │
 ╰─────────────────────────────────────────────╯
 
-  + CREATE TABLE `users` (
-        `id` bigint NOT NULL AUTO_INCREMENT,
-        `email` varchar(255) NOT NULL,
-        `created_at` timestamp DEFAULT current_timestamp(),
-        PRIMARY KEY(`id`),
-        INDEX `idx_email`(`email`)
-    );
+     + users
+       CREATE TABLE `users` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `email` varchar(255) NOT NULL,
+           `created_at` timestamp DEFAULT current_timestamp(),
+           PRIMARY KEY(`id`),
+           INDEX `idx_email`(`email`)
+       );
 
-  + CREATE TABLE `orders` (
-        `id` bigint NOT NULL AUTO_INCREMENT,
-        `user_id` bigint NOT NULL,
-        `total_cents` bigint NOT NULL,
-        `status` varchar(50) NOT NULL DEFAULT 'pending',
-        PRIMARY KEY(`id`),
-        INDEX `idx_user_id`(`user_id`)
-    );
+     + orders
+       CREATE TABLE `orders` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `user_id` bigint NOT NULL,
+           `total_cents` bigint NOT NULL,
+           `status` varchar(50) NOT NULL DEFAULT 'pending',
+           PRIMARY KEY(`id`),
+           INDEX `idx_user_id`(`user_id`)
+       );
 
-  ~ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+     ~ products
+       ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ⚠️  Lint Warnings:
   - [orders] has_float: New column uses floating-point data type
@@ -767,7 +770,7 @@ Options: ⏸️ Defer Cutover
 ╰─────────────────────────────────────────────╯
 
 
-  Keyspace: commerce
+  ── commerce ──
 
   ~ VSchema:
            "auto_increment": {
@@ -781,23 +784,25 @@ Options: ⏸️ Defer Cutover
          }
        }
 
-  ~ ALTER TABLE `orders`
-        ADD COLUMN `region` varchar(50) NOT NULL DEFAULT '',
-        ADD INDEX `idx_region`(`region`);
+     ~ orders
+       ALTER TABLE `orders`
+           ADD COLUMN `region` varchar(50) NOT NULL DEFAULT '',
+           ADD INDEX `idx_region`(`region`);
 
 
-  Keyspace: customer
+  ── customer ──
 
-  + CREATE TABLE `addresses` (
-        `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-        `customer_id` bigint NOT NULL,
-        `street` varchar(255) NOT NULL,
-        `city` varchar(100) NOT NULL,
-        PRIMARY KEY(`id`),
-        INDEX `idx_customer_id`(`customer_id`)
-    ) ENGINE InnoDB,
-      CHARSET utf8mb4,
-      COLLATE utf8mb4_0900_ai_ci;
+     + addresses
+       CREATE TABLE `addresses` (
+           `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+           `customer_id` bigint NOT NULL,
+           `street` varchar(255) NOT NULL,
+           `city` varchar(100) NOT NULL,
+           PRIMARY KEY(`id`),
+           INDEX `idx_customer_id`(`customer_id`)
+       ) ENGINE InnoDB,
+         CHARSET utf8mb4,
+         COLLATE utf8mb4_0900_ai_ci;
 
 📋 Plan: 1 table to create, 1 table to alter
 
@@ -817,24 +822,27 @@ Options: ⏸️ Defer Cutover
 │  Schema name: testapp                       │
 ╰─────────────────────────────────────────────╯
 
-  + CREATE TABLE `users` (
-        `id` bigint NOT NULL AUTO_INCREMENT,
-        `email` varchar(255) NOT NULL,
-        `created_at` timestamp DEFAULT current_timestamp(),
-        PRIMARY KEY(`id`),
-        INDEX `idx_email`(`email`)
-    );
+     + users
+       CREATE TABLE `users` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `email` varchar(255) NOT NULL,
+           `created_at` timestamp DEFAULT current_timestamp(),
+           PRIMARY KEY(`id`),
+           INDEX `idx_email`(`email`)
+       );
 
-  + CREATE TABLE `orders` (
-        `id` bigint NOT NULL AUTO_INCREMENT,
-        `user_id` bigint NOT NULL,
-        `total_cents` bigint NOT NULL,
-        `status` varchar(50) NOT NULL DEFAULT 'pending',
-        PRIMARY KEY(`id`),
-        INDEX `idx_user_id`(`user_id`)
-    );
+     + orders
+       CREATE TABLE `orders` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `user_id` bigint NOT NULL,
+           `total_cents` bigint NOT NULL,
+           `status` varchar(50) NOT NULL DEFAULT 'pending',
+           PRIMARY KEY(`id`),
+           INDEX `idx_user_id`(`user_id`)
+       );
 
-  ~ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+     ~ products
+       ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 📋 Plan: 2 tables to create, 1 table to alter
 
@@ -855,29 +863,30 @@ Options: ⏸️ Defer Cutover
 ╰─────────────────────────────────────────────╯
 
 Staging
-
 ✓ No schema changes detected.
 
 Production
+     + users
+       CREATE TABLE `users` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `email` varchar(255) NOT NULL,
+           `created_at` timestamp DEFAULT current_timestamp(),
+           PRIMARY KEY(`id`),
+           INDEX `idx_email`(`email`)
+       );
 
-  + CREATE TABLE `users` (
-        `id` bigint NOT NULL AUTO_INCREMENT,
-        `email` varchar(255) NOT NULL,
-        `created_at` timestamp DEFAULT current_timestamp(),
-        PRIMARY KEY(`id`),
-        INDEX `idx_email`(`email`)
-    );
+     + orders
+       CREATE TABLE `orders` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `user_id` bigint NOT NULL,
+           `total_cents` bigint NOT NULL,
+           `status` varchar(50) NOT NULL DEFAULT 'pending',
+           PRIMARY KEY(`id`),
+           INDEX `idx_user_id`(`user_id`)
+       );
 
-  + CREATE TABLE `orders` (
-        `id` bigint NOT NULL AUTO_INCREMENT,
-        `user_id` bigint NOT NULL,
-        `total_cents` bigint NOT NULL,
-        `status` varchar(50) NOT NULL DEFAULT 'pending',
-        PRIMARY KEY(`id`),
-        INDEX `idx_user_id`(`user_id`)
-    );
-
-  ~ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+     ~ products
+       ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 📋 Plan: 2 tables to create, 1 table to alter
 
@@ -897,24 +906,27 @@ Production
 │  Schema name: testapp                       │
 ╰─────────────────────────────────────────────╯
 
-  + CREATE TABLE `users` (
-        `id` bigint NOT NULL AUTO_INCREMENT,
-        `email` varchar(255) NOT NULL,
-        `created_at` timestamp DEFAULT current_timestamp(),
-        PRIMARY KEY(`id`),
-        INDEX `idx_email`(`email`)
-    );
+     + users
+       CREATE TABLE `users` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `email` varchar(255) NOT NULL,
+           `created_at` timestamp DEFAULT current_timestamp(),
+           PRIMARY KEY(`id`),
+           INDEX `idx_email`(`email`)
+       );
 
-  + CREATE TABLE `orders` (
-        `id` bigint NOT NULL AUTO_INCREMENT,
-        `user_id` bigint NOT NULL,
-        `total_cents` bigint NOT NULL,
-        `status` varchar(50) NOT NULL DEFAULT 'pending',
-        PRIMARY KEY(`id`),
-        INDEX `idx_user_id`(`user_id`)
-    );
+     + orders
+       CREATE TABLE `orders` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `user_id` bigint NOT NULL,
+           `total_cents` bigint NOT NULL,
+           `status` varchar(50) NOT NULL DEFAULT 'pending',
+           PRIMARY KEY(`id`),
+           INDEX `idx_user_id`(`user_id`)
+       );
 
-  ~ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+     ~ products
+       ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ⚠️  Lint Warnings:
   - [orders] has_float: New column uses floating-point data type
@@ -3280,7 +3292,7 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
 ╰─────────────────────────────────────────────╯
 
 
-  Keyspace: testapp_sharded
+  ── testapp_sharded ──
 
   ~ VSchema:
        },
@@ -3298,16 +3310,18 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
        }
      }
 
-  + CREATE TABLE `user_preferences` (
-        `id` bigint NOT NULL AUTO_INCREMENT,
-        `user_id` bigint NOT NULL,
-        `key` varchar(255) NOT NULL,
-        `value` text,
-        PRIMARY KEY(`id`),
-        INDEX `idx_user_id`(`user_id`)
-    );
+     + user_preferences
+       CREATE TABLE `user_preferences` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `user_id` bigint NOT NULL,
+           `key` varchar(255) NOT NULL,
+           `value` text,
+           PRIMARY KEY(`id`),
+           INDEX `idx_user_id`(`user_id`)
+       );
 
-  ~ ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
+     ~ users
+       ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
 
 📋 **Plan**: 1 table to create, 1 table to alter, 1 VSchema change
 
@@ -3331,7 +3345,7 @@ Vitess plan: VSchema-only update (no table DDL changes)
 ╰─────────────────────────────────────────────╯
 
 
-  Keyspace: testapp_sharded
+  ── testapp_sharded ──
 
   ~ VSchema:
      {
@@ -3368,7 +3382,7 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 ╰─────────────────────────────────────────────╯
 
 
-  Keyspace: testapp_sharded
+  ── testapp_sharded ──
 
   ~ VSchema:
        "vindexes": {
@@ -3380,12 +3394,14 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
     +    }
        },
 
-  ~ ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
+     ~ users
+       ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
 
-  ~ ALTER TABLE `orders` ADD INDEX `idx_status_created`(`status`, `created_at`);
+     ~ orders
+       ALTER TABLE `orders` ADD INDEX `idx_status_created`(`status`, `created_at`);
 
 
-  Keyspace: testapp
+  ── testapp ──
 
   ~ VSchema:
      {
@@ -3397,11 +3413,12 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
     +  }
      }
 
-  + CREATE TABLE `users_email_idx` (
-        `email` varchar(255) NOT NULL,
-        `user_id` bigint NOT NULL,
-        PRIMARY KEY(`email`, `user_id`)
-    );
+     + users_email_idx
+       CREATE TABLE `users_email_idx` (
+           `email` varchar(255) NOT NULL,
+           `user_id` bigint NOT NULL,
+           PRIMARY KEY(`email`, `user_id`)
+       );
 
 📋 **Plan**: 1 table to create, 2 tables to alter, 2 VSchema changes
 

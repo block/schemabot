@@ -9,7 +9,6 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -99,11 +98,7 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 		}
 
 		if !singleNamespace {
-			label := "Keyspace"
-			if isMySQL {
-				label = "Schema Name"
-			}
-			fmt.Printf("\n  %s: %s\n\n", label, ns.Namespace)
+			fmt.Print(FormatKeyspaceHeader(ns.Namespace))
 		}
 
 		if ns.VSchemaChanged && !isMySQL {
@@ -138,41 +133,17 @@ func colorizeDiffLine(line string) string {
 	return line
 }
 
-// changeSymbol returns the Terraform-style symbol for a change type.
-func changeSymbol(changeType string) string {
-	switch strings.ToUpper(changeType) {
-	case "CHANGE_TYPE_CREATE", "CREATE":
-		return "+"
-	case "CHANGE_TYPE_ALTER", "ALTER":
-		return "~"
-	case "CHANGE_TYPE_DROP", "DROP":
-		return "-"
-	default:
-		return "?"
-	}
-}
-
-// WriteSQLChanges writes the SQL changes section with Terraform-style symbols.
-// It combines multiple ALTER statements for the same table into a single statement.
+// WriteSQLChanges writes the SQL changes section matching the progress view format:
+// table name on its own line with change symbol, DDL indented below.
 func WriteSQLChanges(changes []DDLChange) {
 	combined := combineAlterStatements(changes)
-	for i, change := range combined {
-		symbol := changeSymbol(change.ChangeType)
-		formatted := ddl.FormatDDL(change.DDL)
-		lines := strings.Split(formatted, "\n")
-		// First line gets the symbol prefix
-		fmt.Printf("  %s %s\n", symbol, FormatSQL(lines[0]))
-		// Continuation lines indented to align with the DDL text
-		for _, line := range lines[1:] {
-			if line != "" {
-				fmt.Printf("    %s\n", FormatSQL(line))
-			}
-		}
-		if i < len(combined)-1 {
-			fmt.Println()
-		}
+	for _, change := range combined {
+		// Table name line: "     ~ tablename:"
+		fmt.Printf(indentTable+"%s%s\n", progressSymbol(change.ChangeType), change.TableName)
+		// DDL indented below
+		fmt.Print(formatProgressDDL(change.DDL))
+		fmt.Println()
 	}
-	fmt.Println()
 }
 
 // combineAlterStatements combines multiple ALTER statements for the same table
@@ -410,7 +381,7 @@ func WriteLintViolations(warnings []apitypes.LintViolationResponse) {
 // WriteEnvironmentHeader writes an environment section header.
 func WriteEnvironmentHeader(env string) {
 	// Use ANSI bold: \033[1m = bold on, \033[0m = reset
-	fmt.Printf("\033[1m%s\033[0m\n\n", cases.Title(language.English).String(env))
+	fmt.Printf("\033[1m%s\033[0m\n", cases.Title(language.English).String(env))
 }
 
 // WriteNoChanges writes the no changes message.

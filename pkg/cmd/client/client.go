@@ -212,7 +212,15 @@ func ReadSchemaFiles(dir string) (map[string]*apitypes.SchemaFiles, error) {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() {
+		// Follow symlinks: DirEntry.IsDir() returns false for symlinks even
+		// if they point to directories. Use os.Stat to resolve.
+		isDir := entry.IsDir()
+		if !isDir {
+			if info, err := os.Stat(filepath.Join(dir, entry.Name())); err == nil {
+				isDir = info.IsDir()
+			}
+		}
+		if isDir {
 			// Read schema files inside the subdirectory
 			subEntries, err := os.ReadDir(filepath.Join(dir, entry.Name()))
 			if err != nil {

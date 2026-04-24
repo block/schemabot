@@ -278,9 +278,12 @@ func (s *Server) handleApplyBranchSchema(w http.ResponseWriter, r *http.Request)
 		for _, stmt := range stmts {
 			if instantStmt := addAlgorithmInstant(stmt); instantStmt != "" {
 				// ALTER TABLE: try ALGORITHM=INSTANT first
-				if _, err := branchDB.ExecContext(r.Context(), instantStmt); err == nil {
+				if _, instantErr := branchDB.ExecContext(r.Context(), instantStmt); instantErr == nil {
 					totalDDL++
+					s.logger.Info("instant DDL succeeded on branch", "branch", branch, "keyspace", keyspace, "stmt", instantStmt[:min(len(instantStmt), 100)])
 					continue // Instant succeeded — DDL already applied
+				} else {
+					s.logger.Info("instant DDL failed on branch, falling back", "branch", branch, "keyspace", keyspace, "error", instantErr, "stmt", instantStmt[:min(len(instantStmt), 100)])
 				}
 				// Not instant-eligible, fall back to normal execution
 				allInstant = false

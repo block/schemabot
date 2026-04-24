@@ -119,7 +119,11 @@ func (m WatchModel) progressView() string {
 	case state.IsState(m.state, state.Apply.RevertWindow):
 		b.WriteString("\n\n")
 		if m.skipRevertTriggered || (m.metadata != nil && m.metadata["revert_skipped"] == "true") {
-			b.WriteString(m.spinner.View() + "Finalizing — closing revert window...\n")
+			elapsed := ""
+			if !m.skipRevertAt.IsZero() {
+				elapsed = fmt.Sprintf(" (%ds)", int(time.Since(m.skipRevertAt).Seconds()))
+			}
+			b.WriteString(m.spinner.View() + "Finalizing — closing revert window..." + elapsed + "\n")
 		} else {
 			b.WriteString("Schema change deployed. Revert window is open.\n\n")
 			b.WriteString("Press Enter to skip revert or ESC to detach\n")
@@ -162,6 +166,11 @@ func (m WatchModel) progressView() string {
 			// Normal mode - simple footer without volume
 			b.WriteString(m.formatFooter())
 		}
+		b.WriteString("\n")
+	case state.IsState(m.state, state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest):
+		b.WriteString("\n\n")
+		dimStyle := lipgloss.NewStyle().Faint(true)
+		b.WriteString(dimStyle.Render("ESC to detach"))
 		b.WriteString("\n")
 	}
 

@@ -432,6 +432,7 @@ type psMetadata struct {
 	DeployRequestID  uint64     `json:"deploy_request_id"`
 	DeployRequestURL string     `json:"deploy_request_url,omitempty"`
 	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
+	IsInstant        bool       `json:"is_instant,omitempty"`
 }
 
 func encodePSMetadata(m *psMetadata) (string, error) {
@@ -866,13 +867,43 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return &engine.ApplyResult{Message: "no changes detected"}, nil
 	}
 
-	// Determine instant DDL eligibility
+	// Determine instant DDL eligibility. Prefer instant when PlanetScale reports
+	// it as eligible — instant DDL modifies metadata only (no row copy), so it
+	// completes immediately and has no revert window regardless of skip_revert.
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	skipRevert := req.Options["skip_revert"] == "true"
-	useInstant := instantEligible && !deferCutover && skipRevert
+	useInstant := instantEligible && !deferCutover
+
+	// Log the raw deploy request fields for debugging instant DDL detection.
+	if dr.Deployment != nil {
+		e.logger.Info("deploy request deployment info",
+			"database", req.Database,
+			"deploy_request", dr.Number,
+			"instant_ddl_eligible", dr.Deployment.InstantDDLEligible,
+			"deployment_state", dr.Deployment.State,
+		)
+	} else {
+		e.logger.Warn("deploy request has nil deployment",
+			"database", req.Database,
+			"deploy_request", dr.Number,
+			"deploy_state", dr.DeploymentState,
+		)
+	}
+	e.logger.Info("instant DDL decision",
+		"database", req.Database,
+		"deploy_request", dr.Number,
+		"has_deployment", dr.Deployment != nil,
+		"instant_eligible", instantEligible,
+		"use_instant", useInstant,
+		"defer_cutover", deferCutover,
+		"deploy_state", dr.DeploymentState,
+	)
 
 	drElapsed := time.Since(drStart).Round(time.Second)
-	emitEvent(fmt.Sprintf("Deploy request #%d ready (%s)", dr.Number, drElapsed), map[string]string{
+	readyMsg := fmt.Sprintf("Deploy request #%d ready (%s)", dr.Number, drElapsed)
+	if useInstant {
+		readyMsg += " — instant DDL eligible"
+	}
+	emitEvent(readyMsg, map[string]string{
 		"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
 		"deploy_request_url": dr.HtmlURL,
 		"instant_ddl":        fmt.Sprintf("%t", useInstant),
@@ -916,6 +947,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		BranchName:       branchName,
 		DeployRequestID:  dr.Number,
 		DeployRequestURL: dr.HtmlURL,
+		IsInstant:        useInstant,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata for deploy request #%d: %w", dr.Number, err)
@@ -1246,8 +1278,13 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return &engine.ApplyResult{Message: "no changes detected on resume"}, nil
 	}
 
+	// Deploy — prefer instant when eligible (no row copy, no revert window needed).
+	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
+	useInstant := instantEligible && !deferCutover
+
 	meta.DeployRequestID = dr.Number
 	meta.DeployRequestURL = dr.HtmlURL
+	meta.IsInstant = useInstant
 	persistMeta, err := encodePSMetadata(meta)
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata on resume: %w", err)
@@ -1258,11 +1295,6 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 			Metadata:         persistMeta,
 		})
 	}
-
-	// Deploy
-	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	skipRevert := req.Options["skip_revert"] == "true"
-	useInstant := instantEligible && !deferCutover && skipRevert
 
 	dr, err = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
 		Organization: org, Database: req.Database, Number: dr.Number, InstantDDL: useInstant,
@@ -1330,6 +1362,16 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
+	e.logger.Info("progress poll",
+		"database", req.Database,
+		"deploy_request", meta.DeployRequestID,
+		"deploy_state", dr.DeploymentState,
+		"engine_state", engineState,
+		"is_instant", meta.IsInstant,
+		"has_migration_context", req.ResumeState != nil && req.ResumeState.MigrationContext != "",
+		"has_vtgate_dsn", req.Credentials.DSN != "",
+	)
+
 	result := &engine.ProgressResult{
 		State:       engineState,
 		Progress:    progress,
@@ -1340,21 +1382,39 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	// Enrich with per-shard progress from SHOW VITESS_MIGRATIONS.
 	// Requires a vtgate DSN (Credentials.DSN) and a migration context
 	// (from VitessApplyData) to query per-shard state.
-	if req.Credentials.DSN == "" {
-		e.logger.Info("no vtgate DSN configured, skipping per-shard progress",
-			"database", req.Database)
-		return result, nil
+	hasMigrationContext := req.Credentials.DSN != "" &&
+		req.ResumeState != nil && req.ResumeState.MigrationContext != ""
+	if hasMigrationContext {
+		tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
+		e.logger.Info("vitess migrations queried",
+			"database", req.Database,
+			"table_count", len(tables),
+			"overall_progress", overallProgress,
+		)
+		if len(tables) > 0 {
+			result.Tables = tables
+			if overallProgress > 0 {
+				result.Progress = overallProgress
+			}
+		}
+	} else {
+		e.logger.Debug("skipping per-shard progress",
+			"database", req.Database,
+			"has_vtgate_dsn", req.Credentials.DSN != "",
+			"has_migration_context", req.ResumeState != nil && req.ResumeState.MigrationContext != "",
+		)
 	}
-	if req.ResumeState == nil || req.ResumeState.MigrationContext == "" {
-		e.logger.Warn("no migration context for per-shard progress — VitessApplyData may not be saved yet",
-			"database", req.Database, "has_resume_state", req.ResumeState != nil)
-		return result, nil
-	}
-	tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
-	if len(tables) > 0 {
-		result.Tables = tables
-		if overallProgress > 0 {
-			result.Progress = overallProgress
+
+	// Propagate instant DDL flag to all tables. Instant DDL may complete
+	// before migration context discovery, so we use the flag from deploy
+	// metadata as the authoritative source.
+	if meta.IsInstant {
+		e.logger.Info("marking tables as instant DDL",
+			"database", req.Database,
+			"table_count", len(result.Tables),
+		)
+		for i := range result.Tables {
+			result.Tables[i].IsInstant = true
 		}
 	}
 
@@ -1890,7 +1950,6 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 		// Determine aggregate table state from shard states
 		tableState := state.Vitess.Complete
 		for i, sh := range shards {
-			tblRowsCopied += sh.rowsCopied
 			tblTableRows += sh.tableRows
 			if sh.etaSeconds > maxETA {
 				maxETA = sh.etaSeconds
@@ -1915,11 +1974,24 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 				shardState = state.Vitess.ReadyToComplete
 			}
 
+			shardPct := sh.progress
+			shardCopied := sh.rowsCopied
+			// When a shard is ready for cutover, the copy phase is complete.
+			// Clamp to 100% since Vitess row counts can lag behind slightly.
+			if shardState == state.Vitess.ReadyToComplete || shardState == state.Vitess.Complete {
+				shardPct = 100
+				if sh.tableRows > 0 && shardCopied < sh.tableRows {
+					shardCopied = sh.tableRows
+				}
+			}
+
+			tblRowsCopied += shardCopied
+
 			shardProgress[i] = engine.ShardProgress{
 				Shard:           sh.shard,
 				State:           shardState,
-				Progress:        sh.progress,
-				RowsCopied:      sh.rowsCopied,
+				Progress:        shardPct,
+				RowsCopied:      shardCopied,
 				RowsTotal:       sh.tableRows,
 				ETASeconds:      sh.etaSeconds,
 				CutoverAttempts: sh.cutoverAttempts,

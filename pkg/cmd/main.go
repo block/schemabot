@@ -62,7 +62,7 @@ func main() {
 	if err != nil {
 		// ErrSilent means the error was already displayed - just exit with code 1
 		if !errors.Is(err, commands.ErrSilent) {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
 		}
 		os.Exit(1)
 	}

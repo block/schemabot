@@ -569,6 +569,117 @@ func normalizeJSON(data []byte) string {
 	return string(b)
 }
 
+// checkInstantEligibility tests whether all ALTER TABLE statements in a deploy
+// can use ALGORITHM=INSTANT. It creates a temporary scratch database per
+// keyspace, copies table schemas from main, and tests each ALTER with
+// ALGORITHM=INSTANT. Non-ALTER statements (CREATE/DROP TABLE) are skipped since
+// they don't involve row copy, but a deploy with no ALTERs is not instant DDL.
+func (s *Server) checkInstantEligibility(ctx context.Context, backend *databaseBackend, ddlByKeyspace map[string][]string) bool {
+	sawAlter := false
+	keyspaceIndex := 0
+	for keyspace, stmts := range ddlByKeyspace {
+		var alterStmts []string
+		for _, stmt := range stmts {
+			if addAlgorithmInstant(stmt) != "" {
+				alterStmts = append(alterStmts, stmt)
+			}
+		}
+		if len(alterStmts) == 0 {
+			continue
+		}
+		sawAlter = true
+		scratchDB := fmt.Sprintf("_ls_instant_%d_%d", time.Now().UnixNano(), keyspaceIndex)
+		keyspaceIndex++
+
+		if _, err := s.metadataDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE `%s`", scratchDB)); err != nil {
+			s.logger.Warn("instant check: create scratch db", "keyspace", keyspace, "error", err)
+			return false
+		}
+		defer func() {
+			if _, err := s.metadataDB.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", scratchDB)); err != nil {
+				s.logger.Warn("instant check: drop scratch db", "keyspace", keyspace, "error", err)
+			}
+		}()
+
+		mainSchemas, err := s.snapshotKeyspaceSchema(ctx, backend, keyspace)
+		if err != nil {
+			s.logger.Warn("instant check: snapshot schema", "keyspace", keyspace, "error", err)
+			return false
+		}
+
+		// Copy table schemas into scratch database
+		for _, createStmt := range mainSchemas {
+			prefixed := strings.Replace(createStmt, "CREATE TABLE ", fmt.Sprintf("CREATE TABLE `%s`.", scratchDB), 1)
+			if _, err := s.metadataDB.ExecContext(ctx, prefixed); err != nil {
+				s.logger.Warn("instant check: copy table", "keyspace", keyspace, "error", err)
+				return false
+			}
+		}
+
+		// Test each ALTER with ALGORITHM=INSTANT.
+		// Non-ALTER statements (CREATE/DROP TABLE) are skipped — they don't
+		// affect instant eligibility since they don't involve row copy.
+		for _, stmt := range alterStmts {
+			instantStmt := addAlgorithmInstant(stmt)
+			tableName := extractAlterTableName(stmt)
+			if tableName == "" {
+				s.logger.Info("instant check: parse failed", "keyspace", keyspace)
+				return false
+			}
+			scratchStmt := qualifyAlterTableName(instantStmt, scratchDB)
+			if scratchStmt == "" {
+				s.logger.Info("instant check: qualify failed", "keyspace", keyspace, "table", tableName)
+				return false
+			}
+			if _, err := s.metadataDB.ExecContext(ctx, scratchStmt); err != nil {
+				s.logger.Info("instant check: not eligible", "keyspace", keyspace, "table", tableName, "error", err)
+				return false
+			}
+			s.logger.Info("instant check: eligible", "keyspace", keyspace, "table", tableName)
+		}
+	}
+	return sawAlter
+}
+
+// hasAlterTableStatements returns true if any DDL statement is an ALTER TABLE.
+func hasAlterTableStatements(ddlByKeyspace map[string][]string) bool {
+	for _, stmts := range ddlByKeyspace {
+		for _, stmt := range stmts {
+			if addAlgorithmInstant(stmt) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// extractAlterTableName extracts the table name from an ALTER TABLE statement
+// using Spirit's SQL parser.
+func extractAlterTableName(stmt string) string {
+	results, err := statement.Classify(stmt)
+	if err != nil || len(results) == 0 {
+		return ""
+	}
+	if results[0].Type != statement.StatementAlterTable {
+		return ""
+	}
+	return results[0].Table
+}
+
+// qualifyAlterTableName rewrites an ALTER TABLE statement to use a fully-qualified
+// table name (schema.table) using Spirit's parsed Alter clause.
+func qualifyAlterTableName(stmt, schemaName string) string {
+	parsed, err := statement.New(stmt)
+	if err != nil || len(parsed) == 0 {
+		return ""
+	}
+	r := parsed[0]
+	if r.Table == "" || r.Alter == "" {
+		return ""
+	}
+	return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", schemaName, r.Table, r.Alter)
+}
+
 // addAlgorithmInstant rewrites an ALTER TABLE statement to include ALGORITHM=INSTANT.
 // Returns "" for non-ALTER TABLE statements (CREATE TABLE, DROP TABLE, etc.).
 //
