@@ -9,7 +9,6 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -99,11 +98,7 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 		}
 
 		if !singleNamespace {
-			label := "Keyspace"
-			if isMySQL {
-				label = "Schema Name"
-			}
-			fmt.Printf("\n  %s: %s\n\n", label, ns.Namespace)
+			fmt.Print(FormatKeyspaceHeader(ns.Namespace))
 		}
 
 		if ns.VSchemaChanged && !isMySQL {
@@ -152,27 +147,17 @@ func changeSymbol(changeType string) string {
 	}
 }
 
-// WriteSQLChanges writes the SQL changes section with Terraform-style symbols.
-// It combines multiple ALTER statements for the same table into a single statement.
+// WriteSQLChanges writes the SQL changes section matching the progress view format:
+// table name on its own line with change symbol, DDL indented below.
 func WriteSQLChanges(changes []DDLChange) {
 	combined := combineAlterStatements(changes)
-	for i, change := range combined {
-		symbol := changeSymbol(change.ChangeType)
-		formatted := ddl.FormatDDL(change.DDL)
-		lines := strings.Split(formatted, "\n")
-		// First line gets the symbol prefix
-		fmt.Printf("  %s %s\n", symbol, FormatSQL(lines[0]))
-		// Continuation lines indented to align with the DDL text
-		for _, line := range lines[1:] {
-			if line != "" {
-				fmt.Printf("    %s\n", FormatSQL(line))
-			}
-		}
-		if i < len(combined)-1 {
-			fmt.Println()
-		}
+	for _, change := range combined {
+		// Table name line: "     ~ tablename:"
+		fmt.Printf(indentTable+"%s%s\n", progressSymbol(change.ChangeType), change.TableName)
+		// DDL indented below
+		fmt.Print(formatProgressDDL(change.DDL))
+		fmt.Println()
 	}
-	fmt.Println()
 }
 
 // combineAlterStatements combines multiple ALTER statements for the same table
