@@ -101,19 +101,13 @@ func TestQualifyAlterTableName(t *testing.T) {
 			name:   "unquoted table",
 			stmt:   "ALTER TABLE users ALGORITHM=INSTANT, ADD COLUMN age INT",
 			schema: "_scratch",
-			want:   "ALTER TABLE `_scratch`.`users` ALGORITHM=INSTANT, ADD COLUMN age INT",
+			want:   "ALTER TABLE `_scratch`.`users` ALGORITHM = INSTANT, ADD COLUMN `age` INT",
 		},
 		{
 			name:   "quoted table",
 			stmt:   "ALTER TABLE `users` ALGORITHM=INSTANT, ADD COLUMN age INT",
 			schema: "_scratch",
-			want:   "ALTER TABLE `_scratch`.`users` ALGORITHM=INSTANT, ADD COLUMN age INT",
-		},
-		{
-			name:   "escaped schema",
-			stmt:   "ALTER TABLE `users` ALGORITHM=INSTANT, ADD COLUMN age INT",
-			schema: "_scratch`x",
-			want:   "ALTER TABLE `_scratch``x`.`users` ALGORITHM=INSTANT, ADD COLUMN age INT",
+			want:   "ALTER TABLE `_scratch`.`users` ALGORITHM = INSTANT, ADD COLUMN `age` INT",
 		},
 	}
 

@@ -641,12 +641,7 @@ func (s *Server) checkInstantEligibility(ctx context.Context, backend *databaseB
 	return sawAlter
 }
 
-// extractAlterTableName extracts the table name from an ALTER TABLE statement.
-func extractAlterTableName(stmt string) string {
-	tableName, _ := splitAlterTableStatement(stmt)
-	return tableName
-}
-
+// hasAlterTableStatements returns true if any DDL statement is an ALTER TABLE.
 func hasAlterTableStatements(ddlByKeyspace map[string][]string) bool {
 	for _, stmts := range ddlByKeyspace {
 		for _, stmt := range stmts {
@@ -658,40 +653,31 @@ func hasAlterTableStatements(ddlByKeyspace map[string][]string) bool {
 	return false
 }
 
-func splitAlterTableStatement(stmt string) (string, string) {
-	trimmed := strings.TrimSpace(stmt)
-	upper := strings.ToUpper(trimmed)
-	if !strings.HasPrefix(upper, "ALTER TABLE ") {
-		return "", ""
-	}
-	rest := strings.TrimSpace(trimmed[len("ALTER TABLE "):])
-	if strings.HasPrefix(rest, "`") {
-		if end := strings.Index(rest[1:], "`"); end >= 0 {
-			tableName := rest[1 : end+1]
-			afterTable := strings.TrimSpace(rest[end+2:])
-			return tableName, afterTable
-		}
-		return "", ""
-	}
-	parts := strings.Fields(rest)
-	if len(parts) == 0 {
-		return "", ""
-	}
-	tableName := parts[0]
-	afterTable := strings.TrimSpace(rest[len(tableName):])
-	return tableName, afterTable
-}
-
-func qualifyAlterTableName(stmt, schemaName string) string {
-	tableName, rest := splitAlterTableStatement(stmt)
-	if tableName == "" || rest == "" {
+// extractAlterTableName extracts the table name from an ALTER TABLE statement
+// using Spirit's SQL parser.
+func extractAlterTableName(stmt string) string {
+	results, err := statement.Classify(stmt)
+	if err != nil || len(results) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", escapeIdentifier(schemaName), escapeIdentifier(tableName), rest)
+	if results[0].Type != statement.StatementAlterTable {
+		return ""
+	}
+	return results[0].Table
 }
 
-func escapeIdentifier(s string) string {
-	return strings.ReplaceAll(s, "`", "``")
+// qualifyAlterTableName rewrites an ALTER TABLE statement to use a fully-qualified
+// table name (schema.table) using Spirit's parsed Alter clause.
+func qualifyAlterTableName(stmt, schemaName string) string {
+	parsed, err := statement.New(stmt)
+	if err != nil || len(parsed) == 0 {
+		return ""
+	}
+	r := parsed[0]
+	if r.Table == "" || r.Alter == "" {
+		return ""
+	}
+	return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", schemaName, r.Table, r.Alter)
 }
 
 // addAlgorithmInstant rewrites an ALTER TABLE statement to include ALGORITHM=INSTANT.
