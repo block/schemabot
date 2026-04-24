@@ -22,7 +22,7 @@ func (s *vitessApplyDataStore) Save(ctx context.Context, data *storage.VitessApp
 			deploy_request_id = VALUES(deploy_request_id),
 			migration_context = VALUES(migration_context),
 			deploy_request_url = VALUES(deploy_request_url),
-			is_instant = VALUES(is_instant),
+			is_instant = is_instant OR VALUES(is_instant),
 			revert_skipped_at = VALUES(revert_skipped_at)`,
 		data.ApplyID, data.BranchName, data.DeployRequestID, data.MigrationContext, data.DeployRequestURL, data.IsInstant, data.RevertSkippedAt,
 	)
