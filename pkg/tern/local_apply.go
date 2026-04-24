@@ -826,6 +826,12 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 	for _, tp := range result.Tables {
 		tableProgress[tp.Table] = tp
 	}
+	instantFromMetadata := false
+	if result.ResumeState != nil && result.ResumeState.Metadata != "" {
+		if meta, err := decodePSMetadataForStorage(result.ResumeState.Metadata); err == nil && meta != nil {
+			instantFromMetadata = meta.IsInstant
+		}
+	}
 
 	for _, task := range tasks {
 		if tp, ok := tableProgress[task.TableName]; ok {
@@ -833,12 +839,18 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 			task.RowsTotal = tp.RowsTotal
 			task.ProgressPercent = tp.Progress
 			task.ETASeconds = int(tp.ETASeconds)
+			task.IsInstant = tp.IsInstant
 			// Use engine-reported timestamps (from SHOW VITESS_MIGRATIONS) if available.
 			if tp.StartedAt != nil && task.StartedAt == nil {
 				task.StartedAt = tp.StartedAt
 			}
 			if tp.CompletedAt != nil && task.CompletedAt == nil {
 				task.CompletedAt = tp.CompletedAt
+			}
+		} else if instantFromMetadata {
+			task.IsInstant = true
+			if result.State.IsTerminal() {
+				task.ProgressPercent = 100
 			}
 		}
 		// For tasks transitioning to a non-pending state without a started_at

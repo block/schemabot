@@ -1278,8 +1278,13 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return &engine.ApplyResult{Message: "no changes detected on resume"}, nil
 	}
 
+	// Deploy — prefer instant when eligible (no row copy, no revert window needed).
+	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
+	useInstant := instantEligible && !deferCutover
+
 	meta.DeployRequestID = dr.Number
 	meta.DeployRequestURL = dr.HtmlURL
+	meta.IsInstant = useInstant
 	persistMeta, err := encodePSMetadata(meta)
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata on resume: %w", err)
@@ -1290,10 +1295,6 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 			Metadata:         persistMeta,
 		})
 	}
-
-	// Deploy — prefer instant when eligible (no row copy, no revert window needed).
-	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible && !deferCutover
 
 	dr, err = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
 		Organization: org, Database: req.Database, Number: dr.Number, InstantDDL: useInstant,

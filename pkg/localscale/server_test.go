@@ -79,3 +79,47 @@ func TestAddAlgorithmInstant(t *testing.T) {
 		})
 	}
 }
+
+func TestHasAlterTableStatements(t *testing.T) {
+	require.False(t, hasAlterTableStatements(map[string][]string{
+		"testapp": {"CREATE TABLE foo (id INT PRIMARY KEY)", "DROP TABLE bar"},
+	}))
+	require.True(t, hasAlterTableStatements(map[string][]string{
+		"testapp":         {"CREATE TABLE foo (id INT PRIMARY KEY)"},
+		"testapp_sharded": {"ALTER TABLE users ADD COLUMN age INT"},
+	}))
+}
+
+func TestQualifyAlterTableName(t *testing.T) {
+	tests := []struct {
+		name   string
+		stmt   string
+		schema string
+		want   string
+	}{
+		{
+			name:   "unquoted table",
+			stmt:   "ALTER TABLE users ALGORITHM=INSTANT, ADD COLUMN age INT",
+			schema: "_scratch",
+			want:   "ALTER TABLE `_scratch`.`users` ALGORITHM=INSTANT, ADD COLUMN age INT",
+		},
+		{
+			name:   "quoted table",
+			stmt:   "ALTER TABLE `users` ALGORITHM=INSTANT, ADD COLUMN age INT",
+			schema: "_scratch",
+			want:   "ALTER TABLE `_scratch`.`users` ALGORITHM=INSTANT, ADD COLUMN age INT",
+		},
+		{
+			name:   "escaped schema",
+			stmt:   "ALTER TABLE `users` ALGORITHM=INSTANT, ADD COLUMN age INT",
+			schema: "_scratch`x",
+			want:   "ALTER TABLE `_scratch``x`.`users` ALGORITHM=INSTANT, ADD COLUMN age INT",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, qualifyAlterTableName(tt.stmt, tt.schema))
+		})
+	}
+}

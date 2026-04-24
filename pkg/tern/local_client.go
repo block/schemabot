@@ -705,6 +705,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// For Vitess, reconstruct ResumeState from vitess_apply_data so the engine
 	// can poll the deploy request and query SHOW VITESS_MIGRATIONS.
 	var engineResult *engine.ProgressResult
+	var vitessApplyIsInstant bool
 	// Query engine for live progress. For Vitess, also query during pending state
 	// to surface PlanetScale states (creating branch, deploy request, etc.).
 	queryDuringPending := c.config.Type == storage.DatabaseTypeVitess
@@ -721,6 +722,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			case vad == nil:
 				c.logger.Warn("VitessApplyData not found for progress — apply may still be initializing", "apply_id", activeTask.ApplyID)
 			default:
+				vitessApplyIsInstant = vad.IsInstant
 				meta, _ := json.Marshal(map[string]any{
 					"branch_name":        vad.BranchName,
 					"deploy_request_id":  vad.DeployRequestID,
@@ -796,6 +798,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			Namespace: t.Namespace,
 			Status:    t.State,
 			TaskId:    t.TaskIdentifier,
+			IsInstant: t.IsInstant || vitessApplyIsInstant,
 		}
 
 		// Look up engine progress for this table
@@ -853,6 +856,9 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				if tp.RowsCopied < tp.RowsTotal {
 					tp.RowsCopied = tp.RowsTotal
 				}
+			}
+			if vitessApplyIsInstant && state.IsState(t.State, state.Task.Completed) {
+				tp.PercentComplete = 100
 			}
 		}
 

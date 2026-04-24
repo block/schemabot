@@ -570,24 +570,37 @@ func normalizeJSON(data []byte) string {
 }
 
 // checkInstantEligibility tests whether all ALTER TABLE statements in a deploy
-// can use ALGORITHM=INSTANT. Creates a temporary scratch database, copies table
-// schemas from main, and tests each ALTER with ALGORITHM=INSTANT. Non-ALTER
-// statements (CREATE/DROP TABLE) are skipped — they don't involve row copy.
-// Returns true when all ALTERs are instant-eligible (or there are no ALTERs).
+// can use ALGORITHM=INSTANT. It creates a temporary scratch database per
+// keyspace, copies table schemas from main, and tests each ALTER with
+// ALGORITHM=INSTANT. Non-ALTER statements (CREATE/DROP TABLE) are skipped since
+// they don't involve row copy, but a deploy with no ALTERs is not instant DDL.
 func (s *Server) checkInstantEligibility(ctx context.Context, backend *databaseBackend, ddlByKeyspace map[string][]string) bool {
-	scratchDB := fmt.Sprintf("_ls_instant_%d", time.Now().UnixNano()%1000000)
-
-	if _, err := s.metadataDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE `%s`", scratchDB)); err != nil {
-		s.logger.Warn("instant check: create scratch db", "error", err)
-		return false
-	}
-	defer func() {
-		if _, err := s.metadataDB.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", scratchDB)); err != nil {
-			s.logger.Warn("instant check: drop scratch db", "error", err)
-		}
-	}()
-
+	sawAlter := false
+	keyspaceIndex := 0
 	for keyspace, stmts := range ddlByKeyspace {
+		var alterStmts []string
+		for _, stmt := range stmts {
+			if addAlgorithmInstant(stmt) != "" {
+				alterStmts = append(alterStmts, stmt)
+			}
+		}
+		if len(alterStmts) == 0 {
+			continue
+		}
+		sawAlter = true
+		scratchDB := fmt.Sprintf("_ls_instant_%d_%d", time.Now().UnixNano(), keyspaceIndex)
+		keyspaceIndex++
+
+		if _, err := s.metadataDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE `%s`", scratchDB)); err != nil {
+			s.logger.Warn("instant check: create scratch db", "keyspace", keyspace, "error", err)
+			return false
+		}
+		defer func() {
+			if _, err := s.metadataDB.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", scratchDB)); err != nil {
+				s.logger.Warn("instant check: drop scratch db", "keyspace", keyspace, "error", err)
+			}
+		}()
+
 		mainSchemas, err := s.snapshotKeyspaceSchema(ctx, backend, keyspace)
 		if err != nil {
 			s.logger.Warn("instant check: snapshot schema", "keyspace", keyspace, "error", err)
@@ -606,20 +619,18 @@ func (s *Server) checkInstantEligibility(ctx context.Context, backend *databaseB
 		// Test each ALTER with ALGORITHM=INSTANT.
 		// Non-ALTER statements (CREATE/DROP TABLE) are skipped — they don't
 		// affect instant eligibility since they don't involve row copy.
-		for _, stmt := range stmts {
+		for _, stmt := range alterStmts {
 			instantStmt := addAlgorithmInstant(stmt)
-			if instantStmt == "" {
-				continue // CREATE/DROP TABLE — not relevant to instant eligibility
-			}
 			tableName := extractAlterTableName(stmt)
 			if tableName == "" {
 				s.logger.Info("instant check: parse failed", "keyspace", keyspace)
 				return false
 			}
-			// Rewrite to target scratch database
-			scratchStmt := strings.Replace(instantStmt,
-				fmt.Sprintf("`%s`", tableName),
-				fmt.Sprintf("`%s`.`%s`", scratchDB, tableName), 1)
+			scratchStmt := qualifyAlterTableName(instantStmt, scratchDB)
+			if scratchStmt == "" {
+				s.logger.Info("instant check: qualify failed", "keyspace", keyspace, "table", tableName)
+				return false
+			}
 			if _, err := s.metadataDB.ExecContext(ctx, scratchStmt); err != nil {
 				s.logger.Info("instant check: not eligible", "keyspace", keyspace, "table", tableName, "error", err)
 				return false
@@ -627,24 +638,60 @@ func (s *Server) checkInstantEligibility(ctx context.Context, backend *databaseB
 			s.logger.Info("instant check: eligible", "keyspace", keyspace, "table", tableName)
 		}
 	}
-	return true
+	return sawAlter
 }
 
 // extractAlterTableName extracts the table name from an ALTER TABLE statement.
 func extractAlterTableName(stmt string) string {
+	tableName, _ := splitAlterTableStatement(stmt)
+	return tableName
+}
+
+func hasAlterTableStatements(ddlByKeyspace map[string][]string) bool {
+	for _, stmts := range ddlByKeyspace {
+		for _, stmt := range stmts {
+			if addAlgorithmInstant(stmt) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func splitAlterTableStatement(stmt string) (string, string) {
 	trimmed := strings.TrimSpace(stmt)
 	upper := strings.ToUpper(trimmed)
 	if !strings.HasPrefix(upper, "ALTER TABLE ") {
-		return ""
+		return "", ""
 	}
 	rest := strings.TrimSpace(trimmed[len("ALTER TABLE "):])
 	if strings.HasPrefix(rest, "`") {
 		if end := strings.Index(rest[1:], "`"); end >= 0 {
-			return rest[1 : end+1]
+			tableName := rest[1 : end+1]
+			afterTable := strings.TrimSpace(rest[end+2:])
+			return tableName, afterTable
 		}
+		return "", ""
+	}
+	parts := strings.Fields(rest)
+	if len(parts) == 0 {
+		return "", ""
+	}
+	tableName := parts[0]
+	afterTable := strings.TrimSpace(rest[len(tableName):])
+	return tableName, afterTable
+}
+
+func qualifyAlterTableName(stmt, schemaName string) string {
+	tableName, rest := splitAlterTableStatement(stmt)
+	if tableName == "" || rest == "" {
 		return ""
 	}
-	return strings.Fields(rest)[0]
+	return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", escapeIdentifier(schemaName), escapeIdentifier(tableName), rest)
+}
+
+func escapeIdentifier(s string) string {
+	return strings.ReplaceAll(s, "`", "``")
 }
 
 // addAlgorithmInstant rewrites an ALTER TABLE statement to include ALGORITHM=INSTANT.

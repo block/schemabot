@@ -413,7 +413,7 @@ func (s *Server) computeDeployRequestDiff(ctx context.Context, backend *database
 	// from main, tries each ALTER with ALGORITHM=INSTANT, and drops the
 	// temp DB. This matches real PlanetScale behavior where the server
 	// evaluates instant eligibility when preparing the deploy request.
-	instantEligible := totalDDL > 0
+	instantEligible := hasAlterTableStatements(ddlByKeyspace)
 	if instantEligible {
 		s.logger.Info("checking instant DDL eligibility", "number", number, "ddl_count", totalDDL, "keyspace_count", len(ddlByKeyspace))
 		instantEligible = s.checkInstantEligibility(ctx, backend, ddlByKeyspace)
