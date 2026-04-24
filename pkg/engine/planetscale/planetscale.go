@@ -1346,27 +1346,21 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	// Enrich with per-shard progress from SHOW VITESS_MIGRATIONS.
 	// Requires a vtgate DSN (Credentials.DSN) and a migration context
 	// (from VitessApplyData) to query per-shard state.
-	if req.Credentials.DSN == "" {
-		e.logger.Info("no vtgate DSN configured, skipping per-shard progress",
-			"database", req.Database)
-		return result, nil
-	}
-	if req.ResumeState == nil || req.ResumeState.MigrationContext == "" {
-		e.logger.Debug("no migration context for per-shard progress",
-			"database", req.Database, "instant_ddl", meta.InstantDDL)
-		return result, nil
-	}
-	tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
-	if len(tables) > 0 {
-		result.Tables = tables
-		if overallProgress > 0 {
-			result.Progress = overallProgress
+	hasMigrationContext := req.Credentials.DSN != "" &&
+		req.ResumeState != nil && req.ResumeState.MigrationContext != ""
+	if hasMigrationContext {
+		tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
+		if len(tables) > 0 {
+			result.Tables = tables
+			if overallProgress > 0 {
+				result.Progress = overallProgress
+			}
 		}
 	}
 
 	// Propagate instant DDL flag to all tables. Instant DDL may complete
-	// before SHOW VITESS_MIGRATIONS reports is_immediate_operation, so we
-	// use the flag from deploy metadata as the authoritative source.
+	// before migration context discovery, so we use the flag from deploy
+	// metadata as the authoritative source.
 	if meta.InstantDDL {
 		for i := range result.Tables {
 			result.Tables[i].IsInstant = true
