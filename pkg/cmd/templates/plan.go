@@ -133,20 +133,6 @@ func colorizeDiffLine(line string) string {
 	return line
 }
 
-// changeSymbol returns the Terraform-style symbol for a change type.
-func changeSymbol(changeType string) string {
-	switch strings.ToUpper(changeType) {
-	case "CHANGE_TYPE_CREATE", "CREATE":
-		return "+"
-	case "CHANGE_TYPE_ALTER", "ALTER":
-		return "~"
-	case "CHANGE_TYPE_DROP", "DROP":
-		return "-"
-	default:
-		return "?"
-	}
-}
-
 // WriteSQLChanges writes the SQL changes section matching the progress view format:
 // table name on its own line with change symbol, DDL indented below.
 func WriteSQLChanges(changes []DDLChange) {
