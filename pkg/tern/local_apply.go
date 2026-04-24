@@ -392,6 +392,12 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 		resumeState = result.ResumeState
 		// Persist to vitess_apply_data for crash recovery and external progress queries.
 		if meta, err := decodePSMetadataForStorage(resumeState.Metadata); meta != nil && err == nil {
+			c.logger.Info("saving VitessApplyData from apply result",
+				"apply_id", apply.ApplyIdentifier,
+				"is_instant", meta.IsInstant,
+				"deploy_request_id", meta.DeployRequestID,
+				"raw_metadata", resumeState.Metadata[:min(len(resumeState.Metadata), 200)],
+			)
 			if saveErr := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
 				ApplyID:          apply.ID,
 				BranchName:       meta.BranchName,
