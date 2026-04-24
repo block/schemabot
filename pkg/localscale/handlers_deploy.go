@@ -408,17 +408,14 @@ func (s *Server) computeDeployRequestDiff(ctx context.Context, backend *database
 		totalDDL += len(stmts)
 	}
 
-	// Read instant DDL eligibility from the branch row — it was determined by
-	// handleApplyBranchSchema which actually tested ALGORITHM=INSTANT against MySQL.
-	// VSchema-only changes are not instant-eligible per PlanetScale behavior.
-	var instantEligible bool
-	if totalDDL > 0 {
-		if err := s.metadataDB.QueryRowContext(ctx,
-			"SELECT instant_ddl_eligible FROM localscale_branches WHERE org = ? AND database_name = ? AND name = ?",
-			org, database, branch,
-		).Scan(&instantEligible); err != nil {
-			s.logger.Warn("read instant_ddl_eligible from branch", "number", number, "branch", branch, "error", err)
-		}
+	// Detect instant DDL eligibility by testing ALGORITHM=INSTANT on a
+	// temporary scratch database. Creates a temp DB, copies table schemas
+	// from main, tries each ALTER with ALGORITHM=INSTANT, and drops the
+	// temp DB. This matches real PlanetScale behavior where the server
+	// evaluates instant eligibility when preparing the deploy request.
+	instantEligible := totalDDL > 0
+	if instantEligible {
+		instantEligible = s.checkInstantEligibility(ctx, backend, ddlByKeyspace)
 	}
 
 	newState := dr.Ready
