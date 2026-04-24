@@ -337,13 +337,22 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 				c.logger.Warn("OnStateChange: no PS metadata in resume state", "apply_id", apply.ApplyIdentifier)
 				return
 			}
+			// Preserve IsInstant if already set — early callbacks fire before
+			// the deploy decides instant eligibility, so meta.IsInstant may be
+			// false even though a later save set it to true.
+			isInstant := meta.IsInstant
+			if !isInstant {
+				if existing, existErr := c.storage.VitessApplyData().GetByApplyID(ctx, apply.ID); existErr == nil && existing != nil {
+					isInstant = existing.IsInstant
+				}
+			}
 			if saveErr := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
 				ApplyID:          apply.ID,
 				BranchName:       meta.BranchName,
 				DeployRequestID:  meta.DeployRequestID,
 				MigrationContext: rs.MigrationContext,
 				DeployRequestURL: meta.DeployRequestURL,
-				IsInstant:        meta.IsInstant,
+				IsInstant:        isInstant,
 			}); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
