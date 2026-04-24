@@ -432,7 +432,7 @@ type psMetadata struct {
 	DeployRequestID  uint64     `json:"deploy_request_id"`
 	DeployRequestURL string     `json:"deploy_request_url,omitempty"`
 	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
-	InstantDDL       bool       `json:"instant_ddl,omitempty"`
+	IsInstant        bool       `json:"is_instant,omitempty"`
 }
 
 func encodePSMetadata(m *psMetadata) (string, error) {
@@ -931,7 +931,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		BranchName:       branchName,
 		DeployRequestID:  dr.Number,
 		DeployRequestURL: dr.HtmlURL,
-		InstantDDL:       useInstant,
+		IsInstant:        useInstant,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata for deploy request #%d: %w", dr.Number, err)
@@ -1350,7 +1350,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		"deploy_request", meta.DeployRequestID,
 		"deploy_state", dr.DeploymentState,
 		"engine_state", engineState,
-		"instant_ddl", meta.InstantDDL,
+		"is_instant", meta.IsInstant,
 		"has_migration_context", req.ResumeState != nil && req.ResumeState.MigrationContext != "",
 		"has_vtgate_dsn", req.Credentials.DSN != "",
 	)
@@ -1391,7 +1391,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	// Propagate instant DDL flag to all tables. Instant DDL may complete
 	// before migration context discovery, so we use the flag from deploy
 	// metadata as the authoritative source.
-	if meta.InstantDDL {
+	if meta.IsInstant {
 		e.logger.Info("marking tables as instant DDL",
 			"database", req.Database,
 			"table_count", len(result.Tables),

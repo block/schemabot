@@ -556,6 +556,40 @@ func TestDeploySubmittingToQueued(t *testing.T) {
 	t.Logf("Verified submitting → queued → complete transition for deploy request %d", dr.Number)
 }
 
+// TestInstantDDLEligibility verifies that ADD COLUMN NULL is detected as
+// instant-eligible on the branch and reported in the deploy request.
+// Uses the /apply-schema HTTP endpoint which tests ALGORITHM=INSTANT.
+func TestInstantDDLEligibility(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	ctx := t.Context()
+
+	// ADD COLUMN NULL is instant in MySQL 8.4.
+	// Apply via /apply-schema endpoint which detects ALGORITHM=INSTANT.
+	branchName := createBranch(t, ctx, "instant-check")
+	applyBranchSchemaHTTP(t, ctx, branchName, map[string][]string{
+		"testapp_sharded": {"ALTER TABLE users ADD COLUMN instant_test_col VARCHAR(50) NULL"},
+	})
+
+	dr := createDeploy(t, ctx, branchName, true)
+	require.Equal(t, drState.Ready, dr.DeploymentState)
+	require.NotNil(t, dr.Deployment, "deploy request should have deployment info")
+	assert.True(t, dr.Deployment.InstantDDLEligible,
+		"ADD COLUMN NULL should be instant-eligible")
+
+	// Non-instant ALTER (ADD INDEX) should NOT be eligible
+	branchName2 := createBranch(t, ctx, "non-instant-check")
+	applyBranchSchemaHTTP(t, ctx, branchName2, map[string][]string{
+		"testapp_sharded": {"ALTER TABLE users ADD INDEX idx_instant_test (email, full_name)"},
+	})
+
+	dr2 := createDeploy(t, ctx, branchName2, true)
+	require.Equal(t, drState.Ready, dr2.DeploymentState)
+	require.NotNil(t, dr2.Deployment)
+	assert.False(t, dr2.Deployment.InstantDDLEligible,
+		"ADD INDEX should NOT be instant-eligible")
+}
+
 // TestCancelInProgressToCompleteCancel verifies that cancelling an in-progress deploy
 // transitions through in_progress_cancel → complete_cancel via the state processor.
 func TestCancelInProgressToCompleteCancel(t *testing.T) {

@@ -54,31 +54,31 @@ func TestReadSchemaFiles_MixedRealAndSymlinked(t *testing.T) {
 	dir := t.TempDir()
 
 	// Real keyspace with its own schema
-	require.NoError(t, os.MkdirAll(filepath.Join(dir, "inventory2"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "inventory2", "settings.sql"), []byte("CREATE TABLE settings (id INT)"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "commerce"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "commerce", "settings.sql"), []byte("CREATE TABLE settings (id INT)"), 0o644))
 
 	// Real sharded keyspace
-	shardedDir := filepath.Join(dir, "inventory2_sharded")
+	shardedDir := filepath.Join(dir, "commerce_sharded")
 	require.NoError(t, os.MkdirAll(shardedDir, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(shardedDir, "orders.sql"), []byte("CREATE TABLE orders (id INT)"), 0o644))
 
 	// Two more sharded keyspaces sharing the same schema via symlinks
-	require.NoError(t, os.Symlink(shardedDir, filepath.Join(dir, "inventory2_sharded_001")))
-	require.NoError(t, os.Symlink(shardedDir, filepath.Join(dir, "inventory2_sharded_002")))
+	require.NoError(t, os.Symlink(shardedDir, filepath.Join(dir, "commerce_sharded_001")))
+	require.NoError(t, os.Symlink(shardedDir, filepath.Join(dir, "commerce_sharded_002")))
 
 	result, err := ReadSchemaFiles(dir)
 	require.NoError(t, err)
 
 	// All four keyspaces should be present
 	require.Len(t, result, 4)
-	require.Contains(t, result, "inventory2")
-	require.Contains(t, result, "inventory2_sharded")
-	require.Contains(t, result, "inventory2_sharded_001")
-	require.Contains(t, result, "inventory2_sharded_002")
+	require.Contains(t, result, "commerce")
+	require.Contains(t, result, "commerce_sharded")
+	require.Contains(t, result, "commerce_sharded_001")
+	require.Contains(t, result, "commerce_sharded_002")
 
 	// Symlinked keyspaces should have the same content as the real one
-	assert.Equal(t, result["inventory2_sharded"].Files["orders.sql"], result["inventory2_sharded_001"].Files["orders.sql"])
-	assert.Equal(t, result["inventory2_sharded"].Files["orders.sql"], result["inventory2_sharded_002"].Files["orders.sql"])
+	assert.Equal(t, result["commerce_sharded"].Files["orders.sql"], result["commerce_sharded_001"].Files["orders.sql"])
+	assert.Equal(t, result["commerce_sharded"].Files["orders.sql"], result["commerce_sharded_002"].Files["orders.sql"])
 }
 
 func TestReadSchemaFiles_SkipsNonSchemaFiles(t *testing.T) {

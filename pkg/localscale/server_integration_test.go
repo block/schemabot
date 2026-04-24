@@ -3,12 +3,15 @@
 package localscale_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -548,6 +551,24 @@ func applyBranchDDL(t *testing.T, ctx context.Context, branchName string, ddl ma
 		}
 		utils.CloseAndLog(db)
 	}
+}
+
+// applyBranchSchemaViaAPI applies DDL to a branch via the /apply-schema HTTP endpoint,
+// which detects ALGORITHM=INSTANT eligibility. This is the path LocalScale uses when
+// called from the SchemaBot engine.
+func applyBranchSchemaHTTP(t *testing.T, ctx context.Context, branchName string, ddl map[string][]string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"ddl": ddl})
+	require.NoError(t, err)
+	url := fmt.Sprintf("%s/v1/organizations/%s/databases/%s/branches/%s/schema", testContainer.URL(), testOrg, testDB, branchName)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "apply-schema failed: %s", string(respBody))
 }
 
 // applyBranchVSchema applies VSchema changes to a branch via UpdateKeyspaceVSchema.

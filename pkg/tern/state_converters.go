@@ -220,7 +220,7 @@ type psMetadataForStorage struct {
 	DeployRequestID  uint64     `json:"deploy_request_id"`
 	DeployRequestURL string     `json:"deploy_request_url,omitempty"`
 	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
-	InstantDDL       bool       `json:"instant_ddl,omitempty"`
+	IsInstant        bool       `json:"is_instant,omitempty"`
 }
 
 func decodePSMetadataForStorage(s string) (*psMetadataForStorage, error) {
