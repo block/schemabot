@@ -343,6 +343,7 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 				DeployRequestID:  meta.DeployRequestID,
 				MigrationContext: rs.MigrationContext,
 				DeployRequestURL: meta.DeployRequestURL,
+				IsInstant:        meta.InstantDDL,
 			}); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
@@ -388,6 +389,7 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 				DeployRequestID:  meta.DeployRequestID,
 				MigrationContext: resumeState.MigrationContext,
 				DeployRequestURL: meta.DeployRequestURL,
+				IsInstant:        meta.InstantDDL,
 			}); saveErr != nil {
 				c.logger.Warn("failed to save vitess apply data", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}

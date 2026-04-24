@@ -547,6 +547,7 @@ type VitessApplyData struct {
 	DeployRequestID  uint64
 	MigrationContext string
 	DeployRequestURL string
+	IsInstant        bool // True when PlanetScale reported the deploy as instant-eligible
 
 	// RevertSkippedAt records when skip-revert was dispatched. Non-nil means
 	// finalization is in progress — the deploy request is transitioning across

@@ -725,6 +725,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 					"branch_name":        vad.BranchName,
 					"deploy_request_id":  vad.DeployRequestID,
 					"deploy_request_url": vad.DeployRequestURL,
+					"instant_ddl":        vad.IsInstant,
 				})
 				progressReq.ResumeState = &engine.ResumeState{
 					MigrationContext: vad.MigrationContext,
