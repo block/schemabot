@@ -92,27 +92,73 @@ type NamespaceChange struct {
 func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string) {
 	singleNamespace := len(namespaces) == 1 && isMySQL && namespaces[0].Namespace == database
 
+	// Group consecutive keyspaces with identical DDL changes for collapsing.
+	type nsGroup struct {
+		namespaces []NamespaceChange
+	}
+	var groups []nsGroup
 	for _, ns := range namespaces {
 		if len(ns.Changes) == 0 && !ns.VSchemaChanged {
 			continue
 		}
-
-		if !singleNamespace {
-			fmt.Print(FormatKeyspaceHeader(ns.Namespace))
-		}
-
-		if ns.VSchemaChanged && !isMySQL {
-			fmt.Println("  ~ VSchema:")
-			if ns.VSchemaDiff != "" {
-				fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, "    "))
-				fmt.Println()
+		// Try to merge with previous group if DDL is identical
+		if len(groups) > 0 && !ns.VSchemaChanged {
+			prev := &groups[len(groups)-1]
+			if !prev.namespaces[0].VSchemaChanged && ddlChangesEqual(prev.namespaces[0].Changes, ns.Changes) {
+				prev.namespaces = append(prev.namespaces, ns)
+				continue
 			}
 		}
+		groups = append(groups, nsGroup{namespaces: []NamespaceChange{ns}})
+	}
 
-		if len(ns.Changes) > 0 {
-			WriteSQLChanges(ns.Changes)
+	const collapseThreshold = 6
+	const maxShown = 3
+
+	for _, g := range groups {
+		if !singleNamespace && len(g.namespaces) >= collapseThreshold {
+			// Show first few keyspace headers, then collapse the rest
+			for i, ns := range g.namespaces {
+				if i >= maxShown {
+					fmt.Printf("\n  %s... and %d more keyspaces with identical changes%s\n",
+						ANSIDim, len(g.namespaces)-maxShown, ANSIReset)
+					break
+				}
+				fmt.Print(FormatKeyspaceHeader(ns.Namespace))
+			}
+			// Show DDL once
+			WriteSQLChanges(g.namespaces[0].Changes)
+		} else {
+			for _, ns := range g.namespaces {
+				if !singleNamespace {
+					fmt.Print(FormatKeyspaceHeader(ns.Namespace))
+				}
+				if ns.VSchemaChanged && !isMySQL {
+					fmt.Println("  ~ VSchema:")
+					if ns.VSchemaDiff != "" {
+						fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, "    "))
+						fmt.Println()
+					}
+				}
+				if len(ns.Changes) > 0 {
+					WriteSQLChanges(ns.Changes)
+				}
+			}
 		}
 	}
+}
+
+// ddlChangesEqual returns true if two slices of DDL changes have identical content.
+func ddlChangesEqual(a, b []DDLChange) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].ChangeType != b[i].ChangeType || a[i].DDL != b[i].DDL || a[i].TableName != b[i].TableName {
+			return false
+		}
+	}
+	return true
 }
 
 // colorizeDiffLine applies ANSI colors to a diff line: green for additions,
