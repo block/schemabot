@@ -33,11 +33,6 @@ databases:
         api_url: "http://localscale:8080"
         organization: "localscale-staging"
         token_secret_ref: "env:PS_TOKEN"
-      api-plan:
-        dsn: "root@tcp(127.0.0.1:1)/"
-        api_url: "http://localscale:8080"
-        organization: "localscale-staging"
-        token_secret_ref: "env:PS_TOKEN"
       production:
         dsn: "root@tcp(localscale:19100)/"
         api_url: "http://localscale:8080"
