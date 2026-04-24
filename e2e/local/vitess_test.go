@@ -510,13 +510,10 @@ func TestVitess_Apply_AddColumn_Sharded(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, resp.Tables, "expected table progress")
 	for _, tbl := range resp.Tables {
-		// ADD COLUMN NULL is instant-eligible on fresh tables (MySQL 8.4).
-		// After prior online DDL (e.g., base schema seeding via Vitess online DDL),
-		// MySQL may reject ALGORITHM=INSTANT. Log the result for visibility but
-		// don't assert — the integration test TestInstantDDLEligibility covers
-		// instant detection on clean tables. Here we verify completion.
-		t.Logf("table %s: is_instant=%v, rows=%d/%d", tbl.TableName, tbl.IsInstant, tbl.RowsCopied, tbl.RowsTotal)
-		assert.Equal(t, int32(100), tbl.PercentComplete, "completed table should show 100%% for %s", tbl.TableName)
+		assert.True(t, tbl.IsInstant,
+			"ADD COLUMN NULL should use instant DDL for table %s (state=%s, rows=%d/%d)",
+			tbl.TableName, tbl.Status, tbl.RowsCopied, tbl.RowsTotal)
+		assert.Equal(t, int32(100), tbl.PercentComplete, "instant DDL should show 100%% for table %s", tbl.TableName)
 	}
 }
 
