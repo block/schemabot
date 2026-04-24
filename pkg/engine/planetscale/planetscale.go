@@ -872,6 +872,22 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// completes immediately and has no revert window regardless of skip_revert.
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
 	useInstant := instantEligible && !deferCutover
+
+	// Log the raw deploy request fields for debugging instant DDL detection.
+	if dr.Deployment != nil {
+		e.logger.Info("deploy request deployment info",
+			"database", req.Database,
+			"deploy_request", dr.Number,
+			"instant_ddl_eligible", dr.Deployment.InstantDDLEligible,
+			"deployment_state", dr.Deployment.State,
+		)
+	} else {
+		e.logger.Warn("deploy request has nil deployment",
+			"database", req.Database,
+			"deploy_request", dr.Number,
+			"deploy_state", dr.DeploymentState,
+		)
+	}
 	e.logger.Info("instant DDL decision",
 		"database", req.Database,
 		"deploy_request", dr.Number,

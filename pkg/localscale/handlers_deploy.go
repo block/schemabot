@@ -415,7 +415,9 @@ func (s *Server) computeDeployRequestDiff(ctx context.Context, backend *database
 	// evaluates instant eligibility when preparing the deploy request.
 	instantEligible := totalDDL > 0
 	if instantEligible {
+		s.logger.Info("checking instant DDL eligibility", "number", number, "ddl_count", totalDDL, "keyspace_count", len(ddlByKeyspace))
 		instantEligible = s.checkInstantEligibility(ctx, backend, ddlByKeyspace)
+		s.logger.Info("instant DDL eligibility result", "number", number, "eligible", instantEligible)
 	}
 
 	newState := dr.Ready
