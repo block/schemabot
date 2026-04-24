@@ -67,8 +67,11 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Post plan comment
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
-	// Create check run
-	h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+	// Create check run and update aggregate
+	headSHA := h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+	if headSHA != "" {
+		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+	}
 
 	h.writeJSON(w, http.StatusOK, map[string]string{
 		"message": "plan generated successfully",
@@ -107,6 +110,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 	}
 
 	// Collect plans for all environments
+	var headSHA string
 	multiEnvData := templates.MultiEnvPlanCommentData{
 		RequestedBy:  requestedBy,
 		Environments: environments,
@@ -152,7 +156,14 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 		multiEnvData.Plans[env] = &commentData
 
 		// Create check run per environment
-		h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, env, installationID)
+		if sha := h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, env, installationID); sha != "" {
+			headSHA = sha
+		}
+	}
+
+	// Update aggregate check once after all environments are planned
+	if headSHA != "" {
+		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 
 	// Auto-plan: skip comment if no changes and no errors (reduce PR noise)

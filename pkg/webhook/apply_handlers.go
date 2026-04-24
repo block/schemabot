@@ -174,8 +174,10 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
-	// Create check run (action_required — waiting for apply-confirm)
-	h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+	// Create check run (action_required — waiting for apply-confirm) and update aggregate
+	if headSHA := h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID); headSHA != "" {
+		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+	}
 }
 
 // handleApplyConfirmCommand handles the "schemabot apply-confirm -e <env>" PR comment command.
@@ -425,9 +427,9 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 
 // createApplyPlanCheckRun creates or updates the check run when an apply plan is posted.
 // Uses the same check name as the plan check run so it updates the existing one.
-func (h *Handler) createApplyPlanCheckRun(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, installationID int64) {
-	// Reuse the plan check run infrastructure which stores the check record
-	h.createPlanCheckRun(ctx, client, repo, pr, schema, planResp, environment, installationID)
+// Returns the PR head SHA, or empty string on error.
+func (h *Handler) createApplyPlanCheckRun(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, installationID int64) string {
+	return h.createPlanCheckRun(ctx, client, repo, pr, schema, planResp, environment, installationID)
 }
 
 // updateCheckRunForApplyStart updates the existing plan check run to "in_progress"
@@ -448,7 +450,7 @@ func (h *Handler) updateCheckRunForApplyStart(ctx context.Context, client *ghcli
 		checkName := checkRunName(environment, schema.Type, schema.Database)
 		opts := ghclient.CheckRunOptions{
 			Name:   checkName,
-			Status: "in_progress",
+			Status: checkStatusInProgress,
 			Output: &ghclient.CheckRunOutput{
 				Title:   "Schema change in progress",
 				Summary: "Applying schema changes...",
@@ -469,12 +471,15 @@ func (h *Handler) updateCheckRunForApplyStart(ctx context.Context, client *ghcli
 			DatabaseName: schema.Database,
 			CheckRunID:   checkRunID,
 			HasChanges:   true,
-			Status:       "in_progress",
+			Status:       checkStatusInProgress,
 			Conclusion:   "",
 		}
 		if err := h.service.Storage().Checks().Upsert(ctx, newCheck); err != nil {
 			h.logger.Error("failed to upsert new check record", "error", err)
 		}
+
+		// Update aggregate check to reflect in_progress state
+		h.updateAggregateCheck(ctx, client, repo, pr, prInfo.HeadSHA)
 		return
 	}
 
@@ -482,7 +487,7 @@ func (h *Handler) updateCheckRunForApplyStart(ctx context.Context, client *ghcli
 	checkName := checkRunName(check.Environment, check.DatabaseType, check.DatabaseName)
 	opts := ghclient.CheckRunOptions{
 		Name:   checkName,
-		Status: "in_progress",
+		Status: checkStatusInProgress,
 		Output: &ghclient.CheckRunOutput{
 			Title:   "Schema change in progress",
 			Summary: "Applying schema changes...",
@@ -493,11 +498,14 @@ func (h *Handler) updateCheckRunForApplyStart(ctx context.Context, client *ghcli
 	}
 
 	// Update stored record
-	check.Status = "in_progress"
+	check.Status = checkStatusInProgress
 	check.Conclusion = ""
 	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
 		h.logger.Error("failed to upsert check record", "error", err)
 	}
+
+	// Update aggregate check to reflect in_progress state
+	h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)
 }
 
 // updateCheckRunAfterUnlock updates a check run to neutral after lock release.
@@ -518,8 +526,8 @@ func (h *Handler) updateCheckRunAfterUnlock(ctx context.Context, repo string, pr
 
 	opts := ghclient.CheckRunOptions{
 		Name:       checkName,
-		Status:     "completed",
-		Conclusion: "neutral",
+		Status:     checkStatusCompleted,
+		Conclusion: checkConclusionNeutral,
 		Output: &ghclient.CheckRunOutput{
 			Title:   "Lock released",
 			Summary: "Schema change cancelled. Lock has been released.",
