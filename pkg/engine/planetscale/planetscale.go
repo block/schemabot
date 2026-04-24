@@ -1336,6 +1336,16 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
+	e.logger.Info("progress poll",
+		"database", req.Database,
+		"deploy_request", meta.DeployRequestID,
+		"deploy_state", dr.DeploymentState,
+		"engine_state", engineState,
+		"instant_ddl", meta.InstantDDL,
+		"has_migration_context", req.ResumeState != nil && req.ResumeState.MigrationContext != "",
+		"has_vtgate_dsn", req.Credentials.DSN != "",
+	)
+
 	result := &engine.ProgressResult{
 		State:       engineState,
 		Progress:    progress,
@@ -1350,18 +1360,33 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		req.ResumeState != nil && req.ResumeState.MigrationContext != ""
 	if hasMigrationContext {
 		tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
+		e.logger.Info("vitess migrations queried",
+			"database", req.Database,
+			"table_count", len(tables),
+			"overall_progress", overallProgress,
+		)
 		if len(tables) > 0 {
 			result.Tables = tables
 			if overallProgress > 0 {
 				result.Progress = overallProgress
 			}
 		}
+	} else {
+		e.logger.Debug("skipping per-shard progress",
+			"database", req.Database,
+			"has_vtgate_dsn", req.Credentials.DSN != "",
+			"has_migration_context", req.ResumeState != nil && req.ResumeState.MigrationContext != "",
+		)
 	}
 
 	// Propagate instant DDL flag to all tables. Instant DDL may complete
 	// before migration context discovery, so we use the flag from deploy
 	// metadata as the authoritative source.
 	if meta.InstantDDL {
+		e.logger.Info("marking tables as instant DDL",
+			"database", req.Database,
+			"table_count", len(result.Tables),
+		)
 		for i := range result.Tables {
 			result.Tables[i].IsInstant = true
 		}
