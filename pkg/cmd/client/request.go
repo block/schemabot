@@ -133,9 +133,54 @@ func doPostInto(endpoint, path string, body any, result any) error {
 func checkNonJSONResponse(resp *http.Response, body []byte, parseErr error) error {
 	ct := resp.Header.Get("Content-Type")
 	if strings.Contains(ct, "html") || (len(body) > 0 && body[0] == '<') {
-		return fmt.Errorf("server returned an HTML page instead of JSON — you may need to re-authenticate with the endpoint")
+		// Extract visible text from HTML for context (strip tags).
+		text := stripHTMLTags(string(body))
+		text = strings.Join(strings.Fields(text), " ") // collapse whitespace
+		if len(text) > 200 {
+			text = text[:200] + "..."
+		}
+		if text != "" {
+			return fmt.Errorf("unexpected response from server (received HTML, expected JSON):\n  %s", text)
+		}
+		return fmt.Errorf("unexpected response from server (received HTML, expected JSON)")
 	}
 	return fmt.Errorf("parse response: %w", parseErr)
+}
+
+// stripHTMLTags removes HTML tags and style/script content, returning only visible text.
+func stripHTMLTags(s string) string {
+	// Remove <style>...</style> and <script>...</script> blocks first
+	for _, tag := range []string{"style", "script"} {
+		for {
+			start := strings.Index(strings.ToLower(s), "<"+tag)
+			if start < 0 {
+				break
+			}
+			end := strings.Index(strings.ToLower(s[start:]), "</"+tag+">")
+			if end < 0 {
+				s = s[:start]
+				break
+			}
+			s = s[:start] + s[start+end+len("</"+tag+">"):]
+		}
+	}
+	// Strip remaining tags
+	var b strings.Builder
+	inTag := false
+	for _, r := range s {
+		if r == '<' {
+			inTag = true
+			continue
+		}
+		if r == '>' {
+			inTag = false
+			continue
+		}
+		if !inTag {
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // parseAPIError builds an APIError from a non-200 HTTP response, extracting
