@@ -909,8 +909,8 @@ func TestVitess_Apply_VSchemaOnly_MultiKeyspace(t *testing.T) {
 	// Plan should show both keyspaces
 	planOut := e2eutil.RunCLIInDir(t, binPath, schemaDir, "plan",
 		"-s", ".", "-e", "staging", "--endpoint", endpoint)
-	e2eutil.AssertContains(t, planOut, "Keyspace: testapp_sharded")
-	e2eutil.AssertContains(t, planOut, "Keyspace: testapp")
+	e2eutil.AssertContains(t, planOut, "── testapp_sharded ──")
+	e2eutil.AssertContains(t, planOut, "── testapp ──")
 	e2eutil.AssertContains(t, planOut, "~ VSchema:")
 
 	// Apply should complete
