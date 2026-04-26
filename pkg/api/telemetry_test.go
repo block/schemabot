@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -102,4 +103,60 @@ func TestRecordPlanMetric(t *testing.T) {
 		},
 	}
 	metricdatatest.AssertEqual(t, want, plansMetric, metricdatatest.IgnoreTimestamp())
+}
+
+func TestOtelHTTPMetrics(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	svc := newTestService()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	handler := otelhttp.NewHandler(mux, "schemabot")
+
+	// Hit /health — the one route guaranteed to work with mock storage.
+	req := httptest.NewRequestWithContext(t.Context(), "GET", "/health", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	// Verify otelhttp produced the standard HTTP server metrics.
+	metricNames := make(map[string]bool)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			metricNames[m.Name] = true
+		}
+	}
+	assert.True(t, metricNames["http.server.request.duration"], "expected http.server.request.duration metric")
+	assert.True(t, metricNames["http.server.request.body.size"], "expected http.server.request.body.size metric")
+	assert.True(t, metricNames["http.server.response.body.size"], "expected http.server.response.body.size metric")
+
+	// Verify the duration histogram has data points with expected attributes.
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "http.server.request.duration" {
+				continue
+			}
+			hist, ok := m.Data.(metricdata.Histogram[float64])
+			require.True(t, ok)
+			assert.GreaterOrEqual(t, len(hist.DataPoints), 1, "expected at least one duration data point")
+
+			// Verify data points have standard HTTP attributes.
+			for _, dp := range hist.DataPoints {
+				_, hasMethod := dp.Attributes.Value(attribute.Key("http.request.method"))
+				assert.True(t, hasMethod, "expected http.request.method attribute on duration data point")
+				_, hasStatus := dp.Attributes.Value(attribute.Key("http.response.status_code"))
+				assert.True(t, hasStatus, "expected http.response.status_code attribute on duration data point")
+			}
+		}
+	}
 }
