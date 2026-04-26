@@ -12,12 +12,13 @@ import (
 )
 
 func (s *Server) handleCancelDeployRequest(w http.ResponseWriter, r *http.Request) error {
-	backend, number, err := s.resolveDeployAction(r)
+	backend, ref, err := s.resolveDeployAction(r)
 	if err != nil {
 		return err
 	}
+	number := ref.number
 
-	info, err := s.getDeployRequestInfo(r.Context(), number)
+	info, err := s.getDeployRequestInfo(r.Context(), ref)
 	if err != nil {
 		return err
 	}
@@ -39,7 +40,10 @@ func (s *Server) handleCancelDeployRequest(w http.ResponseWriter, r *http.Reques
 	// Set in_progress_cancel — the processor will advance to complete_cancel
 	// once all Vitess migrations reach terminal state.
 	if err := s.execLog(r.Context(),
-		"UPDATE localscale_deploy_requests SET deployment_state = ? WHERE number = ?", dr.InProgressCancel, number,
+		`UPDATE localscale_deploy_requests
+		 SET deployment_state = ?
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		dr.InProgressCancel, ref.org, ref.database, number,
 	); err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 	}
@@ -49,12 +53,13 @@ func (s *Server) handleCancelDeployRequest(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleApplyDeployRequest(w http.ResponseWriter, r *http.Request) error {
-	backend, number, err := s.resolveDeployAction(r)
+	backend, ref, err := s.resolveDeployAction(r)
 	if err != nil {
 		return err
 	}
+	number := ref.number
 
-	info, err := s.getDeployRequestInfo(r.Context(), number)
+	info, err := s.getDeployRequestInfo(r.Context(), ref)
 	if err != nil {
 		return err
 	}
@@ -75,7 +80,10 @@ func (s *Server) handleApplyDeployRequest(w http.ResponseWriter, r *http.Request
 	// Mark cutover as requested so the processor can distinguish
 	// "pending_cutover" from "in_progress_cutover".
 	if err := s.execLog(r.Context(),
-		"UPDATE localscale_deploy_requests SET cutover_requested = TRUE, deployment_state = ? WHERE number = ?", dr.InProgressCutover, number,
+		`UPDATE localscale_deploy_requests
+		 SET cutover_requested = TRUE, deployment_state = ?
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		dr.InProgressCutover, ref.org, ref.database, number,
 	); err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 	}
@@ -85,16 +93,20 @@ func (s *Server) handleApplyDeployRequest(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Request) error {
-	backend, number, err := s.resolveDeployAction(r)
+	backend, ref, err := s.resolveDeployAction(r)
 	if err != nil {
 		return err
 	}
+	number := ref.number
 
 	var branch, migrationContext, ddlJSON, currentState string
 	var vschemaOriginalSQL, schemaBeforeSQL sql.NullString
 	var vschemaReverted bool
 	err = s.metadataDB.QueryRowContext(r.Context(),
-		"SELECT branch, migration_context, ddl_statements, vschema_data_original, vschema_reverted, schema_before, deployment_state FROM localscale_deploy_requests WHERE number = ?", number,
+		`SELECT branch, migration_context, ddl_statements, vschema_data_original, vschema_reverted, schema_before, deployment_state
+		 FROM localscale_deploy_requests
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		ref.org, ref.database, number,
 	).Scan(&branch, &migrationContext, &ddlJSON, &vschemaOriginalSQL, &vschemaReverted, &schemaBeforeSQL, &currentState)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
@@ -111,13 +123,13 @@ func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Reques
 	hasOriginalVSchema := hasVSchemaData(vschemaOriginalSQL)
 	if hasOriginalVSchema && !vschemaReverted {
 		// Set transitional state before VSchema revert
-		if err := s.updateDeployState(r.Context(), number, dr.InProgressRevertVSchema); err != nil {
+		if err := s.updateDeployState(r.Context(), ref, dr.InProgressRevertVSchema); err != nil {
 			return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 		}
-		if err := s.revertPendingVSchema(r.Context(), backend, number, vschemaOriginalSQL.String); err != nil {
+		if err := s.revertPendingVSchema(r.Context(), backend, ref, vschemaOriginalSQL.String); err != nil {
 			s.logger.Error("revert vschema failed", "number", number, "error", err)
 			// Best-effort state restore so the operation can be retried.
-			if restoreErr := s.updateDeployState(r.Context(), number, dr.CompletePendingRevert); restoreErr != nil {
+			if restoreErr := s.updateDeployState(r.Context(), ref, dr.CompletePendingRevert); restoreErr != nil {
 				s.logger.Error("failed to restore state after revert failure", "number", number, "error", restoreErr)
 			}
 			return newHTTPError(http.StatusInternalServerError, "revert vschema: %v", err)
@@ -163,8 +175,10 @@ func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err := s.execLog(r.Context(),
-		"UPDATE localscale_deploy_requests SET reverted = TRUE, revert_migration_context = ?, deployment_state = ? WHERE number = ?",
-		revertContext, revertState, number,
+		`UPDATE localscale_deploy_requests
+		 SET reverted = TRUE, revert_migration_context = ?, deployment_state = ?
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		revertContext, revertState, ref.org, ref.database, number,
 	); err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 	}
@@ -174,12 +188,13 @@ func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleSkipRevertDeployRequest(w http.ResponseWriter, r *http.Request) error {
-	backend, number, err := s.resolveDeployAction(r)
+	backend, ref, err := s.resolveDeployAction(r)
 	if err != nil {
 		return err
 	}
+	number := ref.number
 
-	info, err := s.getDeployRequestInfo(r.Context(), number)
+	info, err := s.getDeployRequestInfo(r.Context(), ref)
 	if err != nil {
 		return err
 	}
@@ -189,7 +204,10 @@ func (s *Server) handleSkipRevertDeployRequest(w http.ResponseWriter, r *http.Re
 	}
 
 	if err := s.execLog(r.Context(),
-		"UPDATE localscale_deploy_requests SET revert_skipped = TRUE, deployment_state = ? WHERE number = ?", dr.Complete, number,
+		`UPDATE localscale_deploy_requests
+		 SET revert_skipped = TRUE, deployment_state = ?
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		dr.Complete, ref.org, ref.database, number,
 	); err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 	}
@@ -202,10 +220,11 @@ func (s *Server) handleSkipRevertDeployRequest(w http.ResponseWriter, r *http.Re
 }
 
 func (s *Server) handleThrottleDeployRequest(w http.ResponseWriter, r *http.Request) error {
-	backend, number, err := s.resolveDeployAction(r)
+	backend, ref, err := s.resolveDeployAction(r)
 	if err != nil {
 		return err
 	}
+	number := ref.number
 
 	var body struct {
 		ThrottleRatio float64 `json:"throttle_ratio"`
@@ -220,8 +239,10 @@ func (s *Server) handleThrottleDeployRequest(w http.ResponseWriter, r *http.Requ
 
 	// Store in metadata for query purposes
 	_, err = s.metadataDB.ExecContext(r.Context(),
-		"UPDATE localscale_deploy_requests SET throttle_ratio = ? WHERE number = ?",
-		body.ThrottleRatio, number)
+		`UPDATE localscale_deploy_requests
+		 SET throttle_ratio = ?
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		body.ThrottleRatio, ref.org, ref.database, number)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update throttle: %v", err)
 	}
@@ -263,7 +284,7 @@ func (s *Server) applyThrottle(ctx context.Context, backend *databaseBackend, nu
 // keyspace's VSchema via vtctldclient.ApplyVSchema, then marks vschema_applied=true.
 // Before applying, it captures the current (original) VSchema for each keyspace so
 // it can be restored on revert.
-func (s *Server) applyPendingVSchema(ctx context.Context, backend *databaseBackend, number uint64, vschemaDataJSON string) error {
+func (s *Server) applyPendingVSchema(ctx context.Context, backend *databaseBackend, ref deployRequest, vschemaDataJSON string) error {
 	var vschemaByKeyspace map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(vschemaDataJSON), &vschemaByKeyspace); err != nil {
 		return fmt.Errorf("unmarshal vschema data: %w", err)
@@ -290,8 +311,10 @@ func (s *Server) applyPendingVSchema(ctx context.Context, backend *databaseBacke
 			return fmt.Errorf("marshal original vschema: %w", err)
 		}
 		_, err = s.metadataDB.ExecContext(ctx,
-			"UPDATE localscale_deploy_requests SET vschema_data_original = ? WHERE number = ?",
-			string(origJSON), number,
+			`UPDATE localscale_deploy_requests
+			 SET vschema_data_original = ?
+			 WHERE org = ? AND database_name = ? AND number = ?`,
+			string(origJSON), ref.org, ref.database, ref.number,
 		)
 		if err != nil {
 			return fmt.Errorf("store original vschema: %w", err)
@@ -302,11 +325,14 @@ func (s *Server) applyPendingVSchema(ctx context.Context, backend *databaseBacke
 		if err := s.applyVSchemaInternal(ctx, backend, keyspace, vschemaJSON); err != nil {
 			return fmt.Errorf("apply vschema to %s: %w", keyspace, err)
 		}
-		s.logger.Info("applied vschema for deploy request", "number", number, "keyspace", keyspace)
+		s.logger.Info("applied vschema for deploy request", "number", ref.number, "keyspace", keyspace)
 	}
 
 	_, err := s.metadataDB.ExecContext(ctx,
-		"UPDATE localscale_deploy_requests SET vschema_applied = TRUE WHERE number = ?", number,
+		`UPDATE localscale_deploy_requests
+		 SET vschema_applied = TRUE
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		ref.org, ref.database, ref.number,
 	)
 	if err != nil {
 		return fmt.Errorf("mark vschema applied: %w", err)
@@ -317,7 +343,7 @@ func (s *Server) applyPendingVSchema(ctx context.Context, backend *databaseBacke
 
 // revertPendingVSchema restores the original VSchema for each keyspace and marks
 // vschema_reverted=true.
-func (s *Server) revertPendingVSchema(ctx context.Context, backend *databaseBackend, number uint64, originalVSchemaJSON string) error {
+func (s *Server) revertPendingVSchema(ctx context.Context, backend *databaseBackend, ref deployRequest, originalVSchemaJSON string) error {
 	var vschemaByKeyspace map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(originalVSchemaJSON), &vschemaByKeyspace); err != nil {
 		return fmt.Errorf("unmarshal original vschema data: %w", err)
@@ -327,11 +353,14 @@ func (s *Server) revertPendingVSchema(ctx context.Context, backend *databaseBack
 		if err := s.applyVSchemaInternal(ctx, backend, keyspace, vschemaJSON); err != nil {
 			return fmt.Errorf("revert vschema for %s: %w", keyspace, err)
 		}
-		s.logger.Info("reverted vschema for deploy request", "number", number, "keyspace", keyspace)
+		s.logger.Info("reverted vschema for deploy request", "number", ref.number, "keyspace", keyspace)
 	}
 
 	_, err := s.metadataDB.ExecContext(ctx,
-		"UPDATE localscale_deploy_requests SET vschema_reverted = TRUE WHERE number = ?", number,
+		`UPDATE localscale_deploy_requests
+		 SET vschema_reverted = TRUE
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		ref.org, ref.database, ref.number,
 	)
 	if err != nil {
 		return fmt.Errorf("mark vschema reverted: %w", err)

@@ -332,6 +332,39 @@ func previewVitessCompletedOutput() {
 	WriteProgress(data)
 }
 
+func previewVitessMultiKeyspaceCompletedWatchOutput() {
+	ddl := "ALTER TABLE `events` ADD COLUMN `source_region_id` int(11) NULL AFTER `account_id`"
+	data := ProgressData{
+		State:       state.Apply.Completed,
+		Engine:      "PlanetScale",
+		ApplyID:     "apply-19b23a035ad54ffb",
+		Database:    "commerce",
+		Environment: "production",
+		StartedAt:   previewTime.Add(-2 * time.Minute).Format(time.RFC3339),
+		CompletedAt: previewTime.Format(time.RFC3339),
+		Metadata: map[string]string{
+			"branch_name":        "schemabot-commerce-72511904",
+			"deploy_request_url": "https://app.planetscale.com/my-org/commerce/deploy-requests/86",
+		},
+		Tables: []TableProgress{
+			{
+				TableName: "events",
+				Namespace: "commerce_sharded",
+				DDL:       ddl,
+				Status:    state.Apply.Completed,
+			},
+			{
+				TableName: "events",
+				Namespace: "commerce_sharded_006",
+				DDL:       ddl,
+				Status:    state.Apply.Completed,
+			},
+		},
+	}
+	WriteProgress(data)
+	fmt.Println(FormatApplyComplete())
+}
+
 func previewVitessFailedOutput() {
 	data := ProgressData{
 		State:        state.Apply.Failed,

@@ -5,13 +5,17 @@ package lint
 
 import (
 	"fmt"
+	"sync"
 
 	spiritlint "github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/table"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 )
+
+var spiritLintMu sync.Mutex
 
 // Config holds configuration for schema linting.
 type Config struct {
@@ -85,7 +89,7 @@ func (l *Linter) LintStatements(ddlStatements []string) ([]Result, bool, error) 
 
 	// Build Spirit lint config and run linters
 	spiritConfig := l.buildSpiritConfig()
-	violations, err := spiritlint.RunLinters(nil, changes, spiritConfig)
+	violations, err := runSpiritLinters(nil, changes, spiritConfig)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to run linters: %w", err)
 	}
@@ -132,7 +136,7 @@ func (l *Linter) LintSchema(schemaFiles map[string]string) ([]Result, error) {
 	spiritConfig := l.buildSpiritConfig()
 
 	// Run Spirit linters
-	violations, err := spiritlint.RunLinters(createTables, nil, spiritConfig)
+	violations, err := runSpiritLinters(createTables, nil, spiritConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +187,21 @@ func (l *Linter) buildSpiritConfig() spiritlint.Config {
 		},
 		IgnoreTables: ignoreTables,
 	}
+}
+
+// PlanChanges serializes calls into Spirit's linter registry. Spirit registers
+// singleton linter instances, and configurable linters mutate instance fields
+// while applying config.
+func PlanChanges(current, desired []table.TableSchema, diffOpts *statement.DiffOptions, lintConfig *spiritlint.Config) (*spiritlint.Plan, error) {
+	spiritLintMu.Lock()
+	defer spiritLintMu.Unlock()
+	return spiritlint.PlanChanges(current, desired, diffOpts, lintConfig)
+}
+
+func runSpiritLinters(existingSchema []*statement.CreateTable, changes []*statement.AbstractStatement, config spiritlint.Config) ([]spiritlint.Violation, error) {
+	spiritLintMu.Lock()
+	defer spiritLintMu.Unlock()
+	return spiritlint.RunLinters(existingSchema, changes, config)
 }
 
 // convertViolation converts a Spirit violation to our Result type.

@@ -112,6 +112,14 @@ func (m WatchModel) progressView() string {
 		b.WriteString("\n\n")
 		b.WriteString(templates.FormatApplyComplete())
 		b.WriteString("\n")
+	case state.IsState(m.state, state.Apply.Failed):
+		b.WriteString("\n\n")
+		if m.errorMsg != "" {
+			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+			b.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
+		}
+		b.WriteString(templates.FormatApplyFailed())
+		b.WriteString("\n")
 	case state.IsState(m.state, state.Apply.Cancelled):
 		b.WriteString("\n\n")
 		b.WriteString("🚫 Schema change cancelled.\n")

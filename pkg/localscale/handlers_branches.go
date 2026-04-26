@@ -22,16 +22,18 @@ func (s *Server) handleGetBranch(w http.ResponseWriter, r *http.Request) error {
 	database := r.PathValue("db")
 	branchName := r.PathValue("branch")
 
+	backend, err := s.backendFor(org, database)
+	if err != nil {
+		return newHTTPError(http.StatusNotFound, "%v", err)
+	}
+
 	// The "main" branch is virtual — it always exists and represents the live database.
 	if branchName == "main" {
-		if _, err := s.backendFor(org, database); err != nil {
-			return newHTTPError(http.StatusNotFound, "%v", err)
-		}
 		s.writeJSON(w, map[string]any{
 			"name":            "main",
 			"parent_branch":   "",
 			"ready":           true,
-			"safe_migrations": true,
+			"safe_migrations": backend.safeMigrations,
 			"region":          map[string]string{"slug": "us-east-1"},
 		})
 		return nil
@@ -40,7 +42,7 @@ func (s *Server) handleGetBranch(w http.ResponseWriter, r *http.Request) error {
 	var name, parentBranch, region string
 	var ready bool
 	var errorMessage sql.NullString
-	err := s.metadataDB.QueryRowContext(r.Context(),
+	err = s.metadataDB.QueryRowContext(r.Context(),
 		"SELECT name, parent_branch, region, ready, error_message FROM localscale_branches WHERE org = ? AND database_name = ? AND name = ?",
 		org, database, branchName,
 	).Scan(&name, &parentBranch, &region, &ready, &errorMessage)
@@ -52,7 +54,7 @@ func (s *Server) handleGetBranch(w http.ResponseWriter, r *http.Request) error {
 		"name":            name,
 		"parent_branch":   parentBranch,
 		"ready":           ready,
-		"safe_migrations": true,
+		"safe_migrations": backend.safeMigrations,
 		"region":          map[string]string{"slug": region},
 	}
 	if errorMessage.Valid && errorMessage.String != "" {

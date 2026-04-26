@@ -26,5 +26,5 @@ CREATE TABLE `localscale_deploy_requests` (
   `revert_expires_at` timestamp NULL DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_database_number` (`database_name`,`number`)
+  UNIQUE KEY `uk_database_number` (`org`,`database_name`,`number`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

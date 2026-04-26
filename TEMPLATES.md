@@ -2901,6 +2901,39 @@ Use 'schemabot start' to resume from checkpoint.
 </details>
 
 <details>
+<summary><a name="vitess-multikeyspace-completed-watch"></a><strong>Vitess: Multi-keyspace Completed Watch</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-19b23a035ad54ffb                                          │
+│  Database:        commerce                                                        │
+│  Environment:     production                                                      │
+│  State:           Completed                                                       │
+│  Branch:          schemabot-commerce-72511904                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/commerce/deploy-requests/86  │
+│  Started:         Jan 15 14:28:00 UTC                                             │
+│  Duration:        2m                                                              │
+└───────────────────────────────────────────────────────────────────────────────────┘
+
+
+  ── commerce_sharded ──
+
+     ~ events: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `events` ADD COLUMN `source_region_id` int(11) NULL AFTER `account_id`;
+
+
+  ── commerce_sharded_006 ──
+
+     ~ events: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `events` ADD COLUMN `source_region_id` int(11) NULL AFTER `account_id`;
+
+✓ Apply complete!
+
+```
+</details>
+
+<details>
 <summary><a name="vitess-failed"></a><strong>Vitess: Failed</strong></summary>
 
 ```

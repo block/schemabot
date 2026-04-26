@@ -101,6 +101,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 	utils.CloseAndLog(rows)
 
 	for _, r := range activeRows {
+		ref := deployRequest{org: r.org, database: r.database, number: r.number}
 		backend, err := s.backendFor(r.org, r.database)
 		if err != nil {
 			s.logger.Warn("unknown backend for deploy request", "number", r.number, "org", r.org, "database", r.database, "error", err)
@@ -116,7 +117,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			if createdAt, err := time.Parse("2006-01-02 15:04:05", r.createdAtStr); err == nil {
 				if time.Since(createdAt) > 2*time.Minute {
 					s.logger.Error("deploy request stuck in submitting (possible crash)", "number", r.number)
-					if err := s.updateDeployState(ctx, r.number, dr.Error); err != nil {
+					if err := s.updateDeployState(ctx, ref, dr.Error); err != nil {
 						s.logger.Error("processor: failed to transition stuck deploy to error", "number", r.number, "error", err)
 					}
 				}
@@ -133,7 +134,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 					s.logger.Error("processor: auto-cutover COMPLETE failed", "number", r.number, "error", err)
 					continue
 				}
-				if err := s.updateDeployState(ctx, r.number, dr.InProgressCutover); err != nil {
+				if err := s.updateDeployState(ctx, ref, dr.InProgressCutover); err != nil {
 					s.logger.Error("processor: failed to transition to in_progress_cutover", "number", r.number, "error", err)
 				}
 			}
@@ -144,7 +145,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 				// VSchema-only deploys have no migration context. If VSchema is
 				// already applied and we're in cutover, transition to complete.
 				if r.vschemaApplied && r.deployState == dr.InProgressCutover {
-					if err := s.updateDeployState(ctx, r.number, dr.CompletePendingRevert); err != nil {
+					if err := s.updateDeployState(ctx, ref, dr.CompletePendingRevert); err != nil {
 						s.logger.Error("processor: failed to complete vschema-only deploy", "number", r.number, "error", err)
 					}
 				} else {
@@ -202,20 +203,20 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			}
 
 			if newState != r.deployState {
-				if err := s.updateDeployState(ctx, r.number, newState); err != nil {
+				if err := s.updateDeployState(ctx, ref, newState); err != nil {
 					s.logger.Error("processor: failed to update deploy state", "number", r.number, "new_state", newState, "error", err)
 				}
 			}
 
 		case dr.InProgressVSchema:
 			// VSchema phase: apply pending VSchema
-			if err := s.applyPendingVSchema(ctx, backend, r.number, r.vschemaDataSQL.String); err != nil {
+			if err := s.applyPendingVSchema(ctx, backend, ref, r.vschemaDataSQL.String); err != nil {
 				s.logger.Error("apply vschema failed", "number", r.number, "error", err)
-				if err := s.updateDeployState(ctx, r.number, dr.CompleteError); err != nil {
+				if err := s.updateDeployState(ctx, ref, dr.CompleteError); err != nil {
 					s.logger.Error("processor: failed to transition to complete_error", "number", r.number, "error", err)
 				}
 			} else {
-				if err := s.updateDeployState(ctx, r.number, dr.CompletePendingRevert); err != nil {
+				if err := s.updateDeployState(ctx, ref, dr.CompletePendingRevert); err != nil {
 					s.logger.Error("processor: failed to transition to complete_pending_revert", "number", r.number, "error", err)
 				}
 			}
@@ -225,8 +226,10 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			if r.migrationContext == "" {
 				// No migrations to cancel (e.g., cancelled during submitting)
 				if err := s.execLog(ctx,
-					"UPDATE localscale_deploy_requests SET cancelled = TRUE, deployment_state = ? WHERE number = ?",
-					dr.CompleteCancel, r.number); err != nil {
+					`UPDATE localscale_deploy_requests
+					 SET cancelled = TRUE, deployment_state = ?
+					 WHERE org = ? AND database_name = ? AND number = ?`,
+					dr.CompleteCancel, ref.org, ref.database, r.number); err != nil {
 					s.logger.Error("processor: update cancel state", "number", r.number, "error", err)
 				} else {
 					s.logger.Info("deploy state transition", "number", r.number, "new_state", dr.CompleteCancel)
@@ -254,8 +257,10 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			}
 			if allTerminal {
 				if err := s.execLog(ctx,
-					"UPDATE localscale_deploy_requests SET cancelled = TRUE, deployment_state = ? WHERE number = ?",
-					dr.CompleteCancel, r.number); err != nil {
+					`UPDATE localscale_deploy_requests
+					 SET cancelled = TRUE, deployment_state = ?
+					 WHERE org = ? AND database_name = ? AND number = ?`,
+					dr.CompleteCancel, ref.org, ref.database, r.number); err != nil {
 					s.logger.Error("processor: update cancel state", "number", r.number, "error", err)
 				} else {
 					s.logger.Info("deploy state transition", "number", r.number, "new_state", dr.CompleteCancel)
@@ -266,7 +271,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			// Revert phase: track reverse DDL progress by revert migration context
 			newState := s.deriveRevertState(ctx, backend, r.revertMigrationContext)
 			if newState != r.deployState {
-				if err := s.updateDeployState(ctx, r.number, newState); err != nil {
+				if err := s.updateDeployState(ctx, ref, newState); err != nil {
 					s.logger.Error("processor: failed to update revert state", "number", r.number, "new_state", newState, "error", err)
 				}
 			}
@@ -280,7 +285,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			if r.revertExpiresAtStr.Valid {
 				if expiresAt, err := time.Parse("2006-01-02 15:04:05", r.revertExpiresAtStr.String); err == nil && time.Now().After(expiresAt) {
 					s.logger.Info("revert window expired", "number", r.number)
-					if err := s.updateDeployState(ctx, r.number, dr.Complete); err != nil {
+					if err := s.updateDeployState(ctx, ref, dr.Complete); err != nil {
 						s.logger.Error("processor: failed to complete expired revert", "number", r.number, "error", err)
 						continue
 					}
@@ -291,24 +296,26 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 	}
 }
 
-func (s *Server) updateDeployState(ctx context.Context, number uint64, newState string) error {
+func (s *Server) updateDeployState(ctx context.Context, ref deployRequest, newState string) error {
 	var err error
 	if newState == dr.CompletePendingRevert {
 		_, err = s.metadataDB.ExecContext(ctx,
 			`UPDATE localscale_deploy_requests
 			 SET deployment_state = ?, revert_expires_at = DATE_ADD(NOW(), INTERVAL ? SECOND)
-			 WHERE number = ?`,
-			newState, int(s.revertWindowDuration.Seconds()), number)
+			 WHERE org = ? AND database_name = ? AND number = ?`,
+			newState, int(s.revertWindowDuration.Seconds()), ref.org, ref.database, ref.number)
 	} else {
 		_, err = s.metadataDB.ExecContext(ctx,
-			"UPDATE localscale_deploy_requests SET deployment_state = ? WHERE number = ?",
-			newState, number)
+			`UPDATE localscale_deploy_requests
+			 SET deployment_state = ?
+			 WHERE org = ? AND database_name = ? AND number = ?`,
+			newState, ref.org, ref.database, ref.number)
 	}
 	if err != nil {
-		s.logger.Error("update deploy state failed", "number", number, "new_state", newState, "error", err)
-		return fmt.Errorf("update deploy state to %s for %d: %w", newState, number, err)
+		s.logger.Error("update deploy state failed", "number", ref.number, "new_state", newState, "error", err)
+		return fmt.Errorf("update deploy state to %s for %d: %w", newState, ref.number, err)
 	}
-	s.logger.Info("deploy state transition", "number", number, "new_state", newState)
+	s.logger.Info("deploy state transition", "number", ref.number, "new_state", newState)
 	return nil
 }
 

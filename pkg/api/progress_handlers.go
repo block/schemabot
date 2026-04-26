@@ -50,6 +50,12 @@ func engineName(e ternv1.Engine) string {
 	}
 }
 
+const progressTableKeySep = "\x00"
+
+func progressTableKey(namespace, table string) string {
+	return namespace + progressTableKeySep + table
+}
+
 // resolveDeployment determines the deployment name from a database and explicit deployment.
 // In local mode (config-based databases), the database name is used as the deployment.
 // In gRPC mode, falls back to DefaultDeployment.
@@ -324,10 +330,11 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
 		taskByTable := make(map[string]*storage.Task, len(tasks))
 		for _, t := range tasks {
-			taskByTable[t.TableName] = t
+			taskByTable[progressTableKey(t.Namespace, t.TableName)] = t
 		}
 		for _, tpr := range httpResp.Tables {
-			if task, ok := taskByTable[tpr.TableName]; ok {
+			task, ok := taskByTable[progressTableKey(tpr.Keyspace, tpr.TableName)]
+			if ok {
 				if task.StartedAt != nil && tpr.StartedAt == "" {
 					tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
 				}
@@ -600,6 +607,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{
 			TableName:       task.TableName,
+			Keyspace:        task.Namespace,
 			ChangeType:      task.DDLAction,
 			DDL:             task.DDL,
 			Status:          task.State,
@@ -639,10 +647,11 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		return fmt.Errorf("progress RPC: %w", err)
 	}
 
-	// Build table name → proto progress lookup
+	// Build namespace/table → proto progress lookup. Vitess applies commonly
+	// include the same table name in multiple keyspaces.
 	tableProgress := make(map[string]*ternv1.TableProgress, len(resp.Tables))
 	for _, tp := range resp.Tables {
-		tableProgress[tp.TableName] = tp
+		tableProgress[progressTableKey(tp.Namespace, tp.TableName)] = tp
 	}
 
 	now := time.Now()
@@ -651,10 +660,10 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		if state.IsTerminalTaskState(task.State) {
 			continue
 		}
-		tp, ok := tableProgress[task.TableName]
+		tp, ok := tableProgress[progressTableKey(task.Namespace, task.TableName)]
 		if !ok {
 			s.logger.Error("task has no matching table in Tern progress response",
-				"task_id", task.TaskIdentifier, "table", task.TableName, "apply_id", apply.ApplyIdentifier)
+				"task_id", task.TaskIdentifier, "namespace", task.Namespace, "table", task.TableName, "apply_id", apply.ApplyIdentifier)
 			continue
 		}
 		task.State = state.NormalizeTaskStatus(tp.Status)

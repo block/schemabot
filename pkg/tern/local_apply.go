@@ -822,10 +822,7 @@ func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Appl
 
 // syncAtomicTaskProgress updates all tasks with engine state and per-table progress.
 func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) {
-	tableProgress := make(map[string]engine.TableProgress, len(result.Tables))
-	for _, tp := range result.Tables {
-		tableProgress[tp.Table] = tp
-	}
+	tableProgress := indexEngineTableProgress(result.Tables)
 	instantFromMetadata := false
 	if result.ResumeState != nil && result.ResumeState.Metadata != "" {
 		if meta, err := decodePSMetadataForStorage(result.ResumeState.Metadata); err == nil && meta != nil {
@@ -834,7 +831,7 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 	}
 
 	for _, task := range tasks {
-		if tp, ok := tableProgress[task.TableName]; ok {
+		if tp, ok := engineProgressForTask(tableProgress, task); ok {
 			task.RowsCopied = tp.RowsCopied
 			task.RowsTotal = tp.RowsTotal
 			task.ProgressPercent = tp.Progress

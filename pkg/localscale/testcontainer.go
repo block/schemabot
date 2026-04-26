@@ -79,6 +79,7 @@ type ContainerOrgConfig struct {
 type ContainerDatabaseConfig struct {
 	Keyspaces       []ContainerKeyspaceConfig `json:"keyspaces"`
 	RequireApproval bool                      `json:"require_approval,omitempty"`
+	SafeMigrations  *bool                     `json:"safe_migrations,omitempty"`
 }
 
 // ContainerKeyspaceConfig describes a keyspace in container config.

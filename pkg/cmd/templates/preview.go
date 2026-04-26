@@ -1097,6 +1097,7 @@ func previewCLIApplyAllOutput() {
 		{"VITESS: STAGING SCHEMA CHANGES (0% with shards)", previewVitessStagingOutput},
 		{"VITESS: RUNNING", previewVitessRunningOutput},
 		{"VITESS: COMPLETED", previewVitessCompletedOutput},
+		{"VITESS: MULTI-KEYSPACE COMPLETED WATCH", previewVitessMultiKeyspaceCompletedWatchOutput},
 		{"VITESS: FAILED", previewVitessFailedOutput},
 		{"VITESS: WAITING FOR CUTOVER", previewVitessWaitingForCutoverOutput},
 		{"VITESS: CUTTING OVER", previewVitessCuttingOverOutput},

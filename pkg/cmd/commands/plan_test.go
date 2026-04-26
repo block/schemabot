@@ -2,6 +2,7 @@ package commands
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"regexp"
@@ -555,4 +556,63 @@ func TestWriteTimeInfo(t *testing.T) {
 		})
 		assert.Contains(t, output, "Failed after", "Expected 'Failed after' in output")
 	})
+}
+
+func TestWriteNamespaceChanges_CollapseIdenticalKeyspaces(t *testing.T) {
+	// 8 keyspaces with identical DDL — should collapse after 3
+	var namespaces []templates.NamespaceChange
+	for i := range 8 {
+		namespaces = append(namespaces, templates.NamespaceChange{
+			Namespace: fmt.Sprintf("commerce_sharded_%03d", i),
+			Changes: []templates.DDLChange{
+				{ChangeType: "ALTER", TableName: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `region` varchar(50) NULL"},
+			},
+		})
+	}
+
+	output := captureStdout(func() {
+		templates.WriteNamespaceChanges(namespaces, false, "commerce")
+	})
+
+	plainOutput := stripAnsi(output)
+
+	// First 3 keyspaces shown with headers
+	assert.Contains(t, plainOutput, "commerce_sharded_000")
+	assert.Contains(t, plainOutput, "commerce_sharded_001")
+	assert.Contains(t, plainOutput, "commerce_sharded_002")
+
+	// Remaining collapsed
+	assert.Contains(t, plainOutput, "5 more keyspaces with identical changes")
+
+	// DDL shown only once
+	assert.Equal(t, 1, strings.Count(plainOutput, "ADD COLUMN"), "DDL should appear only once for collapsed keyspaces")
+
+	// Keyspaces beyond the first 3 should NOT have individual headers
+	assert.NotContains(t, plainOutput, "commerce_sharded_005")
+}
+
+func TestWriteNamespaceChanges_NoCollapseUnderThreshold(t *testing.T) {
+	// 4 keyspaces — under threshold, no collapse
+	var namespaces []templates.NamespaceChange
+	for i := range 4 {
+		namespaces = append(namespaces, templates.NamespaceChange{
+			Namespace: fmt.Sprintf("ks_%d", i),
+			Changes: []templates.DDLChange{
+				{ChangeType: "ALTER", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `x` int NULL"},
+			},
+		})
+	}
+
+	output := captureStdout(func() {
+		templates.WriteNamespaceChanges(namespaces, false, "db")
+	})
+
+	plainOutput := stripAnsi(output)
+
+	// All 4 keyspaces shown individually
+	for i := range 4 {
+		assert.Contains(t, plainOutput, fmt.Sprintf("ks_%d", i))
+	}
+	assert.NotContains(t, plainOutput, "more keyspaces")
+	assert.Equal(t, 4, strings.Count(plainOutput, "ADD COLUMN"), "each keyspace should show DDL")
 }

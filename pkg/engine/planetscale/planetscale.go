@@ -390,6 +390,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"sort"
 	"strconv"
@@ -400,7 +401,6 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
-	spiritlint "github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -545,6 +545,15 @@ func (e *Engine) getVtgateDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
+func (e *Engine) getVtgateKeyspaceDB(ctx context.Context, dsn, keyspace string) (*sql.DB, error) {
+	mysqlCfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse vtgate DSN for keyspace %s: %w", keyspace, err)
+	}
+	mysqlCfg.DBName = keyspace
+	return e.getVtgateDB(ctx, mysqlCfg.FormatDSN())
+}
+
 // mainBranch returns the main branch name from credentials, defaulting to "main".
 // Credential helpers — read PlanetScale-specific values from Metadata.
 
@@ -579,8 +588,8 @@ func mainBranch(creds *engine.Credentials) string {
 // --- Plan ---
 
 // Plan computes the schema changes needed by diffing current schema against desired.
-// For each keyspace in the schema files, it fetches the current schema from PlanetScale
-// and uses Spirit's PlanChanges to diff and lint in a single pass.
+// For each keyspace in the schema files, it fetches the current schema and uses
+// Spirit's PlanChanges to diff and lint in a single pass.
 func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
 	e.logger.Info("computing plan",
 		"database", req.Database,
@@ -595,112 +604,138 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	org := credOrg(req.Credentials)
 	branch := mainBranch(req.Credentials)
 
-	// Fetch current schema from PlanetScale per keyspace
-	currentSchema, err := e.fetchDatabaseSchema(ctx, client, org, req.Database, branch)
+	// Sort keyspaces for deterministic order
+	keyspaces := sortedKeyspaces(req.SchemaFiles)
+
+	// Prefer the PlanetScale schema API when safe schema changes are enabled,
+	// and use vtgate only when they are not.
+	currentSchema, err := e.fetchPlanSchema(ctx, client, org, req.Database, branch, req.Credentials, keyspaces)
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
 
-	// Diff and lint per keyspace using Spirit's PlanChanges.
+	// Diff and lint per keyspace in parallel using Spirit's PlanChanges.
+	type keyspaceResult struct {
+		change     engine.SchemaChange
+		violations []engine.LintViolation
+		schemas    map[string]string // keyspace.table -> CREATE TABLE
+		hasChanges bool
+	}
+
+	var mu sync.Mutex
+	results := make(map[string]*keyspaceResult, len(keyspaces))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(20)
+
+	for _, keyspace := range keyspaces {
+		ks := keyspace
+		g.Go(func() error {
+			ns := req.SchemaFiles[ks]
+
+			var currentTableSchemas []table.TableSchema
+			schemas := make(map[string]string)
+			if tables, ok := currentSchema[ks]; ok {
+				for _, t := range tables {
+					currentTableSchemas = append(currentTableSchemas, t)
+					schemas[ks+"."+t.Name] = t.Schema
+				}
+			}
+
+			desiredTableSchemas, parseErr := parseDesiredSchemas(ks, ns)
+			if parseErr != nil {
+				return parseErr
+			}
+
+			sc := engine.SchemaChange{
+				Namespace: ks,
+				Metadata:  make(map[string]string),
+			}
+
+			// Diff VSchema
+			if content, ok := ns.Files["vschema.json"]; ok && content != "" {
+				currentVSchema, fetchErr := client.GetKeyspaceVSchema(gCtx, &ps.GetKeyspaceVSchemaRequest{
+					Organization: org,
+					Database:     req.Database,
+					Branch:       branch,
+					Keyspace:     ks,
+				})
+				if fetchErr != nil {
+					e.logger.Warn("failed to fetch current VSchema, treating as empty",
+						"keyspace", ks, "error", fetchErr)
+				}
+				currentVSchemaRaw := ""
+				if currentVSchema != nil {
+					currentVSchemaRaw = currentVSchema.Raw
+				}
+				if VSchemaChanged(currentVSchemaRaw, content) {
+					sc.Metadata["vschema"] = VSchemaDiff(currentVSchemaRaw, content)
+				}
+			}
+
+			plan, planErr := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
+			if planErr != nil {
+				return fmt.Errorf("plan changes for keyspace %s: %w", ks, planErr)
+			}
+
+			var violations []engine.LintViolation
+			for _, pc := range plan.Changes {
+				op, _, classifyErr := ddl.ClassifyStatementAST(pc.Statement)
+				if classifyErr != nil {
+					return fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
+				}
+				change := engine.TableChange{
+					Table:     pc.TableName,
+					Operation: op,
+					DDL:       pc.Statement,
+				}
+				if errViolations := pc.Errors(); len(errViolations) > 0 {
+					change.IsUnsafe = true
+					msgs := make([]string, len(errViolations))
+					for i, v := range errViolations {
+						msgs[i] = v.Message
+					}
+					change.UnsafeReason = strings.Join(msgs, "; ")
+				}
+				sc.TableChanges = append(sc.TableChanges, change)
+
+				for _, v := range pc.Violations {
+					violations = append(violations, engine.LintViolation{
+						Table:    pc.TableName,
+						Linter:   v.Linter.Name(),
+						Message:  v.Message,
+						Severity: strings.ToLower(v.Severity.String()),
+					})
+				}
+			}
+
+			mu.Lock()
+			results[ks] = &keyspaceResult{
+				change:     sc,
+				violations: violations,
+				schemas:    schemas,
+				hasChanges: len(sc.TableChanges) > 0 || sc.Metadata["vschema"] != "",
+			}
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Collect results in deterministic keyspace order
 	var changes []engine.SchemaChange
 	var lintViolations []engine.LintViolation
 	originalSchema := make(map[string]string)
-
-	// Sort keyspaces for deterministic order
-	keyspaces := sortedKeyspaces(req.SchemaFiles)
-
-	for _, keyspace := range keyspaces {
-		ns := req.SchemaFiles[keyspace]
-
-		// Build current table schemas for this keyspace
-		var currentTableSchemas []table.TableSchema
-		if tables, ok := currentSchema[keyspace]; ok {
-			for _, t := range tables {
-				currentTableSchemas = append(currentTableSchemas, t)
-				originalSchema[keyspace+"."+t.Name] = t.Schema
-			}
+	for _, ks := range keyspaces {
+		r := results[ks]
+		if r == nil {
+			continue
 		}
-
-		// Build desired table schemas from SQL files
-		desiredTableSchemas, err := parseDesiredSchemas(keyspace, ns)
-		if err != nil {
-			return nil, err
-		}
-		var desiredVSchema string
-		if content, ok := ns.Files["vschema.json"]; ok {
-			desiredVSchema = content
-		}
-
-		sc := engine.SchemaChange{
-			Namespace: keyspace,
-			Metadata:  make(map[string]string),
-		}
-
-		// Diff VSchema if desired VSchema is provided
-		if desiredVSchema != "" {
-			currentVSchema, fetchErr := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
-				Organization: org,
-				Database:     req.Database,
-				Branch:       branch,
-				Keyspace:     keyspace,
-			})
-			if fetchErr != nil {
-				e.logger.Warn("failed to fetch current VSchema, treating as empty",
-					"keyspace", keyspace, "error", fetchErr)
-			}
-			currentVSchemaRaw := ""
-			if currentVSchema != nil {
-				currentVSchemaRaw = currentVSchema.Raw
-			}
-			if VSchemaChanged(currentVSchemaRaw, desiredVSchema) {
-				sc.Metadata["vschema"] = VSchemaDiff(currentVSchemaRaw, desiredVSchema)
-			}
-		}
-
-		// Use Spirit's PlanChanges to diff + lint in one call.
-		plan, planErr := spiritlint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
-		if planErr != nil {
-			return nil, fmt.Errorf("plan changes for keyspace %s: %w", keyspace, planErr)
-		}
-
-		// Convert PlannedChanges to engine types
-		for _, pc := range plan.Changes {
-			op, _, classifyErr := ddl.ClassifyStatementAST(pc.Statement)
-			if classifyErr != nil {
-				return nil, fmt.Errorf("classify statement in keyspace %s: %w", keyspace, classifyErr)
-			}
-			change := engine.TableChange{
-				Table:     pc.TableName,
-				Operation: op,
-				DDL:       pc.Statement,
-			}
-
-			// Error-severity violations mark the change as unsafe
-			if errViolations := pc.Errors(); len(errViolations) > 0 {
-				change.IsUnsafe = true
-				msgs := make([]string, len(errViolations))
-				for i, v := range errViolations {
-					msgs[i] = v.Message
-				}
-				change.UnsafeReason = strings.Join(msgs, "; ")
-			}
-
-			sc.TableChanges = append(sc.TableChanges, change)
-
-			// Collect all lint violations
-			for _, v := range pc.Violations {
-				lintViolations = append(lintViolations, engine.LintViolation{
-					Table:    pc.TableName,
-					Linter:   v.Linter.Name(),
-					Message:  v.Message,
-					Severity: strings.ToLower(v.Severity.String()),
-				})
-			}
-		}
-
-		// Only include keyspaces with actual changes
-		if len(sc.TableChanges) > 0 || sc.Metadata["vschema"] != "" {
-			changes = append(changes, sc)
+		maps.Copy(originalSchema, r.schemas)
+		lintViolations = append(lintViolations, r.violations...)
+		if r.hasChanges {
+			changes = append(changes, r.change)
 		}
 	}
 
@@ -1130,7 +1165,7 @@ func (e *Engine) diffBranchForResume(ctx context.Context, client psclient.PSClie
 		}
 
 		// Diff: what DDL is needed to bring branch from current to desired?
-		plan, err := spiritlint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
+		plan, err := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
 		if err != nil {
 			return nil, fmt.Errorf("diff keyspace %s for resume: %w", keyspace, err)
 		}
@@ -2016,6 +2051,7 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 		}
 
 		tables = append(tables, engine.TableProgress{
+			Namespace:   key.keyspace,
 			Table:       key.table,
 			State:       tableState,
 			Progress:    tblProgress,
@@ -2125,6 +2161,58 @@ func (e *Engine) fetchDatabaseSchema(ctx context.Context, client psclient.PSClie
 			tables[i] = table.TableSchema{Name: t.Name, Schema: t.Raw}
 		}
 		result[ks.Name] = tables
+	}
+	return result, nil
+}
+
+func (e *Engine) fetchPlanSchema(ctx context.Context, client psclient.PSClient, org, database, branch string, creds *engine.Credentials, keyspaces []string) (map[string][]table.TableSchema, error) {
+	parent, err := client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
+		Organization: org,
+		Database:     database,
+		Branch:       branch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get branch %s: %w", branch, err)
+	}
+
+	if parent.SafeMigrations {
+		e.logger.Debug("using PlanetScale schema API for plan", "database", database, "branch", branch)
+		return e.fetchDatabaseSchema(ctx, client, org, database, branch)
+	}
+
+	if creds == nil || creds.DSN == "" {
+		return nil, fmt.Errorf("safe schema changes are not enabled on branch %q of database %q and vtgate DSN is not configured", branch, database)
+	}
+
+	e.logger.Info("using vtgate schema for plan because PlanetScale safe schema changes are disabled", "database", database, "branch", branch)
+	return e.fetchVtgateSchema(ctx, creds.DSN, keyspaces)
+}
+
+func (e *Engine) fetchVtgateSchema(ctx context.Context, dsn string, keyspaces []string) (map[string][]table.TableSchema, error) {
+	var mu sync.Mutex
+	result := make(map[string][]table.TableSchema, len(keyspaces))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(20)
+
+	for _, keyspace := range keyspaces {
+		ks := keyspace
+		g.Go(func() error {
+			db, err := e.getVtgateKeyspaceDB(gCtx, dsn, ks)
+			if err != nil {
+				return fmt.Errorf("get vtgate connection for keyspace %s: %w", ks, err)
+			}
+			tables, err := table.LoadSchemaFromDB(gCtx, db, table.WithoutUnderscoreTables)
+			if err != nil {
+				return fmt.Errorf("load schema for keyspace %s: %w", ks, err)
+			}
+			mu.Lock()
+			result[ks] = tables
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
