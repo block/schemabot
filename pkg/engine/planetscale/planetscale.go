@@ -419,7 +419,7 @@ import (
 const (
 	// maxConcurrentKeyspaces limits parallel DDL application during Apply.
 	// Each keyspace gets its own MySQL connection to the branch.
-	maxConcurrentKeyspaces = 2
+	maxConcurrentKeyspaces = 3
 
 	// maxRetries is the number of retry attempts per keyspace when applying DDL.
 	maxRetries = 3
