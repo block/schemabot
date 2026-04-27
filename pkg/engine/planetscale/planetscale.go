@@ -1057,69 +1057,42 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 
 	total := len(changes)
 	var applied atomic.Int32
-	emitProgress := func(message string, metadata map[string]string) {
-		n := int(applied.Load())
-		msg := fmt.Sprintf("Applying to branch (%d/%d keyspaces)... %s", n, total, message)
-		emitEvent(msg, metadata)
-	}
 
 	emitEvent(fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName), map[string]string{"branch": branchName})
 
-	// Track which keyspaces need DDL (vs VSchema-only)
-	needsDDL := make(map[string]bool, len(changes))
-	for _, sc := range changes {
-		if len(sc.TableChanges) > 0 {
-			needsDDL[sc.Namespace] = true
-		}
-	}
-
-	// Phase 1: Apply VSchema changes sequentially. PlanetScale blocks
-	// concurrent VSchema writes while schema snapshots are in progress.
-	for _, sc := range changes {
-		vschemaContent := getVSchemaContent(sc, schemaFiles)
-		if vschemaContent == "" {
-			continue
-		}
-		if err := e.updateBranchVSchemaWithRetry(ctx, client, org, database, branchName, sc.Namespace, vschemaContent, emitProgress); err != nil {
-			return fmt.Errorf("update vschema for %s: %w", sc.Namespace, err)
-		}
-		// VSchema-only keyspaces are done after this phase
-		if !needsDDL[sc.Namespace] {
-			applied.Add(1)
-			emitProgress(fmt.Sprintf("VSchema applied to %s", sc.Namespace), map[string]string{"keyspace": sc.Namespace})
-		}
-	}
-
-	// Phase 2: Apply DDL changes in parallel (MySQL connections are independent).
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(maxConcurrentKeyspaces)
 	for _, sc := range changes {
-		if !needsDDL[sc.Namespace] {
-			continue
-		}
 		g.Go(func() error {
-			if err := e.applyKeyspaceDDL(gCtx, sc, password, org, database, branchName, emitProgress); err != nil {
+			if err := e.applyKeyspaceChanges(gCtx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
 				return err
 			}
-			applied.Add(1)
-			emitProgress(fmt.Sprintf("DDL applied to %s", sc.Namespace), map[string]string{"keyspace": sc.Namespace})
+			n := int(applied.Add(1))
+			emitEvent(fmt.Sprintf("Applied keyspace %s (%d/%d)", sc.Namespace, n, total),
+				map[string]string{"keyspace": sc.Namespace})
 			return nil
 		})
 	}
 	return g.Wait()
 }
 
-// updateBranchVSchemaWithRetry applies VSchema for a keyspace with retries.
-// Uses longer backoff when a schema snapshot is in progress.
-func (e *Engine) updateBranchVSchemaWithRetry(ctx context.Context, client psclient.PSClient, org, database, branchName, keyspace, vschemaContent string, emitEvent func(string, map[string]string)) error {
-	e.logger.Info("updating VSchema on branch", "keyspace", keyspace, "branch", branchName)
+// applyKeyspaceChanges applies VSchema and DDL for a single keyspace with retries.
+// Uses longer backoff when PlanetScale reports a schema snapshot is in progress.
+func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
+	start := time.Now()
+	e.logger.Info("applying changes to keyspace",
+		"keyspace", sc.Namespace,
+		"ddl_count", len(sc.TableChanges),
+		"has_vschema", sc.Metadata["vschema"] != "",
+		"branch", branchName,
+	)
 
-	maxAttempts := maxSnapshotRetries
+	maxAttempts := maxRetries
 	var lastErr error
 	for attempt := range maxAttempts {
 		if attempt > 0 {
 			delay := retryDelay(attempt, lastErr)
-			e.logger.Warn("retrying VSchema update", "keyspace", keyspace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
+			e.logger.Warn("retrying keyspace apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -1127,50 +1100,20 @@ func (e *Engine) updateBranchVSchemaWithRetry(ctx context.Context, client psclie
 			}
 		}
 
-		if err := e.updateBranchVSchema(ctx, client, org, database, branchName, keyspace, vschemaContent); err != nil {
+		if err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
 			lastErr = err
-			e.logger.Error("VSchema update failed", "keyspace", keyspace, "attempt", attempt+1, "error", err)
-			continue
-		}
-		emitEvent(fmt.Sprintf("Applied VSchema to keyspace %s", keyspace), map[string]string{"keyspace": keyspace})
-		return nil
-	}
-	return fmt.Errorf("update vschema for keyspace %s on branch %s (after %d attempts): %w", keyspace, branchName, maxAttempts, lastErr)
-}
-
-// applyKeyspaceDDL applies DDL statements for a single keyspace with retries.
-func (e *Engine) applyKeyspaceDDL(ctx context.Context, sc engine.SchemaChange, password *ps.DatabaseBranchPassword, org, database, branchName string, emitEvent func(string, map[string]string)) error {
-	start := time.Now()
-	e.logger.Info("applying DDL to keyspace",
-		"keyspace", sc.Namespace,
-		"ddl_count", len(sc.TableChanges),
-		"branch", branchName,
-	)
-
-	var lastErr error
-	for attempt := range maxRetries {
-		if attempt > 0 {
-			delay := retryDelay(attempt, lastErr)
-			e.logger.Warn("retrying DDL apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
+			e.logger.Error("keyspace apply attempt failed", "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
+			if isSnapshotInProgress(err) && maxAttempts == maxRetries {
+				maxAttempts = maxSnapshotRetries
+				e.logger.Info("schema snapshot in progress, extending retries",
+					"keyspace", sc.Namespace, "max_attempts", maxAttempts)
 			}
-		}
-
-		if err := e.applyKeyspaceDDLOnce(ctx, sc, password, branchName); err != nil {
-			lastErr = err
-			e.logger.Error("DDL apply failed", "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
 			continue
 		}
-		elapsed := time.Since(start).Round(time.Second)
-		e.logger.Info("keyspace DDL applied", "keyspace", sc.Namespace, "elapsed", elapsed)
-		emitEvent(fmt.Sprintf("Applied DDL to keyspace %s (%s)", sc.Namespace, elapsed),
-			map[string]string{"keyspace": sc.Namespace})
+		e.logger.Info("keyspace changes applied", "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
 		return nil
 	}
-	return fmt.Errorf("apply DDL for keyspace %s (after %d attempts): %w", sc.Namespace, maxRetries, lastErr)
+	return fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
 }
 
 // isSnapshotInProgress returns true if the error indicates PlanetScale is
@@ -1193,8 +1136,21 @@ func retryDelay(attempt int, lastErr error) time.Duration {
 	return base + jitter
 }
 
-// applyKeyspaceDDLOnce executes DDL statements for a single keyspace in one attempt.
-func (e *Engine) applyKeyspaceDDLOnce(ctx context.Context, sc engine.SchemaChange, password *ps.DatabaseBranchPassword, branchName string) error {
+// applyKeyspaceChangesOnce applies VSchema and DDL for a single keyspace in one attempt.
+func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
+	// Apply VSchema first — vtgate needs VSchema to route DDL correctly
+	if vschemaContent := getVSchemaContent(sc, schemaFiles); vschemaContent != "" {
+		if err := e.updateBranchVSchema(ctx, client, org, database, branchName, sc.Namespace, vschemaContent); err != nil {
+			return fmt.Errorf("update vschema for %s: %w", sc.Namespace, err)
+		}
+		e.logger.Info("applied vschema to branch", "keyspace", sc.Namespace, "branch", branchName)
+	}
+
+	if len(sc.TableChanges) == 0 {
+		e.logger.Debug("no DDL for keyspace, vschema-only", "keyspace", sc.Namespace, "branch", branchName)
+		return nil
+	}
+
 	// Build DSN targeting this specific keyspace.
 	// TLS is configured automatically when RegisterMTLS has been called.
 	mysqlCfg := mysql.NewConfig()
