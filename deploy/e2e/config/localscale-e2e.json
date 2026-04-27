@@ -22,7 +22,7 @@
     }
   },
   "listen_addr": ":8080",
-  "revert_window_duration": "15s",
+  "revert_window_duration": "2s",
   "default_throttle_ratio": 0.85,
   "branch_creation_delay": "50ms",
   "deploy_request_delay": "50ms",

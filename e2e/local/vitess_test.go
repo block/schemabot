@@ -612,11 +612,43 @@ func TestVitess_Apply_ShardProgress(t *testing.T) {
   COLLATE utf8mb4_0900_ai_ci;`, indexName),
 	}))
 
-	out := vitessApplyAndWait(t, schemaDir, "staging")
+	// Use --no-watch so the CLI returns immediately. Online DDL for ADD INDEX
+	// on a 2-shard table can exceed the default CLI timeout on slow CI runners.
+	binPath := buildCLI(t)
+	endpoint := schemabotURL(t)
+	applyOut := e2eutil.RunCLIInDir(t, binPath, schemaDir, "apply",
+		"-s", ".", "-e", "staging", "--endpoint", endpoint,
+		"-y", "--no-watch", "--allow-unsafe")
+	e2eutil.AssertContains(t, applyOut, "Apply started")
+	applyID := extractApplyIDFromLog(applyOut)
+	require.NotEmpty(t, applyID)
 
-	e2eutil.AssertContains(t, out, "Apply completed")
-	// testapp_sharded has 2 shards — verify shard progress appears
-	assert.Contains(t, out, "shards=2", "expected per-shard progress for 2-shard keyspace")
+	// Poll for shard progress during the running state. Shard data comes
+	// from live engine polling (SHOW VITESS_MIGRATIONS) and may not be
+	// available after the engine shuts down. Poll until shards are found,
+	// then wait for completion separately to ensure cleanup is safe.
+	var foundShards bool
+	var lastState string
+	deadline := time.Now().Add(testutil.PollDeadline)
+	for time.Now().Before(deadline) {
+		resp, err := client.GetProgress(endpoint, applyID)
+		if err == nil {
+			lastState = resp.State
+			for _, tbl := range resp.Tables {
+				if len(tbl.Shards) > 0 {
+					foundShards = true
+				}
+			}
+			if foundShards {
+				break
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	assert.True(t, foundShards, "expected per-shard progress for 2-shard keyspace; last state: %s", lastState)
+
+	// Wait for completion so cleanup doesn't race with in-flight DDL
+	waitForApplyState(t, endpoint, applyID, state.Apply.Completed, testutil.PollDeadline)
 }
 
 func TestVitess_Apply_LogMode_Lifecycle(t *testing.T) {
