@@ -912,3 +912,19 @@ func TestGetKeyspaceVSchemaOnNonMainBranch(t *testing.T) {
 	require.NotNil(t, mainVS, "expected non-nil VSchema for main")
 	assert.NotContains(t, mainVS.Raw, "branch_test_vdx", "main VSchema should NOT contain 'branch_test_vdx'")
 }
+
+// TestGetBranchSchemaUnknownKeyspace verifies that GetBranchSchema returns an
+// error for a keyspace that doesn't exist. The PlanetScale engine relies on
+// this behavior to detect new keyspaces and treat them as empty (all tables
+// show as CREATEs in the plan diff).
+func TestGetBranchSchemaUnknownKeyspace(t *testing.T) {
+	ctx := t.Context()
+
+	_, err := testClient.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
+		Organization: testOrg,
+		Database:     testDB,
+		Branch:       "main",
+		Keyspace:     "nonexistent_keyspace",
+	})
+	require.Error(t, err, "GetBranchSchema should fail for unknown keyspace")
+}

@@ -886,9 +886,27 @@ func (s *Server) writeError(w http.ResponseWriter, code int, format string, args
 	s.logger.Warn("api error", "code", code, "message", msg)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	// PS SDK expects "code" as a string, not a number
+	// Use PlanetScale SDK error code strings so the SDK's error parser
+	// produces typed *ps.Error values (e.g., ErrNotFound for 404).
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"code":    fmt.Sprintf("%d", code),
+		"code":    httpStatusToPSCode(code),
 		"message": msg,
 	})
+}
+
+// httpStatusToPSCode maps HTTP status codes to PlanetScale SDK error code
+// strings. The SDK parses these in its error handler to set ps.Error.Code.
+func httpStatusToPSCode(status int) string {
+	switch status {
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "unauthorized"
+	case http.StatusBadRequest:
+		return "bad_request"
+	case http.StatusUnprocessableEntity:
+		return "unprocessable"
+	default:
+		return fmt.Sprintf("%d", status)
+	}
 }
