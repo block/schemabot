@@ -150,31 +150,31 @@ func confirmAction(prompt, cancelMsg string) (bool, error) {
 	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
 
-	responseCh := make(chan string, 1)
-	errCh := make(chan error, 1)
+	type readResult struct {
+		response string
+		err      error
+	}
+	resultCh := make(chan readResult, 1)
 	go func() {
 		reader := bufio.NewReader(os.Stdin)
 		response, err := reader.ReadString('\n')
-		if err != nil {
-			errCh <- err
-			return
-		}
-		responseCh <- response
+		resultCh <- readResult{response, err}
 	}()
 
 	select {
 	case <-sigCh:
 		fmt.Println(cancelMsg)
 		return false, nil
-	case err := <-errCh:
-		// EOF from Ctrl+D or closed stdin
-		fmt.Println(cancelMsg)
-		if errors.Is(err, io.EOF) {
+	case r := <-resultCh:
+		// EOF with data is valid (e.g., echo -n yes | schemabot apply)
+		if r.err != nil && !errors.Is(r.err, io.EOF) {
+			return false, fmt.Errorf("failed to read response: %w", r.err)
+		}
+		response := strings.TrimSpace(strings.ToLower(r.response))
+		if errors.Is(r.err, io.EOF) && response == "" {
+			fmt.Println(cancelMsg)
 			return false, nil
 		}
-		return false, fmt.Errorf("failed to read response: %w", err)
-	case response := <-responseCh:
-		response = strings.TrimSpace(strings.ToLower(response))
 		if response != "yes" {
 			fmt.Println(cancelMsg)
 			return false, nil
