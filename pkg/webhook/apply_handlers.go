@@ -175,7 +175,11 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
 	// Create check run (action_required — waiting for apply-confirm) and update aggregate
-	if headSHA := h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID); headSHA != "" {
+	headSHA, checkErr := h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+	if checkErr != nil {
+		h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkErr)
+	}
+	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 }
@@ -427,8 +431,7 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 
 // createApplyPlanCheckRun creates or updates the check run when an apply plan is posted.
 // Uses the same check name as the plan check run so it updates the existing one.
-// Returns the PR head SHA, or empty string on error.
-func (h *Handler) createApplyPlanCheckRun(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, installationID int64) string {
+func (h *Handler) createApplyPlanCheckRun(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, installationID int64) (string, error) {
 	return h.createPlanCheckRun(ctx, client, repo, pr, schema, planResp, environment, installationID)
 }
 

@@ -53,13 +53,13 @@ func checkRunName(environment, dbType, database string) string {
 }
 
 // createPlanCheckRun creates a GitHub Check Run after a plan is generated.
-// Returns the PR head SHA used for the check run, or empty string on error.
-func (h *Handler) createPlanCheckRun(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, installationID int64) string {
+// Returns the PR head SHA used for the check run. Check run failures are non-fatal —
+// they should not prevent the plan from being posted.
+func (h *Handler) createPlanCheckRun(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, installationID int64) (string, error) {
 	// Get PR head SHA for the check run
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR for check run", "error", err)
-		return ""
+		return "", fmt.Errorf("fetch PR for check run: %w", err)
 	}
 
 	tables := planResp.FlatTables()
@@ -101,8 +101,7 @@ func (h *Handler) createPlanCheckRun(ctx context.Context, client *ghclient.Insta
 
 	checkRunID, err := client.CreateCheckRun(ctx, repo, prInfo.HeadSHA, opts)
 	if err != nil {
-		h.logger.Error("failed to create check run", "error", err)
-		return ""
+		return "", fmt.Errorf("create check run: %w", err)
 	}
 
 	// Store check record in CheckStore
@@ -119,10 +118,10 @@ func (h *Handler) createPlanCheckRun(ctx context.Context, client *ghclient.Insta
 		Conclusion:   conclusion,
 	}
 	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
-		h.logger.Error("failed to store check record", "error", err)
+		return prInfo.HeadSHA, fmt.Errorf("store check record: %w", err)
 	}
 
-	return prInfo.HeadSHA
+	return prInfo.HeadSHA, nil
 }
 
 // buildCheckRunSummary builds a brief summary for the check run.

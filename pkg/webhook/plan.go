@@ -68,7 +68,10 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
 	// Create check run and update aggregate
-	headSHA := h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+	headSHA, checkErr := h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+	if checkErr != nil {
+		h.logger.Error("failed to create plan check run", "repo", repo, "pr", pr, "error", checkErr)
+	}
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
@@ -156,7 +159,11 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 		multiEnvData.Plans[env] = &commentData
 
 		// Create check run per environment
-		if sha := h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, env, installationID); sha != "" {
+		sha, checkErr := h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, env, installationID)
+		if checkErr != nil {
+			h.logger.Error("failed to create plan check run", "repo", repo, "pr", pr, "env", env, "error", checkErr)
+		}
+		if sha != "" {
 			headSHA = sha
 		}
 	}
