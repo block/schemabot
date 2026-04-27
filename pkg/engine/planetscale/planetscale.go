@@ -397,6 +397,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -418,10 +419,14 @@ import (
 const (
 	// maxConcurrentKeyspaces limits parallel DDL application during Apply.
 	// Each keyspace gets its own MySQL connection to the branch.
-	maxConcurrentKeyspaces = 6
+	maxConcurrentKeyspaces = 3
 
 	// maxRetries is the number of retry attempts per keyspace when applying DDL.
 	maxRetries = 3
+
+	// maxSnapshotRetries is used when a schema snapshot is in progress
+	// (e.g., after RefreshSchema). Snapshots can take 30-60s on large databases.
+	maxSnapshotRetries = 5
 )
 
 // deployState is a shorthand alias for PlanetScale deploy request state constants.
@@ -891,8 +896,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return nil, fmt.Errorf("create branch password: %w", err)
 	}
 
-	// Apply DDL and VSchema changes to all keyspaces concurrently
-	if err := e.applyChangesToBranch(ctx, req.Changes, req.SchemaFiles, password, client, org, req.Database, branchName); err != nil {
+	// Apply DDL and VSchema changes to all keyspaces
+	emitEvent("Applying changes to branch", map[string]string{"branch": branchName})
+	if err := e.applyChangesToBranch(ctx, req.Changes, req.SchemaFiles, password, client, org, req.Database, branchName, emitEvent); err != nil {
 		return nil, fmt.Errorf("apply changes to branch: %w", err)
 	}
 	ddlCount := 0
@@ -1039,27 +1045,47 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}, nil
 }
 
-// applyDDLToBranch connects to the branch via MySQL and executes DDL statements.
-// applyChangesToBranch applies DDL and VSchema changes to all keyspaces concurrently.
-// Each keyspace gets its own MySQL connection and runs independently. Transient
-// failures are retried up to 3 times per keyspace.
-func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
+// applyChangesToBranch applies VSchema and DDL changes to all keyspaces.
+// VSchema updates are applied sequentially (PlanetScale rejects concurrent
+// VSchema writes during schema snapshots). DDL is applied in parallel after
+// all VSchema changes are committed.
+func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string, emitEvent func(string, map[string]string)) error {
 	if len(changes) == 0 {
 		e.logger.Debug("no changes to apply to branch", "branch", branchName)
 		return nil
 	}
 
+	total := len(changes)
+	var applied atomic.Int32
+
+	// Serialize event callbacks — OnEvent mutates shared apply state.
+	var eventMu sync.Mutex
+	safeEmit := func(message string, metadata map[string]string) {
+		eventMu.Lock()
+		defer eventMu.Unlock()
+		emitEvent(message, metadata)
+	}
+
+	safeEmit(fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName), map[string]string{"branch": branchName})
+
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(maxConcurrentKeyspaces)
 	for _, sc := range changes {
 		g.Go(func() error {
-			return e.applyKeyspaceChanges(gCtx, sc, schemaFiles, password, client, org, database, branchName)
+			if err := e.applyKeyspaceChanges(gCtx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
+				return err
+			}
+			n := int(applied.Add(1))
+			safeEmit(fmt.Sprintf("Applied keyspace %s (%d/%d)", sc.Namespace, n, total),
+				map[string]string{"keyspace": sc.Namespace})
+			return nil
 		})
 	}
 	return g.Wait()
 }
 
-// applyKeyspaceChanges applies DDL and VSchema for a single keyspace with retries.
+// applyKeyspaceChanges applies VSchema and DDL for a single keyspace with retries.
+// Uses longer backoff when PlanetScale reports a schema snapshot is in progress.
 func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
 	start := time.Now()
 	e.logger.Info("applying changes to keyspace",
@@ -1069,25 +1095,54 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 		"branch", branchName,
 	)
 
+	maxAttempts := maxRetries
 	var lastErr error
-	for attempt := range maxRetries {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			base := time.Duration(attempt) * 2 * time.Second
-			jitter := time.Duration(rand.IntN(1000)) * time.Millisecond
-			delay := base + jitter
+			delay := retryDelay(attempt, lastErr)
 			e.logger.Warn("retrying keyspace apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
-			time.Sleep(delay)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
 		}
 
 		if err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
 			lastErr = err
 			e.logger.Error("keyspace apply attempt failed", "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
+			if isSnapshotInProgress(err) && maxAttempts == maxRetries {
+				maxAttempts = maxSnapshotRetries
+				e.logger.Info("schema snapshot in progress, extending retries",
+					"keyspace", sc.Namespace, "max_attempts", maxAttempts)
+			}
 			continue
 		}
 		e.logger.Info("keyspace changes applied", "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
 		return nil
 	}
-	return fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxRetries, lastErr)
+	return fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
+}
+
+// isSnapshotInProgress returns true if the error indicates PlanetScale is
+// running a schema snapshot (e.g., after RefreshSchema). VSchema updates
+// are blocked while the snapshot completes.
+func isSnapshotInProgress(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "schema snapshot is in progress")
+}
+
+// retryDelay returns the backoff duration for a retry attempt using
+// exponential backoff with full jitter. When a schema snapshot is in
+// progress the base delay is longer since snapshots can take 30-60s.
+func retryDelay(attempt int, lastErr error) time.Duration {
+	if isSnapshotInProgress(lastErr) {
+		// Snapshot: 5s, 10s, 20s, 40s, ... capped at 60s + up to 5s jitter
+		base := min(5*time.Second*(1<<min(attempt, 4)), 60*time.Second)
+		return base + time.Duration(rand.IntN(5000))*time.Millisecond
+	}
+	// Normal: 2s, 4s, 8s capped at 10s + up to 2s jitter
+	base := min(2*time.Second*(1<<min(attempt, 3)), 10*time.Second)
+	return base + time.Duration(rand.IntN(2000))*time.Millisecond
 }
 
 // applyKeyspaceChangesOnce applies VSchema and DDL for a single keyspace in one attempt.
@@ -1244,6 +1299,17 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("decode resume state: %w", err)
 	}
 
+	emitEvent := func(message string, metadata map[string]string) {
+		attrs := []any{"database", req.Database}
+		for k, v := range metadata {
+			attrs = append(attrs, k, v)
+		}
+		e.logger.Info(message, attrs...)
+		if req.OnEvent != nil {
+			req.OnEvent(engine.ApplyEvent{Message: message, Metadata: metadata})
+		}
+	}
+
 	e.logger.Info("resuming apply",
 		"branch", meta.BranchName,
 		"deploy_request", meta.DeployRequestID,
@@ -1315,7 +1381,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		if err != nil {
 			return nil, fmt.Errorf("create branch password on resume: %w", err)
 		}
-		if err := e.applyChangesToBranch(ctx, remainingChanges, req.SchemaFiles, password, client, org, req.Database, meta.BranchName); err != nil {
+		if err := e.applyChangesToBranch(ctx, remainingChanges, req.SchemaFiles, password, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
 			return nil, fmt.Errorf("apply remaining DDL on resume: %w", err)
 		}
 	} else {

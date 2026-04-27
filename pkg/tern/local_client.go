@@ -918,6 +918,16 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			resp.Metadata = ensureMetadata(resp.Metadata)
 			resp.Metadata["existing_branch"] = opts.Branch
 		}
+
+		// During branch setup phases, include the latest event message so the
+		// CLI can show what's happening instead of a static spinner.
+		if state.IsState(overallState, state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest) {
+			if logs, err := c.storage.ApplyLogs().GetByApply(ctx, apply.ID); err == nil && len(logs) > 0 {
+				latest := logs[len(logs)-1]
+				resp.Metadata = ensureMetadata(resp.Metadata)
+				resp.Metadata["status_detail"] = latest.Message
+			}
+		}
 	}
 
 	return resp, nil

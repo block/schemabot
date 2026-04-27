@@ -1,7 +1,9 @@
 package planetscale
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -337,4 +339,40 @@ func TestSplitStatements(t *testing.T) {
 	// Semicolons with no valid statements are a parse error
 	_, err = ddl.SplitStatements("  ;  ;  ")
 	assert.Error(t, err)
+}
+
+func TestIsSnapshotInProgress(t *testing.T) {
+	assert.True(t, isSnapshotInProgress(fmt.Errorf("Cannot update VSchema while a schema snapshot is in progress.")))
+	assert.True(t, isSnapshotInProgress(fmt.Errorf("wrapped: schema snapshot is in progress")))
+	assert.False(t, isSnapshotInProgress(fmt.Errorf("connection refused")))
+	assert.False(t, isSnapshotInProgress(nil))
+}
+
+func TestRetryDelay(t *testing.T) {
+	t.Run("normal backoff is exponential", func(t *testing.T) {
+		d0 := retryDelay(0, fmt.Errorf("connection refused"))
+		d1 := retryDelay(1, fmt.Errorf("connection refused"))
+		d2 := retryDelay(2, fmt.Errorf("connection refused"))
+		// Base: 2s, 4s, 8s (plus up to 2s jitter)
+		assert.GreaterOrEqual(t, d0, 2*time.Second)
+		assert.Less(t, d0, 5*time.Second)
+		assert.GreaterOrEqual(t, d1, 4*time.Second)
+		assert.GreaterOrEqual(t, d2, 8*time.Second)
+	})
+
+	t.Run("snapshot backoff is longer", func(t *testing.T) {
+		snapshotErr := fmt.Errorf("schema snapshot is in progress")
+		d0 := retryDelay(0, snapshotErr)
+		d1 := retryDelay(1, snapshotErr)
+		// Base: 5s, 10s (plus up to 5s jitter)
+		assert.GreaterOrEqual(t, d0, 5*time.Second)
+		assert.Less(t, d0, 11*time.Second)
+		assert.GreaterOrEqual(t, d1, 10*time.Second)
+	})
+
+	t.Run("snapshot backoff caps at 60s", func(t *testing.T) {
+		snapshotErr := fmt.Errorf("schema snapshot is in progress")
+		d10 := retryDelay(10, snapshotErr)
+		assert.LessOrEqual(t, d10, 65*time.Second)
+	})
 }
