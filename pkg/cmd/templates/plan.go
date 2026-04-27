@@ -94,8 +94,8 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 	singleNamespace := len(namespaces) == 1 && isMySQL && namespaces[0].Namespace == database
 
 	// Sort a copy so callers aren't affected by reordering. This keeps output
-	// stable and groups similarly named keyspaces together, but collapsing still
-	// only applies to consecutive keyspaces with identical changes.
+	// stable and groups similarly named namespaces together, but collapsing
+	// still only applies to consecutive namespaces with identical changes.
 	sorted := make([]NamespaceChange, len(namespaces))
 	copy(sorted, namespaces)
 	sort.Slice(sorted, func(i, j int) bool {
