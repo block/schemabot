@@ -425,7 +425,7 @@ const (
 
 	// maxSnapshotRetries is used when a schema snapshot is in progress
 	// (e.g., after RefreshSchema). Snapshots can take 30-60s on large databases.
-	maxSnapshotRetries = 12
+	maxSnapshotRetries = 5
 )
 
 // deployState is a shorthand alias for PlanetScale deploy request state constants.
