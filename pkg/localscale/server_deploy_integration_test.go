@@ -717,3 +717,96 @@ func TestCompleteRevertError(t *testing.T) {
 	verifyColumnNotExists(t, "users", "revert_error_col")
 	t.Logf("Verified revert flow with correct state differentiation for deploy request %d", dr.Number)
 }
+
+// TestRefreshSchema verifies that syncing a branch re-snapshots schema from main.
+func TestRefreshSchema(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	ctx := t.Context()
+
+	// Create a branch and apply DDL to it
+	branchName := createBranchWithDDL(t, ctx, "refresh-test",
+		map[string][]string{
+			"testapp_sharded": {"ALTER TABLE users ADD COLUMN refresh_test_col VARCHAR(50) NULL"},
+		},
+		nil,
+	)
+
+	// Verify branch has a diff (column was added)
+	branchSchema, err := testClient.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
+		Organization: testOrg, Database: testDB, Branch: branchName, Keyspace: "testapp_sharded",
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, branchSchema, "expected schema diff before refresh")
+
+	// Refresh schema with main — re-snapshots from main, losing the added column
+	err = testClient.RefreshSchema(ctx, testOrg, testDB, branchName)
+	require.NoError(t, err, "RefreshSchema")
+	waitForBranchReady(t, ctx, branchName)
+
+	// Verify the added column is gone after schema refresh — the branch should match main
+	branchSchema, err = testClient.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
+		Organization: testOrg, Database: testDB, Branch: branchName, Keyspace: "testapp_sharded",
+	})
+	require.NoError(t, err)
+	for _, d := range branchSchema {
+		assert.NotContains(t, d.Raw, "refresh_test_col",
+			"branch should not have refresh_test_col after schema refresh (table %s)", d.Name)
+	}
+}
+
+// TestRefreshSchemaAndApply verifies the full --branch reuse workflow:
+// create branch once, then sync + apply DDL multiple times.
+func TestRefreshSchemaAndApply(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cancelAllVitessMigrations(t, t.Context())
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+
+	// Create a reusable branch
+	branchName := createBranch(t, ctx, "reuse-test")
+
+	// First apply: add a column
+	applyBranchDDL(t, ctx, branchName, map[string][]string{
+		"testapp_sharded": {"ALTER TABLE users ADD COLUMN reuse_col_1 VARCHAR(50) NULL"},
+	})
+	dr := createDeploy(t, ctx, branchName, true)
+	require.Equal(t, drState.Ready, dr.DeploymentState)
+
+	deploy(t, ctx, dr.Number, false)
+	dr = waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert, drState.Complete)
+	if dr.DeploymentState == drState.CompletePendingRevert {
+		_, err := testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
+			Organization: testOrg, Database: testDB, Number: dr.Number,
+		})
+		require.NoError(t, err, "SkipRevert")
+		waitForDeployState(t, ctx, dr.Number, drState.Complete)
+	}
+
+	// Refresh schema for reuse
+	err := testClient.RefreshSchema(ctx, testOrg, testDB, branchName)
+	require.NoError(t, err, "RefreshSchema after first apply")
+	waitForBranchReady(t, ctx, branchName)
+
+	// Second apply on same branch: add another column
+	applyBranchDDL(t, ctx, branchName, map[string][]string{
+		"testapp_sharded": {"ALTER TABLE users ADD COLUMN reuse_col_2 VARCHAR(50) NULL"},
+	})
+	dr2 := createDeploy(t, ctx, branchName, true)
+	require.Equal(t, drState.Ready, dr2.DeploymentState)
+
+	deploy(t, ctx, dr2.Number, false)
+	dr2 = waitForDeployState(t, ctx, dr2.Number, drState.CompletePendingRevert, drState.Complete)
+	if dr2.DeploymentState == drState.CompletePendingRevert {
+		_, err = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
+			Organization: testOrg, Database: testDB, Number: dr2.Number,
+		})
+		require.NoError(t, err, "SkipRevert")
+		waitForDeployState(t, ctx, dr2.Number, drState.Complete)
+	}
+
+	// Verify both columns exist on main
+	verifyColumnExists(t, "users", "reuse_col_1")
+	verifyColumnExists(t, "users", "reuse_col_2")
+}

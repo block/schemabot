@@ -17,7 +17,11 @@ type PSClient interface {
 	// Branch operations
 	GetBranch(ctx context.Context, req *ps.GetDatabaseBranchRequest) (*ps.DatabaseBranch, error)
 	CreateBranch(ctx context.Context, req *ps.CreateDatabaseBranchRequest) (*ps.DatabaseBranch, error)
+	DeleteBranch(ctx context.Context, req *ps.DeleteDatabaseBranchRequest) error
 	GetBranchSchema(ctx context.Context, req *ps.BranchSchemaRequest) ([]*ps.Diff, error)
+
+	// RefreshSchema brings a branch's schema up to date with its parent (main).
+	RefreshSchema(ctx context.Context, org, database, branch string) error
 
 	// Branch credentials — returns a MySQL endpoint + credentials for connecting to a branch.
 	// The engine uses this to MySQL-connect and run DDL on the branch directly.
@@ -74,6 +78,7 @@ func NewPSClient(tokenName, tokenValue string, opts ...ps.ClientOption) (PSClien
 	}
 	return &psClientWrapper{
 		client:     client,
+		baseURL:    "https://api.planetscale.com",
 		tokenName:  tokenName,
 		tokenValue: tokenValue,
 	}, nil
@@ -107,6 +112,18 @@ func (w *psClientWrapper) GetBranch(ctx context.Context, req *ps.GetDatabaseBran
 
 func (w *psClientWrapper) CreateBranch(ctx context.Context, req *ps.CreateDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
 	return w.client.DatabaseBranches.Create(ctx, req)
+}
+
+func (w *psClientWrapper) DeleteBranch(ctx context.Context, req *ps.DeleteDatabaseBranchRequest) error {
+	return w.client.DatabaseBranches.Delete(ctx, req)
+}
+
+func (w *psClientWrapper) RefreshSchema(ctx context.Context, org, database, branch string) error {
+	return w.client.DatabaseBranches.RefreshSchema(ctx, &ps.RefreshSchemaRequest{
+		Organization: org,
+		Database:     database,
+		Branch:       branch,
+	})
 }
 
 func (w *psClientWrapper) GetBranchSchema(ctx context.Context, req *ps.BranchSchemaRequest) ([]*ps.Diff, error) {

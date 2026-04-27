@@ -50,7 +50,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewDeferCuttingAll, templates.PreviewDeferAll:
 		templates.PreviewCLIOutput(previewType)
 	// Apply watch mode types
-	case templates.PreviewApplyWatch, templates.PreviewApplyStopped:
+	case templates.PreviewApplyWatch, templates.PreviewApplyStopped, templates.PreviewBranchRefresh:
 		templates.PreviewCLIOutput(previewType)
 	// Stop/Start command types
 	case templates.PreviewStopCommand, templates.PreviewStartCommand:
@@ -166,6 +166,7 @@ Atomic Mode (--defer-cutover flag):
 Apply Watch Mode:
   apply_watch           Running with footer controls
   apply_stopped         Stopped by user
+  branch_refresh        Reusing branch with --branch flag
 
 Stop/Start Commands:
   stop_command          Output when user runs 'schemabot stop'

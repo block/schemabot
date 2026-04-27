@@ -1104,6 +1104,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Apply DDL/VSchema to a branch (used by PlanetScale engine before CreateDeployRequest)
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/branches/{branch}/schema", s.handleError(s.handleApplyBranchSchema))
+	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/branches/{branch}/refresh-schema", s.handleError(s.handleRefreshSchema))
 
 	// Deploy request action endpoints (registered before the GET for {number})
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/deploy", s.handleError(s.handleDeployDeployRequest))

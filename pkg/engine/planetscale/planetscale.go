@@ -818,23 +818,62 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		})
 	}
 
-	// Create a new branch
-	branchName := generateBranchName(req.Database, req.PlanID)
-	persistState(&psMetadata{BranchName: branchName})
-	emitEvent(fmt.Sprintf("Creating branch %s", branchName), map[string]string{"branch": branchName})
-
+	// Create or reuse a branch
+	existingBranch := req.Options["branch"]
+	var branchName string
 	branchStart := time.Now()
-	_, err = e.createBranch(ctx, client, org, req.Database, branchName, main)
-	if err != nil {
-		return nil, fmt.Errorf("create branch: %w", err)
-	}
 
-	// Wait for branch to be ready
-	if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
-		return nil, fmt.Errorf("wait for branch: %w", err)
+	if existingBranch != "" {
+		// Reuse existing branch: wait for ready, refresh schema from main, wait again
+		branchName = existingBranch
+		if branchName == main {
+			return nil, fmt.Errorf("cannot reuse the %s branch — use a development branch", main)
+		}
+		persistState(&psMetadata{BranchName: branchName})
+		emitEvent(fmt.Sprintf("Reusing branch %s", branchName), map[string]string{"branch": branchName})
+
+		// Verify branch exists
+		if _, err := client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
+			Organization: org, Database: req.Database, Branch: branchName,
+		}); err != nil {
+			return nil, fmt.Errorf("branch %s not found: %w", branchName, err)
+		}
+
+		// Wait for branch to be ready (may be initializing from a prior create)
+		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
+			return nil, fmt.Errorf("wait for branch %s: %w", branchName, err)
+		}
+
+		// Sync with main to pick up latest schema
+		emitEvent(fmt.Sprintf("Refreshing schema for branch %s from %s", branchName, main), map[string]string{"branch": branchName})
+		if err := client.RefreshSchema(ctx, org, req.Database, branchName); err != nil {
+			return nil, fmt.Errorf("refresh schema for branch %s: %w", branchName, err)
+		}
+
+		// Wait for sync to complete
+		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
+			return nil, fmt.Errorf("wait for schema refresh %s: %w", branchName, err)
+		}
+		elapsed := time.Since(branchStart).Round(time.Second)
+		emitEvent(fmt.Sprintf("Branch %s schema refreshed (%s)", branchName, elapsed), map[string]string{"branch": branchName})
+	} else {
+		// Create a new branch
+		branchName = generateBranchName(req.Database, req.PlanID)
+		persistState(&psMetadata{BranchName: branchName})
+		emitEvent(fmt.Sprintf("Creating branch %s", branchName), map[string]string{"branch": branchName})
+
+		_, err = e.createBranch(ctx, client, org, req.Database, branchName, main)
+		if err != nil {
+			return nil, fmt.Errorf("create branch: %w", err)
+		}
+
+		// Wait for branch to be ready
+		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
+			return nil, fmt.Errorf("wait for branch: %w", err)
+		}
+		elapsed := time.Since(branchStart).Round(time.Second)
+		emitEvent(fmt.Sprintf("Branch %s ready (%s)", branchName, elapsed), map[string]string{"branch": branchName})
 	}
-	elapsed := time.Since(branchStart).Round(time.Second)
-	emitEvent(fmt.Sprintf("Branch %s ready (%s)", branchName, elapsed), map[string]string{"branch": branchName})
 
 	// Get branch credentials to apply DDL via MySQL
 	pwCtx, pwCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -871,7 +910,8 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// The server computes the schema diff asynchronously — poll until the deploy
 	// request transitions from "pending" to "ready" (or "no_changes"/"error").
 	drStart := time.Now()
-	dr, err := e.createDeployRequest(ctx, client, org, req.Database, branchName, main, !deferCutover)
+	autoDeleteBranch := existingBranch == "" // don't delete reused branches
+	dr, err := e.createDeployRequest(ctx, client, org, req.Database, branchName, main, !deferCutover, autoDeleteBranch)
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
@@ -1295,7 +1335,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	main := mainBranch(req.Credentials)
 	deferCutover := req.Options["defer_cutover"] == "true"
 
-	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, !deferCutover)
+	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, !deferCutover, true)
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request on resume: %w", err)
 	}
@@ -2294,14 +2334,14 @@ func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClien
 	}
 }
 
-func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoCutover bool) (*ps.DeployRequest, error) {
+func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoCutover, autoDeleteBranch bool) (*ps.DeployRequest, error) {
 	return client.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
 		Organization:     org,
 		Database:         database,
 		Branch:           branchName,
 		IntoBranch:       intoBranch,
 		AutoCutover:      autoCutover,
-		AutoDeleteBranch: true,
+		AutoDeleteBranch: autoDeleteBranch,
 	})
 }
 

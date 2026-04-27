@@ -313,22 +313,20 @@ type Apply struct {
 // Stored as JSON in the database for flexibility across engine types.
 type ApplyOptions struct {
 	// AllowUnsafe permits destructive changes (DROP TABLE, DROP COLUMN).
-	// Universal across all engines.
 	AllowUnsafe bool `json:"allow_unsafe,omitempty"`
 
+	// Branch is the name of an existing PlanetScale branch to reuse.
+	// When set, the engine refreshes the branch schema from main instead
+	// of creating a new branch.
+	Branch string `json:"branch,omitempty"`
+
 	// DeferCutover pauses at cutover and waits for explicit trigger.
-	// Spirit: enables atomic multi-table cutover
-	// PlanetScale: waits for manual cutover trigger
-	// Not applicable to direct MySQL DDL.
 	DeferCutover bool `json:"defer_cutover,omitempty"`
 
-	// SkipRevert skips the revert window after completion.
-	// Vitess/PlanetScale only — revert window is ON by default.
+	// SkipRevert skips the revert window after completion (Vitess only).
 	SkipRevert bool `json:"skip_revert,omitempty"`
 
 	// Volume controls schema change aggressiveness (1-11).
-	// Spirit: maps to threads and chunk time
-	// Not all engines support this.
 	Volume int `json:"volume,omitempty"`
 }
 

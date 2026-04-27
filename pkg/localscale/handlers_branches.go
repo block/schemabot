@@ -129,6 +129,55 @@ func (s *Server) handleCreateBranch(w http.ResponseWriter, r *http.Request) erro
 	return nil
 }
 
+// handleRefreshSchema re-snapshots a branch from main. Drops existing branch
+// databases, re-copies schema from vtgate, and marks the branch ready.
+// This is the LocalScale equivalent of PlanetScale's refresh-schema API.
+func (s *Server) handleRefreshSchema(w http.ResponseWriter, r *http.Request) error {
+	org := r.PathValue("org")
+	database := r.PathValue("db")
+	branchName := r.PathValue("branch")
+
+	backend, err := s.backendFor(org, database)
+	if err != nil {
+		return newHTTPError(http.StatusNotFound, "%v", err)
+	}
+
+	// Verify branch exists
+	var ready bool
+	if err := s.metadataDB.QueryRowContext(r.Context(),
+		"SELECT ready FROM localscale_branches WHERE org = ? AND database_name = ? AND name = ?",
+		org, database, branchName,
+	).Scan(&ready); err != nil {
+		return newHTTPError(http.StatusNotFound, "branch %s not found", branchName)
+	}
+
+	// Mark not ready during schema refresh
+	if err := s.execLog(r.Context(),
+		"UPDATE localscale_branches SET ready = FALSE WHERE org = ? AND database_name = ? AND name = ?",
+		org, database, branchName); err != nil {
+		return newHTTPError(http.StatusInternalServerError, "update branch: %v", err)
+	}
+
+	// Drop existing branch databases and re-snapshot from main
+	s.dropBranchDatabases(r.Context(), backend, branchName)
+
+	s.wg.Go(func() {
+		bgCtx := s.shutdownCtx
+		if err := s.snapshotBranch(bgCtx, backend, org, database, branchName); err != nil {
+			s.logger.Error("branch schema refresh failed", "branch", branchName, "error", err)
+			_ = s.execLog(bgCtx,
+				"UPDATE localscale_branches SET error_message = ? WHERE org = ? AND database_name = ? AND name = ?",
+				err.Error(), org, database, branchName)
+		}
+	})
+
+	s.writeJSON(w, map[string]any{
+		"name":  branchName,
+		"ready": false,
+	})
+	return nil
+}
+
 // snapshotBranch creates branch databases, copies schema from vtgate, snapshots
 // VSchema from vtctld, and marks the branch as ready. Called as a background
 // goroutine after the branch row is inserted.

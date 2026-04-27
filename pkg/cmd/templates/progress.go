@@ -59,6 +59,9 @@ func WriteProgress(data ProgressData) {
 
 	// Build key/value pairs for the detail box
 	displayState := StateLabel(data.State)
+	if data.State == state.Apply.CreatingBranch && data.Metadata != nil && data.Metadata["existing_branch"] != "" {
+		displayState = "Refreshing branch schema"
+	}
 	colorFn := stateColorFunc(data.State)
 
 	var rows []BoxRow

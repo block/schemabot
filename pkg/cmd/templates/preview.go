@@ -51,8 +51,9 @@ const (
 	PreviewCLIApplyAll         PreviewType = "cli_apply_all"          // CLI: apply watch, stop/start, volume
 
 	// Apply watch mode previews
-	PreviewApplyWatch   PreviewType = "apply_watch"   // Running with footer controls
-	PreviewApplyStopped PreviewType = "apply_stopped" // Stopped by user
+	PreviewApplyWatch    PreviewType = "apply_watch"    // Running with footer controls
+	PreviewApplyStopped  PreviewType = "apply_stopped"  // Stopped by user
+	PreviewBranchRefresh PreviewType = "branch_refresh" // Reusing branch with --branch flag
 
 	// Sequential mode previews (multi-table, one at a time)
 	PreviewSeqPending    PreviewType = "seq_pending"    // All tables pending (just started)
@@ -198,6 +199,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewApplyWatchOutput()
 	case PreviewApplyStopped:
 		previewApplyStoppedOutput()
+	case PreviewBranchRefresh:
+		previewRefreshingBranchOutput()
 	case PreviewSeqPending:
 		previewSeqPendingOutput()
 	case PreviewSeqFirstRun:
@@ -1092,6 +1095,7 @@ func previewCLIApplyAllOutput() {
 		{"MYSQL: MULTI-TABLE STOPPED", previewSeqStoppedOutput},
 		// Vitess: PlanetScale lifecycle
 		{"VITESS: CREATING BRANCH", previewCreatingBranchOutput},
+		{"VITESS: REFRESHING BRANCH (--branch)", previewRefreshingBranchOutput},
 		{"VITESS: APPLYING BRANCH CHANGES", previewApplyingBranchChangesOutput},
 		{"VITESS: CREATING DEPLOY REQUEST", previewCreatingDeployRequestOutput},
 		{"VITESS: STAGING SCHEMA CHANGES (0% with shards)", previewVitessStagingOutput},

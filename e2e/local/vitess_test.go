@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1421,3 +1422,106 @@ func TestVitess_Apply_Cancel(t *testing.T) {
 }
 
 // extractApplyID is defined in apply_wait_test.go
+
+// createBranchViaLocalScale creates a PlanetScale branch via the LocalScale API
+// and waits for it to be ready. Returns the branch name.
+func createBranchViaLocalScale(t *testing.T, branchName string) {
+	t.Helper()
+	ctx := t.Context()
+	localscaleURL := os.Getenv("LOCALSCALE_URL")
+	require.NotEmpty(t, localscaleURL, "LOCALSCALE_URL not set")
+
+	body := fmt.Sprintf(`{"name":"%s","parent_branch":"main"}`, branchName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		localscaleURL+"/v1/organizations/localscale-staging/databases/"+vitessDB+"/branches",
+		strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode, "CreateBranch failed")
+
+	// Poll until branch is ready
+	deadline := time.Now().Add(testutil.PollDeadline)
+	for time.Now().Before(deadline) {
+		getReq, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+			localscaleURL+"/v1/organizations/localscale-staging/databases/"+vitessDB+"/branches/"+branchName, nil)
+		resp, err := http.DefaultClient.Do(getReq)
+		if err == nil {
+			var branch struct {
+				Ready bool `json:"ready"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&branch)
+			resp.Body.Close()
+			if branch.Ready {
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatalf("branch %s not ready within deadline", branchName)
+}
+
+// TestVitess_Apply_BranchReuse tests the --branch flag for reusing an existing
+// PlanetScale branch. Creates a branch, applies with --branch, then syncs and
+// applies again on the same branch.
+func TestVitess_Apply_BranchReuse(t *testing.T) {
+	vitessAvailable(t)
+	clearSchemaBotState(t)
+	defer vitessRestoreBaseSchema(t, "staging")
+
+	branchName := fmt.Sprintf("reuse-e2e-%d", time.Now().UnixMilli()%100000)
+	createBranchViaLocalScale(t, branchName)
+
+	// First apply: add a column using --branch
+	col1 := fmt.Sprintf("reuse_col1_%d", time.Now().UnixMilli()%100000)
+	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
+		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
+  `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  `+"`email`"+` varchar(255) NOT NULL,
+  `+"`full_name`"+` varchar(255) NULL,
+  `+"`%s`"+` varchar(100) NULL,
+  `+"`created_at`"+` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX `+"`idx_email`"+` (`+"`email`"+`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, col1),
+	}))
+
+	out := vitessApplyAndWait(t, schemaDir, "staging", "--branch", branchName)
+	e2eutil.AssertContains(t, out, "Apply started")
+	e2eutil.AssertContains(t, out, "Apply completed")
+
+	// Verify branch refresh happened via apply logs
+	applyID := extractApplyIDFromLog(out)
+	endpoint := schemabotURL(t)
+	logs, err := client.GetLogs(endpoint, "", "", applyID, 50)
+	require.NoError(t, err)
+	var foundRefresh bool
+	for _, entry := range logs {
+		if strings.Contains(entry.Message, "Refreshing schema for branch") {
+			foundRefresh = true
+			break
+		}
+	}
+	assert.True(t, foundRefresh, "expected 'Refreshing schema for branch' in apply logs")
+
+	// Second apply on the same branch: add another column
+	clearSchemaBotState(t)
+	col2 := fmt.Sprintf("reuse_col2_%d", time.Now().UnixMilli()%100000)
+	schemaDir2 := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
+		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
+  `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  `+"`email`"+` varchar(255) NOT NULL,
+  `+"`full_name`"+` varchar(255) NULL,
+  `+"`%s`"+` varchar(100) NULL,
+  `+"`%s`"+` varchar(100) NULL,
+  `+"`created_at`"+` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX `+"`idx_email`"+` (`+"`email`"+`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, col1, col2),
+	}))
+
+	out2 := vitessApplyAndWait(t, schemaDir2, "staging", "--branch", branchName)
+	e2eutil.AssertContains(t, out2, "Apply started")
+	// Second apply completing proves the branch was preserved and reused
+	e2eutil.AssertContains(t, out2, "Apply completed")
+}

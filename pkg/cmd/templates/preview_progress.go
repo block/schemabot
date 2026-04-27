@@ -27,6 +27,28 @@ func previewCreatingBranchOutput() {
 	WriteProgress(data)
 }
 
+func previewRefreshingBranchOutput() {
+	data := ProgressData{
+		State:       state.Apply.CreatingBranch,
+		Engine:      "PlanetScale",
+		ApplyID:     "apply-b7c8d9e0f1a2",
+		Database:    "myapp",
+		Environment: "staging",
+		Metadata: map[string]string{
+			"existing_branch": "my-reusable-branch",
+			"branch_name":     "my-reusable-branch",
+		},
+		Tables: []TableProgress{
+			{
+				TableName: "users", Namespace: "myapp_sharded",
+				DDL:    "ALTER TABLE `users` ADD COLUMN `region` varchar(50) DEFAULT NULL",
+				Status: state.Apply.Pending,
+			},
+		},
+	}
+	WriteProgress(data)
+}
+
 func previewApplyingBranchChangesOutput() {
 	data := ProgressData{
 		State:       state.Apply.ApplyingBranchChanges,
