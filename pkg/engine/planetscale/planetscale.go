@@ -388,6 +388,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -2190,14 +2191,18 @@ func (e *Engine) fetchDatabaseSchema(ctx context.Context, client psclient.PSClie
 				Keyspace:     ks,
 			})
 			if err != nil {
-				// Keyspace doesn't exist yet — treat as empty so all tables
-				// appear as CREATEs in the diff.
-				e.logger.Info("keyspace not found on branch, treating as empty",
-					"keyspace", ks, "branch", branch, "error", err)
-				mu.Lock()
-				result[ks] = nil
-				mu.Unlock()
-				return nil
+				var psErr *ps.Error
+				if errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound {
+					// Keyspace doesn't exist yet — treat as empty so all
+					// tables appear as CREATEs in the diff.
+					e.logger.Info("keyspace not found on branch, treating as empty",
+						"keyspace", ks, "branch", branch)
+					mu.Lock()
+					result[ks] = nil
+					mu.Unlock()
+					return nil
+				}
+				return fmt.Errorf("fetch schema for keyspace %s: %w", ks, err)
 			}
 
 			tables := make([]table.TableSchema, len(schemaResult))
