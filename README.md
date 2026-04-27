@@ -5,15 +5,17 @@ GitOps for database schemas. Define your desired schema in SQL files, open a PR,
 > [!WARNING]
 > **Experimental** — SchemaBot is under active development. APIs and configuration may change without notice.
 
-## CLI Demo
+## Schema Changes via Pull Request
+
+Open a PR with schema changes and SchemaBot handles the rest — plan, apply, and verify across environments:
+
+![SchemaBot PR Demo](./assets/pr-demo.gif)
+
+## Interactive CLI
 
 SchemaBot provides a fully interactive CLI for planning, applying, and monitoring schema changes:
 
-![SchemaBot CLI Demo](./docs/assets/cli-demo.gif)
-
-## PR Demo
-
-_Coming soon_
+![SchemaBot CLI Demo](./assets/cli-demo.gif)
 
 ## How It Works
 
