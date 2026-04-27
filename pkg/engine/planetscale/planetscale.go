@@ -1058,7 +1058,15 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 	total := len(changes)
 	var applied atomic.Int32
 
-	emitEvent(fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName), map[string]string{"branch": branchName})
+	// Serialize event callbacks — OnEvent mutates shared apply state.
+	var eventMu sync.Mutex
+	safeEmit := func(message string, metadata map[string]string) {
+		eventMu.Lock()
+		defer eventMu.Unlock()
+		emitEvent(message, metadata)
+	}
+
+	safeEmit(fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName), map[string]string{"branch": branchName})
 
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(maxConcurrentKeyspaces)
@@ -1068,7 +1076,7 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 				return err
 			}
 			n := int(applied.Add(1))
-			emitEvent(fmt.Sprintf("Applied keyspace %s (%d/%d)", sc.Namespace, n, total),
+			safeEmit(fmt.Sprintf("Applied keyspace %s (%d/%d)", sc.Namespace, n, total),
 				map[string]string{"keyspace": sc.Namespace})
 			return nil
 		})
@@ -1089,7 +1097,7 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 
 	maxAttempts := maxRetries
 	var lastErr error
-	for attempt := range maxAttempts {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			delay := retryDelay(attempt, lastErr)
 			e.logger.Warn("retrying keyspace apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
