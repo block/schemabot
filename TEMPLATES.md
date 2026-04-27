@@ -1516,7 +1516,7 @@ schemabot stop apply-a1b2c3d4e5f6
 <summary><a name="single-table-completed"></a><strong>Single Table: Completed</strong></summary>
 
 
-## 🚀 Schema Change Complete
+## ✅ Schema Change Applied
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
@@ -1767,7 +1767,7 @@ schemabot stop apply-a1b2c3d4e5f6
 <summary><a name="all-completed"></a><strong>All Completed</strong></summary>
 
 
-## 🚀 Schema Change Complete
+## ✅ Schema Change Applied
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
@@ -2008,11 +2008,10 @@ Cutover in progress — typically completes within seconds.
 <summary><a name="summary-completed"></a><strong>Summary: Completed</strong></summary>
 
 
-## 🚀 Schema Change Complete
+## ✅ Schema Change Applied
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
+**Database**: `testapp` | **Environment**: `staging`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
 > All 3 tables applied successfully — your schema changes are live!
 
@@ -2031,6 +2030,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
+*Apply ID: `apply-a1b2c3d4e5f6`*
 
 </details>
 
@@ -2117,11 +2117,10 @@ schemabot start apply-a1b2c3d4e5f6
 <summary><a name="summary-completed-large"></a><strong>Summary: Completed (Large)</strong></summary>
 
 
-## 🚀 Schema Change Complete
+## ✅ Schema Change Applied
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 2w 3d 5h
+**Database**: `testapp` | **Environment**: `staging`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
 > All 8 tables applied successfully — your schema changes are live!
 
@@ -2166,6 +2165,7 @@ ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 ```
 
 </details>
+*Apply ID: `apply-a1b2c3d4e5f6`*
 
 </details>
 
@@ -2295,11 +2295,10 @@ schemabot apply -e staging
 <summary><a name="summary-multinamespace-completed"></a><strong>Summary: Multi-namespace Completed</strong></summary>
 
 
-## 🚀 Schema Change Complete
+## ✅ Schema Change Applied
 
-**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 3d 4h
+**Database**: `testapp` | **Environment**: `staging`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
 > All 5 tables applied successfully — your schema changes are live!
 
@@ -2336,6 +2335,7 @@ ALTER TABLE `addresses` ADD INDEX `idx_zip`(`zip_code`);
 ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 ```
 
+*Apply ID: `apply-a1b2c3d4e5f6`*
 </details>
 
 ### CLI Output

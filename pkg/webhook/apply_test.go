@@ -153,7 +153,7 @@ func TestFormatSummaryComment(t *testing.T) {
 
 	body := formatSummaryComment(apply, tasks)
 
-	assert.Contains(t, body, "Schema Change Complete")
+	assert.Contains(t, body, "Schema Change Applied")
 	assert.Contains(t, body, "`users`")
 	assert.Contains(t, body, "`orders`")
 	assert.Contains(t, body, "applied successfully")

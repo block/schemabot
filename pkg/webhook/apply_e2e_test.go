@@ -417,14 +417,14 @@ func TestE2EApplyConfirmExecutesApply(t *testing.T) {
 	// For a CREATE TABLE, it completes fast — the sync handler catches it and
 	// posts the summary directly without an "In Progress" comment.
 	//
-	// Wait for either "Schema Change In Progress" or "Schema Change Complete/Failed"
+	// Wait for either "Schema Change In Progress" or "Schema Change Applied/Failed"
 	// as the first comment.
 	select {
 	case body := <-result.comments:
 		hasProgress := strings.Contains(body, "Schema Change In Progress")
-		hasComplete := strings.Contains(body, "Schema Change Complete")
+		hasApplied := strings.Contains(body, "Schema Change Applied")
 		hasFailed := strings.Contains(body, "Schema Change Failed")
-		assert.True(t, hasProgress || hasComplete || hasFailed,
+		assert.True(t, hasProgress || hasApplied || hasFailed,
 			"expected progress or summary comment, got: %s", body[:min(len(body), 200)])
 
 		// If we got a progress comment, wait for the summary too
@@ -432,7 +432,7 @@ func TestE2EApplyConfirmExecutesApply(t *testing.T) {
 			select {
 			case summary := <-result.comments:
 				assert.True(t,
-					strings.Contains(summary, "Schema Change Complete") || strings.Contains(summary, "Schema Change Failed"),
+					strings.Contains(summary, "Schema Change Applied") || strings.Contains(summary, "Schema Change Failed"),
 					"expected summary comment")
 			case <-time.After(60 * time.Second):
 				t.Fatal("timed out waiting for summary comment")

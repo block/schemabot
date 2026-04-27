@@ -66,12 +66,12 @@ func TestRenderApplyStatusComment_Completed(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## 🚀 Schema Change Complete")
+	assert.Contains(t, result, "## ✅ Schema Change Applied")
 	assert.Contains(t, result, "### Table Progress")
 	// Progress summary line
 	assert.Contains(t, result, "📊 2/2 complete")
-	// Header has "Complete" + each table has "✓ Complete" = 3 total
-	assert.Equal(t, 3, strings.Count(result, "Complete"))
+	// Each table has "✓ Complete" = 2 total
+	assert.Equal(t, 2, strings.Count(result, "Complete"))
 }
 
 func TestRenderApplyStatusComment_Failed(t *testing.T) {
@@ -248,7 +248,7 @@ func TestPreviewCommentApplyProgress(t *testing.T) {
 func TestPreviewCommentApplyCompleted(t *testing.T) {
 	result := PreviewCommentApplyCompleted()
 
-	assert.Contains(t, result, "Schema Change Complete")
+	assert.Contains(t, result, "Schema Change Applied")
 	assert.Contains(t, result, "### Table Progress")
 }
 
@@ -285,7 +285,7 @@ func TestPreviewCommentApplyCuttingOver(t *testing.T) {
 func TestPreviewCommentSummaryCompleted(t *testing.T) {
 	result := PreviewCommentSummaryCompleted()
 
-	assert.Contains(t, result, "Schema Change Complete")
+	assert.Contains(t, result, "Schema Change Applied")
 	assert.Contains(t, result, "All 3 tables applied successfully")
 	// Single namespace matching database name — header skipped
 	assert.NotContains(t, result, "### ")

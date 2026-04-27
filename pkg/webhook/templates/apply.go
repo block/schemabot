@@ -80,7 +80,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.CuttingOver:
 		sb.WriteString("## Schema Change — Cutting Over\n\n")
 	case state.Apply.Completed:
-		sb.WriteString("## 🚀 Schema Change Complete\n\n")
+		sb.WriteString("## ✅ Schema Change Applied\n\n")
 	case state.Apply.Failed:
 		sb.WriteString("## ❌ Schema Change Failed\n\n")
 	case state.Apply.Stopped:
@@ -420,9 +420,30 @@ func countTableOutcomes(tables []TableProgressData) (completed, failed int) {
 
 func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, totalTables int) {
 	writeApplyHeader(sb, data)
-	writeSummaryMetadata(sb, data)
-	writeSuccessBlock(sb, fmt.Sprintf("All %d %s applied successfully — your schema changes are live!", totalTables, pluralize("table", totalTables)))
+	writeSummaryCompletedMetadata(sb, data)
+	var msg string
+	if totalTables == 1 {
+		msg = "Schema change applied successfully — your changes are live!"
+	} else {
+		msg = fmt.Sprintf("All %d tables applied successfully — your schema changes are live!", totalTables)
+	}
+	writeSuccessBlock(sb, msg)
 	writeSummaryTableList(sb, data)
+	if data.ApplyID != "" {
+		fmt.Fprintf(sb, "*Apply ID: `%s`*\n", data.ApplyID)
+	}
+}
+
+// writeSummaryCompletedMetadata writes a clean metadata line for completed applies.
+// Only shows database and environment — apply ID and duration are operational details
+// that add clutter without value for most users.
+func writeSummaryCompletedMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
+	if data.Environment != "" {
+		fmt.Fprintf(sb, "**Database**: `%s` | **Environment**: `%s`\n", data.Database, data.Environment)
+	} else {
+		fmt.Fprintf(sb, "**Database**: `%s`\n", data.Database)
+	}
+	sb.WriteString("\n")
 }
 
 func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, completedCount, _, totalTables int) {
