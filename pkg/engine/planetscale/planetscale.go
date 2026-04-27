@@ -397,6 +397,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -1054,7 +1055,23 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 		return nil
 	}
 
-	emitEvent(fmt.Sprintf("Applying changes to %d keyspaces on branch %s", len(changes), branchName), map[string]string{"branch": branchName})
+	total := len(changes)
+	var applied atomic.Int32
+	emitProgress := func(message string, metadata map[string]string) {
+		n := int(applied.Load())
+		msg := fmt.Sprintf("Applying to branch (%d/%d keyspaces)... %s", n, total, message)
+		emitEvent(msg, metadata)
+	}
+
+	emitEvent(fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName), map[string]string{"branch": branchName})
+
+	// Track which keyspaces need DDL (vs VSchema-only)
+	needsDDL := make(map[string]bool, len(changes))
+	for _, sc := range changes {
+		if len(sc.TableChanges) > 0 {
+			needsDDL[sc.Namespace] = true
+		}
+	}
 
 	// Phase 1: Apply VSchema changes sequentially. PlanetScale blocks
 	// concurrent VSchema writes while schema snapshots are in progress.
@@ -1063,8 +1080,13 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 		if vschemaContent == "" {
 			continue
 		}
-		if err := e.updateBranchVSchemaWithRetry(ctx, client, org, database, branchName, sc.Namespace, vschemaContent, emitEvent); err != nil {
+		if err := e.updateBranchVSchemaWithRetry(ctx, client, org, database, branchName, sc.Namespace, vschemaContent, emitProgress); err != nil {
 			return fmt.Errorf("update vschema for %s: %w", sc.Namespace, err)
+		}
+		// VSchema-only keyspaces are done after this phase
+		if !needsDDL[sc.Namespace] {
+			applied.Add(1)
+			emitProgress(fmt.Sprintf("VSchema applied to %s", sc.Namespace), map[string]string{"keyspace": sc.Namespace})
 		}
 	}
 
@@ -1072,11 +1094,16 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(maxConcurrentKeyspaces)
 	for _, sc := range changes {
-		if len(sc.TableChanges) == 0 {
+		if !needsDDL[sc.Namespace] {
 			continue
 		}
 		g.Go(func() error {
-			return e.applyKeyspaceDDL(gCtx, sc, password, org, database, branchName, emitEvent)
+			if err := e.applyKeyspaceDDL(gCtx, sc, password, org, database, branchName, emitProgress); err != nil {
+				return err
+			}
+			applied.Add(1)
+			emitProgress(fmt.Sprintf("DDL applied to %s", sc.Namespace), map[string]string{"keyspace": sc.Namespace})
+			return nil
 		})
 	}
 	return g.Wait()
