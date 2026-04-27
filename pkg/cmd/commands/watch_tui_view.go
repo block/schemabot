@@ -92,9 +92,16 @@ func (m WatchModel) progressView() string {
 		if m.metadata != nil && m.metadata["existing_branch"] != "" {
 			label = "Refreshing branch schema..."
 		}
+		if m.metadata != nil && m.metadata["status_detail"] != "" {
+			label = m.metadata["status_detail"]
+		}
 		b.WriteString(m.spinner.View() + label + m.elapsed() + "\n")
 	case state.IsState(m.state, state.Apply.ApplyingBranchChanges):
-		b.WriteString(m.spinner.View() + "Applying changes to branch..." + m.elapsed() + "\n")
+		label := "Applying changes to branch..."
+		if m.metadata != nil && m.metadata["status_detail"] != "" {
+			label = m.metadata["status_detail"]
+		}
+		b.WriteString(m.spinner.View() + label + m.elapsed() + "\n")
 	case state.IsState(m.state, state.Apply.CreatingDeployRequest):
 		msg := "Creating deploy request..."
 		if m.deployRequestURL != "" {

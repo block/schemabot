@@ -62,6 +62,12 @@ func WriteProgress(data ProgressData) {
 	if data.State == state.Apply.CreatingBranch && data.Metadata != nil && data.Metadata["existing_branch"] != "" {
 		displayState = "Refreshing branch schema"
 	}
+	// Show latest event detail during setup phases
+	if data.Metadata != nil && data.Metadata["status_detail"] != "" {
+		if state.IsState(data.State, state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest) {
+			displayState = data.Metadata["status_detail"]
+		}
+	}
 	colorFn := stateColorFunc(data.State)
 
 	var rows []BoxRow
