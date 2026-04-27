@@ -422,9 +422,9 @@ func TestE2EApplyConfirmExecutesApply(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		hasProgress := strings.Contains(body, "Schema Change In Progress")
-		hasComplete := strings.Contains(body, "Schema Change Applied")
+		hasApplied := strings.Contains(body, "Schema Change Applied")
 		hasFailed := strings.Contains(body, "Schema Change Failed")
-		assert.True(t, hasProgress || hasComplete || hasFailed,
+		assert.True(t, hasProgress || hasApplied || hasFailed,
 			"expected progress or summary comment, got: %s", body[:min(len(body), 200)])
 
 		// If we got a progress comment, wait for the summary too
