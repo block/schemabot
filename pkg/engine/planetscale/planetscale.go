@@ -419,7 +419,7 @@ import (
 const (
 	// maxConcurrentKeyspaces limits parallel DDL application during Apply.
 	// Each keyspace gets its own MySQL connection to the branch.
-	maxConcurrentKeyspaces = 6
+	maxConcurrentKeyspaces = 2
 
 	// maxRetries is the number of retry attempts per keyspace when applying DDL.
 	maxRetries = 3
@@ -1123,17 +1123,18 @@ func isSnapshotInProgress(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "schema snapshot is in progress")
 }
 
-// retryDelay returns the backoff duration for a retry attempt. Uses longer
-// delays when a schema snapshot is in progress since those can take 30-60s.
+// retryDelay returns the backoff duration for a retry attempt using
+// exponential backoff with full jitter. When a schema snapshot is in
+// progress the base delay is longer since snapshots can take 30-60s.
 func retryDelay(attempt int, lastErr error) time.Duration {
 	if isSnapshotInProgress(lastErr) {
-		// Snapshot retries: 5s base + jitter
-		return 5*time.Second + time.Duration(rand.IntN(2000))*time.Millisecond
+		// Snapshot: 5s, 10s, 20s, 40s, ... capped at 60s + up to 5s jitter
+		base := min(5*time.Second*(1<<min(attempt, 4)), 60*time.Second)
+		return base + time.Duration(rand.IntN(5000))*time.Millisecond
 	}
-	// Normal retries: exponential backoff 2s, 4s, 6s + jitter
-	base := time.Duration(attempt) * 2 * time.Second
-	jitter := time.Duration(rand.IntN(1000)) * time.Millisecond
-	return base + jitter
+	// Normal: 2s, 4s, 8s capped at 10s + up to 2s jitter
+	base := min(2*time.Second*(1<<min(attempt, 3)), 10*time.Second)
+	return base + time.Duration(rand.IntN(2000))*time.Millisecond
 }
 
 // applyKeyspaceChangesOnce applies VSchema and DDL for a single keyspace in one attempt.
