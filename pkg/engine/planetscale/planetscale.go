@@ -1183,7 +1183,7 @@ func (e *Engine) updateBranchVSchema(ctx context.Context, client psclient.PSClie
 // diffBranchForResume fetches the working branch's current schema and diffs it
 // against the desired schema to find DDL that wasn't applied before the crash.
 func (e *Engine) diffBranchForResume(ctx context.Context, client psclient.PSClient, org, database, branch string, schemaFiles schema.SchemaFiles) ([]engine.SchemaChange, error) {
-	currentSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, branch)
+	currentSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, branch, sortedKeyspaces(schemaFiles))
 	if err != nil {
 		return nil, fmt.Errorf("fetch branch schema: %w", err)
 	}
@@ -2174,33 +2174,44 @@ func shardLess(a, b string) bool {
 
 // --- Helper functions ---
 
-func (e *Engine) fetchDatabaseSchema(ctx context.Context, client psclient.PSClient, org, database, branch string) (map[string][]table.TableSchema, error) {
-	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
-		Organization: org,
-		Database:     database,
-		Branch:       branch,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list keyspaces: %w", err)
-	}
+func (e *Engine) fetchDatabaseSchema(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string) (map[string][]table.TableSchema, error) {
+	var mu sync.Mutex
+	result := make(map[string][]table.TableSchema, len(keyspaces))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(20)
 
-	result := make(map[string][]table.TableSchema)
-	for _, ks := range keyspaces {
-		schemaResult, err := client.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
-			Organization: org,
-			Database:     database,
-			Branch:       branch,
-			Keyspace:     ks.Name,
+	for _, keyspace := range keyspaces {
+		ks := keyspace
+		g.Go(func() error {
+			schemaResult, err := client.GetBranchSchema(gCtx, &ps.BranchSchemaRequest{
+				Organization: org,
+				Database:     database,
+				Branch:       branch,
+				Keyspace:     ks,
+			})
+			if err != nil {
+				// Keyspace doesn't exist yet — treat as empty so all tables
+				// appear as CREATEs in the diff.
+				e.logger.Info("keyspace not found on branch, treating as empty",
+					"keyspace", ks, "branch", branch, "error", err)
+				mu.Lock()
+				result[ks] = nil
+				mu.Unlock()
+				return nil
+			}
+
+			tables := make([]table.TableSchema, len(schemaResult))
+			for i, t := range schemaResult {
+				tables[i] = table.TableSchema{Name: t.Name, Schema: t.Raw}
+			}
+			mu.Lock()
+			result[ks] = tables
+			mu.Unlock()
+			return nil
 		})
-		if err != nil {
-			return nil, fmt.Errorf("fetch schema for keyspace %s: %w", ks.Name, err)
-		}
-
-		tables := make([]table.TableSchema, len(schemaResult))
-		for i, t := range schemaResult {
-			tables[i] = table.TableSchema{Name: t.Name, Schema: t.Raw}
-		}
-		result[ks.Name] = tables
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
@@ -2217,7 +2228,7 @@ func (e *Engine) fetchPlanSchema(ctx context.Context, client psclient.PSClient, 
 
 	if parent.SafeMigrations {
 		e.logger.Debug("using PlanetScale schema API for plan", "database", database, "branch", branch)
-		return e.fetchDatabaseSchema(ctx, client, org, database, branch)
+		return e.fetchDatabaseSchema(ctx, client, org, database, branch, keyspaces)
 	}
 
 	if creds == nil || creds.DSN == "" {
