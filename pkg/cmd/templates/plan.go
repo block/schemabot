@@ -3,6 +3,7 @@ package templates
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"golang.org/x/text/cases"
@@ -91,6 +92,11 @@ type NamespaceChange struct {
 // For Vitess, each keyspace gets a header with optional VSchema diff.
 func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string) {
 	singleNamespace := len(namespaces) == 1 && isMySQL && namespaces[0].Namespace == database
+
+	// Sort keyspaces so identical changes are adjacent for collapsing.
+	sort.Slice(namespaces, func(i, j int) bool {
+		return namespaces[i].Namespace < namespaces[j].Namespace
+	})
 
 	// Group consecutive keyspaces with identical DDL changes for collapsing.
 	type nsGroup struct {

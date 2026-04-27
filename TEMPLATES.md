@@ -3438,25 +3438,6 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 ╰─────────────────────────────────────────────╯
 
 
-  ── testapp_sharded ──
-
-  ~ VSchema:
-       "vindexes": {
-    -    "hash": {"type": "hash"}
-    +    "hash": {"type": "hash"},
-    +    "lookup_email": {
-    +      "type": "consistent_lookup",
-    +      "params": {"table": "users_email_idx", "from": "email", "to": "user_id"}
-    +    }
-       },
-
-     ~ users
-       ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
-
-     ~ orders
-       ALTER TABLE `orders` ADD INDEX `idx_status_created`(`status`, `created_at`);
-
-
   ── testapp ──
 
   ~ VSchema:
@@ -3475,6 +3456,25 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
            `user_id` bigint NOT NULL,
            PRIMARY KEY(`email`, `user_id`)
        );
+
+
+  ── testapp_sharded ──
+
+  ~ VSchema:
+       "vindexes": {
+    -    "hash": {"type": "hash"}
+    +    "hash": {"type": "hash"},
+    +    "lookup_email": {
+    +      "type": "consistent_lookup",
+    +      "params": {"table": "users_email_idx", "from": "email", "to": "user_id"}
+    +    }
+       },
+
+     ~ users
+       ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
+
+     ~ orders
+       ALTER TABLE `orders` ADD INDEX `idx_status_created`(`status`, `created_at`);
 
 📋 **Plan**: 1 table to create, 2 tables to alter, 2 VSchema changes
 
