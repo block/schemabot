@@ -1127,7 +1127,7 @@ func TestE2EAggregateCheck(t *testing.T) {
 	// Verify aggregate check record persisted in storage
 	ctx := t.Context()
 	aggCheck, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
-		aggregateEnvironment, aggregateDBType, aggregateDBName)
+		aggregateSentinel, aggregateSentinel, aggregateSentinel)
 	require.NoError(t, err)
 	require.NotNil(t, aggCheck, "expected aggregate check record in storage")
 	assert.Equal(t, "action_required", aggCheck.Conclusion)
@@ -1165,9 +1165,9 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 		Repository:   "octocat/hello-world",
 		PullRequest:  1,
 		HeadSHA:      "oldsha111",
-		Environment:  aggregateEnvironment,
-		DatabaseType: aggregateDBType,
-		DatabaseName: aggregateDBName,
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
 		CheckRunID:   200,
 		HasChanges:   true,
 		Status:       checkStatusCompleted,
@@ -1274,7 +1274,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	deadline2 := time.After(5 * time.Second)
 	for {
 		storedAgg, aggErr = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
-			aggregateEnvironment, aggregateDBType, aggregateDBName)
+			aggregateSentinel, aggregateSentinel, aggregateSentinel)
 		if aggErr == nil && storedAgg != nil && storedAgg.HeadSHA == "newsha222" {
 			break
 		}
@@ -1929,7 +1929,8 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 		t.Fatal("timed out waiting for plan comment")
 	}
 
-	// Check runs should be for payments only (plus the aggregate)
+	// Check runs should be for payments only (1 per-database + 1 aggregate).
+	// This test uses a single-env setup, so expect exactly 1 per-database check.
 	var perDBCheckNames []string
 	hasAggregate := false
 	deadline := time.After(5 * time.Second)
@@ -1941,7 +1942,7 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 			} else {
 				perDBCheckNames = append(perDBCheckNames, cr.Name)
 			}
-			if len(perDBCheckNames) >= 2 && hasAggregate {
+			if len(perDBCheckNames) >= 1 && hasAggregate {
 				goto checksDone
 			}
 		case <-deadline:
@@ -1950,6 +1951,7 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 	}
 checksDone:
 	assert.True(t, hasAggregate, "expected aggregate check run")
+	require.NotEmpty(t, perDBCheckNames, "expected at least one per-database check run")
 	for _, name := range perDBCheckNames {
 		assert.Contains(t, name, "payments", "check run should be for payments: %s", name)
 		assert.NotContains(t, name, "orders", "check run should NOT be for orders: %s", name)

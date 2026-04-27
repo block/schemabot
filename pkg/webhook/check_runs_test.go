@@ -83,9 +83,9 @@ func TestComputeAggregate(t *testing.T) {
 
 func TestIsAggregateCheck(t *testing.T) {
 	aggregate := &storage.Check{
-		Environment:  aggregateEnvironment,
-		DatabaseType: aggregateDBType,
-		DatabaseName: aggregateDBName,
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
 	}
 	require.True(t, isAggregateCheck(aggregate))
 

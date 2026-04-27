@@ -29,24 +29,22 @@ const (
 	checkConclusionNeutral        = "neutral"
 )
 
-// aggregateCheckName is the single required check name for branch protection.
-// Per-database checks (e.g., "SchemaBot: staging/mysql/orders") are informational;
-// this aggregate reflects the overall state of all schema changes in a PR.
+// aggregateCheckName is the check name to require in branch protection.
+// Per-database checks (e.g., "SchemaBot: staging/mysql/orders") provide granular
+// visibility per environment and database; the aggregate rolls them into a single
+// conclusion so branch protection only needs one stable name.
 const aggregateCheckName = "SchemaBot"
 
-// Sentinel values to store the aggregate check record in the checks table,
-// distinct from per-database checks which use real environment/type/database values.
-const (
-	aggregateEnvironment = "_aggregate"
-	aggregateDBType      = "_aggregate"
-	aggregateDBName      = "_aggregate"
-)
+// aggregateSentinel is used for environment, database type, and database name when
+// storing the aggregate check record in the checks table. Distinguishes it from
+// per-database checks which use real values.
+const aggregateSentinel = "_aggregate"
 
 // isAggregateCheck returns true if the check is the aggregate (not a per-database check).
 func isAggregateCheck(c *storage.Check) bool {
-	return c.Environment == aggregateEnvironment &&
-		c.DatabaseType == aggregateDBType &&
-		c.DatabaseName == aggregateDBName
+	return c.Environment == aggregateSentinel &&
+		c.DatabaseType == aggregateSentinel &&
+		c.DatabaseName == aggregateSentinel
 }
 
 // checkRunName returns the canonical check run name for a given environment, database type, and database.
@@ -349,6 +347,8 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		}
 	}
 
+	// No per-database checks means the PR doesn't touch schema files (or all check
+	// records were already deleted by PR close cleanup). No aggregate to create.
 	if len(dbChecks) == 0 {
 		h.logger.Debug("no per-database checks for aggregate", "repo", repo, "pr", pr)
 		return
@@ -371,7 +371,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	}
 
 	// Look up existing aggregate check record
-	existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, aggregateEnvironment, aggregateDBType, aggregateDBName)
+	existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, aggregateSentinel, aggregateSentinel, aggregateSentinel)
 	if err != nil {
 		h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "error", err)
 		return
@@ -388,6 +388,11 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		}
 		checkRunID = existing.CheckRunID
 	} else {
+		if existing != nil && existing.HeadSHA != headSHA {
+			h.logger.Info("re-creating aggregate check on new HEAD SHA",
+				"repo", repo, "pr", pr,
+				"old_sha", existing.HeadSHA, "new_sha", headSHA)
+		}
 		id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
 		if err != nil {
 			h.logger.Error("failed to create aggregate check run", "error", err)
@@ -400,9 +405,9 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 		Repository:   repo,
 		PullRequest:  pr,
 		HeadSHA:      headSHA,
-		Environment:  aggregateEnvironment,
-		DatabaseType: aggregateDBType,
-		DatabaseName: aggregateDBName,
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
 		CheckRunID:   checkRunID,
 		HasChanges:   conclusion != checkConclusionSuccess,
 		Status:       status,
