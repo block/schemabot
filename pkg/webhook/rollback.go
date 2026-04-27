@@ -289,6 +289,6 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 			h.logger.Error("failed to load apply for progress watch", "applyID", applyID, "error", err)
 			return
 		}
-		go h.watchApplyProgress(context.Background(), apply)
+		go h.watchApplyProgress(context.Background(), repo, pr, installationID, apply)
 	}
 }
