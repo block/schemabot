@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
@@ -143,18 +145,42 @@ func resolveApplyID(endpoint, applyID string) (string, string, error) {
 // confirmAction prompts the user for "yes" confirmation. Returns true if confirmed.
 func confirmAction(prompt, cancelMsg string) (bool, error) {
 	fmt.Print(prompt)
-	reader := bufio.NewReader(os.Stdin)
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		return false, fmt.Errorf("failed to read response: %w", err)
-	}
 
-	response = strings.TrimSpace(strings.ToLower(response))
-	if response != "yes" {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	responseCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(os.Stdin)
+		response, err := reader.ReadString('\n')
+		if err != nil {
+			errCh <- err
+			return
+		}
+		responseCh <- response
+	}()
+
+	select {
+	case <-sigCh:
 		fmt.Println(cancelMsg)
 		return false, nil
+	case err := <-errCh:
+		// EOF from Ctrl+D or closed stdin
+		fmt.Println(cancelMsg)
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to read response: %w", err)
+	case response := <-responseCh:
+		response = strings.TrimSpace(strings.ToLower(response))
+		if response != "yes" {
+			fmt.Println(cancelMsg)
+			return false, nil
+		}
+		return true, nil
 	}
-	return true, nil
 }
 
 // writeJSON writes v as pretty-printed JSON to stdout.
