@@ -27,6 +27,7 @@ type ApplyCmd struct {
 	Watch        bool          `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
 	DeferCutover bool          `help:"Defer cutover until manual trigger (use 'schemabot cutover')" name:"defer-cutover"`
 	SkipRevert   bool          `help:"Skip revert window after completion (Vitess only)" name:"skip-revert"`
+	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
 	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
 	Yield        bool          `help:"Yield lock after successful completion"`
@@ -106,7 +107,13 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Validate engine-specific options
 	if cmd.SkipRevert && planResult.Engine != "" && !state.IsPlanetScaleEngine(planResult.Engine) {
-		return fmt.Errorf("--skip-revert is only relevant for Vitess/PlanetScale databases")
+		return fmt.Errorf("--skip-revert is only supported for Vitess/PlanetScale databases")
+	}
+	if cmd.Branch != "" && planResult.Engine != "" && !state.IsPlanetScaleEngine(planResult.Engine) {
+		return fmt.Errorf("--branch is only supported for Vitess/PlanetScale databases")
+	}
+	if err := validateBranchFlag(cmd.Branch); err != nil {
+		return err
 	}
 
 	// Check for errors
@@ -229,7 +236,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying changes...")
 
-	if _, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.SkipRevert, cmd.Watch, cmd.Output, cmd.LogHeartbeat, opts); err != nil {
+	if _, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.SkipRevert, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat, opts); err != nil {
 		return err
 	}
 
@@ -935,4 +942,12 @@ func watchApplyProgressJSON(endpoint, applyID string) error {
 
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// validateBranchFlag checks that the --branch flag value is safe to use.
+func validateBranchFlag(branch string) error {
+	if branch == "main" {
+		return fmt.Errorf("cannot reuse the main branch — use a development branch")
+	}
+	return nil
 }

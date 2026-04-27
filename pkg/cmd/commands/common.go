@@ -261,7 +261,7 @@ func resolveControlFlags(endpoint, profile string, applyID, database, environmen
 // optionally watches progress. Returns the apply ID (for yield logic, etc.).
 // Used by both RunApply and RunRollback.
 func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, environment, caller, operation string,
-	deferCutover, skipRevert, watch bool, format OutputFormat, logHeartbeat time.Duration, opts ...client.PlanOptions) (string, error) {
+	deferCutover, skipRevert bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration, opts ...client.PlanOptions) (string, error) {
 
 	if planResult.PlanID == "" {
 		return "", fmt.Errorf("no plan_id in response")
@@ -273,6 +273,9 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	}
 	if skipRevert {
 		options["skip_revert"] = "true"
+	}
+	if branch != "" {
+		options["branch"] = branch
 	}
 
 	applyResult, err := client.CallApplyAPI(ep, planResult.PlanID, database, environment, caller, options, opts...)

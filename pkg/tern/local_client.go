@@ -913,10 +913,19 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			resp.Engine = eng
 		}
 		opts := storage.ParseApplyOptions(apply.Options)
-		if opts.Volume > 0 {
-			resp.Volume = int32(opts.Volume)
+		resp.Volume = int32(opts.Volume)
+		if opts.Branch != "" {
+			resp.Metadata = ensureMetadata(resp.Metadata)
+			resp.Metadata["existing_branch"] = opts.Branch
 		}
 	}
 
 	return resp, nil
+}
+
+func ensureMetadata(m map[string]string) map[string]string {
+	if m == nil {
+		return make(map[string]string)
+	}
+	return m
 }

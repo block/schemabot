@@ -88,7 +88,11 @@ func (m WatchModel) progressView() string {
 	case state.IsState(m.state, state.Apply.Stopped):
 		// No status line - show stopped message after tables
 	case state.IsState(m.state, state.Apply.CreatingBranch):
-		b.WriteString(m.spinner.View() + "Creating branch..." + m.elapsed() + "\n")
+		label := "Creating branch..."
+		if m.metadata != nil && m.metadata["existing_branch"] != "" {
+			label = "Refreshing branch schema..."
+		}
+		b.WriteString(m.spinner.View() + label + m.elapsed() + "\n")
 	case state.IsState(m.state, state.Apply.ApplyingBranchChanges):
 		b.WriteString(m.spinner.View() + "Applying changes to branch..." + m.elapsed() + "\n")
 	case state.IsState(m.state, state.Apply.CreatingDeployRequest):

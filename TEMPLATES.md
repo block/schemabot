@@ -2777,6 +2777,29 @@ Use 'schemabot start' to resume from checkpoint.
 </details>
 
 <details>
+<summary><a name="vitess-refreshing-branch-branch"></a><strong>Vitess: Refreshing Branch (--branch)</strong></summary>
+
+```
+
+┌──────────────────────────────────────────┐
+│  Apply ID:     apply-b7c8d9e0f1a2        │
+│  Database:     myapp                     │
+│  Environment:  staging                   │
+│  State:        Refreshing branch schema  │
+│  Branch:       my-reusable-branch        │
+└──────────────────────────────────────────┘
+
+
+  ── myapp_sharded ──
+
+     ~ users: ⏳ Queued
+       ALTER TABLE `users` ADD COLUMN `region` varchar(50);
+
+
+```
+</details>
+
+<details>
 <summary><a name="vitess-applying-branch-changes"></a><strong>Vitess: Applying Branch Changes</strong></summary>
 
 ```
