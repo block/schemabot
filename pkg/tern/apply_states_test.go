@@ -2,6 +2,8 @@ package tern
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"testing"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -94,6 +96,67 @@ func TestDeriveApplyPhase(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestApplyEventStateTransition(t *testing.T) {
+	logger := slog.Default()
+	succeedUpdate := func(_ *storage.Apply) error { return nil }
+	failUpdate := func(_ *storage.Apply) error { return fmt.Errorf("db unavailable") }
+
+	t.Run("transitions state on new event", func(t *testing.T) {
+		apply := &storage.Apply{State: state.Apply.Pending}
+		event := engine.ApplyEvent{NewState: state.Apply.PreparingBranch}
+
+		got := applyEventStateTransition(apply, event, succeedUpdate, logger)
+
+		assert.Equal(t, state.Apply.PreparingBranch, got)
+		assert.Equal(t, state.Apply.PreparingBranch, apply.State)
+	})
+
+	t.Run("skips write when state unchanged", func(t *testing.T) {
+		apply := &storage.Apply{State: state.Apply.ApplyingBranchChanges}
+		event := engine.ApplyEvent{NewState: state.Apply.ApplyingBranchChanges}
+
+		got := applyEventStateTransition(apply, event, succeedUpdate, logger)
+
+		assert.Empty(t, got)
+		assert.Equal(t, state.Apply.ApplyingBranchChanges, apply.State)
+	})
+
+	t.Run("skips informational event with no NewState", func(t *testing.T) {
+		apply := &storage.Apply{State: state.Apply.ApplyingBranchChanges}
+		event := engine.ApplyEvent{Message: "Applied keyspace ks1 (3/10)"}
+
+		got := applyEventStateTransition(apply, event, succeedUpdate, logger)
+
+		assert.Empty(t, got)
+		assert.Equal(t, state.Apply.ApplyingBranchChanges, apply.State)
+	})
+
+	t.Run("rolls back in-memory state on failed write", func(t *testing.T) {
+		apply := &storage.Apply{State: state.Apply.Pending}
+		event := engine.ApplyEvent{NewState: state.Apply.PreparingBranch}
+
+		got := applyEventStateTransition(apply, event, failUpdate, logger)
+
+		assert.Empty(t, got)
+		assert.Equal(t, state.Apply.Pending, apply.State, "state should be rolled back after failed write")
+	})
+
+	t.Run("retries after rollback", func(t *testing.T) {
+		apply := &storage.Apply{State: state.Apply.Pending}
+		event := engine.ApplyEvent{NewState: state.Apply.PreparingBranch}
+
+		// First attempt fails — state rolls back
+		got := applyEventStateTransition(apply, event, failUpdate, logger)
+		assert.Empty(t, got)
+		assert.Equal(t, state.Apply.Pending, apply.State)
+
+		// Second attempt with same event succeeds
+		got = applyEventStateTransition(apply, event, succeedUpdate, logger)
+		assert.Equal(t, state.Apply.PreparingBranch, got)
+		assert.Equal(t, state.Apply.PreparingBranch, apply.State)
+	})
 }
 
 func TestPlanNamespacesToChanges_VSchemaOnlyWhenStored(t *testing.T) {

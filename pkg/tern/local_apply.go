@@ -290,19 +290,9 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 			newState := deriveApplyPhase(event)
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 				event.Message, oldState, newState)
-			// Update apply state to reflect engine setup phases so the
-			// progress handler returns the current phase to the CLI.
-			// Skip if already in the target state to avoid redundant DB writes.
-			// Only update in-memory state after a successful write so a failed
-			// write can be retried on the next event.
-			if newState != "" && newState != oldState {
-				apply.State = newState
-				apply.UpdatedAt = time.Now()
-				if err := c.storage.Applies().Update(ctx, apply); err != nil {
-					c.logger.Error("failed to update apply phase", "apply_id", apply.ApplyIdentifier, "state", newState, "error", err)
-					apply.State = oldState
-				}
-			}
+			applyEventStateTransition(apply, event, func(a *storage.Apply) error {
+				return c.storage.Applies().Update(ctx, a)
+			}, c.logger)
 		},
 		OnStateChange: func(rs *engine.ResumeState) {
 			if rs == nil {
@@ -1056,6 +1046,26 @@ func deriveOverallState(tasks []*storage.Task) string {
 // Returns empty string if the event is informational (no state transition).
 func deriveApplyPhase(event engine.ApplyEvent) string {
 	return event.NewState
+}
+
+// applyEventStateTransition updates an apply's state based on an engine event.
+// Skips the write if the state hasn't changed. On DB write failure, rolls back
+// the in-memory state so the next event with the same NewState retries.
+// Returns the new state if a transition occurred, or empty string if skipped.
+func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, updateFn func(*storage.Apply) error, logger *slog.Logger) string {
+	oldState := apply.State
+	newState := deriveApplyPhase(event)
+	if newState == "" || newState == oldState {
+		return ""
+	}
+	apply.State = newState
+	apply.UpdatedAt = time.Now()
+	if err := updateFn(apply); err != nil {
+		logger.Error("failed to update apply phase", "apply_id", apply.ApplyIdentifier, "state", newState, "error", err)
+		apply.State = oldState
+		return ""
+	}
+	return newState
 }
 
 // planNamespacesToChanges converts stored plan namespace data to engine schema
