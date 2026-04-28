@@ -838,7 +838,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		emitEvent(engine.ApplyEvent{
 			Message:  fmt.Sprintf("Reusing branch %s", branchName),
 			Metadata: map[string]string{"branch": branchName},
-			NewState: state.Apply.CreatingBranch,
+			NewState: state.Apply.PreparingBranch,
 		})
 
 		// Verify branch exists
@@ -879,7 +879,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		emitEvent(engine.ApplyEvent{
 			Message:  fmt.Sprintf("Creating branch %s", branchName),
 			Metadata: map[string]string{"branch": branchName},
-			NewState: state.Apply.CreatingBranch,
+			NewState: state.Apply.PreparingBranch,
 		})
 
 		_, err = e.createBranch(ctx, client, org, req.Database, branchName, main)

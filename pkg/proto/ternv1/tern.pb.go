@@ -84,7 +84,7 @@ const (
 	State_STATE_STOPPED                 State = 8
 	State_STATE_REVERTED                State = 9
 	State_STATE_CANCELLED               State = 10
-	State_STATE_CREATING_BRANCH         State = 11
+	State_STATE_PREPARING_BRANCH        State = 11
 	State_STATE_APPLYING_BRANCH_CHANGES State = 12
 	State_STATE_CREATING_DEPLOY_REQUEST State = 13
 )
@@ -103,7 +103,7 @@ var (
 		8:  "STATE_STOPPED",
 		9:  "STATE_REVERTED",
 		10: "STATE_CANCELLED",
-		11: "STATE_CREATING_BRANCH",
+		11: "STATE_PREPARING_BRANCH",
 		12: "STATE_APPLYING_BRANCH_CHANGES",
 		13: "STATE_CREATING_DEPLOY_REQUEST",
 	}
@@ -119,7 +119,7 @@ var (
 		"STATE_STOPPED":                 8,
 		"STATE_REVERTED":                9,
 		"STATE_CANCELLED":               10,
-		"STATE_CREATING_BRANCH":         11,
+		"STATE_PREPARING_BRANCH":        11,
 		"STATE_APPLYING_BRANCH_CHANGES": 12,
 		"STATE_CREATING_DEPLOY_REQUEST": 13,
 	}
@@ -2369,7 +2369,7 @@ const file_tern_proto_rawDesc = "" +
 	"new_volume\x18\x04 \x01(\x05R\tnewVolume*3\n" +
 	"\x06Engine\x12\x11\n" +
 	"\rENGINE_SPIRIT\x10\x00\x12\x16\n" +
-	"\x12ENGINE_PLANETSCALE\x10\x01*\xdd\x02\n" +
+	"\x12ENGINE_PLANETSCALE\x10\x01*\xde\x02\n" +
 	"\x05State\x12\x1a\n" +
 	"\x16STATE_NO_ACTIVE_CHANGE\x10\x00\x12\x11\n" +
 	"\rSTATE_PENDING\x10\x01\x12\x11\n" +
@@ -2382,8 +2382,8 @@ const file_tern_proto_rawDesc = "" +
 	"\rSTATE_STOPPED\x10\b\x12\x12\n" +
 	"\x0eSTATE_REVERTED\x10\t\x12\x13\n" +
 	"\x0fSTATE_CANCELLED\x10\n" +
-	"\x12\x19\n" +
-	"\x15STATE_CREATING_BRANCH\x10\v\x12!\n" +
+	"\x12\x1a\n" +
+	"\x16STATE_PREPARING_BRANCH\x10\v\x12!\n" +
 	"\x1dSTATE_APPLYING_BRANCH_CHANGES\x10\f\x12!\n" +
 	"\x1dSTATE_CREATING_DEPLOY_REQUEST\x10\r*h\n" +
 	"\n" +

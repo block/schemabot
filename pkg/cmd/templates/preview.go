@@ -1094,7 +1094,7 @@ func previewCLIApplyAllOutput() {
 		{"MYSQL: MULTI-TABLE MIDDLE TABLE FAILED", previewSeqMidFailOutput},
 		{"MYSQL: MULTI-TABLE STOPPED", previewSeqStoppedOutput},
 		// Vitess: PlanetScale lifecycle
-		{"VITESS: CREATING BRANCH", previewCreatingBranchOutput},
+		{"VITESS: PREPARING BRANCH", previewPreparingBranchOutput},
 		{"VITESS: REFRESHING BRANCH (--branch)", previewRefreshingBranchOutput},
 		{"VITESS: APPLYING BRANCH CHANGES", previewApplyingBranchChangesOutput},
 		{"VITESS: CREATING DEPLOY REQUEST", previewCreatingDeployRequestOutput},

@@ -87,8 +87,8 @@ func (m WatchModel) progressView() string {
 		// No status line for completed - just show completion message after tables
 	case state.IsState(m.state, state.Apply.Stopped):
 		// No status line - show stopped message after tables
-	case state.IsState(m.state, state.Apply.CreatingBranch):
-		label := "Creating branch..."
+	case state.IsState(m.state, state.Apply.PreparingBranch):
+		label := "Preparing branch..."
 		if m.metadata != nil && m.metadata["existing_branch"] != "" {
 			label = "Refreshing branch schema..."
 		}

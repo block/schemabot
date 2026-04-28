@@ -21,20 +21,20 @@ func TestDeriveApplyPhase(t *testing.T) {
 		wantNoChange bool
 	}{
 		{
-			name: "creating branch transitions to creating_branch",
+			name: "preparing branch transitions to preparing_branch",
 			event: engine.ApplyEvent{
 				Message:  "Creating branch schemabot-boardgames-123",
-				NewState: state.Apply.CreatingBranch,
+				NewState: state.Apply.PreparingBranch,
 			},
-			wantState: state.Apply.CreatingBranch,
+			wantState: state.Apply.PreparingBranch,
 		},
 		{
-			name: "reusing branch transitions to creating_branch",
+			name: "reusing branch transitions to preparing_branch",
 			event: engine.ApplyEvent{
 				Message:  "Reusing branch dr-branch-reuse",
-				NewState: state.Apply.CreatingBranch,
+				NewState: state.Apply.PreparingBranch,
 			},
-			wantState: state.Apply.CreatingBranch,
+			wantState: state.Apply.PreparingBranch,
 		},
 		{
 			name: "branch ready transitions to applying_branch_changes",

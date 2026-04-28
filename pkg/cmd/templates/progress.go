@@ -59,12 +59,12 @@ func WriteProgress(data ProgressData) {
 
 	// Build key/value pairs for the detail box
 	displayState := StateLabel(data.State)
-	if data.State == state.Apply.CreatingBranch && data.Metadata != nil && data.Metadata["existing_branch"] != "" {
+	if data.State == state.Apply.PreparingBranch && data.Metadata != nil && data.Metadata["existing_branch"] != "" {
 		displayState = "Refreshing branch schema"
 	}
 	// Show latest event detail during setup phases
 	if data.Metadata != nil && data.Metadata["status_detail"] != "" {
-		if state.IsState(data.State, state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest) {
+		if state.IsState(data.State, state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest) {
 			displayState = data.Metadata["status_detail"]
 		}
 	}
@@ -351,8 +351,8 @@ func FormatProgressState(s string) string {
 		return "No active schema change"
 	case state.Apply.Pending:
 		return "⏳ Starting..."
-	case state.Apply.CreatingBranch:
-		return ANSICyan + "🔄 Creating branch..." + ANSIReset
+	case state.Apply.PreparingBranch:
+		return ANSICyan + "🔄 Preparing branch..." + ANSIReset
 	case state.Apply.ApplyingBranchChanges:
 		return ANSICyan + "🔄 Applying changes to branch..." + ANSIReset
 	case state.Apply.CreatingDeployRequest:
@@ -818,8 +818,8 @@ func StateLabel(s string) string {
 		return "Pending"
 	case state.Apply.Cancelled:
 		return "Cancelled"
-	case state.Apply.CreatingBranch:
-		return "Creating branch"
+	case state.Apply.PreparingBranch:
+		return "Preparing branch"
 	case state.Apply.ApplyingBranchChanges:
 		return "Applying changes to branch"
 	case state.Apply.CreatingDeployRequest:
@@ -850,7 +850,7 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIRed)
 	case state.Apply.Pending:
 		return colorWrap(ANSIDim)
-	case state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest:
+	case state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest:
 		return colorWrap(ANSICyan)
 	case state.Apply.Reverted:
 		return colorWrap(ANSIRed)

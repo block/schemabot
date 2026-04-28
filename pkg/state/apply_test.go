@@ -236,7 +236,7 @@ func TestDeriveApplyState_Scenario_UserCancellation(t *testing.T) {
 func TestIsBranchSetupPhase(t *testing.T) {
 	setupPhases := []string{
 		Apply.Pending,
-		Apply.CreatingBranch,
+		Apply.PreparingBranch,
 		Apply.ApplyingBranchChanges,
 		Apply.CreatingDeployRequest,
 	}

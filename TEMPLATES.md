@@ -2755,7 +2755,7 @@ Use 'schemabot start' to resume from checkpoint.
 </details>
 
 <details>
-<summary><a name="vitess-creating-branch"></a><strong>Vitess: Creating Branch</strong></summary>
+<summary><a name="vitess-preparing-branch"></a><strong>Vitess: Preparing Branch</strong></summary>
 
 ```
 
@@ -2763,7 +2763,7 @@ Use 'schemabot start' to resume from checkpoint.
 │  Apply ID:     apply-a1b2c3d4e5f6  │
 │  Database:     myapp               │
 │  Environment:  staging             │
-│  State:        Creating branch     │
+│  State:        Preparing branch    │
 └────────────────────────────────────┘
 
 

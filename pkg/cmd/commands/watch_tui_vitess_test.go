@@ -132,16 +132,16 @@ func TestTUIBranchApplyProgress(t *testing.T) {
 			absent:   []string{"Queued", "users", "──"},
 		},
 		{
-			name:  "creating branch with existing_branch shows refreshing",
-			state: state.Apply.CreatingBranch,
+			name:  "preparing branch with existing_branch shows refreshing",
+			state: state.Apply.PreparingBranch,
 			metadata: map[string]string{
 				"existing_branch": "my-branch",
 			},
 			contains: []string{"Refreshing branch schema..."},
 		},
 		{
-			name:  "creating branch with status_detail overrides label",
-			state: state.Apply.CreatingBranch,
+			name:  "preparing branch with status_detail overrides label",
+			state: state.Apply.PreparingBranch,
 			metadata: map[string]string{
 				"existing_branch": "my-branch",
 				"status_detail":   "Refreshing schema for branch my-branch from main",

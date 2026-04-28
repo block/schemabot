@@ -254,7 +254,7 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 	changes := planNamespacesToChanges(plan.Namespaces)
 
 	// For Vitess: initialize the VitessApplyData row before the engine starts.
-	// State transitions (creating_branch, applying_branch_changes, etc.) are
+	// State transitions (preparing_branch, applying_branch_changes, etc.) are
 	// handled by the engine via ApplyEvent.NewState in the OnEvent callback.
 	if c.config.Type == storage.DatabaseTypeVitess {
 		if err := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
