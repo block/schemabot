@@ -12,6 +12,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/block/schemabot/pkg/schema"
@@ -401,4 +402,27 @@ type Config struct {
 	// Timeouts
 	BranchTimeout time.Duration // Timeout for branch creation/readiness
 	DeployTimeout time.Duration // Timeout for deploy operations
+}
+
+// RetryableError wraps an error to indicate it is transient and the operation
+// can be retried. Engines return this for known-recoverable failures like
+// network timeouts, schema snapshots in progress, or binlog streaming errors.
+type RetryableError struct {
+	Err error
+}
+
+func (e *RetryableError) Error() string { return e.Err.Error() }
+func (e *RetryableError) Unwrap() error { return e.Err }
+
+// NewRetryableError wraps an error as retryable.
+func NewRetryableError(err error) error {
+	return &RetryableError{Err: err}
+}
+
+// IsRetryable returns true if the error (or any error in its chain) is a
+// RetryableError. Used by the apply orchestration to decide between
+// FailedRetryable and Failed states.
+func IsRetryable(err error) bool {
+	var re *RetryableError
+	return errors.As(err, &re)
 }
