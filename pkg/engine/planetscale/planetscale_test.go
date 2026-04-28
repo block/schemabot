@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -377,9 +378,36 @@ func TestRetryDelay(t *testing.T) {
 	})
 }
 
-func TestIsDeployValidating(t *testing.T) {
-	assert.True(t, isDeployValidating(fmt.Errorf("We're currently validating that these changes are safe to deploy. Please try again in a few moments.")))
-	assert.True(t, isDeployValidating(fmt.Errorf("something something try again later")))
-	assert.False(t, isDeployValidating(fmt.Errorf("deploy request failed")))
-	assert.False(t, isDeployValidating(nil))
+func TestIsRetryablePSError(t *testing.T) {
+	t.Run("PS SDK ErrRetry is retryable", func(t *testing.T) {
+		assert.True(t, isRetryablePSError(&ps.Error{Code: ps.ErrRetry}))
+	})
+
+	t.Run("PS SDK ErrInternal is retryable", func(t *testing.T) {
+		assert.True(t, isRetryablePSError(&ps.Error{Code: ps.ErrInternal}))
+	})
+
+	t.Run("PS SDK ErrResponseMalformed is retryable", func(t *testing.T) {
+		assert.True(t, isRetryablePSError(&ps.Error{Code: ps.ErrResponseMalformed}))
+	})
+
+	t.Run("PS SDK ErrNotFound is NOT retryable", func(t *testing.T) {
+		assert.False(t, isRetryablePSError(&ps.Error{Code: ps.ErrNotFound}))
+	})
+
+	t.Run("PS SDK ErrPermission is NOT retryable", func(t *testing.T) {
+		assert.False(t, isRetryablePSError(&ps.Error{Code: ps.ErrPermission}))
+	})
+
+	t.Run("snapshot in progress is retryable", func(t *testing.T) {
+		assert.True(t, isRetryablePSError(fmt.Errorf("schema snapshot is in progress")))
+	})
+
+	t.Run("plain error is NOT retryable", func(t *testing.T) {
+		assert.False(t, isRetryablePSError(fmt.Errorf("DDL syntax error")))
+	})
+
+	t.Run("nil is NOT retryable", func(t *testing.T) {
+		assert.False(t, isRetryablePSError(nil))
+	})
 }

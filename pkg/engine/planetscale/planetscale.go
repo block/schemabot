@@ -1051,7 +1051,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		if strings.Contains(deployErr.Error(), "approved") {
 			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", drNumber)
 		}
-		if !isDeployValidating(deployErr) {
+		if !isRetryablePSError(deployErr) {
 			return nil, fmt.Errorf("deploy deploy request #%d: %w", drNumber, deployErr)
 		}
 	}
@@ -1193,12 +1193,22 @@ func isSnapshotInProgress(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "schema snapshot is in progress")
 }
 
-// isDeployValidating returns true if the error indicates PlanetScale is still
-// validating the deploy request (e.g., "please try again in a few moments").
-// This is a transient race where the deploy request reports "ready" but the
-// deploy endpoint rejects the call because validation is still running.
-func isDeployValidating(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "try again")
+// isRetryablePSError returns true if the error is a transient PlanetScale
+// condition that may succeed on retry. Uses the SDK's typed error codes
+// (e.g., ps.ErrRetry for 422, ps.ErrInternal for 500) and falls back to
+// message matching for errors outside the SDK.
+func isRetryablePSError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var psErr *ps.Error
+	if errors.As(err, &psErr) {
+		switch psErr.Code {
+		case ps.ErrRetry, ps.ErrInternal, ps.ErrResponseMalformed:
+			return true
+		}
+	}
+	return isSnapshotInProgress(err)
 }
 
 // retryDelay returns the backoff duration for a retry attempt using
