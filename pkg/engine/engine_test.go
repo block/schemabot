@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -112,4 +113,32 @@ func TestEncodeResumeState_Nil(t *testing.T) {
 	encoded, err := EncodeResumeState(nil)
 	require.NoError(t, err)
 	assert.Equal(t, "", encoded)
+}
+
+func TestIsRetryable(t *testing.T) {
+	t.Run("RetryableError is retryable", func(t *testing.T) {
+		err := NewRetryableError(fmt.Errorf("schema snapshot is in progress"))
+		assert.True(t, IsRetryable(err))
+	})
+
+	t.Run("wrapped RetryableError is retryable", func(t *testing.T) {
+		err := fmt.Errorf("apply failed: %w", NewRetryableError(fmt.Errorf("connection refused")))
+		assert.True(t, IsRetryable(err))
+	})
+
+	t.Run("plain error is not retryable", func(t *testing.T) {
+		err := fmt.Errorf("DDL syntax error")
+		assert.False(t, IsRetryable(err))
+	})
+
+	t.Run("nil is not retryable", func(t *testing.T) {
+		assert.False(t, IsRetryable(nil))
+	})
+}
+
+func TestRetryableError_Unwrap(t *testing.T) {
+	inner := fmt.Errorf("network timeout")
+	err := NewRetryableError(inner)
+	assert.ErrorIs(t, err, inner)
+	assert.Contains(t, err.Error(), "network timeout")
 }
