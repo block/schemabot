@@ -21,6 +21,22 @@ func TestDeriveApplyPhase(t *testing.T) {
 		wantNoChange bool
 	}{
 		{
+			name: "creating branch transitions to creating_branch",
+			event: engine.ApplyEvent{
+				Message:  "Creating branch schemabot-boardgames-123",
+				NewState: state.Apply.CreatingBranch,
+			},
+			wantState: state.Apply.CreatingBranch,
+		},
+		{
+			name: "reusing branch transitions to creating_branch",
+			event: engine.ApplyEvent{
+				Message:  "Reusing branch dr-branch-reuse",
+				NewState: state.Apply.CreatingBranch,
+			},
+			wantState: state.Apply.CreatingBranch,
+		},
+		{
 			name: "branch ready transitions to applying_branch_changes",
 			event: engine.ApplyEvent{
 				Message:  "Branch schemabot-boardgames-123 ready (44s)",
@@ -57,14 +73,6 @@ func TestDeriveApplyPhase(t *testing.T) {
 			event: engine.ApplyEvent{
 				Message:  "Applied keyspace commerce_sharded_015 (12/33)",
 				Metadata: map[string]string{"keyspace": "commerce_sharded_015"},
-			},
-			wantNoChange: true,
-		},
-		{
-			name: "creating branch — no transition",
-			event: engine.ApplyEvent{
-				Message:  "Creating branch schemabot-boardgames-123",
-				Metadata: map[string]string{"branch": "schemabot-boardgames-123"},
 			},
 			wantNoChange: true,
 		},

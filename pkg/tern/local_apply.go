@@ -253,16 +253,10 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 	}
 	changes := planNamespacesToChanges(plan.Namespaces)
 
-	// For Vitess: set apply state to creating_branch before the engine call.
-	// eng.Apply() blocks during branch creation and deploy request setup, so
-	// this state is what the progress handler returns during that period.
+	// For Vitess: initialize the VitessApplyData row before the engine starts.
+	// State transitions (creating_branch, applying_branch_changes, etc.) are
+	// handled by the engine via ApplyEvent.NewState in the OnEvent callback.
 	if c.config.Type == storage.DatabaseTypeVitess {
-		apply.State = state.Apply.CreatingBranch
-		apply.UpdatedAt = time.Now()
-		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.CreatingBranch, "error", err)
-		}
-
 		if err := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
 			ApplyID:          apply.ID,
 			MigrationContext: apply.ApplyIdentifier,
