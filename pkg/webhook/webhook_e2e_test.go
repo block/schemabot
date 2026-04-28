@@ -71,6 +71,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -373,13 +374,15 @@ func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[stri
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
 
-	// Capture check run creates
+	// Capture check run creates (incrementing IDs so aggregate can distinguish create vs update)
+	var checkRunIDCounter atomic.Int64
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
+		id := checkRunIDCounter.Add(1)
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 
 	// Capture check run updates (PATCH)
@@ -440,7 +443,7 @@ func TestE2EPlanWithChanges(t *testing.T) {
 		t.Fatal("timed out waiting for plan comment")
 	}
 
-	// Verify check run was created
+	// Verify check run was created (per-database + aggregate)
 	select {
 	case cr := <-result.checkRuns:
 		assert.Contains(t, cr.Name, "SchemaBot")
@@ -670,7 +673,7 @@ func TestE2EMultiEnvPlan(t *testing.T) {
 		t.Fatal("timed out waiting for multi-env plan comment")
 	}
 
-	// Should get check runs for both environments
+	// Should get check runs for both environments (plus aggregate updates on the channel)
 	checkRunNames := make(map[string]bool)
 	for i := range 2 {
 		select {
@@ -1059,6 +1062,230 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	t.Cleanup(func() { _ = svc.Close() })
 
 	return svc
+}
+
+// TestE2EAggregateCheck verifies that a multi-env plan creates a single aggregate
+// "SchemaBot" check run that rolls up per-database checks, and that the aggregate
+// record is persisted in storage with the correct conclusion.
+func TestE2EAggregateCheck(t *testing.T) {
+	dbName := "webhook_aggregate_check"
+	svc := setupE2EServiceMultiEnv(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n  - production\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	// Trigger multi-env plan
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// Drain the comment
+	select {
+	case <-result.comments:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
+	}
+
+	// Collect all check runs: 2 per-database + 1 aggregate = 3 total
+	checkRuns := make(map[string]checkRunCapture)
+	for range 3 {
+		select {
+		case cr := <-result.checkRuns:
+			checkRuns[cr.Name] = cr
+		case <-time.After(30 * time.Second):
+			t.Fatalf("timed out waiting for check runs, got %d so far: %v", len(checkRuns), checkRuns)
+		}
+	}
+
+	// Per-database checks exist
+	assert.Contains(t, checkRuns, "SchemaBot: staging/mysql/"+dbName)
+	assert.Contains(t, checkRuns, "SchemaBot: production/mysql/"+dbName)
+
+	// Aggregate check exists with correct conclusion
+	aggCR, ok := checkRuns["SchemaBot"]
+	require.True(t, ok, "expected aggregate check run named 'SchemaBot'")
+	assert.Equal(t, "completed", aggCR.Status)
+	assert.Equal(t, "action_required", aggCR.Conclusion)
+
+	// Verify aggregate check record persisted in storage
+	ctx := t.Context()
+	aggCheck, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
+		aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, aggCheck, "expected aggregate check record in storage")
+	assert.Equal(t, "action_required", aggCheck.Conclusion)
+	assert.Equal(t, "completed", aggCheck.Status)
+	assert.True(t, aggCheck.HasChanges)
+	assert.Equal(t, "abc123", aggCheck.HeadSHA)
+}
+
+// TestE2EAggregateCheckStaleCleanup verifies that when a new commit removes all schema
+// changes from a PR, the stale per-database checks and aggregate check are re-created
+// on the new HEAD SHA with "success" conclusion. This reproduces the scenario where a
+// user pushes a commit that reverts their schema change.
+func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
+	dbName := "webhook_aggregate_stale"
+	svc := setupE2EServiceMultiEnv(t, dbName)
+	ctx := t.Context()
+
+	// Seed per-database checks and aggregate as if a plan already ran on the first commit.
+	for _, env := range []string{"staging", "production"} {
+		check := &storage.Check{
+			Repository:   "octocat/hello-world",
+			PullRequest:  1,
+			HeadSHA:      "oldsha111",
+			Environment:  env,
+			DatabaseType: "mysql",
+			DatabaseName: dbName,
+			CheckRunID:   100,
+			HasChanges:   true,
+			Status:       checkStatusCompleted,
+			Conclusion:   checkConclusionActionRequired,
+		}
+		require.NoError(t, svc.Storage().Checks().Upsert(ctx, check))
+	}
+	aggCheck := &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
+		CheckRunID:   200,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionActionRequired,
+	}
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, aggCheck))
+
+	// Set up fake GitHub server that returns NO changed files (simulating revert commit)
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// PR info with new HEAD SHA
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{
+				Ref: new("feature-branch"),
+				SHA: new("newsha222"),
+			},
+			Base: &gh.PullRequestBranch{
+				Ref: new("main"),
+				SHA: new("def456"),
+			},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	// Empty PR files — the revert commit means no schema files changed
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{})
+	})
+
+	// Capture check run creates on the new SHA
+	checkRuns := make(chan checkRunCapture, 10)
+	var checkRunIDCounter atomic.Int64
+	checkRunIDCounter.Store(300)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		id := checkRunIDCounter.Add(1)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
+	})
+
+	h := newE2EHandler(t, svc, client)
+
+	// Send synchronize event with new HEAD SHA
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "synchronize",
+		headSHA: "newsha222",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// cleanupStaleChecks runs async via goSafe — collect the 3 new check runs
+	// (2 per-database + 1 aggregate, all created on the new SHA with success)
+	newCheckRuns := make(map[string]checkRunCapture)
+	for range 3 {
+		select {
+		case cr := <-checkRuns:
+			newCheckRuns[cr.Name] = cr
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for stale cleanup check runs, got %d: %v", len(newCheckRuns), newCheckRuns)
+		}
+	}
+
+	// Per-database checks re-created as success
+	for _, name := range []string{
+		"SchemaBot: staging/mysql/" + dbName,
+		"SchemaBot: production/mysql/" + dbName,
+	} {
+		cr, ok := newCheckRuns[name]
+		require.True(t, ok, "expected check run %s", name)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+	}
+
+	// Aggregate check re-created as success
+	aggCR, ok := newCheckRuns[aggregateCheckName]
+	require.True(t, ok, "expected aggregate check run")
+	assert.Equal(t, checkStatusCompleted, aggCR.Status)
+	assert.Equal(t, checkConclusionSuccess, aggCR.Conclusion)
+
+	// Verify storage records updated with new SHA
+	for _, env := range []string{"staging", "production"} {
+		check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, env, "mysql", dbName)
+		require.NoError(t, err)
+		require.NotNil(t, check)
+		assert.Equal(t, "newsha222", check.HeadSHA, "check should have new HEAD SHA")
+		assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+		assert.False(t, check.HasChanges)
+	}
+
+	// Poll for aggregate storage update — the Upsert runs after the GitHub API call
+	// that sends the check run to the channel, so there's a brief race.
+	var storedAgg *storage.Check
+	var aggErr error
+	deadline2 := time.After(5 * time.Second)
+	for {
+		storedAgg, aggErr = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
+			aggregateSentinel, aggregateSentinel, aggregateSentinel)
+		if aggErr == nil && storedAgg != nil && storedAgg.HeadSHA == "newsha222" {
+			break
+		}
+		select {
+		case <-deadline2:
+			t.Fatal("timed out waiting for aggregate storage update")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	assert.Equal(t, checkConclusionSuccess, storedAgg.Conclusion)
+	assert.False(t, storedAgg.HasChanges)
 }
 
 // TestE2EPlanUsesRepoDeployment verifies that the webhook plan handler routes
@@ -1702,14 +1929,20 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 		t.Fatal("timed out waiting for plan comment")
 	}
 
-	// Check runs should be for payments only
-	var checkNames []string
+	// Check runs should be for payments only (1 per-database + 1 aggregate).
+	// This test uses a single-env setup, so expect exactly 1 per-database check.
+	var perDBCheckNames []string
+	hasAggregate := false
 	deadline := time.After(5 * time.Second)
 	for {
 		select {
 		case cr := <-result.checkRuns:
-			checkNames = append(checkNames, cr.Name)
-			if len(checkNames) >= 2 { // staging + production
+			if cr.Name == aggregateCheckName {
+				hasAggregate = true
+			} else {
+				perDBCheckNames = append(perDBCheckNames, cr.Name)
+			}
+			if len(perDBCheckNames) >= 1 && hasAggregate {
 				goto checksDone
 			}
 		case <-deadline:
@@ -1717,7 +1950,9 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 		}
 	}
 checksDone:
-	for _, name := range checkNames {
+	assert.True(t, hasAggregate, "expected aggregate check run")
+	require.NotEmpty(t, perDBCheckNames, "expected at least one per-database check run")
+	for _, name := range perDBCheckNames {
 		assert.Contains(t, name, "payments", "check run should be for payments: %s", name)
 		assert.NotContains(t, name, "orders", "check run should NOT be for orders: %s", name)
 	}

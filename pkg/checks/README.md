@@ -16,7 +16,15 @@ A GitHub Check Run has:
 
 ## Check Run Naming
 
-One check per (environment, database type, database name):
+**Aggregate check** (one per PR):
+
+```
+SchemaBot
+```
+
+This is the only check that needs to be required in branch protection. It rolls up all per-database checks into a single conclusion.
+
+**Per-database checks** (one per environment × database, informational):
 
 ```
 SchemaBot: staging/mysql/payments
@@ -24,7 +32,7 @@ SchemaBot: production/mysql/payments
 SchemaBot: staging/vitess/commerce
 ```
 
-A PR touching one database gets 2 checks (staging + production). A PR touching 3 databases gets 6 checks.
+A PR touching one database gets 2 per-database checks (staging + production) plus 1 aggregate. A PR touching 3 databases gets 6 per-database checks plus 1 aggregate.
 
 ## Lifecycle
 
@@ -253,6 +261,56 @@ When new commits are pushed (`synchronize`), SchemaBot re-discovers which databa
 
 When a PR is closed (merged or not), all locks held by the PR are released and all check records are deleted from storage.
 
-## Aggregate Checks (Future)
+## Aggregate Check
 
-For monorepos with many apps, a single `SchemaBot` aggregate check can roll up all per-database checks. Branch protection requires only the aggregate — per-database checks remain informational.
+The `SchemaBot` aggregate check rolls up all per-database checks into a single conclusion. This solves the monorepo problem: you can't require dynamic per-database check names in branch protection because different PRs produce different names, and new databases would require branch protection updates.
+
+### Aggregate Logic
+
+Priority order (first match wins):
+
+1. ANY per-database check `in_progress` → aggregate status `in_progress`
+2. ANY per-database check `failure` → aggregate `failure`
+3. ANY per-database check `action_required` → aggregate `action_required`
+4. ALL per-database checks `success` → aggregate `success`
+
+PRs that don't touch schema files get no aggregate check — they aren't blocked.
+
+### Branch Protection Setup
+
+Require the `SchemaBot` status check in branch protection. This is a one-time setup that never changes.
+
+**Via the GitHub UI** (after SchemaBot has run on at least one PR):
+
+1. Go to **Settings → Branches → Branch protection rules**
+2. Edit (or add) a rule for your default branch
+3. Enable **Require status checks to pass before merging**
+4. Search for `SchemaBot` in the status check dropdown and select it
+
+**Via the GitHub API** (works before SchemaBot has ever run):
+
+```bash
+gh api repos/{owner}/{repo}/branches/{branch}/protection \
+  --method PUT \
+  --input - <<'EOF'
+{
+  "required_status_checks": {
+    "strict": false,
+    "contexts": ["SchemaBot"]
+  },
+  "enforce_admins": null,
+  "required_pull_request_reviews": null,
+  "restrictions": null
+}
+EOF
+```
+
+### SHA Tracking
+
+Check runs are tied to a specific commit SHA. When new commits are pushed:
+
+- Per-database checks for removed databases are **re-created** on the new SHA as `success`
+- The aggregate check is **re-created** on the new SHA (not updated on the old one)
+- Per-database checks for still-affected databases are re-created by the auto-plan
+
+This ensures all checks are visible on the current HEAD commit in the PR.

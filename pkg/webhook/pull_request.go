@@ -96,9 +96,11 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 		affectedDatabases[cfg.Config.Database] = true
 	}
 
-	// Clean up stale checks from databases no longer in the PR
+	// Clean up stale checks from databases no longer in the PR.
+	// Pass the new HEAD SHA so cleanup can create new check runs on the correct commit.
+	headSHA := payload.PullRequest.Head.SHA
 	h.goSafe(repo, pr, installationID, func() {
-		h.cleanupStaleChecks(repo, pr, installationID, affectedDatabases)
+		h.cleanupStaleChecks(repo, pr, headSHA, installationID, affectedDatabases)
 	})
 
 	if len(configs) == 0 {
@@ -155,7 +157,11 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 // cleanupStaleChecks marks checks for databases no longer in the PR as "success".
 // This handles the case where a user removes a schema change from the PR — the old
 // check would otherwise stay at "action_required" and block merge.
-func (h *Handler) cleanupStaleChecks(repo string, pr int, installationID int64, affectedDatabases map[string]bool) {
+//
+// On synchronize events, headSHA is the new commit SHA. Stale checks must be created
+// as new check runs on this SHA (not updated on the old SHA) so GitHub shows them
+// on the current commit.
+func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, installationID int64, affectedDatabases map[string]bool) {
 	if h.service == nil {
 		return
 	}
@@ -169,7 +175,15 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, installationID int64, 
 		return
 	}
 
+	var client *ghclient.InstallationClient
+	cleaned := false
+
 	for _, check := range checks {
+		// Skip the aggregate check — it's recomputed, not cleaned up
+		if isAggregateCheck(check) {
+			continue
+		}
+
 		if affectedDatabases[check.DatabaseName] {
 			continue // still affected, not stale
 		}
@@ -180,34 +194,46 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, installationID int64, 
 			"database", check.DatabaseName, "environment", check.Environment,
 			"previous_conclusion", check.Conclusion)
 
-		if check.CheckRunID > 0 {
-			client, err := h.ghClient.ForInstallation(installationID)
+		if client == nil {
+			client, err = h.ghClient.ForInstallation(installationID)
 			if err != nil {
 				h.logger.Error("failed to create GitHub client for stale check cleanup", "error", err)
-				continue
-			}
-
-			checkName := checkRunName(check.Environment, check.DatabaseType, check.DatabaseName)
-			opts := ghclient.CheckRunOptions{
-				Name:       checkName,
-				Status:     "completed",
-				Conclusion: "success",
-				Output: &ghclient.CheckRunOutput{
-					Title:   "No schema changes",
-					Summary: "Schema files for this database were removed from the PR.",
-				},
-			}
-			if err := client.UpdateCheckRun(ctx, repo, check.CheckRunID, opts); err != nil {
-				h.logger.Error("failed to update stale check run", "checkRunID", check.CheckRunID, "error", err)
+				return
 			}
 		}
 
-		// Update stored check record to reflect success
-		check.Conclusion = "success"
+		// Create a new check run on the current HEAD SHA so it shows on the latest commit.
+		// Updating the old check run (tied to the previous SHA) would be invisible in the PR.
+		checkName := checkRunName(check.Environment, check.DatabaseType, check.DatabaseName)
+		opts := ghclient.CheckRunOptions{
+			Name:       checkName,
+			Status:     checkStatusCompleted,
+			Conclusion: checkConclusionSuccess,
+			Output: &ghclient.CheckRunOutput{
+				Title:   "No schema changes",
+				Summary: "Schema files for this database were removed from the PR.",
+			},
+		}
+		newCheckRunID, createErr := client.CreateCheckRun(ctx, repo, headSHA, opts)
+		if createErr != nil {
+			h.logger.Error("failed to create stale check run on new SHA", "error", createErr)
+			continue
+		}
+
+		// Update stored check record with new check run ID and SHA
+		check.CheckRunID = newCheckRunID
+		check.HeadSHA = headSHA
+		check.Conclusion = checkConclusionSuccess
 		check.HasChanges = false
-		check.Status = "completed"
+		check.Status = checkStatusCompleted
 		if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
 			h.logger.Error("failed to update stale check record", "checkID", check.ID, "error", err)
 		}
+		cleaned = true
+	}
+
+	// Recompute aggregate on the new HEAD SHA after cleaning up stale checks
+	if cleaned && client != nil {
+		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 }
