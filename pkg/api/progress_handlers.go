@@ -32,7 +32,13 @@ func changeTypeToString(ct ternv1.ChangeType) string {
 // deriveErrorCode returns an error code based on apply state
 // and error message. Returns empty string when no error code applies.
 func deriveErrorCode(applyState, errorMessage string) string {
-	if errorMessage != "" && state.IsState(applyState, state.Apply.Failed) {
+	if errorMessage == "" {
+		return ""
+	}
+	if state.IsState(applyState, state.Apply.FailedRetryable) {
+		return apitypes.ErrCodeEngineErrorRetryable
+	}
+	if state.IsState(applyState, state.Apply.Failed) {
 		return apitypes.ErrCodeEngineError
 	}
 	return ""

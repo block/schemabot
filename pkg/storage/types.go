@@ -296,6 +296,11 @@ type Apply struct {
 	// Use ParseApplyOptions() to get typed access.
 	Options []byte
 
+	// Attempt tracks how many times this apply has been dispatched.
+	// Incremented on each recovery attempt. When Attempt >= MaxAttempts,
+	// the apply transitions from FailedRetryable to Failed (permanent).
+	Attempt int
+
 	// CreatedAt is when the apply was created.
 	CreatedAt time.Time
 
@@ -405,6 +410,10 @@ type Task struct {
 
 	// Options contains engine-specific options as JSON.
 	Options []byte
+
+	// Attempt tracks how many times this task has been dispatched.
+	// Incremented on each recovery attempt.
+	Attempt int
 
 	// Namespace is the schema name (MySQL) or keyspace (Vitess) this table belongs to.
 	Namespace string

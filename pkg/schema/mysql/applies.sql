@@ -16,6 +16,7 @@ CREATE TABLE `applies` (
   `state` varchar(100) NOT NULL,
   `error_message` text,
   `options` json NOT NULL,
+  `attempt` int unsigned NOT NULL DEFAULT '0',
   `started_at` datetime DEFAULT NULL,
   `completed_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,

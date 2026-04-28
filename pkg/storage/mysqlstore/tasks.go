@@ -17,7 +17,7 @@ import (
 // taskColumns lists all columns for SELECT queries.
 const taskColumns = `id, task_identifier, apply_id, plan_id, database_name, database_type,
 	namespace, table_name, ddl, ddl_action,
-	engine, repository, pull_request, environment, state, error_message, options,
+	engine, repository, pull_request, environment, state, error_message, options, attempt,
 	rows_copied, rows_total, progress_percent, eta_seconds,
 	is_instant, ready_to_complete, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
@@ -255,6 +255,7 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 		&task.State,
 		&errorMsg,
 		&options,
+		&task.Attempt,
 		&task.RowsCopied,
 		&task.RowsTotal,
 		&task.ProgressPercent,

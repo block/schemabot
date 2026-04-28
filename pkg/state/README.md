@@ -22,7 +22,8 @@ Vitess OnlineDDL and Spirit report — and they are translated into Task and App
 | WaitingForCutover | `waiting_for_cutover` | All tasks ready, waiting for manual cutover (atomic mode only — in sequential mode each task cuts over independently) |
 | CuttingOver | `cutting_over` | Cutover in progress (atomic mode only) |
 | Completed | `completed` | All tasks finished successfully |
-| Failed | `failed` | At least one task failed |
+| Failed | `failed` | At least one task failed permanently |
+| FailedRetryable | `failed_retryable` | Transient failure, recovery loop will retry (not terminal) |
 | Stopped | `stopped` | User requested stop, resumable via start (engine-dependent) |
 | RevertWindow | `revert_window` | Schema change applied, revert available. Only meaningful for PlanetScale; Spirit doesn't support revert so SchemaBot auto-advances to completed |
 | Reverted | `reverted` | Schema change was reverted |
@@ -31,9 +32,13 @@ Vitess OnlineDDL and Spirit report — and they are translated into Task and App
 stateDiagram-v2
     pending --> running
     running --> completed
-    running --> failed
+    running --> failed : permanent
+    running --> failed_retryable : transient
     running --> stopped : resumable (Spirit only)
     running --> cancelled : permanent (PlanetScale only)
+
+    failed_retryable --> running : recovery retry
+    failed_retryable --> failed : attempts exhausted
     running --> waiting_for_cutover : atomic mode
     running --> revert_window : PlanetScale only
 
@@ -60,7 +65,8 @@ Per-table execution state. Same state machine as Apply, plus `cancelled`:
 | WaitingForCutover | `waiting_for_cutover` | Row copy complete, waiting for cutover signal |
 | CuttingOver | `cutting_over` | Table cutover in progress |
 | Completed | `complete` | Schema change applied successfully |
-| Failed | `failed` | Engine reported failure |
+| Failed | `failed` | Engine reported permanent failure |
+| FailedRetryable | `failed_retryable` | Transient failure, will be retried (not terminal) |
 | Stopped | `stopped` | User requested stop, checkpoint saved |
 | RevertWindow | `revert_window` | Schema change applied, revert available (PlanetScale only) |
 | Reverted | `reverted` | Schema change was reverted |
@@ -71,6 +77,7 @@ Per-table execution state. Same state machine as Apply, plus `cancelled`:
 `DeriveApplyState()` computes the apply state from the collective task states. Priority rules (highest to lowest):
 
 1. Any task **failed** → apply `failed`
+1b. Any task **failed_retryable** (and none permanent **failed**) → apply `failed_retryable`
 2. Any task **stopped** → apply `stopped`
 3. Any task **reverted** → apply `reverted`
 4. All tasks **completed** → apply `completed`
@@ -80,7 +87,7 @@ Per-table execution state. Same state machine as Apply, plus `cancelled`:
 8. Any task **running** → apply `running`
 9. Otherwise → apply `pending`
 
-Terminal states (`completed`, `failed`, `reverted`, `cancelled`) are checked via `IsTerminalApplyState()`. Note: `stopped` is NOT terminal at the task level — a stopped task can be resumed via Start.
+Terminal states (`completed`, `failed`, `reverted`, `cancelled`) are checked via `IsTerminalApplyState()`. Note: `stopped` is NOT terminal at the task level — a stopped task can be resumed via Start. `failed_retryable` is NOT terminal — the recovery loop re-dispatches the apply with an incremented attempt counter.
 
 ## Spirit states
 

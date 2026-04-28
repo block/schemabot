@@ -16,8 +16,12 @@ import (
 // applyColumns lists all columns for SELECT queries.
 const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, database_type,
 	repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
-	state, error_message, options,
+	state, error_message, options, attempt,
 	created_at, started_at, completed_at, updated_at`
+
+// maxRecoveryAttempts is the maximum number of times a failed_retryable apply
+// will be re-dispatched before transitioning to permanent failed.
+const maxRecoveryAttempts = 5
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
@@ -111,10 +115,10 @@ func (s *applyStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Ap
 func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE applies
-		SET state = ?, error_message = ?,
+		SET state = ?, error_message = ?, attempt = ?,
 		    external_id = ?, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?
-	`, apply.State, apply.ErrorMessage,
+	`, apply.State, apply.ErrorMessage, apply.Attempt,
 		apply.ExternalID, apply.StartedAt, apply.CompletedAt, apply.ID)
 	return err
 }
@@ -166,29 +170,20 @@ func (s *applyStore) ClaimForRecovery(ctx context.Context) (*storage.Apply, erro
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Find an apply that:
-	// 1. Is in an active (non-terminal) state:
-	//    - pending: created but not started (server crashed before Apply spawned worker)
-	//    - running: actively copying rows
-	//    - waiting_for_cutover: copy complete, waiting for cutover trigger
-	//    - cutting_over: actively swapping tables
-	//    - revert_window: completed but monitoring for revert (optional recovery)
-	// 2. Has a stale heartbeat (updated_at > 1 minute ago) = crashed worker
-	// 3. Use FOR UPDATE SKIP LOCKED to prevent race conditions
+	// Only claim failed_retryable applies within the attempt limit.
+	// Stale active applies (crashed workers) are handled separately by
+	// the existing heartbeat/conflict detection in Apply().
+	// Uses FOR UPDATE SKIP LOCKED to prevent race conditions between workers.
 	row := tx.QueryRowContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
-		WHERE state IN (?, ?, ?, ?, ?)
-		  AND updated_at < NOW() - INTERVAL 1 MINUTE
+		WHERE state = ? AND attempt < ?
 		ORDER BY created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
 	`,
-		state.Apply.Pending,
-		state.Apply.Running,
-		state.Apply.WaitingForCutover,
-		state.Apply.CuttingOver,
-		state.Apply.RevertWindow,
+		state.Apply.FailedRetryable,
+		maxRecoveryAttempts,
 	)
 
 	apply, err := scanApplyInto(row)
@@ -199,10 +194,11 @@ func (s *applyStore) ClaimForRecovery(ctx context.Context) (*storage.Apply, erro
 		return nil, err
 	}
 
-	// Claim by updating updated_at to now (this is our heartbeat)
+	// Claim by updating updated_at and incrementing attempt counter
 	_, err = tx.ExecContext(ctx, `
-		UPDATE applies SET updated_at = NOW() WHERE id = ?
+		UPDATE applies SET updated_at = NOW(), attempt = attempt + 1 WHERE id = ?
 	`, apply.ID)
+	apply.Attempt++ // reflect the increment in the returned object
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +220,20 @@ func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 		UPDATE applies SET updated_at = NOW() WHERE id = ?
 	`, applyID)
 	return err
+}
+
+// ExpireRetryable transitions failed_retryable applies that have exhausted
+// their retry budget to permanent failed. Returns the number of rows affected.
+func (s *applyStore) ExpireRetryable(ctx context.Context) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE applies
+		SET state = ?, completed_at = NOW(), updated_at = NOW()
+		WHERE state = ? AND attempt >= ?
+	`, state.Apply.Failed, state.Apply.FailedRetryable, maxRecoveryAttempts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // GetByDatabase returns applies for a specific database and optionally filtered by dbType and environment.
@@ -323,7 +333,7 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 		&apply.Database, &apply.DatabaseType,
 		&apply.Repository, &apply.PullRequest, &apply.Environment, &apply.Deployment,
 		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &apply.Engine,
-		&apply.State, &apply.ErrorMessage, &options,
+		&apply.State, &apply.ErrorMessage, &options, &apply.Attempt,
 		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt,
 	)
 	if err != nil {

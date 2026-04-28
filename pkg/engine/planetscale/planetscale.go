@@ -1121,7 +1121,61 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 		e.logger.Info("keyspace changes applied", "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
 		return nil
 	}
-	return fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
+	finalErr := fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
+	// Wrap as retryable if the last error was a transient condition.
+	// This signals the apply orchestration to use failed_retryable instead of failed.
+	if isRetryableEngineError(lastErr) {
+		return engine.NewRetryableError(finalErr)
+	}
+	return finalErr
+}
+
+// isRetryableEngineError returns true if the error is a transient condition
+// that may succeed on a future attempt. Used to wrap errors as RetryableError
+// when engine-level retries are exhausted.
+//
+// Classification uses the PlanetScale SDK's typed error codes where available,
+// falling back to message matching for errors outside the SDK (MySQL connection
+// errors, context deadlines, etc.).
+func isRetryableEngineError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// PlanetScale SDK typed errors
+	var psErr *ps.Error
+	if errors.As(err, &psErr) {
+		switch psErr.Code {
+		case ps.ErrRetry:
+			return true // 422 "unprocessable" — SDK says retry
+		case ps.ErrInternal, ps.ErrResponseMalformed:
+			return true // 500 / malformed response — transient server issues
+		case ps.ErrNotFound, ps.ErrPermission, ps.ErrInvalid:
+			return false // permanent — wrong resource, auth, or bad request
+		default:
+			// Unknown code — check the message for known transient patterns.
+			// "schema snapshot is in progress" falls here (PS returns it with
+			// an empty error code).
+		}
+	}
+
+	// Message-based fallback for errors outside the PS SDK
+	return isSnapshotInProgress(err) ||
+		isTransientNetworkError(err)
+}
+
+// isTransientNetworkError returns true for common network/connection errors
+// that are transient and may resolve on retry.
+func isTransientNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "Too many requests")
 }
 
 // isSnapshotInProgress returns true if the error indicates PlanetScale is

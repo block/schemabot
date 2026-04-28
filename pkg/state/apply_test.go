@@ -232,3 +232,37 @@ func TestDeriveApplyState_Scenario_UserCancellation(t *testing.T) {
 	states := []string{"COMPLETED", "STOPPED", "PENDING"}
 	assert.Equal(t, Apply.Stopped, DeriveApplyState(states))
 }
+
+// FailedRetryable tests
+
+func TestDeriveApplyState_FailedRetryable(t *testing.T) {
+	// FailedRetryable without permanent Failed → apply is FailedRetryable
+	states := []string{"COMPLETED", "FAILED_RETRYABLE", "RUNNING"}
+	assert.Equal(t, Apply.FailedRetryable, DeriveApplyState(states))
+}
+
+func TestDeriveApplyState_FailedRetryable_AllRetryable(t *testing.T) {
+	states := []string{"FAILED_RETRYABLE", "FAILED_RETRYABLE"}
+	assert.Equal(t, Apply.FailedRetryable, DeriveApplyState(states))
+}
+
+func TestDeriveApplyState_FailedOverridesFailedRetryable(t *testing.T) {
+	// Permanent Failed takes priority over FailedRetryable
+	states := []string{"FAILED_RETRYABLE", "FAILED", "COMPLETED"}
+	assert.Equal(t, Apply.Failed, DeriveApplyState(states))
+}
+
+func TestDeriveApplyState_FailedRetryable_NormalizedInput(t *testing.T) {
+	states := []string{"failed_retryable"}
+	assert.Equal(t, Apply.FailedRetryable, DeriveApplyState(states))
+}
+
+func TestIsTerminalApplyState_FailedRetryable(t *testing.T) {
+	assert.False(t, IsTerminalApplyState(Apply.FailedRetryable),
+		"FailedRetryable should NOT be terminal — recovery loop can retry")
+}
+
+func TestNormalizeApplyState_FailedRetryable(t *testing.T) {
+	assert.Equal(t, Apply.FailedRetryable, normalizeApplyState("FAILED_RETRYABLE"))
+	assert.Equal(t, Apply.FailedRetryable, normalizeApplyState("failed_retryable"))
+}
