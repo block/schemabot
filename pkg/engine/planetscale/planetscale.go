@@ -1024,19 +1024,39 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		},
 	})
 
-	// Deploy (starts the schema change)
+	// Deploy (starts the schema change). PlanetScale may still be validating
+	// the deploy request even after reporting "ready", so retry on transient
+	// validation errors.
 	drNumber := dr.Number
-	dr, err = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-		Organization: org,
-		Database:     req.Database,
-		Number:       drNumber,
-		InstantDDL:   useInstant,
-	})
-	if err != nil {
-		if strings.Contains(err.Error(), "approved") {
+	var deployErr error
+	for attempt := range maxRetries {
+		if attempt > 0 {
+			delay := retryDelay(attempt, deployErr)
+			e.logger.Warn("retrying deploy request", "deploy_request", drNumber, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", deployErr)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		dr, deployErr = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+			Organization: org,
+			Database:     req.Database,
+			Number:       drNumber,
+			InstantDDL:   useInstant,
+		})
+		if deployErr == nil {
+			break
+		}
+		if strings.Contains(deployErr.Error(), "approved") {
 			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", drNumber)
 		}
-		return nil, fmt.Errorf("deploy deploy request: %w", err)
+		if !isDeployValidating(deployErr) {
+			return nil, fmt.Errorf("deploy deploy request #%d: %w", drNumber, deployErr)
+		}
+	}
+	if deployErr != nil {
+		return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", drNumber, maxRetries, deployErr)
 	}
 
 	emitEvent(engine.ApplyEvent{
@@ -1171,6 +1191,14 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 // are blocked while the snapshot completes.
 func isSnapshotInProgress(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "schema snapshot is in progress")
+}
+
+// isDeployValidating returns true if the error indicates PlanetScale is still
+// validating the deploy request (e.g., "please try again in a few moments").
+// This is a transient race where the deploy request reports "ready" but the
+// deploy endpoint rejects the call because validation is still running.
+func isDeployValidating(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "try again")
 }
 
 // retryDelay returns the backoff duration for a retry attempt using

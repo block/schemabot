@@ -376,3 +376,10 @@ func TestRetryDelay(t *testing.T) {
 		assert.LessOrEqual(t, d10, 65*time.Second)
 	})
 }
+
+func TestIsDeployValidating(t *testing.T) {
+	assert.True(t, isDeployValidating(fmt.Errorf("We're currently validating that these changes are safe to deploy. Please try again in a few moments.")))
+	assert.True(t, isDeployValidating(fmt.Errorf("something something try again later")))
+	assert.False(t, isDeployValidating(fmt.Errorf("deploy request failed")))
+	assert.False(t, isDeployValidating(nil))
+}
