@@ -170,28 +170,18 @@ func (s *applyStore) ClaimForRecovery(ctx context.Context) (*storage.Apply, erro
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Find an apply that needs recovery. Two categories:
-	// 1. Active states with stale heartbeat (crashed worker):
-	//    pending, running, waiting_for_cutover, cutting_over, revert_window
-	// 2. Retryable failures within attempt limit:
-	//    failed_retryable with attempt < maxRecoveryAttempts
+	// Only claim failed_retryable applies within the attempt limit.
+	// Stale active applies (crashed workers) are handled separately by
+	// the existing heartbeat/conflict detection in Apply().
 	// Uses FOR UPDATE SKIP LOCKED to prevent race conditions between workers.
 	row := tx.QueryRowContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
-		WHERE (
-			(state IN (?, ?, ?, ?, ?) AND updated_at < NOW() - INTERVAL 1 MINUTE)
-			OR (state = ? AND attempt < ?)
-		)
+		WHERE state = ? AND attempt < ?
 		ORDER BY created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
 	`,
-		state.Apply.Pending,
-		state.Apply.Running,
-		state.Apply.WaitingForCutover,
-		state.Apply.CuttingOver,
-		state.Apply.RevertWindow,
 		state.Apply.FailedRetryable,
 		maxRecoveryAttempts,
 	)
@@ -230,6 +220,20 @@ func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 		UPDATE applies SET updated_at = NOW() WHERE id = ?
 	`, applyID)
 	return err
+}
+
+// ExpireRetryable transitions failed_retryable applies that have exhausted
+// their retry budget to permanent failed. Returns the number of rows affected.
+func (s *applyStore) ExpireRetryable(ctx context.Context) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE applies
+		SET state = ?, completed_at = NOW(), updated_at = NOW()
+		WHERE state = ? AND attempt >= ?
+	`, state.Apply.Failed, state.Apply.FailedRetryable, maxRecoveryAttempts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 // GetByDatabase returns applies for a specific database and optionally filtered by dbType and environment.

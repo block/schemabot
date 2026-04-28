@@ -190,6 +190,11 @@ type ApplyStore interface {
 	// If not called for > 1 minute, another worker can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
 
+	// ExpireRetryable transitions failed_retryable applies that have exhausted
+	// their retry budget (attempt >= maxRecoveryAttempts) to permanent failed.
+	// Returns the number of applies transitioned.
+	ExpireRetryable(ctx context.Context) (int64, error)
+
 	// GetByPR returns all applies for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Apply, error)
 

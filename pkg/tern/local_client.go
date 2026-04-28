@@ -206,17 +206,25 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 
 // Close closes the client and releases resources.
 func (c *LocalClient) Close() error {
+	c.cancelMu.Lock()
 	if c.cancelRecovery != nil {
 		c.cancelRecovery()
 	}
+	c.cancelMu.Unlock()
 	return nil
 }
 
 // StartRecoveryLoop starts a background goroutine that polls for
 // failed_retryable applies and re-dispatches them. Call Close() to stop.
+// Safe to call multiple times — stops any existing loop before starting a new one.
 func (c *LocalClient) StartRecoveryLoop(ctx context.Context) {
+	c.cancelMu.Lock()
+	if c.cancelRecovery != nil {
+		c.cancelRecovery() // stop existing loop
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	c.cancelRecovery = cancel
+	c.cancelMu.Unlock()
 
 	go func() {
 		c.logger.Info("recovery loop started", "interval", c.recoveryInterval)
@@ -229,10 +237,24 @@ func (c *LocalClient) StartRecoveryLoop(ctx context.Context) {
 				c.logger.Info("recovery loop stopped")
 				return
 			case <-ticker.C:
+				c.expireExhaustedRetries(ctx)
 				c.recoverOneApply(ctx)
 			}
 		}
 	}()
+}
+
+// expireExhaustedRetries transitions failed_retryable applies that have
+// exhausted their retry budget to permanent failed.
+func (c *LocalClient) expireExhaustedRetries(ctx context.Context) {
+	n, err := c.storage.Applies().ExpireRetryable(ctx)
+	if err != nil {
+		c.logger.Error("recovery loop: expire retryable failed", "error", err)
+		return
+	}
+	if n > 0 {
+		c.logger.Info("recovery loop: expired exhausted retryable applies", "count", n)
+	}
 }
 
 // recoverOneApply claims one failed_retryable apply and re-dispatches it.
@@ -248,23 +270,31 @@ func (c *LocalClient) recoverOneApply(ctx context.Context) {
 
 	c.logger.Info("recovery loop: claimed apply for retry",
 		"apply_id", apply.ApplyIdentifier,
-		"state", apply.State,
 		"attempt", apply.Attempt,
 		"database", apply.Database,
 	)
 
-	// Only re-dispatch failed_retryable applies. Stale active applies
-	// (pending/running with dead heartbeat) are handled by the existing
-	// conflict check in Apply().
-	if apply.State != state.Apply.FailedRetryable {
-		c.logger.Debug("recovery loop: skipping non-retryable apply",
-			"apply_id", apply.ApplyIdentifier, "state", apply.State)
+	// Verify plan and tasks can be loaded BEFORE transitioning state.
+	// If loading fails, mark as permanently failed rather than leaving
+	// the apply stuck in running with no worker.
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil || plan == nil {
+		c.logger.Error("recovery loop: plan not found", "apply_id", apply.ApplyIdentifier, "plan_id", apply.PlanID, "error", err)
+		c.failRecovery(ctx, apply, "recovery failed: plan not found")
 		return
 	}
 
-	// Transition back to running for the retry attempt
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		c.logger.Error("recovery loop: failed to load tasks", "apply_id", apply.ApplyIdentifier, "error", err)
+		c.failRecovery(ctx, apply, fmt.Sprintf("recovery failed: load tasks: %v", err))
+		return
+	}
+
+	// Transition to running now that we've verified everything is loadable
 	apply.State = state.Apply.Running
 	apply.ErrorMessage = ""
+	apply.CompletedAt = nil
 	apply.UpdatedAt = time.Now()
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		c.logger.Error("recovery loop: failed to update apply state",
@@ -272,32 +302,41 @@ func (c *LocalClient) recoverOneApply(ctx context.Context) {
 		return
 	}
 
+	// Reset task states for retry
+	for _, task := range tasks {
+		if task.State == state.Task.FailedRetryable {
+			task.State = state.Task.Pending
+			task.ErrorMessage = ""
+			task.CompletedAt = nil
+			task.Attempt++
+			if err := c.storage.Tasks().Update(ctx, task); err != nil {
+				c.logger.Warn("recovery loop: failed to reset task",
+					"task_id", task.TaskIdentifier, "error", err)
+			}
+		}
+	}
+
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Recovery attempt %d: retrying apply %s", apply.Attempt, apply.ApplyIdentifier), "", state.Apply.Running)
-
-	// Load the plan and re-dispatch
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
-	if err != nil || plan == nil {
-		c.logger.Error("recovery loop: plan not found", "apply_id", apply.ApplyIdentifier, "plan_id", apply.PlanID, "error", err)
-		apply.State = state.Apply.Failed
-		apply.ErrorMessage = "recovery failed: plan not found"
-		now := time.Now()
-		apply.CompletedAt = &now
-		_ = c.storage.Applies().Update(ctx, apply)
-		return
-	}
-
-	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
-	if err != nil {
-		c.logger.Error("recovery loop: failed to load tasks", "apply_id", apply.ApplyIdentifier, "error", err)
-		return
-	}
 
 	// Re-dispatch in background (same as initial Apply)
 	applyCtx := context.WithoutCancel(ctx)
 	go c.runWithRecovery(applyCtx, apply, tasks, func() {
 		c.executeApplyAtomic(applyCtx, apply, tasks, plan, parseOptionsMap(apply.Options))
 	})
+}
+
+// failRecovery permanently fails an apply that can't be recovered.
+func (c *LocalClient) failRecovery(ctx context.Context, apply *storage.Apply, errMsg string) {
+	now := time.Now()
+	apply.State = state.Apply.Failed
+	apply.ErrorMessage = errMsg
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("recovery loop: failed to mark apply as permanently failed",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+	}
 }
 
 // SetRecoveryInterval sets the polling interval for the recovery loop.

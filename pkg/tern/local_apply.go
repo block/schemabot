@@ -975,7 +975,9 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 		if task.ErrorMessage == "" {
 			task.ErrorMessage = errMsg
 		}
-		task.CompletedAt = &now
+		if !retryable {
+			task.CompletedAt = &now
+		}
 		c.transitionTaskState(ctx, task, 0, taskState, "")
 	}
 
