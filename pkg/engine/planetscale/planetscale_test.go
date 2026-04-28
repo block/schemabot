@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -364,15 +365,49 @@ func TestRetryDelay(t *testing.T) {
 		snapshotErr := fmt.Errorf("schema snapshot is in progress")
 		d0 := retryDelay(0, snapshotErr)
 		d1 := retryDelay(1, snapshotErr)
-		// Base: 5s, 10s (plus up to 5s jitter)
-		assert.GreaterOrEqual(t, d0, 5*time.Second)
-		assert.Less(t, d0, 11*time.Second)
-		assert.GreaterOrEqual(t, d1, 10*time.Second)
+		// Base: 10s, 20s (plus up to 5s jitter)
+		assert.GreaterOrEqual(t, d0, 10*time.Second)
+		assert.Less(t, d0, 16*time.Second)
+		assert.GreaterOrEqual(t, d1, 20*time.Second)
 	})
 
 	t.Run("snapshot backoff caps at 60s", func(t *testing.T) {
 		snapshotErr := fmt.Errorf("schema snapshot is in progress")
 		d10 := retryDelay(10, snapshotErr)
 		assert.LessOrEqual(t, d10, 65*time.Second)
+	})
+}
+
+func TestIsRetryablePSError(t *testing.T) {
+	t.Run("PS SDK ErrRetry is retryable", func(t *testing.T) {
+		assert.True(t, isRetryablePSError(&ps.Error{Code: ps.ErrRetry}))
+	})
+
+	t.Run("PS SDK ErrInternal is retryable", func(t *testing.T) {
+		assert.True(t, isRetryablePSError(&ps.Error{Code: ps.ErrInternal}))
+	})
+
+	t.Run("PS SDK ErrResponseMalformed is retryable", func(t *testing.T) {
+		assert.True(t, isRetryablePSError(&ps.Error{Code: ps.ErrResponseMalformed}))
+	})
+
+	t.Run("PS SDK ErrNotFound is NOT retryable", func(t *testing.T) {
+		assert.False(t, isRetryablePSError(&ps.Error{Code: ps.ErrNotFound}))
+	})
+
+	t.Run("PS SDK ErrPermission is NOT retryable", func(t *testing.T) {
+		assert.False(t, isRetryablePSError(&ps.Error{Code: ps.ErrPermission}))
+	})
+
+	t.Run("snapshot in progress is retryable", func(t *testing.T) {
+		assert.True(t, isRetryablePSError(fmt.Errorf("schema snapshot is in progress")))
+	})
+
+	t.Run("plain error is NOT retryable", func(t *testing.T) {
+		assert.False(t, isRetryablePSError(fmt.Errorf("DDL syntax error")))
+	})
+
+	t.Run("nil is NOT retryable", func(t *testing.T) {
+		assert.False(t, isRetryablePSError(nil))
 	})
 }

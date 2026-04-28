@@ -425,7 +425,9 @@ const (
 	maxRetries = 3
 
 	// maxSnapshotRetries is used when a schema snapshot is in progress
-	// (e.g., after RefreshSchema). Snapshots can take 30-60s on large databases.
+	// (e.g., after RefreshSchema or VSchema updates). With exponential
+	// backoff (20s, 40s, 60s, 60s) this gives ~3 minutes of total
+	// wait time before failing.
 	maxSnapshotRetries = 5
 )
 
@@ -785,17 +787,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	// emitEvent logs a lifecycle event and sends it to the caller for apply_logs recording.
-	emitEvent := func(message string, metadata map[string]string) {
+	emitEvent := func(event engine.ApplyEvent) {
 		attrs := []any{"database", req.Database}
-		for k, v := range metadata {
+		for k, v := range event.Metadata {
 			attrs = append(attrs, k, v)
 		}
-		e.logger.Info(message, attrs...)
+		e.logger.Info(event.Message, attrs...)
 		if req.OnEvent != nil {
-			req.OnEvent(engine.ApplyEvent{
-				Message:  message,
-				Metadata: metadata,
-			})
+			req.OnEvent(event)
 		}
 	}
 
@@ -836,7 +835,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			return nil, fmt.Errorf("cannot reuse the %s branch — use a development branch", main)
 		}
 		persistState(&psMetadata{BranchName: branchName})
-		emitEvent(fmt.Sprintf("Reusing branch %s", branchName), map[string]string{"branch": branchName})
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Reusing branch %s", branchName),
+			Metadata: map[string]string{"branch": branchName},
+			NewState: state.Apply.PreparingBranch,
+		})
 
 		// Verify branch exists
 		if _, err := client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
@@ -851,7 +854,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 
 		// Sync with main to pick up latest schema
-		emitEvent(fmt.Sprintf("Refreshing schema for branch %s from %s", branchName, main), map[string]string{"branch": branchName})
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Refreshing schema for branch %s from %s", branchName, main),
+			Metadata: map[string]string{"branch": branchName},
+		})
 		if err := client.RefreshSchema(ctx, org, req.Database, branchName); err != nil {
 			return nil, fmt.Errorf("refresh schema for branch %s: %w", branchName, err)
 		}
@@ -861,12 +867,20 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			return nil, fmt.Errorf("wait for schema refresh %s: %w", branchName, err)
 		}
 		elapsed := time.Since(branchStart).Round(time.Second)
-		emitEvent(fmt.Sprintf("Branch %s schema refreshed (%s)", branchName, elapsed), map[string]string{"branch": branchName})
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Branch %s schema refreshed (%s)", branchName, elapsed),
+			Metadata: map[string]string{"branch": branchName},
+			NewState: state.Apply.ApplyingBranchChanges,
+		})
 	} else {
 		// Create a new branch
 		branchName = generateBranchName(req.Database, req.PlanID)
 		persistState(&psMetadata{BranchName: branchName})
-		emitEvent(fmt.Sprintf("Creating branch %s", branchName), map[string]string{"branch": branchName})
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Creating branch %s", branchName),
+			Metadata: map[string]string{"branch": branchName},
+			NewState: state.Apply.PreparingBranch,
+		})
 
 		_, err = e.createBranch(ctx, client, org, req.Database, branchName, main)
 		if err != nil {
@@ -878,7 +892,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			return nil, fmt.Errorf("wait for branch: %w", err)
 		}
 		elapsed := time.Since(branchStart).Round(time.Second)
-		emitEvent(fmt.Sprintf("Branch %s ready (%s)", branchName, elapsed), map[string]string{"branch": branchName})
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Branch %s ready (%s)", branchName, elapsed),
+			Metadata: map[string]string{"branch": branchName},
+			NewState: state.Apply.ApplyingBranchChanges,
+		})
 	}
 
 	// Get branch credentials to apply DDL via MySQL
@@ -897,7 +915,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	// Apply DDL and VSchema changes to all keyspaces
-	emitEvent("Applying changes to branch", map[string]string{"branch": branchName})
+	emitEvent(engine.ApplyEvent{
+		Message:  "Applying changes to branch",
+		Metadata: map[string]string{"branch": branchName},
+		NewState: state.Apply.ApplyingBranchChanges,
+	})
 	if err := e.applyChangesToBranch(ctx, req.Changes, req.SchemaFiles, password, client, org, req.Database, branchName, emitEvent); err != nil {
 		return nil, fmt.Errorf("apply changes to branch: %w", err)
 	}
@@ -905,7 +927,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	for _, sc := range req.Changes {
 		ddlCount += len(sc.TableChanges)
 	}
-	emitEvent(fmt.Sprintf("Applied %d DDL changes to branch %s", ddlCount, branchName), map[string]string{"branch": branchName})
+	emitEvent(engine.ApplyEvent{
+		Message:  fmt.Sprintf("Applied %d DDL changes to branch %s", ddlCount, branchName),
+		Metadata: map[string]string{"branch": branchName},
+		NewState: state.Apply.CreatingDeployRequest,
+	})
 
 	// Capture existing migration_contexts before deploy so we can discover the new one
 	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
@@ -922,10 +948,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
-	emitEvent(fmt.Sprintf("Deploy request #%d created", dr.Number), map[string]string{
-		"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
-		"deploy_request_url": dr.HtmlURL,
-		"branch":             branchName,
+	emitEvent(engine.ApplyEvent{
+		Message: fmt.Sprintf("Deploy request #%d created", dr.Number),
+		Metadata: map[string]string{
+			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
+			"deploy_request_url": dr.HtmlURL,
+			"branch":             branchName,
+		},
 	})
 	persistState(&psMetadata{
 		BranchName:       branchName,
@@ -943,8 +972,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return nil, fmt.Errorf("deploy request #%d failed during preparation (state: %s)", dr.Number, dr.DeploymentState)
 	}
 	if dr.DeploymentState == deployState.NoChanges {
-		emitEvent(fmt.Sprintf("Deploy request #%d: no changes detected", dr.Number), map[string]string{
-			"deploy_request_id": fmt.Sprintf("%d", dr.Number),
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Deploy request #%d: no changes detected", dr.Number),
+			Metadata: map[string]string{"deploy_request_id": fmt.Sprintf("%d", dr.Number)},
 		})
 		return &engine.ApplyResult{Message: "no changes detected"}, nil
 	}
@@ -985,30 +1015,56 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if useInstant {
 		readyMsg += " — instant DDL eligible"
 	}
-	emitEvent(readyMsg, map[string]string{
-		"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
-		"deploy_request_url": dr.HtmlURL,
-		"instant_ddl":        fmt.Sprintf("%t", useInstant),
+	emitEvent(engine.ApplyEvent{
+		Message: readyMsg,
+		Metadata: map[string]string{
+			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
+			"deploy_request_url": dr.HtmlURL,
+			"instant_ddl":        fmt.Sprintf("%t", useInstant),
+		},
 	})
 
-	// Deploy (starts the schema change)
+	// Deploy (starts the schema change). PlanetScale may still be validating
+	// the deploy request even after reporting "ready", so retry on transient
+	// validation errors.
 	drNumber := dr.Number
-	dr, err = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-		Organization: org,
-		Database:     req.Database,
-		Number:       drNumber,
-		InstantDDL:   useInstant,
-	})
-	if err != nil {
-		if strings.Contains(err.Error(), "approved") {
+	var deployErr error
+	for attempt := range maxRetries {
+		if attempt > 0 {
+			delay := retryDelay(attempt, deployErr)
+			e.logger.Warn("retrying deploy request", "deploy_request", drNumber, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", deployErr)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		dr, deployErr = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+			Organization: org,
+			Database:     req.Database,
+			Number:       drNumber,
+			InstantDDL:   useInstant,
+		})
+		if deployErr == nil {
+			break
+		}
+		if strings.Contains(deployErr.Error(), "approved") {
 			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", drNumber)
 		}
-		return nil, fmt.Errorf("deploy deploy request: %w", err)
+		if !isRetryablePSError(deployErr) {
+			return nil, fmt.Errorf("deploy deploy request #%d: %w", drNumber, deployErr)
+		}
+	}
+	if deployErr != nil {
+		return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", drNumber, maxRetries, deployErr)
 	}
 
-	emitEvent(fmt.Sprintf("Deploy request #%d deployed", dr.Number), map[string]string{
-		"deploy_request_id": fmt.Sprintf("%d", dr.Number),
-		"instant_ddl":       fmt.Sprintf("%t", useInstant),
+	emitEvent(engine.ApplyEvent{
+		Message: fmt.Sprintf("Deploy request #%d deployed", dr.Number),
+		Metadata: map[string]string{
+			"deploy_request_id": fmt.Sprintf("%d", dr.Number),
+			"instant_ddl":       fmt.Sprintf("%t", useInstant),
+		},
 	})
 
 	// Discover migration_context by diffing current SHOW VITESS_MIGRATIONS against
@@ -1049,7 +1105,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 // VSchema updates are applied sequentially (PlanetScale rejects concurrent
 // VSchema writes during schema snapshots). DDL is applied in parallel after
 // all VSchema changes are committed.
-func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string, emitEvent func(string, map[string]string)) error {
+func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string, emitEvent func(engine.ApplyEvent)) error {
 	if len(changes) == 0 {
 		e.logger.Debug("no changes to apply to branch", "branch", branchName)
 		return nil
@@ -1060,13 +1116,17 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 
 	// Serialize event callbacks — OnEvent mutates shared apply state.
 	var eventMu sync.Mutex
-	safeEmit := func(message string, metadata map[string]string) {
+	safeEmit := func(event engine.ApplyEvent) {
 		eventMu.Lock()
 		defer eventMu.Unlock()
-		emitEvent(message, metadata)
+		emitEvent(event)
 	}
 
-	safeEmit(fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName), map[string]string{"branch": branchName})
+	safeEmit(engine.ApplyEvent{
+		Message:  fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName),
+		Metadata: map[string]string{"branch": branchName},
+		NewState: state.Apply.ApplyingBranchChanges,
+	})
 
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(maxConcurrentKeyspaces)
@@ -1076,8 +1136,10 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 				return err
 			}
 			n := int(applied.Add(1))
-			safeEmit(fmt.Sprintf("Applied keyspace %s (%d/%d)", sc.Namespace, n, total),
-				map[string]string{"keyspace": sc.Namespace})
+			safeEmit(engine.ApplyEvent{
+				Message:  fmt.Sprintf("Applied keyspace %s (%d/%d)", sc.Namespace, n, total),
+				Metadata: map[string]string{"keyspace": sc.Namespace},
+			})
 			return nil
 		})
 	}
@@ -1088,7 +1150,7 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 // Uses longer backoff when PlanetScale reports a schema snapshot is in progress.
 func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
 	start := time.Now()
-	e.logger.Info("applying changes to keyspace",
+	e.logger.Info(fmt.Sprintf("applying changes to keyspace %s on branch %s", sc.Namespace, branchName),
 		"keyspace", sc.Namespace,
 		"ddl_count", len(sc.TableChanges),
 		"has_vschema", sc.Metadata["vschema"] != "",
@@ -1110,7 +1172,7 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 
 		if err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
 			lastErr = err
-			e.logger.Error("keyspace apply attempt failed", "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
+			e.logger.Error(fmt.Sprintf("keyspace %s apply attempt %d failed", sc.Namespace, attempt+1), "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
 			if isSnapshotInProgress(err) && maxAttempts == maxRetries {
 				maxAttempts = maxSnapshotRetries
 				e.logger.Info("schema snapshot in progress, extending retries",
@@ -1118,7 +1180,7 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 			}
 			continue
 		}
-		e.logger.Info("keyspace changes applied", "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
+		e.logger.Info(fmt.Sprintf("keyspace %s changes applied (%s)", sc.Namespace, time.Since(start).Round(time.Second)), "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
 		return nil
 	}
 	return fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
@@ -1131,13 +1193,31 @@ func isSnapshotInProgress(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "schema snapshot is in progress")
 }
 
+// isRetryablePSError returns true if the error is a transient PlanetScale
+// condition that may succeed on retry. Uses the SDK's typed error codes
+// (e.g., ps.ErrRetry for 422, ps.ErrInternal for 500) and falls back to
+// message matching for errors outside the SDK.
+func isRetryablePSError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var psErr *ps.Error
+	if errors.As(err, &psErr) {
+		switch psErr.Code {
+		case ps.ErrRetry, ps.ErrInternal, ps.ErrResponseMalformed:
+			return true
+		}
+	}
+	return isSnapshotInProgress(err)
+}
+
 // retryDelay returns the backoff duration for a retry attempt using
 // exponential backoff with full jitter. When a schema snapshot is in
 // progress the base delay is longer since snapshots can take 30-60s.
 func retryDelay(attempt int, lastErr error) time.Duration {
 	if isSnapshotInProgress(lastErr) {
-		// Snapshot: 5s, 10s, 20s, 40s, ... capped at 60s + up to 5s jitter
-		base := min(5*time.Second*(1<<min(attempt, 4)), 60*time.Second)
+		// Snapshot: 10s, 20s, 40s, 60s, 60s + up to 5s jitter
+		base := min(10*time.Second*(1<<min(attempt, 3)), 60*time.Second)
 		return base + time.Duration(rand.IntN(5000))*time.Millisecond
 	}
 	// Normal: 2s, 4s, 8s capped at 10s + up to 2s jitter
@@ -1152,7 +1232,7 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 		if err := e.updateBranchVSchema(ctx, client, org, database, branchName, sc.Namespace, vschemaContent); err != nil {
 			return fmt.Errorf("update vschema for %s: %w", sc.Namespace, err)
 		}
-		e.logger.Info("applied vschema to branch", "keyspace", sc.Namespace, "branch", branchName)
+		e.logger.Info(fmt.Sprintf("applied vschema for %s on branch %s", sc.Namespace, branchName), "keyspace", sc.Namespace, "branch", branchName)
 	}
 
 	if len(sc.TableChanges) == 0 {
@@ -1189,7 +1269,7 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 	}
 
 	for _, tc := range sc.TableChanges {
-		e.logger.Info("applying DDL to branch",
+		e.logger.Info(fmt.Sprintf("applying DDL to %s.%s on branch", sc.Namespace, tc.Table),
 			"keyspace", sc.Namespace,
 			"table", tc.Table,
 			"operation", tc.Operation,
@@ -1219,7 +1299,7 @@ func getVSchemaContent(sc engine.SchemaChange, schemaFiles schema.SchemaFiles) s
 // updateBranchVSchema updates the VSchema for a keyspace on a branch
 // using the PlanetScale SDK's UpdateKeyspaceVSchema endpoint.
 func (e *Engine) updateBranchVSchema(ctx context.Context, client psclient.PSClient, org, database, branch, keyspace, vschemaJSON string) error {
-	e.logger.Info("updating VSchema on branch",
+	e.logger.Info(fmt.Sprintf("updating VSchema for %s on branch %s", keyspace, branch),
 		"branch", branch,
 		"keyspace", keyspace,
 	)
@@ -1299,14 +1379,14 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("decode resume state: %w", err)
 	}
 
-	emitEvent := func(message string, metadata map[string]string) {
+	emitEvent := func(event engine.ApplyEvent) {
 		attrs := []any{"database", req.Database}
-		for k, v := range metadata {
+		for k, v := range event.Metadata {
 			attrs = append(attrs, k, v)
 		}
-		e.logger.Info(message, attrs...)
+		e.logger.Info(event.Message, attrs...)
 		if req.OnEvent != nil {
-			req.OnEvent(engine.ApplyEvent{Message: message, Metadata: metadata})
+			req.OnEvent(event)
 		}
 	}
 

@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/e2e/testutil"
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/e2eutil"
 	"github.com/block/schemabot/pkg/state"
@@ -124,6 +125,20 @@ func vitessSchemaWithOverrides(overrides map[string]string) map[string]string {
 	files := vitessBaseSchema()
 	maps.Copy(files, overrides)
 	return files
+}
+
+// usersSchemaWithColumn returns the testapp_sharded/users.sql CREATE TABLE
+// with an extra varchar column added. Reads the base schema from examples/
+// and inserts the column before the closing line, keeping it in sync with
+// the canonical schema.
+func usersSchemaWithColumn(colName string) string {
+	base := vitessBaseSchema()
+	original := base["testapp_sharded/users.sql"]
+	// Insert the new column before the PRIMARY KEY line
+	return strings.Replace(original,
+		"  PRIMARY KEY (`id`)",
+		fmt.Sprintf("  `%s` varchar(100) DEFAULT NULL,\n  PRIMARY KEY (`id`)", colName),
+		1)
 }
 
 // localscaleAdminPost delegates to the shared e2eutil helper.
@@ -434,14 +449,7 @@ func TestVitess_Plan_UsesSchemaAPIWhenSafeSchemaChangesEnabled(t *testing.T) {
 	// of querying vtgate directly.
 	colName := fmt.Sprintf("schema_api_col_%d", time.Now().UnixMilli()%100000)
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
-		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
-  `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  `+"`email`"+` varchar(255) NOT NULL,
-  `+"`full_name`"+` varchar(255) NULL,
-  `+"`%s`"+` varchar(100) NULL,
-  `+"`created_at`"+` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX `+"`idx_email`"+` (`+"`email`"+`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, colName),
+		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
 
 	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "plan",
@@ -834,6 +842,35 @@ func TestVitess_Plan_Deduplication(t *testing.T) {
 		"-s", ".", "--endpoint", endpoint)
 	e2eutil.AssertContains(t, outAll, "ADD INDEX")
 	e2eutil.AssertContains(t, outAll, indexName)
+}
+
+// TestVitess_Plan_DDLOnly_NoVSchemaMetadata verifies that a plan with only DDL
+// changes (no VSchema diff) does not include VSchema metadata. This prevents
+// unnecessary VSchema updates during apply, which would trigger PlanetScale
+// schema snapshot conflicts on databases with many keyspaces.
+func TestVitess_Plan_DDLOnly_NoVSchemaMetadata(t *testing.T) {
+	vitessAvailable(t)
+	binPath := buildCLI(t)
+	endpoint := schemabotURL(t)
+
+	// Add a column — DDL only, no VSchema change
+	colName := fmt.Sprintf("col_novs_%d", time.Now().UnixMilli()%100000)
+	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
+		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
+	}))
+
+	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "plan",
+		"-s", ".", "-e", "staging", "--endpoint", endpoint, "--json")
+
+	var envResults map[string]*apitypes.PlanResponse
+	require.NoError(t, json.Unmarshal([]byte(out), &envResults))
+	staging, ok := envResults["staging"]
+	require.True(t, ok, "expected 'staging' in plan output")
+
+	for _, sc := range staging.Changes {
+		assert.Empty(t, sc.Metadata["vschema"],
+			"keyspace %s should not have VSchema metadata for DDL-only changes", sc.Namespace)
+	}
 }
 
 func TestVitess_Plan_UnsafeBlocked(t *testing.T) {

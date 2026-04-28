@@ -295,10 +295,15 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Operation: tc.Operation,
 			})
 		}
-		// Store VSchema from schema files if present for this namespace.
-		if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
-			if vs, ok := nsFiles.Files["vschema.json"]; ok {
-				nsData.VSchema = json.RawMessage(vs)
+		// Only store VSchema when the Plan detected a change. The engine
+		// sets sc.Metadata["vschema"] to the diff string when VSchemaChanged()
+		// returns true. Storing unchanged VSchema causes the Apply to
+		// unnecessarily update VSchema on every keyspace.
+		if sc.Metadata["vschema"] != "" {
+			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
+				if vs, ok := nsFiles.Files["vschema.json"]; ok {
+					nsData.VSchema = json.RawMessage(vs)
+				}
 			}
 		}
 	}
@@ -713,7 +718,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	var engineResult *engine.ProgressResult
 	var vitessApplyIsInstant bool
 	// Query engine for live progress. For Vitess, also query during pending state
-	// to surface PlanetScale states (creating branch, deploy request, etc.).
+	// to surface PlanetScale states (preparing branch, deploy request, etc.).
 	queryDuringPending := c.config.Type == storage.DatabaseTypeVitess
 	if eng != nil && (activeTask.State != state.Task.Pending || queryDuringPending) {
 		progressReq := &engine.ProgressRequest{
@@ -871,16 +876,16 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 	// Derive overall state from ALL tasks in this apply.
 	// If tasks are all pending, check the apply record for a more specific state
-	// (e.g., creating_branch, creating_deploy_request during PlanetScale setup).
+	// (e.g., preparing_branch, creating_deploy_request during PlanetScale setup).
 	overallState := deriveOverallState(currentApplyTasks)
 	// For Vitess setup phases, the apply record has a more specific state
-	// (creating_branch, applying_branch_changes, creating_deploy_request)
+	// (preparing_branch, applying_branch_changes, creating_deploy_request)
 	// than what task states alone can derive. Check the apply record when
 	// tasks are still pending or when the overall state doesn't yet reflect
 	// real progress (e.g., engine returns "running" during setup).
 	if applyRec, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && applyRec != nil {
 		switch applyRec.State {
-		case state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest:
+		case state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest:
 			overallState = applyRec.State
 		}
 	}
@@ -921,7 +926,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 		// During branch setup phases, include the latest event message so the
 		// CLI can show what's happening instead of a static spinner.
-		if state.IsState(overallState, state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest) {
+		if state.IsState(overallState, state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest) {
 			if logs, err := c.storage.ApplyLogs().GetByApply(ctx, apply.ID); err == nil && len(logs) > 0 {
 				latest := logs[len(logs)-1]
 				resp.Metadata = ensureMetadata(resp.Metadata)

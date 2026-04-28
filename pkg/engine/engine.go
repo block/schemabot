@@ -217,9 +217,15 @@ type ApplyRequest struct {
 }
 
 // ApplyEvent represents a structured lifecycle event emitted by an engine during Apply.
+// Mirrors the OldState/NewState convention from storage.ApplyLog.
 type ApplyEvent struct {
 	Message  string            // Human-readable description (e.g., "Branch schemabot-mydb-123 created")
 	Metadata map[string]string // Structured data (e.g., branch name, deploy request URL)
+
+	// NewState is the apply state this event transitions to (e.g., state.Apply.ApplyingBranchChanges).
+	// Empty means the event is informational and does not trigger a state transition.
+	// Set by the engine; the tern layer derives OldState from the current apply record.
+	NewState string
 }
 
 // FlatDDL returns all DDL statements across all namespaces in the apply request.

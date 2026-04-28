@@ -87,8 +87,8 @@ func (m WatchModel) progressView() string {
 		// No status line for completed - just show completion message after tables
 	case state.IsState(m.state, state.Apply.Stopped):
 		// No status line - show stopped message after tables
-	case state.IsState(m.state, state.Apply.CreatingBranch):
-		label := "Creating branch..."
+	case state.IsState(m.state, state.Apply.PreparingBranch):
+		label := "Preparing branch..."
 		if m.metadata != nil && m.metadata["existing_branch"] != "" {
 			label = "Refreshing branch schema..."
 		}
@@ -112,8 +112,11 @@ func (m WatchModel) progressView() string {
 		b.WriteString(m.spinner.View() + "Starting...\n")
 	}
 
-	// Render tables grouped by keyspace
-	m.renderTables(&b, tables)
+	// Hide table list during setup phases — all tables are "Queued" and the
+	// status line already shows per-keyspace progress.
+	if !state.IsBranchSetupPhase(m.state) {
+		m.renderTables(&b, tables)
+	}
 
 	// Footer based on state
 	isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
@@ -186,7 +189,7 @@ func (m WatchModel) progressView() string {
 			b.WriteString(m.formatFooter())
 		}
 		b.WriteString("\n")
-	case state.IsState(m.state, state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest):
+	case state.IsBranchSetupPhase(m.state):
 		b.WriteString("\n\n")
 		dimStyle := lipgloss.NewStyle().Faint(true)
 		b.WriteString(dimStyle.Render("ESC to detach"))

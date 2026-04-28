@@ -90,8 +90,8 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_CANCELLED
 	case state.Task.Reverted:
 		return ternv1.State_STATE_REVERTED
-	case state.Apply.CreatingBranch:
-		return ternv1.State_STATE_CREATING_BRANCH
+	case state.Apply.PreparingBranch:
+		return ternv1.State_STATE_PREPARING_BRANCH
 	case state.Apply.ApplyingBranchChanges:
 		return ternv1.State_STATE_APPLYING_BRANCH_CHANGES
 	case state.Apply.CreatingDeployRequest:
@@ -158,8 +158,8 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.Cancelled
 	case ternv1.State_STATE_REVERTED:
 		return state.Apply.Reverted
-	case ternv1.State_STATE_CREATING_BRANCH:
-		return state.Apply.CreatingBranch
+	case ternv1.State_STATE_PREPARING_BRANCH:
+		return state.Apply.PreparingBranch
 	case ternv1.State_STATE_APPLYING_BRANCH_CHANGES:
 		return state.Apply.ApplyingBranchChanges
 	case ternv1.State_STATE_CREATING_DEPLOY_REQUEST:

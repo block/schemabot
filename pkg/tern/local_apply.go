@@ -246,42 +246,17 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 	// Build per-namespace changes from the plan. For Vitess databases, each
 	// namespace is a keyspace (e.g., "testapp", "testapp_sharded"). For MySQL,
 	// there's typically one namespace ("default" or the database name).
-	var changes []engine.SchemaChange
 	c.logger.Info("building changes from plan", "namespaces", len(plan.Namespaces), "plan_id", plan.PlanIdentifier)
-	if len(plan.Namespaces) > 0 {
-		for namespace, nsData := range plan.Namespaces {
-			var tableChanges []engine.TableChange
-			for _, tc := range nsData.Tables {
-				tableChanges = append(tableChanges, engine.TableChange{
-					Table: tc.Table,
-					DDL:   tc.DDL,
-				})
-			}
-			metadata := make(map[string]string)
-			if len(nsData.VSchema) > 0 {
-				metadata["vschema"] = "true"
-			}
-			changes = append(changes, engine.SchemaChange{
-				Namespace:    namespace,
-				TableChanges: tableChanges,
-				Metadata:     metadata,
-			})
-		}
-	} else {
+	if len(plan.Namespaces) == 0 {
 		c.failApplyWithTasks(ctx, apply, tasks, "plan has no namespace data")
 		return
 	}
+	changes := planNamespacesToChanges(plan.Namespaces)
 
-	// For Vitess: set apply state to creating_branch before the engine call.
-	// eng.Apply() blocks during branch creation and deploy request setup, so
-	// this state is what the progress handler returns during that period.
+	// For Vitess: initialize the VitessApplyData row before the engine starts.
+	// State transitions (preparing_branch, applying_branch_changes, etc.) are
+	// handled by the engine via ApplyEvent.NewState in the OnEvent callback.
 	if c.config.Type == storage.DatabaseTypeVitess {
-		apply.State = state.Apply.CreatingBranch
-		apply.UpdatedAt = time.Now()
-		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.CreatingBranch, "error", err)
-		}
-
 		if err := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
 			ApplyID:          apply.ID,
 			MigrationContext: apply.ApplyIdentifier,
@@ -311,17 +286,13 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 		ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
 		Credentials: creds,
 		OnEvent: func(event engine.ApplyEvent) {
+			oldState := apply.State
+			newState := deriveApplyPhase(event)
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-				event.Message, "", "")
-			// Update apply state to reflect engine setup phases so the
-			// progress handler returns the current phase to the CLI.
-			if newState := deriveApplyPhase(event.Message); newState != "" {
-				apply.State = newState
-				apply.UpdatedAt = time.Now()
-				if err := c.storage.Applies().Update(ctx, apply); err != nil {
-					c.logger.Error("failed to update apply phase", "apply_id", apply.ApplyIdentifier, "state", newState, "error", err)
-				}
-			}
+				event.Message, oldState, newState)
+			applyEventStateTransition(apply, event, func(a *storage.Apply) error {
+				return c.storage.Applies().Update(ctx, a)
+			}, c.logger)
 		},
 		OnStateChange: func(rs *engine.ResumeState) {
 			if rs == nil {
@@ -1071,15 +1042,55 @@ func deriveOverallState(tasks []*storage.Task) string {
 	return tasks[0].State
 }
 
-// deriveApplyPhase maps an engine lifecycle event message to a PlanetScale
-// apply phase state. Returns empty string if the event doesn't trigger a
-// state transition.
-func deriveApplyPhase(message string) string {
-	if strings.Contains(message, "Branch") && strings.Contains(message, "ready") {
-		return state.Apply.ApplyingBranchChanges
+// deriveApplyPhase returns the apply state transition from an engine event.
+// Returns empty string if the event is informational (no state transition).
+func deriveApplyPhase(event engine.ApplyEvent) string {
+	return event.NewState
+}
+
+// applyEventStateTransition updates an apply's state based on an engine event.
+// Skips the write if the state hasn't changed. On DB write failure, rolls back
+// the in-memory state so the next event with the same NewState retries.
+// Returns the new state if a transition occurred, or empty string if skipped.
+func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, updateFn func(*storage.Apply) error, logger *slog.Logger) string {
+	oldState := apply.State
+	newState := deriveApplyPhase(event)
+	if newState == "" || newState == oldState {
+		return ""
 	}
-	if strings.Contains(message, "DDL changes to branch") {
-		return state.Apply.CreatingDeployRequest
+	apply.State = newState
+	apply.UpdatedAt = time.Now()
+	if err := updateFn(apply); err != nil {
+		logger.Error("failed to update apply phase", "apply_id", apply.ApplyIdentifier, "state", newState, "error", err)
+		apply.State = oldState
+		return ""
 	}
-	return ""
+	return newState
+}
+
+// planNamespacesToChanges converts stored plan namespace data to engine schema
+// changes for the Apply call. VSchema metadata is only set when the plan
+// stored a VSchema diff (i.e., the Plan detected a real change).
+func planNamespacesToChanges(namespaces map[string]*storage.NamespacePlanData) []engine.SchemaChange {
+	var changes []engine.SchemaChange
+	for namespace, nsData := range namespaces {
+		var tableChanges []engine.TableChange
+		for _, tc := range nsData.Tables {
+			tableChanges = append(tableChanges, engine.TableChange{
+				Table:     tc.Table,
+				DDL:       tc.DDL,
+				Operation: tc.Operation,
+			})
+		}
+		metadata := make(map[string]string)
+		if len(nsData.VSchema) > 0 {
+			metadata["vschema"] = "true"
+		}
+		changes = append(changes, engine.SchemaChange{
+			Namespace:    namespace,
+			TableChanges: tableChanges,
+			Metadata:     metadata,
+		})
+	}
+	return changes
 }

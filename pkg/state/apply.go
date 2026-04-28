@@ -8,7 +8,7 @@ import "strings"
 // An apply is a single schema change operation stored in the applies table.
 //
 // The state machine is a union across all engines. Some states are only valid
-// for specific engines (e.g., CreatingBranch and RevertWindow are PlanetScale-only,
+// for specific engines (e.g., PreparingBranch and RevertWindow are PlanetScale-only,
 // Stopped with resume is Spirit-only). Each engine uses the subset that applies
 // to its lifecycle. Consumers (CLI, TUI, PR templates) handle all states via
 // switch/case with a default fallback for unknown states.
@@ -27,7 +27,7 @@ var Apply = struct {
 	// PlanetScale-specific states for the branch/deploy lifecycle.
 	// These are set on the apply record during engine setup so the
 	// progress handler and CLI can show what's happening.
-	CreatingBranch        string
+	PreparingBranch       string
 	ApplyingBranchChanges string
 	CreatingDeployRequest string
 }{
@@ -42,7 +42,7 @@ var Apply = struct {
 	Cancelled:         "cancelled",
 	Reverted:          "reverted",
 
-	CreatingBranch:        "creating_branch",
+	PreparingBranch:       "preparing_branch",
 	ApplyingBranchChanges: "applying_branch_changes",
 	CreatingDeployRequest: "creating_deploy_request",
 }
@@ -155,6 +155,13 @@ func IsTerminalApplyState(s string) bool {
 	default:
 		return false
 	}
+}
+
+// IsBranchSetupPhase returns true if the apply state is a PlanetScale branch
+// lifecycle phase where per-table progress is not yet meaningful (all tables
+// are Queued). Used by the TUI to hide the table list during setup.
+func IsBranchSetupPhase(s string) bool {
+	return IsState(s, Apply.Pending, Apply.PreparingBranch, Apply.ApplyingBranchChanges, Apply.CreatingDeployRequest)
 }
 
 // IsPlanetScaleEngine returns true if the engine string indicates PlanetScale/Vitess.
