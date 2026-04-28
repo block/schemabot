@@ -216,10 +216,16 @@ type ApplyRequest struct {
 	OnEvent func(event ApplyEvent)
 }
 
+// MetadataKeyPhase is the metadata key engines use to declare the apply phase
+// an event belongs to. Values are state.Apply constants (e.g., "applying_branch_changes").
+// This lets the tern layer derive state transitions from structured metadata
+// instead of parsing human-readable message strings.
+const MetadataKeyPhase = "phase"
+
 // ApplyEvent represents a structured lifecycle event emitted by an engine during Apply.
 type ApplyEvent struct {
 	Message  string            // Human-readable description (e.g., "Branch schemabot-mydb-123 created")
-	Metadata map[string]string // Structured data (e.g., branch name, deploy request URL)
+	Metadata map[string]string // Structured data (e.g., branch name, deploy request URL, phase)
 }
 
 // FlatDDL returns all DDL statements across all namespaces in the apply request.

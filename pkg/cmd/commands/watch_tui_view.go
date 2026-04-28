@@ -114,7 +114,7 @@ func (m WatchModel) progressView() string {
 
 	// Hide table list during setup phases — all tables are "Queued" and the
 	// status line already shows per-keyspace progress.
-	if !state.IsState(m.state, state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest, state.Apply.Pending) {
+	if !state.IsBranchSetupPhase(m.state) {
 		m.renderTables(&b, tables)
 	}
 
@@ -189,7 +189,7 @@ func (m WatchModel) progressView() string {
 			b.WriteString(m.formatFooter())
 		}
 		b.WriteString("\n")
-	case state.IsState(m.state, state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest):
+	case state.IsBranchSetupPhase(m.state):
 		b.WriteString("\n\n")
 		dimStyle := lipgloss.NewStyle().Faint(true)
 		b.WriteString(dimStyle.Render("ESC to detach"))

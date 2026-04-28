@@ -232,3 +232,28 @@ func TestDeriveApplyState_Scenario_UserCancellation(t *testing.T) {
 	states := []string{"COMPLETED", "STOPPED", "PENDING"}
 	assert.Equal(t, Apply.Stopped, DeriveApplyState(states))
 }
+
+func TestIsBranchSetupPhase(t *testing.T) {
+	setupPhases := []string{
+		Apply.Pending,
+		Apply.CreatingBranch,
+		Apply.ApplyingBranchChanges,
+		Apply.CreatingDeployRequest,
+	}
+	for _, s := range setupPhases {
+		assert.True(t, IsBranchSetupPhase(s), "%s should be a setup phase", s)
+	}
+
+	nonSetupPhases := []string{
+		Apply.Running,
+		Apply.WaitingForCutover,
+		Apply.CuttingOver,
+		Apply.RevertWindow,
+		Apply.Completed,
+		Apply.Failed,
+		Apply.Stopped,
+	}
+	for _, s := range nonSetupPhases {
+		assert.False(t, IsBranchSetupPhase(s), "%s should NOT be a setup phase", s)
+	}
+}

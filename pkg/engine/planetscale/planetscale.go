@@ -426,7 +426,7 @@ const (
 
 	// maxSnapshotRetries is used when a schema snapshot is in progress
 	// (e.g., after RefreshSchema or VSchema updates). With exponential
-	// backoff (5s, 10s, 20s, 40s, 60s) this gives ~2.5 minutes of total
+	// backoff (20s, 40s, 60s, 60s) this gives ~3 minutes of total
 	// wait time before failing.
 	maxSnapshotRetries = 5
 )
@@ -863,7 +863,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			return nil, fmt.Errorf("wait for schema refresh %s: %w", branchName, err)
 		}
 		elapsed := time.Since(branchStart).Round(time.Second)
-		emitEvent(fmt.Sprintf("Branch %s schema refreshed (%s)", branchName, elapsed), map[string]string{"branch": branchName})
+		emitEvent(fmt.Sprintf("Branch %s schema refreshed (%s)", branchName, elapsed), map[string]string{
+			"branch":                branchName,
+			engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges,
+		})
 	} else {
 		// Create a new branch
 		branchName = generateBranchName(req.Database, req.PlanID)
@@ -880,7 +883,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			return nil, fmt.Errorf("wait for branch: %w", err)
 		}
 		elapsed := time.Since(branchStart).Round(time.Second)
-		emitEvent(fmt.Sprintf("Branch %s ready (%s)", branchName, elapsed), map[string]string{"branch": branchName})
+		emitEvent(fmt.Sprintf("Branch %s ready (%s)", branchName, elapsed), map[string]string{
+			"branch":                branchName,
+			engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges,
+		})
 	}
 
 	// Get branch credentials to apply DDL via MySQL
@@ -899,7 +905,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	// Apply DDL and VSchema changes to all keyspaces
-	emitEvent("Applying changes to branch", map[string]string{"branch": branchName})
+	emitEvent("Applying changes to branch", map[string]string{
+		"branch":                branchName,
+		engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges,
+	})
 	if err := e.applyChangesToBranch(ctx, req.Changes, req.SchemaFiles, password, client, org, req.Database, branchName, emitEvent); err != nil {
 		return nil, fmt.Errorf("apply changes to branch: %w", err)
 	}
@@ -907,7 +916,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	for _, sc := range req.Changes {
 		ddlCount += len(sc.TableChanges)
 	}
-	emitEvent(fmt.Sprintf("Applied %d DDL changes to branch %s", ddlCount, branchName), map[string]string{"branch": branchName})
+	emitEvent(fmt.Sprintf("Applied %d DDL changes to branch %s", ddlCount, branchName), map[string]string{
+		"branch":                branchName,
+		engine.MetadataKeyPhase: state.Apply.CreatingDeployRequest,
+	})
 
 	// Capture existing migration_contexts before deploy so we can discover the new one
 	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
@@ -1068,7 +1080,10 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 		emitEvent(message, metadata)
 	}
 
-	safeEmit(fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName), map[string]string{"branch": branchName})
+	safeEmit(fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName), map[string]string{
+		"branch":                branchName,
+		engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges,
+	})
 
 	g, gCtx := errgroup.WithContext(ctx)
 	g.SetLimit(maxConcurrentKeyspaces)

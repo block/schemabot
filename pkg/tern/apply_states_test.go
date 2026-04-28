@@ -11,76 +11,79 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestOnEventApplyStateTransitions verifies that engine lifecycle events
-// trigger the correct apply state transitions for PlanetScale applies.
-func TestOnEventApplyStateTransitions(t *testing.T) {
+// TestDeriveApplyPhase verifies that engine events with structured phase
+// metadata produce the correct state transitions, and events without
+// phase metadata produce no transition.
+func TestDeriveApplyPhase(t *testing.T) {
 	tests := []struct {
 		name         string
-		message      string
+		event        engine.ApplyEvent
 		wantState    string
 		wantNoChange bool
 	}{
 		{
-			name:      "branch ready transitions to applying_branch_changes",
-			message:   "Branch schemabot-boardgames-123 ready (44s)",
+			name: "branch ready transitions to applying_branch_changes",
+			event: engine.ApplyEvent{
+				Message:  "Branch schemabot-boardgames-123 ready (44s)",
+				Metadata: map[string]string{engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges},
+			},
 			wantState: state.Apply.ApplyingBranchChanges,
 		},
 		{
-			name:      "branch schema refreshed transitions to applying_branch_changes",
-			message:   "Branch dr-branch-reuse schema refreshed (5s)",
+			name: "branch schema refreshed transitions to applying_branch_changes",
+			event: engine.ApplyEvent{
+				Message:  "Branch dr-branch-reuse schema refreshed (5s)",
+				Metadata: map[string]string{engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges},
+			},
 			wantState: state.Apply.ApplyingBranchChanges,
 		},
 		{
-			name:      "applying changes transitions to applying_branch_changes",
-			message:   "Applying changes to 33 keyspaces on branch dr-branch-reuse",
+			name: "applying changes transitions to applying_branch_changes",
+			event: engine.ApplyEvent{
+				Message:  "Applying changes to 33 keyspaces on branch dr-branch-reuse",
+				Metadata: map[string]string{engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges},
+			},
 			wantState: state.Apply.ApplyingBranchChanges,
 		},
 		{
-			name:         "applied keyspace does not re-transition",
-			message:      "Applied keyspace commerce_sharded_015 (12/33)",
-			wantNoChange: true,
-		},
-		{
-			name:      "DDL applied transitions to creating_deploy_request",
-			message:   "Applied 1 DDL changes to branch schemabot-boardgames-123",
+			name: "DDL applied transitions to creating_deploy_request",
+			event: engine.ApplyEvent{
+				Message:  "Applied 3 DDL changes to branch schemabot-commerce-456",
+				Metadata: map[string]string{engine.MetadataKeyPhase: state.Apply.CreatingDeployRequest},
+			},
 			wantState: state.Apply.CreatingDeployRequest,
 		},
 		{
-			name:      "multiple DDL changes transitions to creating_deploy_request",
-			message:   "Applied 3 DDL changes to branch schemabot-commerce-456",
-			wantState: state.Apply.CreatingDeployRequest,
-		},
-		{
-			name:         "creating branch does not transition",
-			message:      "Creating branch schemabot-boardgames-123",
+			name: "applied keyspace has no phase — no transition",
+			event: engine.ApplyEvent{
+				Message:  "Applied keyspace commerce_sharded_015 (12/33)",
+				Metadata: map[string]string{"keyspace": "commerce_sharded_015"},
+			},
 			wantNoChange: true,
 		},
 		{
-			name:         "deploy request created does not transition",
-			message:      "Deploy request #77 created",
+			name: "creating branch has no phase — no transition",
+			event: engine.ApplyEvent{
+				Message:  "Creating branch schemabot-boardgames-123",
+				Metadata: map[string]string{"branch": "schemabot-boardgames-123"},
+			},
 			wantNoChange: true,
 		},
 		{
-			name:         "deploy request deployed does not transition",
-			message:      "Deploy request #77 deployed",
-			wantNoChange: true,
-		},
-		{
-			name:         "no changes detected does not transition",
-			message:      "Deploy request #77: no changes detected",
+			name:         "nil metadata — no transition",
+			event:        engine.ApplyEvent{Message: "some log line"},
 			wantNoChange: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			event := engine.ApplyEvent{Message: tt.message}
-			newState := deriveApplyPhase(event.Message)
+			newState := deriveApplyPhase(tt.event)
 
 			if tt.wantNoChange {
-				assert.Empty(t, newState, "expected no state change for %q", tt.message)
+				assert.Empty(t, newState, "expected no state change for %q", tt.event.Message)
 			} else {
-				assert.Equal(t, tt.wantState, newState, "wrong state for %q", tt.message)
+				assert.Equal(t, tt.wantState, newState, "wrong state for %q", tt.event.Message)
 			}
 		})
 	}
@@ -89,11 +92,11 @@ func TestOnEventApplyStateTransitions(t *testing.T) {
 func TestPlanNamespacesToChanges_VSchemaOnlyWhenStored(t *testing.T) {
 	namespaces := map[string]*storage.NamespacePlanData{
 		"ks_with_vschema": {
-			Tables:  []storage.TableChange{{Table: "users", DDL: "ALTER TABLE users ADD COLUMN x INT"}},
+			Tables:  []storage.TableChange{{Table: "users", DDL: "ALTER TABLE users ADD COLUMN x INT", Operation: "alter"}},
 			VSchema: json.RawMessage(`{"tables":{"users":{}}}`),
 		},
 		"ks_without_vschema": {
-			Tables: []storage.TableChange{{Table: "orders", DDL: "ALTER TABLE orders ADD COLUMN y INT"}},
+			Tables: []storage.TableChange{{Table: "orders", DDL: "ALTER TABLE orders ADD COLUMN y INT", Operation: "alter"}},
 		},
 	}
 
@@ -111,4 +114,8 @@ func TestPlanNamespacesToChanges_VSchemaOnlyWhenStored(t *testing.T) {
 	// Keyspace without VSchema should NOT have metadata["vschema"] set
 	assert.Empty(t, byNS["ks_without_vschema"].Metadata["vschema"],
 		"keyspace without VSchema change should not have vschema metadata")
+
+	// Operation field should be preserved
+	assert.Equal(t, "alter", byNS["ks_with_vschema"].TableChanges[0].Operation)
+	assert.Equal(t, "alter", byNS["ks_without_vschema"].TableChanges[0].Operation)
 }

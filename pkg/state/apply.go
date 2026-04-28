@@ -157,6 +157,13 @@ func IsTerminalApplyState(s string) bool {
 	}
 }
 
+// IsBranchSetupPhase returns true if the apply state is a PlanetScale branch
+// lifecycle phase where per-table progress is not yet meaningful (all tables
+// are Queued). Used by the TUI to hide the table list during setup.
+func IsBranchSetupPhase(s string) bool {
+	return IsState(s, Apply.Pending, Apply.CreatingBranch, Apply.ApplyingBranchChanges, Apply.CreatingDeployRequest)
+}
+
 // IsPlanetScaleEngine returns true if the engine string indicates PlanetScale/Vitess.
 // Handles display names ("PlanetScale"), storage constants ("planetscale"),
 // and proto enum strings ("ENGINE_PLANETSCALE").

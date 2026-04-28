@@ -296,7 +296,7 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 				event.Message, "", "")
 			// Update apply state to reflect engine setup phases so the
 			// progress handler returns the current phase to the CLI.
-			if newState := deriveApplyPhase(event.Message); newState != "" {
+			if newState := deriveApplyPhase(event); newState != "" {
 				apply.State = newState
 				apply.UpdatedAt = time.Now()
 				if err := c.storage.Applies().Update(ctx, apply); err != nil {
@@ -1052,20 +1052,13 @@ func deriveOverallState(tasks []*storage.Task) string {
 	return tasks[0].State
 }
 
-// deriveApplyPhase maps an engine lifecycle event message to a PlanetScale
-// apply phase state. Returns empty string if the event doesn't trigger a
-// state transition.
-func deriveApplyPhase(message string) string {
-	switch {
-	case strings.Contains(message, "Branch") && (strings.Contains(message, "ready") || strings.Contains(message, "refreshed")):
-		return state.Apply.ApplyingBranchChanges
-	case strings.Contains(message, "Applying changes to"):
-		return state.Apply.ApplyingBranchChanges
-	case strings.Contains(message, "DDL changes to branch"):
-		return state.Apply.CreatingDeployRequest
-	default:
+// deriveApplyPhase extracts the apply phase from an engine event's structured
+// metadata. Returns empty string if the event carries no phase transition.
+func deriveApplyPhase(event engine.ApplyEvent) string {
+	if event.Metadata == nil {
 		return ""
 	}
+	return event.Metadata[engine.MetadataKeyPhase]
 }
 
 // planNamespacesToChanges converts stored plan namespace data to engine schema
@@ -1077,8 +1070,9 @@ func planNamespacesToChanges(namespaces map[string]*storage.NamespacePlanData) [
 		var tableChanges []engine.TableChange
 		for _, tc := range nsData.Tables {
 			tableChanges = append(tableChanges, engine.TableChange{
-				Table: tc.Table,
-				DDL:   tc.DDL,
+				Table:     tc.Table,
+				DDL:       tc.DDL,
+				Operation: tc.Operation,
 			})
 		}
 		metadata := make(map[string]string)
