@@ -295,10 +295,15 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Operation: tc.Operation,
 			})
 		}
-		// Store VSchema from schema files if present for this namespace.
-		if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
-			if vs, ok := nsFiles.Files["vschema.json"]; ok {
-				nsData.VSchema = json.RawMessage(vs)
+		// Only store VSchema when the Plan detected a change. The engine
+		// sets sc.Metadata["vschema"] to the diff string when VSchemaChanged()
+		// returns true. Storing unchanged VSchema causes the Apply to
+		// unnecessarily update VSchema on every keyspace.
+		if sc.Metadata["vschema"] != "" {
+			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
+				if vs, ok := nsFiles.Files["vschema.json"]; ok {
+					nsData.VSchema = json.RawMessage(vs)
+				}
 			}
 		}
 	}

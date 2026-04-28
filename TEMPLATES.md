@@ -2804,19 +2804,13 @@ Use 'schemabot start' to resume from checkpoint.
 
 ```
 
-┌────────────────────────────────────────────┐
-│  Apply ID:     apply-a1b2c3d4e5f6          │
-│  Database:     myapp                       │
-│  Environment:  staging                     │
-│  State:        Applying changes to branch  │
-│  Branch:       schemabot-myapp-28471035    │
-└────────────────────────────────────────────┘
-
-
-  ── myapp_sharded ──
-
-     ~ users: ⏳ Queued
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+┌───────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6                         │
+│  Database:     myapp                                      │
+│  Environment:  staging                                    │
+│  State:        Applied keyspace myapp_sharded_003 (8/12)  │
+│  Branch:       schemabot-myapp-28471035                   │
+└───────────────────────────────────────────────────────────┘
 
 
 ```

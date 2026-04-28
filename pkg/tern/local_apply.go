@@ -246,31 +246,12 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 	// Build per-namespace changes from the plan. For Vitess databases, each
 	// namespace is a keyspace (e.g., "testapp", "testapp_sharded"). For MySQL,
 	// there's typically one namespace ("default" or the database name).
-	var changes []engine.SchemaChange
 	c.logger.Info("building changes from plan", "namespaces", len(plan.Namespaces), "plan_id", plan.PlanIdentifier)
-	if len(plan.Namespaces) > 0 {
-		for namespace, nsData := range plan.Namespaces {
-			var tableChanges []engine.TableChange
-			for _, tc := range nsData.Tables {
-				tableChanges = append(tableChanges, engine.TableChange{
-					Table: tc.Table,
-					DDL:   tc.DDL,
-				})
-			}
-			metadata := make(map[string]string)
-			if len(nsData.VSchema) > 0 {
-				metadata["vschema"] = "true"
-			}
-			changes = append(changes, engine.SchemaChange{
-				Namespace:    namespace,
-				TableChanges: tableChanges,
-				Metadata:     metadata,
-			})
-		}
-	} else {
+	if len(plan.Namespaces) == 0 {
 		c.failApplyWithTasks(ctx, apply, tasks, "plan has no namespace data")
 		return
 	}
+	changes := planNamespacesToChanges(plan.Namespaces)
 
 	// For Vitess: set apply state to creating_branch before the engine call.
 	// eng.Apply() blocks during branch creation and deploy request setup, so
@@ -1075,11 +1056,40 @@ func deriveOverallState(tasks []*storage.Task) string {
 // apply phase state. Returns empty string if the event doesn't trigger a
 // state transition.
 func deriveApplyPhase(message string) string {
-	if strings.Contains(message, "Branch") && strings.Contains(message, "ready") {
+	switch {
+	case strings.Contains(message, "Branch") && (strings.Contains(message, "ready") || strings.Contains(message, "refreshed")):
 		return state.Apply.ApplyingBranchChanges
-	}
-	if strings.Contains(message, "DDL changes to branch") {
+	case strings.Contains(message, "Applying changes to"):
+		return state.Apply.ApplyingBranchChanges
+	case strings.Contains(message, "DDL changes to branch"):
 		return state.Apply.CreatingDeployRequest
+	default:
+		return ""
 	}
-	return ""
+}
+
+// planNamespacesToChanges converts stored plan namespace data to engine schema
+// changes for the Apply call. VSchema metadata is only set when the plan
+// stored a VSchema diff (i.e., the Plan detected a real change).
+func planNamespacesToChanges(namespaces map[string]*storage.NamespacePlanData) []engine.SchemaChange {
+	var changes []engine.SchemaChange
+	for namespace, nsData := range namespaces {
+		var tableChanges []engine.TableChange
+		for _, tc := range nsData.Tables {
+			tableChanges = append(tableChanges, engine.TableChange{
+				Table: tc.Table,
+				DDL:   tc.DDL,
+			})
+		}
+		metadata := make(map[string]string)
+		if len(nsData.VSchema) > 0 {
+			metadata["vschema"] = "true"
+		}
+		changes = append(changes, engine.SchemaChange{
+			Namespace:    namespace,
+			TableChanges: tableChanges,
+			Metadata:     metadata,
+		})
+	}
+	return changes
 }

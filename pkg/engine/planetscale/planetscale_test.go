@@ -364,10 +364,10 @@ func TestRetryDelay(t *testing.T) {
 		snapshotErr := fmt.Errorf("schema snapshot is in progress")
 		d0 := retryDelay(0, snapshotErr)
 		d1 := retryDelay(1, snapshotErr)
-		// Base: 5s, 10s (plus up to 5s jitter)
-		assert.GreaterOrEqual(t, d0, 5*time.Second)
-		assert.Less(t, d0, 11*time.Second)
-		assert.GreaterOrEqual(t, d1, 10*time.Second)
+		// Base: 10s, 20s (plus up to 5s jitter)
+		assert.GreaterOrEqual(t, d0, 10*time.Second)
+		assert.Less(t, d0, 16*time.Second)
+		assert.GreaterOrEqual(t, d1, 20*time.Second)
 	})
 
 	t.Run("snapshot backoff caps at 60s", func(t *testing.T) {

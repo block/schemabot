@@ -425,7 +425,9 @@ const (
 	maxRetries = 3
 
 	// maxSnapshotRetries is used when a schema snapshot is in progress
-	// (e.g., after RefreshSchema). Snapshots can take 30-60s on large databases.
+	// (e.g., after RefreshSchema or VSchema updates). With exponential
+	// backoff (5s, 10s, 20s, 40s, 60s) this gives ~2.5 minutes of total
+	// wait time before failing.
 	maxSnapshotRetries = 5
 )
 
@@ -1088,7 +1090,7 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 // Uses longer backoff when PlanetScale reports a schema snapshot is in progress.
 func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
 	start := time.Now()
-	e.logger.Info("applying changes to keyspace",
+	e.logger.Info(fmt.Sprintf("applying changes to keyspace %s on branch %s", sc.Namespace, branchName),
 		"keyspace", sc.Namespace,
 		"ddl_count", len(sc.TableChanges),
 		"has_vschema", sc.Metadata["vschema"] != "",
@@ -1110,7 +1112,7 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 
 		if err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
 			lastErr = err
-			e.logger.Error("keyspace apply attempt failed", "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
+			e.logger.Error(fmt.Sprintf("keyspace %s apply attempt %d failed", sc.Namespace, attempt+1), "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
 			if isSnapshotInProgress(err) && maxAttempts == maxRetries {
 				maxAttempts = maxSnapshotRetries
 				e.logger.Info("schema snapshot in progress, extending retries",
@@ -1118,7 +1120,7 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 			}
 			continue
 		}
-		e.logger.Info("keyspace changes applied", "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
+		e.logger.Info(fmt.Sprintf("keyspace %s changes applied (%s)", sc.Namespace, time.Since(start).Round(time.Second)), "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
 		return nil
 	}
 	return fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
@@ -1136,8 +1138,8 @@ func isSnapshotInProgress(err error) bool {
 // progress the base delay is longer since snapshots can take 30-60s.
 func retryDelay(attempt int, lastErr error) time.Duration {
 	if isSnapshotInProgress(lastErr) {
-		// Snapshot: 5s, 10s, 20s, 40s, ... capped at 60s + up to 5s jitter
-		base := min(5*time.Second*(1<<min(attempt, 4)), 60*time.Second)
+		// Snapshot: 10s, 20s, 40s, 60s, 60s + up to 5s jitter
+		base := min(10*time.Second*(1<<min(attempt, 3)), 60*time.Second)
 		return base + time.Duration(rand.IntN(5000))*time.Millisecond
 	}
 	// Normal: 2s, 4s, 8s capped at 10s + up to 2s jitter
@@ -1152,7 +1154,7 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 		if err := e.updateBranchVSchema(ctx, client, org, database, branchName, sc.Namespace, vschemaContent); err != nil {
 			return fmt.Errorf("update vschema for %s: %w", sc.Namespace, err)
 		}
-		e.logger.Info("applied vschema to branch", "keyspace", sc.Namespace, "branch", branchName)
+		e.logger.Info(fmt.Sprintf("applied vschema for %s on branch %s", sc.Namespace, branchName), "keyspace", sc.Namespace, "branch", branchName)
 	}
 
 	if len(sc.TableChanges) == 0 {
@@ -1189,7 +1191,7 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 	}
 
 	for _, tc := range sc.TableChanges {
-		e.logger.Info("applying DDL to branch",
+		e.logger.Info(fmt.Sprintf("applying DDL to %s.%s on branch", sc.Namespace, tc.Table),
 			"keyspace", sc.Namespace,
 			"table", tc.Table,
 			"operation", tc.Operation,
@@ -1219,7 +1221,7 @@ func getVSchemaContent(sc engine.SchemaChange, schemaFiles schema.SchemaFiles) s
 // updateBranchVSchema updates the VSchema for a keyspace on a branch
 // using the PlanetScale SDK's UpdateKeyspaceVSchema endpoint.
 func (e *Engine) updateBranchVSchema(ctx context.Context, client psclient.PSClient, org, database, branch, keyspace, vschemaJSON string) error {
-	e.logger.Info("updating VSchema on branch",
+	e.logger.Info(fmt.Sprintf("updating VSchema for %s on branch %s", keyspace, branch),
 		"branch", branch,
 		"keyspace", keyspace,
 	)

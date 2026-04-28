@@ -112,8 +112,11 @@ func (m WatchModel) progressView() string {
 		b.WriteString(m.spinner.View() + "Starting...\n")
 	}
 
-	// Render tables grouped by keyspace
-	m.renderTables(&b, tables)
+	// Hide table list during setup phases — all tables are "Queued" and the
+	// status line already shows per-keyspace progress.
+	if !state.IsState(m.state, state.Apply.CreatingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest, state.Apply.Pending) {
+		m.renderTables(&b, tables)
+	}
 
 	// Footer based on state
 	isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered

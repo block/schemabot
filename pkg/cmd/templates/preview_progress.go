@@ -57,14 +57,8 @@ func previewApplyingBranchChangesOutput() {
 		Database:    "myapp",
 		Environment: "staging",
 		Metadata: map[string]string{
-			"branch_name": "schemabot-myapp-28471035",
-		},
-		Tables: []TableProgress{
-			{
-				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status: state.Apply.Pending,
-			},
+			"branch_name":   "schemabot-myapp-28471035",
+			"status_detail": "Applied keyspace myapp_sharded_003 (8/12)",
 		},
 	}
 	WriteProgress(data)
