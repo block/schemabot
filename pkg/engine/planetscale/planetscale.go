@@ -1133,17 +1133,48 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 // isRetryableEngineError returns true if the error is a transient condition
 // that may succeed on a future attempt. Used to wrap errors as RetryableError
 // when engine-level retries are exhausted.
+//
+// Classification uses the PlanetScale SDK's typed error codes where available,
+// falling back to message matching for errors outside the SDK (MySQL connection
+// errors, context deadlines, etc.).
 func isRetryableEngineError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
+
+	// PlanetScale SDK typed errors
+	var psErr *ps.Error
+	if errors.As(err, &psErr) {
+		switch psErr.Code {
+		case ps.ErrRetry:
+			return true // 422 "unprocessable" — SDK says retry
+		case ps.ErrInternal, ps.ErrResponseMalformed:
+			return true // 500 / malformed response — transient server issues
+		case ps.ErrNotFound, ps.ErrPermission, ps.ErrInvalid:
+			return false // permanent — wrong resource, auth, or bad request
+		default:
+			// Unknown code — check the message for known transient patterns.
+			// "schema snapshot is in progress" falls here (PS returns it with
+			// an empty error code).
+		}
+	}
+
+	// Message-based fallback for errors outside the PS SDK
 	return isSnapshotInProgress(err) ||
-		strings.Contains(msg, "connection refused") ||
+		isTransientNetworkError(err)
+}
+
+// isTransientNetworkError returns true for common network/connection errors
+// that are transient and may resolve on retry.
+func isTransientNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection refused") ||
 		strings.Contains(msg, "connection reset") ||
 		strings.Contains(msg, "i/o timeout") ||
 		strings.Contains(msg, "context deadline exceeded") ||
-		strings.Contains(msg, "branch not ready") ||
 		strings.Contains(msg, "Too many requests")
 }
 
