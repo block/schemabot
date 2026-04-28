@@ -670,7 +670,7 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 			}
 		}
 
-		// Emit engine status messages (e.g., "Creating branch sb-...")
+		// Emit engine status messages (e.g., "Preparing branch sb-...")
 		if result.Summary != "" && result.Summary != lastSummary {
 			lastSummary = result.Summary
 			log.emit("msg", result.Summary)

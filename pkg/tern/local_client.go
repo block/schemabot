@@ -718,7 +718,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	var engineResult *engine.ProgressResult
 	var vitessApplyIsInstant bool
 	// Query engine for live progress. For Vitess, also query during pending state
-	// to surface PlanetScale states (creating branch, deploy request, etc.).
+	// to surface PlanetScale states (preparing branch, deploy request, etc.).
 	queryDuringPending := c.config.Type == storage.DatabaseTypeVitess
 	if eng != nil && (activeTask.State != state.Task.Pending || queryDuringPending) {
 		progressReq := &engine.ProgressRequest{
