@@ -351,10 +351,14 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 	})
 
 	if err != nil {
-		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-		c.logger.Error("atomic apply failed", "error", err, "apply_id", apply.ApplyIdentifier)
+		c.failApplyWithTasks(ctx, apply, tasks, err.Error(), err)
+		newState := state.Apply.Failed
+		if engine.IsRetryable(err) {
+			newState = state.Apply.FailedRetryable
+		}
+		c.logger.Error("atomic apply failed", "error", err, "apply_id", apply.ApplyIdentifier, "retryable", engine.IsRetryable(err))
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Engine apply failed: %v", err), state.Apply.Pending, state.Apply.Failed)
+			fmt.Sprintf("Engine apply failed: %v", err), state.Apply.Pending, newState)
 		return
 	}
 
@@ -952,8 +956,18 @@ func (c *LocalClient) markTaskFailed(ctx context.Context, task *storage.Task, er
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.
 // If the apply is already in a terminal state (e.g., cancelled by Stop()), the
 // apply state is not overwritten.
-func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
+func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string, originalErr ...error) {
 	now := time.Now()
+
+	// Determine if the failure is retryable based on the original error.
+	retryable := len(originalErr) > 0 && originalErr[0] != nil && engine.IsRetryable(originalErr[0])
+	taskState := state.Task.Failed
+	applyState := state.Apply.Failed
+	if retryable {
+		taskState = state.Task.FailedRetryable
+		applyState = state.Apply.FailedRetryable
+	}
+
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
 			continue
@@ -962,7 +976,7 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 			task.ErrorMessage = errMsg
 		}
 		task.CompletedAt = &now
-		c.transitionTaskState(ctx, task, 0, state.Task.Failed, "")
+		c.transitionTaskState(ctx, task, 0, taskState, "")
 	}
 
 	// Re-read the apply from storage — Stop() may have already set a terminal
@@ -974,12 +988,19 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 		return
 	}
 
-	apply.State = state.Apply.Failed
+	apply.State = applyState
 	apply.ErrorMessage = errMsg
-	apply.CompletedAt = &now
+	if !retryable {
+		apply.CompletedAt = &now
+	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", applyState, "error", err)
+	}
+
+	if retryable {
+		c.logger.Info("apply marked as retryable, recovery loop will retry",
+			"apply_id", apply.ApplyIdentifier, "attempt", apply.Attempt, "error", errMsg)
 	}
 }
 

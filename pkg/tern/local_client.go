@@ -138,11 +138,18 @@ type LocalClient struct {
 	// Defaults to 10s. Tests may lower this to verify heartbeat behavior.
 	heartbeatInterval time.Duration
 
+	// recoveryInterval controls how often the recovery loop polls for retryable applies.
+	// Defaults to 30s. Tests may lower this.
+	recoveryInterval time.Duration
+
 	// cancelApply cancels the background goroutine running executeApplySequential
 	// or executeApplyAtomic. Set when an apply starts, called by Stop().
 	// Protected by cancelMu since Apply and Stop run on different goroutines.
 	cancelMu    sync.Mutex
 	cancelApply context.CancelFunc
+
+	// cancelRecovery stops the background recovery loop. Set by StartRecoveryLoop.
+	cancelRecovery context.CancelFunc
 }
 
 // Compile-time check that LocalClient implements Client.
@@ -169,6 +176,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		planetscaleEngine: psEngine,
 		logger:            logger,
 		heartbeatInterval: 10 * time.Second,
+		recoveryInterval:  30 * time.Second,
 	}, nil
 }
 
@@ -198,8 +206,118 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 
 // Close closes the client and releases resources.
 func (c *LocalClient) Close() error {
-	// LocalClient doesn't own storage, so nothing to close
+	if c.cancelRecovery != nil {
+		c.cancelRecovery()
+	}
 	return nil
+}
+
+// StartRecoveryLoop starts a background goroutine that polls for
+// failed_retryable applies and re-dispatches them. Call Close() to stop.
+func (c *LocalClient) StartRecoveryLoop(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	c.cancelRecovery = cancel
+
+	go func() {
+		c.logger.Info("recovery loop started", "interval", c.recoveryInterval)
+		ticker := time.NewTicker(c.recoveryInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				c.logger.Info("recovery loop stopped")
+				return
+			case <-ticker.C:
+				c.recoverOneApply(ctx)
+			}
+		}
+	}()
+}
+
+// recoverOneApply claims one failed_retryable apply and re-dispatches it.
+func (c *LocalClient) recoverOneApply(ctx context.Context) {
+	apply, err := c.storage.Applies().ClaimForRecovery(ctx)
+	if err != nil {
+		c.logger.Error("recovery loop: claim failed", "error", err)
+		return
+	}
+	if apply == nil {
+		return // nothing to recover
+	}
+
+	c.logger.Info("recovery loop: claimed apply for retry",
+		"apply_id", apply.ApplyIdentifier,
+		"state", apply.State,
+		"attempt", apply.Attempt,
+		"database", apply.Database,
+	)
+
+	// Only re-dispatch failed_retryable applies. Stale active applies
+	// (pending/running with dead heartbeat) are handled by the existing
+	// conflict check in Apply().
+	if apply.State != state.Apply.FailedRetryable {
+		c.logger.Debug("recovery loop: skipping non-retryable apply",
+			"apply_id", apply.ApplyIdentifier, "state", apply.State)
+		return
+	}
+
+	// Transition back to running for the retry attempt
+	apply.State = state.Apply.Running
+	apply.ErrorMessage = ""
+	apply.UpdatedAt = time.Now()
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("recovery loop: failed to update apply state",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return
+	}
+
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Recovery attempt %d: retrying apply %s", apply.Attempt, apply.ApplyIdentifier), "", state.Apply.Running)
+
+	// Load the plan and re-dispatch
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil || plan == nil {
+		c.logger.Error("recovery loop: plan not found", "apply_id", apply.ApplyIdentifier, "plan_id", apply.PlanID, "error", err)
+		apply.State = state.Apply.Failed
+		apply.ErrorMessage = "recovery failed: plan not found"
+		now := time.Now()
+		apply.CompletedAt = &now
+		_ = c.storage.Applies().Update(ctx, apply)
+		return
+	}
+
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		c.logger.Error("recovery loop: failed to load tasks", "apply_id", apply.ApplyIdentifier, "error", err)
+		return
+	}
+
+	// Re-dispatch in background (same as initial Apply)
+	applyCtx := context.WithoutCancel(ctx)
+	go c.runWithRecovery(applyCtx, apply, tasks, func() {
+		c.executeApplyAtomic(applyCtx, apply, tasks, plan, parseOptionsMap(apply.Options))
+	})
+}
+
+// parseOptionsMap converts stored apply options JSON back to a string map
+// for re-dispatching applies through executeApplyAtomic.
+func parseOptionsMap(data []byte) map[string]string {
+	opts := storage.ParseApplyOptions(data)
+	m := make(map[string]string)
+	if opts.DeferCutover {
+		m["defer_cutover"] = "true"
+	}
+	if opts.SkipRevert {
+		m["skip_revert"] = "true"
+	}
+	if opts.AllowUnsafe {
+		m["allow_unsafe"] = "true"
+	}
+	if opts.Branch != "" {
+		m["branch"] = opts.Branch
+	}
+	return m
 }
 
 // credentials returns engine credentials from the client config.

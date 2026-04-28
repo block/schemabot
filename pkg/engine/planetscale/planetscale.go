@@ -1121,7 +1121,30 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 		e.logger.Info("keyspace changes applied", "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
 		return nil
 	}
-	return fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
+	finalErr := fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
+	// Wrap as retryable if the last error was a transient condition.
+	// This signals the apply orchestration to use failed_retryable instead of failed.
+	if isRetryableEngineError(lastErr) {
+		return engine.NewRetryableError(finalErr)
+	}
+	return finalErr
+}
+
+// isRetryableEngineError returns true if the error is a transient condition
+// that may succeed on a future attempt. Used to wrap errors as RetryableError
+// when engine-level retries are exhausted.
+func isRetryableEngineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return isSnapshotInProgress(err) ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "branch not ready") ||
+		strings.Contains(msg, "Too many requests")
 }
 
 // isSnapshotInProgress returns true if the error indicates PlanetScale is
