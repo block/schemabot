@@ -293,11 +293,14 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 			// Update apply state to reflect engine setup phases so the
 			// progress handler returns the current phase to the CLI.
 			// Skip if already in the target state to avoid redundant DB writes.
+			// Only update in-memory state after a successful write so a failed
+			// write can be retried on the next event.
 			if newState != "" && newState != oldState {
 				apply.State = newState
 				apply.UpdatedAt = time.Now()
 				if err := c.storage.Applies().Update(ctx, apply); err != nil {
 					c.logger.Error("failed to update apply phase", "apply_id", apply.ApplyIdentifier, "state", newState, "error", err)
+					apply.State = oldState
 				}
 			}
 		},
