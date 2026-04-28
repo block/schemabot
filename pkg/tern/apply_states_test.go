@@ -11,9 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestDeriveApplyPhase verifies that engine events with structured phase
-// metadata produce the correct state transitions, and events without
-// phase metadata produce no transition.
+// TestDeriveApplyPhase verifies that engine events with structured state
+// produce the correct transitions, and events without a state produce none.
 func TestDeriveApplyPhase(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -25,7 +24,7 @@ func TestDeriveApplyPhase(t *testing.T) {
 			name: "branch ready transitions to applying_branch_changes",
 			event: engine.ApplyEvent{
 				Message:  "Branch schemabot-boardgames-123 ready (44s)",
-				Metadata: map[string]string{engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges},
+				NewState: state.Apply.ApplyingBranchChanges,
 			},
 			wantState: state.Apply.ApplyingBranchChanges,
 		},
@@ -33,7 +32,7 @@ func TestDeriveApplyPhase(t *testing.T) {
 			name: "branch schema refreshed transitions to applying_branch_changes",
 			event: engine.ApplyEvent{
 				Message:  "Branch dr-branch-reuse schema refreshed (5s)",
-				Metadata: map[string]string{engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges},
+				NewState: state.Apply.ApplyingBranchChanges,
 			},
 			wantState: state.Apply.ApplyingBranchChanges,
 		},
@@ -41,7 +40,7 @@ func TestDeriveApplyPhase(t *testing.T) {
 			name: "applying changes transitions to applying_branch_changes",
 			event: engine.ApplyEvent{
 				Message:  "Applying changes to 33 keyspaces on branch dr-branch-reuse",
-				Metadata: map[string]string{engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges},
+				NewState: state.Apply.ApplyingBranchChanges,
 			},
 			wantState: state.Apply.ApplyingBranchChanges,
 		},
@@ -49,12 +48,12 @@ func TestDeriveApplyPhase(t *testing.T) {
 			name: "DDL applied transitions to creating_deploy_request",
 			event: engine.ApplyEvent{
 				Message:  "Applied 3 DDL changes to branch schemabot-commerce-456",
-				Metadata: map[string]string{engine.MetadataKeyPhase: state.Apply.CreatingDeployRequest},
+				NewState: state.Apply.CreatingDeployRequest,
 			},
 			wantState: state.Apply.CreatingDeployRequest,
 		},
 		{
-			name: "applied keyspace has no phase — no transition",
+			name: "applied keyspace — no transition",
 			event: engine.ApplyEvent{
 				Message:  "Applied keyspace commerce_sharded_015 (12/33)",
 				Metadata: map[string]string{"keyspace": "commerce_sharded_015"},
@@ -62,7 +61,7 @@ func TestDeriveApplyPhase(t *testing.T) {
 			wantNoChange: true,
 		},
 		{
-			name: "creating branch has no phase — no transition",
+			name: "creating branch — no transition",
 			event: engine.ApplyEvent{
 				Message:  "Creating branch schemabot-boardgames-123",
 				Metadata: map[string]string{"branch": "schemabot-boardgames-123"},
@@ -70,7 +69,7 @@ func TestDeriveApplyPhase(t *testing.T) {
 			wantNoChange: true,
 		},
 		{
-			name:         "nil metadata — no transition",
+			name:         "empty event — no transition",
 			event:        engine.ApplyEvent{Message: "some log line"},
 			wantNoChange: true,
 		},

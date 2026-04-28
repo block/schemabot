@@ -787,17 +787,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	// emitEvent logs a lifecycle event and sends it to the caller for apply_logs recording.
-	emitEvent := func(message string, metadata map[string]string) {
+	emitEvent := func(event engine.ApplyEvent) {
 		attrs := []any{"database", req.Database}
-		for k, v := range metadata {
+		for k, v := range event.Metadata {
 			attrs = append(attrs, k, v)
 		}
-		e.logger.Info(message, attrs...)
+		e.logger.Info(event.Message, attrs...)
 		if req.OnEvent != nil {
-			req.OnEvent(engine.ApplyEvent{
-				Message:  message,
-				Metadata: metadata,
-			})
+			req.OnEvent(event)
 		}
 	}
 
@@ -838,7 +835,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			return nil, fmt.Errorf("cannot reuse the %s branch — use a development branch", main)
 		}
 		persistState(&psMetadata{BranchName: branchName})
-		emitEvent(fmt.Sprintf("Reusing branch %s", branchName), map[string]string{"branch": branchName})
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Reusing branch %s", branchName),
+			Metadata: map[string]string{"branch": branchName},
+		})
 
 		// Verify branch exists
 		if _, err := client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
@@ -853,7 +853,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 
 		// Sync with main to pick up latest schema
-		emitEvent(fmt.Sprintf("Refreshing schema for branch %s from %s", branchName, main), map[string]string{"branch": branchName})
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Refreshing schema for branch %s from %s", branchName, main),
+			Metadata: map[string]string{"branch": branchName},
+		})
 		if err := client.RefreshSchema(ctx, org, req.Database, branchName); err != nil {
 			return nil, fmt.Errorf("refresh schema for branch %s: %w", branchName, err)
 		}
@@ -863,15 +866,19 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			return nil, fmt.Errorf("wait for schema refresh %s: %w", branchName, err)
 		}
 		elapsed := time.Since(branchStart).Round(time.Second)
-		emitEvent(fmt.Sprintf("Branch %s schema refreshed (%s)", branchName, elapsed), map[string]string{
-			"branch":                branchName,
-			engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges,
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Branch %s schema refreshed (%s)", branchName, elapsed),
+			Metadata: map[string]string{"branch": branchName},
+			NewState: state.Apply.ApplyingBranchChanges,
 		})
 	} else {
 		// Create a new branch
 		branchName = generateBranchName(req.Database, req.PlanID)
 		persistState(&psMetadata{BranchName: branchName})
-		emitEvent(fmt.Sprintf("Creating branch %s", branchName), map[string]string{"branch": branchName})
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Creating branch %s", branchName),
+			Metadata: map[string]string{"branch": branchName},
+		})
 
 		_, err = e.createBranch(ctx, client, org, req.Database, branchName, main)
 		if err != nil {
@@ -883,9 +890,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			return nil, fmt.Errorf("wait for branch: %w", err)
 		}
 		elapsed := time.Since(branchStart).Round(time.Second)
-		emitEvent(fmt.Sprintf("Branch %s ready (%s)", branchName, elapsed), map[string]string{
-			"branch":                branchName,
-			engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges,
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Branch %s ready (%s)", branchName, elapsed),
+			Metadata: map[string]string{"branch": branchName},
+			NewState: state.Apply.ApplyingBranchChanges,
 		})
 	}
 
@@ -905,9 +913,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	// Apply DDL and VSchema changes to all keyspaces
-	emitEvent("Applying changes to branch", map[string]string{
-		"branch":                branchName,
-		engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges,
+	emitEvent(engine.ApplyEvent{
+		Message:  "Applying changes to branch",
+		Metadata: map[string]string{"branch": branchName},
+		NewState: state.Apply.ApplyingBranchChanges,
 	})
 	if err := e.applyChangesToBranch(ctx, req.Changes, req.SchemaFiles, password, client, org, req.Database, branchName, emitEvent); err != nil {
 		return nil, fmt.Errorf("apply changes to branch: %w", err)
@@ -916,9 +925,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	for _, sc := range req.Changes {
 		ddlCount += len(sc.TableChanges)
 	}
-	emitEvent(fmt.Sprintf("Applied %d DDL changes to branch %s", ddlCount, branchName), map[string]string{
-		"branch":                branchName,
-		engine.MetadataKeyPhase: state.Apply.CreatingDeployRequest,
+	emitEvent(engine.ApplyEvent{
+		Message:  fmt.Sprintf("Applied %d DDL changes to branch %s", ddlCount, branchName),
+		Metadata: map[string]string{"branch": branchName},
+		NewState: state.Apply.CreatingDeployRequest,
 	})
 
 	// Capture existing migration_contexts before deploy so we can discover the new one
@@ -936,10 +946,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
-	emitEvent(fmt.Sprintf("Deploy request #%d created", dr.Number), map[string]string{
-		"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
-		"deploy_request_url": dr.HtmlURL,
-		"branch":             branchName,
+	emitEvent(engine.ApplyEvent{
+		Message: fmt.Sprintf("Deploy request #%d created", dr.Number),
+		Metadata: map[string]string{
+			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
+			"deploy_request_url": dr.HtmlURL,
+			"branch":             branchName,
+		},
 	})
 	persistState(&psMetadata{
 		BranchName:       branchName,
@@ -957,8 +970,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return nil, fmt.Errorf("deploy request #%d failed during preparation (state: %s)", dr.Number, dr.DeploymentState)
 	}
 	if dr.DeploymentState == deployState.NoChanges {
-		emitEvent(fmt.Sprintf("Deploy request #%d: no changes detected", dr.Number), map[string]string{
-			"deploy_request_id": fmt.Sprintf("%d", dr.Number),
+		emitEvent(engine.ApplyEvent{
+			Message:  fmt.Sprintf("Deploy request #%d: no changes detected", dr.Number),
+			Metadata: map[string]string{"deploy_request_id": fmt.Sprintf("%d", dr.Number)},
 		})
 		return &engine.ApplyResult{Message: "no changes detected"}, nil
 	}
@@ -999,10 +1013,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if useInstant {
 		readyMsg += " — instant DDL eligible"
 	}
-	emitEvent(readyMsg, map[string]string{
-		"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
-		"deploy_request_url": dr.HtmlURL,
-		"instant_ddl":        fmt.Sprintf("%t", useInstant),
+	emitEvent(engine.ApplyEvent{
+		Message: readyMsg,
+		Metadata: map[string]string{
+			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
+			"deploy_request_url": dr.HtmlURL,
+			"instant_ddl":        fmt.Sprintf("%t", useInstant),
+		},
 	})
 
 	// Deploy (starts the schema change)
@@ -1020,9 +1037,12 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return nil, fmt.Errorf("deploy deploy request: %w", err)
 	}
 
-	emitEvent(fmt.Sprintf("Deploy request #%d deployed", dr.Number), map[string]string{
-		"deploy_request_id": fmt.Sprintf("%d", dr.Number),
-		"instant_ddl":       fmt.Sprintf("%t", useInstant),
+	emitEvent(engine.ApplyEvent{
+		Message: fmt.Sprintf("Deploy request #%d deployed", dr.Number),
+		Metadata: map[string]string{
+			"deploy_request_id": fmt.Sprintf("%d", dr.Number),
+			"instant_ddl":       fmt.Sprintf("%t", useInstant),
+		},
 	})
 
 	// Discover migration_context by diffing current SHOW VITESS_MIGRATIONS against
@@ -1063,7 +1083,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 // VSchema updates are applied sequentially (PlanetScale rejects concurrent
 // VSchema writes during schema snapshots). DDL is applied in parallel after
 // all VSchema changes are committed.
-func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string, emitEvent func(string, map[string]string)) error {
+func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string, emitEvent func(engine.ApplyEvent)) error {
 	if len(changes) == 0 {
 		e.logger.Debug("no changes to apply to branch", "branch", branchName)
 		return nil
@@ -1074,15 +1094,16 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 
 	// Serialize event callbacks — OnEvent mutates shared apply state.
 	var eventMu sync.Mutex
-	safeEmit := func(message string, metadata map[string]string) {
+	safeEmit := func(event engine.ApplyEvent) {
 		eventMu.Lock()
 		defer eventMu.Unlock()
-		emitEvent(message, metadata)
+		emitEvent(event)
 	}
 
-	safeEmit(fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName), map[string]string{
-		"branch":                branchName,
-		engine.MetadataKeyPhase: state.Apply.ApplyingBranchChanges,
+	safeEmit(engine.ApplyEvent{
+		Message:  fmt.Sprintf("Applying changes to %d keyspaces on branch %s", total, branchName),
+		Metadata: map[string]string{"branch": branchName},
+		NewState: state.Apply.ApplyingBranchChanges,
 	})
 
 	g, gCtx := errgroup.WithContext(ctx)
@@ -1093,8 +1114,10 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 				return err
 			}
 			n := int(applied.Add(1))
-			safeEmit(fmt.Sprintf("Applied keyspace %s (%d/%d)", sc.Namespace, n, total),
-				map[string]string{"keyspace": sc.Namespace})
+			safeEmit(engine.ApplyEvent{
+				Message:  fmt.Sprintf("Applied keyspace %s (%d/%d)", sc.Namespace, n, total),
+				Metadata: map[string]string{"keyspace": sc.Namespace},
+			})
 			return nil
 		})
 	}
@@ -1316,14 +1339,14 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("decode resume state: %w", err)
 	}
 
-	emitEvent := func(message string, metadata map[string]string) {
+	emitEvent := func(event engine.ApplyEvent) {
 		attrs := []any{"database", req.Database}
-		for k, v := range metadata {
+		for k, v := range event.Metadata {
 			attrs = append(attrs, k, v)
 		}
-		e.logger.Info(message, attrs...)
+		e.logger.Info(event.Message, attrs...)
 		if req.OnEvent != nil {
-			req.OnEvent(engine.ApplyEvent{Message: message, Metadata: metadata})
+			req.OnEvent(event)
 		}
 	}
 

@@ -292,11 +292,14 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 		ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
 		Credentials: creds,
 		OnEvent: func(event engine.ApplyEvent) {
+			oldState := apply.State
+			newState := deriveApplyPhase(event)
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-				event.Message, "", "")
+				event.Message, oldState, newState)
 			// Update apply state to reflect engine setup phases so the
 			// progress handler returns the current phase to the CLI.
-			if newState := deriveApplyPhase(event); newState != "" {
+			// Skip if already in the target state to avoid redundant DB writes.
+			if newState != "" && newState != oldState {
 				apply.State = newState
 				apply.UpdatedAt = time.Now()
 				if err := c.storage.Applies().Update(ctx, apply); err != nil {
@@ -1052,13 +1055,10 @@ func deriveOverallState(tasks []*storage.Task) string {
 	return tasks[0].State
 }
 
-// deriveApplyPhase extracts the apply phase from an engine event's structured
-// metadata. Returns empty string if the event carries no phase transition.
+// deriveApplyPhase returns the apply state transition from an engine event.
+// Returns empty string if the event is informational (no state transition).
 func deriveApplyPhase(event engine.ApplyEvent) string {
-	if event.Metadata == nil {
-		return ""
-	}
-	return event.Metadata[engine.MetadataKeyPhase]
+	return event.NewState
 }
 
 // planNamespacesToChanges converts stored plan namespace data to engine schema
