@@ -21,6 +21,7 @@ import (
 
 	schemabotapi "github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -1458,4 +1459,192 @@ CREATE TABLE ccc_cancelled (
 	assert.Error(t, err, "ccc_cancelled table should NOT exist in DB")
 
 	t.Log("Partial failure test passed: 1 completed, 1 failed, 1 cancelled")
+}
+
+// TestRecoveryLoop_FailedRetryable verifies that the recovery loop picks up
+// a failed_retryable apply and completes it. The test:
+//  1. Creates a plan via API (CREATE TABLE)
+//  2. Creates an apply via API — it succeeds and creates the table
+//  3. Drops the table and creates a second plan (same CREATE TABLE)
+//  4. Calls Apply API for the second plan, waits for running, then
+//     manually sets the apply to failed_retryable (simulating transient failure)
+//  5. Starts the recovery loop
+//  6. Verifies the apply transitions to completed and the table exists
+func TestRecoveryLoop_FailedRetryable(t *testing.T) {
+	ctx := t.Context()
+
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err, "read schema file")
+
+	appDBName, appDSN := createTestDB(t, "recovery_")
+	ts := startTestServer(t, appDBName, appDSN)
+
+	// Plan a CREATE TABLE
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database":    appDBName,
+		"environment": "staging",
+		"type":        "mysql",
+		"schema_files": map[string]any{
+			"default": map[string]any{
+				"files": map[string]string{
+					"users.sql": string(schemaSQL),
+				},
+			},
+		},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+
+	// Apply — this creates the table normally
+	applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id":     planID,
+		"environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true)
+	applyID1, _ := applyResp["apply_id"].(string)
+	waitForState(t, "http://"+ts.Addr, applyID1, "completed", 15*time.Second)
+	t.Log("First apply completed, table exists")
+
+	// Drop the table so the next plan produces the same CREATE TABLE
+	targetConn, err := sql.Open("mysql", appDSN)
+	require.NoError(t, err)
+	defer func() { _ = targetConn.Close() }()
+	_, err = targetConn.ExecContext(ctx, "DROP TABLE IF EXISTS users")
+	require.NoError(t, err, "drop users table")
+
+	// Second plan — same CREATE TABLE
+	plan2Resp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database":    appDBName,
+		"environment": "staging",
+		"type":        "mysql",
+		"schema_files": map[string]any{
+			"default": map[string]any{
+				"files": map[string]string{
+					"users.sql": string(schemaSQL),
+				},
+			},
+		},
+	})
+	planID2, _ := plan2Resp["plan_id"].(string)
+	require.NotEmpty(t, planID2)
+
+	// Apply — but we'll intercept and mark as failed_retryable
+	apply2Resp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id":     planID2,
+		"environment": "staging",
+	})
+	require.True(t, apply2Resp["accepted"] == true)
+	applyID2, _ := apply2Resp["apply_id"].(string)
+	require.NotEmpty(t, applyID2)
+
+	// Wait for the second apply to complete (it will succeed quickly since it's CREATE TABLE)
+	waitForState(t, "http://"+ts.Addr, applyID2, "completed", 15*time.Second)
+
+	// Now simulate the recovery scenario: drop table again, create a third plan+apply,
+	// and manually set state to failed_retryable before the engine runs.
+	_, err = targetConn.ExecContext(ctx, "DROP TABLE IF EXISTS users")
+	require.NoError(t, err)
+
+	plan3Resp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database":    appDBName,
+		"environment": "staging",
+		"type":        "mysql",
+		"schema_files": map[string]any{
+			"default": map[string]any{
+				"files": map[string]string{
+					"users.sql": string(schemaSQL),
+				},
+			},
+		},
+	})
+	planID3, _ := plan3Resp["plan_id"].(string)
+	require.NotEmpty(t, planID3)
+
+	// Look up the plan in storage to create the apply record directly
+	plan3, err := ts.Storage.Plans().Get(ctx, planID3)
+	require.NoError(t, err)
+	require.NotNil(t, plan3)
+
+	// Create an apply record directly in failed_retryable state
+	// (simulating an apply that ran partway and hit a transient error)
+	now := time.Now()
+	failedApply := &storage.Apply{
+		ApplyIdentifier: "apply-recovery-test-" + fmt.Sprintf("%d", now.UnixNano()%100000),
+		PlanID:          plan3.ID,
+		Database:        appDBName,
+		DatabaseType:    "mysql",
+		Engine:          "spirit",
+		State:           state.Apply.FailedRetryable,
+		ErrorMessage:    "simulated transient failure",
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now.Add(-2 * time.Minute), // stale heartbeat so ClaimForRecovery picks it up
+	}
+	applyID3, err := ts.Storage.Applies().Create(ctx, failedApply)
+	require.NoError(t, err)
+	failedApply.ID = applyID3
+
+	// Create tasks for this apply (one per DDL change in the plan)
+	for _, tc := range plan3.FlatDDLChanges() {
+		task := &storage.Task{
+			TaskIdentifier: "task-recovery-" + fmt.Sprintf("%d", time.Now().UnixNano()%100000),
+			ApplyID:        applyID3,
+			PlanID:         plan3.ID,
+			Database:       appDBName,
+			DatabaseType:   "mysql",
+			Engine:         "spirit",
+			State:          state.Task.FailedRetryable,
+			ErrorMessage:   "simulated transient failure",
+			TableName:      tc.Table,
+			DDL:            tc.DDL,
+			DDLAction:      tc.Operation,
+			Options:        []byte("{}"),
+			Environment:    "staging",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		_, err := ts.Storage.Tasks().Create(ctx, task)
+		require.NoError(t, err)
+	}
+
+	t.Logf("Created failed_retryable apply %s with %d tasks", failedApply.ApplyIdentifier, len(plan3.FlatDDLChanges()))
+
+	// Start the recovery loop with a fast poll interval
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	recoveryClient, err := tern.NewLocalClient(tern.LocalConfig{
+		Database:  appDBName,
+		Type:      "mysql",
+		TargetDSN: appDSN,
+	}, ts.Storage, logger)
+	require.NoError(t, err)
+	recoveryClient.SetRecoveryInterval(1 * time.Second) // fast poll for testing
+	recoveryClient.StartRecoveryLoop(t.Context())
+	defer func() { _ = recoveryClient.Close() }()
+
+	// Wait for the apply to be picked up and completed
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		apply, err := ts.Storage.Applies().Get(ctx, applyID3)
+		require.NoError(t, err)
+		if apply != nil && apply.State == state.Apply.Completed {
+			t.Logf("Recovery succeeded: apply %s completed (attempt %d)", apply.ApplyIdentifier, apply.Attempt)
+
+			// Verify the table was actually created
+			var tableName string
+			err := targetConn.QueryRowContext(ctx, `
+				SELECT TABLE_NAME FROM information_schema.TABLES
+				WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'users'
+			`, appDBName).Scan(&tableName)
+			require.NoError(t, err, "users table should exist after recovery")
+			t.Log("Recovery loop test passed: failed_retryable apply recovered and completed")
+			return
+		}
+		// Also check if it permanently failed (shouldn't happen)
+		if apply != nil && apply.State == state.Apply.Failed {
+			t.Fatalf("Apply permanently failed instead of recovering: %s", apply.ErrorMessage)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatal("timeout: recovery loop did not complete the apply within 20s")
 }

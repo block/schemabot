@@ -300,6 +300,12 @@ func (c *LocalClient) recoverOneApply(ctx context.Context) {
 	})
 }
 
+// SetRecoveryInterval sets the polling interval for the recovery loop.
+// For testing only — production uses the default 30s.
+func (c *LocalClient) SetRecoveryInterval(d time.Duration) {
+	c.recoveryInterval = d
+}
+
 // parseOptionsMap converts stored apply options JSON back to a string map
 // for re-dispatching applies through executeApplyAtomic.
 func parseOptionsMap(data []byte) map[string]string {
