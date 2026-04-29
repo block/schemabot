@@ -19,7 +19,7 @@ else
   GOTEST := go test
 endif
 
-.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -170,6 +170,15 @@ ifeq ($(FRESH),1)
 	docker compose -f deploy/local/docker-compose.yml down -v 2>/dev/null || true
 endif
 	docker compose -f deploy/local/docker-compose.yml up --build
+
+# Start local dev with observability (Grafana + Prometheus + Loki + Tempo)
+#   make up-telemetry           # Start with Grafana at http://localhost:3000
+#   make up-telemetry FRESH=1   # Reinitialize databases
+up-telemetry:
+ifeq ($(FRESH),1)
+	docker compose -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.telemetry.yml down -v 2>/dev/null || true
+endif
+	docker compose -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.telemetry.yml up --build
 
 # Start services, apply testapp schema, then show logs (full demo workflow)
 #   make demo              # Start and apply MySQL + Vitess schema (wipes data)

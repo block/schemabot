@@ -1,0 +1,35 @@
+# Observability overlay: adds Grafana + Prometheus + Loki + Tempo via otel-lgtm.
+#
+# Usage (layer on top of the base compose):
+#   docker compose -f docker-compose.yml -f docker-compose.telemetry.yml up
+#
+# Endpoints:
+#   Grafana:    http://localhost:3000 (admin/admin)
+#   OTLP HTTP:  localhost:4318
+#   OTLP gRPC:  localhost:4317
+#   Prometheus: http://localhost:9090
+#
+# SchemaBot's /metrics endpoint is scraped by Prometheus inside otel-lgtm.
+# Grafana comes pre-configured with Prometheus, Loki, and Tempo datasources.
+
+services:
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.26.0
+    ports:
+      - "3000:3000"   # Grafana
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "9090:9090"   # Prometheus
+    volumes:
+      - ./telemetry/prometheus.yml:/otel-lgtm/prometheus.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  schemabot:
+    depends_on:
+      otel-lgtm:
+        condition: service_started
