@@ -178,6 +178,7 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
 - Use `utils.CloseAndLog(runner)` for Spirit runner cleanup instead of `_ = runner.Close()`.
 - Use `table.LoadSchemaFromDB(ctx, db)` (from `github.com/block/spirit/pkg/table`) to load all table schemas from a database instead of manual `SHOW TABLES` + `SHOW CREATE TABLE` loops. Filter results with `ddl.IsSpiritInternalTable` when Spirit internal tables should be excluded.
 - **Use `statement.New()` for DDL parsing** (from `github.com/block/spirit/pkg/statement`). Never hand-parse ALTER TABLE statements with string splitting — use Spirit's `AbstractStatement` which gives you `Table`, `Alter`, `Type`, and `Schema` fields. Use `statement.Classify()` for lightweight type detection without full parsing.
+- **Use Spirit's typed constants for DDL classification.** Prefer `statement.Classify()` with Spirit's typed constants (`statement.StatementCreateTable`, `statement.StatementAlterTable`, `statement.StatementDropTable`) over `ddl.ClassifyStatementAST()` wherever possible. Push Spirit's types as far to the edge as you can — only convert to strings (`"create"`, `"alter"`, `"drop"`) at storage/API/proto boundaries. Don't define separate string constants for DDL operations; Spirit already provides the typed ones.
 
 ### Vitess Dependency
 
