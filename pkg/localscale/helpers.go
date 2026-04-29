@@ -688,8 +688,10 @@ func qualifyAlterTableName(stmt, schemaName string) string {
 	return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", schemaName, r.Table, r.Alter)
 }
 
-// addAlgorithmInstant rewrites an ALTER TABLE statement to include ALGORITHM=INSTANT.
-// Returns "" for non-ALTER TABLE statements (CREATE TABLE, DROP TABLE, etc.).
+// addAlgorithmInstant rewrites a statement into ALTER TABLE form with ALGORITHM=INSTANT
+// when Spirit parses it with table and alter components. Returns "" for statements that
+// do not parse into an ALTER TABLE rewrite. Some non-ALTER inputs (e.g., CREATE INDEX)
+// are normalized by Spirit into ALTER TABLE ... ADD INDEX ... and will be rewritten.
 func addAlgorithmInstant(stmt string) string {
 	parsed, err := statement.New(strings.TrimSpace(stmt))
 	if err != nil || len(parsed) == 0 {

@@ -27,9 +27,14 @@ func (e *Engine) executeMigration(ctx context.Context, host, username, password,
 
 	for _, stmt := range ddlStatements {
 		results, err := statement.Classify(stmt)
-		if err != nil || len(results) == 0 {
+		if err != nil {
 			e.logger.Error("failed to classify statement", "error", err, "statement", stmt)
-			e.setMigrationFailed(fmt.Errorf("failed to classify statement: %w", err))
+			e.setMigrationFailed(fmt.Errorf("classify statement %q: %w", stmt, err))
+			return
+		}
+		if len(results) == 0 {
+			e.logger.Error("no classification result for statement", "statement", stmt)
+			e.setMigrationFailed(fmt.Errorf("no classification result for statement %q", stmt))
 			return
 		}
 		switch results[0].Type {
