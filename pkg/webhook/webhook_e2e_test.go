@@ -82,6 +82,11 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -2082,4 +2087,84 @@ func e2eContainerName(base string) string {
 		return '-'
 	}, branch)
 	return base + "-" + sanitized
+}
+
+func TestE2EWebhookMetrics(t *testing.T) {
+	// Set up OTel ManualReader to capture metrics.
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	dbName := "webhook_metrics_test"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	// Send an issue_comment webhook (plan command).
+	commentReq := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, commentReq)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// Send a pull_request opened webhook (auto-plan trigger).
+	prReq := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened"}, nil)
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, prReq)
+	require.Equal(t, http.StatusOK, rr2.Code)
+
+	// Collect metrics and verify both webhook events were recorded.
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	var found bool
+	observedEvents := make(map[string]bool)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == "schemabot.webhook.events_total" {
+				found = true
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				require.True(t, ok)
+
+				for _, dp := range sum.DataPoints {
+					evType, _ := dp.Attributes.Value(attribute.Key("event_type"))
+					action, _ := dp.Attributes.Value(attribute.Key("action"))
+					status, _ := dp.Attributes.Value(attribute.Key("status"))
+					repo, _ := dp.Attributes.Value(attribute.Key("repository"))
+					key := evType.AsString() + "/" + action.AsString()
+					observedEvents[key] = true
+					t.Logf("webhook metric: event_type=%s action=%s repo=%s status=%s",
+						evType.AsString(), action.AsString(), repo.AsString(), status.AsString())
+				}
+			}
+		}
+	}
+	require.True(t, found, "schemabot.webhook.events_total metric not found")
+	assert.True(t, observedEvents["issue_comment/created"], "expected issue_comment/created metric")
+	assert.True(t, observedEvents["pull_request/opened"], "expected pull_request/opened metric")
 }
