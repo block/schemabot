@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,6 +26,50 @@ func TestSetupTelemetry(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, tel.Shutdown(t.Context())) })
 
 	require.NotNil(t, tel.MetricsHandler)
+	assert.Nil(t, tel.tracerProvider, "tracerProvider should be nil without OTLP endpoint")
+}
+
+func TestSetupTelemetryWithOTLP(t *testing.T) {
+	// Start a fake OTLP endpoint that records which paths receive data.
+	var mu sync.Mutex
+	receivedPaths := make(map[string]int)
+	fakeOTLP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		receivedPaths[r.URL.Path]++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", fakeOTLP.URL)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	tel, err := SetupTelemetry(logger)
+	require.NoError(t, err)
+
+	require.NotNil(t, tel.MetricsHandler)
+	assert.NotNil(t, tel.tracerProvider, "tracerProvider should be set with OTLP endpoint")
+
+	// Record a metric so there's data to push.
+	RecordPlan(t.Context(), "testdb", "staging", "success")
+
+	// Create a trace span so there's trace data to push.
+	tracer := otel.Tracer("test")
+	_, span := tracer.Start(t.Context(), "test-span")
+	span.End()
+
+	// Shutdown flushes all pending data to the OTLP endpoint.
+	require.NoError(t, tel.Shutdown(t.Context()))
+	fakeOTLP.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// OTLP HTTP exporter POSTs to /v1/metrics and /v1/traces.
+	assert.Greater(t, receivedPaths["/v1/traces"], 0,
+		"expected OTLP trace export to /v1/traces, got paths: %v", receivedPaths)
+	assert.Greater(t, receivedPaths["/v1/metrics"], 0,
+		"expected OTLP metric export to /v1/metrics, got paths: %v", receivedPaths)
 }
 
 func TestMetricsEndpoint(t *testing.T) {
