@@ -3,7 +3,6 @@ package commands
 import (
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -293,9 +292,8 @@ func sortStoppedByProgress(tables []tableProgress) {
 	})
 }
 
-func isTableStopped(status string) bool {
-	upper := strings.ToUpper(status)
-	return upper == "STOPPED" || upper == "STATE_STOPPED"
+func isTableStopped(s string) bool {
+	return state.IsState(s, state.Apply.Stopped)
 }
 
 // isEffectivelyStopped returns true if the apply is effectively stopped.

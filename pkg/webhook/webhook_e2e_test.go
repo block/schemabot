@@ -91,6 +91,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
@@ -1539,7 +1540,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 		if err != nil || apply == nil {
 			return false
 		}
-		return apply.State == "completed"
+		return state.IsState(apply.State, state.Apply.Completed)
 	}, 30*time.Second, 500*time.Millisecond, "apply should complete")
 
 	// Step 3: Set up fake GitHub and webhook handler

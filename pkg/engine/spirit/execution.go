@@ -11,7 +11,6 @@ import (
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
 
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 )
 
@@ -27,16 +26,16 @@ func (e *Engine) executeMigration(ctx context.Context, host, username, password,
 	var alterStatements []string
 
 	for _, stmt := range ddlStatements {
-		op, _, err := ddl.ClassifyStatementAST(stmt)
-		if err != nil {
+		results, err := statement.Classify(stmt)
+		if err != nil || len(results) == 0 {
 			e.logger.Error("failed to classify statement", "error", err, "statement", stmt)
-			e.setMigrationFailed(err)
+			e.setMigrationFailed(fmt.Errorf("failed to classify statement: %w", err))
 			return
 		}
-		switch op {
-		case "create":
+		switch results[0].Type {
+		case statement.StatementCreateTable:
 			createStatements = append(createStatements, stmt)
-		case "drop":
+		case statement.StatementDropTable:
 			dropStatements = append(dropStatements, stmt)
 		default:
 			// ALTER TABLE, RENAME TABLE, and unknown go here

@@ -418,25 +418,23 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 	semaphore := make(chan struct{}, 10)
 
 	for _, entry := range filesToFetch {
-		wg.Add(1)
-		go func(e TreeEntry) {
-			defer wg.Done()
+		wg.Go(func() {
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			content, err := ic.FetchBlobContent(ctx, repo, e.SHA)
+			content, err := ic.FetchBlobContent(ctx, repo, entry.SHA)
 			if err != nil {
-				results <- fileResult{err: fmt.Errorf("fetch %s: %w", e.Path, err)}
+				results <- fileResult{err: fmt.Errorf("fetch %s: %w", entry.Path, err)}
 				return
 			}
 			results <- fileResult{
 				file: GitHubFile{
-					Name:    path.Base(e.Path),
+					Name:    path.Base(entry.Path),
 					Content: content,
-					Path:    e.Path,
+					Path:    entry.Path,
 				},
 			}
-		}(entry)
+		})
 	}
 
 	go func() {

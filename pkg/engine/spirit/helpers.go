@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -19,18 +20,19 @@ func parseDSN(dsn string) (host, username, password, database string, err error)
 }
 
 // namespaceForTable finds which namespace a table belongs to by checking
-// which namespace's schema files define it. Returns an error if no namespace
-// can be matched.
+// which namespace's schema files define it. Uses Spirit's parser for accurate
+// table name extraction. Returns an error if no namespace can be matched.
 func namespaceForTable(table string, sf schema.SchemaFiles) (string, error) {
 	for nsName, ns := range sf {
 		for filename, content := range ns.Files {
-			// Check if this file defines the table (filename match or content match)
+			// Check filename match first (fast path)
 			baseName := strings.TrimSuffix(filename, ".sql")
 			if baseName == table {
 				return nsName, nil
 			}
-			if strings.Contains(content, "CREATE TABLE "+table) ||
-				strings.Contains(content, "CREATE TABLE `"+table+"`") {
+			// Parse the file content to extract the table name
+			_, tbl, err := ddl.ClassifyStatementAST(content)
+			if err == nil && tbl == table {
 				return nsName, nil
 			}
 		}

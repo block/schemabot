@@ -52,14 +52,14 @@ var nowFunc = time.Now
 // WriteProgress writes the schema change progress to stdout.
 func WriteProgress(data ProgressData) {
 	// No active schema change
-	if data.State == "" || data.State == state.NoActiveChange {
+	if state.IsState(data.State, state.NoActiveChange) {
 		fmt.Println("No active schema change")
 		return
 	}
 
 	// Build key/value pairs for the detail box
 	displayState := StateLabel(data.State)
-	if data.State == state.Apply.PreparingBranch && data.Metadata != nil && data.Metadata["existing_branch"] != "" {
+	if state.IsState(data.State, state.Apply.PreparingBranch) && data.Metadata != nil && data.Metadata["existing_branch"] != "" {
 		displayState = "Refreshing branch schema"
 	}
 	// Show latest event detail during setup phases
