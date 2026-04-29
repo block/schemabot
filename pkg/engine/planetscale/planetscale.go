@@ -640,79 +640,54 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		g.Go(func() error {
 			ns := req.SchemaFiles[ks]
 
+			tableChanges, vschemaChanged, diffErr := e.diffKeyspace(gCtx, client, org, req.Database, branch, ks, ns, currentSchema)
+			if diffErr != nil {
+				return diffErr
+			}
+
+			sc := engine.SchemaChange{
+				Namespace:    ks,
+				Metadata:     make(map[string]string),
+				TableChanges: tableChanges,
+			}
+
+			if vschemaChanged {
+				currentVSchemaRaw := ""
+				currentVSchema, _ := client.GetKeyspaceVSchema(gCtx, &ps.GetKeyspaceVSchemaRequest{
+					Organization: org, Database: req.Database, Branch: branch, Keyspace: ks,
+				})
+				if currentVSchema != nil {
+					currentVSchemaRaw = currentVSchema.Raw
+				}
+				sc.Metadata["vschema_changed"] = "true"
+				sc.Metadata["vschema"] = VSchemaDiff(currentVSchemaRaw, ns.Files["vschema.json"])
+			}
+
 			var currentTableSchemas []table.TableSchema
+			if tables, ok := currentSchema[ks]; ok {
+				currentTableSchemas = append(currentTableSchemas, tables...)
+			}
+			desiredTableSchemas, _ := parseDesiredSchemas(ks, ns)
+			plan, _ := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
+
 			schemas := make(map[string]string)
 			if tables, ok := currentSchema[ks]; ok {
 				for _, t := range tables {
-					currentTableSchemas = append(currentTableSchemas, t)
 					schemas[ks+"."+t.Name] = t.Schema
 				}
 			}
 
-			desiredTableSchemas, parseErr := parseDesiredSchemas(ks, ns)
-			if parseErr != nil {
-				return parseErr
-			}
-
-			sc := engine.SchemaChange{
-				Namespace: ks,
-				Metadata:  make(map[string]string),
-			}
-
-			// Diff VSchema
-			if content, ok := ns.Files["vschema.json"]; ok && content != "" {
-				currentVSchema, fetchErr := client.GetKeyspaceVSchema(gCtx, &ps.GetKeyspaceVSchemaRequest{
-					Organization: org,
-					Database:     req.Database,
-					Branch:       branch,
-					Keyspace:     ks,
-				})
-				if fetchErr != nil {
-					e.logger.Warn("failed to fetch current VSchema, treating as empty",
-						"keyspace", ks, "error", fetchErr)
-				}
-				currentVSchemaRaw := ""
-				if currentVSchema != nil {
-					currentVSchemaRaw = currentVSchema.Raw
-				}
-				if VSchemaChanged(currentVSchemaRaw, content) {
-					sc.Metadata["vschema"] = VSchemaDiff(currentVSchemaRaw, content)
-				}
-			}
-
-			plan, planErr := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
-			if planErr != nil {
-				return fmt.Errorf("plan changes for keyspace %s: %w", ks, planErr)
-			}
-
 			var violations []engine.LintViolation
-			for _, pc := range plan.Changes {
-				op, _, classifyErr := ddl.ClassifyStatementAST(pc.Statement)
-				if classifyErr != nil {
-					return fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
-				}
-				change := engine.TableChange{
-					Table:     pc.TableName,
-					Operation: op,
-					DDL:       pc.Statement,
-				}
-				if errViolations := pc.Errors(); len(errViolations) > 0 {
-					change.IsUnsafe = true
-					msgs := make([]string, len(errViolations))
-					for i, v := range errViolations {
-						msgs[i] = v.Message
+			if plan != nil {
+				for _, pc := range plan.Changes {
+					for _, v := range pc.Violations {
+						violations = append(violations, engine.LintViolation{
+							Table:    pc.TableName,
+							Linter:   v.Linter.Name(),
+							Message:  v.Message,
+							Severity: strings.ToLower(v.Severity.String()),
+						})
 					}
-					change.UnsafeReason = strings.Join(msgs, "; ")
-				}
-				sc.TableChanges = append(sc.TableChanges, change)
-
-				for _, v := range pc.Violations {
-					violations = append(violations, engine.LintViolation{
-						Table:    pc.TableName,
-						Linter:   v.Linter.Name(),
-						Message:  v.Message,
-						Severity: strings.ToLower(v.Severity.String()),
-					})
 				}
 			}
 
@@ -721,7 +696,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				change:     sc,
 				violations: violations,
 				schemas:    schemas,
-				hasChanges: len(sc.TableChanges) > 0 || sc.Metadata["vschema"] != "",
+				hasChanges: len(sc.TableChanges) > 0 || sc.Metadata["vschema_changed"] == "true",
 			}
 			mu.Unlock()
 			return nil
@@ -872,6 +847,15 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			Metadata: map[string]string{"branch": branchName},
 			NewState: state.Apply.ApplyingBranchChanges,
 		})
+
+		// Verify the branch schema matches main after refresh. If the branch
+		// has stale DDL from a previous failed apply, RefreshSchema won't
+		// remove it — the branch will be ahead of main, producing inverted
+		// diffs (e.g., DROP COLUMN instead of ADD COLUMN).
+		keyspaces := sortedKeyspaces(req.SchemaFiles)
+		if err := e.verifyBranchMatchesMain(ctx, client, org, req.Database, branchName, main, keyspaces, req.SchemaFiles); err != nil {
+			return nil, fmt.Errorf("branch %s has stale changes from a previous apply — delete the branch and retry without --branch: %w", branchName, err)
+		}
 	} else {
 		// Create a new branch
 		branchName = generateBranchName(req.Database, req.PlanID)
@@ -931,6 +915,19 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		Message:  fmt.Sprintf("Applied %d DDL changes to branch %s", ddlCount, branchName),
 		Metadata: map[string]string{"branch": branchName},
 		NewState: state.Apply.CreatingDeployRequest,
+	})
+
+	// Verify the branch now matches the desired schema. If DDL application
+	// was partial or the branch had stale state, some tables may still differ.
+	// Catch this before creating the deploy request to prevent deploying
+	// unexpected changes (e.g., DROP COLUMN when ADD COLUMN was intended).
+	keyspaces := sortedKeyspaces(req.SchemaFiles)
+	if err := e.verifyBranchMatchesDesired(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles); err != nil {
+		return nil, fmt.Errorf("branch validation failed after DDL apply: %w", err)
+	}
+	emitEvent(engine.ApplyEvent{
+		Message:  "Branch schema validated — matches desired state",
+		Metadata: map[string]string{"branch": branchName},
 	})
 
 	// Capture existing migration_contexts before deploy so we can discover the new one
@@ -1153,7 +1150,7 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 	e.logger.Info(fmt.Sprintf("applying changes to keyspace %s on branch %s", sc.Namespace, branchName),
 		"keyspace", sc.Namespace,
 		"ddl_count", len(sc.TableChanges),
-		"has_vschema", sc.Metadata["vschema"] != "",
+		"has_vschema", sc.Metadata["vschema_changed"] == "true",
 		"branch", branchName,
 	)
 
@@ -1285,7 +1282,7 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 // getVSchemaContent extracts the vschema.json content for a keyspace from schema files.
 // Returns empty string if no VSchema change is needed.
 func getVSchemaContent(sc engine.SchemaChange, schemaFiles schema.SchemaFiles) string {
-	if sc.Metadata["vschema"] == "" {
+	if sc.Metadata["vschema_changed"] != "true" {
 		return ""
 	}
 	if ns, ok := schemaFiles[sc.Namespace]; ok && ns != nil {
@@ -1584,7 +1581,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
-	e.logger.Info("progress poll",
+	e.logger.Debug("progress poll",
 		"database", req.Database,
 		"deploy_request", meta.DeployRequestID,
 		"deploy_state", dr.DeploymentState,
@@ -1608,7 +1605,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		req.ResumeState != nil && req.ResumeState.MigrationContext != ""
 	if hasMigrationContext {
 		tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
-		e.logger.Info("vitess migrations queried",
+		e.logger.Debug("vitess migrations queried",
 			"database", req.Database,
 			"table_count", len(tables),
 			"overall_progress", overallProgress,
@@ -1631,7 +1628,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	// before migration context discovery, so we use the flag from deploy
 	// metadata as the authoritative source.
 	if meta.IsInstant {
-		e.logger.Info("marking tables as instant DDL",
+		e.logger.Debug("marking tables as instant DDL",
 			"database", req.Database,
 			"table_count", len(result.Tables),
 		)
@@ -2317,6 +2314,211 @@ func shardLess(a, b string) bool {
 		return false
 	}
 	return aStart < bStart
+}
+
+// verifyBranchMatchesDesired uses the same diffing logic as Plan to verify
+// the branch schema matches the desired schema files for all keyspaces.
+// Validates both DDL (via Spirit differ) and VSchema (via protojson
+// normalization). Any mismatch blocks the deploy request from being created.
+func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles) error {
+	branchSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, branch, keyspaces)
+	if err != nil {
+		return fmt.Errorf("fetch branch schema for validation: %w", err)
+	}
+
+	for _, ks := range keyspaces {
+		ns := schemaFiles[ks]
+		if ns == nil {
+			continue
+		}
+
+		ddlChanges, vschemaChanged, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
+		if err != nil {
+			return fmt.Errorf("validate keyspace %s: %w", ks, err)
+		}
+
+		if len(ddlChanges) > 0 {
+			var descriptions []string
+			for _, ch := range ddlChanges {
+				classified, _ := statement.Classify(ch.DDL)
+				desc := ch.DDL
+				if len(classified) > 0 {
+					desc = fmt.Sprintf("%s %s", classified[0].Type, classified[0].Table)
+				}
+				descriptions = append(descriptions, desc)
+			}
+			e.logger.Error("branch validation failed: unexpected DDL changes",
+				"keyspace", ks,
+				"branch", branch,
+				"change_count", len(ddlChanges),
+				"changes", descriptions,
+				"branch_table_count", len(branchSchema[ks]),
+				"desired_file_count", len(ns.Files),
+			)
+			return fmt.Errorf("keyspace %s has %d unexpected DDL changes after apply: %v — the branch may have stale state from a previous apply",
+				ks, len(ddlChanges), descriptions)
+		}
+
+		if vschemaChanged {
+			return fmt.Errorf("keyspace %s has unexpected VSchema difference after apply — VSchema may not have been applied to the branch", ks)
+		}
+	}
+
+	e.logger.Info("branch schema validated — matches desired state",
+		"branch", branch,
+		"keyspaces", len(keyspaces),
+	)
+	return nil
+}
+
+// diffKeyspace diffs a single keyspace's schema between a branch and the
+// desired schema files. Returns DDL changes and whether VSchema differs.
+// Shared by Plan() and verifyBranchMatchesDesired().
+func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) ([]engine.TableChange, bool, error) {
+	var currentTableSchemas []table.TableSchema
+	if tables, ok := currentSchema[ks]; ok {
+		currentTableSchemas = append(currentTableSchemas, tables...)
+	}
+
+	desiredTableSchemas, parseErr := parseDesiredSchemas(ks, ns)
+	if parseErr != nil {
+		return nil, false, parseErr
+	}
+
+	plan, planErr := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
+	if planErr != nil {
+		return nil, false, fmt.Errorf("plan changes for keyspace %s: %w", ks, planErr)
+	}
+
+	if len(plan.Changes) > 0 {
+		e.logger.Info("diffKeyspace: changes detected",
+			"keyspace", ks,
+			"change_count", len(plan.Changes),
+			"current_table_count", len(currentTableSchemas),
+			"desired_table_count", len(desiredTableSchemas),
+		)
+		for _, pc := range plan.Changes {
+			e.logger.Info("diffKeyspace: change detail",
+				"keyspace", ks,
+				"table", pc.TableName,
+				"statement", pc.Statement[:min(len(pc.Statement), 200)],
+			)
+		}
+		// Log table names from both sides for debugging
+		var currentNames, desiredNames []string
+		for _, t := range currentTableSchemas {
+			currentNames = append(currentNames, t.Name)
+		}
+		for _, t := range desiredTableSchemas {
+			desiredNames = append(desiredNames, t.Name)
+		}
+		e.logger.Info("diffKeyspace: table names",
+			"keyspace", ks,
+			"current", currentNames,
+			"desired", desiredNames,
+		)
+	}
+
+	var tableChanges []engine.TableChange
+	for _, pc := range plan.Changes {
+		op, _, classifyErr := ddl.ClassifyStatementAST(pc.Statement)
+		if classifyErr != nil {
+			return nil, false, fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
+		}
+		change := engine.TableChange{
+			Table:     pc.TableName,
+			Operation: op,
+			DDL:       pc.Statement,
+		}
+		if errViolations := pc.Errors(); len(errViolations) > 0 {
+			change.IsUnsafe = true
+			msgs := make([]string, len(errViolations))
+			for i, v := range errViolations {
+				msgs[i] = v.Message
+			}
+			change.UnsafeReason = strings.Join(msgs, "; ")
+		}
+		tableChanges = append(tableChanges, change)
+	}
+
+	// Check VSchema diff
+	vschemaChanged := false
+	if content, ok := ns.Files["vschema.json"]; ok && content != "" {
+		currentVSchema, fetchErr := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
+			Organization: org,
+			Database:     database,
+			Branch:       branch,
+			Keyspace:     ks,
+		})
+		if fetchErr != nil {
+			e.logger.Warn("failed to fetch VSchema for diff, treating as empty",
+				"keyspace", ks, "error", fetchErr)
+		}
+		currentVSchemaRaw := ""
+		if currentVSchema != nil {
+			currentVSchemaRaw = currentVSchema.Raw
+		}
+		vschemaChanged = VSchemaChanged(currentVSchemaRaw, content)
+		if vschemaChanged {
+			e.logger.Info("diffKeyspace: VSchema mismatch detected",
+				"keyspace", ks,
+				"branch", branch,
+				"current_normalized", normalizeVSchemaJSON(currentVSchemaRaw),
+				"desired_normalized", normalizeVSchemaJSON(content),
+			)
+		}
+	}
+
+	return tableChanges, vschemaChanged, nil
+}
+
+// verifyBranchMatchesMain uses Spirit's differ to compare the branch schema
+// against main for the given keyspaces. Returns an error if any DDL changes
+// exist, indicating the branch has stale DDL from a previous failed apply
+// that RefreshSchema did not clean up.
+func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PSClient, org, database, branchName, mainBranch string, keyspaces []string, schemaFiles schema.SchemaFiles) error {
+	// Fetch main schema and use it as the "desired" state. If the branch
+	// matches main exactly, diffKeyspace returns zero changes.
+	mainSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, mainBranch, keyspaces)
+	if err != nil {
+		return fmt.Errorf("fetch main schema: %w", err)
+	}
+	branchSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, branchName, keyspaces)
+	if err != nil {
+		return fmt.Errorf("fetch branch schema: %w", err)
+	}
+
+	// Build a Namespace from main's schema so we can use diffKeyspace.
+	// This diffs branch (current) against main (desired) — any changes
+	// mean the branch is ahead of main.
+	for _, ks := range keyspaces {
+		mainTables := mainSchema[ks]
+		branchTables := branchSchema[ks]
+
+		// Quick length check — different table counts means mismatch
+		if len(branchTables) != len(mainTables) {
+			return fmt.Errorf("keyspace %s: branch has %d tables, main has %d — branch has stale state from a previous apply",
+				ks, len(branchTables), len(mainTables))
+		}
+
+		// Use Spirit to diff branch vs main (normalized comparison)
+		mainNS := &schema.Namespace{Files: make(map[string]string)}
+		for _, t := range mainTables {
+			mainNS.Files[t.Name+".sql"] = t.Schema + ";"
+		}
+
+		changes, _, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema)
+		if diffErr != nil {
+			return fmt.Errorf("diff branch vs main for %s: %w", ks, diffErr)
+		}
+		if len(changes) > 0 {
+			return fmt.Errorf("keyspace %s: branch has %d DDL differences from main after refresh — branch has stale state from a previous apply",
+				ks, len(changes))
+		}
+	}
+
+	e.logger.Info("branch schema matches main", "branch", branchName, "keyspaces", len(keyspaces))
+	return nil
 }
 
 // --- Helper functions ---

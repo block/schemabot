@@ -873,6 +873,38 @@ func TestVitess_Plan_DDLOnly_NoVSchemaMetadata(t *testing.T) {
 	}
 }
 
+// TestVitess_Apply_BranchValidation verifies that the branch validation
+// passes for a normal apply and the success message appears in logs.
+func TestVitess_Apply_BranchValidation(t *testing.T) {
+	vitessAvailable(t)
+	clearSchemaBotState(t)
+	defer vitessRestoreBaseSchema(t, "staging")
+
+	colName := fmt.Sprintf("col_val_%d", time.Now().UnixMilli()%100000)
+	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
+		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
+	}))
+
+	out := vitessApplyAndWait(t, schemaDir, "staging")
+	e2eutil.AssertContains(t, out, "Apply started")
+
+	// Verify the branch validation passed by checking apply logs
+	applyID := extractApplyIDFromLog(out)
+	endpoint := schemabotURL(t)
+	logs, err := client.GetLogs(endpoint, "", "", applyID, 50)
+	require.NoError(t, err)
+
+	var foundValidation bool
+	for _, entry := range logs {
+		if strings.Contains(entry.Message, "Branch schema validated") {
+			foundValidation = true
+			break
+		}
+	}
+	assert.True(t, foundValidation,
+		"expected 'Branch schema validated' in apply logs — branch validation should pass for a normal apply")
+}
+
 func TestVitess_Plan_UnsafeBlocked(t *testing.T) {
 	vitessAvailable(t)
 	binPath := buildCLI(t)

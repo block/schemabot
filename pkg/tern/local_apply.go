@@ -281,7 +281,7 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 		Database:    apply.Database,
 		PlanID:      plan.PlanIdentifier,
 		Changes:     changes,
-		SchemaFiles: planToSchemaFiles(plan),
+		SchemaFiles: plan.SchemaFiles,
 		Options:     options,
 		ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
 		Credentials: creds,
@@ -1084,7 +1084,7 @@ func planNamespacesToChanges(namespaces map[string]*storage.NamespacePlanData) [
 		}
 		metadata := make(map[string]string)
 		if len(nsData.VSchema) > 0 {
-			metadata["vschema"] = "true"
+			metadata["vschema_changed"] = "true"
 		}
 		changes = append(changes, engine.SchemaChange{
 			Namespace:    namespace,

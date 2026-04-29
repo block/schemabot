@@ -295,11 +295,8 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Operation: tc.Operation,
 			})
 		}
-		// Only store VSchema when the Plan detected a change. The engine
-		// sets sc.Metadata["vschema"] to the diff string when VSchemaChanged()
-		// returns true. Storing unchanged VSchema causes the Apply to
-		// unnecessarily update VSchema on every keyspace.
-		if sc.Metadata["vschema"] != "" {
+		// Only store VSchema when the Plan detected a change.
+		if sc.Metadata["vschema_changed"] == "true" {
 			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
 				if vs, ok := nsFiles.Files["vschema.json"]; ok {
 					nsData.VSchema = json.RawMessage(vs)

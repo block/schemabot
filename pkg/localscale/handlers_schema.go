@@ -216,10 +216,17 @@ func (s *Server) handleUpdateKeyspaceVSchema(w http.ResponseWriter, r *http.Requ
 		return newHTTPError(http.StatusBadRequest, "invalid VSchema JSON")
 	}
 
-	// Read existing vschema_data from branch row.
+	// Use a transaction with row locking to prevent concurrent updates
+	// from overwriting each other (read-modify-write race).
+	tx, err := s.metadataDB.BeginTx(r.Context(), nil)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "begin transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	var vschemaSQL sql.NullString
-	err := s.metadataDB.QueryRowContext(r.Context(),
-		"SELECT vschema_data FROM localscale_branches WHERE org = ? AND database_name = ? AND name = ?",
+	err = tx.QueryRowContext(r.Context(),
+		"SELECT vschema_data FROM localscale_branches WHERE org = ? AND database_name = ? AND name = ? FOR UPDATE",
 		org, database, branch,
 	).Scan(&vschemaSQL)
 	if err != nil {
@@ -234,12 +241,16 @@ func (s *Server) handleUpdateKeyspaceVSchema(w http.ResponseWriter, r *http.Requ
 	existing[keyspace] = json.RawMessage(body.VSchema)
 	merged, _ := json.Marshal(existing)
 
-	_, err = s.metadataDB.ExecContext(r.Context(),
+	_, err = tx.ExecContext(r.Context(),
 		"UPDATE localscale_branches SET vschema_data = ? WHERE org = ? AND database_name = ? AND name = ?",
 		string(merged), org, database, branch,
 	)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update branch vschema: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return newHTTPError(http.StatusInternalServerError, "commit vschema update: %v", err)
 	}
 
 	s.logger.Info("updated branch vschema", "org", org, "database", database, "branch", branch, "keyspace", keyspace)
