@@ -39,16 +39,39 @@ func ClassifyStatementAST(stmt string) (string, string, error) {
 		return "", "", fmt.Errorf("failed to classify statement: %w", err)
 	}
 	c := results[0]
-	switch c.Type {
+	return StatementTypeToOp(c.Type), c.Table, nil
+}
+
+// StatementTypeToOp converts a Spirit StatementType to the lowercase operation
+// string used in storage and API layers ("create", "alter", "drop", "rename").
+func StatementTypeToOp(t statement.StatementType) string {
+	switch t {
 	case statement.StatementCreateTable:
-		return "create", c.Table, nil
+		return "create"
 	case statement.StatementAlterTable:
-		return "alter", c.Table, nil
+		return "alter"
 	case statement.StatementDropTable:
-		return "drop", c.Table, nil
+		return "drop"
 	case statement.StatementRenameTable:
-		return "rename", c.Table, nil
+		return "rename"
 	default:
-		return "unknown", c.Table, nil
+		return "unknown"
+	}
+}
+
+// OpToStatementType converts a storage operation string back to a Spirit
+// StatementType. Used when reading from storage/proto boundaries.
+func OpToStatementType(op string) statement.StatementType {
+	switch strings.ToLower(op) {
+	case "create":
+		return statement.StatementCreateTable
+	case "alter":
+		return statement.StatementAlterTable
+	case "drop":
+		return statement.StatementDropTable
+	case "rename":
+		return statement.StatementRenameTable
+	default:
+		return statement.StatementUnknown
 	}
 }

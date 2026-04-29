@@ -6,6 +6,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/block/spirit/pkg/statement"
+
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
@@ -109,14 +111,14 @@ func storageStateToProto(ts string) ternv1.State {
 	}
 }
 
-// changeTypeToProto converts operation string to proto ChangeType enum.
-func changeTypeToProto(op string) ternv1.ChangeType {
+// changeTypeToProto converts a Spirit StatementType to the proto ChangeType enum.
+func changeTypeToProto(op statement.StatementType) ternv1.ChangeType {
 	switch op {
-	case "create":
+	case statement.StatementCreateTable:
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case "alter":
+	case statement.StatementAlterTable:
 		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case "drop":
+	case statement.StatementDropTable:
 		return ternv1.ChangeType_CHANGE_TYPE_DROP
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER

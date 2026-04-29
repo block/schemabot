@@ -259,13 +259,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	var lintViolations []engine.LintViolation
 	changes := make([]engine.TableChange, 0, len(plan.Changes))
 	for _, pc := range plan.Changes {
-		op, _, err := ddl.ClassifyStatementAST(pc.Statement)
-		if err != nil {
+		results, err := statement.Classify(pc.Statement)
+		if err != nil || len(results) == 0 {
 			return nil, fmt.Errorf("classify statement: %w", err)
 		}
 		change := engine.TableChange{
 			Table:     pc.TableName,
-			Operation: op,
+			Operation: results[0].Type,
 			DDL:       pc.Statement,
 		}
 
