@@ -441,6 +441,7 @@ type psMetadata struct {
 	DeployRequestURL string     `json:"deploy_request_url,omitempty"`
 	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
 	IsInstant        bool       `json:"is_instant,omitempty"`
+	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
 }
 
 func encodePSMetadata(m *psMetadata) (string, error) {
@@ -933,8 +934,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Capture existing migration_contexts before deploy so we can discover the new one
 	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-	// Check if we should defer cutover
+	// Check defer options
 	deferCutover := req.Options["defer_cutover"] == "true"
+	deferDeploy := req.Options["defer_deploy"] == "true"
 
 	// Create deploy request and wait for it to be ready.
 	// The server computes the schema diff asynchronously — poll until the deploy
@@ -979,8 +981,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Determine instant DDL eligibility. Prefer instant when PlanetScale reports
 	// it as eligible — instant DDL modifies metadata only (no row copy), so it
 	// completes immediately and has no revert window regardless of skip_revert.
+	// Instant DDL is orthogonal to defer flags — the mechanism (instant vs row copy)
+	// is independent of when the deploy executes.
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible && !deferCutover
+	useInstant := instantEligible
 
 	// Log the raw deploy request fields for debugging instant DDL detection.
 	if dr.Deployment != nil {
@@ -1004,8 +1008,20 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		"instant_eligible", instantEligible,
 		"use_instant", useInstant,
 		"defer_cutover", deferCutover,
+		"defer_deploy", deferDeploy,
 		"deploy_state", dr.DeploymentState,
 	)
+
+	// Log when --defer-cutover has no effect for instant DDL
+	if deferCutover && useInstant {
+		e.logger.Info("--defer-cutover has no effect for instant DDL",
+			"database", req.Database,
+			"deploy_request", dr.Number,
+		)
+		emitEvent(engine.ApplyEvent{
+			Message: "Note: --defer-cutover has no effect for instant DDL",
+		})
+	}
 
 	drElapsed := time.Since(drStart).Round(time.Second)
 	readyMsg := fmt.Sprintf("Deploy request #%d ready (%s)", dr.Number, drElapsed)
@@ -1020,6 +1036,38 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			"instant_ddl":        fmt.Sprintf("%t", useInstant),
 		},
 	})
+
+	// Deferred deploy: don't call DeployDeployRequest yet. The user will review
+	// the deploy request diff on PlanetScale and trigger via `schemabot cutover`.
+	if deferDeploy {
+		e.logger.Info("deferring deploy — user must trigger via cutover",
+			"database", req.Database,
+			"deploy_request", dr.Number,
+			"instant_eligible", useInstant,
+		)
+		meta, encErr := encodePSMetadata(&psMetadata{
+			BranchName:       branchName,
+			DeployRequestID:  dr.Number,
+			DeployRequestURL: dr.HtmlURL,
+			IsInstant:        useInstant,
+			DeferredDeploy:   true,
+		})
+		if encErr != nil {
+			return nil, fmt.Errorf("encode metadata for deferred deploy request #%d: %w", dr.Number, encErr)
+		}
+		suffix := ""
+		if useInstant {
+			suffix = " (instant DDL)"
+		}
+		return &engine.ApplyResult{
+			Accepted: true,
+			Message:  fmt.Sprintf("Deploy request #%d ready%s — waiting for deploy", dr.Number, suffix),
+			ResumeState: &engine.ResumeState{
+				MigrationContext: migCtx,
+				Metadata:         meta,
+			},
+		}, nil
+	}
 
 	// Deploy (starts the schema change). PlanetScale may still be validating
 	// the deploy request even after reporting "ready", so retry on transient
@@ -1478,6 +1526,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// Create deploy request
 	main := mainBranch(req.Credentials)
 	deferCutover := req.Options["defer_cutover"] == "true"
+	deferDeploy := req.Options["defer_deploy"] == "true"
 
 	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, !deferCutover, true)
 	if err != nil {
@@ -1499,11 +1548,39 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 
 	// Deploy — prefer instant when eligible (no row copy, no revert window needed).
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible && !deferCutover
+	useInstant := instantEligible
 
 	meta.DeployRequestID = dr.Number
 	meta.DeployRequestURL = dr.HtmlURL
 	meta.IsInstant = useInstant
+
+	// Deferred deploy on resume: don't start the deploy yet.
+	if deferDeploy {
+		meta.DeferredDeploy = true
+		persistMeta, encErr := encodePSMetadata(meta)
+		if encErr != nil {
+			return nil, fmt.Errorf("encode metadata for deferred deploy on resume: %w", encErr)
+		}
+		if req.OnStateChange != nil {
+			req.OnStateChange(&engine.ResumeState{
+				MigrationContext: req.ResumeState.MigrationContext,
+				Metadata:         persistMeta,
+			})
+		}
+		suffix := ""
+		if useInstant {
+			suffix = " (instant DDL)"
+		}
+		return &engine.ApplyResult{
+			Accepted: true,
+			Message:  fmt.Sprintf("Deploy request #%d ready%s — waiting for deploy", dr.Number, suffix),
+			ResumeState: &engine.ResumeState{
+				MigrationContext: req.ResumeState.MigrationContext,
+				Metadata:         persistMeta,
+			},
+		}, nil
+	}
+
 	persistMeta, err := encodePSMetadata(meta)
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata on resume: %w", err)
@@ -1564,10 +1641,22 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	dr, err := e.getDeployRequest(ctx, client, credOrg(req.Credentials), req.Database, meta.DeployRequestID)
 	if err != nil {
+		// Deploy request not found is non-retryable (e.g., server restarted
+		// with fresh LocalScale state but stale apply record).
+		var psErr *ps.Error
+		if errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound {
+			return nil, engine.NewNonRetryableError("deploy request #%d not found: %w", meta.DeployRequestID, err)
+		}
 		return nil, fmt.Errorf("get deploy request: %w", err)
 	}
 
 	engineState, progress := deployStateToEngineState(dr.DeploymentState)
+
+	// Deferred deploy: the deploy request is ready but hasn't been triggered yet.
+	if meta.DeferredDeploy && dr.DeploymentState == deployState.Ready {
+		engineState = engine.StateWaitingForDeploy
+		progress = 0
+	}
 
 	// Update metadata with DeployedAt when available (used by tern layer for
 	// revert window timeout calculation).
@@ -1670,12 +1759,43 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	}, nil
 }
 
-// Start is not supported for PlanetScale. Cancelled deploy requests cannot be restarted.
-func (e *Engine) Start(_ context.Context, _ *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("start not supported for planetscale engine: cancelled deploy requests cannot be restarted")
+// Start starts a deferred deploy request. Cancelled deploy requests cannot be restarted.
+func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	meta, err := e.controlMeta(req)
+	if err != nil {
+		return nil, fmt.Errorf("decode control metadata: %w", err)
+	}
+
+	if !meta.DeferredDeploy {
+		return nil, fmt.Errorf("start not supported for planetscale engine: cancelled deploy requests cannot be restarted")
+	}
+
+	client, err := e.getClient(req.Credentials)
+	if err != nil {
+		return nil, fmt.Errorf("get planetscale client: %w", err)
+	}
+
+	e.logger.Info("starting deferred deploy",
+		"deploy_request", meta.DeployRequestID,
+		"instant_ddl", meta.IsInstant,
+	)
+	dr, deployErr := client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+		Organization: credOrg(req.Credentials),
+		Database:     req.Database,
+		Number:       meta.DeployRequestID,
+		InstantDDL:   meta.IsInstant,
+	})
+	if deployErr != nil {
+		return nil, fmt.Errorf("deploy deploy request #%d: %w", meta.DeployRequestID, deployErr)
+	}
+	return &engine.ControlResult{
+		Accepted:    true,
+		Message:     fmt.Sprintf("Deploy initiated for deploy request #%d", dr.Number),
+		ResumeState: req.ResumeState,
+	}, nil
 }
 
-// Cutover completes the deploy request, triggering the final schema swap.
+// Cutover triggers the final schema swap via ApplyDeployRequest.
 func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	meta, err := e.controlMeta(req)
 	if err != nil {

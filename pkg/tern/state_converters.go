@@ -20,6 +20,8 @@ func taskStateToApplyState(ts string) string {
 		return state.Apply.Pending
 	case state.Task.Running:
 		return state.Apply.Running
+	case state.Task.WaitingForDeploy:
+		return state.Apply.WaitingForDeploy
 	case state.Task.WaitingForCutover:
 		return state.Apply.WaitingForCutover
 	case state.Task.CuttingOver:
@@ -48,6 +50,8 @@ func engineStateToStorage(es engine.State) string {
 		return state.Task.Pending
 	case engine.StateRunning:
 		return state.Task.Running
+	case engine.StateWaitingForDeploy:
+		return state.Task.WaitingForDeploy
 	case engine.StateWaitingForCutover:
 		return state.Task.WaitingForCutover
 	case engine.StateCuttingOver:
@@ -74,6 +78,8 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_PENDING
 	case state.Task.Running:
 		return ternv1.State_STATE_RUNNING
+	case state.Task.WaitingForDeploy:
+		return ternv1.State_STATE_WAITING_FOR_DEPLOY
 	case state.Task.WaitingForCutover:
 		return ternv1.State_STATE_WAITING_FOR_CUTOVER
 	case state.Task.CuttingOver:
@@ -142,6 +148,8 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.Pending
 	case ternv1.State_STATE_RUNNING:
 		return state.Apply.Running
+	case ternv1.State_STATE_WAITING_FOR_DEPLOY:
+		return state.Apply.WaitingForDeploy
 	case ternv1.State_STATE_WAITING_FOR_CUTOVER:
 		return state.Apply.WaitingForCutover
 	case ternv1.State_STATE_CUTTING_OVER:
@@ -202,6 +210,7 @@ type psMetadataForStorage struct {
 	DeployRequestURL string     `json:"deploy_request_url,omitempty"`
 	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
 	IsInstant        bool       `json:"is_instant,omitempty"`
+	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
 }
 
 func decodePSMetadataForStorage(s string) (*psMetadataForStorage, error) {

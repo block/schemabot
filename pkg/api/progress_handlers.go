@@ -372,6 +372,12 @@ func (s *Service) overlayVitessMetadata(ctx context.Context, resp *apitypes.Prog
 	if vad.DeployRequestURL != "" {
 		resp.Metadata["deploy_request_url"] = vad.DeployRequestURL
 	}
+	if vad.IsInstant {
+		resp.Metadata["is_instant"] = "true"
+	}
+	if vad.DeferredDeploy {
+		resp.Metadata["deferred_deploy"] = "true"
+	}
 	if vad.RevertSkippedAt != nil {
 		resp.Metadata["revert_skipped"] = "true"
 	}
@@ -691,6 +697,9 @@ func overlayApplyOptions(resp *apitypes.ProgressResponse, apply *storage.Apply) 
 	optMap := make(map[string]string)
 	if opts.DeferCutover {
 		optMap["defer_cutover"] = "true"
+	}
+	if opts.DeferDeploy {
+		optMap["defer_deploy"] = "true"
 	}
 	if opts.SkipRevert {
 		optMap["skip_revert"] = "true"

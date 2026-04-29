@@ -42,8 +42,8 @@ func (cmd *StartCmd) Run(g *Globals) error {
 		}
 		return nil
 	}
-	if !state.IsState(curState, state.Apply.Stopped) {
-		return fmt.Errorf("cannot start schema change in state: %s (expected STOPPED)", curState)
+	if !state.IsState(curState, state.Apply.Stopped, state.Apply.WaitingForDeploy) {
+		return fmt.Errorf("cannot start schema change in state: %s", curState)
 	}
 
 	// Always scope start to the specific apply to avoid cross-apply contamination.

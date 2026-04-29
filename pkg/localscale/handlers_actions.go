@@ -321,8 +321,24 @@ func (s *Server) applyPendingVSchema(ctx context.Context, backend *databaseBacke
 		}
 	}
 
+	// Apply unsharded keyspaces first — they define sequence tables that
+	// sharded keyspaces reference via auto_increment. Vtgate's
+	// resolveAutoIncrement deletes tables with unresolvable sequence
+	// references, so the defining keyspace must be in the VSchema before
+	// the referencing keyspace is applied.
+	var unsharded, sharded []string
 	for keyspace, vschemaJSON := range vschemaByKeyspace {
-		if err := s.applyVSchemaInternal(ctx, backend, keyspace, vschemaJSON); err != nil {
+		var ks struct {
+			Sharded bool `json:"sharded"`
+		}
+		if json.Unmarshal(vschemaJSON, &ks) == nil && ks.Sharded {
+			sharded = append(sharded, keyspace)
+		} else {
+			unsharded = append(unsharded, keyspace)
+		}
+	}
+	for _, keyspace := range append(unsharded, sharded...) {
+		if err := s.applyVSchemaInternal(ctx, backend, keyspace, vschemaByKeyspace[keyspace]); err != nil {
 			return fmt.Errorf("apply vschema to %s: %w", keyspace, err)
 		}
 		s.logger.Info("applied vschema for deploy request", "number", ref.number, "keyspace", keyspace)

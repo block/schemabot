@@ -15,6 +15,7 @@ import "strings"
 var Apply = struct {
 	Pending           string
 	Running           string
+	WaitingForDeploy  string
 	WaitingForCutover string
 	CuttingOver       string
 	RevertWindow      string
@@ -33,6 +34,7 @@ var Apply = struct {
 }{
 	Pending:           "pending",
 	Running:           "running",
+	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
 	CuttingOver:       "cutting_over",
 	RevertWindow:      "revert_window",
@@ -56,9 +58,10 @@ var Apply = struct {
 //  4. All tasks COMPLETED → Apply COMPLETED
 //  5. Any task CUTTING_OVER → Apply CUTTING_OVER
 //  6. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
-//  7. Any task REVERT_WINDOW → Apply REVERT_WINDOW
-//  8. Any task RUNNING → Apply RUNNING
-//  9. Otherwise → Apply PENDING
+//  7. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
+//  8. Any task REVERT_WINDOW → Apply REVERT_WINDOW
+//  9. Any task RUNNING → Apply RUNNING
+//  10. Otherwise → Apply PENDING
 //
 // taskStates should be the State field from each Task. Empty slice returns PENDING.
 func DeriveApplyState(taskStates []string) string {
@@ -95,6 +98,10 @@ func DeriveApplyState(taskStates []string) string {
 	if waitingOrCompleted == total && counts[Apply.WaitingForCutover] > 0 {
 		return Apply.WaitingForCutover
 	}
+	waitingDeployOrCompleted := counts[Apply.WaitingForDeploy] + counts[Apply.Completed]
+	if waitingDeployOrCompleted == total && counts[Apply.WaitingForDeploy] > 0 {
+		return Apply.WaitingForDeploy
+	}
 	if counts[Apply.RevertWindow] > 0 {
 		return Apply.RevertWindow
 	}
@@ -111,6 +118,8 @@ func normalizeApplyState(raw string) string {
 		return Apply.Pending
 	case "RUNNING":
 		return Apply.Running
+	case "WAITING_FOR_DEPLOY":
+		return Apply.WaitingForDeploy
 	case "WAITING_FOR_CUTOVER":
 		return Apply.WaitingForCutover
 	case "CUTTING_OVER":
@@ -159,9 +168,10 @@ func IsTerminalApplyState(s string) bool {
 
 // IsBranchSetupPhase returns true if the apply state is a PlanetScale branch
 // lifecycle phase where per-table progress is not yet meaningful (all tables
-// are Queued). Used by the TUI to hide the table list during setup.
+// are Queued). Used by the TUI and CLI to hide the table list during setup.
+// WaitingForDeploy is included because the deploy hasn't started yet.
 func IsBranchSetupPhase(s string) bool {
-	return IsState(s, Apply.Pending, Apply.PreparingBranch, Apply.ApplyingBranchChanges, Apply.CreatingDeployRequest)
+	return IsState(s, Apply.Pending, Apply.PreparingBranch, Apply.ApplyingBranchChanges, Apply.CreatingDeployRequest, Apply.WaitingForDeploy)
 }
 
 // IsPlanetScaleEngine returns true if the engine string indicates PlanetScale/Vitess.

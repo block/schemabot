@@ -64,6 +64,37 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		return nil, fmt.Errorf("no stopped schema change to resume")
 	}
 
+	// Deferred deploy that isn't ready yet — reject with a clear message.
+	if apply.GetOptions().DeferDeploy && apply.State != state.Apply.WaitingForDeploy {
+		return nil, fmt.Errorf("schema change is not ready for deploy (current state: %s)", apply.State)
+	}
+
+	// Deferred deploy: call engine Start to trigger the deploy request.
+	// This is a separate path from the stopped-task resume flow below.
+	if apply.State == state.Apply.WaitingForDeploy {
+		applyTasks, taskErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+		if taskErr != nil || len(applyTasks) == 0 {
+			return nil, fmt.Errorf("no tasks found for apply %s", apply.ApplyIdentifier)
+		}
+		creds := c.credentials()
+		eng := c.getEngine()
+		if eng == nil {
+			return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
+		}
+		controlReq := c.buildControlRequest(ctx, applyTasks[0], creds)
+		result, err := eng.Start(ctx, controlReq)
+		if err != nil {
+			return nil, fmt.Errorf("start deferred deploy: %w", err)
+		}
+		if !result.Accepted {
+			return nil, fmt.Errorf("deferred deploy not accepted: %s", result.Message)
+		}
+		return &ternv1.StartResponse{
+			Accepted:     true,
+			StartedCount: 1,
+		}, nil
+	}
+
 	// Second pass: collect stopped tasks ONLY from the target apply
 	var stoppedTasks []*storage.Task
 	for _, task := range tasks {

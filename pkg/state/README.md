@@ -19,6 +19,7 @@ Vitess OnlineDDL and Spirit report — and they are translated into Task and App
 |-------|-------|-------------|
 | Pending | `pending` | Apply created, no tasks started |
 | Running | `running` | At least one task is actively executing |
+| WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only). Without `--defer-deploy`, auto-advances immediately. |
 | WaitingForCutover | `waiting_for_cutover` | All tasks ready, waiting for manual cutover (atomic mode only — in sequential mode each task cuts over independently) |
 | CuttingOver | `cutting_over` | Cutover in progress (atomic mode only) |
 | Completed | `completed` | All tasks finished successfully |
@@ -30,6 +31,8 @@ Vitess OnlineDDL and Spirit report — and they are translated into Task and App
 ```mermaid
 stateDiagram-v2
     pending --> running
+    pending --> waiting_for_deploy : PlanetScale
+    waiting_for_deploy --> running : deploy triggered
     running --> completed
     running --> failed
     running --> stopped : resumable (Spirit only)
@@ -44,7 +47,8 @@ stateDiagram-v2
     revert_window --> reverted : user-initiated
 ```
 
-- `waiting_for_cutover`/`cutting_over`: Only with `--defer-cutover` or atomic mode (Spirit)
+- `waiting_for_deploy`: PlanetScale only. The deploy request is created and ready, but not yet executed. With `--defer-deploy`, the user reviews the deploy request diff on PlanetScale and triggers via `schemabot cutover`. Without `--defer-deploy`, the system auto-advances through this state. For instant DDL, the deploy completes immediately after triggering. `--defer-deploy` and `--defer-cutover` compose: the first pauses before deploy, the second pauses before cutover.
+- `waiting_for_cutover`/`cutting_over`: Only with `--defer-cutover` or atomic mode (Spirit). Note: `--defer-cutover` is a no-op for instant DDL (no cutover exists).
 - `revert_window`: Only with `--enable-revert`. Spirit auto-advances through it; PlanetScale holds until expiry or user action. Maps from PlanetScale's `complete_pending_revert` deploy state
 - `stopped`: Spirit only — resumable via `schemabot start`. Spirit checkpoints progress for resume.
 - `cancelled`: PlanetScale only — permanent. Cancels the deploy request; the underlying Vitess migrations are cancelled. Not resumable — start a new apply instead.
@@ -76,9 +80,10 @@ Per-table execution state. Same state machine as Apply, plus `cancelled`:
 4. All tasks **completed** → apply `completed`
 5. Any task **cutting_over** → apply `cutting_over`
 6. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
-7. Any task **revert_window** → apply `revert_window`
-8. Any task **running** → apply `running`
-9. Otherwise → apply `pending`
+7. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
+8. Any task **revert_window** → apply `revert_window`
+9. Any task **running** → apply `running`
+10. Otherwise → apply `pending`
 
 Terminal states (`completed`, `failed`, `reverted`, `cancelled`) are checked via `IsTerminalApplyState()`. Note: `stopped` is NOT terminal at the task level — a stopped task can be resumed via Start.
 

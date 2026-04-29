@@ -72,6 +72,16 @@ func TestDeriveApplyState_AnyRunning(t *testing.T) {
 	}
 }
 
+func TestDeriveApplyState_AllWaitingForDeploy(t *testing.T) {
+	states := []string{"WAITING_FOR_DEPLOY", "WAITING_FOR_DEPLOY"}
+	assert.Equal(t, Apply.WaitingForDeploy, DeriveApplyState(states))
+}
+
+func TestDeriveApplyState_WaitingForDeployAndCompleted(t *testing.T) {
+	states := []string{"COMPLETED", "WAITING_FOR_DEPLOY"}
+	assert.Equal(t, Apply.WaitingForDeploy, DeriveApplyState(states))
+}
+
 func TestDeriveApplyState_AllWaitingForCutover(t *testing.T) {
 	states := []string{"WAITING_FOR_CUTOVER", "WAITING_FOR_CUTOVER", "WAITING_FOR_CUTOVER"}
 	assert.Equal(t, Apply.WaitingForCutover, DeriveApplyState(states))
@@ -177,6 +187,8 @@ func TestNormalizeState(t *testing.T) {
 		{"pending", Apply.Pending},
 		{"RUNNING", Apply.Running},
 		{"running", Apply.Running},
+		{"WAITING_FOR_DEPLOY", Apply.WaitingForDeploy},
+		{"waiting_for_deploy", Apply.WaitingForDeploy},
 		{"WAITING_FOR_CUTOVER", Apply.WaitingForCutover},
 		{"waiting_for_cutover", Apply.WaitingForCutover},
 		{"CUTTING_OVER", Apply.CuttingOver},

@@ -29,7 +29,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	previewType := templates.PreviewType(cmd.Type)
 	switch previewType {
 	// Basic types
-	case templates.PreviewPlan, templates.PreviewProgress, templates.PreviewWaitingForCutover,
+	case templates.PreviewPlan, templates.PreviewProgress, templates.PreviewWaitingForDeploy, templates.PreviewWaitingForCutover,
 		templates.PreviewCuttingOver, templates.PreviewCompleted, templates.PreviewFailed,
 		templates.PreviewStopped, templates.PreviewStates:
 		templates.PreviewCLIOutput(previewType)
@@ -126,6 +126,7 @@ Usage:
 Basic Types:
   plan                  Show sample plan output
   progress              Show sample progress output (running state)
+  waiting_for_deploy    Show sample waiting for deploy output (PlanetScale)
   waiting_for_cutover   Show sample waiting for cutover output
   cutting_over          Show sample cutting over output
   completed             Show sample completed output

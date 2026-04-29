@@ -26,6 +26,13 @@ esac
 MYSQL="mysql -h 127.0.0.1 -P $VTGATE_PORT -u $VTGATE_USER --batch --skip-column-names"
 BATCH_SIZE=2000
 
+# Verify connectivity before starting
+if ! $MYSQL -e "SELECT 1" testapp_sharded >/dev/null 2>&1; then
+    echo "ERROR: Cannot connect to vtgate at 127.0.0.1:$VTGATE_PORT (user: $VTGATE_USER)"
+    echo "Skipping Vitess seeding."
+    exit 0
+fi
+
 # Bytes per row estimates (data + indexes, conservative).
 #   users:    ~163 bytes/row
 #   orders:   ~148 bytes/row

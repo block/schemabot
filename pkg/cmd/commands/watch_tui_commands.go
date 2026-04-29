@@ -49,6 +49,25 @@ func (m WatchModel) fetchProgress() tea.Cmd {
 	}
 }
 
+func (m WatchModel) triggerDeploy() tea.Cmd {
+	return func() tea.Msg {
+		result, err := client.CallStartAPI(m.endpoint, m.database, m.environment, m.applyID)
+		if err != nil {
+			return deployResultMsg{success: false, err: err}
+		}
+
+		if !result.Accepted {
+			errMsg := result.ErrorMessage
+			if errMsg == "" {
+				errMsg = "deploy not accepted"
+			}
+			return deployResultMsg{success: false, err: fmt.Errorf("%s", errMsg)}
+		}
+
+		return deployResultMsg{success: true}
+	}
+}
+
 func (m WatchModel) triggerCutover() tea.Cmd {
 	return func() tea.Msg {
 		result, err := client.CallCutoverAPI(m.endpoint, m.database, m.environment, m.applyID)

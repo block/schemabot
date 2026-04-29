@@ -186,11 +186,10 @@ endif
 #   make demo SKIP_APPLY=1 # Start server only, skip schema applies (for debugging)
 demo:
 ifeq ($(KEEP_DATA),1)
-	docker compose -f deploy/local/docker-compose.yml down -t 10 2>/dev/null || true
+	docker compose -f deploy/local/docker-compose.yml down --remove-orphans -t 10 2>/dev/null || true
 else
-	docker compose -f deploy/local/docker-compose.yml down -v -t 10 2>/dev/null || true
+	docker compose -f deploy/local/docker-compose.yml down --remove-orphans -v -t 10 2>/dev/null || true
 endif
-	docker rm -f schemabot-mysql-schemabot-1 schemabot-mysql-staging-1 schemabot-mysql-production-1 schemabot-schemabot-1 2>/dev/null || true
 	@# Build everything in parallel: LocalScale image + Go binaries + start MySQL containers
 	@echo "Building binaries and starting containers in parallel..."
 	@docker compose -f deploy/local/docker-compose.yml up -d mysql-schemabot mysql-staging mysql-production & \
@@ -206,26 +205,22 @@ endif
 	@$(MAKE) wait-localscale
 ifneq ($(SKIP_APPLY),1)
 	@trap 'kill 0' INT TERM; \
-	echo "Applying schemas (MySQL + Vitess in parallel, staging → production)..."; \
-	( ./bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:13370 -y --allow-unsafe -o log && \
-	  ./bin/schemabot apply -s examples/mysql/schema/testapp -e production --endpoint http://localhost:13370 -y --allow-unsafe -o log ) & \
-	( for ks in testapp testapp_sharded; do \
-		if [ -f examples/vitess/schema/$$ks/vschema.json ]; then \
-			curl -sf -X POST "http://localhost:13374/admin/seed-vschema" \
-				-H "Content-Type: application/json" \
-				-d "{\"org\":\"localscale-staging\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
-			curl -sf -X POST "http://localhost:13374/admin/seed-vschema" \
-				-H "Content-Type: application/json" \
-				-d "{\"org\":\"localscale-production\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
-		fi; \
-	done && \
-	  ./bin/schemabot apply -s examples/vitess/schema -e staging --endpoint http://localhost:13370 -y -o log && \
-	  ./bin/schemabot apply -s examples/vitess/schema -e production --endpoint http://localhost:13370 -y -o log ) & \
-	wait; \
-	echo "Seeding data (MySQL + Vitess in parallel)..."; \
-	./scripts/seed-large.sh 50 both & \
-	VTGATE_MYSQL_PORT=19101 ./scripts/seed-vitess.sh 200 & \
-	wait
+	echo "Applying MySQL schemas (staging → production)..."; \
+	./bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:13370 -y --allow-unsafe -o log && \
+	./bin/schemabot apply -s examples/mysql/schema/testapp -e production --endpoint http://localhost:13370 -y --allow-unsafe -o log && \
+	echo "MySQL schemas applied." && \
+	echo "" && \
+	echo "Applying Vitess schemas (staging → production)..." && \
+	./bin/schemabot apply -s examples/vitess/schema -e staging --endpoint http://localhost:13370 -y -o log --allow-unsafe --skip-revert && \
+	./bin/schemabot apply -s examples/vitess/schema -e production --endpoint http://localhost:13370 -y -o log --allow-unsafe --skip-revert && \
+	echo "Vitess schemas applied." && \
+	echo "Waiting for VSchema propagation..." && \
+	sleep 5 && \
+	echo "" && \
+	echo "Seeding data..." && \
+	./scripts/seed-large.sh 50 both && \
+	STAGING_VTGATE_PORT=19101 ./scripts/seed-vitess.sh 200 && \
+	echo "Seeding complete."
 	@echo "$$DEMO_READY_MSG"
 else
 	@echo "$$DEMO_SKIP_APPLY_MSG"

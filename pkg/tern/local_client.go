@@ -476,8 +476,10 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// Build typed ApplyOptions for storage (booleans, not strings).
 	// Revert window is ON by default — only disabled when skip_revert is explicitly set.
 	skipRevert := options["skip_revert"] == "true"
+	deferDeploy := options["defer_deploy"] == "true"
 	applyOpts := storage.ApplyOptions{
 		DeferCutover: deferCutover,
+		DeferDeploy:  deferDeploy,
 		AllowUnsafe:  allowUnsafe,
 		SkipRevert:   skipRevert,
 	}
@@ -736,6 +738,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 					"deploy_request_id":  vad.DeployRequestID,
 					"deploy_request_url": vad.DeployRequestURL,
 					"is_instant":         vad.IsInstant,
+					"deferred_deploy":    vad.DeferredDeploy,
 				})
 				progressReq.ResumeState = &engine.ResumeState{
 					MigrationContext: vad.MigrationContext,

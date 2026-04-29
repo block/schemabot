@@ -90,6 +90,9 @@ func WriteProgress(data ProgressData) {
 	}
 	if len(data.Options) > 0 {
 		var opts []string
+		if data.Options["defer_deploy"] == "true" {
+			opts = append(opts, "⏸️ Defer Deploy")
+		}
 		if data.Options["defer_cutover"] == "true" {
 			opts = append(opts, "⏸️ Defer Cutover")
 		}
@@ -148,7 +151,8 @@ func WriteProgress(data ProgressData) {
 	}
 
 	// Table progress (sorted: active first, sharded before unsharded, terminal last)
-	if len(activeTables) > 0 {
+	// Hide tables during branch setup phases (all tables are Queued, not meaningful)
+	if len(activeTables) > 0 && !state.IsBranchSetupPhase(data.State) {
 		sort.SliceStable(activeTables, func(i, j int) bool {
 			pi := ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[i].Status))
 			pj := ui.TableStatePriority(state.NormalizeTaskStatus(activeTables[j].Status))
@@ -181,6 +185,19 @@ func WriteProgress(data ProgressData) {
 				fmt.Print(FormatTableProgress(t))
 			}
 		}
+	}
+
+	// Show deploy request info for deferred deploys
+	if data.State == state.Apply.WaitingForDeploy {
+		fmt.Println()
+		if url := data.Metadata["deploy_request_url"]; url != "" {
+			fmt.Printf("Deploy request created: %s\n", url)
+		}
+		if data.Metadata["is_instant"] == "true" {
+			fmt.Println("⚡ This change will be applied using instant mode.")
+		}
+		fmt.Println()
+		fmt.Println("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)")
 	}
 
 	// Show remediation guidance for failed applies
@@ -361,6 +378,8 @@ func FormatProgressState(s string) string {
 		return "Idle"
 	case state.Apply.Running:
 		return ANSICyan + "🔄 Running" + ANSIReset
+	case state.Apply.WaitingForDeploy:
+		return ANSIYellow + "🟨 Waiting for deploy" + ANSIReset
 	case state.Apply.WaitingForCutover:
 		return ANSIYellow + "🟨 Waiting for cutover" + ANSIReset
 	case state.Apply.CuttingOver:
@@ -808,6 +827,8 @@ func StateLabel(s string) string {
 		return "Failed"
 	case state.Apply.Running:
 		return "Running"
+	case state.Apply.WaitingForDeploy:
+		return "Waiting for deploy"
 	case state.Apply.WaitingForCutover:
 		return "Waiting for cutover"
 	case state.Apply.CuttingOver:
@@ -842,7 +863,7 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIRed)
 	case state.Apply.Running:
 		return colorWrap(ANSICyan)
-	case state.Apply.WaitingForCutover, state.Apply.CuttingOver:
+	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.CuttingOver:
 		return colorWrap(ANSIYellow)
 	case state.Apply.Stopped:
 		return colorWrap(ANSIOrange)

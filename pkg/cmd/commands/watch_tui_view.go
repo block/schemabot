@@ -74,7 +74,7 @@ func (m WatchModel) progressView() string {
 		}
 	case effectivelyStopped:
 		// Don't show status line - stopped message comes after tables
-	case state.IsState(m.state, state.Apply.Running) && !m.cutoverTriggered:
+	case state.IsState(m.state, state.Apply.Running) && !m.cutoverTriggered && !m.deployTriggered:
 		b.WriteString(m.spinner.View() + "Running...")
 		b.WriteString("\n")
 	case state.IsState(m.state, state.Apply.WaitingForCutover):
@@ -165,6 +165,30 @@ func (m WatchModel) progressView() string {
 		dimStyle := lipgloss.NewStyle().Faint(true)
 		b.WriteString(dimStyle.Render("Cutover in progress - please wait..."))
 		b.WriteString("\n")
+	case m.deployTriggered:
+		b.WriteString("\n\n")
+		b.WriteString(m.spinner.View() + "Deploying...\n")
+	case state.IsState(m.state, state.Apply.WaitingForDeploy):
+		b.WriteString("\n\n")
+		if m.deployRequestURL != "" {
+			b.WriteString("Deploy request created: " + m.deployRequestURL + "\n")
+		} else {
+			b.WriteString("Deploy request created.\n")
+		}
+		if m.metadata != nil && m.metadata["is_instant"] == "true" {
+			b.WriteString("⚡ This change will be applied using instant mode.\n")
+		}
+		b.WriteString("\n")
+		if m.allowCutover {
+			b.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
+		} else {
+			if m.applyID != "" {
+				fmt.Fprintf(&b, "To proceed: schemabot start --apply-id %s\n", m.applyID)
+			} else {
+				fmt.Fprintf(&b, "To proceed: schemabot start -d %s -e %s\n", m.database, m.environment)
+			}
+			b.WriteString("Watching for deploy... (ESC to detach)\n")
+		}
 	case state.IsState(m.state, state.Apply.WaitingForCutover):
 		b.WriteString("\n\n")
 		b.WriteString("Row copy complete. All data has been copied and new writes\n")
@@ -327,13 +351,23 @@ func (m WatchModel) detachedView() string {
 	var b strings.Builder
 	b.WriteString("\n")
 	b.WriteString("Detached from progress view.\n")
-	b.WriteString("The schema change continues running in the background.\n")
+	if state.IsState(m.state, state.Apply.WaitingForDeploy) {
+		b.WriteString("The deploy request is waiting for you to trigger it.\n")
+	} else {
+		b.WriteString("The schema change continues running in the background.\n")
+	}
 	b.WriteString("\n")
 	if m.applyID != "" {
 		fmt.Fprintf(&b, "To reattach: schemabot progress %s\n", m.applyID)
+		if state.IsState(m.state, state.Apply.WaitingForDeploy) {
+			fmt.Fprintf(&b, "To deploy:   schemabot start %s\n", m.applyID)
+		}
 		fmt.Fprintf(&b, "To stop:     schemabot stop %s\n", m.applyID)
 	} else {
 		fmt.Fprintf(&b, "To reattach: schemabot progress -d %s -e %s\n", m.database, m.environment)
+		if state.IsState(m.state, state.Apply.WaitingForDeploy) {
+			fmt.Fprintf(&b, "To deploy:   schemabot start -d %s -e %s\n", m.database, m.environment)
+		}
 		fmt.Fprintf(&b, "To stop:     schemabot stop -d %s -e %s\n", m.database, m.environment)
 	}
 	return b.String()
