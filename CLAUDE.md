@@ -169,6 +169,7 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
 
 - After `sql.Open()`, always call `db.PingContext(ctx)` to verify the connection works (Go's sql driver lazy-loads connections).
 - Always backtick-quote SQL identifiers: `` USE `db` ``, `` SHOW CREATE TABLE `tbl` ``.
+- **Never manipulate DSN strings with `strings.Replace`.** Use `mysql.ParseDSN()` / `cfg.FormatDSN()` from `github.com/go-sql-driver/mysql` to parse, modify fields, and re-serialize. String manipulation is fragile and breaks on DSNs with passwords containing `/` or other special characters.
 
 ### Spirit Integration
 
