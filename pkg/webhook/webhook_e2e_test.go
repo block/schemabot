@@ -75,7 +75,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 	gh "github.com/google/go-github/v68/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1656,6 +1656,114 @@ func TestE2ERollbackConfirmNoLock(t *testing.T) {
 		assert.Contains(t, body, "schemabot rollback -e staging")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for no-lock comment")
+	}
+}
+
+// TestE2ERollbackConfirmExecutesAndPostsComments verifies the full rollback-confirm
+// flow: rollback plan → rollback-confirm → apply executes → summary comment posted
+// on the correct PR. This catches regressions where watchApplyProgress loses the
+// repo/PR/installationID context and fails to post comments.
+func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
+	dbName := "webhook_rbconfirm_exec"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Step 1: Create initial table
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	cfg.DBName = dbName
+	cfg.MultiStatements = true
+	appDSN := cfg.FormatDSN()
+	db, err := sql.Open("mysql", appDSN)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	_ = db.Close()
+
+	// Step 2: Plan + apply adding an index (creates OriginalSchema for rollback)
+	schemaWithIndex := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
+		Database:    dbName,
+		Environment: "staging",
+		Type:        "mysql",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			dbName: {Files: map[string]string{"users.sql": schemaWithIndex}},
+		},
+	})
+	require.NoError(t, err)
+
+	applyResp, applyID, err := svc.ExecuteApply(ctx, api.ApplyRequest{
+		PlanID:      planResp.PlanID,
+		Environment: "staging",
+		Options:     map[string]string{"allow_unsafe": "true"},
+	})
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted)
+
+	require.Eventually(t, func() bool {
+		a, err := svc.Storage().Applies().Get(ctx, applyID)
+		return err == nil && a != nil && a.State == "completed"
+	}, 30*time.Second, 500*time.Millisecond, "initial apply should complete")
+
+	// Step 3: Run rollback to generate plan and acquire lock
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": schemaWithIndex,
+	}, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+
+	storedApply, err := svc.Storage().Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: fmt.Sprintf("schemabot rollback %s", storedApply.ApplyIdentifier),
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// Drain the rollback plan comment
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Rollback Plan")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for rollback plan comment")
+	}
+
+	// Step 4: Run rollback-confirm — this triggers the apply + watchApplyProgress
+	req = buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot rollback-confirm -e staging",
+		isPR:    true,
+	}, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// Step 5: Verify that the summary comment arrives on the PR.
+	// This is the critical assertion — if repo/PR/installationID are wrong,
+	// the comment goes to the wrong URL and never reaches the channel.
+	gotSummary := false
+	deadline := time.After(30 * time.Second)
+	for !gotSummary {
+		select {
+		case body := <-result.comments:
+			if strings.Contains(body, "Schema Change") && (strings.Contains(body, "Applied") || strings.Contains(body, "Complete") || strings.Contains(body, "Failed")) {
+				gotSummary = true
+				assert.Contains(t, body, "DROP INDEX", "rollback should drop the index")
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for rollback summary comment — " +
+				"watchApplyProgress may have lost repo/PR/installationID context")
+		}
 	}
 }
 

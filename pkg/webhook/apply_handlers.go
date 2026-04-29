@@ -371,7 +371,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	})
 	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
 
-	go h.watchApplyProgress(context.Background(), apply, true)
+	go h.watchApplyProgress(context.Background(), repo, pr, installationID, apply, true)
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command.

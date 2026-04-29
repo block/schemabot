@@ -18,10 +18,7 @@ import (
 //
 // This function runs as a background goroutine spawned after an apply is submitted.
 // It exits when the apply reaches a terminal state or the context is cancelled.
-func (h *Handler) watchApplyProgress(ctx context.Context, apply *storage.Apply, skipInitialPost ...bool) {
-	repo := apply.Repository
-	pr := apply.PullRequest
-	installationID := apply.InstallationID
+func (h *Handler) watchApplyProgress(ctx context.Context, repo string, pr int, installationID int64, apply *storage.Apply, skipInitialPost ...bool) {
 	applyID := apply.ID
 	opts := apply.GetOptions()
 
