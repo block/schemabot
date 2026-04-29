@@ -179,10 +179,10 @@ func TestPlanNamespacesToChanges_VSchemaOnlyWhenStored(t *testing.T) {
 	}
 
 	// Keyspace with VSchema stored should have metadata["vschema"] set
-	assert.Equal(t, "true", byNS["ks_with_vschema"].Metadata["vschema"])
+	assert.Equal(t, "true", byNS["ks_with_vschema"].Metadata["vschema_changed"])
 
 	// Keyspace without VSchema should NOT have metadata["vschema"] set
-	assert.Empty(t, byNS["ks_without_vschema"].Metadata["vschema"],
+	assert.Empty(t, byNS["ks_without_vschema"].Metadata["vschema_changed"],
 		"keyspace without VSchema change should not have vschema metadata")
 
 	// Operation field should be preserved

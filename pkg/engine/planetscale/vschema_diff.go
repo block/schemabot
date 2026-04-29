@@ -57,19 +57,22 @@ func normalizeVSchemaJSON(s string) string {
 	if err := protojson.Unmarshal([]byte(s), &ks); err == nil {
 		marshaler := protojson.MarshalOptions{UseProtoNames: true}
 		if data, err := marshaler.Marshal(&ks); err == nil {
-			return string(data)
+			// protojson map ordering is non-deterministic. Re-marshal through
+			// encoding/json which sorts map keys for stable comparison.
+			return sortedJSON(string(data))
 		}
 	}
 
 	// Fallback: JSON round-trip stripping empty maps
-	var obj map[string]any
+	return sortedJSON(s)
+}
+
+// sortedJSON re-marshals JSON with sorted keys for deterministic comparison.
+// Strips empty maps as a side effect of the round-trip.
+func sortedJSON(s string) string {
+	var obj any
 	if err := json.Unmarshal([]byte(s), &obj); err != nil {
 		return s
-	}
-	for key, val := range obj {
-		if m, ok := val.(map[string]any); ok && len(m) == 0 {
-			delete(obj, key)
-		}
 	}
 	data, err := json.Marshal(obj)
 	if err != nil {
