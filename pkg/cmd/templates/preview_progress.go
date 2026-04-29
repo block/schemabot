@@ -405,6 +405,34 @@ func previewVitessFailedOutput() {
 	WriteProgress(data)
 }
 
+func previewVitessWaitingForDeployOutput() {
+	data := ProgressData{
+		State:       state.Apply.WaitingForDeploy,
+		Engine:      "PlanetScale",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Database:    "myapp",
+		Environment: "production",
+		StartedAt:   previewTime.Add(-30 * time.Second).Format(time.RFC3339),
+		Options: map[string]string{
+			"defer_deploy": "true",
+		},
+		Metadata: map[string]string{
+			"branch_name":        "schemabot-myapp-28471035",
+			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/50",
+			"deferred_deploy":    "true",
+			"is_instant":         "true",
+		},
+		Tables: []TableProgress{
+			{
+				TableName: "users", Namespace: "myapp_sharded",
+				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status: state.Apply.Pending,
+			},
+		},
+	}
+	WriteProgress(data)
+}
+
 func previewVitessWaitingForCutoverOutput() {
 	data := ProgressData{
 		State:       state.Apply.WaitingForCutover,

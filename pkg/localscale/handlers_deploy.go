@@ -469,9 +469,22 @@ func (s *Server) executeDeployRequest(ctx context.Context, p deployExecParams) e
 	// to route DDL correctly to multi-shard keyspaces. Without it, vtgate treats
 	// the keyspace as unsharded and rejects DDL with "Keyspace does not have
 	// exactly one shard".
+	//
+	// When there are DDLs, apply VSchema for routing but reset vschema_applied
+	// so the processor re-applies after DDL completes. Sequence tables (type:
+	// sequence) need their backing tables to exist before vtgate recognizes them.
 	if p.hasVSchema {
 		if err := s.applyPendingVSchema(ctx, p.backend, p.ref, p.vschemaData); err != nil {
 			return fmt.Errorf("apply vschema for deploy request %d: %w", p.ref.number, err)
+		}
+		if p.totalDDL > 0 {
+			// Reset so the processor re-applies VSchema after DDL completes
+			if _, err := s.metadataDB.ExecContext(ctx,
+				`UPDATE localscale_deploy_requests SET vschema_applied = FALSE
+				 WHERE org = ? AND database_name = ? AND number = ?`,
+				p.ref.org, p.ref.database, p.ref.number); err != nil {
+				s.logger.Warn("failed to reset vschema_applied", "number", p.ref.number, "error", err)
+			}
 		}
 	}
 

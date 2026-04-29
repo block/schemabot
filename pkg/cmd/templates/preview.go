@@ -27,6 +27,7 @@ type PreviewType string
 const (
 	PreviewPlan              PreviewType = "plan"
 	PreviewProgress          PreviewType = "progress"
+	PreviewWaitingForDeploy  PreviewType = "waiting_for_deploy"
 	PreviewWaitingForCutover PreviewType = "waiting_for_cutover"
 	PreviewCuttingOver       PreviewType = "cutting_over"
 	PreviewCompleted         PreviewType = "completed"
@@ -169,6 +170,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewVitessPlanOutput()
 	case PreviewProgress:
 		previewProgressOutput()
+	case PreviewWaitingForDeploy:
+		previewVitessWaitingForDeployOutput()
 	case PreviewWaitingForCutover:
 		previewWaitingForCutoverOutput()
 	case PreviewCuttingOver:
@@ -1103,6 +1106,7 @@ func previewCLIApplyAllOutput() {
 		{"VITESS: COMPLETED", previewVitessCompletedOutput},
 		{"VITESS: MULTI-KEYSPACE COMPLETED WATCH", previewVitessMultiKeyspaceCompletedWatchOutput},
 		{"VITESS: FAILED", previewVitessFailedOutput},
+		{"VITESS: WAITING FOR DEPLOY", previewVitessWaitingForDeployOutput},
 		{"VITESS: WAITING FOR CUTOVER", previewVitessWaitingForCutoverOutput},
 		{"VITESS: CUTTING OVER", previewVitessCuttingOverOutput},
 		{"VITESS: CANCELLED", previewVitessCancelledOutput},

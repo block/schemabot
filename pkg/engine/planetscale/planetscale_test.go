@@ -170,6 +170,65 @@ func TestPSMetadataEncodeDecode(t *testing.T) {
 	assert.Equal(t, original.DeployRequestURL, decoded.DeployRequestURL)
 }
 
+func TestPSMetadataEncodeDecode_DeferredDeploy(t *testing.T) {
+	original := &psMetadata{
+		BranchName:       "schemabot-mydb-12345678",
+		DeployRequestID:  42,
+		DeployRequestURL: "https://app.planetscale.com/org/db/deploy-requests/42",
+		IsInstant:        true,
+		DeferredDeploy:   true,
+	}
+
+	encoded, err := encodePSMetadata(original)
+	require.NoError(t, err)
+
+	decoded, err := decodePSMetadata(encoded)
+	require.NoError(t, err)
+	assert.Equal(t, original.BranchName, decoded.BranchName)
+	assert.Equal(t, original.DeployRequestID, decoded.DeployRequestID)
+	assert.True(t, decoded.IsInstant)
+	assert.True(t, decoded.DeferredDeploy)
+}
+
+func TestStart_RejectsNonDeferredDeploy(t *testing.T) {
+	e := &Engine{}
+
+	// Non-deferred metadata — Start should return "not supported"
+	meta, err := encodePSMetadata(&psMetadata{
+		BranchName:      "schemabot-mydb-abc",
+		DeployRequestID: 1,
+		DeferredDeploy:  false,
+	})
+	require.NoError(t, err)
+
+	_, err = e.Start(t.Context(), &engine.ControlRequest{
+		ResumeState: &engine.ResumeState{Metadata: meta},
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not supported")
+}
+
+func TestStart_AcceptsDeferredDeploy(t *testing.T) {
+	// Start with DeferredDeploy=true should attempt to deploy
+	// (will fail because no PS client, but validates dispatch logic)
+	e := &Engine{}
+
+	meta, err := encodePSMetadata(&psMetadata{
+		BranchName:      "schemabot-mydb-abc",
+		DeployRequestID: 1,
+		IsInstant:       true,
+		DeferredDeploy:  true,
+	})
+	require.NoError(t, err)
+
+	_, err = e.Start(t.Context(), &engine.ControlRequest{
+		ResumeState: &engine.ResumeState{Metadata: meta},
+	})
+	// Fails because no PS client configured — but proves it didn't reject as "not supported"
+	assert.Error(t, err)
+	assert.NotContains(t, err.Error(), "not supported")
+}
+
 func TestDecodePSMetadata_Empty(t *testing.T) {
 	_, err := decodePSMetadata("")
 	assert.Error(t, err)

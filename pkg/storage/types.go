@@ -323,6 +323,11 @@ type ApplyOptions struct {
 	// DeferCutover pauses at cutover and waits for explicit trigger.
 	DeferCutover bool `json:"defer_cutover,omitempty"`
 
+	// DeferDeploy pauses before deploying the deploy request and waits for
+	// explicit trigger (PlanetScale only). The user can review the deploy
+	// request diff on PlanetScale before proceeding.
+	DeferDeploy bool `json:"defer_deploy,omitempty"`
+
 	// SkipRevert skips the revert window after completion (Vitess only).
 	SkipRevert bool `json:"skip_revert,omitempty"`
 
@@ -479,6 +484,7 @@ const (
 	LogEventTaskUpdate          = "task_update"
 	LogEventStopRequested       = "stop_requested"
 	LogEventStartRequested      = "start_requested"
+	LogEventDeployTriggered     = "deploy_triggered"
 	LogEventCutoverTriggered    = "cutover_triggered"
 	LogEventSkipRevertTriggered = "skip_revert_triggered"
 	LogEventError               = "error"
@@ -546,6 +552,7 @@ type VitessApplyData struct {
 	MigrationContext string
 	DeployRequestURL string
 	IsInstant        bool // True when PlanetScale reported the deploy as instant-eligible
+	DeferredDeploy   bool // True when deploy was deferred (--defer-deploy flag)
 
 	// RevertSkippedAt records when skip-revert was dispatched. Non-nil means
 	// finalization is in progress — the deploy request is transitioning across

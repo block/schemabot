@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -315,6 +316,7 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 				MigrationContext: rs.MigrationContext,
 				DeployRequestURL: meta.DeployRequestURL,
 				IsInstant:        meta.IsInstant,
+				DeferredDeploy:   meta.DeferredDeploy,
 			}); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
@@ -367,6 +369,7 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 				MigrationContext: resumeState.MigrationContext,
 				DeployRequestURL: meta.DeployRequestURL,
 				IsInstant:        meta.IsInstant,
+				DeferredDeploy:   meta.DeferredDeploy,
 			}); saveErr != nil {
 				c.logger.Warn("failed to save vitess apply data", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
@@ -528,9 +531,9 @@ func (c *LocalClient) runEngineTask(ctx context.Context, task *storage.Task, pla
 
 // Timeouts for idle states where user action is expected.
 const (
-	// waitingForCutoverTimeout is how long to wait for a manual cutover trigger
-	// before auto-cancelling the apply.
-	waitingForCutoverTimeout = 14 * 24 * time.Hour
+	// waitingForManualActionTimeout is how long to wait for a manual trigger
+	// (deploy or cutover) before auto-cancelling the apply.
+	waitingForManualActionTimeout = 14 * 24 * time.Hour
 
 	// defaultRevertWindowDuration is the default revert window period.
 	// 30 minutes matches PlanetScale's default.
@@ -606,6 +609,14 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ResumeState: resumeState,
 	})
 	if err != nil {
+		// Non-retryable errors (e.g., deploy request not found) — fail immediately.
+		var nonRetryable *engine.ErrNonRetryable
+		if errors.As(err, &nonRetryable) {
+			c.logger.Error("progress check failed with non-retryable error",
+				"error", err, "apply_id", apply.ApplyIdentifier)
+			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed: %v", err))
+			return true
+		}
 		ps.consecutiveErrors++
 		c.logger.Warn("progress check failed",
 			"error", err, "apply_id", apply.ApplyIdentifier, "consecutive_errors", ps.consecutiveErrors)
@@ -649,6 +660,16 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ResumeState: resumeState,
 	}
 
+	// Auto-trigger deploy if waiting and not in defer-deploy mode
+	if result.State == engine.StateWaitingForDeploy && !opts.DeferDeploy {
+		c.logger.Info("auto-triggering deploy (not in defer-deploy mode)", "apply_id", apply.ApplyIdentifier)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventDeployTriggered, storage.LogSourceSchemaBot,
+			"Auto-triggering deploy (defer_deploy not set)", "", "")
+		if _, err := eng.Start(ctx, controlReq); err != nil {
+			c.logger.Error("auto-deploy failed", "error", err, "apply_id", apply.ApplyIdentifier)
+		}
+	}
+
 	// Auto-trigger cutover if waiting and not in defer mode
 	if result.State == engine.StateWaitingForCutover && !opts.DeferCutover {
 		c.logger.Info("auto-triggering cutover (not in defer mode)", "apply_id", apply.ApplyIdentifier)
@@ -659,13 +680,25 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
+	// Timeout: cancel the apply if waiting for manual deploy too long.
+	if result.State == engine.StateWaitingForDeploy && opts.DeferDeploy &&
+		!ps.stateEnteredAt.IsZero() && time.Since(ps.stateEnteredAt) > waitingForManualActionTimeout {
+		c.logger.Info("waiting-for-deploy timed out, cancelling apply",
+			"apply_id", apply.ApplyIdentifier, "timeout", waitingForManualActionTimeout)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Waiting for deploy timed out after %s, cancelling", waitingForManualActionTimeout), "", "")
+		if _, err := eng.Stop(ctx, controlReq); err != nil {
+			c.logger.Error("timeout stop failed", "error", err, "apply_id", apply.ApplyIdentifier)
+		}
+	}
+
 	// Timeout: cancel the apply if waiting for manual cutover too long.
 	if result.State == engine.StateWaitingForCutover && opts.DeferCutover &&
-		!ps.stateEnteredAt.IsZero() && time.Since(ps.stateEnteredAt) > waitingForCutoverTimeout {
+		!ps.stateEnteredAt.IsZero() && time.Since(ps.stateEnteredAt) > waitingForManualActionTimeout {
 		c.logger.Info("waiting-for-cutover timed out, cancelling apply",
-			"apply_id", apply.ApplyIdentifier, "timeout", waitingForCutoverTimeout)
+			"apply_id", apply.ApplyIdentifier, "timeout", waitingForManualActionTimeout)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Waiting for cutover timed out after %s, cancelling", waitingForCutoverTimeout), "", "")
+			fmt.Sprintf("Waiting for cutover timed out after %s, cancelling", waitingForManualActionTimeout), "", "")
 		if _, err := eng.Stop(ctx, controlReq); err != nil {
 			c.logger.Error("timeout stop failed", "error", err, "apply_id", apply.ApplyIdentifier)
 		}

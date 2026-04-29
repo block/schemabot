@@ -70,6 +70,8 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		}
 		var stateMsg string
 		switch {
+		case state.IsState(active.State, state.Apply.WaitingForDeploy):
+			stateMsg = "A schema change is waiting for deploy."
 		case state.IsState(active.State, state.Apply.WaitingForCutover):
 			stateMsg = "A schema change is waiting for cutover."
 		case state.IsState(active.State, state.Apply.Running):
@@ -86,7 +88,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 			fmt.Println()
 			fmt.Println(stateMsg)
 			fmt.Println()
-			if state.IsState(active.State, state.Apply.WaitingForCutover) {
+			if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
 				if active.ApplyID != "" {
 					fmt.Printf("To trigger cutover:  schemabot cutover --apply-id %s\n", active.ApplyID)
 				} else {
@@ -682,6 +684,8 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 		if globalNorm != lastGlobalState {
 			// Emit global state changes that aren't covered by per-table events
 			switch {
+			case state.IsState(curState, state.Apply.WaitingForDeploy) && lastGlobalState != "":
+				log.emit("msg", "Deploy request ready — waiting for deploy")
 			case state.IsState(curState, state.Apply.WaitingForCutover) && lastGlobalState != "":
 				log.emit("msg", "Waiting for cutover")
 			case state.IsState(curState, state.Apply.CuttingOver):

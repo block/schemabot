@@ -1535,6 +1535,102 @@ func createBranchViaLocalScale(t *testing.T, branchName string) {
 // TestVitess_Apply_BranchReuse tests the --branch flag for reusing an existing
 // PlanetScale branch. Creates a branch, applies with --branch, then syncs and
 // applies again on the same branch.
+func TestVitess_Apply_DeferDeploy(t *testing.T) {
+	// Verify that applies with defer_deploy hold at WaitingForDeploy,
+	// and that calling Start triggers the deploy to completion.
+	vitessAvailable(t)
+	clearSchemaBotState(t)
+	defer vitessRestoreBaseSchema(t, "staging")
+
+	endpoint := schemabotURL(t)
+
+	// Plan via API
+	colName := fmt.Sprintf("defer_col_%d", time.Now().UnixMilli()%100000)
+	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
+		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
+	}))
+	planResp, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0)
+	require.NoError(t, err)
+	require.NotEmpty(t, planResp.PlanID)
+	require.NotEmpty(t, planResp.Changes, "expected plan to have changes")
+
+	// Apply via API with defer_deploy option
+	applyResp, err := client.CallApplyAPI(endpoint, planResp.PlanID, vitessDB, "staging", "e2e-test",
+		map[string]string{"defer_deploy": "true", "skip_revert": "true"})
+	require.NoError(t, err)
+	require.NotEmpty(t, applyResp.ApplyID)
+	t.Logf("apply started: %s", applyResp.ApplyID)
+
+	// Poll until WaitingForDeploy
+	waitForApplyState(t, endpoint, applyResp.ApplyID, state.Apply.WaitingForDeploy, testutil.PollDeadline)
+	t.Logf("apply reached waiting_for_deploy")
+
+	// Verify the progress response has deferred_deploy metadata
+	progress, err := client.GetProgress(endpoint, applyResp.ApplyID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.WaitingForDeploy, progress.State)
+	assert.Equal(t, "true", progress.Metadata["deferred_deploy"])
+
+	// Trigger deploy via Start API. Retry briefly — the progress API may
+	// return WaitingForDeploy before the apply record in storage catches up.
+	var startResp *apitypes.StartResponse
+	for range 10 {
+		startResp, err = client.CallStartAPI(endpoint, vitessDB, "staging", applyResp.ApplyID)
+		if err == nil && startResp.Accepted {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	require.NoError(t, err)
+	require.True(t, startResp.Accepted, "start should be accepted: %s", startResp.ErrorMessage)
+	t.Logf("deploy triggered via start API")
+
+	// Wait for completion
+	waitForApplyState(t, endpoint, applyResp.ApplyID, state.Apply.Completed, testutil.PollDeadline)
+	t.Logf("apply completed")
+}
+
+func TestVitess_Apply_DeferDeploy_StartTooEarly(t *testing.T) {
+	// Verify that calling Start before the apply reaches WaitingForDeploy
+	// returns a clear "not ready" error instead of a confusing message.
+	vitessAvailable(t)
+	clearSchemaBotState(t)
+	defer vitessRestoreBaseSchema(t, "staging")
+
+	endpoint := schemabotURL(t)
+
+	colName := fmt.Sprintf("early_col_%d", time.Now().UnixMilli()%100000)
+	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
+		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
+	}))
+	planResp, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0)
+	require.NoError(t, err)
+	require.NotEmpty(t, planResp.PlanID)
+
+	applyResp, err := client.CallApplyAPI(endpoint, planResp.PlanID, vitessDB, "staging", "e2e-test",
+		map[string]string{"defer_deploy": "true", "skip_revert": "true"})
+	require.NoError(t, err)
+	require.NotEmpty(t, applyResp.ApplyID)
+
+	// Call Start immediately — apply hasn't reached WaitingForDeploy yet
+	_, startErr := client.CallStartAPI(endpoint, vitessDB, "staging", applyResp.ApplyID)
+	require.Error(t, startErr)
+	assert.Contains(t, startErr.Error(), "not ready for deploy")
+
+	// Clean up: wait for WaitingForDeploy, then trigger and complete
+	waitForApplyState(t, endpoint, applyResp.ApplyID, state.Apply.WaitingForDeploy, testutil.PollDeadline)
+	var startResp *apitypes.StartResponse
+	for range 10 {
+		startResp, err = client.CallStartAPI(endpoint, vitessDB, "staging", applyResp.ApplyID)
+		if err == nil && startResp.Accepted {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	require.NoError(t, err)
+	waitForApplyState(t, endpoint, applyResp.ApplyID, state.Apply.Completed, testutil.PollDeadline)
+}
+
 func TestVitess_Apply_BranchReuse(t *testing.T) {
 	vitessAvailable(t)
 	clearSchemaBotState(t)

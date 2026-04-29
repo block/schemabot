@@ -41,6 +41,8 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 		// Ignore errors - progress API may fail if no schema change exists
 	} else if active != nil && active.State != "" && !state.IsState(active.State, state.NoActiveChange) {
 		switch {
+		case state.IsState(active.State, state.Apply.WaitingForDeploy):
+			return fmt.Errorf("cannot rollback: a schema change is waiting for deploy")
 		case state.IsState(active.State, state.Apply.WaitingForCutover):
 			return fmt.Errorf("cannot rollback: a schema change is waiting for cutover")
 		case state.IsState(active.State, state.Apply.Running):

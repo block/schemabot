@@ -178,7 +178,7 @@ func (s *applyStore) ClaimForRecovery(ctx context.Context) (*storage.Apply, erro
 	row := tx.QueryRowContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
-		WHERE state IN (?, ?, ?, ?, ?)
+		WHERE state IN (?, ?, ?, ?, ?, ?)
 		  AND updated_at < NOW() - INTERVAL 1 MINUTE
 		ORDER BY created_at
 		LIMIT 1
@@ -186,6 +186,7 @@ func (s *applyStore) ClaimForRecovery(ctx context.Context) (*storage.Apply, erro
 	`,
 		state.Apply.Pending,
 		state.Apply.Running,
+		state.Apply.WaitingForDeploy,
 		state.Apply.WaitingForCutover,
 		state.Apply.CuttingOver,
 		state.Apply.RevertWindow,

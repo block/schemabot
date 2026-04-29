@@ -22,6 +22,7 @@ type WatchModel struct {
 	applyID             string // When set, fetches progress by apply ID instead of database/environment
 	allowCutover        bool
 	maxTableNameLen     int
+	deployTriggered     bool
 	cutoverTriggered    bool
 	skipRevertTriggered bool
 	skipRevertAt        time.Time // When skip-revert was triggered (for timeout)
@@ -113,6 +114,11 @@ type cutoverResultMsg struct {
 	err     error
 }
 
+type deployResultMsg struct {
+	success bool
+	err     error
+}
+
 type stopResultMsg struct {
 	success bool
 	err     error
@@ -180,7 +186,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			// Stop (Spirit) or cancel (PlanetScale) the schema change
-			if state.IsState(m.state, state.Apply.Running, state.Apply.WaitingForCutover) && !m.stopTriggered {
+			if state.IsState(m.state, state.Apply.Running, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) && !m.stopTriggered {
 				m.stopTriggered = true
 				return m, m.triggerStop()
 			}
@@ -191,6 +197,11 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "enter":
+			// Trigger deploy if waiting for deploy and not already triggered
+			if state.IsState(m.state, state.Apply.WaitingForDeploy) && m.allowCutover && !m.deployTriggered {
+				m.deployTriggered = true
+				return m, m.triggerDeploy()
+			}
 			// Trigger cutover if waiting and not already triggered
 			if state.IsState(m.state, state.Apply.WaitingForCutover) && m.allowCutover && !m.cutoverTriggered {
 				m.cutoverTriggered = true
@@ -289,6 +300,13 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case cutoverResultMsg:
 		if msg.err != nil {
 			m.errorMsg = msg.err.Error()
+		}
+		// Continue polling - next tick will fetch updated state
+
+	case deployResultMsg:
+		if msg.err != nil {
+			m.errorMsg = msg.err.Error()
+			m.deployTriggered = false // Allow retry
 		}
 		// Continue polling - next tick will fetch updated state
 

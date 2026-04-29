@@ -297,6 +297,11 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	if deferCutover {
 		options["defer_cutover"] = "true"
 	}
+	// TUI mode: defer deploy so the user can review the deploy request diff
+	// on PlanetScale before triggering. Non-interactive modes auto-deploy.
+	if watch && format == OutputFormatInteractive {
+		options["defer_deploy"] = "true"
+	}
 	if skipRevert {
 		options["skip_revert"] = "true"
 	}

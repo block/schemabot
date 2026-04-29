@@ -2529,16 +2529,6 @@ Sequential mode: Just started (all tables pending)
 └──────────────────────────────────┘
 
 
-     ~ users: ⏳ Queued
-       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-
-     ~ orders: ⏳ Queued
-       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
-
-     ~ products: ⏳ Queued
-       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
-
-
 ```
 </details>
 
@@ -2767,12 +2757,6 @@ Use 'schemabot start' to resume from checkpoint.
 └────────────────────────────────────┘
 
 
-  ── myapp_sharded ──
-
-     ~ users: ⏳ Queued
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
-
-
 ```
 </details>
 
@@ -2788,12 +2772,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  State:        Refreshing branch schema  │
 │  Branch:       my-reusable-branch        │
 └──────────────────────────────────────────┘
-
-
-  ── myapp_sharded ──
-
-     ~ users: ⏳ Queued
-       ALTER TABLE `users` ADD COLUMN `region` varchar(50);
 
 
 ```
@@ -2828,12 +2806,6 @@ Use 'schemabot start' to resume from checkpoint.
 │  State:        Creating deploy request   │
 │  Branch:       schemabot-myapp-28471035  │
 └──────────────────────────────────────────┘
-
-
-  ── myapp_sharded ──
-
-     ~ users: ⏳ Queued
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
 ```
@@ -2977,6 +2949,32 @@ Use 'schemabot start' to resume from checkpoint.
 
 To recover: Fix the issue above, then run a new apply.
 The new apply will only process tables that haven't completed.
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-waiting-for-deploy"></a><strong>Vitess: Waiting For Deploy</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     production                                                   │
+│  State:           Waiting for deploy                                           │
+│  Options:         ⏸️ Defer Deploy                                              │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/50  │
+│  Started:         Jan 15 14:29:30 UTC                                          │
+│  Duration:        30s                                                          │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+
+Deploy request created: https://app.planetscale.com/my-org/myapp/deploy-requests/50
+⚡ This change will be applied using instant mode.
+
+Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
 ```
 </details>
@@ -3789,16 +3787,6 @@ Sequential mode: Just started (all tables pending)
 │  Started:   Jan 15 14:29:50 UTC  │
 │  Duration:  10s                  │
 └──────────────────────────────────┘
-
-
-     ~ users: ⏳ Queued
-       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-
-     ~ orders: ⏳ Queued
-       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
-
-     ~ products: ⏳ Queued
-       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
 ```

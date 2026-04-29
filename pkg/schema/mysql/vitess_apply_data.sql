@@ -6,6 +6,7 @@ CREATE TABLE `vitess_apply_data` (
   `migration_context` varchar(255) DEFAULT NULL,
   `deploy_request_url` varchar(512) DEFAULT NULL,
   `is_instant` tinyint(1) NOT NULL DEFAULT '0',
+  `deferred_deploy` tinyint(1) NOT NULL DEFAULT '0',
   `revert_skipped_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

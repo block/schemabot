@@ -75,6 +75,8 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("## Schema Change Starting\n\n")
 	case state.Apply.Running:
 		sb.WriteString("## Schema Change In Progress\n\n")
+	case state.Apply.WaitingForDeploy:
+		sb.WriteString("## Schema Change — Waiting for Deploy\n\n")
 	case state.Apply.WaitingForCutover:
 		sb.WriteString("## Schema Change — Waiting for Cutover\n\n")
 	case state.Apply.CuttingOver:
@@ -361,6 +363,8 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 // All actionable states follow the same pattern: --- separator + "To <verb>:" + command.
 func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
+	case state.Apply.WaitingForDeploy:
+		writeFooterAction(sb, "To deploy:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
 	case state.Apply.WaitingForCutover:
 		writeFooterAction(sb, "To proceed with cutover:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
 	case state.Apply.CuttingOver:

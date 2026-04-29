@@ -304,6 +304,8 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 				"branch_name":        vad.BranchName,
 				"deploy_request_id":  vad.DeployRequestID,
 				"deploy_request_url": vad.DeployRequestURL,
+				"is_instant":         vad.IsInstant,
+				"deferred_deploy":    vad.DeferredDeploy,
 			})
 			req.ResumeState = &engine.ResumeState{
 				MigrationContext: vad.MigrationContext,

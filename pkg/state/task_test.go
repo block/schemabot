@@ -54,7 +54,7 @@ func TestNormalizeTaskStatus_PassThrough(t *testing.T) {
 	for _, s := range []string{
 		Task.Pending, Task.Running, Task.Stopped, Task.Failed,
 		Task.RevertWindow, Task.Reverted,
-		Task.WaitingForCutover, Task.CuttingOver, Task.Cancelled,
+		Task.WaitingForDeploy, Task.WaitingForCutover, Task.CuttingOver, Task.Cancelled,
 	} {
 		assert.Equal(t, s, NormalizeTaskStatus(s), "NormalizeTaskStatus(%q)", s)
 	}
