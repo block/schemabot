@@ -107,8 +107,8 @@ github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24
 github.com/beorn7/perks v1.0.0/go.mod h1:KWe93zE9D1o94FZ5RNwFwVgaQK1VOXiVxmqh+CedLV8=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
-github.com/block/spirit v0.12.1-0.20260414123006-daa99d533e68 h1:xeqyQXjhD3mSsA0SUoCZ0EtxKkZDN6IwbJmDSvjiB1w=
-github.com/block/spirit v0.12.1-0.20260414123006-daa99d533e68/go.mod h1:TpxEit7CjSLSrhDG21K5ORu3abMED5OipGLDAadjX5Y=
+github.com/block/spirit v0.12.1-0.20260428210128-cd4aecfd2fcd h1:KGwjKbjDe5fAWQHXoButCeAIoqeuzOptBoUZFUVmoN0=
+github.com/block/spirit v0.12.1-0.20260428210128-cd4aecfd2fcd/go.mod h1:TpxEit7CjSLSrhDG21K5ORu3abMED5OipGLDAadjX5Y=
 github.com/block/vitess v0.0.0-20260312213147-c2d162972c2d h1:IUsLaXSDLqBWN/5KiuGwhP8GOKVSY3ORkZuqoQnryrI=
 github.com/block/vitess v0.0.0-20260312213147-c2d162972c2d/go.mod h1:Q6qWoQw3mAEBOMg0Hn28sb5EWi7pRJ9885zrVtU6MGM=
 github.com/bndr/gotabulate v1.1.2 h1:yC9izuZEphojb9r+KYL4W9IJKO/ceIO8HDwxMA24U4c=
