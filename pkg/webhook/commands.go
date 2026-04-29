@@ -3,6 +3,8 @@ package webhook
 import (
 	"regexp"
 	"strings"
+
+	"github.com/block/schemabot/pkg/webhook/action"
 )
 
 // CommandParser parses SchemaBot commands from PR comments.
@@ -55,14 +57,14 @@ type CommandResult struct {
 func (p *CommandParser) ParseCommand(body string) CommandResult {
 	// Check help first
 	if p.helpRegex.MatchString(body) {
-		return CommandResult{Action: "help", IsHelp: true, IsMention: true}
+		return CommandResult{Action: action.Help, IsHelp: true, IsMention: true}
 	}
 
 	// Check rollback <apply-id> (positional arg, no -e flag)
 	rollbackMatches := p.rollbackRegex.FindStringSubmatch(body)
 	if len(rollbackMatches) >= 2 {
 		result := CommandResult{
-			Action:       "rollback",
+			Action:       action.Rollback,
 			ApplyID:      rollbackMatches[1],
 			Found:        true,
 			IsMention:    true,
@@ -78,16 +80,16 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 	// Check valid command with environment
 	matches := p.commandRegex.FindStringSubmatch(body)
 	if len(matches) >= 3 {
-		action := strings.ToLower(matches[1])
+		cmd := strings.ToLower(matches[1])
 		result := CommandResult{
-			Action:       action,
+			Action:       cmd,
 			Environment:  strings.ToLower(matches[2]),
 			Found:        true,
 			IsMention:    true,
 			SkipRevert:   p.skipRevertRegex.MatchString(body),
 			DeferCutover: p.deferCutoverRegex.MatchString(body),
 			AllowUnsafe:  p.allowUnsafeRegex.MatchString(body),
-			AutoConfirm:  action == "apply" && p.autoConfirmRegex.MatchString(body),
+			AutoConfirm:  cmd == action.Apply && p.autoConfirmRegex.MatchString(body),
 		}
 
 		dbMatches := p.databaseRegex.FindStringSubmatch(body)
@@ -101,16 +103,16 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 	// Check recognized command without -e flag
 	envMatches := p.commandWithoutEnvRegex.FindStringSubmatch(body)
 	if len(envMatches) >= 2 {
-		action := strings.ToLower(envMatches[1])
+		cmd := strings.ToLower(envMatches[1])
 
 		// unlock and fix-lint don't require -e flag
-		if action == "unlock" || action == "fix-lint" {
+		if cmd == action.Unlock || cmd == action.FixLint {
 			result := CommandResult{
-				Action:    action,
+				Action:    cmd,
 				Found:     true,
 				IsMention: true,
 			}
-			if action == "fix-lint" {
+			if cmd == action.FixLint {
 				dbMatches := p.databaseRegex.FindStringSubmatch(body)
 				if len(dbMatches) >= 2 {
 					result.Database = dbMatches[1]
@@ -120,9 +122,9 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 		}
 
 		// plan without -e runs for all configured environments
-		if action == "plan" {
+		if cmd == action.Plan {
 			result := CommandResult{
-				Action:     action,
+				Action:     cmd,
 				IsMention:  true,
 				MissingEnv: true,
 			}
@@ -134,7 +136,7 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 		}
 
 		return CommandResult{
-			Action:     action,
+			Action:     cmd,
 			IsMention:  true,
 			MissingEnv: true,
 		}

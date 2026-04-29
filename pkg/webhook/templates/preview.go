@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/webhook/action"
 )
 
 // Shared preview error messages — used by both PR comment and CLI preview functions
@@ -61,7 +62,7 @@ func PreviewCommentErrorNoConfig() string {
 		RequestedBy: "aparajon",
 		Timestamp:   "2026-01-15 14:30:00",
 		Environment: "staging",
-		CommandName: "plan",
+		CommandName: action.Plan,
 	})
 }
 
@@ -71,7 +72,7 @@ func PreviewCommentErrorMultiple() string {
 		RequestedBy:        "aparajon",
 		Timestamp:          "2026-01-15 14:30:00",
 		Environment:        "staging",
-		CommandName:        "plan",
+		CommandName:        action.Plan,
 		AvailableDatabases: "- `testapp` (schema/testapp/schemabot.yaml)\n- `payments` (schema/payments/schemabot.yaml)",
 	})
 }
@@ -83,7 +84,7 @@ func PreviewCommentErrorNotFound() string {
 		Timestamp:    "2026-01-15 14:30:00",
 		Environment:  "staging",
 		DatabaseName: "nonexistent-db",
-		CommandName:  "plan",
+		CommandName:  action.Plan,
 	})
 }
 
@@ -93,7 +94,7 @@ func PreviewCommentErrorInvalid() string {
 		RequestedBy: "aparajon",
 		Timestamp:   "2026-01-15 14:30:00",
 		Environment: "staging",
-		CommandName: "plan",
+		CommandName: action.Plan,
 	})
 }
 
@@ -103,14 +104,14 @@ func PreviewCommentErrorGeneric() string {
 		RequestedBy: "aparajon",
 		Timestamp:   "2026-01-15 14:30:00",
 		Environment: "staging",
-		CommandName: "plan",
+		CommandName: action.Plan,
 		ErrorDetail: "failed to fetch repository contents: API rate limit exceeded",
 	})
 }
 
 // PreviewCommentMissingEnv renders the "missing -e flag" error comment.
 func PreviewCommentMissingEnv() string {
-	return RenderMissingEnv("plan")
+	return RenderMissingEnv(action.Plan)
 }
 
 // PreviewCommentInvalidCmd renders the "invalid command" error comment.
@@ -197,7 +198,7 @@ func PreviewCommentReviewGateError() string {
 	return RenderGenericError(SchemaErrorData{
 		RequestedBy: "aparajon",
 		Environment: "staging",
-		CommandName: "apply",
+		CommandName: action.Apply,
 		ErrorDetail: "Review gate check failed: expand team @acme/schema-reviewers: API rate limit exceeded. An admin can run schema changes directly via the CLI to bypass the review gate.",
 	})
 }

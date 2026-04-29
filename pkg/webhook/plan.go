@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -27,7 +28,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
 	if err != nil {
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, "plan", err)
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return
 	}
@@ -54,7 +55,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 			RequestedBy: requestedBy,
 			Timestamp:   time.Now().UTC().Format("2006-01-02 15:04:05"),
 			Environment: environment,
-			CommandName: "plan",
+			CommandName: action.Plan,
 			ErrorDetail: err.Error(),
 		}))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan failed"})
@@ -99,14 +100,14 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 	if databaseName != "" {
 		config, _, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, "plan", findErr)
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
 			return
 		}
 		environments = config.GetEnvironments()
 	} else {
 		config, _, findErr := client.FindConfigForPR(ctx, repo, pr)
 		if findErr != nil {
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, "plan", findErr)
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
 			return
 		}
 		environments = config.GetEnvironments()

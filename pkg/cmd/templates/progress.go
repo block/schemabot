@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/spirit/pkg/statement"
+
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -17,10 +19,10 @@ const indentTable = "     " // 5 spaces — matches "  ── " in FormatKeyspac
 
 // progressSymbol returns a Terraform-style prefix for the change type.
 func progressSymbol(changeType string) string {
-	switch strings.ToLower(changeType) {
-	case "create":
+	switch ddl.OpToStatementType(changeType) {
+	case statement.StatementCreateTable:
 		return "+ "
-	case "drop":
+	case statement.StatementDropTable:
 		return "- "
 	default:
 		return "~ "

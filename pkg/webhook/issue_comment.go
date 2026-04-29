@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -113,14 +114,14 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 
 	// Handle missing -e flag
 	if result.MissingEnv {
-		if result.Action == "plan" {
+		if result.Action == action.Plan {
 			// Plan without -e: run for all configured environments
 			h.logger.Info("plan without -e flag", "repo", repo, "pr", pr)
 			go h.handleMultiEnvPlan(repo, pr, result.Database, installationID, requestedBy, false)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return
 		}
-		if result.Action == "rollback" {
+		if result.Action == action.Rollback {
 			// Rollback without apply ID — handler will post usage message
 			go h.handleRollbackCommand(repo, pr, installationID, requestedBy, result)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "rollback started"})
@@ -144,7 +145,7 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 	}
 
 	// Reject -y/--yes on commands that don't support it
-	if result.Action != "apply" && parser.autoConfirmRegex.MatchString(payload.Comment.Body) {
+	if result.Action != action.Apply && parser.autoConfirmRegex.MatchString(payload.Comment.Body) {
 		h.postComment(repo, pr, installationID,
 			fmt.Sprintf("The `-y` flag is not supported for `%s`.", result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
@@ -159,38 +160,38 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 	)
 
 	switch result.Action {
-	case "plan":
+	case action.Plan:
 		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, installationID, requestedBy)
-	case "help":
+	case action.Help:
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})
-	case "apply":
+	case action.Apply:
 		h.goSafe(repo, pr, installationID, func() {
 			h.handleApplyCommand(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "apply started"})
-	case "apply-confirm":
+	case action.ApplyConfirm:
 		h.goSafe(repo, pr, installationID, func() {
 			h.handleApplyConfirmCommand(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "apply-confirm started"})
-	case "unlock":
+	case action.Unlock:
 		h.goSafe(repo, pr, installationID, func() {
 			h.handleUnlockCommand(repo, pr, installationID, requestedBy)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unlock started"})
-	case "rollback":
+	case action.Rollback:
 		h.goSafe(repo, pr, installationID, func() {
 			h.handleRollbackCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "rollback started"})
-	case "rollback-confirm":
+	case action.RollbackConfirm:
 		h.goSafe(repo, pr, installationID, func() {
 			h.handleRollbackConfirmCommand(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "rollback-confirm started"})
 	// Phase 2 commands — acknowledge but not yet implemented
-	case "stop", "revert", "skip-revert", "cutover":
+	case action.Stop, action.Revert, action.SkipRevert, action.Cutover:
 		h.postComment(repo, pr, installationID,
 			fmt.Sprintf("The `%s` command is not yet available via PR comments. Use the CLI instead:\n```\nschemabot %s -e %s\n```",
 				result.Action, result.Action, result.Environment))

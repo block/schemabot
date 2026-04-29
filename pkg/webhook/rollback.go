@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -39,7 +40,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		h.logger.Error("failed to look up apply", "applyID", applyID, "error", err)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
-			CommandName: "rollback",
+			CommandName: action.Rollback,
 			ErrorDetail: "Failed to look up apply: " + err.Error(),
 		}))
 		return
@@ -62,7 +63,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "rollback",
+			CommandName: action.Rollback,
 			ErrorDetail: "Failed to check lock status: " + err.Error(),
 		}))
 		return
@@ -103,7 +104,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "rollback",
+			CommandName: action.Rollback,
 			ErrorDetail: errMsg,
 		}))
 		return
@@ -131,7 +132,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "rollback",
+			CommandName: action.Rollback,
 			ErrorDetail: "Failed to acquire lock: " + err.Error(),
 		}))
 		return
@@ -185,7 +186,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
 	if err != nil {
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, "rollback-confirm", err)
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.RollbackConfirm, err)
 		return
 	}
 
@@ -200,7 +201,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "rollback-confirm",
+			CommandName: action.RollbackConfirm,
 			ErrorDetail: "Failed to check lock status: " + err.Error(),
 		}))
 		return
@@ -226,7 +227,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 			RequestedBy: requestedBy,
 			Timestamp:   time.Now().UTC().Format("2006-01-02 15:04:05"),
 			Environment: environment,
-			CommandName: "rollback-confirm",
+			CommandName: action.RollbackConfirm,
 			ErrorDetail: err.Error(),
 		}))
 		return
@@ -267,7 +268,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 			RequestedBy: requestedBy,
 			Timestamp:   time.Now().UTC().Format("2006-01-02 15:04:05"),
 			Environment: environment,
-			CommandName: "rollback-confirm",
+			CommandName: action.RollbackConfirm,
 			ErrorDetail: "Failed to execute rollback: " + err.Error(),
 		}))
 		return
