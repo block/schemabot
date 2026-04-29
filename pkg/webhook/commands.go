@@ -16,6 +16,7 @@ type CommandParser struct {
 	skipRevertRegex        *regexp.Regexp
 	deferCutoverRegex      *regexp.Regexp
 	allowUnsafeRegex       *regexp.Regexp
+	autoConfirmRegex       *regexp.Regexp
 }
 
 // NewCommandParser creates a new command parser.
@@ -30,6 +31,7 @@ func NewCommandParser() *CommandParser {
 		skipRevertRegex:        regexp.MustCompile(`(?i)--skip-revert\b`),
 		deferCutoverRegex:      regexp.MustCompile(`(?i)--defer-cutover\b`),
 		allowUnsafeRegex:       regexp.MustCompile(`(?i)--allow-unsafe\b`),
+		autoConfirmRegex:       regexp.MustCompile(`(?i)(?:--yes\b|-y\b)`),
 	}
 }
 
@@ -42,6 +44,7 @@ type CommandResult struct {
 	SkipRevert   bool
 	DeferCutover bool
 	AllowUnsafe  bool
+	AutoConfirm  bool
 	Found        bool
 	IsHelp       bool
 	IsMention    bool
@@ -75,14 +78,16 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 	// Check valid command with environment
 	matches := p.commandRegex.FindStringSubmatch(body)
 	if len(matches) >= 3 {
+		action := strings.ToLower(matches[1])
 		result := CommandResult{
-			Action:       strings.ToLower(matches[1]),
+			Action:       action,
 			Environment:  strings.ToLower(matches[2]),
 			Found:        true,
 			IsMention:    true,
 			SkipRevert:   p.skipRevertRegex.MatchString(body),
 			DeferCutover: p.deferCutoverRegex.MatchString(body),
 			AllowUnsafe:  p.allowUnsafeRegex.MatchString(body),
+			AutoConfirm:  action == "apply" && p.autoConfirmRegex.MatchString(body),
 		}
 
 		dbMatches := p.databaseRegex.FindStringSubmatch(body)

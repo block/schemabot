@@ -259,6 +259,60 @@ func TestParseCommand(t *testing.T) {
 				AllowUnsafe:  true,
 			},
 		},
+		{
+			name: "apply with -y short flag",
+			body: "schemabot apply -e staging -y",
+			expected: CommandResult{
+				Action:      "apply",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+				AutoConfirm: true,
+			},
+		},
+		{
+			name: "apply with --yes long flag",
+			body: "schemabot apply -e staging --yes",
+			expected: CommandResult{
+				Action:      "apply",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+				AutoConfirm: true,
+			},
+		},
+		{
+			name: "apply with -y and --allow-unsafe",
+			body: "schemabot apply -e production --allow-unsafe -y",
+			expected: CommandResult{
+				Action:      "apply",
+				Environment: "production",
+				Found:       true,
+				IsMention:   true,
+				AllowUnsafe: true,
+				AutoConfirm: true,
+			},
+		},
+		{
+			name: "-y ignored on apply-confirm (already a confirmation)",
+			body: "schemabot apply-confirm -e staging -y",
+			expected: CommandResult{
+				Action:      "apply-confirm",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "-y ignored on plan",
+			body: "schemabot plan -e staging -y",
+			expected: CommandResult{
+				Action:      "plan",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
 	}
 
 	for _, tt := range tests {
