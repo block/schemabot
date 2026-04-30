@@ -374,8 +374,12 @@ func FormatProgressState(s string) string {
 		return ANSICyan + "🔄 Preparing branch..." + ANSIReset
 	case state.Apply.ApplyingBranchChanges:
 		return ANSICyan + "🔄 Applying changes to branch..." + ANSIReset
+	case state.Apply.ValidatingBranch:
+		return ANSICyan + "🔄 Validating branch schema..." + ANSIReset
 	case state.Apply.CreatingDeployRequest:
 		return ANSICyan + "🔄 Creating deploy request..." + ANSIReset
+	case state.Apply.ValidatingDeployRequest:
+		return ANSICyan + "🔄 Validating deploy request..." + ANSIReset
 	case "idle":
 		return "Idle"
 	case state.Apply.Running:
@@ -407,6 +411,17 @@ func FormatProgressState(s string) string {
 func FormatTableProgress(t TableProgress) string {
 	var b strings.Builder
 
+	// Instant DDL: show "Applying instantly" for any non-terminal state.
+	if t.IsInstant && !state.IsTerminalApplyState(state.NormalizeTaskStatus(t.Status)) {
+		bar := ui.ProgressBarRowCopy(100)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		return b.String()
+	}
+
 	// Handle special states first - all use format: tablename: [bar] [status]
 	switch t.Status {
 	case state.Apply.Pending:
@@ -420,7 +435,11 @@ func FormatTableProgress(t TableProgress) string {
 		return b.String()
 	case state.Apply.Completed:
 		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete\n", t.TableName, bar)
+		label := "✓ Complete"
+		if t.IsInstant {
+			label = "⚡ Applied instantly"
+		}
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
@@ -438,7 +457,12 @@ func FormatTableProgress(t TableProgress) string {
 		return b.String()
 	case state.Apply.CuttingOver:
 		bar := ui.ProgressBarRowCopy(100) // blue — still in progress
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔄 Cutting over...\n", t.TableName, bar)
+		label := "Cutting over..."
+		op := ddl.OpToStatementType(t.ChangeType)
+		if op == statement.StatementCreateTable || op == statement.StatementDropTable {
+			label = "Applying..."
+		}
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔄 %s\n", t.TableName, bar, label)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
@@ -556,10 +580,17 @@ func FormatTableProgress(t TableProgress) string {
 			fmt.Fprintf(&b, indentDetail+"Status: %s\n", t.Status)
 		}
 	default:
-		if t.IsInstant {
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⚡ Applying instantly...\n", t.TableName)
-		} else {
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Running...\n", t.TableName)
+		// No row copy data — CREATE/DROP, instant DDL, or VSchema-only.
+		// Show a full blue bar with a state label.
+		bar := ui.ProgressBarRowCopy(100)
+		op := ddl.OpToStatementType(t.ChangeType)
+		switch {
+		case t.IsInstant:
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...\n", t.TableName, bar)
+		case op == statement.StatementCreateTable || op == statement.StatementDropTable:
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying...\n", t.TableName, bar)
+		default:
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Running...\n", t.TableName, bar)
 		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
@@ -845,8 +876,12 @@ func StateLabel(s string) string {
 		return "Preparing branch"
 	case state.Apply.ApplyingBranchChanges:
 		return "Applying changes to branch"
+	case state.Apply.ValidatingBranch:
+		return "Validating branch"
 	case state.Apply.CreatingDeployRequest:
 		return "Creating deploy request"
+	case state.Apply.ValidatingDeployRequest:
+		return "Validating deploy request"
 	case state.Apply.RevertWindow:
 		return "Revert window"
 	case state.Apply.Reverted:
@@ -873,7 +908,7 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIRed)
 	case state.Apply.Pending:
 		return colorWrap(ANSIDim)
-	case state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest:
+	case state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.ValidatingBranch, state.Apply.CreatingDeployRequest, state.Apply.ValidatingDeployRequest:
 		return colorWrap(ANSICyan)
 	case state.Apply.Reverted:
 		return colorWrap(ANSIRed)

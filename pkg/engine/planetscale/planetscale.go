@@ -707,9 +707,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, err
 	}
 
-	// Collect results in deterministic keyspace order
+	// Collect results in deterministic keyspace order, deduplicating lint violations.
 	var changes []engine.SchemaChange
 	var lintViolations []engine.LintViolation
+	seenLint := make(map[string]bool)
 	originalSchema := make(map[string]string)
 	for _, ks := range keyspaces {
 		r := results[ks]
@@ -717,7 +718,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			continue
 		}
 		maps.Copy(originalSchema, r.schemas)
-		lintViolations = append(lintViolations, r.violations...)
+		for _, v := range r.violations {
+			key := v.Table + "\x00" + v.Message
+			if !seenLint[key] {
+				seenLint[key] = true
+				lintViolations = append(lintViolations, v)
+			}
+		}
 		if r.hasChanges {
 			changes = append(changes, r.change)
 		}
@@ -849,14 +856,6 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			NewState: state.Apply.ApplyingBranchChanges,
 		})
 
-		// Verify the branch schema matches main after refresh. If the branch
-		// has stale DDL from a previous failed apply, RefreshSchema won't
-		// remove it — the branch will be ahead of main, producing inverted
-		// diffs (e.g., DROP COLUMN instead of ADD COLUMN).
-		keyspaces := sortedKeyspaces(req.SchemaFiles)
-		if err := e.verifyBranchMatchesMain(ctx, client, org, req.Database, branchName, main, keyspaces, req.SchemaFiles); err != nil {
-			return nil, fmt.Errorf("branch %s has stale changes from a previous apply — delete the branch and retry without --branch: %w", branchName, err)
-		}
 	} else {
 		// Create a new branch
 		branchName = generateBranchName(req.Database, req.PlanID)
@@ -884,7 +883,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		})
 	}
 
-	// Get branch credentials to apply DDL via MySQL
+	// Get branch credentials for MySQL access (used for DDL apply and validation).
 	pwCtx, pwCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer pwCancel()
 
@@ -897,6 +896,18 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create branch password: %w", err)
+	}
+
+	// For reused branches, verify the branch schema matches main. If the
+	// branch has stale DDL from a previous failed apply, RefreshSchema won't
+	// remove it — the branch will be ahead of main, producing inverted
+	// diffs (e.g., DROP COLUMN instead of ADD COLUMN).
+	// Uses MySQL to fetch the branch schema (real-time, no API staleness).
+	if existingBranch != "" {
+		keyspaces := sortedKeyspaces(req.SchemaFiles)
+		if err := e.verifyBranchMatchesMain(ctx, client, org, req.Database, branchName, main, keyspaces, req.SchemaFiles, password); err != nil {
+			return nil, fmt.Errorf("branch %s has stale changes from a previous apply — delete the branch and retry without --branch: %w", branchName, err)
+		}
 	}
 
 	// Apply DDL and VSchema changes to all keyspaces
@@ -915,7 +926,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	emitEvent(engine.ApplyEvent{
 		Message:  fmt.Sprintf("Applied %d DDL changes to branch %s", ddlCount, branchName),
 		Metadata: map[string]string{"branch": branchName},
-		NewState: state.Apply.CreatingDeployRequest,
+		NewState: state.Apply.ValidatingBranch,
 	})
 
 	// Verify the branch now matches the desired schema. If DDL application
@@ -923,16 +934,17 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Catch this before creating the deploy request to prevent deploying
 	// unexpected changes (e.g., DROP COLUMN when ADD COLUMN was intended).
 	//
-	// Uses the branch MySQL connection directly instead of PlanetScale's
-	// GetBranchSchema API, which returns stale schema until an asynchronous
-	// schema snapshot completes after DDL execution.
+	// DDL is fetched via MySQL (real-time), but VSchema is fetched via the
+	// PlanetScale API which may return stale data after UpdateKeyspaceVSchema.
+	// Retry up to 30s to allow the API to converge.
 	keyspaces := sortedKeyspaces(req.SchemaFiles)
-	if err := e.verifyBranchMatchesDesired(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, password); err != nil {
+	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, password); err != nil {
 		return nil, fmt.Errorf("branch validation failed after DDL apply: %w", err)
 	}
 	emitEvent(engine.ApplyEvent{
 		Message:  "Branch schema validated — matches desired state",
 		Metadata: map[string]string{"branch": branchName},
+		NewState: state.Apply.CreatingDeployRequest,
 	})
 
 	// Capture existing migration_contexts before deploy so we can discover the new one
@@ -952,12 +964,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
 	emitEvent(engine.ApplyEvent{
-		Message: fmt.Sprintf("Deploy request #%d created", dr.Number),
+		Message: fmt.Sprintf("Deploy request #%d created, validating...", dr.Number),
 		Metadata: map[string]string{
 			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
 			"deploy_request_url": dr.HtmlURL,
 			"branch":             branchName,
 		},
+		NewState: state.Apply.ValidatingDeployRequest,
 	})
 	persistState(&psMetadata{
 		BranchName:       branchName,
@@ -965,7 +978,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		DeployRequestURL: dr.HtmlURL,
 	})
 	for dr.DeploymentState == deployState.Pending {
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled waiting for deploy request: %w", ctx.Err())
+		case <-time.After(500 * time.Millisecond):
+		}
 		dr, err = e.getDeployRequest(ctx, client, org, req.Database, dr.Number)
 		if err != nil {
 			return nil, fmt.Errorf("poll deploy request %d: %w", dr.Number, err)
@@ -1654,12 +1671,16 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		return nil, fmt.Errorf("get deploy request: %w", err)
 	}
 
-	engineState, progress := deployStateToEngineState(dr.DeploymentState)
+	engineState := deployStateToEngineState(dr.DeploymentState)
 
 	// Deferred deploy: the deploy request is ready but hasn't been triggered yet.
 	if meta.DeferredDeploy && dr.DeploymentState == deployState.Ready {
 		engineState = engine.StateWaitingForDeploy
-		progress = 0
+	}
+
+	// Update instant DDL flag from deploy request if not already set.
+	if !meta.IsInstant && dr.Deployment != nil && dr.Deployment.InstantDDLEligible {
+		meta.IsInstant = true
 	}
 
 	// Update metadata with DeployedAt when available (used by tern layer for
@@ -1686,7 +1707,6 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	result := &engine.ProgressResult{
 		State:       engineState,
-		Progress:    progress,
 		Message:     deployStateToMessage(dr.DeploymentState),
 		ResumeState: req.ResumeState,
 	}
@@ -2440,6 +2460,48 @@ func shardLess(a, b string) bool {
 	return aStart < bStart
 }
 
+// verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired up to
+// 90s to handle PlanetScale VSchema API staleness. DDL schema is fetched via
+// MySQL (real-time) and fails fast on mismatch. Only VSchema errors are
+// retried, since GetKeyspaceVSchema may return stale data after
+// UpdateKeyspaceVSchema.
+func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword) error {
+	const maxAttempts = 18
+	const pollInterval = 5 * time.Second
+
+	var lastErr error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			e.logger.Info("retrying branch schema validation, waiting for VSchema API to converge",
+				"branch", branch, "attempt", attempt+1, "delay", pollInterval)
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("context cancelled waiting for schema validation: %w", ctx.Err())
+			case <-time.After(pollInterval):
+			}
+		}
+
+		lastErr = e.verifyBranchMatchesDesired(ctx, client, org, database, branch, keyspaces, schemaFiles, password)
+		if lastErr == nil {
+			if attempt > 0 {
+				e.logger.Info("branch schema validated after retry",
+					"branch", branch, "attempts", attempt+1)
+			}
+			return nil
+		}
+
+		// Only retry VSchema staleness errors. DDL validation uses MySQL
+		// (real-time) so DDL mismatches are genuine failures.
+		if !strings.Contains(lastErr.Error(), "unexpected VSchema difference") {
+			return lastErr
+		}
+		e.logger.Debug("VSchema validation attempt failed (API may be stale)",
+			"branch", branch, "attempt", attempt+1, "error", lastErr)
+	}
+	return fmt.Errorf("VSchema still mismatched after %d attempts (%ds): %w",
+		maxAttempts, maxAttempts*int(pollInterval.Seconds()), lastErr)
+}
+
 // verifyBranchMatchesDesired validates that the branch schema matches the
 // desired schema files for all keyspaces. Fetches DDL schema directly via
 // MySQL (LoadSchemaFromDB) to avoid PlanetScale's GetBranchSchema API, which
@@ -2654,16 +2716,16 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 // against main for the given keyspaces. Returns an error if any DDL changes
 // exist, indicating the branch has stale DDL from a previous failed apply
 // that RefreshSchema did not clean up.
-func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PSClient, org, database, branchName, mainBranch string, keyspaces []string, schemaFiles schema.SchemaFiles) error {
-	// Fetch main schema and use it as the "desired" state. If the branch
-	// matches main exactly, diffKeyspace returns zero changes.
+func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PSClient, org, database, branchName, mainBranch string, keyspaces []string, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword) error {
+	// Fetch main schema via API (stable, not recently modified) and branch
+	// schema via MySQL (real-time, avoids API staleness after RefreshSchema).
 	mainSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, mainBranch, keyspaces)
 	if err != nil {
 		return fmt.Errorf("fetch main schema: %w", err)
 	}
-	branchSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, branchName, keyspaces)
+	branchSchema, err := e.fetchBranchSchemaViaMySQL(ctx, password, keyspaces)
 	if err != nil {
-		return fmt.Errorf("fetch branch schema: %w", err)
+		return fmt.Errorf("fetch branch schema via MySQL: %w", err)
 	}
 
 	// Build a Namespace from main's schema so we can use diffKeyspace.
@@ -2842,7 +2904,7 @@ func (e *Engine) createBranch(ctx context.Context, client psclient.PSClient, org
 }
 
 func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClient, org, database, branchName string) error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 
 	ticker := time.NewTicker(2 * time.Second)
@@ -2910,42 +2972,32 @@ func generateBranchName(database, planID string) string {
 
 // --- Deploy state mapping ---
 
-func deployStateToEngineState(drState string) (engine.State, int) {
+func deployStateToEngineState(drState string) engine.State {
 	switch drState {
-	case deployState.Pending:
-		return engine.StatePending, 0
-	case deployState.Ready:
-		return engine.StatePending, 0
-	case deployState.NoChanges:
-		return engine.StateCompleted, 100
-	case deployState.Queued, deployState.Submitting:
-		return engine.StateRunning, 5
-	case deployState.InProgress:
-		return engine.StateRunning, 50
-	case deployState.InProgressVSchema:
-		return engine.StateRunning, 50
-	case deployState.PendingCutover:
-		return engine.StateWaitingForCutover, 90
-	case deployState.InProgressCutover:
-		return engine.StateCuttingOver, 95
-	case deployState.Complete:
-		return engine.StateCompleted, 100
+	case deployState.Pending, deployState.Ready:
+		return engine.StatePending
+	case deployState.NoChanges, deployState.Complete:
+		return engine.StateCompleted
 	case deployState.CompletePendingRevert:
-		return engine.StateRevertWindow, 100
-	case deployState.CompleteError, deployState.Error, deployState.Failed:
-		return engine.StateFailed, 0
+		return engine.StateRevertWindow
+	case deployState.Queued, deployState.Submitting, deployState.InProgress, deployState.InProgressVSchema:
+		return engine.StateRunning
+	case deployState.PendingCutover:
+		return engine.StateWaitingForCutover
+	case deployState.InProgressCutover:
+		return engine.StateCuttingOver
+	case deployState.CompleteError, deployState.Error, deployState.Failed, deployState.CompleteRevertError:
+		return engine.StateFailed
 	case deployState.InProgressCancel:
-		return engine.StateStopped, 0
+		return engine.StateStopped
 	case deployState.CompleteCancel, deployState.Cancelled:
-		return engine.StateStopped, 0
+		return engine.StateStopped
 	case deployState.InProgressRevert, deployState.InProgressRevertVSchema:
-		return engine.StateRunning, 50
+		return engine.StateRunning
 	case deployState.CompleteRevert:
-		return engine.StateReverted, 100
-	case deployState.CompleteRevertError:
-		return engine.StateFailed, 0
+		return engine.StateReverted
 	default:
-		return engine.StateRunning, 25
+		return engine.StateRunning
 	}
 }
 

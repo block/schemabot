@@ -10,7 +10,7 @@
 #   Staging MySQL:     localhost:14372 (testapp database)
 #   Production MySQL:  localhost:14373 (testapp database)
 #   LocalScale API:    http://localhost:14374
-#   Branch Proxies:    localhost:19100-19199 (vtgate MySQL via branch passwords)
+#   Branch Proxies:    localhost:20100-20199 (vtgate MySQL via branch passwords)
 name: schemabot-e2e
 
 services:
@@ -82,7 +82,7 @@ services:
       - localscale-data:/vt/vtdataroot
     ports:
       - "14374:8080"
-      - "19100-19199:19100-19199"
+      - "20100-20199:19100-19199"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
       interval: 5s

@@ -106,6 +106,8 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 **No bug references in code:** When fixing a bug, write code and tests as if the correct behavior always existed. Don't add comments like `// this is where the bug was`, `// regression test for #123`, or `// without this fix, X breaks`. The git history has the context. Code and test comments should describe *what* and *why*, not the history of what was wrong.
 
+**No "what changed" comments:** Don't add comments explaining what was removed, moved, or changed. Comments like `// Previously this was X, now it's Y` or `// The first progress poll transitions to the correct state` describe the change, not the code. If the code is clear without the comment, omit it. The git diff shows what changed.
+
 **No PR/issue links in code comments.** Don't reference GitHub issues or PRs (e.g., `// fixes #147`) in code comments — they go stale and provide no value to future readers. The git history links commits to issues; code comments should describe *what* and *why*, not *when* or *which ticket*.
 
 **No fragile comments.** Don't include specific counts, thresholds, external project names, or implementation details that will go stale when the code changes. For example, `// 100k rows` will be wrong when someone changes the count. `// uses the misk pattern` means nothing to someone who doesn't know misk. Comments should describe *intent* — the *what* and *why* — not restate the code or reference external context that may not persist.

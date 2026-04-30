@@ -40,6 +40,7 @@ type WatchModel struct {
 	metadata         map[string]string // Full metadata from progress response
 
 	// UI state
+	pastPending       bool
 	detached          bool
 	quitting          bool
 	spinner           spinner.Model
@@ -56,12 +57,14 @@ type tableProgress struct {
 	Name           string
 	Keyspace       string
 	DDL            string
+	ChangeType     string
 	Status         string
 	RowsCopied     int64
 	RowsTotal      int64
 	Percent        int
 	ETA            string
 	ProgressDetail string
+	IsInstant      bool
 	Shards         []shardProgress
 }
 
@@ -236,6 +239,9 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.consecutiveErrors = 0
 		m.errorMsg = ""
 		m.state = msg.state
+		if !state.IsState(m.state, state.Apply.Pending) {
+			m.pastPending = true
+		}
 
 		// Preserve last known tables during volume change to avoid visual reset
 		if !m.volumeChanging || len(m.tables) == 0 {
@@ -274,6 +280,14 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if url := msg.metadata["deploy_request_url"]; url != "" {
 					m.deployRequestURL = url
 				}
+			}
+		}
+
+		// Propagate instant DDL from metadata to tables so the label
+		// renders correctly even if the per-table flag hasn't arrived yet.
+		if m.metadata != nil && m.metadata["is_instant"] == "true" {
+			for i := range m.tables {
+				m.tables[i].IsInstant = true
 			}
 		}
 

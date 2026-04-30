@@ -102,18 +102,25 @@ func (m WatchModel) progressView() string {
 			label = m.metadata["status_detail"]
 		}
 		b.WriteString(m.spinner.View() + label + m.elapsed() + "\n")
+	case state.IsState(m.state, state.Apply.ValidatingBranch):
+		b.WriteString(m.spinner.View() + "Validating branch schema..." + m.elapsed() + "\n")
 	case state.IsState(m.state, state.Apply.CreatingDeployRequest):
 		msg := "Creating deploy request..."
 		if m.deployRequestURL != "" {
 			msg = fmt.Sprintf("Deploy request created  %s", m.deployRequestURL)
 		}
 		b.WriteString(m.spinner.View() + msg + m.elapsed() + "\n")
-	case state.IsState(m.state, state.Apply.Pending):
+	case state.IsState(m.state, state.Apply.ValidatingDeployRequest):
+		msg := "Validating deploy request..."
+		if m.deployRequestURL != "" {
+			msg = fmt.Sprintf("Validating deploy request  %s", m.deployRequestURL)
+		}
+		b.WriteString(m.spinner.View() + msg + m.elapsed() + "\n")
+	case state.IsState(m.state, state.Apply.Pending) && !m.pastPending:
 		b.WriteString(m.spinner.View() + "Starting...\n")
 	}
 
-	// Hide table list during setup phases — all tables are "Queued" and the
-	// status line already shows per-keyspace progress.
+	// Show table progress once past branch setup phases.
 	if !state.IsBranchSetupPhase(m.state) {
 		m.renderTables(&b, tables)
 	}
@@ -257,12 +264,14 @@ func toTemplateTables(tables []tableProgress) []templates.TableProgress {
 			TableName:       t.Name,
 			Namespace:       t.Keyspace,
 			DDL:             t.DDL,
+			ChangeType:      t.ChangeType,
 			Status:          state.NormalizeTaskStatus(t.Status),
 			RowsCopied:      t.RowsCopied,
 			RowsTotal:       t.RowsTotal,
 			PercentComplete: t.Percent,
 			ETASeconds:      etaSeconds,
 			ProgressDetail:  t.ProgressDetail,
+			IsInstant:       t.IsInstant,
 		}
 		for _, sh := range t.Shards {
 			tp.Shards = append(tp.Shards, templates.ShardProgress{

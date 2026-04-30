@@ -772,17 +772,17 @@ Options: ⏸️ Defer Cutover
 
   ── commerce ──
 
-  ~ VSchema:
-           "auto_increment": {
-             "column": "id",
-             "sequence": "orders_seq"
-    +      },
-    +      "column_vindexes": [
-    +        { "column": "region", "name": "region_map" }
-    +      ]
-           }
-         }
-       }
+     ~ VSchema:
+              "auto_increment": {
+                "column": "id",
+                "sequence": "orders_seq"
+       +      },
+       +      "column_vindexes": [
+       +        { "column": "region", "name": "region_map" }
+       +      ]
+              }
+            }
+          }
 
      ~ orders
        ALTER TABLE `orders`
@@ -2795,6 +2795,23 @@ Use 'schemabot start' to resume from checkpoint.
 </details>
 
 <details>
+<summary><a name="vitess-validating-branch"></a><strong>Vitess: Validating Branch</strong></summary>
+
+```
+
+┌──────────────────────────────────────────┐
+│  Apply ID:     apply-a1b2c3d4e5f6        │
+│  Database:     myapp                     │
+│  Environment:  staging                   │
+│  State:        Validating branch         │
+│  Branch:       schemabot-myapp-28471035  │
+└──────────────────────────────────────────┘
+
+
+```
+</details>
+
+<details>
 <summary><a name="vitess-creating-deploy-request"></a><strong>Vitess: Creating Deploy Request</strong></summary>
 
 ```
@@ -2806,6 +2823,24 @@ Use 'schemabot start' to resume from checkpoint.
 │  State:        Creating deploy request   │
 │  Branch:       schemabot-myapp-28471035  │
 └──────────────────────────────────────────┘
+
+
+```
+</details>
+
+<details>
+<summary><a name="vitess-validating-deploy-request"></a><strong>Vitess: Validating Deploy Request</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Apply ID:        apply-a1b2c3d4e5f6                                           │
+│  Database:        myapp                                                        │
+│  Environment:     staging                                                      │
+│  State:           Validating deploy request                                    │
+│  Branch:          schemabot-myapp-28471035                                     │
+│  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/42  │
+└────────────────────────────────────────────────────────────────────────────────┘
 
 
 ```
@@ -2856,7 +2891,7 @@ Use 'schemabot start' to resume from checkpoint.
 
   ── myapp_sharded ──
 
-     ~ users: Running...
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Running...
        ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
@@ -3141,31 +3176,31 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── commerce_001 ──
 
-     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
        ALTER TABLE `transactions` ADD COLUMN `region_id` int;
 
 
   ── commerce_002 ──
 
-     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
        ALTER TABLE `transactions` ADD COLUMN `region_id` int;
 
 
   ── commerce_003 ──
 
-     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
        ALTER TABLE `transactions` ADD COLUMN `region_id` int;
 
 
   ── commerce_004 ──
 
-     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
        ALTER TABLE `transactions` ADD COLUMN `region_id` int;
 
 
   ── commerce_005 ──
 
-     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+     ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
        ALTER TABLE `transactions` ADD COLUMN `region_id` int;
 
 
@@ -3219,7 +3254,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── myapp_unsharded ──
 
-     ~ orders_seq: Running...
+     ~ orders_seq: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Running...
        CREATE TABLE `orders_seq` (
            `id` int unsigned NOT NULL DEFAULT '0',
            `next_id` bigint unsigned,
@@ -3259,7 +3294,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
     ~ VSchema: Applying...
        + "users": {"column_vindexes": [{"column": "id", "name": "hash"}]}
 
-     ~ users: Running...
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Running...
        ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 
@@ -3342,21 +3377,21 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
 
   ── testapp_sharded ──
 
-  ~ VSchema:
-       },
-       "tables": {
-         "users": {
-    +      "column_vindexes": [
-    +        {"column": "id", "name": "hash"}
-    +      ]
-    +    },
-    +    "user_preferences": {
-    +      "column_vindexes": [
-    +        {"column": "user_id", "name": "hash"}
-    +      ]
-         }
-       }
-     }
+     ~ VSchema:
+          },
+          "tables": {
+            "users": {
+       +      "column_vindexes": [
+       +        {"column": "id", "name": "hash"}
+       +      ]
+       +    },
+       +    "user_preferences": {
+       +      "column_vindexes": [
+       +        {"column": "user_id", "name": "hash"}
+       +      ]
+            }
+          }
+        }
 
      + user_preferences
        CREATE TABLE `user_preferences` (
@@ -3395,18 +3430,18 @@ Vitess plan: VSchema-only update (no table DDL changes)
 
   ── testapp_sharded ──
 
-  ~ VSchema:
-     {
-       "sharded": true,
-       "vindexes": {
-    -    "hash": {"type": "hash"}
-    +    "hash": {"type": "hash"},
-    +    "lookup_email": {
-    +      "type": "consistent_lookup",
-    +      "params": {"table": "users_email_idx", "from": "email", "to": "user_id"}
-    +    }
-       },
-       "tables": {
+     ~ VSchema:
+        {
+          "sharded": true,
+          "vindexes": {
+       -    "hash": {"type": "hash"}
+       +    "hash": {"type": "hash"},
+       +    "lookup_email": {
+       +      "type": "consistent_lookup",
+       +      "params": {"table": "users_email_idx", "from": "email", "to": "user_id"}
+       +    }
+          },
+          "tables": {
 
 📋 **Plan**: 1 VSchema change
 
@@ -3432,15 +3467,15 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 
   ── testapp ──
 
-  ~ VSchema:
-     {
-    -  "tables": {}
-    +  "tables": {
-    +    "users_email_idx": {},
-    +    "users_seq": {"type": "sequence"},
-    +    "orders_seq": {"type": "sequence"}
-    +  }
-     }
+     ~ VSchema:
+        {
+       -  "tables": {}
+       +  "tables": {
+       +    "users_email_idx": {},
+       +    "users_seq": {"type": "sequence"},
+       +    "orders_seq": {"type": "sequence"}
+       +  }
+        }
 
      + users_email_idx
        CREATE TABLE `users_email_idx` (
@@ -3452,15 +3487,15 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 
   ── testapp_sharded ──
 
-  ~ VSchema:
-       "vindexes": {
-    -    "hash": {"type": "hash"}
-    +    "hash": {"type": "hash"},
-    +    "lookup_email": {
-    +      "type": "consistent_lookup",
-    +      "params": {"table": "users_email_idx", "from": "email", "to": "user_id"}
-    +    }
-       },
+     ~ VSchema:
+          "vindexes": {
+       -    "hash": {"type": "hash"}
+       +    "hash": {"type": "hash"},
+       +    "lookup_email": {
+       +      "type": "consistent_lookup",
+       +      "params": {"table": "users_email_idx", "from": "email", "to": "user_id"}
+       +    }
+          },
 
      ~ users
        ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
@@ -3493,7 +3528,7 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
 
   ── myapp_sharded ──
 
-     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
        ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 

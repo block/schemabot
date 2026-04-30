@@ -404,7 +404,7 @@ CREATE TABLE orders (
 		tables := flatTablesFromPlan(planResp)
 		require.Len(t, tables, 1, "plan response tables: %v", planResp)
 		table := tables[0].(map[string]any)
-		assert.Equal(t, "CHANGE_TYPE_CREATE", table["change_type"])
+		assert.Equal(t, "create", table["change_type"])
 
 		// Verify table was created
 		assert.True(t, tableExists("orders"), "orders table should exist")
@@ -435,7 +435,7 @@ CREATE TABLE orders (
 		tables := flatTablesFromPlan(planResp)
 		require.Len(t, tables, 1, "plan response tables: %v", planResp)
 		table := tables[0].(map[string]any)
-		assert.Equal(t, "CHANGE_TYPE_ALTER", table["change_type"])
+		assert.Equal(t, "alter", table["change_type"])
 
 		// Verify column was added
 		assert.True(t, columnExists("orders", "notes"), "notes column should exist")
@@ -493,7 +493,7 @@ CREATE TABLE customers (
 			table := tbl.(map[string]any)
 			if table["table_name"] == "customers" {
 				foundCustomers = true
-				assert.Equal(t, "CHANGE_TYPE_CREATE", table["change_type"], "customers change type")
+				assert.Equal(t, "create", table["change_type"], "customers change type")
 			}
 		}
 		assert.True(t, foundCustomers, "expected customers table in changes")
@@ -548,7 +548,7 @@ CREATE TABLE orders (
 		foundDrop := false
 		for _, tbl := range tables {
 			table := tbl.(map[string]any)
-			if table["table_name"] == "customers" && table["change_type"] == "CHANGE_TYPE_DROP" {
+			if table["table_name"] == "customers" && table["change_type"] == "drop" {
 				foundDrop = true
 			}
 		}
@@ -719,7 +719,7 @@ CREATE TABLE users (
 		foundDropTable := false
 		for _, tbl := range tables {
 			table := tbl.(map[string]any)
-			if table["table_name"] == "users" && table["change_type"] == "CHANGE_TYPE_DROP" {
+			if table["table_name"] == "users" && table["change_type"] == "drop" {
 				foundDropTable = true
 				isUnsafe, _ := table["is_unsafe"].(bool)
 				assert.True(t, isUnsafe, "expected is_unsafe=true for DROP TABLE")
@@ -820,7 +820,7 @@ func TestCLI_PlanApply(t *testing.T) {
 				if tblMap["table_name"] == "users" {
 					found = true
 					changeType := tblMap["change_type"]
-					assert.Contains(t, []string{"CHANGE_TYPE_CREATE", "CREATE"}, changeType, "change type")
+					assert.Equal(t, "create", changeType, "change type")
 				}
 			}
 		}
@@ -1095,7 +1095,7 @@ CREATE TABLE users (
 		tables := flatTablesFromPlan(planResp)
 		require.Len(t, tables, 1, "plan response tables: %v", planResp)
 		table := tables[0].(map[string]any)
-		assert.Equal(t, "CHANGE_TYPE_ALTER", table["change_type"])
+		assert.Equal(t, "alter", table["change_type"])
 
 		// Verify we observed progress states (with data, should see RUNNING)
 		t.Logf("Add index states: %v", states)

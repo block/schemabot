@@ -73,21 +73,23 @@ func (Engine) EnumDescriptor() ([]byte, []int) {
 type State int32
 
 const (
-	State_STATE_NO_ACTIVE_CHANGE        State = 0
-	State_STATE_PENDING                 State = 1
-	State_STATE_RUNNING                 State = 2
-	State_STATE_WAITING_FOR_CUTOVER     State = 3
-	State_STATE_CUTTING_OVER            State = 4
-	State_STATE_REVERT_WINDOW           State = 5
-	State_STATE_COMPLETED               State = 6
-	State_STATE_FAILED                  State = 7
-	State_STATE_STOPPED                 State = 8
-	State_STATE_REVERTED                State = 9
-	State_STATE_CANCELLED               State = 10
-	State_STATE_PREPARING_BRANCH        State = 11
-	State_STATE_APPLYING_BRANCH_CHANGES State = 12
-	State_STATE_CREATING_DEPLOY_REQUEST State = 13
-	State_STATE_WAITING_FOR_DEPLOY      State = 14
+	State_STATE_NO_ACTIVE_CHANGE          State = 0
+	State_STATE_PENDING                   State = 1
+	State_STATE_RUNNING                   State = 2
+	State_STATE_WAITING_FOR_CUTOVER       State = 3
+	State_STATE_CUTTING_OVER              State = 4
+	State_STATE_REVERT_WINDOW             State = 5
+	State_STATE_COMPLETED                 State = 6
+	State_STATE_FAILED                    State = 7
+	State_STATE_STOPPED                   State = 8
+	State_STATE_REVERTED                  State = 9
+	State_STATE_CANCELLED                 State = 10
+	State_STATE_PREPARING_BRANCH          State = 11
+	State_STATE_APPLYING_BRANCH_CHANGES   State = 12
+	State_STATE_CREATING_DEPLOY_REQUEST   State = 13
+	State_STATE_WAITING_FOR_DEPLOY        State = 14
+	State_STATE_VALIDATING_DEPLOY_REQUEST State = 15
+	State_STATE_VALIDATING_BRANCH         State = 16
 )
 
 // Enum value maps for State.
@@ -108,23 +110,27 @@ var (
 		12: "STATE_APPLYING_BRANCH_CHANGES",
 		13: "STATE_CREATING_DEPLOY_REQUEST",
 		14: "STATE_WAITING_FOR_DEPLOY",
+		15: "STATE_VALIDATING_DEPLOY_REQUEST",
+		16: "STATE_VALIDATING_BRANCH",
 	}
 	State_value = map[string]int32{
-		"STATE_NO_ACTIVE_CHANGE":        0,
-		"STATE_PENDING":                 1,
-		"STATE_RUNNING":                 2,
-		"STATE_WAITING_FOR_CUTOVER":     3,
-		"STATE_CUTTING_OVER":            4,
-		"STATE_REVERT_WINDOW":           5,
-		"STATE_COMPLETED":               6,
-		"STATE_FAILED":                  7,
-		"STATE_STOPPED":                 8,
-		"STATE_REVERTED":                9,
-		"STATE_CANCELLED":               10,
-		"STATE_PREPARING_BRANCH":        11,
-		"STATE_APPLYING_BRANCH_CHANGES": 12,
-		"STATE_CREATING_DEPLOY_REQUEST": 13,
-		"STATE_WAITING_FOR_DEPLOY":      14,
+		"STATE_NO_ACTIVE_CHANGE":          0,
+		"STATE_PENDING":                   1,
+		"STATE_RUNNING":                   2,
+		"STATE_WAITING_FOR_CUTOVER":       3,
+		"STATE_CUTTING_OVER":              4,
+		"STATE_REVERT_WINDOW":             5,
+		"STATE_COMPLETED":                 6,
+		"STATE_FAILED":                    7,
+		"STATE_STOPPED":                   8,
+		"STATE_REVERTED":                  9,
+		"STATE_CANCELLED":                 10,
+		"STATE_PREPARING_BRANCH":          11,
+		"STATE_APPLYING_BRANCH_CHANGES":   12,
+		"STATE_CREATING_DEPLOY_REQUEST":   13,
+		"STATE_WAITING_FOR_DEPLOY":        14,
+		"STATE_VALIDATING_DEPLOY_REQUEST": 15,
+		"STATE_VALIDATING_BRANCH":         16,
 	}
 )
 
@@ -2372,7 +2378,7 @@ const file_tern_proto_rawDesc = "" +
 	"new_volume\x18\x04 \x01(\x05R\tnewVolume*3\n" +
 	"\x06Engine\x12\x11\n" +
 	"\rENGINE_SPIRIT\x10\x00\x12\x16\n" +
-	"\x12ENGINE_PLANETSCALE\x10\x01*\xfc\x02\n" +
+	"\x12ENGINE_PLANETSCALE\x10\x01*\xbe\x03\n" +
 	"\x05State\x12\x1a\n" +
 	"\x16STATE_NO_ACTIVE_CHANGE\x10\x00\x12\x11\n" +
 	"\rSTATE_PENDING\x10\x01\x12\x11\n" +
@@ -2389,7 +2395,9 @@ const file_tern_proto_rawDesc = "" +
 	"\x16STATE_PREPARING_BRANCH\x10\v\x12!\n" +
 	"\x1dSTATE_APPLYING_BRANCH_CHANGES\x10\f\x12!\n" +
 	"\x1dSTATE_CREATING_DEPLOY_REQUEST\x10\r\x12\x1c\n" +
-	"\x18STATE_WAITING_FOR_DEPLOY\x10\x0e*h\n" +
+	"\x18STATE_WAITING_FOR_DEPLOY\x10\x0e\x12#\n" +
+	"\x1fSTATE_VALIDATING_DEPLOY_REQUEST\x10\x0f\x12\x1b\n" +
+	"\x17STATE_VALIDATING_BRANCH\x10\x10*h\n" +
 	"\n" +
 	"ChangeType\x12\x15\n" +
 	"\x11CHANGE_TYPE_OTHER\x10\x00\x12\x16\n" +

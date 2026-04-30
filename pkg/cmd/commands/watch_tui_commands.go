@@ -239,11 +239,13 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 			Name:           tbl.TableName,
 			Keyspace:       tbl.Keyspace,
 			DDL:            tbl.DDL,
+			ChangeType:     tbl.ChangeType,
 			Status:         tbl.Status,
 			RowsCopied:     tbl.RowsCopied,
 			RowsTotal:      tbl.RowsTotal,
 			Percent:        int(tbl.PercentComplete),
 			ProgressDetail: tbl.ProgressDetail,
+			IsInstant:      tbl.IsInstant,
 		}
 		if tp.ProgressDetail != "" {
 			if info := templates.ParseSpiritProgress(tp.ProgressDetail); info != nil {

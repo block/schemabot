@@ -64,6 +64,7 @@ type activeDeployRow struct {
 	vschemaDataSQL         sql.NullString
 	vschemaApplied         bool
 	autoCutover            bool
+	instantDDLEligible     bool
 	branch                 string
 	revertExpiresAtStr     sql.NullString
 	createdAtStr           string
@@ -74,7 +75,7 @@ type activeDeployRow struct {
 func (s *Server) processActiveDeployRequests(ctx context.Context) {
 	rows, err := s.metadataDB.QueryContext(ctx,
 		`SELECT org, database_name, number, deployment_state, migration_context, revert_migration_context,
-		        vschema_data, vschema_applied, auto_cutover, branch, revert_expires_at, created_at
+		        vschema_data, vschema_applied, auto_cutover, instant_ddl_eligible, branch, revert_expires_at, created_at
 		 FROM localscale_deploy_requests
 		 WHERE deployment_state IN ('submitting','queued','in_progress','pending_cutover','in_progress_cutover','in_progress_vschema','in_progress_cancel','in_progress_revert','in_progress_revert_vschema','complete_pending_revert')
 		 AND deployed = TRUE`)
@@ -87,7 +88,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 	for rows.Next() {
 		var r activeDeployRow
 		if err := rows.Scan(&r.org, &r.database, &r.number, &r.deployState, &r.migrationContext, &r.revertMigrationContext,
-			&r.vschemaDataSQL, &r.vschemaApplied, &r.autoCutover, &r.branch, &r.revertExpiresAtStr, &r.createdAtStr); err != nil {
+			&r.vschemaDataSQL, &r.vschemaApplied, &r.autoCutover, &r.instantDDLEligible, &r.branch, &r.revertExpiresAtStr, &r.createdAtStr); err != nil {
 			s.logger.Warn("processor: scan deploy request row", "error", err)
 			continue
 		}
@@ -180,7 +181,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 				}
 			}
 
-			newState := deriveDeployState(migrations, cutoverRequested)
+			newState := deriveDeployState(migrations, cutoverRequested, r.instantDDLEligible)
 
 			// If the processor detects cancelled migrations while the deploy is
 			// still in queued/in_progress, route through the cancel flow instead
@@ -354,7 +355,8 @@ type migrationInfo struct {
 //
 // cutoverRequested tracks whether apply-deploy (cutover) has been triggered, enabling
 // the distinction between pending_cutover and in_progress_cutover states.
-func deriveDeployState(migrations []migrationInfo, cutoverRequested bool) string {
+func deriveDeployState(migrations []migrationInfo, cutoverRequested bool, instantDDL ...bool) string {
+	isInstant := len(instantDDL) > 0 && instantDDL[0]
 	var failed, cancelled, complete, running, waitingCutover, queued int
 
 	for _, m := range migrations {
@@ -402,6 +404,8 @@ func deriveDeployState(migrations []migrationInfo, cutoverRequested bool) string
 		// Note: "cancelled" is a transient signal from Vitess, not a real PlanetScale
 		// deploy state. The processor routes this through InProgressCancel → CompleteCancel.
 		return vitessCancelledSignal
+	case complete == total && isInstant:
+		return dr.Complete
 	case complete == total:
 		return dr.CompletePendingRevert
 	case cutoverRequested && complete > 0:

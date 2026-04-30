@@ -123,7 +123,9 @@ seed_products() {
     echo "  products: done"
 }
 
-# Seed tables concurrently for speed
+# Seed tables concurrently for speed.
+# Each function writes progress to stderr (visible during run) and pipes SQL to mysql.
+# On failure, the exit code propagates and we report which table failed.
 seed_users &
 pid_users=$!
 seed_orders &
@@ -131,12 +133,17 @@ pid_orders=$!
 seed_products &
 pid_products=$!
 
-failed=0
-wait $pid_users || failed=1
-wait $pid_orders || failed=1
-wait $pid_products || failed=1
+failed=""
+wait $pid_users    || failed="$failed users"
+wait $pid_orders   || failed="$failed orders"
+wait $pid_products || failed="$failed products"
 
-[ $failed -ne 0 ] && echo "Some seeds failed!" && exit 1
+if [ -n "$failed" ]; then
+    echo ""
+    echo "ERROR: Vitess seed failed for:$failed"
+    echo "Check the output above for mysql errors."
+    exit 1
+fi
 
 echo ""
 echo "Done! Seeded ${TARGET_MB} MB per table into testapp_sharded via vtgate"

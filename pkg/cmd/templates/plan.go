@@ -145,9 +145,9 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 					fmt.Print(FormatKeyspaceHeader(ns.Namespace))
 				}
 				if ns.VSchemaChanged && !isMySQL {
-					fmt.Println("  ~ VSchema:")
+					fmt.Println(indentTable + "~ VSchema:")
 					if ns.VSchemaDiff != "" {
-						fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, "    "))
+						fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, indentContent))
 						fmt.Println()
 					}
 				}

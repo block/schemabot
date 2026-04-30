@@ -19,6 +19,8 @@ Vitess OnlineDDL and Spirit report — and they are translated into Task and App
 |-------|-------|-------------|
 | Pending | `pending` | Apply created, no tasks started |
 | Running | `running` | At least one task is actively executing |
+| ValidatingBranch | `validating_branch` | Branch schema validation in progress after DDL apply (PlanetScale only) |
+| ValidatingDeployRequest | `validating_deploy_request` | PlanetScale is validating the deploy request diff (PlanetScale only) |
 | WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only). Without `--defer-deploy`, auto-advances immediately. |
 | WaitingForCutover | `waiting_for_cutover` | All tasks ready, waiting for manual cutover (atomic mode only — in sequential mode each task cuts over independently) |
 | CuttingOver | `cutting_over` | Cutover in progress (atomic mode only) |
@@ -31,7 +33,12 @@ Vitess OnlineDDL and Spirit report — and they are translated into Task and App
 ```mermaid
 stateDiagram-v2
     pending --> running
-    pending --> waiting_for_deploy : PlanetScale
+    pending --> preparing_branch : PlanetScale
+    preparing_branch --> applying_branch_changes
+    applying_branch_changes --> validating_branch
+    validating_branch --> creating_deploy_request
+    creating_deploy_request --> validating_deploy_request
+    validating_deploy_request --> waiting_for_deploy
     waiting_for_deploy --> running : deploy triggered
     running --> completed
     running --> failed
