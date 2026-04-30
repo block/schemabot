@@ -1403,13 +1403,13 @@ func (e *Engine) diffBranchForResume(ctx context.Context, client psclient.PSClie
 			Metadata:  make(map[string]string),
 		}
 		for _, pc := range plan.Changes {
-			results, classifyErr := statement.Classify(pc.Statement)
-			if classifyErr != nil || len(results) == 0 {
+			stmtType, _, classifyErr := ddl.ClassifyStatement(pc.Statement)
+			if classifyErr != nil {
 				return nil, fmt.Errorf("classify statement in keyspace %s: %w", keyspace, classifyErr)
 			}
 			sc.TableChanges = append(sc.TableChanges, engine.TableChange{
 				Table:     pc.TableName,
-				Operation: results[0].Type,
+				Operation: stmtType,
 				DDL:       pc.Statement,
 			})
 		}
@@ -2599,13 +2599,13 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 
 	var tableChanges []engine.TableChange
 	for _, pc := range plan.Changes {
-		results, classifyErr := statement.Classify(pc.Statement)
-		if classifyErr != nil || len(results) == 0 {
+		stmtType, _, classifyErr := ddl.ClassifyStatement(pc.Statement)
+		if classifyErr != nil {
 			return nil, false, fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
 		}
 		change := engine.TableChange{
 			Table:     pc.TableName,
-			Operation: results[0].Type,
+			Operation: stmtType,
 			DDL:       pc.Statement,
 		}
 		if errViolations := pc.Errors(); len(errViolations) > 0 {

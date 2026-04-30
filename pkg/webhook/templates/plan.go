@@ -246,11 +246,11 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops int) {
 	for _, ks := range changes {
 		for _, stmt := range ks.Statements {
-			results, err := statement.Classify(stmt)
-			if err != nil || len(results) == 0 {
+			stmtType, _, err := ddl.ClassifyStatement(stmt)
+			if err != nil {
 				continue
 			}
-			switch results[0].Type {
+			switch stmtType {
 			case statement.StatementCreateTable:
 				creates++
 			case statement.StatementAlterTable:
