@@ -6,6 +6,8 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/block/spirit/pkg/statement"
+
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -30,9 +32,9 @@ func namespaceForTable(table string, sf schema.SchemaFiles) (string, error) {
 			if baseName == table {
 				return nsName, nil
 			}
-			// Parse the file content to extract the table name
-			_, tbl, err := ddl.ClassifyStatementAST(content)
-			if err == nil && tbl == table {
+			// Parse the file content — only match CREATE TABLE (the defining statement)
+			stmtType, tbl, err := ddl.ClassifyStatement(content)
+			if err == nil && stmtType == statement.StatementCreateTable && tbl == table {
 				return nsName, nil
 			}
 		}
