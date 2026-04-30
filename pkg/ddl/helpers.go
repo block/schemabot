@@ -45,9 +45,9 @@ func ClassifyStatement(stmt string) (statement.StatementType, string, error) {
 	return results[0].Type, results[0].Table, nil
 }
 
-// ClassifyStatementAST is like ClassifyStatement but returns the operation as a
+// ClassifyStatementOp is like ClassifyStatement but returns the operation as a
 // lowercase string ("create", "alter", "drop") for storage/API boundaries.
-func ClassifyStatementAST(stmt string) (string, string, error) {
+func ClassifyStatementOp(stmt string) (string, string, error) {
 	t, table, err := ClassifyStatement(stmt)
 	if err != nil {
 		return "", "", err
