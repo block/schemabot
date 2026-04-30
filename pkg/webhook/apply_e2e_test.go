@@ -983,6 +983,118 @@ func TestE2EApplyProductionAllowedWhenStagingSuccess(t *testing.T) {
 	})
 }
 
+// TestE2EApplyAutoConfirmExecutes verifies that `schemabot apply -e staging -y`
+// plans, acquires a lock, and executes the apply in a single command.
+func TestE2EApplyAutoConfirmExecutes(t *testing.T) {
+	dbName := "webhook_auto_confirm"
+	svc := setupE2EService(t, dbName)
+
+	// Seed a check record with the correct HEAD SHA so the SHA verification passes
+	seedCheck(t, svc, dbName, "staging", checkConclusionActionRequired)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging -y",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// First comment: plan with "Applying automatically"
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "Applying automatically")
+		assert.Contains(t, body, "-y")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for auto-confirm plan comment")
+	}
+
+	// Second comment: summary (apply completed or failed)
+	select {
+	case body := <-result.comments:
+		hasApplied := strings.Contains(body, "Schema Change Applied")
+		hasFailed := strings.Contains(body, "Schema Change Failed")
+		assert.True(t, hasApplied || hasFailed,
+			"expected apply summary comment, got: %s", body[:min(len(body), 200)])
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for apply summary comment")
+	}
+}
+
+// TestE2EApplyAutoConfirmDowngradesOnSHAMismatch verifies that -y downgrades to
+// manual confirmation when the HEAD SHA doesn't match the stored check record.
+func TestE2EApplyAutoConfirmDowngradesOnSHAMismatch(t *testing.T) {
+	dbName := "webhook_auto_confirm_sha"
+	svc := setupE2EService(t, dbName)
+
+	// Seed a check record with a DIFFERENT SHA than what FetchPullRequest returns ("abc123")
+	check := &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha999",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   1,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionActionRequired,
+	}
+	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), check))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging -y",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// Should get a plan comment with the downgrade warning, NOT "Applying automatically"
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Auto-confirm skipped")
+		assert.Contains(t, body, "New commits pushed since auto-plan")
+		assert.NotContains(t, body, "Applying automatically")
+		assert.Contains(t, body, "apply-confirm", "should show manual confirm instructions")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for downgraded plan comment")
+	}
+}
+
 // TestE2EApplyThreeEnvEnforcement verifies that checkPriorEnvironments checks ALL
 // prior environments, not just the immediately previous one. Uses 3 environments
 // (sandbox → staging → production) and calls checkPriorEnvironments directly

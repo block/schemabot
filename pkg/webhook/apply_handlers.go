@@ -172,6 +172,68 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
 
+	// Auto-confirm (-y): check safety conditions before proceeding
+	if result.AutoConfirm {
+		// Check 1: HEAD SHA hasn't changed since auto-plan.
+		// Fail closed: if we can't verify the SHA (missing check record, API error),
+		// downgrade to manual confirmation rather than proceeding with stale data.
+		check, checkErr := h.service.Storage().Checks().Get(ctx, repo, pr, environment, dbType, database)
+		prInfo, prErr := client.FetchPullRequest(ctx, repo, pr)
+
+		shaVerified := checkErr == nil && prErr == nil && check != nil && prInfo != nil && check.HeadSHA == prInfo.HeadSHA
+		if !shaVerified {
+			reason := "Could not verify HEAD SHA — confirm manually"
+			if checkErr == nil && prErr == nil && check != nil && prInfo != nil {
+				reason = "New commits pushed since auto-plan"
+			}
+			h.logger.Info("auto-confirm downgraded",
+				"repo", repo, "pr", pr, "database", database, "reason", reason)
+			commentData.AutoConfirmDowngradeReason = reason
+			h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+			headSHA, checkRunErr := h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+			if checkRunErr != nil {
+				h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
+			}
+			if headSHA != "" {
+				h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+			}
+			return
+		}
+
+		// Look up the plan we just created for DDL comparison in executeApply.
+		// Fail closed: if we can't load the plan, downgrade to manual confirmation
+		// rather than skipping the DDL drift check entirely.
+		storedPlan, planErr := h.service.Storage().Plans().Get(ctx, planResp.PlanID)
+		if planErr != nil || storedPlan == nil {
+			h.logger.Info("auto-confirm downgraded: could not load plan for DDL comparison",
+				"repo", repo, "pr", pr, "planID", planResp.PlanID, "error", planErr)
+			commentData.AutoConfirmDowngradeReason = "Could not verify plan — confirm manually"
+			h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+			headSHA, checkRunErr := h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+			if checkRunErr != nil {
+				h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
+			}
+			if headSHA != "" {
+				h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+			}
+			return
+		}
+
+		commentData.AutoConfirm = true
+		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		headSHA, checkErr := h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+		if checkErr != nil {
+			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkErr)
+		}
+		if headSHA != "" {
+			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		}
+
+		// Check 2 (DDL drift) happens inside executeApply after re-plan
+		h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan)
+		return
+	}
+
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
 	// Create check run (action_required — waiting for apply-confirm) and update aggregate
@@ -244,6 +306,24 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		return
 	}
 
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil)
+}
+
+// executeApply re-plans for drift detection and executes the apply. This is the shared
+// execution core used by both handleApplyConfirmCommand and handleApplyCommand (with -y).
+//
+// When storedPlan is non-nil (auto-confirm path), the re-plan DDL is compared against it.
+// If the DDL differs, execution is downgraded to manual confirmation — a plan comment is
+// posted with a warning and the user must run apply-confirm separately.
+func (h *Handler) executeApply(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
+	environment string, installationID int64, requestedBy string,
+	result CommandResult, storedPlan *storage.Plan,
+) {
+	database := schemaResult.Database
+	dbType := schemaResult.Type
+
 	// Re-plan for drift detection
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
@@ -262,7 +342,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "apply-confirm",
+			CommandName: "apply",
 			ErrorDetail: err.Error(),
 		}))
 		return
@@ -275,10 +355,22 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		return
 	}
 
+	// Auto-confirm DDL drift check: if the re-plan DDL differs from the stored auto-plan,
+	// downgrade to manual confirmation so the user reviews the new plan.
+	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
+		h.logger.Info("auto-confirm downgraded: DDL drift detected",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+		commentData.IsLocked = true
+		commentData.AutoConfirmDowngradeReason = "Schema changes differ from auto-plan — review and confirm manually"
+		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		return
+	}
+
 	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
-		h.logger.Info("apply-confirm blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
 		return
 	}
@@ -311,18 +403,18 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "apply-confirm",
+			CommandName: "apply",
 			ErrorDetail: "Failed to execute apply: " + err.Error(),
 		}))
 		return
 	}
 
 	if !applyResp.Accepted {
-		h.logger.Info("apply-confirm rejected by engine", "repo", repo, "pr", pr, "database", database, "environment", environment, "error", applyResp.ErrorMessage)
+		h.logger.Info("apply rejected by engine", "repo", repo, "pr", pr, "database", database, "environment", environment, "error", applyResp.ErrorMessage)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "apply-confirm",
+			CommandName: "apply",
 			ErrorDetail: "Apply was not accepted: " + applyResp.ErrorMessage,
 		}))
 		return
@@ -372,6 +464,32 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
 
 	go h.watchApplyProgress(context.Background(), repo, pr, installationID, apply, true)
+}
+
+// ddlMatchesStoredPlan compares the re-plan DDL against a previously stored plan.
+// Uses order-independent comparison since FlatTables() and FlatDDLChanges() may
+// return statements in different order.
+func ddlMatchesStoredPlan(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) bool {
+	newDDL := planResp.FlatTables()
+	storedDDL := storedPlan.FlatDDLChanges()
+
+	if len(newDDL) != len(storedDDL) {
+		return false
+	}
+
+	// Build a set of DDL strings from the stored plan
+	storedSet := make(map[string]int, len(storedDDL))
+	for _, s := range storedDDL {
+		storedSet[s.DDL]++
+	}
+
+	for _, n := range newDDL {
+		if storedSet[n.DDL] <= 0 {
+			return false
+		}
+		storedSet[n.DDL]--
+	}
+	return true
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command.

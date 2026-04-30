@@ -47,6 +47,10 @@ type PlanCommentData struct {
 	IsLocked     bool
 	LockOwner    string
 	LockAcquired string // formatted timestamp
+
+	// Auto-confirm state
+	AutoConfirm                bool   // -y flag was used, will auto-execute
+	AutoConfirmDowngradeReason string // Non-empty: -y was downgraded to manual, this is the reason
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -121,7 +125,6 @@ func RenderPlanComment(data PlanCommentData) string {
 	sb.WriteString("\n---\n\n")
 
 	if data.IsLocked {
-		// Apply-plan footer: confirm instructions + cancel
 		applyConfirmCmd := fmt.Sprintf("schemabot apply-confirm -e %s", data.Environment)
 		if data.AllowUnsafe {
 			applyConfirmCmd += " --allow-unsafe"
@@ -132,9 +135,26 @@ func RenderPlanComment(data PlanCommentData) string {
 		if data.SkipRevert {
 			applyConfirmCmd += " --skip-revert"
 		}
-		writeApplyHint(&sb, applyConfirmCmd)
-		sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
-		sb.WriteString("```\nschemabot unlock\n```\n")
+
+		switch {
+		case data.AutoConfirmDowngradeReason != "":
+			// -y was downgraded to manual confirmation — show unlock since user needs to act
+			fmt.Fprintf(&sb, "⚠️ **Auto-confirm skipped**: %s\n\n", data.AutoConfirmDowngradeReason)
+			sb.WriteString("Review the plan above, then confirm manually:\n")
+			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
+			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
+			sb.WriteString("```\nschemabot unlock\n```\n")
+		case data.AutoConfirm:
+			// -y is proceeding — include unlock hint in case the apply fails before starting
+			sb.WriteString("**Applying automatically** (`-y` flag)\n")
+			sb.WriteString("\n🔓 If the apply fails, unlock with:\n")
+			sb.WriteString("```\nschemabot unlock\n```\n")
+		default:
+			// Normal two-step flow: confirm instructions + unlock option
+			writeApplyHint(&sb, applyConfirmCmd)
+			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
+			sb.WriteString("```\nschemabot unlock\n```\n")
+		}
 	} else {
 		writeApplyHint(&sb, fmt.Sprintf("schemabot apply -e %s", data.Environment))
 	}

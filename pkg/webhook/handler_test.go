@@ -191,6 +191,36 @@ func TestWebhookMissingEnvForApply(t *testing.T) {
 	}
 }
 
+func TestWebhookYesFlagRejectedOnNonApply(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	for _, cmd := range []string{
+		"schemabot plan -e staging -y",
+		"schemabot apply-confirm -e staging -y",
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment: cmd,
+				isPR:    true,
+			}, nil)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), "unsupported flag")
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, "-y")
+				assert.Contains(t, body, "not supported for")
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for error comment")
+			}
+		})
+	}
+}
+
 func TestWebhookBotCommentIgnored(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 

@@ -143,6 +143,14 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 		return
 	}
 
+	// Reject -y/--yes on commands that don't support it
+	if result.Action != "apply" && parser.autoConfirmRegex.MatchString(payload.Comment.Body) {
+		h.postComment(repo, pr, installationID,
+			fmt.Sprintf("The `-y` flag is not supported for `%s`.", result.Action))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+
 	h.logger.Info("processing command",
 		"action", result.Action,
 		"environment", result.Environment,
