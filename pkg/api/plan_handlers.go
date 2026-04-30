@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -88,11 +89,14 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
 	}
 
+	planStart := time.Now()
+
 	deployment := s.resolveDeployment(req.Database, req.Deployment)
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
-		RecordPlan(ctx, req.Database, req.Environment, "error")
+		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
 		return nil, fmt.Errorf("tern client: %w", err)
 	}
 
@@ -122,10 +126,12 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 
 	resp, err := client.Plan(ctx, ternReq)
 	if err != nil {
-		RecordPlan(ctx, req.Database, req.Environment, "error")
+		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
 		return nil, err
 	}
-	RecordPlan(ctx, req.Database, req.Environment, "success")
+	metrics.RecordPlan(ctx, req.Database, req.Environment, "success")
+	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "success")
 
 	s.logger.Info("ExecutePlan: plan response",
 		"plan_id", resp.PlanId,
@@ -228,6 +234,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
+		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
 		return nil, 0, fmt.Errorf("tern client: %w", err)
 	}
 
@@ -251,9 +258,22 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		Caller:      req.Caller,
 	}
 
+	// Time only the client.Apply call, not plan lookup or client creation.
+	applyStart := time.Now()
 	resp, err := client.Apply(ctx, ternReq)
 	if err != nil {
+		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
+		metrics.RecordApplyDuration(ctx, time.Since(applyStart), plan.Database, req.Environment, "error")
 		return nil, 0, err
+	}
+	applyStatus := "success"
+	if !resp.Accepted {
+		applyStatus = "rejected"
+	}
+	metrics.RecordApply(ctx, plan.Database, req.Environment, applyStatus)
+	metrics.RecordApplyDuration(ctx, time.Since(applyStart), plan.Database, req.Environment, applyStatus)
+	if resp.Accepted {
+		metrics.AdjustActiveApplies(ctx, 1, plan.Database, req.Environment)
 	}
 
 	// Store apply and task records in SchemaBot's storage.

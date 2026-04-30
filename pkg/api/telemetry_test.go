@@ -7,7 +7,9 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -51,7 +53,7 @@ func TestSetupTelemetryWithOTLP(t *testing.T) {
 	assert.NotNil(t, tel.tracerProvider, "tracerProvider should be set with OTLP endpoint")
 
 	// Record a metric so there's data to push.
-	RecordPlan(t.Context(), "testdb", "staging", "success")
+	metrics.RecordPlan(t.Context(), "testdb", "staging", "success")
 
 	// Create a trace span so there's trace data to push.
 	tracer := otel.Tracer("test")
@@ -103,10 +105,10 @@ func TestRecordPlanMetric(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	RecordPlan(t.Context(), "testdb", "staging", "success")
-	RecordPlan(t.Context(), "testdb", "staging", "success")
-	RecordPlan(t.Context(), "testdb", "staging", "error")
-	RecordPlan(t.Context(), "other", "production", "success")
+	metrics.RecordPlan(t.Context(), "testdb", "staging", "success")
+	metrics.RecordPlan(t.Context(), "testdb", "staging", "success")
+	metrics.RecordPlan(t.Context(), "testdb", "staging", "error")
+	metrics.RecordPlan(t.Context(), "other", "production", "success")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
@@ -204,4 +206,85 @@ func TestOtelHTTPMetrics(t *testing.T) {
 			}
 		}
 	}
+}
+
+// collectMetricNames returns all metric names from the reader.
+func collectMetricNames(t *testing.T, reader *sdkmetric.ManualReader) map[string]bool {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	names := make(map[string]bool)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			names[m.Name] = true
+		}
+	}
+	return names
+}
+
+func TestRecordApplyMetrics(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordApply(t.Context(), "mydb", "staging", "success")
+	metrics.RecordApply(t.Context(), "mydb", "staging", "error")
+	metrics.RecordApplyDuration(t.Context(), 2*time.Second, "mydb", "staging", "success")
+
+	names := collectMetricNames(t, reader)
+	assert.True(t, names["schemabot.applies.total"], "expected schemabot.applies.total")
+	assert.True(t, names["schemabot.apply.duration_seconds"], "expected schemabot.apply.duration_seconds")
+}
+
+func TestRecordPlanDurationMetric(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordPlanDuration(t.Context(), 500*time.Millisecond, "mydb", "staging", "success")
+
+	names := collectMetricNames(t, reader)
+	assert.True(t, names["schemabot.plan.duration_seconds"], "expected schemabot.plan.duration_seconds")
+}
+
+func TestRecordWebhookEventMetric(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordWebhookEvent(t.Context(), "issue_comment", "created", "org/repo", "processed")
+	metrics.RecordWebhookEvent(t.Context(), "pull_request", "opened", "org/repo", "processed")
+	metrics.RecordWebhookEvent(t.Context(), "pull_request", "closed", "org/repo", "processed")
+	metrics.RecordWebhookEvent(t.Context(), "ping", "", "", "ignored")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	var found bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == "schemabot.webhook.events_total" {
+				found = true
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				require.True(t, ok)
+				assert.Len(t, sum.DataPoints, 4, "expected 4 data points (one per event_type/action/status combo)")
+			}
+		}
+	}
+	assert.True(t, found, "schemabot.webhook.events_total metric not found")
 }

@@ -17,6 +17,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/metrics"
 )
 
 // Handler processes GitHub webhook events.
@@ -50,27 +51,48 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(h.webhookSecret) > 0 {
 		signature := r.Header.Get("X-Hub-Signature-256")
 		if !h.verifySignature(signature, body) {
+			eventType := r.Header.Get("X-GitHub-Event")
+			metrics.RecordWebhookEvent(r.Context(), eventType, "", "", "invalid_signature")
 			h.writeError(w, http.StatusUnauthorized, "invalid webhook signature")
 			return
 		}
 	}
 
 	eventType := r.Header.Get("X-GitHub-Event")
-	h.logger.Debug("webhook received", "event", eventType)
+	action, repo := webhookMetadata(body)
+	h.logger.Debug("webhook received", "event", eventType, "action", action, "repo", repo)
 
 	switch eventType {
 	case "issue_comment":
 		h.handleIssueComment(w, body)
+		metrics.RecordWebhookEvent(r.Context(), eventType, action, repo, "processed")
 	case "check_run":
 		// Phase 2: h.handleCheckRun(w, body)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run events not yet implemented"})
+		metrics.RecordWebhookEvent(r.Context(), eventType, action, repo, "ignored")
 	case "pull_request":
 		h.handlePullRequest(w, body)
+		metrics.RecordWebhookEvent(r.Context(), eventType, action, repo, "processed")
 	default:
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": fmt.Sprintf("event type '%s' ignored", eventType),
 		})
+		metrics.RecordWebhookEvent(r.Context(), eventType, action, repo, "ignored")
 	}
+}
+
+// webhookMetadata extracts the "action" and repository name from a GitHub webhook payload.
+func webhookMetadata(body []byte) (action, repo string) {
+	var payload struct {
+		Action     string `json:"action"`
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", ""
+	}
+	return payload.Action, payload.Repository.FullName
 }
 
 // verifySignature validates the HMAC-SHA256 webhook signature.

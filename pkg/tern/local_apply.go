@@ -10,6 +10,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -751,6 +752,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
 		}
+		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 		c.logger.Info("atomic apply completed", "apply_id", apply.ApplyIdentifier, "state", result.State, "task_count", len(tasks))
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Apply completed with state: %s", result.State), ps.lastTaskState, apply.State)
@@ -985,6 +987,7 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
 	}
+	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 }
 
 // finalizeSequentialApply updates the apply state based on sequential task outcomes.
@@ -1011,6 +1014,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
 	}
+	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 }
 
 // deriveOverallState determines the overall state from a list of tasks.
