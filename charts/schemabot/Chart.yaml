@@ -2,8 +2,8 @@ apiVersion: v2
 name: schemabot
 description: GitOps for database schemas
 type: application
-version: 0.1.2
-appVersion: "v0.1.2"
+version: 0.1.3
+appVersion: "v0.1.3"
 maintainers:
   - name: aparajon
     url: https://github.com/aparajon
