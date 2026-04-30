@@ -2457,7 +2457,10 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 			continue
 		}
 
-		ddlChanges, vschemaChanged, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
+		// Only validate DDL — VSchema is applied via the PlanetScale API
+		// (UpdateKeyspaceVSchema) and read back via GetKeyspaceVSchema, which
+		// may return stale data. VSchema cannot be fetched via MySQL.
+		ddlChanges, _, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
 		if err != nil {
 			return fmt.Errorf("validate keyspace %s: %w", ks, err)
 		}
@@ -2485,10 +2488,6 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 			)
 			return fmt.Errorf("keyspace %s has %d unexpected DDL changes after apply: %v\nstatements:\n%s",
 				ks, len(ddlChanges), summaries, strings.Join(statements, "\n"))
-		}
-
-		if vschemaChanged {
-			return fmt.Errorf("keyspace %s has unexpected VSchema difference after apply — VSchema may not have been applied to the branch", ks)
 		}
 	}
 
