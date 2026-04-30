@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/spirit/pkg/statement"
+
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -244,13 +246,16 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops int) {
 	for _, ks := range changes {
 		for _, stmt := range ks.Statements {
-			upper := strings.ToUpper(strings.TrimSpace(stmt))
-			switch {
-			case strings.HasPrefix(upper, "CREATE "):
+			stmtType, _, err := ddl.ClassifyStatement(stmt)
+			if err != nil {
+				continue
+			}
+			switch stmtType {
+			case statement.StatementCreateTable:
 				creates++
-			case strings.HasPrefix(upper, "ALTER "):
+			case statement.StatementAlterTable:
 				alters++
-			case strings.HasPrefix(upper, "DROP "):
+			case statement.StatementDropTable:
 				drops++
 			}
 		}

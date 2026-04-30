@@ -13,45 +13,51 @@ func TestAddAlgorithmInstant(t *testing.T) {
 		want string
 	}{
 		// ALTER TABLE — should inject ALGORITHM=INSTANT
+		// Output is normalized by Spirit's parser (backtick-quoted identifiers).
 		{
 			name: "add column",
 			in:   "ALTER TABLE users ADD COLUMN age INT",
-			want: "ALTER TABLE users ALGORITHM=INSTANT, ADD COLUMN age INT",
+			want: "ALTER TABLE `users` ALGORITHM=INSTANT, ADD COLUMN `age` INT",
 		},
 		{
 			name: "drop column",
 			in:   "ALTER TABLE users DROP COLUMN bio",
-			want: "ALTER TABLE users ALGORITHM=INSTANT, DROP COLUMN bio",
+			want: "ALTER TABLE `users` ALGORITHM=INSTANT, DROP COLUMN `bio`",
 		},
 		{
 			name: "modify column",
 			in:   "ALTER TABLE orders MODIFY COLUMN status ENUM('pending','active','done')",
-			want: "ALTER TABLE orders ALGORITHM=INSTANT, MODIFY COLUMN status ENUM('pending','active','done')",
+			want: "ALTER TABLE `orders` ALGORITHM=INSTANT, MODIFY COLUMN `status` ENUM('pending','active','done')",
 		},
 		{
 			name: "add index",
 			in:   "ALTER TABLE users ADD INDEX idx_email (email)",
-			want: "ALTER TABLE users ALGORITHM=INSTANT, ADD INDEX idx_email (email)",
+			want: "ALTER TABLE `users` ALGORITHM=INSTANT, ADD INDEX `idx_email`(`email`)",
 		},
 		{
 			name: "backtick-quoted table",
 			in:   "ALTER TABLE `my_table` DROP COLUMN x",
-			want: "ALTER TABLE `my_table` ALGORITHM=INSTANT, DROP COLUMN x",
+			want: "ALTER TABLE `my_table` ALGORITHM=INSTANT, DROP COLUMN `x`",
 		},
 		{
 			name: "case-insensitive alter",
 			in:   "alter table users ADD COLUMN x INT",
-			want: "ALTER TABLE users ALGORITHM=INSTANT, ADD COLUMN x INT",
+			want: "ALTER TABLE `users` ALGORITHM=INSTANT, ADD COLUMN `x` INT",
 		},
 		{
 			name: "leading whitespace",
 			in:   "  ALTER TABLE users ADD COLUMN x INT  ",
-			want: "ALTER TABLE users ALGORITHM=INSTANT, ADD COLUMN x INT",
+			want: "ALTER TABLE `users` ALGORITHM=INSTANT, ADD COLUMN `x` INT",
 		},
 		{
 			name: "rename column",
 			in:   "ALTER TABLE users RENAME COLUMN old_name TO new_name",
-			want: "ALTER TABLE users ALGORITHM=INSTANT, RENAME COLUMN old_name TO new_name",
+			want: "ALTER TABLE `users` ALGORITHM=INSTANT, RENAME COLUMN `old_name` TO `new_name`",
+		},
+		{
+			name: "create index parsed as alter",
+			in:   "CREATE INDEX idx_name ON users (name)",
+			want: "ALTER TABLE `users` ALGORITHM=INSTANT, ADD INDEX `idx_name` (`name`)",
 		},
 
 		// Non-ALTER — should return ""
@@ -63,11 +69,6 @@ func TestAddAlgorithmInstant(t *testing.T) {
 		{
 			name: "drop table",
 			in:   "DROP TABLE bar",
-			want: "",
-		},
-		{
-			name: "create index",
-			in:   "CREATE INDEX idx_name ON users (name)",
 			want: "",
 		},
 	}

@@ -96,6 +96,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -271,7 +272,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		ddlChanges[i] = storage.TableChange{
 			Table:     t.Table,
 			DDL:       t.DDL,
-			Operation: t.Operation,
+			Operation: ddl.StatementTypeToOp(t.Operation),
 		}
 	}
 
@@ -292,7 +293,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 			nsData.Tables = append(nsData.Tables, storage.TableChange{
 				Table:     tc.Table,
 				DDL:       tc.DDL,
-				Operation: tc.Operation,
+				Operation: ddl.StatementTypeToOp(tc.Operation),
 			})
 		}
 		// Only store VSchema when the Plan detected a change.

@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/block/spirit/pkg/statement"
+
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -185,7 +187,7 @@ func TestPlanNamespacesToChanges_VSchemaOnlyWhenStored(t *testing.T) {
 	assert.Empty(t, byNS["ks_without_vschema"].Metadata["vschema_changed"],
 		"keyspace without VSchema change should not have vschema metadata")
 
-	// Operation field should be preserved
-	assert.Equal(t, "alter", byNS["ks_with_vschema"].TableChanges[0].Operation)
-	assert.Equal(t, "alter", byNS["ks_without_vschema"].TableChanges[0].Operation)
+	// Operation field should be preserved (storage string → Spirit type via OpToStatementType)
+	assert.Equal(t, statement.StatementAlterTable, byNS["ks_with_vschema"].TableChanges[0].Operation)
+	assert.Equal(t, statement.StatementAlterTable, byNS["ks_without_vschema"].TableChanges[0].Operation)
 }

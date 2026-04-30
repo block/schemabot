@@ -19,6 +19,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // ResolveEndpoint returns the endpoint to use, checking in order:
@@ -192,7 +193,7 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 		return nil, err
 	}
 
-	if result.State == "" || strings.EqualFold(result.State, "no_active_change") {
+	if state.IsState(result.State, state.NoActiveChange) {
 		return nil, nil
 	}
 	return &ActiveSchemaChange{State: result.State, ApplyID: result.ApplyID}, nil

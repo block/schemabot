@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/metrics"
@@ -1116,7 +1117,7 @@ func planNamespacesToChanges(namespaces map[string]*storage.NamespacePlanData) [
 			tableChanges = append(tableChanges, engine.TableChange{
 				Table:     tc.Table,
 				DDL:       tc.DDL,
-				Operation: tc.Operation,
+				Operation: ddl.OpToStatementType(tc.Operation),
 			})
 		}
 		metadata := make(map[string]string)

@@ -688,44 +688,20 @@ func qualifyAlterTableName(stmt, schemaName string) string {
 	return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", schemaName, r.Table, r.Alter)
 }
 
-// addAlgorithmInstant rewrites an ALTER TABLE statement to include ALGORITHM=INSTANT.
-// Returns "" for non-ALTER TABLE statements (CREATE TABLE, DROP TABLE, etc.).
-//
-// Example: "ALTER TABLE users ADD COLUMN age INT" → "ALTER TABLE users ALGORITHM=INSTANT, ADD COLUMN age INT"
+// addAlgorithmInstant rewrites a statement into ALTER TABLE form with ALGORITHM=INSTANT
+// when Spirit parses it with table and alter components. Returns "" for statements that
+// do not parse into an ALTER TABLE rewrite. Some non-ALTER inputs (e.g., CREATE INDEX)
+// are normalized by Spirit into ALTER TABLE ... ADD INDEX ... and will be rewritten.
 func addAlgorithmInstant(stmt string) string {
-	trimmed := strings.TrimSpace(stmt)
-	if !strings.HasPrefix(strings.ToUpper(trimmed), "ALTER TABLE ") {
+	parsed, err := statement.New(strings.TrimSpace(stmt))
+	if err != nil || len(parsed) == 0 {
 		return ""
 	}
-	// Find end of "ALTER TABLE <name>" — skip past table name
-	// Format: ALTER TABLE <name> <rest>
-	rest := trimmed[len("ALTER TABLE "):]
-	if len(rest) == 0 {
+	r := parsed[0]
+	if r.Table == "" || r.Alter == "" {
 		return ""
 	}
-	// Table name might be backtick-quoted
-	var tableName string
-	if rest[0] == '`' {
-		end := strings.Index(rest[1:], "`")
-		if end < 0 {
-			return ""
-		}
-		tableName = rest[:end+2] // includes backticks
-		rest = rest[end+2:]
-	} else {
-		parts := strings.SplitN(rest, " ", 2)
-		tableName = parts[0]
-		if len(parts) > 1 {
-			rest = " " + parts[1]
-		} else {
-			rest = ""
-		}
-	}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return ""
-	}
-	return fmt.Sprintf("ALTER TABLE %s ALGORITHM=INSTANT, %s", tableName, rest)
+	return fmt.Sprintf("ALTER TABLE `%s` ALGORITHM=INSTANT, %s", r.Table, r.Alter)
 }
 
 func branchDBName(branch, keyspace string) string {

@@ -83,7 +83,7 @@ func TestSplitStatements_Content(t *testing.T) {
 	assert.Contains(t, stmts[1], "t2")
 }
 
-func TestClassifyStatementAST(t *testing.T) {
+func TestClassifyStatementOp(t *testing.T) {
 	tests := []struct {
 		stmt      string
 		wantOp    string
@@ -103,7 +103,7 @@ func TestClassifyStatementAST(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.stmt, func(t *testing.T) {
-			gotOp, gotTable, err := ClassifyStatementAST(tt.stmt)
+			gotOp, gotTable, err := ClassifyStatementOp(tt.stmt)
 			if tt.wantErr {
 				assert.Error(t, err)
 				return

@@ -2,9 +2,11 @@ package api
 
 import (
 	"maps"
-	"strings"
+
+	"github.com/block/spirit/pkg/statement"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -94,11 +96,11 @@ func storageToProtoTableChanges(changes []storage.TableChange) []*ternv1.TableCh
 func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 	switch ct {
 	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return "create"
+		return ddl.StatementTypeToOp(statement.StatementCreateTable)
 	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return "alter"
+		return ddl.StatementTypeToOp(statement.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return "drop"
+		return ddl.StatementTypeToOp(statement.StatementDropTable)
 	default:
 		return "other"
 	}
@@ -106,12 +108,12 @@ func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 
 // changeTypeToProto converts operation string to proto ChangeType enum.
 func changeTypeToProto(op string) ternv1.ChangeType {
-	switch strings.ToLower(op) {
-	case "create":
+	switch ddl.OpToStatementType(op) {
+	case statement.StatementCreateTable:
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case "alter":
+	case statement.StatementAlterTable:
 		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case "drop":
+	case statement.StatementDropTable:
 		return ternv1.ChangeType_CHANGE_TYPE_DROP
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER

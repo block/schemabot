@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/spirit/pkg/statement"
+
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -17,10 +19,10 @@ const indentTable = "     " // 5 spaces — matches "  ── " in FormatKeyspac
 
 // progressSymbol returns a Terraform-style prefix for the change type.
 func progressSymbol(changeType string) string {
-	switch strings.ToLower(changeType) {
-	case "create":
+	switch ddl.OpToStatementType(changeType) {
+	case statement.StatementCreateTable:
 		return "+ "
-	case "drop":
+	case statement.StatementDropTable:
 		return "- "
 	default:
 		return "~ "
@@ -52,14 +54,14 @@ var nowFunc = time.Now
 // WriteProgress writes the schema change progress to stdout.
 func WriteProgress(data ProgressData) {
 	// No active schema change
-	if data.State == "" || data.State == state.NoActiveChange {
+	if state.IsState(data.State, state.NoActiveChange) {
 		fmt.Println("No active schema change")
 		return
 	}
 
 	// Build key/value pairs for the detail box
 	displayState := StateLabel(data.State)
-	if data.State == state.Apply.PreparingBranch && data.Metadata != nil && data.Metadata["existing_branch"] != "" {
+	if state.IsState(data.State, state.Apply.PreparingBranch) && data.Metadata != nil && data.Metadata["existing_branch"] != "" {
 		displayState = "Refreshing branch schema"
 	}
 	// Show latest event detail during setup phases

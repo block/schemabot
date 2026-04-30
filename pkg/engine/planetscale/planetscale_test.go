@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/statement"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -513,7 +514,7 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, changes, 1, "should detect CREATE TABLE")
 		assert.Equal(t, "users", changes[0].Table)
-		assert.Equal(t, "create", changes[0].Operation)
+		assert.Equal(t, statement.StatementCreateTable, changes[0].Operation)
 	})
 }
 

@@ -10,6 +10,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -28,12 +29,12 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	// Discover config and fetch schema files from PR
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
 	if err != nil {
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, "apply", err)
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
 		return
 	}
 
 	// Tier 1: CODEOWNERS review gate (path-scoped to this database's schema directory)
-	if blocked := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, "apply"); blocked {
+	if blocked := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.Apply); blocked {
 		h.logger.Info("apply blocked by review gate", "repo", repo, "pr", pr, "environment", environment, "requested_by", requestedBy)
 		return
 	}
@@ -57,7 +58,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "apply",
+			CommandName: action.Apply,
 			ErrorDetail: "Failed to check lock status: " + err.Error(),
 		}))
 		return
@@ -123,7 +124,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "apply",
+			CommandName: action.Apply,
 			ErrorDetail: err.Error(),
 		}))
 		return
@@ -157,7 +158,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "apply",
+			CommandName: action.Apply,
 			ErrorDetail: "Failed to acquire lock: " + err.Error(),
 		}))
 		return
@@ -261,12 +262,12 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
 	if err != nil {
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, "apply-confirm", err)
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
 		return
 	}
 
 	// Tier 1: CODEOWNERS review gate (re-check on confirm to prevent bypass)
-	if blocked := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, "apply-confirm"); blocked {
+	if blocked := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.ApplyConfirm); blocked {
 		h.logger.Info("apply-confirm blocked by review gate", "repo", repo, "pr", pr, "environment", environment, "requested_by", requestedBy)
 		return
 	}
@@ -282,7 +283,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "apply-confirm",
+			CommandName: action.ApplyConfirm,
 			ErrorDetail: "Failed to check lock status: " + err.Error(),
 		}))
 		return
@@ -342,7 +343,7 @@ func (h *Handler) executeApply(
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "apply",
+			CommandName: action.Apply,
 			ErrorDetail: err.Error(),
 		}))
 		return
@@ -403,7 +404,7 @@ func (h *Handler) executeApply(
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "apply",
+			CommandName: action.Apply,
 			ErrorDetail: "Failed to execute apply: " + err.Error(),
 		}))
 		return
@@ -414,7 +415,7 @@ func (h *Handler) executeApply(
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Environment: environment,
-			CommandName: "apply",
+			CommandName: action.Apply,
 			ErrorDetail: "Apply was not accepted: " + applyResp.ErrorMessage,
 		}))
 		return
@@ -504,7 +505,7 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 		h.logger.Error("failed to look up locks", "repo", repo, "pr", pr, "error", err)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
-			CommandName: "unlock",
+			CommandName: action.Unlock,
 			ErrorDetail: "Failed to look up locks: " + err.Error(),
 		}))
 		return
