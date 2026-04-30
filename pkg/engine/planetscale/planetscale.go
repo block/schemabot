@@ -922,8 +922,12 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// was partial or the branch had stale state, some tables may still differ.
 	// Catch this before creating the deploy request to prevent deploying
 	// unexpected changes (e.g., DROP COLUMN when ADD COLUMN was intended).
+	//
+	// Uses the branch MySQL connection directly instead of PlanetScale's
+	// GetBranchSchema API, which returns stale schema until an asynchronous
+	// schema snapshot completes after DDL execution.
 	keyspaces := sortedKeyspaces(req.SchemaFiles)
-	if err := e.verifyBranchMatchesDesired(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles); err != nil {
+	if err := e.verifyBranchMatchesDesired(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, password); err != nil {
 		return nil, fmt.Errorf("branch validation failed after DDL apply: %w", err)
 	}
 	emitEvent(engine.ApplyEvent{
@@ -2436,14 +2440,15 @@ func shardLess(a, b string) bool {
 	return aStart < bStart
 }
 
-// verifyBranchMatchesDesired uses the same diffing logic as Plan to verify
-// the branch schema matches the desired schema files for all keyspaces.
-// Validates both DDL (via Spirit differ) and VSchema (via protojson
-// normalization). Any mismatch blocks the deploy request from being created.
-func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles) error {
-	branchSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, branch, keyspaces)
+// verifyBranchMatchesDesired validates that the branch schema matches the
+// desired schema files for all keyspaces. Fetches DDL schema directly via
+// MySQL (LoadSchemaFromDB) to avoid PlanetScale's GetBranchSchema API, which
+// returns stale schema until an asynchronous schema snapshot completes after
+// DDL execution.
+func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword) error {
+	branchSchema, err := e.fetchBranchSchemaViaMySQL(ctx, password, keyspaces)
 	if err != nil {
-		return fmt.Errorf("fetch branch schema for validation: %w", err)
+		return fmt.Errorf("fetch branch schema via MySQL for validation: %w", err)
 	}
 
 	for _, ks := range keyspaces {
@@ -2458,25 +2463,28 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 		}
 
 		if len(ddlChanges) > 0 {
-			var descriptions []string
+			var summaries []string
+			var statements []string
 			for _, ch := range ddlChanges {
 				classified, _ := statement.Classify(ch.DDL)
-				desc := ch.DDL
+				summary := ch.DDL
 				if len(classified) > 0 {
-					desc = fmt.Sprintf("%s %s", classified[0].Type, classified[0].Table)
+					summary = fmt.Sprintf("%s %s", classified[0].Type, classified[0].Table)
 				}
-				descriptions = append(descriptions, desc)
+				summaries = append(summaries, summary)
+				statements = append(statements, ch.DDL)
 			}
 			e.logger.Error("branch validation failed: unexpected DDL changes",
 				"keyspace", ks,
 				"branch", branch,
 				"change_count", len(ddlChanges),
-				"changes", descriptions,
+				"changes", summaries,
+				"statements", statements,
 				"branch_table_count", len(branchSchema[ks]),
 				"desired_file_count", len(ns.Files),
 			)
-			return fmt.Errorf("keyspace %s has %d unexpected DDL changes after apply: %v — the branch may have stale state from a previous apply",
-				ks, len(ddlChanges), descriptions)
+			return fmt.Errorf("keyspace %s has %d unexpected DDL changes after apply: %v\nstatements:\n%s",
+				ks, len(ddlChanges), summaries, strings.Join(statements, "\n"))
 		}
 
 		if vschemaChanged {
@@ -2484,11 +2492,61 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 		}
 	}
 
-	e.logger.Info("branch schema validated — matches desired state",
+	e.logger.Info("branch schema validated via MySQL — matches desired state",
 		"branch", branch,
 		"keyspaces", len(keyspaces),
 	)
 	return nil
+}
+
+// fetchBranchSchemaViaMySQL connects to the branch via MySQL using the branch
+// password and loads table schemas with LoadSchemaFromDB. This returns the
+// real-time schema, bypassing PlanetScale's cached GetBranchSchema API.
+func (e *Engine) fetchBranchSchemaViaMySQL(ctx context.Context, password *ps.DatabaseBranchPassword, keyspaces []string) (map[string][]table.TableSchema, error) {
+	mysqlCfg := mysql.NewConfig()
+	mysqlCfg.User = password.Username
+	mysqlCfg.Passwd = password.PlainText
+	mysqlCfg.Net = "tcp"
+	mysqlCfg.Addr = password.Hostname
+	mysqlCfg.InterpolateParams = true
+	if mtlsRegistered.Load() {
+		mysqlCfg.TLSConfig = mtlsConfigName
+	}
+
+	var mu sync.Mutex
+	result := make(map[string][]table.TableSchema, len(keyspaces))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(20)
+
+	for _, keyspace := range keyspaces {
+		ks := keyspace
+		g.Go(func() error {
+			ksCfg := mysqlCfg.Clone()
+			ksCfg.DBName = ks
+			db, err := sql.Open("mysql", ksCfg.FormatDSN())
+			if err != nil {
+				return fmt.Errorf("open branch MySQL for keyspace %s: %w", ks, err)
+			}
+			defer utils.CloseAndLog(db)
+
+			if err := db.PingContext(gCtx); err != nil {
+				return fmt.Errorf("ping branch MySQL for keyspace %s: %w", ks, err)
+			}
+
+			tables, err := table.LoadSchemaFromDB(gCtx, db, table.WithoutUnderscoreTables)
+			if err != nil {
+				return fmt.Errorf("load schema for keyspace %s: %w", ks, err)
+			}
+			mu.Lock()
+			result[ks] = tables
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // diffKeyspace diffs a single keyspace's schema between a branch and the
