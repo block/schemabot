@@ -139,6 +139,6 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying rollback...")
 
-	_, err = applyAndWatch(ep, planResult, database, environment, owner, "rollback", cmd.DeferCutover, false, "", cmd.Watch, OutputFormatInteractive, 0)
+	_, err = applyAndWatch(ep, planResult, database, environment, owner, "rollback", cmd.DeferCutover, false, false, "", cmd.Watch, OutputFormatInteractive, 0)
 	return err
 }

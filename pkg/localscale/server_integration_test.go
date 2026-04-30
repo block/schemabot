@@ -61,7 +61,7 @@ func TestMain(m *testing.M) {
 				},
 			}},
 		},
-		RevertWindowDuration: "5s",
+		RevertWindowDuration: "2s",
 		Reuse:                os.Getenv("DEBUG") == "1",
 	})
 	if err != nil {

@@ -30,6 +30,21 @@ import (
 	"github.com/go-mysql-org/go-mysql/server"
 )
 
+// defaultMySQLServerOnce lazily initializes a shared go-mysql Server for
+// non-TLS branch proxies. NewDefaultServer() generates an RSA CA + cert
+// on every call, which is CPU-intensive and causes timeouts under load.
+var (
+	defaultMySQLServerOnce sync.Once
+	defaultMySQLServerInst *server.Server
+)
+
+func defaultMySQLServer() *server.Server {
+	defaultMySQLServerOnce.Do(func() {
+		defaultMySQLServerInst = server.NewDefaultServer()
+	})
+	return defaultMySQLServerInst
+}
+
 // portAllocator manages a pool of ports from a fixed range.
 // Used to give branch proxies predictable ports that can be exposed in Docker.
 type portAllocator struct {
@@ -79,7 +94,10 @@ type branchProxy struct {
 }
 
 func newBranchProxy(ctx context.Context, listenAddr, upstreamDSN string, branchName string, keyspaces []string, logger *slog.Logger, tlsCfg *tls.Config) (*branchProxy, error) {
-	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
+	lc := &net.ListenConfig{
+		Control: setReuseAddr,
+	}
+	ln, err := lc.Listen(ctx, "tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen on %s: %w", listenAddr, err)
 	}
@@ -99,11 +117,15 @@ func newBranchProxy(ctx context.Context, listenAddr, upstreamDSN string, branchN
 	// Configure the go-mysql protocol server. When TLS is configured, use
 	// NewServer with the TLS config so the server advertises TLS capability
 	// and performs STARTTLS during the MySQL handshake.
+	//
+	// Without TLS, use a shared default server to avoid generating RSA
+	// keys on every proxy creation (NewDefaultServer generates a CA + cert
+	// per call, which is CPU-intensive under load).
 	var mysqlSrv *server.Server
 	if tlsCfg != nil {
 		mysqlSrv = server.NewServer("8.0.35-localscale", 255, "mysql_native_password", nil, tlsCfg)
 	} else {
-		mysqlSrv = server.NewDefaultServer()
+		mysqlSrv = defaultMySQLServer()
 	}
 
 	p := &branchProxy{

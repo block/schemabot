@@ -530,9 +530,10 @@ func (s *Server) ResetState(ctx context.Context) error {
 	}
 	// Wait for all migrations to reach terminal state so table locks are released.
 	// Uses shard-targeted connections for the same reason as above.
-	ticker := time.NewTicker(500 * time.Millisecond)
+	// Short timeout: after CANCEL ALL, migrations should transition quickly.
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	timer := time.NewTimer(30 * time.Second)
+	timer := time.NewTimer(10 * time.Second)
 	defer timer.Stop()
 	for {
 		allTerminal := true
@@ -718,12 +719,21 @@ func (s *Server) closeProxy(branch string) {
 
 // closeAllProxies shuts down all branch TCP proxies.
 func (s *Server) closeAllProxies() {
+	// Snapshot and clear under lock, then close outside the lock.
+	// proxy.Close() blocks on <-p.done (waits for serve() to exit),
+	// and holding proxyMu during that wait deadlocks any concurrent
+	// trackProxy calls (e.g., from password handlers).
 	s.proxyMu.Lock()
-	defer s.proxyMu.Unlock()
+	old := make(map[string]*branchProxy, len(s.proxies))
 	for name, p := range s.proxies {
+		old[name] = p
+		delete(s.proxies, name)
+	}
+	s.proxyMu.Unlock()
+
+	for _, p := range old {
 		s.releaseProxyPort(p)
 		utils.CloseAndLog(p)
-		delete(s.proxies, name)
 	}
 }
 
