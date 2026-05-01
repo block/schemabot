@@ -15,6 +15,10 @@ import (
 	"runtime/debug"
 	"strings"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
@@ -60,24 +64,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	eventType := r.Header.Get("X-GitHub-Event")
 	action, repo := webhookMetadata(body)
+
+	ctx, span := otel.Tracer("schemabot").Start(r.Context(), "webhook",
+		trace.WithAttributes(
+			attribute.String("event_type", eventType),
+			attribute.String("action", action),
+			attribute.String("repository", repo),
+		),
+	)
+	defer span.End()
+
 	h.logger.Debug("webhook received", "event", eventType, "action", action, "repo", repo)
 
 	switch eventType {
 	case "issue_comment":
 		h.handleIssueComment(w, body)
-		metrics.RecordWebhookEvent(r.Context(), eventType, action, repo, "processed")
+		metrics.RecordWebhookEvent(ctx, eventType, action, repo, "processed")
 	case "check_run":
 		// Phase 2: h.handleCheckRun(w, body)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run events not yet implemented"})
-		metrics.RecordWebhookEvent(r.Context(), eventType, action, repo, "ignored")
+		metrics.RecordWebhookEvent(ctx, eventType, action, repo, "ignored")
 	case "pull_request":
 		h.handlePullRequest(w, body)
-		metrics.RecordWebhookEvent(r.Context(), eventType, action, repo, "processed")
+		metrics.RecordWebhookEvent(ctx, eventType, action, repo, "processed")
 	default:
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": fmt.Sprintf("event type '%s' ignored", eventType),
 		})
-		metrics.RecordWebhookEvent(r.Context(), eventType, action, repo, "ignored")
+		metrics.RecordWebhookEvent(ctx, eventType, action, repo, "ignored")
 	}
 }
 
