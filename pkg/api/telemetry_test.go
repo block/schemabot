@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -18,6 +20,8 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestSetupTelemetry(t *testing.T) {
@@ -341,4 +345,105 @@ func TestRecordRecoveryCycleMetric(t *testing.T) {
 	assert.True(t, names["schemabot.recovery.cycles_total"], "expected schemabot.recovery.cycles_total")
 	assert.True(t, names["schemabot.recovery.recovered_total"], "expected schemabot.recovery.recovered_total")
 	assert.True(t, names["schemabot.recovery.failed_total"], "expected schemabot.recovery.failed_total")
+}
+
+// setupTraceTest creates an in-memory trace exporter and configures the global
+// TracerProvider. Returns the exporter for span inspection.
+func setupTraceTest(t *testing.T) *tracetest.InMemoryExporter {
+	t.Helper()
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	prevTP := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		if err := tp.Shutdown(t.Context()); err != nil {
+			t.Logf("tracer shutdown: %v", err)
+		}
+	})
+	return exporter
+}
+
+// findSpan returns the first span with the given name, or nil.
+func findSpan(spans tracetest.SpanStubs, name string) *tracetest.SpanStub {
+	for i := range spans {
+		if spans[i].Name == name {
+			return &spans[i]
+		}
+	}
+	return nil
+}
+
+// spanAttrs returns a map of string attribute values from a span.
+func spanAttrs(s *tracetest.SpanStub) map[string]string {
+	attrs := make(map[string]string)
+	for _, a := range s.Attributes {
+		attrs[string(a.Key)] = a.Value.Emit()
+	}
+	return attrs
+}
+
+func TestExecutePlanTrace(t *testing.T) {
+	exporter := setupTraceTest(t)
+
+	svc := newTestService()
+
+	// ExecutePlan will fail (mock tern client), but the span is still recorded.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, _ = svc.ExecutePlan(ctx, PlanRequest{
+		Database:    "testdb",
+		Environment: "staging",
+		Type:        "mysql",
+	})
+
+	s := findSpan(exporter.GetSpans(), "ExecutePlan")
+	require.NotNil(t, s, "expected ExecutePlan span")
+
+	attrs := spanAttrs(s)
+	assert.Equal(t, "testdb", attrs["database"])
+	assert.Equal(t, "staging", attrs["environment"])
+	assert.Equal(t, "mysql", attrs["type"])
+}
+
+// mockPlanStore returns nil for all lookups, simulating "plan not found".
+type mockPlanStore struct{}
+
+func (m *mockPlanStore) Create(context.Context, *storage.Plan) (int64, error)      { return 0, nil }
+func (m *mockPlanStore) Get(context.Context, string) (*storage.Plan, error)        { return nil, nil }
+func (m *mockPlanStore) GetByID(context.Context, int64) (*storage.Plan, error)     { return nil, nil }
+func (m *mockPlanStore) GetByLock(context.Context, int64) ([]*storage.Plan, error) { return nil, nil }
+func (m *mockPlanStore) GetByPR(context.Context, string, int) ([]*storage.Plan, error) {
+	return nil, nil
+}
+func (m *mockPlanStore) Delete(context.Context, int64) error           { return nil }
+func (m *mockPlanStore) DeleteByPR(context.Context, string, int) error { return nil }
+
+// mockStorageWithPlans wraps mockStorage but returns a real PlanStore.
+type mockStorageWithPlans struct {
+	mockStorage
+}
+
+func (m *mockStorageWithPlans) Plans() storage.PlanStore { return &mockPlanStore{} }
+
+func TestExecuteApplyTrace(t *testing.T) {
+	exporter := setupTraceTest(t)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithPlans{}, testServerConfig(), nil, logger)
+
+	// ExecuteApply returns "plan not found" — no panic, span is recorded cleanly.
+	_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "nonexistent",
+		Environment: "staging",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plan not found")
+
+	s := findSpan(exporter.GetSpans(), "ExecuteApply")
+	require.NotNil(t, s, "expected ExecuteApply span")
+
+	attrs := spanAttrs(s)
+	assert.Equal(t, "nonexistent", attrs["plan_id"])
+	assert.Equal(t, "staging", attrs["environment"])
 }

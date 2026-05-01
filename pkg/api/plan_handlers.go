@@ -10,6 +10,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
@@ -83,7 +87,18 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 // and returns the plan response. This is the shared implementation used by both
 // the HTTP handler and the webhook handler.
 func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.PlanResponse, error) {
+	ctx, span := otel.Tracer("schemabot").Start(ctx, "ExecutePlan",
+		trace.WithAttributes(
+			attribute.String("database", req.Database),
+			attribute.String("environment", req.Environment),
+			attribute.String("type", req.Type),
+		),
+	)
+	defer span.End()
+
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "invalid schema files")
 		return nil, err
 	} else if warning != "" {
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
@@ -95,6 +110,8 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "tern client")
 		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
 		return nil, fmt.Errorf("tern client: %w", err)
@@ -126,10 +143,13 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 
 	resp, err := client.Plan(ctx, ternReq)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "plan failed")
 		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
 		return nil, err
 	}
+	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
 	metrics.RecordPlan(ctx, req.Database, req.Environment, "success")
 	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "success")
 
@@ -221,19 +241,35 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 //
 // Returns the API response, the stored apply ID (0 if not stored), and any error.
 func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes.ApplyResponse, int64, error) {
+	ctx, span := otel.Tracer("schemabot").Start(ctx, "ExecuteApply",
+		trace.WithAttributes(
+			attribute.String("plan_id", req.PlanID),
+			attribute.String("environment", req.Environment),
+		),
+	)
+	defer span.End()
+
 	// Load plan first — it's the source of truth for database and type.
 	plan, err := s.storage.Plans().Get(ctx, req.PlanID)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "get plan")
 		return nil, 0, fmt.Errorf("get plan: %w", err)
 	}
 	if plan == nil {
-		return nil, 0, fmt.Errorf("plan not found: %s", req.PlanID)
+		planErr := fmt.Errorf("plan not found: %s", req.PlanID)
+		span.RecordError(planErr)
+		span.SetStatus(codes.Error, "plan not found")
+		return nil, 0, planErr
 	}
+	span.SetAttributes(attribute.String("database", plan.Database))
 
 	deployment := s.resolveDeployment(plan.Database, req.Deployment)
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "tern client")
 		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
 		return nil, 0, fmt.Errorf("tern client: %w", err)
 	}
@@ -262,6 +298,8 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	applyStart := time.Now()
 	resp, err := client.Apply(ctx, ternReq)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "apply failed")
 		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
 		metrics.RecordApplyDuration(ctx, time.Since(applyStart), plan.Database, req.Environment, "error")
 		return nil, 0, err
@@ -270,6 +308,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	if !resp.Accepted {
 		applyStatus = "rejected"
 	}
+	span.SetAttributes(attribute.String("apply_id", resp.ApplyId), attribute.Bool("accepted", resp.Accepted))
 	metrics.RecordApply(ctx, plan.Database, req.Environment, applyStatus)
 	metrics.RecordApplyDuration(ctx, time.Since(applyStart), plan.Database, req.Environment, applyStatus)
 	if resp.Accepted {
