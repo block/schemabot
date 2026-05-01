@@ -147,6 +147,74 @@ func TestServerConfig_Validate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "databases only (local mode)",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "both databases and tern_deployments (hybrid mode)",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"local-db": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/localdb"}},
+					},
+				},
+				TernDeployments: TernConfig{
+					"default": {"staging": "localhost:9090"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "hybrid mode: repo references valid deployment",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"local-db": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/localdb"}},
+					},
+				},
+				TernDeployments: TernConfig{
+					"remote-cluster": {"staging": "localhost:9090"},
+				},
+				Repos: map[string]RepoConfig{
+					"org/repo": {DefaultTernDeployment: "remote-cluster"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "hybrid mode: repo references nonexistent deployment",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"local-db": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/localdb"}},
+					},
+				},
+				TernDeployments: TernConfig{
+					"default": {"staging": "localhost:9090"},
+				},
+				Repos: map[string]RepoConfig{
+					"org/repo": {DefaultTernDeployment: "nonexistent"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name:    "neither databases nor tern_deployments",
+			cfg:     ServerConfig{},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
