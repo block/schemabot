@@ -52,21 +52,39 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 
 	port := getEnv("PORT", "8080")
 
-	// Apply storage schema using Spirit (same mechanism as LocalClient)
-	// This ensures SchemaBot's storage tables exist and are up-to-date.
+	// Apply storage schema with retries for transient failures (e.g., DNS
+	// not yet available when the container starts in Kubernetes).
 	logger.Info("ensuring storage schema")
-	if err := api.EnsureSchema(dsn, logger); err != nil {
-		return fmt.Errorf("ensure schema: %w", err)
-	}
+	var db *sql.DB
+	const maxRetries = 5
+	const pingTimeout = 10 * time.Second
+	for attempt := range maxRetries {
+		if err := api.EnsureSchema(dsn, logger); err != nil {
+			if attempt < maxRetries-1 {
+				logger.Warn("ensure schema failed, retrying", "attempt", attempt+1, "error", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return fmt.Errorf("ensure schema after %d attempts: %w", maxRetries, err)
+		}
 
-	// Connect to database
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return fmt.Errorf("open database: %w", err)
-	}
-	if err := db.PingContext(context.Background()); err != nil {
-		utils.CloseAndLog(db)
-		return fmt.Errorf("ping database: %w", err)
+		db, err = sql.Open("mysql", dsn)
+		if err != nil {
+			return fmt.Errorf("open database: %w", err)
+		}
+		pingCtx, pingCancel := context.WithTimeout(context.Background(), pingTimeout)
+		pingErr := db.PingContext(pingCtx)
+		pingCancel()
+		if pingErr != nil {
+			utils.CloseAndLog(db)
+			if attempt < maxRetries-1 {
+				logger.Warn("database ping failed, retrying", "attempt", attempt+1, "error", pingErr)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			return fmt.Errorf("ping database after %d attempts: %w", maxRetries, pingErr)
+		}
+		break
 	}
 
 	// Create service with dependencies
