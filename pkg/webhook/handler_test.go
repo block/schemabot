@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -410,17 +411,8 @@ func TestWebhookMultipleCommandsSequential(t *testing.T) {
 	}
 }
 
-func TestWebhookPRClosedTriggersCleanup(t *testing.T) {
-	h, _, _ := newTestHandler(t)
-
-	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "closed"}, nil)
-
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-
-	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "PR close cleanup started")
-}
+// PR close cleanup is tested in the integration suite (TestE2EPRCloseCleanup)
+// which has real storage via testcontainers.
 
 func TestWebhookPREditIgnored(t *testing.T) {
 	h, _, _ := newTestHandler(t)
@@ -534,3 +526,149 @@ func TestWebhookConcurrentRequests(t *testing.T) {
 		}
 	}
 }
+
+func TestWebhookRepoAllowlistRejectsUnregisteredRepo(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	factory := &fakeClientFactory{client: installClient}
+
+	service := api.New(nil, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{
+			"org/allowed-repo": {DefaultTernDeployment: "default"},
+		},
+	}, nil, testLogger())
+
+	h := &Handler{
+		service:  service,
+		ghClient: factory,
+		logger:   testLogger(),
+	}
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "repository not registered")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Repository not registered")
+		assert.Contains(t, body, "`repos`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rejection comment")
+	}
+}
+
+func TestWebhookRepoAllowlistAllowsRegisteredRepo(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	factory := &fakeClientFactory{client: installClient}
+
+	service := api.New(nil, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {DefaultTernDeployment: "default"},
+		},
+	}, nil, testLogger())
+
+	h := &Handler{
+		service:  service,
+		ghClient: factory,
+		logger:   testLogger(),
+	}
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot help",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "help posted")
+}
+
+func TestWebhookRepoAllowlistEmptyAllowsAll(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	factory := &fakeClientFactory{client: installClient}
+
+	service := api.New(nil, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{},
+	}, nil, testLogger())
+
+	h := &Handler{
+		service:  service,
+		ghClient: factory,
+		logger:   testLogger(),
+	}
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot help",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "help posted")
+}
+
+func TestWebhookRepoAllowlistPullRequestRejectsUnregistered(t *testing.T) {
+	service := api.New(nil, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{
+			"org/allowed-repo": {DefaultTernDeployment: "default"},
+		},
+	}, nil, testLogger())
+
+	h := &Handler{
+		service: service,
+		logger:  testLogger(),
+	}
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened"}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "repository not registered")
+}
+
+// PR close bypass of the allowlist is tested in the integration suite
+// (TestE2EPRCloseCleanup) which has real storage via testcontainers.

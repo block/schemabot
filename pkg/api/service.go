@@ -454,6 +454,11 @@ func (s *Service) findActiveApplyID(ctx context.Context, database, environment s
 	return "", nil, nil
 }
 
+// Config returns the service's server configuration.
+func (s *Service) Config() *ServerConfig {
+	return s.config
+}
+
 // Storage returns the service's storage instance.
 // This is used by the webhook handler to store check records.
 func (s *Service) Storage() storage.Storage {

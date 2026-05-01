@@ -277,6 +277,18 @@ func (c *ServerConfig) TernDeployment(repo string) string {
 	return DefaultDeployment
 }
 
+// IsRepoAllowed returns whether the given repository is permitted to use SchemaBot.
+// If the receiver is nil, Repos is empty, or Repos is nil, all repositories are
+// allowed (backwards compatible). If Repos is populated, only listed repositories
+// are allowed.
+func (c *ServerConfig) IsRepoAllowed(repo string) bool {
+	if c == nil || len(c.Repos) == 0 {
+		return true
+	}
+	_, ok := c.Repos[repo]
+	return ok
+}
+
 // StorageDSN returns the resolved storage DSN.
 // It handles special prefixes (env:, file:) to read from various sources.
 // Falls back to MYSQL_DSN environment variable if not configured.

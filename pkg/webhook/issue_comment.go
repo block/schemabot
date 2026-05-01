@@ -88,6 +88,17 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 		return
 	}
 
+	// Reject commands from repositories not in the configured allowlist
+	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("webhook from unregistered repository", "repo", repo, "pr", pr)
+		h.postComment(repo, pr, installationID,
+			"**Repository not registered.** This repository is not in SchemaBot's configuration. To onboard, add it to the `repos` section of SchemaBot's config and redeploy.")
+		h.writeJSON(w, http.StatusOK, map[string]string{
+			"message": "repository not registered",
+		})
+		return
+	}
+
 	// Add instant acknowledgment reaction
 	if payload.Comment.ID > 0 && installationID > 0 {
 		go func() {
