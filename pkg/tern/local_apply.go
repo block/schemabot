@@ -340,23 +340,12 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 		return
 	}
 
-	// All tasks start running together
-	c.markTasksRunning(ctx, tasks)
-	apply.State = state.Apply.Running
-	apply.UpdatedAt = time.Now()
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
-	}
-	c.logger.Info("atomic apply started", "apply_id", apply.ApplyIdentifier, "task_count", len(tasks))
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-		fmt.Sprintf("All %d tables started copying in parallel", len(tasks)), state.Apply.Pending, state.Apply.Running)
-
-	// Store resume state from engine (deploy request ID, migration context)
-	// so progress polling can track the deploy request.
+	// Save vitess_apply_data and set IsInstant on tasks BEFORE marking running.
+	// The progress handler reads both vitess_apply_data.is_instant and task.is_instant
+	// to determine the instant label — both must be committed before the first poll.
 	var resumeState *engine.ResumeState
 	if result.ResumeState != nil {
 		resumeState = result.ResumeState
-		// Persist to vitess_apply_data for crash recovery and external progress queries.
 		if meta, err := decodePSMetadataForStorage(resumeState.Metadata); meta != nil && err == nil {
 			c.logger.Info("saving VitessApplyData from apply result",
 				"apply_id", apply.ApplyIdentifier,
@@ -377,6 +366,27 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 			}
 		}
 	}
+
+	if result.ResumeState != nil {
+		if meta, err := decodePSMetadataForStorage(result.ResumeState.Metadata); meta != nil && err == nil && meta.IsInstant {
+			for _, task := range tasks {
+				task.IsInstant = true
+			}
+		}
+	}
+	c.markTasksRunning(ctx, tasks)
+	if c.config.Type == storage.DatabaseTypeVitess {
+		apply.State = state.Apply.ValidatingDeployRequest
+	} else {
+		apply.State = state.Apply.Running
+	}
+	apply.UpdatedAt = time.Now()
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+	}
+	c.logger.Info("atomic apply started", "apply_id", apply.ApplyIdentifier, "task_count", len(tasks))
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		fmt.Sprintf("All %d tables started copying in parallel", len(tasks)), state.Apply.Pending, apply.State)
 
 	// Poll for completion - all tasks share the same state
 	c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState)
@@ -643,8 +653,12 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Log state transitions and track when waiting states are entered (for timeouts)
 	if newState != ps.lastTaskState {
+		msg := fmt.Sprintf("State changed to %s", newState)
+		if result.Message != "" {
+			msg = fmt.Sprintf("State changed to %s (%s)", newState, result.Message)
+		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			fmt.Sprintf("State changed to %s", newState), ps.lastTaskState, newState)
+			msg, ps.lastTaskState, newState)
 		ps.lastTaskState = newState
 		ps.stateEnteredAt = now
 	}

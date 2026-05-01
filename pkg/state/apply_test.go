@@ -250,7 +250,9 @@ func TestIsBranchSetupPhase(t *testing.T) {
 		Apply.Pending,
 		Apply.PreparingBranch,
 		Apply.ApplyingBranchChanges,
+		Apply.ValidatingBranch,
 		Apply.CreatingDeployRequest,
+		Apply.ValidatingDeployRequest,
 	}
 	for _, s := range setupPhases {
 		assert.True(t, IsBranchSetupPhase(s), "%s should be a setup phase", s)
@@ -268,4 +270,9 @@ func TestIsBranchSetupPhase(t *testing.T) {
 	for _, s := range nonSetupPhases {
 		assert.False(t, IsBranchSetupPhase(s), "%s should NOT be a setup phase", s)
 	}
+}
+
+func TestNormalizeApplyState_NewStates(t *testing.T) {
+	assert.Equal(t, Apply.ValidatingBranch, normalizeApplyState("VALIDATING_BRANCH"))
+	assert.Equal(t, Apply.ValidatingDeployRequest, normalizeApplyState("VALIDATING_DEPLOY_REQUEST"))
 }

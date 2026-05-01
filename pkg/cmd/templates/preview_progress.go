@@ -64,6 +64,20 @@ func previewApplyingBranchChangesOutput() {
 	WriteProgress(data)
 }
 
+func previewValidatingBranchOutput() {
+	data := ProgressData{
+		State:       state.Apply.ValidatingBranch,
+		Engine:      "PlanetScale",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Database:    "myapp",
+		Environment: "staging",
+		Metadata: map[string]string{
+			"branch_name": "schemabot-myapp-28471035",
+		},
+	}
+	WriteProgress(data)
+}
+
 func previewCreatingDeployRequestOutput() {
 	data := ProgressData{
 		State:       state.Apply.CreatingDeployRequest,
@@ -80,6 +94,21 @@ func previewCreatingDeployRequestOutput() {
 				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
 				Status: state.Apply.Pending,
 			},
+		},
+	}
+	WriteProgress(data)
+}
+
+func previewValidatingDeployRequestOutput() {
+	data := ProgressData{
+		State:       state.Apply.ValidatingDeployRequest,
+		Engine:      "PlanetScale",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Database:    "myapp",
+		Environment: "staging",
+		Metadata: map[string]string{
+			"branch_name":        "schemabot-myapp-28471035",
+			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/42",
 		},
 	}
 	WriteProgress(data)

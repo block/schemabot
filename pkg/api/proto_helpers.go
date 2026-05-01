@@ -36,7 +36,7 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 				TableName:    t.TableName,
 				Namespace:    t.Namespace,
 				DDL:          t.Ddl,
-				ChangeType:   t.ChangeType.String(),
+				ChangeType:   protoChangeTypeToOperation(t.ChangeType),
 				IsUnsafe:     t.IsUnsafe,
 				UnsafeReason: t.UnsafeReason,
 			})

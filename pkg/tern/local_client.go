@@ -535,7 +535,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		for ns, nsData := range plan.Namespaces {
 			if len(nsData.VSchema) > 0 {
 				ddlChanges = append(ddlChanges, storage.TableChange{
-					Table:     "vschema:" + ns,
+					Table:     "VSchema: " + ns,
 					Namespace: ns,
 					Operation: "vschema_update",
 				})
@@ -803,12 +803,13 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 	for _, t := range currentApplyTasks {
 		tp := &ternv1.TableProgress{
-			TableName: t.TableName,
-			Ddl:       t.DDL,
-			Namespace: t.Namespace,
-			Status:    t.State,
-			TaskId:    t.TaskIdentifier,
-			IsInstant: t.IsInstant || vitessApplyIsInstant,
+			TableName:  t.TableName,
+			Ddl:        t.DDL,
+			Namespace:  t.Namespace,
+			Status:     t.State,
+			TaskId:     t.TaskIdentifier,
+			IsInstant:  t.IsInstant || vitessApplyIsInstant,
+			ChangeType: changeTypeToProto(ddl.OpToStatementType(t.DDLAction)),
 		}
 
 		// Look up engine progress for this table
@@ -819,7 +820,9 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			tp.RowsCopied = et.RowsCopied
 			tp.RowsTotal = et.RowsTotal
 			tp.EtaSeconds = et.ETASeconds
-			tp.IsInstant = et.IsInstant
+			if et.IsInstant {
+				tp.IsInstant = true
+			}
 			tp.ProgressDetail = et.ProgressDetail
 
 			// Update task timestamps from engine if not already set.
@@ -886,7 +889,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// real progress (e.g., engine returns "running" during setup).
 	if applyRec, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && applyRec != nil {
 		switch applyRec.State {
-		case state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest:
+		case state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest, state.Apply.ValidatingBranch, state.Apply.ValidatingDeployRequest:
 			overallState = applyRec.State
 		}
 	}

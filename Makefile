@@ -185,6 +185,9 @@ endif
 #   make demo KEEP_DATA=1  # Restart without wiping data (preserves seeded rows)
 #   make demo SKIP_APPLY=1 # Start server only, skip schema applies (for debugging)
 demo:
+	@# Reset schema files to baseline so the demo starts clean.
+	@./scripts/generate-schema-change.sh reset 2>/dev/null || true
+	@./scripts/generate-schema-change.sh reset --vitess 2>/dev/null || true
 ifeq ($(KEEP_DATA),1)
 	docker compose -f deploy/local/docker-compose.yml down --remove-orphans -t 10 2>/dev/null || true
 else
@@ -219,7 +222,7 @@ ifneq ($(SKIP_APPLY),1)
 	echo "" && \
 	echo "Seeding data..." && \
 	./scripts/seed-large.sh 50 both && \
-	STAGING_VTGATE_PORT=19101 ./scripts/seed-vitess.sh 200 && \
+	STAGING_VTGATE_PORT=19101 ./scripts/seed-vitess.sh 100 && \
 	echo "Seeding complete."
 	@echo "$$DEMO_READY_MSG"
 else

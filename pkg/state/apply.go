@@ -28,9 +28,11 @@ var Apply = struct {
 	// PlanetScale-specific states for the branch/deploy lifecycle.
 	// These are set on the apply record during engine setup so the
 	// progress handler and CLI can show what's happening.
-	PreparingBranch       string
-	ApplyingBranchChanges string
-	CreatingDeployRequest string
+	PreparingBranch         string
+	ApplyingBranchChanges   string
+	ValidatingBranch        string
+	CreatingDeployRequest   string
+	ValidatingDeployRequest string
 }{
 	Pending:           "pending",
 	Running:           "running",
@@ -44,9 +46,11 @@ var Apply = struct {
 	Cancelled:         "cancelled",
 	Reverted:          "reverted",
 
-	PreparingBranch:       "preparing_branch",
-	ApplyingBranchChanges: "applying_branch_changes",
-	CreatingDeployRequest: "creating_deploy_request",
+	PreparingBranch:         "preparing_branch",
+	ApplyingBranchChanges:   "applying_branch_changes",
+	ValidatingBranch:        "validating_branch",
+	CreatingDeployRequest:   "creating_deploy_request",
+	ValidatingDeployRequest: "validating_deploy_request",
 }
 
 // DeriveApplyState determines the overall Apply state from individual Task states.
@@ -136,6 +140,10 @@ func normalizeApplyState(raw string) string {
 		return Apply.Cancelled
 	case "REVERTED":
 		return Apply.Reverted
+	case "VALIDATING_BRANCH":
+		return Apply.ValidatingBranch
+	case "VALIDATING_DEPLOY_REQUEST":
+		return Apply.ValidatingDeployRequest
 	default:
 		return Apply.Pending
 	}
@@ -171,7 +179,7 @@ func IsTerminalApplyState(s string) bool {
 // are Queued). Used by the TUI and CLI to hide the table list during setup.
 // WaitingForDeploy is included because the deploy hasn't started yet.
 func IsBranchSetupPhase(s string) bool {
-	return IsState(s, Apply.Pending, Apply.PreparingBranch, Apply.ApplyingBranchChanges, Apply.CreatingDeployRequest, Apply.WaitingForDeploy)
+	return IsState(s, Apply.Pending, Apply.PreparingBranch, Apply.ApplyingBranchChanges, Apply.ValidatingBranch, Apply.CreatingDeployRequest, Apply.ValidatingDeployRequest, Apply.WaitingForDeploy)
 }
 
 // IsPlanetScaleEngine returns true if the engine string indicates PlanetScale/Vitess.

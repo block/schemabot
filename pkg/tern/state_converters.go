@@ -104,6 +104,10 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_APPLYING_BRANCH_CHANGES
 	case state.Apply.CreatingDeployRequest:
 		return ternv1.State_STATE_CREATING_DEPLOY_REQUEST
+	case state.Apply.ValidatingBranch:
+		return ternv1.State_STATE_VALIDATING_BRANCH
+	case state.Apply.ValidatingDeployRequest:
+		return ternv1.State_STATE_VALIDATING_DEPLOY_REQUEST
 	default:
 		// Unknown task state — return PENDING as a safe default so clients
 		// continue polling rather than assuming no change is active.
@@ -174,6 +178,10 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.ApplyingBranchChanges
 	case ternv1.State_STATE_CREATING_DEPLOY_REQUEST:
 		return state.Apply.CreatingDeployRequest
+	case ternv1.State_STATE_VALIDATING_BRANCH:
+		return state.Apply.ValidatingBranch
+	case ternv1.State_STATE_VALIDATING_DEPLOY_REQUEST:
+		return state.Apply.ValidatingDeployRequest
 	default:
 		return ""
 	}

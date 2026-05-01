@@ -24,37 +24,35 @@ func TestDeployStateToEngineState(t *testing.T) {
 	tests := []struct {
 		deployState   string
 		expectedState engine.State
-		expectedProg  int
 	}{
-		{"pending", engine.StatePending, 0},
-		{"ready", engine.StatePending, 0},
-		{"no_changes", engine.StateCompleted, 100},
-		{"queued", engine.StateRunning, 5},
-		{"submitting", engine.StateRunning, 5},
-		{"in_progress", engine.StateRunning, 50},
-		{"in_progress_vschema", engine.StateRunning, 50},
-		{"pending_cutover", engine.StateWaitingForCutover, 90},
-		{"in_progress_cutover", engine.StateCuttingOver, 95},
-		{"complete", engine.StateCompleted, 100},
-		{"complete_pending_revert", engine.StateRevertWindow, 100},
-		{"complete_error", engine.StateFailed, 0},
-		{"error", engine.StateFailed, 0},
-		{"failed", engine.StateFailed, 0},
-		{"in_progress_cancel", engine.StateStopped, 0},
-		{"cancelled", engine.StateStopped, 0},
-		{"complete_cancel", engine.StateStopped, 0},
-		{"in_progress_revert", engine.StateRunning, 50},
-		{"in_progress_revert_vschema", engine.StateRunning, 50},
-		{"complete_revert", engine.StateReverted, 100},
-		{"complete_revert_error", engine.StateFailed, 0},
-		{"unknown_state", engine.StateRunning, 25},
+		{"pending", engine.StatePending},
+		{"ready", engine.StatePending},
+		{"no_changes", engine.StateCompleted},
+		{"queued", engine.StateRunning},
+		{"submitting", engine.StateRunning},
+		{"in_progress", engine.StateRunning},
+		{"in_progress_vschema", engine.StateRunning},
+		{"pending_cutover", engine.StateWaitingForCutover},
+		{"in_progress_cutover", engine.StateCuttingOver},
+		{"complete", engine.StateCompleted},
+		{"complete_pending_revert", engine.StateRevertWindow},
+		{"complete_error", engine.StateFailed},
+		{"error", engine.StateFailed},
+		{"failed", engine.StateFailed},
+		{"in_progress_cancel", engine.StateStopped},
+		{"cancelled", engine.StateStopped},
+		{"complete_cancel", engine.StateStopped},
+		{"in_progress_revert", engine.StateRunning},
+		{"in_progress_revert_vschema", engine.StateRunning},
+		{"complete_revert", engine.StateReverted},
+		{"complete_revert_error", engine.StateFailed},
+		{"unknown_state", engine.StateRunning},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.deployState, func(t *testing.T) {
-			state, progress := deployStateToEngineState(tt.deployState)
-			assert.Equal(t, tt.expectedState, state)
-			assert.Equal(t, tt.expectedProg, progress)
+			got := deployStateToEngineState(tt.deployState)
+			assert.Equal(t, tt.expectedState, got)
 		})
 	}
 }
