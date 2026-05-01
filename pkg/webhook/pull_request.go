@@ -65,6 +65,15 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 	repo := payload.Repository.FullName
 	pr := payload.PullRequest.Number
 
+	// Reject webhooks from repositories not in the configured allowlist
+	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
+		h.logger.Warn("webhook from unregistered repository", "repo", repo)
+		h.writeJSON(w, http.StatusOK, map[string]string{
+			"message": "repository not registered",
+		})
+		return
+	}
+
 	h.logger.Info("auto-plan triggered",
 		"action", payload.Action,
 		"repo", repo,
@@ -125,10 +134,6 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	if h.service == nil {
-		return
-	}
 
 	// Release all locks held by this PR
 	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)

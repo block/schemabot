@@ -297,6 +297,67 @@ func TestGitHubConfig_ResolvePrivateKey(t *testing.T) {
 	})
 }
 
+func TestServerConfig_IsRepoAllowed(t *testing.T) {
+	t.Run("nil repos allows all", func(t *testing.T) {
+		cfg := ServerConfig{Repos: nil}
+		assert.True(t, cfg.IsRepoAllowed("org/any-repo"))
+		assert.True(t, cfg.IsRepoAllowed(""))
+	})
+
+	t.Run("empty repos allows all", func(t *testing.T) {
+		cfg := ServerConfig{Repos: map[string]RepoConfig{}}
+		assert.True(t, cfg.IsRepoAllowed("org/any-repo"))
+	})
+
+	t.Run("populated repos allows listed repo", func(t *testing.T) {
+		cfg := ServerConfig{
+			Repos: map[string]RepoConfig{
+				"org/allowed-repo": {},
+			},
+		}
+		assert.True(t, cfg.IsRepoAllowed("org/allowed-repo"))
+	})
+
+	t.Run("populated repos rejects unlisted repo", func(t *testing.T) {
+		cfg := ServerConfig{
+			Repos: map[string]RepoConfig{
+				"org/allowed-repo": {},
+			},
+		}
+		assert.False(t, cfg.IsRepoAllowed("org/other-repo"))
+	})
+
+	t.Run("multiple repos allows any listed", func(t *testing.T) {
+		cfg := ServerConfig{
+			Repos: map[string]RepoConfig{
+				"org/repo-a": {},
+				"org/repo-b": {DefaultTernDeployment: "secondary"},
+			},
+		}
+		assert.True(t, cfg.IsRepoAllowed("org/repo-a"))
+		assert.True(t, cfg.IsRepoAllowed("org/repo-b"))
+		assert.False(t, cfg.IsRepoAllowed("org/repo-c"))
+	})
+
+	t.Run("nil receiver allows all", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.True(t, cfg.IsRepoAllowed("org/any-repo"))
+	})
+
+	t.Run("local mode repos as allowlist", func(t *testing.T) {
+		cfg := ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"payments": {Type: "mysql"},
+			},
+			Repos: map[string]RepoConfig{
+				"myorg/payments-service": {},
+			},
+		}
+		assert.True(t, cfg.IsRepoAllowed("myorg/payments-service"))
+		assert.False(t, cfg.IsRepoAllowed("myorg/other-repo"))
+	})
+}
+
 func TestGitHubConfig_ResolveWebhookSecret(t *testing.T) {
 	t.Run("resolves direct value", func(t *testing.T) {
 		g := GitHubConfig{WebhookSecret: "my-secret"}
