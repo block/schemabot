@@ -12,10 +12,23 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 | `schemabot.apply.duration_seconds` | Histogram | database, environment, status | Apply API call time |
 | `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies |
 | `schemabot.webhook.events_total` | Counter | event_type, action, repository, status | GitHub webhook events |
+| `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
+| `schemabot.lock_operations_total` | Counter | operation, database, status | Lock acquire/release operations |
+| `schemabot.recovery.cycles_total` | Counter | — | Recovery worker polling cycles |
+| `schemabot.recovery.recovered_total` | Counter | — | Applies recovered by the recovery worker |
+| `schemabot.recovery.failed_total` | Counter | — | Recovery attempts that failed |
 
 ### Attribute Values
 
 **status** (plans/applies): `success`, `error`, `rejected`
+
+**operation** (control): `cutover`, `stop`, `start`, `volume`, `revert`, `skip_revert`, `rollback_plan`
+
+**status** (control): `success`, `error`, `rejected`
+
+**operation** (locks): `acquire`, `release`
+
+**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `error`
 
 **event_type** (webhooks): `issue_comment`, `pull_request`, `check_run`, `ping`
 

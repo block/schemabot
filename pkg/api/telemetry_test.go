@@ -288,3 +288,57 @@ func TestRecordWebhookEventMetric(t *testing.T) {
 	}
 	assert.True(t, found, "schemabot.webhook.events_total metric not found")
 }
+
+func TestRecordControlOperationMetric(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordControlOperation(t.Context(), "cutover", "mydb", "staging", "success")
+	metrics.RecordControlOperation(t.Context(), "stop", "mydb", "staging", "success")
+	metrics.RecordControlOperation(t.Context(), "start", "mydb", "staging", "error")
+
+	names := collectMetricNames(t, reader)
+	assert.True(t, names["schemabot.control_operations_total"], "expected schemabot.control_operations_total")
+}
+
+func TestRecordLockOperationMetric(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordLockOperation(t.Context(), "acquire", "mydb", "success")
+	metrics.RecordLockOperation(t.Context(), "acquire", "mydb", "conflict")
+	metrics.RecordLockOperation(t.Context(), "release", "mydb", "success")
+
+	names := collectMetricNames(t, reader)
+	assert.True(t, names["schemabot.lock_operations_total"], "expected schemabot.lock_operations_total")
+}
+
+func TestRecordRecoveryCycleMetric(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordRecoveryCycle(t.Context(), 2, 1)
+
+	names := collectMetricNames(t, reader)
+	assert.True(t, names["schemabot.recovery.cycles_total"], "expected schemabot.recovery.cycles_total")
+	assert.True(t, names["schemabot.recovery.recovered_total"], "expected schemabot.recovery.recovered_total")
+	assert.True(t, names["schemabot.recovery.failed_total"], "expected schemabot.recovery.failed_total")
+}

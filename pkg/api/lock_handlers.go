@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -76,6 +77,7 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	err := s.storage.Locks().Acquire(ctx, lock)
 	if errors.Is(err, storage.ErrLockHeld) {
+		metrics.RecordLockOperation(ctx, "acquire", req.Database, "conflict")
 		// Lock is held by someone else - return the current lock info
 		existing, getErr := s.storage.Locks().Get(ctx, req.Database, req.DatabaseType)
 		if getErr != nil || existing == nil {
@@ -90,10 +92,12 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		metrics.RecordLockOperation(ctx, "acquire", req.Database, "error")
 		s.logger.Error("acquire lock failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	metrics.RecordLockOperation(ctx, "acquire", req.Database, "success")
 
 	// Refetch to get created_at
 	acquired, err := s.storage.Locks().Get(ctx, req.Database, req.DatabaseType)
@@ -129,14 +133,17 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 		// Force release - no ownership check
 		err := s.storage.Locks().ForceRelease(ctx, req.Database, req.DatabaseType)
 		if errors.Is(err, storage.ErrLockNotFound) {
+			metrics.RecordLockOperation(ctx, "release", req.Database, "not_found")
 			s.writeError(w, http.StatusNotFound, "lock not found")
 			return
 		}
 		if err != nil {
+			metrics.RecordLockOperation(ctx, "release", req.Database, "error")
 			s.logger.Error("force release lock failed", "error", err)
 			s.writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
+		metrics.RecordLockOperation(ctx, "release", req.Database, "success")
 
 		s.writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
 		return
@@ -150,18 +157,22 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 
 	err := s.storage.Locks().Release(ctx, req.Database, req.DatabaseType, req.Owner)
 	if errors.Is(err, storage.ErrLockNotFound) {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "not_found")
 		s.writeError(w, http.StatusNotFound, "lock not found")
 		return
 	}
 	if errors.Is(err, storage.ErrLockNotOwned) {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "not_owned")
 		s.writeError(w, http.StatusForbidden, "lock is not owned by you")
 		return
 	}
 	if err != nil {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "error")
 		s.logger.Error("release lock failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	metrics.RecordLockOperation(ctx, "release", req.Database, "success")
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
 }
