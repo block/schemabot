@@ -108,6 +108,8 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 **No PR/issue links in code comments.** Don't reference GitHub issues or PRs (e.g., `// fixes #147`) in code comments — they go stale and provide no value to future readers. The git history links commits to issues; code comments should describe *what* and *why*, not *when* or *which ticket*.
 
+**No fragile comments.** Don't include specific counts, thresholds, external project names, or implementation details that will go stale when the code changes. For example, `// 100k rows` will be wrong when someone changes the count. `// uses the misk pattern` means nothing to someone who doesn't know misk. Comments should describe *intent* — the *what* and *why* — not restate the code or reference external context that may not persist.
+
 **No `nolint` directives.** Always fix the underlying lint issue rather than suppressing it with `//nolint:`. If the linter flags something, the code should be changed to satisfy it.
 
 **Instant DDL terminology:** In MySQL, "instant DDL" has a specific meaning — `ALTER TABLE` operations that only modify metadata (e.g., adding a column with `ALGORITHM=INSTANT`). `CREATE TABLE` and `DROP TABLE` are **not** instant DDL even though they complete quickly. Don't describe them as instant in code or comments.

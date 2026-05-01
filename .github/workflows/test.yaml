@@ -100,7 +100,7 @@ jobs:
       - name: "Generate shard matrix"
         id: gen
         run: |
-          NUM_SHARDS=2
+          NUM_SHARDS=3
           tests=$(grep -h -o 'func Test[^(]*' pkg/localscale/*_test.go | sed 's/func //' | grep -v '/' | shuf)
           shards=$(echo "$tests" | awk -v n="$NUM_SHARDS" '
             { bucket[NR % n] = bucket[NR % n] (bucket[NR % n] ? "|" : "") $0 }

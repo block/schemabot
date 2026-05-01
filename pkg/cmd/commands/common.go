@@ -287,7 +287,7 @@ func resolveControlFlags(endpoint, profile string, applyID, database, environmen
 // optionally watches progress. Returns the apply ID (for yield logic, etc.).
 // Used by both RunApply and RunRollback.
 func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, environment, caller, operation string,
-	deferCutover, skipRevert bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration, opts ...client.PlanOptions) (string, error) {
+	deferCutover, deferDeploy, skipRevert bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration, opts ...client.PlanOptions) (string, error) {
 
 	if planResult.PlanID == "" {
 		return "", fmt.Errorf("no plan_id in response")
@@ -299,7 +299,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	}
 	// TUI mode: defer deploy so the user can review the deploy request diff
 	// on PlanetScale before triggering. Non-interactive modes auto-deploy.
-	if watch && format == OutputFormatInteractive {
+	if deferDeploy || (watch && format == OutputFormatInteractive) {
 		options["defer_deploy"] = "true"
 	}
 	if skipRevert {

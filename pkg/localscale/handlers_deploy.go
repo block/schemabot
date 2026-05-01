@@ -215,7 +215,9 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Atomically mark as deployed — deployed=FALSE prevents double-deploy races.
-	migrationContext := fmt.Sprintf("localscale:%d", number)
+	// Include timestamp to ensure uniqueness across reset-state cycles
+	// (which truncate deploy_requests and reset auto-increment numbering).
+	migrationContext := fmt.Sprintf("localscale:%d_%d", number, time.Now().UnixMilli()%1000000)
 	result, err := s.metadataDB.ExecContext(r.Context(),
 		`UPDATE localscale_deploy_requests
 		 SET deployed = TRUE, migration_context = ?, deployment_state = ?

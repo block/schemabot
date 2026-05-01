@@ -402,7 +402,6 @@ func (s *Server) handleCreateBranchPassword(w http.ResponseWriter, r *http.Reque
 	org := r.PathValue("org")
 	database := r.PathValue("db")
 	branch := r.PathValue("branch")
-
 	var body struct {
 		Name string `json:"name"`
 		Role string `json:"role"`

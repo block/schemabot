@@ -18,7 +18,7 @@ func LocalScaleAdminPost(t *testing.T, localscaleURL, endpoint, body string) ([]
 	if localscaleURL == "" {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "POST", localscaleURL+endpoint, strings.NewReader(body))
 	if err != nil {

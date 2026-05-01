@@ -439,11 +439,9 @@ func TestRevertWindowExpiration(t *testing.T) {
 	// Deploy
 	deploy(t, ctx, dr.Number, false)
 
-	// Wait for complete_pending_revert (test uses 5s revert window)
-	dr = waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert)
-	require.Equal(t, drState.CompletePendingRevert, dr.DeploymentState, "test uses 5s revert window, should reach complete_pending_revert")
-
-	// Now wait for the revert window to expire (configured as 5s).
+	// Wait for complete_pending_revert (revert window), then complete.
+	// The 2s revert window is long enough for the poll to catch it reliably.
+	waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert)
 	waitForDeployState(t, ctx, dr.Number, drState.Complete)
 }
 
@@ -549,9 +547,8 @@ func TestDeploySubmittingToQueued(t *testing.T) {
 	assert.Equal(t, drState.Submitting, dr.DeploymentState, "initial deploy state should be submitting")
 
 	// Background goroutine should transition through queued → completion
-	dr = waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert, drState.Complete)
-	require.True(t, dr.DeploymentState == drState.CompletePendingRevert || dr.DeploymentState == drState.Complete,
-		"expected terminal state, got %q", dr.DeploymentState)
+	waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert)
+	waitForDeployState(t, ctx, dr.Number, drState.Complete)
 
 	t.Logf("Verified submitting → queued → complete transition for deploy request %d", dr.Number)
 }

@@ -26,6 +26,7 @@ type ApplyCmd struct {
 	AutoApprove  bool          `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 	Watch        bool          `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
 	DeferCutover bool          `help:"Defer cutover until manual trigger (use 'schemabot cutover')" name:"defer-cutover"`
+	DeferDeploy  bool          `help:"Defer deploy until manual trigger (holds at waiting_for_deploy)" name:"defer-deploy"`
 	SkipRevert   bool          `help:"Skip revert window after completion (Vitess only)" name:"skip-revert"`
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
@@ -238,7 +239,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying changes...")
 
-	if _, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.SkipRevert, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat, opts); err != nil {
+	if _, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat, opts); err != nil {
 		return err
 	}
 

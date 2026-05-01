@@ -364,6 +364,14 @@ Fast mode: `DEBUG=1 go test -tags=integration ./mypackage/...`
 
 Deploy request endpoints (create, deploy, cancel, cutover, revert, throttle) and the background state machine processor are coming in a follow-up PR.
 
+## Online DDL Strategy
+
+LocalScale submits online DDL with the `vitess` strategy and `--singleton-context` flag. This means Vitess rejects new DDL submissions if there is a pending migration from a **different** migration context (each deploy request gets a unique context like `localscale:7`).
+
+This is important for test cleanup: if a test's online DDL migration is still running when the next test starts, the new deploy request will fail with `singleton-context migration rejected`. To avoid this, call `POST /admin/reset-state` between tests — it cancels all pending migrations and waits for them to reach terminal state before returning.
+
+See `buildDDLStrategy()` in `helpers.go` for the full strategy string, and the [Vitess online DDL documentation](https://vitess.io/docs/user-guides/schema-changes/managed-online-schema-changes/) for details on singleton strategies.
+
 ## Differences from Real PlanetScale
 
 1. **Single vtgate**: All branches share the same vtgate. Branch isolation via per-branch databases + TCP proxy
