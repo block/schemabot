@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"time"
+
+	"github.com/block/schemabot/pkg/metrics"
 )
 
 // Recovery worker constants.
@@ -126,6 +128,8 @@ func (s *Service) resumeInProgressApplies(ctx context.Context) {
 			"previous_state", apply.State)
 		recovered++
 	}
+
+	metrics.RecordRecoveryCycle(ctx, recovered, failed)
 
 	if recovered > 0 || failed > 0 {
 		s.logger.Info("recovery worker: cycle complete",

@@ -7,11 +7,20 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
+
+// controlStatus returns "success" if accepted, "rejected" otherwise.
+func controlStatus(accepted bool) string {
+	if accepted {
+		return "success"
+	}
+	return "rejected"
+}
 
 // writeControlError logs and writes an HTTP error for a control operation.
 func (s *Service) writeControlError(w http.ResponseWriter, opName, database string, err error) {
@@ -111,9 +120,11 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 		Environment: req.Environment,
 	})
 	if err != nil {
+		metrics.RecordControlOperation(r.Context(), "cutover", req.Database, req.Environment, "error")
 		s.writeControlError(w, "cutover", req.Database, err)
 		return
 	}
+	metrics.RecordControlOperation(r.Context(), "cutover", req.Database, req.Environment, controlStatus(resp.Accepted))
 
 	s.writeJSON(w, http.StatusOK, &apitypes.ControlResponse{
 		Accepted:     resp.Accepted,
@@ -143,9 +154,11 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 		Environment: req.Environment,
 	})
 	if err != nil {
+		metrics.RecordControlOperation(r.Context(), "stop", req.Database, req.Environment, "error")
 		s.writeControlError(w, "stop", req.Database, err)
 		return
 	}
+	metrics.RecordControlOperation(r.Context(), "stop", req.Database, req.Environment, controlStatus(resp.Accepted))
 
 	s.writeJSON(w, http.StatusOK, &apitypes.StopResponse{
 		Accepted:     resp.Accepted,
@@ -176,9 +189,11 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		Environment: req.Environment,
 	})
 	if err != nil {
+		metrics.RecordControlOperation(r.Context(), "start", req.Database, req.Environment, "error")
 		s.writeControlError(w, "start", req.Database, err)
 		return
 	}
+	metrics.RecordControlOperation(r.Context(), "start", req.Database, req.Environment, controlStatus(resp.Accepted))
 
 	// For remote (gRPC) clients, update local apply state and restart the
 	// background progress poller. Without this, the local applies.state stays
@@ -241,9 +256,11 @@ func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 		Volume:   req.Volume,
 	})
 	if err != nil {
+		metrics.RecordControlOperation(r.Context(), "volume", req.Database, req.Environment, "error")
 		s.writeControlError(w, "volume", req.Database, err)
 		return
 	}
+	metrics.RecordControlOperation(r.Context(), "volume", req.Database, req.Environment, controlStatus(resp.Accepted))
 
 	s.writeJSON(w, http.StatusOK, &apitypes.VolumeResponse{
 		Accepted:       resp.Accepted,
@@ -273,9 +290,11 @@ func (s *Service) handleRevert(w http.ResponseWriter, r *http.Request) {
 		Database: req.Database,
 	})
 	if err != nil {
+		metrics.RecordControlOperation(r.Context(), "revert", req.Database, req.Environment, "error")
 		s.writeControlError(w, "revert", req.Database, err)
 		return
 	}
+	metrics.RecordControlOperation(r.Context(), "revert", req.Database, req.Environment, controlStatus(resp.Accepted))
 
 	s.writeJSON(w, http.StatusOK, &apitypes.ControlResponse{
 		Accepted:     resp.Accepted,
@@ -303,9 +322,11 @@ func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 		Database: req.Database,
 	})
 	if err != nil {
+		metrics.RecordControlOperation(r.Context(), "skip_revert", req.Database, req.Environment, "error")
 		s.writeControlError(w, "skip-revert", req.Database, err)
 		return
 	}
+	metrics.RecordControlOperation(r.Context(), "skip_revert", req.Database, req.Environment, controlStatus(resp.Accepted))
 
 	// Record skip-revert on VitessApplyData for progress visibility
 	if resp.Accepted && req.ApplyID != "" && s.storage != nil && s.storage.Applies() != nil {
@@ -369,9 +390,11 @@ func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.ExecuteRollbackPlan(r.Context(), apply.Database, apply.Environment, apply.Deployment)
 	if err != nil {
+		metrics.RecordControlOperation(r.Context(), "rollback_plan", apply.Database, apply.Environment, "error")
 		s.writeControlError(w, "rollback plan", apply.Database, err)
 		return
 	}
+	metrics.RecordControlOperation(r.Context(), "rollback_plan", apply.Database, apply.Environment, "success")
 
 	// Include database metadata so the caller doesn't need to look it up separately
 	resp.Database = apply.Database
