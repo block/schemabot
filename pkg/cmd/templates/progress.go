@@ -343,12 +343,16 @@ func vschemaStatusLabel(status string) string {
 		return "Pending"
 	case state.Apply.Running:
 		return "Applying..."
+	case state.Apply.WaitingForDeploy:
+		return "Pending"
+	case state.Apply.WaitingForCutover, state.Apply.CuttingOver:
+		return "Applying..."
 	case state.Apply.Completed:
-		return ANSIGreen + "Applied" + ANSIReset
+		return "Applied"
 	case state.Apply.Failed:
 		return ANSIRed + "Failed" + ANSIReset
 	case state.Apply.RevertWindow:
-		return ANSIYellow + "Applied (pending revert)" + ANSIReset
+		return "Applied (pending revert)"
 	default:
 		return status
 	}
@@ -462,7 +466,7 @@ func FormatTableProgress(t TableProgress) string {
 		if op == statement.StatementCreateTable || op == statement.StatementDropTable {
 			label = "Applying..."
 		}
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔄 %s\n", t.TableName, bar, label)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}

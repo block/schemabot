@@ -3016,7 +3016,7 @@ func deployStateToMessage(drState string) string {
 	case deployState.InProgress:
 		return "Deployment in progress"
 	case deployState.InProgressVSchema:
-		return "Applying VSchema changes"
+		return engine.MessageApplyingVSchema
 	case deployState.PendingCutover:
 		return "Waiting for cutover"
 	case deployState.InProgressCutover:

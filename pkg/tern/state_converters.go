@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/spirit/pkg/statement"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
@@ -126,6 +127,17 @@ func changeTypeToProto(op statement.StatementType) ternv1.ChangeType {
 		return ternv1.ChangeType_CHANGE_TYPE_DROP
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER
+	}
+}
+
+// ddlActionToProtoChangeType converts a task's DDLAction string to a proto ChangeType.
+// Handles vschema_update which doesn't come from Spirit's statement parser.
+func ddlActionToProtoChangeType(action string) ternv1.ChangeType {
+	switch action {
+	case "vschema_update":
+		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
+	default:
+		return changeTypeToProto(ddl.OpToStatementType(action))
 	}
 }
 

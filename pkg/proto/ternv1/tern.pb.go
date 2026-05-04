@@ -161,14 +161,15 @@ func (State) EnumDescriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{1}
 }
 
-// ChangeType represents the type of DDL change.
+// ChangeType represents the type of schema change.
 type ChangeType int32
 
 const (
-	ChangeType_CHANGE_TYPE_OTHER  ChangeType = 0
-	ChangeType_CHANGE_TYPE_CREATE ChangeType = 1
-	ChangeType_CHANGE_TYPE_ALTER  ChangeType = 2
-	ChangeType_CHANGE_TYPE_DROP   ChangeType = 3
+	ChangeType_CHANGE_TYPE_OTHER   ChangeType = 0
+	ChangeType_CHANGE_TYPE_CREATE  ChangeType = 1
+	ChangeType_CHANGE_TYPE_ALTER   ChangeType = 2
+	ChangeType_CHANGE_TYPE_DROP    ChangeType = 3
+	ChangeType_CHANGE_TYPE_VSCHEMA ChangeType = 4
 )
 
 // Enum value maps for ChangeType.
@@ -178,12 +179,14 @@ var (
 		1: "CHANGE_TYPE_CREATE",
 		2: "CHANGE_TYPE_ALTER",
 		3: "CHANGE_TYPE_DROP",
+		4: "CHANGE_TYPE_VSCHEMA",
 	}
 	ChangeType_value = map[string]int32{
-		"CHANGE_TYPE_OTHER":  0,
-		"CHANGE_TYPE_CREATE": 1,
-		"CHANGE_TYPE_ALTER":  2,
-		"CHANGE_TYPE_DROP":   3,
+		"CHANGE_TYPE_OTHER":   0,
+		"CHANGE_TYPE_CREATE":  1,
+		"CHANGE_TYPE_ALTER":   2,
+		"CHANGE_TYPE_DROP":    3,
+		"CHANGE_TYPE_VSCHEMA": 4,
 	}
 )
 
@@ -2397,13 +2400,14 @@ const file_tern_proto_rawDesc = "" +
 	"\x1dSTATE_CREATING_DEPLOY_REQUEST\x10\r\x12\x1c\n" +
 	"\x18STATE_WAITING_FOR_DEPLOY\x10\x0e\x12#\n" +
 	"\x1fSTATE_VALIDATING_DEPLOY_REQUEST\x10\x0f\x12\x1b\n" +
-	"\x17STATE_VALIDATING_BRANCH\x10\x10*h\n" +
+	"\x17STATE_VALIDATING_BRANCH\x10\x10*\x81\x01\n" +
 	"\n" +
 	"ChangeType\x12\x15\n" +
 	"\x11CHANGE_TYPE_OTHER\x10\x00\x12\x16\n" +
 	"\x12CHANGE_TYPE_CREATE\x10\x01\x12\x15\n" +
 	"\x11CHANGE_TYPE_ALTER\x10\x02\x12\x14\n" +
-	"\x10CHANGE_TYPE_DROP\x10\x032\xbc\x06\n" +
+	"\x10CHANGE_TYPE_DROP\x10\x03\x12\x17\n" +
+	"\x13CHANGE_TYPE_VSCHEMA\x10\x042\xbc\x06\n" +
 	"\x04Tern\x12H\n" +
 	"\x04Plan\x12\x14.tern.v1.PlanRequest\x1a\x15.tern.v1.PlanResponse\"\x13\x82\xd3\xe4\x93\x02\r:\x01*\"\b/v1/plan\x12L\n" +
 	"\x05Apply\x12\x15.tern.v1.ApplyRequest\x1a\x16.tern.v1.ApplyResponse\"\x14\x82\xd3\xe4\x93\x02\x0e:\x01*\"\t/v1/apply\x12X\n" +

@@ -2504,10 +2504,10 @@ Watching for cutover... (Ctrl+C to detach)
 
   ── testapp ──
 
-     ~ order_items: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+     ~ order_items: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Cutting over...
        ALTER TABLE `order_items` ADD INDEX `idx_product_id`(`product_id`);
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Cutting over...
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 
@@ -3064,7 +3064,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── myapp_sharded ──
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Cutting over...
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
        • Shards: 2 (2 cutting over)
@@ -3284,18 +3284,23 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 │  State:           Running                                                      │
 │  Branch:          schemabot-myapp-28471035                                     │
 │  Deploy Request:  https://app.planetscale.com/my-org/myapp/deploy-requests/45  │
-│  Started:         Jan 15 14:29:45 UTC                                          │
-│  Duration:        15s                                                          │
+│  Started:         Jan 15 14:29:30 UTC                                          │
+│  Duration:        30s                                                          │
 └────────────────────────────────────────────────────────────────────────────────┘
 
 
   ── myapp_sharded ──
 
     ~ VSchema: Applying...
-       + "users": {"column_vindexes": [{"column": "id", "name": "hash"}]}
+       + "xxhash": {"type": "xxhash"}
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Running...
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+
+
+  ── myapp ──
+
+    ~ VSchema: Applied
 
 
 ```
@@ -4236,13 +4241,13 @@ Defer cutover: Cutting over in progress
 └──────────────────────────────────┘
 
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Cutting over...
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Cutting over...
        ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Cutting over...
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 Cutover in progress. This typically completes within seconds.

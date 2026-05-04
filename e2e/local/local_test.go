@@ -441,6 +441,49 @@ CREATE TABLE %s (
 	assert.Equalf(t, 1, count, "table %s should exist after apply", tableName)
 }
 
+func TestLocal_Apply_CreateMultipleTables(t *testing.T) {
+	binPath := buildCLI(t)
+	endpoint := schemabotURL(t)
+
+	table1 := uniqueTableName("multi_alpha")
+	table2 := uniqueTableName("multi_beta")
+	table3 := uniqueTableName("multi_gamma")
+	defer dropTestTable(t, table1)
+	defer dropTestTable(t, table2)
+	defer dropTestTable(t, table3)
+
+	db := openTestappStaging(t)
+	schemaDir := newSchemaDir(t)
+	writeExistingTablesSchema(t, schemaDir)
+
+	for _, tbl := range []string{table1, table2, table3} {
+		e2eutil.WriteFile(t, filepath.Join(schemaDir, tbl+".sql"), fmt.Sprintf(`
+CREATE TABLE %s (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+`, tbl))
+	}
+
+	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "apply",
+		"-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "--watch=false",
+	)
+	e2eutil.AssertContains(t, out, "Apply started")
+
+	testutil.WaitForState(t, endpoint, e2eutil.ParseApplyID(t, out), state.Apply.Completed, 15*time.Second)
+
+	for _, tbl := range []string{table1, table2, table3} {
+		var count int
+		err := db.QueryRowContext(t.Context(), `
+			SELECT COUNT(*) FROM information_schema.TABLES
+			WHERE TABLE_SCHEMA = 'testapp' AND TABLE_NAME = ?
+		`, tbl).Scan(&count)
+		require.NoError(t, err, "query for table %s", tbl)
+		assert.Equalf(t, 1, count, "table %s should exist after apply", tbl)
+	}
+}
+
 func TestLocal_Apply_BlocksUnsafeWithoutFlag(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
