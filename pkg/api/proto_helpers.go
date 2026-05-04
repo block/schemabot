@@ -2,6 +2,7 @@ package api
 
 import (
 	"maps"
+	"strings"
 
 	"github.com/block/spirit/pkg/statement"
 
@@ -101,6 +102,8 @@ func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 		return ddl.StatementTypeToOp(statement.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
 		return ddl.StatementTypeToOp(statement.StatementDropTable)
+	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
+		return "vschema_update"
 	default:
 		return "other"
 	}
@@ -108,6 +111,9 @@ func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 
 // changeTypeToProto converts operation string to proto ChangeType enum.
 func changeTypeToProto(op string) ternv1.ChangeType {
+	if strings.EqualFold(op, "vschema_update") {
+		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
+	}
 	switch ddl.OpToStatementType(op) {
 	case statement.StatementCreateTable:
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE

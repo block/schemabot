@@ -137,6 +137,42 @@ func previewVitessVSchemaOnlyOutput() {
 	WriteProgress(data)
 }
 
+func previewVitessDDLWithVSchemaOutput() {
+	data := ProgressData{
+		State:       state.Apply.Running,
+		Engine:      "PlanetScale",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Database:    "myapp",
+		Environment: "staging",
+		StartedAt:   previewTime.Add(-30 * time.Second).Format(time.RFC3339),
+		Metadata: map[string]string{
+			"branch_name":        "schemabot-myapp-28471035",
+			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/45",
+		},
+		Tables: []TableProgress{
+			{
+				TableName: "users", Namespace: "myapp_sharded",
+				ChangeType:      "alter",
+				DDL:             "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:          state.Apply.Completed,
+				RowsCopied:      50000,
+				RowsTotal:       50000,
+				PercentComplete: 100,
+			},
+			{
+				TableName: "VSchema: myapp_sharded", Namespace: "myapp_sharded",
+				DDL:    `+ "xxhash": {"type": "xxhash"}`,
+				Status: state.Apply.Running,
+			},
+			{
+				TableName: "VSchema: myapp", Namespace: "myapp",
+				Status: state.Apply.Completed,
+			},
+		},
+	}
+	WriteProgress(data)
+}
+
 func previewVitessMultiKeyspaceOutput() {
 	data := ProgressData{
 		State:       state.Apply.Running,
@@ -160,34 +196,6 @@ func previewVitessMultiKeyspaceOutput() {
 				Namespace: "myapp_unsharded",
 				DDL:       "CREATE TABLE `orders_seq` (`id` int unsigned NOT NULL DEFAULT '0', `next_id` bigint unsigned, `cache` bigint unsigned, PRIMARY KEY (`id`)) ENGINE InnoDB",
 				Status:    state.Apply.Running,
-			},
-		},
-	}
-	WriteProgress(data)
-}
-
-func previewVitessDDLWithVSchemaOutput() {
-	data := ProgressData{
-		State:       state.Apply.Running,
-		Engine:      "PlanetScale",
-		ApplyID:     "apply-a1b2c3d4e5f6",
-		Database:    "myapp",
-		Environment: "staging",
-		StartedAt:   previewTime.Add(-15 * time.Second).Format(time.RFC3339),
-		Metadata: map[string]string{
-			"branch_name":        "schemabot-myapp-28471035",
-			"deploy_request_url": "https://app.planetscale.com/my-org/myapp/deploy-requests/45",
-		},
-		Tables: []TableProgress{
-			{
-				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status: state.Apply.Running,
-			},
-			{
-				TableName: "VSchema: myapp_sharded", Namespace: "myapp_sharded",
-				DDL:    `+ "users": {"column_vindexes": [{"column": "id", "name": "hash"}]}`,
-				Status: state.Apply.Running,
 			},
 		},
 	}

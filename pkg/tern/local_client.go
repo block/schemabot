@@ -529,17 +529,15 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		)
 	}
 
-	// Add synthetic VSchema tasks when there are VSchema changes but no DDL
-	// for a given namespace. This ensures the progress API tracks VSchema-only deploys.
-	if len(ddlChanges) == 0 {
-		for ns, nsData := range plan.Namespaces {
-			if len(nsData.VSchema) > 0 {
-				ddlChanges = append(ddlChanges, storage.TableChange{
-					Table:     "VSchema: " + ns,
-					Namespace: ns,
-					Operation: "vschema_update",
-				})
-			}
+	// Create VSchema tasks for namespaces with VSchema changes so the
+	// progress API and TUI can track VSchema application alongside DDL.
+	for ns, nsData := range plan.Namespaces {
+		if len(nsData.VSchema) > 0 {
+			ddlChanges = append(ddlChanges, storage.TableChange{
+				Table:     "VSchema: " + ns,
+				Namespace: ns,
+				Operation: "vschema_update",
+			})
 		}
 	}
 
@@ -768,20 +766,29 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			}
 
 			// Also update the apply record if the engine reports a terminal state
-			// but the apply hasn't been updated yet. This can happen when the
-			// progress handler detects completion before the background polling
-			// goroutine persists it.
+			// but the apply hasn't been updated yet. Only do this when ALL tasks
+			// for this apply are terminal — in sequential mode, the engine reports
+			// "completed" per-task, but the apply isn't done until all tasks finish.
 			if result.State.IsTerminal() {
-				apply, _ := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-				if apply != nil && !state.IsTerminalApplyState(apply.State) {
-					now := time.Now()
-					apply.State = engineStateToStorage(result.State)
-					apply.CompletedAt = &now
-					apply.UpdatedAt = now
-					if err := c.storage.Applies().Update(ctx, apply); err != nil {
-						c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
+				allTerminal := true
+				for _, t := range currentApplyTasks {
+					if !state.IsTerminalTaskState(t.State) {
+						allTerminal = false
+						break
 					}
-					c.logger.Info("apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
+				}
+				if allTerminal {
+					apply, _ := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+					if apply != nil && !state.IsTerminalApplyState(apply.State) {
+						now := time.Now()
+						apply.State = engineStateToStorage(result.State)
+						apply.CompletedAt = &now
+						apply.UpdatedAt = now
+						if err := c.storage.Applies().Update(ctx, apply); err != nil {
+							c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
+						}
+						c.logger.Info("apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
+					}
 				}
 			}
 		}
@@ -809,7 +816,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			Status:     t.State,
 			TaskId:     t.TaskIdentifier,
 			IsInstant:  t.IsInstant || vitessApplyIsInstant,
-			ChangeType: changeTypeToProto(ddl.OpToStatementType(t.DDLAction)),
+			ChangeType: ddlActionToProtoChangeType(t.DDLAction),
 		}
 
 		// Look up engine progress for this table
@@ -820,9 +827,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			tp.RowsCopied = et.RowsCopied
 			tp.RowsTotal = et.RowsTotal
 			tp.EtaSeconds = et.ETASeconds
-			if et.IsInstant {
-				tp.IsInstant = true
-			}
+			tp.IsInstant = et.IsInstant
 			tp.ProgressDetail = et.ProgressDetail
 
 			// Update task timestamps from engine if not already set.
@@ -888,8 +893,12 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// tasks are still pending or when the overall state doesn't yet reflect
 	// real progress (e.g., engine returns "running" during setup).
 	if applyRec, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && applyRec != nil {
-		switch applyRec.State {
-		case state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest, state.Apply.ValidatingBranch, state.Apply.ValidatingDeployRequest:
+		switch {
+		case state.IsBranchSetupPhase(applyRec.State):
+			c.logger.Debug("Progress: overriding task-derived state with apply record setup phase",
+				"task_derived", overallState, "apply_record", applyRec.State)
+			overallState = applyRec.State
+		case state.IsTerminalApplyState(applyRec.State):
 			overallState = applyRec.State
 		}
 	}
@@ -900,6 +909,17 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			if t.State == state.Task.Failed && t.ErrorMessage != "" {
 				errorMessage = t.ErrorMessage
 				break
+			}
+		}
+	}
+
+	// Clamp per-table status to match overall state. Engine per-table progress
+	// can report individual migrations as completed while the deploy request is
+	// still in revert window. All tasks share one deploy request in atomic mode.
+	if state.IsState(overallState, state.Apply.RevertWindow) {
+		for _, tp := range tables {
+			if state.IsState(tp.Status, state.Apply.Completed) {
+				tp.Status = state.Apply.RevertWindow
 			}
 		}
 	}

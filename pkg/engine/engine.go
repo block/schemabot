@@ -333,6 +333,10 @@ const (
 	StateReverted          State = "reverted"
 )
 
+// MessageApplyingVSchema is the engine progress message emitted during the
+// VSchema application phase of a deploy. Used to detect VSchema task transitions.
+const MessageApplyingVSchema = "Applying VSchema changes"
+
 // IsTerminal returns true if this is a final state.
 func (s State) IsTerminal() bool {
 	switch s {

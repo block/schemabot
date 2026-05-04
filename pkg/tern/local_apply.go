@@ -188,10 +188,15 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 	}
 }
 
-// markTasksRunning sets all tasks to running state with a start timestamp.
+// markTasksRunning sets DDL tasks to running state with a start timestamp.
+// VSchema tasks are skipped — their state is driven by the deploy request
+// lifecycle (deriveVSchemaTaskState), not by apply start.
 func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Task) {
 	now := time.Now()
 	for _, task := range tasks {
+		if task.DDLAction == "vschema_update" {
+			continue
+		}
 		task.State = state.Task.Running
 		task.StartedAt = &now
 		task.UpdatedAt = now
@@ -852,13 +857,24 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 	}
 
 	for _, task := range tasks {
+		// VSchema tasks follow deploy-request-level state, not per-migration state.
+		// They have no SHOW VITESS_MIGRATIONS rows. Their state transitions are:
+		// pending → running (during in_progress_vschema) → completed/failed.
+		if task.DDLAction == "vschema_update" {
+			vsState := c.deriveVSchemaTaskState(task, result, newState, now)
+			if vsState != task.State {
+				msg := fmt.Sprintf("VSchema %s → %s", task.State, vsState)
+				c.transitionTaskState(ctx, task, task.ApplyID, vsState, msg)
+			}
+			continue
+		}
+
 		if tp, ok := engineProgressForTask(tableProgress, task); ok {
 			task.RowsCopied = tp.RowsCopied
 			task.RowsTotal = tp.RowsTotal
 			task.ProgressPercent = tp.Progress
 			task.ETASeconds = int(tp.ETASeconds)
 			task.IsInstant = tp.IsInstant
-			// Use engine-reported timestamps (from SHOW VITESS_MIGRATIONS) if available.
 			if tp.StartedAt != nil && task.StartedAt == nil {
 				task.StartedAt = tp.StartedAt
 			}
@@ -871,9 +887,6 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 				task.ProgressPercent = 100
 			}
 		}
-		// For tasks transitioning to a non-pending state without a started_at
-		// (e.g., instant DDL where SHOW VITESS_MIGRATIONS has no timestamp),
-		// use the current time.
 		if task.StartedAt == nil && newState != state.Task.Pending {
 			task.StartedAt = &now
 		}
@@ -881,6 +894,41 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 			task.CompletedAt = &now
 		}
 		c.transitionTaskState(ctx, task, 0, newState, "")
+	}
+}
+
+// deriveVSchemaTaskState determines the state for a VSchema task based on
+// the engine progress result. VSchema tasks have no per-migration rows in
+// SHOW VITESS_MIGRATIONS — their state tracks the deploy request's VSchema
+// application phase (in_progress_vschema).
+func (c *LocalClient) deriveVSchemaTaskState(task *storage.Task, result *engine.ProgressResult, taskState string, now time.Time) string {
+	if state.IsTerminalTaskState(task.State) {
+		return task.State
+	}
+
+	switch {
+	case result.Message == engine.MessageApplyingVSchema:
+		if task.StartedAt == nil {
+			task.StartedAt = &now
+		}
+		return state.Task.Running
+	case result.State == engine.StateFailed:
+		if task.CompletedAt == nil {
+			task.CompletedAt = &now
+		}
+		return state.Task.Failed
+	case state.IsState(taskState, state.Task.RevertWindow):
+		if task.CompletedAt == nil {
+			task.CompletedAt = &now
+		}
+		return state.Task.RevertWindow
+	case result.State.IsTerminal(), state.IsState(taskState, state.Task.Completed):
+		if task.CompletedAt == nil {
+			task.CompletedAt = &now
+		}
+		return state.Task.Completed
+	default:
+		return task.State
 	}
 }
 
@@ -1044,7 +1092,7 @@ func deriveOverallState(tasks []*storage.Task) string {
 		return state.Task.Pending
 	}
 
-	var hasRunning, hasPending, hasStopped, hasFailed, hasCancelled, hasCompleted bool
+	var hasRunning, hasPending, hasStopped, hasFailed, hasCancelled, hasCompleted, hasRevertWindow bool
 	var runningState string
 
 	for _, t := range tasks {
@@ -1068,6 +1116,8 @@ func deriveOverallState(tasks []*storage.Task) string {
 			hasCancelled = true
 		case state.Task.Completed:
 			hasCompleted = true
+		case state.Task.RevertWindow:
+			hasRevertWindow = true
 		}
 	}
 
@@ -1085,6 +1135,9 @@ func deriveOverallState(tasks []*storage.Task) string {
 		// Cancelled implies a prior task failed (sequential mode), so overall is failed.
 		// For Vitess cancellation (user-initiated), the apply state is set directly.
 		return state.Task.Failed
+	}
+	if hasRevertWindow {
+		return state.Task.RevertWindow
 	}
 	if hasCompleted {
 		return state.Task.Completed

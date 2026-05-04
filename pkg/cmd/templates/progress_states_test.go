@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
@@ -84,6 +85,37 @@ func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	}
 	output := FormatTableProgress(tp)
 	assert.Contains(t, output, "Cutting over...")
+}
+
+func TestVSchemaStatusLabel(t *testing.T) {
+	assert.Equal(t, "Pending", vschemaStatusLabel(state.Apply.Pending))
+	assert.Equal(t, "Pending", vschemaStatusLabel(state.Apply.WaitingForDeploy))
+	assert.Contains(t, vschemaStatusLabel(state.Apply.Running), "Applying")
+	assert.Contains(t, vschemaStatusLabel(state.Apply.WaitingForCutover), "Applying")
+	assert.Contains(t, vschemaStatusLabel(state.Apply.CuttingOver), "Applying")
+	assert.Contains(t, vschemaStatusLabel(state.Apply.Completed), "Applied")
+	assert.Contains(t, vschemaStatusLabel(state.Apply.Failed), "Failed")
+	assert.Contains(t, vschemaStatusLabel(state.Apply.RevertWindow), "pending revert")
+}
+
+func TestVSchemaTaskRenderedWithDDLTasks(t *testing.T) {
+	tables := []TableProgress{
+		{TableName: "users", Namespace: "myapp_sharded", Status: state.Apply.Completed, DDL: "ALTER TABLE `users` ADD COLUMN `phone` varchar(20)"},
+		{TableName: "VSchema: myapp_sharded", Namespace: "myapp_sharded", Status: state.Apply.Running},
+	}
+	result := FormatNamespacedTables(tables)
+	assert.Contains(t, result, "VSchema")
+	assert.Contains(t, result, "users")
+	vsIdx := strings.Index(result, "VSchema")
+	usersIdx := strings.Index(result, "users:")
+	assert.Less(t, vsIdx, usersIdx, "VSchema should render before DDL tables")
+}
+
+func TestIsVSchemaTask_Variants(t *testing.T) {
+	assert.True(t, isVSchemaTask(TableProgress{TableName: "VSchema"}))
+	assert.True(t, isVSchemaTask(TableProgress{TableName: "VSchema: myapp_sharded"}))
+	assert.True(t, isVSchemaTask(TableProgress{TableName: "vschema:myapp"}))
+	assert.False(t, isVSchemaTask(TableProgress{TableName: "users"}))
 }
 
 func TestStateColorFunc_PlanetScalePhases(t *testing.T) {

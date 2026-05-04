@@ -190,10 +190,10 @@ func vitessRestoreBaseSchema(t *testing.T, _ string) {
 	t.Logf("vitessRestoreBaseSchema: resetState done (elapsed=%s)", time.Since(start))
 	clearSchemaBotState(t)
 	t.Logf("vitessRestoreBaseSchema: clearState done (elapsed=%s)", time.Since(start))
-	vitessResetVSchema(t)
-	t.Logf("vitessRestoreBaseSchema: resetVSchema done (elapsed=%s)", time.Since(start))
 	vitessCleanupSchema(t)
 	t.Logf("vitessRestoreBaseSchema: cleanup done (elapsed=%s)", time.Since(start))
+	vitessResetVSchema(t)
+	t.Logf("vitessRestoreBaseSchema: resetVSchema done (elapsed=%s)", time.Since(start))
 }
 
 // vitessCleanupSchema restores each keyspace to the base schema using Spirit's
@@ -1035,6 +1035,79 @@ func TestVitess_Apply_VSchemaWithDDL(t *testing.T) {
 
 	out := vitessApplyAndWait(t, schemaDir, "staging")
 	e2eutil.AssertContains(t, out, colName)
+}
+
+func TestVitess_Apply_VSchemaTaskTracking(t *testing.T) {
+	vitessAvailable(t)
+	clearSchemaBotState(t)
+	defer vitessRestoreBaseSchema(t, "staging")
+
+	endpoint := schemabotURL(t)
+	colName := fmt.Sprintf("vt_col_%d", time.Now().UnixMilli()%100000)
+	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
+		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
+		"testapp_sharded/vschema.json": `{
+  "sharded": true,
+  "vindexes": {
+    "hash": {"type": "hash"},
+    "xxhash": {"type": "xxhash"}
+  },
+  "tables": {
+    "users": {
+      "column_vindexes": [{"column": "id", "name": "hash"}],
+      "auto_increment": {"column": "id", "sequence": "users_seq"}
+    },
+    "orders": {
+      "column_vindexes": [{"column": "user_id", "name": "hash"}],
+      "auto_increment": {"column": "id", "sequence": "orders_seq"}
+    },
+    "products": {
+      "column_vindexes": [{"column": "id", "name": "hash"}],
+      "auto_increment": {"column": "id", "sequence": "products_seq"}
+    }
+  }
+}`,
+	}))
+
+	binPath := buildCLI(t)
+	applyOut := e2eutil.RunCLI(t, binPath, schemaDir, "apply",
+		"-s", ".", "-e", "staging", "--endpoint", endpoint,
+		"-y", "-o", "log", "--no-watch", "--allow-unsafe",
+	)
+	applyID := extractApplyIDFromLog(applyOut)
+	require.NotEmpty(t, applyID)
+
+	// Poll progress until completion, verifying VSchema tasks appear
+	var foundVSchemaTask bool
+	var vschemaChangeType string
+	var finalState string
+	deadline := time.Now().Add(testutil.PollDeadline)
+	for time.Now().Before(deadline) {
+		resp, err := client.GetProgress(endpoint, applyID)
+		if err == nil {
+			for _, tbl := range resp.Tables {
+				if tbl.ChangeType == "vschema_update" {
+					foundVSchemaTask = true
+					vschemaChangeType = tbl.ChangeType
+				}
+			}
+			if state.IsTerminalApplyState(resp.State) {
+				finalState = resp.State
+				// Verify all tables (including VSchema) reached terminal state
+				for _, tbl := range resp.Tables {
+					assert.True(t, state.IsTerminalApplyState(state.NormalizeTaskStatus(tbl.Status)),
+						"table %s should be terminal, got %s", tbl.TableName, tbl.Status)
+				}
+				break
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	assert.True(t, foundVSchemaTask, "expected VSchema task in progress tables")
+	assert.Equal(t, "vschema_update", vschemaChangeType)
+	require.NotEmpty(t, finalState, "apply did not reach terminal state")
+	assert.Equal(t, state.Apply.Completed, finalState)
 }
 
 // --- Apply: Unsafe (DROP) ---

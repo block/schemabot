@@ -219,12 +219,13 @@ enum State {
   STATE_VALIDATING_BRANCH = 16;
 }
 
-// ChangeType represents the type of DDL change.
+// ChangeType represents the type of schema change.
 enum ChangeType {
   CHANGE_TYPE_OTHER = 0;
   CHANGE_TYPE_CREATE = 1;
   CHANGE_TYPE_ALTER = 2;
   CHANGE_TYPE_DROP = 3;
+  CHANGE_TYPE_VSCHEMA = 4;
 }
 
 // SchemaFiles contains the schema files for a namespace (e.g. schema name for MySQL, keyspace for Vitess).
