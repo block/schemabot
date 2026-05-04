@@ -1,0 +1,51 @@
+# Dex OIDC Provider Configuration (Local Development)
+#
+# Provides a local OIDC provider for testing SchemaBot's authentication.
+# Start with: docker compose --profile oidc up
+#
+# Test user:
+#   Email:    admin@example.com
+#   Password: password
+#   Groups:   admins
+#
+# Token endpoint (from host): http://localhost:5556/dex
+# JWKS endpoint:              http://localhost:5556/dex/keys
+
+issuer: http://localhost:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+oauth2:
+  # Skip the "Grant access to ..." approval screen for faster dev iteration.
+  skipApprovalScreen: true
+
+staticClients:
+  - id: schemabot
+    name: SchemaBot CLI
+    public: true
+    redirectURIs:
+      - "http://localhost:5555/callback"
+      - "urn:ietf:wg:oauth:2.0:oob"
+
+enablePasswordDB: true
+
+staticPasswords:
+  - email: admin@example.com
+    # bcrypt hash of "password"
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: admin
+    userID: "admin-001"
+    groups:
+      - admins
+
+  - email: viewer@example.com
+    # bcrypt hash of "password"
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: viewer
+    userID: "viewer-001"
+    groups:
+      - viewers

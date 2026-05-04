@@ -75,6 +75,70 @@ When a webhook arrives from an unlisted repository:
 
 If `repos` is not configured or empty, all repositories are allowed.
 
+## Authentication
+
+SchemaBot supports OIDC-based authentication for API endpoints. When enabled, read endpoints require a valid JWT Bearer token, and write endpoints (plan, apply, cutover, stop, start) additionally require membership in a configured admin group.
+
+```yaml
+auth:
+  type: oidc
+  issuer: "https://your-oidc-provider.example.com"
+  audience: "schemabot"       # optional — skip audience validation if empty
+  admin_group: "schema-admins"
+  groups_claim: "groups"      # optional — defaults to "groups"
+```
+
+When `auth.type` is empty or `"none"`, authentication is disabled and all API requests are allowed (the default for backwards compatibility).
+
+### Testing OIDC Locally with Dex
+
+The local development stack includes an optional [Dex](https://dexidp.io/) OIDC provider for testing authentication end-to-end without external dependencies.
+
+**Start the stack with OIDC:**
+
+```bash
+docker compose --profile oidc up
+```
+
+This starts a Dex instance alongside the standard services, plus a `schemabot-oidc` service that validates tokens against Dex. The OIDC-enabled SchemaBot runs on port `13380` (the standard SchemaBot on `13370` remains available without auth).
+
+**Dex endpoints (from host):**
+
+| Endpoint | URL |
+|---|---|
+| Discovery | `http://localhost:5556/dex/.well-known/openid-configuration` |
+| JWKS | `http://localhost:5556/dex/keys` |
+| Authorization | `http://localhost:5556/dex/auth` |
+| Token | `http://localhost:5556/dex/token` |
+
+**Test users** (defined in `deploy/local/config/dex.yaml`):
+
+| Email | Password | Groups | Access |
+|---|---|---|---|
+| `admin@example.com` | `password` | `admins` | Read + Write |
+| `viewer@example.com` | `password` | `viewers` | Read only |
+
+**Get a test token:**
+
+```bash
+# Interactive browser flow — opens Dex login page, returns a JWT.
+TOKEN=$(./scripts/get-oidc-token.sh)
+
+# Verify auth is working on read endpoints:
+curl -H "Authorization: Bearer $TOKEN" http://localhost:13380/api/databases
+
+# Verify write access (admin user):
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  http://localhost:13380/api/databases/testapp/environments/staging/plan
+
+# Verify unauthenticated requests are rejected:
+curl http://localhost:13380/api/databases
+# => {"error":"invalid or missing authentication token"}
+```
+
+The Dex configuration is at `deploy/local/config/dex.yaml` and the OIDC-enabled SchemaBot config is at `deploy/local/config/local-oidc.yaml`.
+
 ## Secret Resolution
 
 DSN values support secret resolution prefixes:

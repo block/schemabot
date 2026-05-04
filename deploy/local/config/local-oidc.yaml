@@ -1,0 +1,42 @@
+# SchemaBot Configuration (Local Mode with OIDC Authentication)
+#
+# Extends the standard local config with OIDC authentication against a local
+# Dex instance. Start the Dex container with: docker compose --profile oidc up
+#
+# To use this config, set SCHEMABOT_CONFIG_FILE=/config/local-oidc.yaml in
+# the schemabot service environment (or use the schemabot-oidc service).
+
+# OIDC authentication against local Dex instance.
+# The issuer URL uses the Docker network hostname (container-to-container).
+auth:
+  type: oidc
+  issuer: "http://dex:5556/dex"
+  admin_group: admins
+
+# SchemaBot's own storage database
+storage:
+  dsn: "env:MYSQL_DSN"
+
+# Database configurations — same as local.yaml.
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root:testpassword@tcp(mysql-staging:3306)/testapp?parseTime=true"
+      production:
+        dsn: "root:testpassword@tcp(mysql-production:3306)/testapp?parseTime=true"
+
+  testapp-vitess:
+    type: vitess
+    environments:
+      staging:
+        dsn: "root@tcp(localscale:19101)/"
+        api_url: "http://localscale:8080"
+        organization: "localscale-staging"
+        token_secret_ref: "env:PS_TOKEN"
+      production:
+        dsn: "root@tcp(localscale:19100)/"
+        api_url: "http://localscale:8080"
+        organization: "localscale-production"
+        token_secret_ref: "env:PS_TOKEN"
