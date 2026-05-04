@@ -6,12 +6,18 @@
 #   make down       # Stop
 #   make logs       # View logs
 #
+# OIDC Authentication (opt-in):
+#   docker compose --profile oidc up
+#   See docs/configuration.md for test credentials and token helper script.
+#
 # Endpoints:
 #   SchemaBot API:     http://localhost:13370
+#   SchemaBot (OIDC):  http://localhost:13380 (--profile oidc)
 #   SchemaBot MySQL:   localhost:13371 (schemabot storage)
 #   Staging MySQL:     localhost:13372 (testapp database)
 #   Production MySQL:  localhost:13373 (testapp database)
 #   LocalScale API:    http://localhost:13374
+#   Dex OIDC:          http://localhost:5556 (--profile oidc)
 #   Branch Proxies:    localhost:19100-19199 (vtgate MySQL via branch passwords)
 #
 # For gRPC mode with separate Tern services, see docker-compose.grpc.yml.
@@ -119,6 +125,59 @@ services:
       mysql-production:
         condition: service_healthy
       localscale:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Dex OIDC provider for local authentication testing.
+  # Only starts with: docker compose --profile oidc up
+  # Provides a local OIDC issuer with static test users.
+  # See config/dex.yaml for test credentials.
+  dex:
+    image: ghcr.io/dexidp/dex:latest
+    profiles: ["oidc"]
+    ports:
+      - "${DEX_PORT:-5556}:5556"
+    volumes:
+      - ./config/dex.yaml:/etc/dex/config.yaml:ro
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5556/dex/.well-known/openid-configuration"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # SchemaBot with OIDC authentication enabled (uses local Dex).
+  # Only starts with: docker compose --profile oidc up
+  # Replaces the default schemabot service when testing auth.
+  schemabot-oidc:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    profiles: ["oidc"]
+    environment:
+      MYSQL_DSN: "root:testpassword@tcp(mysql-schemabot:3306)/schemabot?parseTime=true&multiStatements=true"
+      SCHEMABOT_CONFIG_FILE: "/config/local-oidc.yaml"
+      PS_TOKEN: "localscale:localscale"
+      PORT: "8080"
+      LOG_LEVEL: "debug"
+    volumes:
+      - ./config:/config:ro
+    ports:
+      - "${SCHEMABOT_OIDC_PORT:-13380}:8080"
+    depends_on:
+      mysql-schemabot:
+        condition: service_healthy
+      mysql-staging:
+        condition: service_healthy
+      mysql-production:
+        condition: service_healthy
+      localscale:
+        condition: service_healthy
+      dex:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]

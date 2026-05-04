@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/auth"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
@@ -136,9 +137,18 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	}
 	mux.Handle("POST /webhook", webhookHandler)
 
+	// Set up authentication middleware based on config.
+	// The auth middleware wraps the mux so it runs before any handler.
+	// Webhook/health/metrics endpoints are excluded within the middleware itself.
+	authz, err := buildAuthorizer(ctx, serverConfig.Auth, logger)
+	if err != nil {
+		return fmt.Errorf("setup auth: %w", err)
+	}
+	authedHandler := authz.Middleware(mux)
+
 	// Wrap mux with OTel HTTP instrumentation for automatic request
 	// duration, request body size, and response body size metrics.
-	handler := otelhttp.NewHandler(mux, "schemabot")
+	handler := otelhttp.NewHandler(authedHandler, "schemabot")
 
 	// Create server
 	server := &http.Server{
@@ -269,6 +279,33 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// buildAuthorizer creates the appropriate Authorizer based on config.
+// When auth.type is "oidc", it performs OIDC provider discovery and sets up
+// JWT validation. When auth.type is empty, it returns a NoneAuthorizer that
+// allows all requests.
+func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, logger *slog.Logger) (auth.Authorizer, error) {
+	switch cfg.Type {
+	case "oidc":
+		logger.Info("initializing OIDC authentication", "issuer", cfg.Issuer, "admin_group", cfg.AdminGroup)
+		authz, err := auth.NewOIDCAuthorizer(ctx, auth.OIDCConfig{
+			Issuer:      cfg.Issuer,
+			Audience:    cfg.Audience,
+			AdminGroup:  cfg.AdminGroup,
+			GroupsClaim: cfg.GroupsClaim,
+		}, logger)
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("OIDC authentication enabled", "issuer", cfg.Issuer)
+		return authz, nil
+	case "", "none":
+		logger.Info("authentication disabled — all API requests allowed")
+		return auth.NoneAuthorizer{}, nil
+	default:
+		return nil, fmt.Errorf("unknown auth type %q", cfg.Type)
+	}
 }
 
 func logLevel() slog.Level {

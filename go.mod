@@ -13,7 +13,9 @@ require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/docker/go-connections v0.6.0
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-mysql-org/go-mysql v1.13.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/google/go-github/v68 v68.0.0

@@ -18,6 +18,11 @@ type ServerConfig struct {
 	// If not specified, falls back to MYSQL_DSN environment variable.
 	Storage StorageConfig `yaml:"storage"`
 
+	// Auth configures API authentication and authorization.
+	// When Type is "oidc", requests must include a valid JWT Bearer token.
+	// When Type is empty (default), all requests are allowed (backwards compatible).
+	Auth AuthConfig `yaml:"auth"`
+
 	// GitHub configures the GitHub App integration for webhook-driven schema changes.
 	// If not set, the webhook endpoint is not registered.
 	GitHub GitHubConfig `yaml:"github"`
@@ -35,6 +40,30 @@ type ServerConfig struct {
 
 	// DefaultReviewers are GitHub teams/users required to review schema changes.
 	DefaultReviewers []string `yaml:"default_reviewers"`
+}
+
+// AuthConfig configures API authentication and authorization.
+type AuthConfig struct {
+	// Type is the authentication type: "oidc" or "" (none).
+	// When empty, authentication is disabled and all requests are allowed.
+	Type string `yaml:"type"`
+
+	// Issuer is the OIDC provider's issuer URL (e.g., "https://accounts.google.com").
+	// Required when Type is "oidc".
+	Issuer string `yaml:"issuer"`
+
+	// Audience is the expected audience (aud) claim in the JWT.
+	// Optional — if empty, audience validation is skipped.
+	Audience string `yaml:"audience"`
+
+	// AdminGroup is the group required for write operations
+	// (e.g., plan, apply, cutover, stop, start).
+	// Required when Type is "oidc".
+	AdminGroup string `yaml:"admin_group"`
+
+	// GroupsClaim is the JWT claim containing group memberships.
+	// Defaults to "groups" if not set.
+	GroupsClaim string `yaml:"groups_claim"`
 }
 
 // GitHubConfig configures the GitHub App used for webhook-driven schema changes.
@@ -243,7 +272,32 @@ func (c *ServerConfig) Validate() error {
 		}
 	}
 
+	// Validate auth config
+	if err := c.Auth.Validate(); err != nil {
+		return fmt.Errorf("auth config: %w", err)
+	}
+
 	return nil
+}
+
+// Validate checks the auth configuration for consistency.
+// When Type is "oidc", Issuer and AdminGroup are required.
+// When Type is empty, no validation is needed (auth disabled).
+func (a *AuthConfig) Validate() error {
+	switch a.Type {
+	case "", "none":
+		return nil
+	case "oidc":
+		if a.Issuer == "" {
+			return fmt.Errorf("issuer is required when auth type is oidc")
+		}
+		if a.AdminGroup == "" {
+			return fmt.Errorf("admin_group is required when auth type is oidc")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown auth type %q (supported: oidc)", a.Type)
+	}
 }
 
 // Database returns the database configuration for the given name.
