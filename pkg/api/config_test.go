@@ -358,6 +358,64 @@ func TestServerConfig_IsRepoAllowed(t *testing.T) {
 	})
 }
 
+func TestServerConfig_IsEnvironmentAllowed(t *testing.T) {
+	t.Run("nil allowed_environments allows all", func(t *testing.T) {
+		cfg := ServerConfig{AllowedEnvironments: nil}
+		assert.True(t, cfg.IsEnvironmentAllowed("staging"))
+		assert.True(t, cfg.IsEnvironmentAllowed("production"))
+		assert.True(t, cfg.IsEnvironmentAllowed(""))
+	})
+
+	t.Run("empty allowed_environments allows all", func(t *testing.T) {
+		cfg := ServerConfig{AllowedEnvironments: []string{}}
+		assert.True(t, cfg.IsEnvironmentAllowed("staging"))
+		assert.True(t, cfg.IsEnvironmentAllowed("production"))
+	})
+
+	t.Run("listed environment is allowed", func(t *testing.T) {
+		cfg := ServerConfig{AllowedEnvironments: []string{"staging"}}
+		assert.True(t, cfg.IsEnvironmentAllowed("staging"))
+	})
+
+	t.Run("unlisted environment is rejected", func(t *testing.T) {
+		cfg := ServerConfig{AllowedEnvironments: []string{"staging"}}
+		assert.False(t, cfg.IsEnvironmentAllowed("production"))
+	})
+
+	t.Run("multiple environments", func(t *testing.T) {
+		cfg := ServerConfig{AllowedEnvironments: []string{"staging", "production"}}
+		assert.True(t, cfg.IsEnvironmentAllowed("staging"))
+		assert.True(t, cfg.IsEnvironmentAllowed("production"))
+		assert.False(t, cfg.IsEnvironmentAllowed("sandbox"))
+	})
+
+	t.Run("nil receiver allows all", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.True(t, cfg.IsEnvironmentAllowed("staging"))
+		assert.True(t, cfg.IsEnvironmentAllowed(""))
+	})
+
+	t.Run("YAML deserialization", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "config.yaml")
+		content := `
+tern_deployments:
+  default:
+    staging: "localhost:9090"
+allowed_environments:
+  - staging
+`
+		err := os.WriteFile(configPath, []byte(content), 0644)
+		require.NoError(t, err)
+
+		cfg, err := LoadServerConfigFromFile(configPath)
+		require.NoError(t, err)
+
+		assert.True(t, cfg.IsEnvironmentAllowed("staging"))
+		assert.False(t, cfg.IsEnvironmentAllowed("production"))
+	})
+}
+
 func TestGitHubConfig_ResolveWebhookSecret(t *testing.T) {
 	t.Run("resolves direct value", func(t *testing.T) {
 		g := GitHubConfig{WebhookSecret: "my-secret"}

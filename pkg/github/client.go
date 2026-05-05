@@ -279,6 +279,43 @@ func (ic *InstallationClient) UpdateCheckRun(ctx context.Context, repo string, c
 	return nil
 }
 
+// CheckRunResult holds the key fields from a GitHub Check Run.
+type CheckRunResult struct {
+	ID         int64
+	Name       string
+	Status     string // "queued", "in_progress", "completed"
+	Conclusion string // "success", "failure", "neutral", "action_required"
+}
+
+// FindCheckRunByName searches for a check run on a specific commit by name.
+// Returns nil if no matching check run is found.
+func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*CheckRunResult, error) {
+	owner, repoName := splitRepo(repo)
+	opts := &gh.ListCheckRunsOptions{
+		CheckName: new(checkName),
+		ListOptions: gh.ListOptions{
+			PerPage: 1,
+		},
+	}
+
+	result, _, err := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, headSHA, opts)
+	if err != nil {
+		return nil, fmt.Errorf("list check runs for %s: %w", checkName, err)
+	}
+
+	if len(result.CheckRuns) == 0 {
+		return nil, nil
+	}
+
+	cr := result.CheckRuns[0]
+	return &CheckRunResult{
+		ID:         cr.GetID(),
+		Name:       cr.GetName(),
+		Status:     cr.GetStatus(),
+		Conclusion: cr.GetConclusion(),
+	}, nil
+}
+
 // TreeEntry represents a single entry in a Git tree.
 type TreeEntry struct {
 	Path string

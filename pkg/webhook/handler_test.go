@@ -292,8 +292,10 @@ func TestWebhookNoMention(t *testing.T) {
 func TestWebhookEyesReaction(t *testing.T) {
 	h, _, reactions := newTestHandler(t)
 
+	// Use an env-scoped command that reaches the reaction point (after all
+	// skip/filter checks). Help returns before the reaction fires.
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot help",
+		comment: "schemabot plan -e staging",
 		isPR:    true,
 	}, nil)
 
