@@ -27,7 +27,7 @@ func (s *Service) handleTernHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := client.Health(r.Context()); err != nil {
-		s.logger.Error("tern health check failed", "deployment", deployment, "environment", environment, "error", err)
+		s.logger.Error("tern health check failed", "deployment", deployment, "environment", environment, "endpoint", client.Endpoint(), "error", err)
 		s.writeError(w, http.StatusServiceUnavailable, "tern unavailable")
 		return
 	}

@@ -57,6 +57,11 @@ type Client interface {
 	// with stale heartbeats (crashed workers).
 	ResumeApply(ctx context.Context, apply *storage.Apply) error
 
+	// Endpoint returns the address this client connects to.
+	// For GRPCClient, this is the dial address (e.g., "tern-staging:9090").
+	// For LocalClient, this is the database name.
+	Endpoint() string
+
 	// IsRemote reports whether this client delegates to a separate Tern
 	// service with its own storage.
 	//
