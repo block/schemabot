@@ -35,7 +35,8 @@ if [ -z "$SECRET_ID" ] && command -v terraform &> /dev/null && [ -d .terraform ]
     SECRET_ID=$(terraform output -raw github_app_secret_id 2>/dev/null || true)
 fi
 if [ -z "$SECRET_ID" ]; then
-    SECRET_ID="schemabot-example/github-app"
+    echo "❌ Could not determine GitHub App secret ID. Run from the environment directory with Terraform initialized."
+    exit 1
 fi
 
 # Prompt and validate each input immediately
