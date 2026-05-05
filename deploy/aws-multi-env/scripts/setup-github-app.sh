@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Store GitHub App credentials in AWS Secrets Manager
-# Usage: ./setup-github-app.sh [--profile PROFILE] [--secret-id ID] [--deploy]
+# Usage: cd deploy/aws-multi-env/staging && ../scripts/setup-github-app.sh [--profile PROFILE] [--secret-id ID] [--deploy]
 #
 # Prompts for App ID, private key file, and webhook secret.
 # Safe to re-run — creates the secret if missing, updates if it exists.
@@ -23,12 +23,11 @@ done
 export AWS_PROFILE
 
 REGION="us-west-2"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 
 echo "🔐 GitHub App Setup"
 echo "======================"
 echo ""
-
-cd "$(dirname "$0")/.."
 
 # Derive secret name from Terraform output (falls back to default)
 SECRET_ID="${GITHUB_APP_SECRET_ID}"
@@ -87,8 +86,8 @@ echo "   ✅ Credentials stored"
 
 if [ "$DEPLOY" = true ]; then
     echo ""
-    exec ./scripts/deploy.sh
+    exec "$SCRIPT_DIR/deploy.sh"
 else
     echo ""
-    echo "Run ./scripts/deploy.sh to deploy with the new credentials."
+    echo "Run ../scripts/deploy.sh to deploy with the new credentials."
 fi

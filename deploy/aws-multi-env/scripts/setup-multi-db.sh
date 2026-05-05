@@ -4,7 +4,7 @@ set -euo pipefail
 # Setup multiple databases on existing RDS instances for multi-app testing.
 # Creates databases and Secrets Manager DSN entries by cloning the testapp config.
 #
-# Usage: ./setup-multi-db.sh [database names...]
+# Usage: cd deploy/aws-multi-env/staging && ../scripts/setup-multi-db.sh [database names...]
 # Default: payments orders inventory
 #
 # Prerequisites:
@@ -12,7 +12,7 @@ set -euo pipefail
 #   - AWS CLI configured with correct region
 #   - SSM access to bastion instance
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 REGION="${AWS_DEFAULT_REGION:-us-west-2}"
 PREFIX="schemabot-example"
 if [ $# -gt 0 ]; then
@@ -28,8 +28,7 @@ echo "  Prefix:    $PREFIX"
 echo "  Databases: ${DATABASES[*]}"
 echo ""
 
-# Get terraform output for bastion and endpoints
-cd "$SCRIPT_DIR/../"
+# Get terraform output for bastion and endpoints (CWD is the environment directory)
 TF_OUTPUT=$(terraform output -json 2>/dev/null)
 BASTION_ID=$(echo "$TF_OUTPUT" | jq -r '.bastion_instance_id.value // empty')
 
@@ -196,5 +195,5 @@ echo "✅ Multi-database setup complete!"
 echo ""
 echo "Next steps:"
 echo "  1. Update deploy/aws/config.yaml with the config above"
-echo "  2. Deploy: deploy/aws/scripts/deploy.sh"
+echo "  2. Deploy: ../scripts/deploy.sh"
 echo "  3. Copy examples/multi-app/ into your test repo for schema directories"

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Bootstrap SchemaBot AWS infrastructure
-# Usage: ./bootstrap.sh [-y]
+# Usage: cd deploy/aws-multi-env/staging && ../scripts/bootstrap.sh [-y]
 #
 # Options:
 #   -y    Auto-approve all terraform applies (no interactive prompts)
@@ -13,7 +13,7 @@ set -euo pipefail
 # 1. ECR repository
 # 2. Docker image (skips if current commit already pushed)
 # 3. Infrastructure (RDS, Bastion, Secrets Manager, VPC, etc.)
-# 4. App Runner service (deploys the image)
+# 4. App Runner service
 
 REGION="us-west-2"
 export AWS_PROFILE="${AWS_PROFILE:-schemabot-deployer}"
@@ -30,10 +30,11 @@ echo "🚀 SchemaBot AWS Bootstrap"
 echo "============================="
 echo ""
 
-# Compute absolute paths once — avoids fragile relative cd chains
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TF_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_ROOT="$(cd "$TF_DIR/../../.." && pwd)"
+# Resolve paths: CWD must be the environment directory (staging/ or production/).
+# Scripts live one level up at deploy/aws-multi-env/scripts/.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
+TF_DIR="$(pwd)"
+REPO_ROOT="$(git -C "$TF_DIR" rev-parse --show-toplevel)"
 cd "$TF_DIR"
 
 # Check prerequisites
@@ -92,7 +93,7 @@ terraform init -upgrade \
 # Phase 1: Ensure ECR repository exists (App Runner needs an image to start)
 echo ""
 echo "🏗️  Phase 1: ECR repository..."
-terraform apply -target=aws_ecr_repository.schemabot $AUTO_APPROVE
+terraform apply -target=module.schemabot.aws_ecr_repository.schemabot $AUTO_APPROVE
 
 if [ $? -ne 0 ]; then
     echo "❌ Terraform apply failed (ECR)"
@@ -138,21 +139,18 @@ echo "🏗️  Phase 3: Infrastructure (RDS, Bastion, Secrets Manager, etc.)..."
 # VPC connector must be applied with App Runner (Phase 4) because
 # the old connector can't be deleted while App Runner references it.
 INFRA_TARGETS=(
-    -target=aws_db_parameter_group.schemabot
-    -target=aws_db_instance.schemabot
-    -target=aws_db_instance.testapp_staging
-    -target=aws_db_instance.testapp_production
-    -target=aws_instance.bastion
-    -target=aws_iam_role_policy_attachment.bastion_ssm
-    -target=aws_secretsmanager_secret.storage_dsn
-    -target=aws_secretsmanager_secret.testapp_staging_dsn
-    -target=aws_secretsmanager_secret.testapp_production_dsn
-    -target=aws_secretsmanager_secret.github_app
-    -target=aws_secretsmanager_secret_version.storage_dsn
-    -target=aws_secretsmanager_secret_version.testapp_staging_dsn
-    -target=aws_secretsmanager_secret_version.testapp_production_dsn
-    -target=aws_secretsmanager_secret_version.github_app
-    -target=aws_vpc_endpoint.secretsmanager
+    -target=module.schemabot.aws_db_parameter_group.schemabot
+    -target=module.schemabot.aws_db_instance.schemabot
+    -target=module.schemabot.aws_db_instance.testapp
+    -target=module.schemabot.aws_instance.bastion
+    -target=module.schemabot.aws_iam_role_policy_attachment.bastion_ssm
+    -target=module.schemabot.aws_secretsmanager_secret.storage_dsn
+    -target=module.schemabot.aws_secretsmanager_secret.testapp_dsn
+    -target=module.schemabot.aws_secretsmanager_secret.github_app
+    -target=module.schemabot.aws_secretsmanager_secret_version.storage_dsn
+    -target=module.schemabot.aws_secretsmanager_secret_version.testapp_dsn
+    -target=module.schemabot.aws_secretsmanager_secret_version.github_app
+    -target=module.schemabot.aws_vpc_endpoint.secretsmanager
 )
 
 # Check if infra needs changes
@@ -247,13 +245,17 @@ else
     STORAGE_DSN=$(echo "$TF_OUTPUT" | jq -r '.schemabot_dsn.value // empty')
     setup_rds_user "storage" "$STORAGE_ENDPOINT" "$STORAGE_DSN" "schemabot" "schemabot_spirit"
 
-    STAGING_ENDPOINT=$(echo "$TF_OUTPUT" | jq -r '.testapp_staging_endpoint.value // empty')
-    STAGING_DSN=$(echo "$TF_OUTPUT" | jq -r '.testapp_dsns.value.staging // empty')
-    setup_rds_user "staging" "$STAGING_ENDPOINT" "$STAGING_DSN" "testapp" "schemabot_spirit"
+    # Detect environment from terraform output names
+    if echo "$TF_OUTPUT" | jq -e '.testapp_staging_endpoint' > /dev/null 2>&1; then
+        ENV_NAME="staging"
+        TESTAPP_ENDPOINT=$(echo "$TF_OUTPUT" | jq -r '.testapp_staging_endpoint.value // empty')
+    else
+        ENV_NAME="production"
+        TESTAPP_ENDPOINT=$(echo "$TF_OUTPUT" | jq -r '.testapp_production_endpoint.value // empty')
+    fi
 
-    PROD_ENDPOINT=$(echo "$TF_OUTPUT" | jq -r '.testapp_production_endpoint.value // empty')
-    PROD_DSN=$(echo "$TF_OUTPUT" | jq -r '.testapp_dsns.value.production // empty')
-    setup_rds_user "production" "$PROD_ENDPOINT" "$PROD_DSN" "testapp" "schemabot_spirit"
+    TESTAPP_DSN=$(echo "$TF_OUTPUT" | jq -r ".testapp_dsns.value.${ENV_NAME} // empty")
+    setup_rds_user "$ENV_NAME" "$TESTAPP_ENDPOINT" "$TESTAPP_DSN" "testapp" "schemabot_spirit"
 
     # Update Secrets Manager DSNs to use the dedicated Spirit user
     echo ""
@@ -262,8 +264,7 @@ else
     SB_PASS=$(cat "$SB_PASSWORD_FILE")
 
     STORAGE_SECRET=$(echo "$TF_OUTPUT" | jq -r '.storage_dsn_secret_id.value // empty')
-    STAGING_SECRET=$(echo "$TF_OUTPUT" | jq -r '.testapp_staging_dsn_secret_id.value // empty')
-    PROD_SECRET=$(echo "$TF_OUTPUT" | jq -r '.testapp_production_dsn_secret_id.value // empty')
+    TESTAPP_SECRET=$(echo "$TF_OUTPUT" | jq -r ".testapp_${ENV_NAME}_dsn_secret_id.value // empty")
 
     aws secretsmanager put-secret-value \
         --secret-id "$STORAGE_SECRET" \
@@ -271,13 +272,8 @@ else
         --region "$REGION"
 
     aws secretsmanager put-secret-value \
-        --secret-id "$STAGING_SECRET" \
-        --secret-string "$(jq -n --arg dsn "schemabot_spirit:${SB_PASS}@tcp(${STAGING_ENDPOINT})/testapp?parseTime=true&tls=true" '{dsn: $dsn}')" \
-        --region "$REGION"
-
-    aws secretsmanager put-secret-value \
-        --secret-id "$PROD_SECRET" \
-        --secret-string "$(jq -n --arg dsn "schemabot_spirit:${SB_PASS}@tcp(${PROD_ENDPOINT})/testapp?parseTime=true&tls=true" '{dsn: $dsn}')" \
+        --secret-id "$TESTAPP_SECRET" \
+        --secret-string "$(jq -n --arg dsn "schemabot_spirit:${SB_PASS}@tcp(${TESTAPP_ENDPOINT})/testapp?parseTime=true&tls=true" '{dsn: $dsn}')" \
         --region "$REGION"
 
     echo "   ✅ MySQL user setup and secrets update complete"

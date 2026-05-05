@@ -2,15 +2,15 @@
 set -euo pipefail
 
 # View App Runner logs for SchemaBot
-# Usage: ./logs.sh [options] [duration] [filter]
+# Usage: cd deploy/aws-multi-env/staging && ../scripts/logs.sh [options] [duration] [filter]
 #
 # Examples:
-#   ./logs.sh               # Application logs, last 30 minutes
-#   ./logs.sh 1h            # Application logs, last 1 hour
-#   ./logs.sh 10m error     # Application logs, last 10 minutes, filter for "error"
-#   ./logs.sh -f            # Follow application logs in real-time
-#   ./logs.sh --service     # App Runner service events (deploys, health checks, crashes)
-#   ./logs.sh --all         # Both application and service logs interleaved
+#   ../scripts/logs.sh               # Application logs, last 30 minutes
+#   ../scripts/logs.sh 1h            # Application logs, last 1 hour
+#   ../scripts/logs.sh 10m error     # Application logs, last 10 minutes, filter for "error"
+#   ../scripts/logs.sh -f            # Follow application logs in real-time
+#   ../scripts/logs.sh --service     # App Runner service events (deploys, health checks, crashes)
+#   ../scripts/logs.sh --all         # Both application and service logs interleaved
 
 REGION="us-west-2"
 export AWS_PROFILE="${AWS_PROFILE:-schemabot-deployer}"
@@ -41,7 +41,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: ./logs.sh [options] [duration] [filter]"
+            echo "Usage: ../scripts/logs.sh [options] [duration] [filter]"
             echo ""
             echo "Options:"
             echo "  --app, --application  Application logs (default)"
@@ -54,11 +54,11 @@ while [[ $# -gt 0 ]]; do
             echo "Filter: text string to filter log messages"
             echo ""
             echo "Examples:"
-            echo "  ./logs.sh                     # App logs, last 30 minutes"
-            echo "  ./logs.sh --service           # Service events (deploy failures, health checks)"
-            echo "  ./logs.sh --all 1h            # All logs, last 1 hour"
-            echo "  ./logs.sh 10m error           # App logs with 'error' filter"
-            echo "  ./logs.sh -f                  # Follow app logs in real-time"
+            echo "  ../scripts/logs.sh                     # App logs, last 30 minutes"
+            echo "  ../scripts/logs.sh --service           # Service events (deploy failures, health checks)"
+            echo "  ../scripts/logs.sh --all 1h            # All logs, last 1 hour"
+            echo "  ../scripts/logs.sh 10m error           # App logs with 'error' filter"
+            echo "  ../scripts/logs.sh -f                  # Follow app logs in real-time"
             exit 0
             ;;
         [0-9]*m|[0-9]*h)
@@ -71,9 +71,6 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-
-# Go to parent dir where main.tf lives
-cd "$(dirname "$0")/.."
 
 # Find log groups (sort by creation time, pick the most recent)
 APP_LOG_GROUP=$(aws logs describe-log-groups \
@@ -96,7 +93,7 @@ case "$LOG_TYPE" in
             LOG_GROUPS+=("$APP_LOG_GROUP")
         else
             echo "⚠️  No application logs found (service may not have started)"
-            echo "   Try: ./logs.sh --service"
+            echo "   Try: ../scripts/logs.sh --service"
             exit 1
         fi
         ;;

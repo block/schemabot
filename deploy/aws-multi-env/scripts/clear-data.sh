@@ -1,11 +1,11 @@
 #!/bin/bash
 # Clear data from testapp tables via SSM tunnel
 #
-# Usage:
-#   ./scripts/clear-data.sh                  # Clear all tables in staging
-#   ./scripts/clear-data.sh production       # Clear all tables in production
-#   ./scripts/clear-data.sh both             # Clear all tables in both envs
-#   ./scripts/clear-data.sh staging orders   # Clear only orders table in staging
+# Usage: cd deploy/aws-multi-env/staging && ../scripts/clear-data.sh
+#   ../scripts/clear-data.sh                  # Clear all tables in staging
+#   ../scripts/clear-data.sh production       # Clear all tables in production
+#   ../scripts/clear-data.sh both             # Clear all tables in both envs
+#   ../scripts/clear-data.sh staging orders   # Clear only orders table in staging
 
 set -e
 
@@ -61,9 +61,7 @@ if ! command -v nc &> /dev/null; then
     exit 1
 fi
 
-# Get terraform outputs
-cd "$(dirname "$0")/.."
-
+# Get terraform outputs (CWD is the environment directory)
 TF_OUTPUT=$(terraform output -json 2>/dev/null) || {
     echo "Could not get terraform output. Run: terraform init && terraform apply"
     exit 1
