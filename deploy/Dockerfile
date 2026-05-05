@@ -50,8 +50,10 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /schemabot /app/schemabot
 
-# Copy AWS config (for App Runner deployments where volumes can't be mounted)
+# Copy AWS configs (for App Runner deployments where volumes can't be mounted)
 COPY --chown=schemabot:schemabot deploy/aws/config.yaml /config/aws-example.yaml
+COPY --chown=schemabot:schemabot deploy/aws-multi-env/staging/config.yaml /config/aws-multi-env-staging.yaml
+COPY --chown=schemabot:schemabot deploy/aws-multi-env/production/config.yaml /config/aws-multi-env-production.yaml
 
 # Default port
 EXPOSE 8080
