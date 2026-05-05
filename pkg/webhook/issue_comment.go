@@ -99,24 +99,13 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 		return
 	}
 
-	// Add instant acknowledgment reaction
-	if payload.Comment.ID > 0 && installationID > 0 {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			client, err := h.ghClient.ForInstallation(installationID)
-			if err != nil {
-				h.logger.Error("failed to create GitHub client for reaction", "error", err)
-				return
-			}
-			if err := client.AddReactionToComment(ctx, repo, payload.Comment.ID, "eyes"); err != nil {
-				h.logger.Error("failed to add acknowledgment reaction", "error", err)
-			}
-		}()
-	}
-
 	// Handle help command
 	if result.IsHelp {
+		if h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
+			h.logger.Debug("skipping help command (respond_to_unscoped is false)", "repo", repo, "pr", pr)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
+			return
+		}
 		h.logger.Info("processing help command", "repo", repo, "pr", pr)
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})
@@ -143,8 +132,25 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 		return
 	}
 
+	// When allowed_environments is configured, silently ignore commands targeting
+	// environments handled by another instance. The other SchemaBot instance will
+	// process the command from its own webhook delivery.
+	if result.Found && result.Environment != "" && h.service != nil && !h.service.Config().IsEnvironmentAllowed(result.Environment) {
+		h.logger.Info("ignoring command for non-allowed environment",
+			"repo", repo, "pr", pr, "environment", result.Environment, "action", result.Action)
+		h.writeJSON(w, http.StatusOK, map[string]string{
+			"message": "environment handled by another instance",
+		})
+		return
+	}
+
 	// Handle invalid command (schemabot mentioned but command not recognized)
 	if !result.Found {
+		if h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
+			h.logger.Debug("skipping invalid command response (respond_to_unscoped is false)", "repo", repo, "pr", pr)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid command"})
 		return
@@ -153,6 +159,24 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 	if installationID == 0 {
 		h.writeError(w, http.StatusBadRequest, "missing installation ID in webhook payload")
 		return
+	}
+
+	// Add acknowledgment reaction now that we know this instance will handle
+	// the command. Placed after all skip/filter checks so only the owning
+	// instance reacts — avoids duplicate reactions in multi-instance setups.
+	if payload.Comment.ID > 0 && h.ghClient != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client, err := h.ghClient.ForInstallation(installationID)
+			if err != nil {
+				h.logger.Error("failed to create GitHub client for reaction", "error", err)
+				return
+			}
+			if err := client.AddReactionToComment(ctx, repo, payload.Comment.ID, "eyes"); err != nil {
+				h.logger.Error("failed to add acknowledgment reaction", "error", err)
+			}
+		}()
 	}
 
 	// Reject -y/--yes on commands that don't support it

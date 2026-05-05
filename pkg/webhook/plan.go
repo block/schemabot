@@ -113,6 +113,28 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 		environments = config.GetEnvironments()
 	}
 
+	// Filter environments to those this instance is allowed to handle
+	if h.service != nil {
+		config := h.service.Config()
+		if len(config.AllowedEnvironments) > 0 {
+			var allowed []string
+			for _, env := range environments {
+				if config.IsEnvironmentAllowed(env) {
+					allowed = append(allowed, env)
+				} else {
+					h.logger.Debug("skipping environment not owned by this instance",
+						"repo", repo, "pr", pr, "env", env)
+				}
+			}
+			environments = allowed
+		}
+	}
+
+	if len(environments) == 0 {
+		h.logger.Info("no environments to plan after filtering", "repo", repo, "pr", pr)
+		return
+	}
+
 	// Collect plans for all environments
 	var headSHA string
 	multiEnvData := templates.MultiEnvPlanCommentData{

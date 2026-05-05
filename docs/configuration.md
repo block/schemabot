@@ -75,6 +75,73 @@ When a webhook arrives from an unlisted repository:
 
 If `repos` is not configured or empty, all repositories are allowed.
 
+## Multi-Environment Deployment
+
+For organizations that need isolated infrastructure per environment (e.g., separate staging and production deployments with their own GitHub Apps and databases), SchemaBot supports scoping each instance to a subset of environments using `allowed_environments`.
+
+### Staging Instance
+
+```yaml
+storage:
+  dsn: "env:STAGING_SCHEMABOT_DSN"
+
+allowed_environments:
+  - staging
+respond_to_unscoped: false  # production instance handles help and error responses
+
+databases:
+  payments:
+    type: mysql
+    environments:
+      staging:
+        dsn: "env:STAGING_PAYMENTS_DSN"
+
+github:
+  app-id: "env:STAGING_GITHUB_APP_ID"
+  private-key: "file:/run/secrets/staging-github-key.pem"
+  webhook-secret: "env:STAGING_WEBHOOK_SECRET"
+```
+
+### Production Instance
+
+```yaml
+storage:
+  dsn: "env:PROD_SCHEMABOT_DSN"
+
+allowed_environments:
+  - production
+
+databases:
+  payments:
+    type: mysql
+    environments:
+      production:
+        dsn: "env:PROD_PAYMENTS_DSN"
+
+github:
+  app-id: "env:PROD_GITHUB_APP_ID"
+  private-key: "file:/run/secrets/prod-github-key.pem"
+  webhook-secret: "env:PROD_WEBHOOK_SECRET"
+```
+
+### How it works
+
+- **Environment scoping:** When `allowed_environments` is set, the instance only processes commands targeting those environments. Commands for other environments (e.g., `schemabot apply -e production` sent to the staging instance) are silently ignored — the other instance handles them from its own webhook delivery.
+
+- **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates.
+
+- **Cross-instance environment verification:** Environment ordering (e.g., staging must succeed before production) works across instances. The production instance queries the GitHub Checks API for the staging instance's `SchemaBot (staging)` aggregate check to verify the prior environment completed successfully.
+
+- **Separate GitHub Apps:** Each instance needs its own GitHub App installation. Both Apps must be installed on the same repositories and configured to receive the same webhook events. GitHub delivers webhooks to all installed Apps independently.
+
+- **Unscoped command routing:** With two Apps on the same repo, commands not scoped to an environment (`help`, invalid commands) would get duplicate responses. Set `respond_to_unscoped: false` on the staging instance so only the production instance responds to these. Environment-scoped commands (`plan -e`, `apply -e`) are unaffected — they're already routed by `allowed_environments`.
+
+- **Backwards compatible:** When `allowed_environments` is not set or empty, the instance handles all environments and creates a single `SchemaBot` aggregate check — the same behavior as a single-instance deployment.
+
+### Auto-plan behavior
+
+When a PR is opened or updated, each instance auto-plans only the environments it owns. The staging instance plans staging, the production instance plans production. Each posts its own plan comment and creates its own per-environment aggregate check.
+
 ## Secret Resolution
 
 DSN values support secret resolution prefixes:
