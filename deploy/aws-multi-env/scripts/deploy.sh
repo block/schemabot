@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Build and deploy SchemaBot to AWS App Runner
-# Usage: ./deploy.sh [--skip-build]
+# Usage: cd deploy/aws-multi-env/staging && ../scripts/deploy.sh [--skip-build]
 #
 # Options:
 #   --skip-build    Skip Docker build, just trigger deployment
@@ -21,7 +21,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: ./deploy.sh [--skip-build]"
+            echo "Usage: ../scripts/deploy.sh [--skip-build]"
             exit 1
             ;;
     esac
@@ -30,10 +30,9 @@ done
 echo "🚀 SchemaBot Deployment"
 echo "=========================="
 
-# Always deploy from the current working tree (worktree or main).
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-TF_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# CWD is the environment directory (staging/ or production/).
+TF_DIR="$(pwd)"
+REPO_ROOT="$(git -C "$TF_DIR" rev-parse --show-toplevel)"
 
 # Ensure working tree is clean (image is tagged by commit SHA)
 if [ "$SKIP_BUILD" = false ] && ! git -C "$REPO_ROOT" diff --quiet HEAD 2>/dev/null; then
@@ -51,14 +50,14 @@ if ! terraform output -json > /dev/null 2>&1; then
         -backend-config="bucket=schemabot-terraform-state-${ACCOUNT_ID}" \
         -backend-config="dynamodb_table=schemabot-terraform-lock" > /dev/null 2>&1 || {
         echo "❌ Could not initialize Terraform"
-        echo "   Run: deploy/aws/scripts/bootstrap.sh"
+        echo "   Run: ../scripts/bootstrap.sh"
         exit 1
     }
 fi
 
 TF_OUTPUT=$(terraform output -json 2>/dev/null) || {
     echo "❌ Could not get terraform output"
-    echo "   Run: deploy/aws/scripts/bootstrap.sh"
+    echo "   Run: ../scripts/bootstrap.sh"
     exit 1
 }
 
@@ -161,19 +160,19 @@ while true; do
         FAILED)
             echo ""
             echo "❌ Deployment failed! ($ELAPSED_FMT)"
-            echo "   Check logs: ./scripts/logs.sh --all 10m"
+            echo "   Check logs: ../scripts/logs.sh --all 10m"
             exit 1
             ;;
         ROLLBACK_SUCCEEDED)
             echo ""
             echo "❌ Deployment failed and rolled back. ($ELAPSED_FMT)"
-            echo "   Check logs: ./scripts/logs.sh --all 10m"
+            echo "   Check logs: ../scripts/logs.sh --all 10m"
             exit 1
             ;;
         ROLLBACK_FAILED)
             echo ""
             echo "❌ Deployment failed and rollback also failed! ($ELAPSED_FMT)"
-            echo "   Check logs: ./scripts/logs.sh --all 10m"
+            echo "   Check logs: ../scripts/logs.sh --all 10m"
             exit 1
             ;;
         ROLLBACK_IN_PROGRESS)

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Connect to RDS MySQL via SSM port forwarding
-# Usage: ./shell.sh [-e staging|production|schemabot]
+# Usage: cd deploy/aws-multi-env/staging && ../scripts/shell.sh [-e staging|production|schemabot]
 #
 # Options:
 #   -e, --env       Database (staging|production|schemabot), default: staging
@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: ./shell.sh [-e staging|production|schemabot]"
+            echo "Usage: ../scripts/shell.sh [-e staging|production|schemabot]"
             exit 1
             ;;
     esac
@@ -80,9 +80,7 @@ LOCAL_PORT=$(find_free_port) || {
     exit 1
 }
 
-# Get terraform outputs (parent dir has main.tf)
-cd "$(dirname "$0")/.."
-
+# Get terraform outputs (CWD is the environment directory)
 TF_OUTPUT=$(terraform output -json 2>/dev/null) || {
     echo "❌ Could not get terraform output"
     echo "   Run: terraform init && terraform apply"

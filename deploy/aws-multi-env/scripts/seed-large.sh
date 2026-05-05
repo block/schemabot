@@ -1,11 +1,11 @@
 #!/bin/bash
 # Seed testapp with large dataset via SSM tunnel
 #
-# Usage:
-#   ./scripts/seed-large.sh                       # 100 MB per table, staging only
-#   ./scripts/seed-large.sh 500                   # 500 MB per table, staging only
-#   ./scripts/seed-large.sh 100 both              # 100 MB per table, both envs
-#   ./scripts/seed-large.sh 600 both orders       # 600 MB orders only, both envs
+# Usage: cd deploy/aws-multi-env/staging && ../scripts/seed-large.sh
+#   ../scripts/seed-large.sh                       # 100 MB per table, staging only
+#   ../scripts/seed-large.sh 500                   # 500 MB per table, staging only
+#   ../scripts/seed-large.sh 100 both              # 100 MB per table, both envs
+#   ../scripts/seed-large.sh 600 both orders       # 600 MB orders only, both envs
 
 set -e
 
@@ -68,9 +68,7 @@ if ! command -v bc &> /dev/null; then
     exit 1
 fi
 
-# Get terraform outputs
-cd "$(dirname "$0")/.."
-
+# Get terraform outputs (CWD is the environment directory)
 TF_OUTPUT=$(terraform output -json 2>/dev/null) || {
     echo "Could not get terraform output. Run: terraform init && terraform apply"
     exit 1

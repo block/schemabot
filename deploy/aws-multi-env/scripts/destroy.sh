@@ -2,16 +2,14 @@
 set -euo pipefail
 
 # Destroy all SchemaBot AWS infrastructure
-# Usage: ./destroy.sh
+# Usage: cd deploy/aws-multi-env/staging && ../scripts/destroy.sh
 #
 # Always requires interactive confirmation — no auto-approve flag.
 
 REGION="us-west-2"
 export AWS_PROFILE="${AWS_PROFILE:-schemabot-deployer}"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TF_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$TF_DIR"
+cd "$(pwd)"
 
 echo "🗑️  SchemaBot AWS Destroy"
 echo "=========================="
@@ -27,7 +25,7 @@ fi
 echo "   $RESOURCE_COUNT resources in terraform state"
 echo ""
 echo "⚠️  This will destroy ALL SchemaBot infrastructure:"
-echo "   - RDS instances (storage, staging, production)"
+echo "   - RDS instances (storage, target)"
 echo "   - App Runner service"
 echo "   - ECR repository and images"
 echo "   - Bastion host"
