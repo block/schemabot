@@ -74,13 +74,13 @@ done
 
 # Find log groups (sort by creation time, pick the most recent)
 APP_LOG_GROUP=$(aws logs describe-log-groups \
-    --log-group-name-prefix "/aws/apprunner/schemabot-example" \
+    --log-group-name-prefix "/aws/apprunner/" \
     --region "$REGION" \
     --query 'sort_by(logGroups[?contains(logGroupName, `/application`)], &creationTime) | [-1].logGroupName' \
     --output text 2>/dev/null)
 
 SVC_LOG_GROUP=$(aws logs describe-log-groups \
-    --log-group-name-prefix "/aws/apprunner/schemabot-example" \
+    --log-group-name-prefix "/aws/apprunner/" \
     --region "$REGION" \
     --query 'sort_by(logGroups[?contains(logGroupName, `/service`)], &creationTime) | [-1].logGroupName' \
     --output text 2>/dev/null)
