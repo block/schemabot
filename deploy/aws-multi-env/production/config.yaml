@@ -1,0 +1,21 @@
+# Multi-Environment Deployment — Production Instance
+#
+# Only handles production environments. Pair with staging in a separate deployment.
+
+allowed_environments:
+  - production
+
+storage:
+  dsn: "secretsmanager:schemabot-production/storage-dsn#dsn"
+
+github:
+  app-id: "secretsmanager:schemabot-production/github-app#app-id"
+  private-key: "secretsmanager:schemabot-production/github-app#private-key"
+  webhook-secret: "secretsmanager:schemabot-production/github-app#webhook-secret"
+
+databases:
+  testapp:
+    type: mysql
+    environments:
+      production:
+        dsn: "secretsmanager:schemabot-production/testapp-production#dsn"

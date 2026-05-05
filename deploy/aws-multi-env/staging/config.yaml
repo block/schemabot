@@ -1,0 +1,23 @@
+# Multi-Environment Deployment — Staging Instance
+#
+# Only handles staging environments. Pair with production in a separate deployment.
+
+allowed_environments:
+  - staging
+
+respond_to_unscoped: false
+
+storage:
+  dsn: "secretsmanager:schemabot-staging/storage-dsn#dsn"
+
+github:
+  app-id: "secretsmanager:schemabot-staging/github-app#app-id"
+  private-key: "secretsmanager:schemabot-staging/github-app#private-key"
+  webhook-secret: "secretsmanager:schemabot-staging/github-app#webhook-secret"
+
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "secretsmanager:schemabot-staging/testapp-staging#dsn"
