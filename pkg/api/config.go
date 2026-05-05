@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strconv"
 
 	"github.com/block/schemabot/pkg/secrets"
@@ -35,6 +36,32 @@ type ServerConfig struct {
 
 	// DefaultReviewers are GitHub teams/users required to review schema changes.
 	DefaultReviewers []string `yaml:"default_reviewers"`
+
+	// AllowedEnvironments restricts which environments this SchemaBot instance handles.
+	// When set, the instance only processes commands for listed environments and uses
+	// the GitHub Checks API to verify prior environments owned by other instances.
+	// When empty or nil, all environments are allowed (backwards compatible).
+	AllowedEnvironments []string `yaml:"allowed_environments"`
+
+	// RespondToUnscoped controls whether this instance responds to commands
+	// that are not scoped to a specific environment. In multi-instance
+	// deployments where each repo has multiple GitHub Apps installed, set
+	// this to false on all but one instance to prevent duplicate responses.
+	//
+	// Unscoped commands (only respond when true):
+	//   - help          (usage instructions)
+	//   - invalid/unknown commands (error responses)
+	//
+	// Scoped commands (always processed based on allowed_environments):
+	//   - plan           (env-scoped, or plans only allowed environments)
+	//   - apply          (env-scoped via -e flag)
+	//   - apply-confirm  (env-scoped via -e flag)
+	//   - rollback       (scoped to an apply ID)
+	//   - stop/start     (scoped to an apply ID)
+	//   - cutover        (scoped to an apply ID)
+	//
+	// Defaults to true (respond to all commands).
+	RespondToUnscoped *bool `yaml:"respond_to_unscoped"`
 }
 
 // GitHubConfig configures the GitHub App used for webhook-driven schema changes.
@@ -287,6 +314,26 @@ func (c *ServerConfig) IsRepoAllowed(repo string) bool {
 	}
 	_, ok := c.Repos[repo]
 	return ok
+}
+
+// IsEnvironmentAllowed returns whether the given environment is handled by this
+// SchemaBot instance. If the receiver is nil, AllowedEnvironments is empty, or
+// AllowedEnvironments is nil, all environments are allowed (backwards compatible).
+func (c *ServerConfig) IsEnvironmentAllowed(env string) bool {
+	if c == nil || len(c.AllowedEnvironments) == 0 {
+		return true
+	}
+	return slices.Contains(c.AllowedEnvironments, env)
+}
+
+// ShouldRespondToUnscoped returns whether this instance should respond to
+// commands not scoped to a specific environment (help, invalid commands).
+// Defaults to true when not configured.
+func (c *ServerConfig) ShouldRespondToUnscoped() bool {
+	if c == nil || c.RespondToUnscoped == nil {
+		return true
+	}
+	return *c.RespondToUnscoped
 }
 
 // StorageDSN returns the resolved storage DSN.
