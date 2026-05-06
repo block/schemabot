@@ -87,6 +87,22 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 		break
 	}
 
+	// Log config summary for debugging
+	logger.Info("config loaded",
+		"databases", len(serverConfig.Databases),
+		"tern_deployments", len(serverConfig.TernDeployments),
+		"repos", len(serverConfig.Repos),
+		"allowed_environments", serverConfig.AllowedEnvironments,
+		"respond_to_unscoped", serverConfig.ShouldRespondToUnscoped(),
+	)
+	for name, db := range serverConfig.Databases {
+		envs := make([]string, 0, len(db.Environments))
+		for env := range db.Environments {
+			envs = append(envs, env)
+		}
+		logger.Info("registered database", "name", name, "type", db.Type, "environments", envs)
+	}
+
 	// Create service with dependencies
 	storage := mysqlstore.New(db)
 	svc := api.New(storage, serverConfig, nil, logger)
