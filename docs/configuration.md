@@ -36,6 +36,31 @@ tern_deployments:
     production: "tern1-production:9090"
 ```
 
+## Hybrid Mode
+
+Both modes can be used simultaneously. Databases configured in the `databases` section use local (direct) connections, while everything else routes through `tern_deployments`. This is useful when some databases are co-located with SchemaBot and others are in remote environments.
+
+```yaml
+storage:
+  dsn: "env:SCHEMABOT_DSN"
+
+# Direct connections for co-located databases
+databases:
+  local-db:
+    type: mysql
+    environments:
+      staging:
+        dsn: "env:LOCAL_DB_DSN"
+
+# Remote Tern services for databases in other environments
+tern_deployments:
+  default:
+    staging: "tern-staging:9090"
+    production: "tern-production:9090"
+```
+
+Routing is automatic — when a plan or apply request arrives, SchemaBot checks the `databases` config first. If the database name matches, it uses a direct connection. Otherwise, it routes to the selected Tern deployment via gRPC (defaulting to the `default` deployment key, or the repo-specific deployment configured via `repos.*.default_tern_deployment`).
+
 ## Repository Allowlist
 
 By default, any repository with the GitHub App installed can use SchemaBot. Adding a `repos` section creates an allowlist — only listed repositories are permitted.
