@@ -177,6 +177,9 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 // apply/task records in the same database as the API layer.
 func (c *LocalClient) IsRemote() bool { return false }
 
+// Endpoint returns the database name for this local client.
+func (c *LocalClient) Endpoint() string { return c.config.Database }
+
 // protoEngine returns the proto engine type based on database configuration.
 func (c *LocalClient) protoEngine() ternv1.Engine {
 	if c.config.Type == storage.DatabaseTypeVitess {

@@ -119,6 +119,7 @@ import (
 type GRPCClient struct {
 	conn    *grpc.ClientConn
 	client  ternv1.TernClient
+	address string          // dial address for logging/debugging
 	storage storage.Storage // SchemaBot's storage for apply/task management
 }
 
@@ -148,6 +149,7 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 	return &GRPCClient{
 		conn:    conn,
 		client:  ternv1.NewTernClient(conn),
+		address: config.Address,
 		storage: config.Storage,
 	}, nil
 }
@@ -156,6 +158,9 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 // with its own storage. SchemaBot must create its own apply/task records
 // and store Tern's apply_id as external_id.
 func (c *GRPCClient) IsRemote() bool { return true }
+
+// Endpoint returns the gRPC dial address for this client.
+func (c *GRPCClient) Endpoint() string { return c.address }
 
 // Close closes the gRPC connection.
 func (c *GRPCClient) Close() error {
