@@ -19,3 +19,18 @@ databases:
     environments:
       production:
         dsn: "secretsmanager:schemabot-production/testapp-production#dsn"
+  payments:
+    type: mysql
+    environments:
+      production:
+        dsn: "secretsmanager:schemabot-production/payments-production#dsn"
+  orders:
+    type: mysql
+    environments:
+      production:
+        dsn: "secretsmanager:schemabot-production/orders-production#dsn"
+  inventory:
+    type: mysql
+    environments:
+      production:
+        dsn: "secretsmanager:schemabot-production/inventory-production#dsn"
