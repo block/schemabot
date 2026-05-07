@@ -123,7 +123,7 @@ func TestAggregateSummary(t *testing.T) {
 
 	title, summary := aggregateSummary(checks, checkConclusionActionRequired)
 
-	assert.Contains(t, title, "1 schema change(s) pending")
+	assert.Contains(t, title, "1 apply pending")
 	assert.Contains(t, summary, "`orders`")
 	assert.Contains(t, summary, "staging")
 	assert.Contains(t, summary, "production")
@@ -138,7 +138,7 @@ func TestAggregateSummary_AllSuccess(t *testing.T) {
 	}
 
 	title, _ := aggregateSummary(checks, checkConclusionSuccess)
-	assert.Equal(t, "All schema changes applied", title)
+	assert.Equal(t, "All applies complete", title)
 }
 
 func TestConclusionEmoji(t *testing.T) {
