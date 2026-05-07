@@ -21,3 +21,18 @@ databases:
     environments:
       staging:
         dsn: "secretsmanager:schemabot-staging/testapp-staging#dsn"
+  payments:
+    type: mysql
+    environments:
+      staging:
+        dsn: "secretsmanager:schemabot-staging/payments-staging#dsn"
+  orders:
+    type: mysql
+    environments:
+      staging:
+        dsn: "secretsmanager:schemabot-staging/orders-staging#dsn"
+  inventory:
+    type: mysql
+    environments:
+      staging:
+        dsn: "secretsmanager:schemabot-staging/inventory-staging#dsn"
