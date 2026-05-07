@@ -496,10 +496,10 @@ func computeAggregate(checks []*storage.Check) (conclusion, status string) {
 func aggregateSummary(checks []*storage.Check, conclusion string) (title, summary string) {
 	switch conclusion {
 	case checkConclusionSuccess:
-		title = "All schema changes applied"
+		title = "All applies complete"
 		summary = buildAggregateTable(checks)
 	case checkConclusionFailure:
-		title = "Schema change failed"
+		title = "Apply failed"
 		summary = buildAggregateTable(checks)
 	case checkConclusionActionRequired:
 		pending := 0
@@ -508,11 +508,15 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 				pending++
 			}
 		}
-		title = fmt.Sprintf("%d schema change(s) pending", pending)
+		if pending == 1 {
+			title = "1 apply pending"
+		} else {
+			title = fmt.Sprintf("%d applies pending", pending)
+		}
 		summary = buildAggregateTable(checks)
 	default:
 		// in_progress — conclusion is empty
-		title = "Schema changes in progress"
+		title = "Apply in progress"
 		summary = buildAggregateTable(checks)
 	}
 	return title, summary
