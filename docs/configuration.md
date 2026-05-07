@@ -112,7 +112,7 @@ storage:
 
 allowed_environments:
   - staging
-respond_to_unscoped: false  # production instance handles help and error responses
+respond_to_unscoped: false  # production instance handles help and invalid commands
 
 databases:
   payments:

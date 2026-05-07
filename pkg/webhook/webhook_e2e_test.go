@@ -679,19 +679,15 @@ func TestE2EMultiEnvPlan(t *testing.T) {
 		t.Fatal("timed out waiting for multi-env plan comment")
 	}
 
-	// Should get check runs for both environments (plus aggregate updates on the channel)
-	checkRunNames := make(map[string]bool)
-	for i := range 2 {
-		select {
-		case cr := <-result.checkRuns:
-			assert.Equal(t, "completed", cr.Status)
-			assert.Equal(t, "action_required", cr.Conclusion)
-			checkRunNames[cr.Name] = true
-		case <-time.After(30 * time.Second):
-			t.Fatalf("timed out waiting for check run %d/2", i+1)
-		}
+	// Should get the aggregate check run
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "completed", cr.Status)
+		assert.Equal(t, "action_required", cr.Conclusion)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for aggregate check run")
 	}
-	assert.Len(t, checkRunNames, 2, "expected 2 distinct check runs (one per environment)")
 }
 
 func TestE2EMultiEnvPlanDifferentChanges(t *testing.T) {
@@ -1109,24 +1105,15 @@ func TestE2EAggregateCheck(t *testing.T) {
 		t.Fatal("timed out waiting for plan comment")
 	}
 
-	// Collect all check runs: 2 per-database + 1 aggregate = 3 total
-	checkRuns := make(map[string]checkRunCapture)
-	for range 3 {
-		select {
-		case cr := <-result.checkRuns:
-			checkRuns[cr.Name] = cr
-		case <-time.After(30 * time.Second):
-			t.Fatalf("timed out waiting for check runs, got %d so far: %v", len(checkRuns), checkRuns)
-		}
+	// Collect the aggregate check run (only aggregates are created, no per-database)
+	var aggCR checkRunCapture
+	select {
+	case aggCR = <-result.checkRuns:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for aggregate check run")
 	}
 
-	// Per-database checks exist
-	assert.Contains(t, checkRuns, "SchemaBot: staging/mysql/"+dbName)
-	assert.Contains(t, checkRuns, "SchemaBot: production/mysql/"+dbName)
-
-	// Aggregate check exists with correct conclusion
-	aggCR, ok := checkRuns["SchemaBot"]
-	require.True(t, ok, "expected aggregate check run named 'SchemaBot'")
+	assert.Equal(t, "SchemaBot", aggCR.Name)
 	assert.Equal(t, "completed", aggCR.Status)
 	assert.Equal(t, "action_required", aggCR.Conclusion)
 
@@ -1234,32 +1221,16 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	// cleanupStaleChecks runs async via goSafe — collect the 3 new check runs
-	// (2 per-database + 1 aggregate, all created on the new SHA with success)
-	newCheckRuns := make(map[string]checkRunCapture)
-	for range 3 {
-		select {
-		case cr := <-checkRuns:
-			newCheckRuns[cr.Name] = cr
-		case <-time.After(10 * time.Second):
-			t.Fatalf("timed out waiting for stale cleanup check runs, got %d: %v", len(newCheckRuns), newCheckRuns)
-		}
+	// cleanupStaleChecks runs async via goSafe — only the aggregate check run
+	// is created (per-database records are updated in storage only)
+	var aggCR checkRunCapture
+	select {
+	case aggCR = <-checkRuns:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for aggregate check run after stale cleanup")
 	}
 
-	// Per-database checks re-created as success
-	for _, name := range []string{
-		"SchemaBot: staging/mysql/" + dbName,
-		"SchemaBot: production/mysql/" + dbName,
-	} {
-		cr, ok := newCheckRuns[name]
-		require.True(t, ok, "expected check run %s", name)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
-	}
-
-	// Aggregate check re-created as success
-	aggCR, ok := newCheckRuns[aggregateCheckName]
-	require.True(t, ok, "expected aggregate check run")
+	assert.Equal(t, aggregateCheckName, aggCR.Name)
 	assert.Equal(t, checkStatusCompleted, aggCR.Status)
 	assert.Equal(t, checkConclusionSuccess, aggCR.Conclusion)
 
@@ -2043,9 +2014,7 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 		t.Fatal("timed out waiting for plan comment")
 	}
 
-	// Check runs should be for payments only (1 per-database + 1 aggregate).
-	// This test uses a single-env setup, so expect exactly 1 per-database check.
-	var perDBCheckNames []string
+	// Only the aggregate check run should be created.
 	hasAggregate := false
 	deadline := time.After(5 * time.Second)
 	for {
@@ -2053,10 +2022,6 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 		case cr := <-result.checkRuns:
 			if cr.Name == aggregateCheckName {
 				hasAggregate = true
-			} else {
-				perDBCheckNames = append(perDBCheckNames, cr.Name)
-			}
-			if len(perDBCheckNames) >= 1 && hasAggregate {
 				goto checksDone
 			}
 		case <-deadline:
@@ -2065,11 +2030,6 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 	}
 checksDone:
 	assert.True(t, hasAggregate, "expected aggregate check run")
-	require.NotEmpty(t, perDBCheckNames, "expected at least one per-database check run")
-	for _, name := range perDBCheckNames {
-		assert.Contains(t, name, "payments", "check run should be for payments: %s", name)
-		assert.NotContains(t, name, "orders", "check run should NOT be for orders: %s", name)
-	}
 }
 
 func e2eContainerName(base string) string {

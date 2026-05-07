@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
-
-	ghclient "github.com/block/schemabot/pkg/github"
 )
 
 // pullRequestPayload represents the relevant fields from a GitHub pull_request webhook.
@@ -180,7 +178,6 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 		return
 	}
 
-	var client *ghclient.InstallationClient
 	cleaned := false
 
 	for _, check := range checks {
@@ -199,34 +196,7 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			"database", check.DatabaseName, "environment", check.Environment,
 			"previous_conclusion", check.Conclusion)
 
-		if client == nil {
-			client, err = h.ghClient.ForInstallation(installationID)
-			if err != nil {
-				h.logger.Error("failed to create GitHub client for stale check cleanup", "error", err)
-				return
-			}
-		}
-
-		// Create a new check run on the current HEAD SHA so it shows on the latest commit.
-		// Updating the old check run (tied to the previous SHA) would be invisible in the PR.
-		checkName := checkRunName(check.Environment, check.DatabaseType, check.DatabaseName)
-		opts := ghclient.CheckRunOptions{
-			Name:       checkName,
-			Status:     checkStatusCompleted,
-			Conclusion: checkConclusionSuccess,
-			Output: &ghclient.CheckRunOutput{
-				Title:   "No schema changes",
-				Summary: "Schema files for this database were removed from the PR.",
-			},
-		}
-		newCheckRunID, createErr := client.CreateCheckRun(ctx, repo, headSHA, opts)
-		if createErr != nil {
-			h.logger.Error("failed to create stale check run on new SHA", "error", createErr)
-			continue
-		}
-
-		// Update stored check record with new check run ID and SHA
-		check.CheckRunID = newCheckRunID
+		// Update stored check record to success
 		check.HeadSHA = headSHA
 		check.Conclusion = checkConclusionSuccess
 		check.HasChanges = false
@@ -238,7 +208,12 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 	}
 
 	// Recompute aggregate on the new HEAD SHA after cleaning up stale checks
-	if cleaned && client != nil {
+	if cleaned {
+		client, clientErr := h.ghClient.ForInstallation(installationID)
+		if clientErr != nil {
+			h.logger.Error("failed to create GitHub client for aggregate update after stale cleanup", "error", clientErr)
+			return
+		}
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 }

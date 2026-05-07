@@ -50,7 +50,7 @@ type ServerConfig struct {
 	//
 	// Unscoped commands (only respond when true):
 	//   - help          (usage instructions)
-	//   - invalid/unknown commands (error responses)
+	//   - invalid/unknown commands (e.g., "schemabot foobar")
 	//
 	// Scoped commands (always processed based on allowed_environments):
 	//   - plan           (env-scoped, or plans only allowed environments)

@@ -72,11 +72,6 @@ func isAggregateCheck(c *storage.Check) bool {
 		c.DatabaseName == aggregateSentinel
 }
 
-// checkRunName returns the canonical check run name for a given environment, database type, and database.
-func checkRunName(environment, dbType, database string) string {
-	return fmt.Sprintf("SchemaBot: %s/%s/%s", environment, dbType, database)
-}
-
 // storePlanCheckRecord stores a per-database check record after a plan is generated.
 // The record is used internally by the aggregate check to compute its overall status.
 // No per-database GitHub Check Run is created — only the aggregate is visible on the PR.
