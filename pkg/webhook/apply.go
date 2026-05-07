@@ -86,7 +86,13 @@ func (h *Handler) watchApplyProgress(ctx context.Context, repo string, pr int, i
 			h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Summary, summaryBody)
 
 			// Update the GitHub check run to reflect the terminal state
-			h.updateCheckRunForApplyResult(ctx, repo, pr, installationID, current)
+			h.updateCheckRecordForApplyResult(ctx, repo, pr, current)
+			if aggClient, err := h.ghClient.ForInstallation(installationID); err == nil {
+				// Look up the head SHA from the check record
+				if checkRecord, err := h.service.Storage().Checks().Get(ctx, repo, pr, current.Environment, current.DatabaseType, current.Database); err == nil && checkRecord != nil {
+					h.updateAggregateCheck(ctx, aggClient, repo, pr, checkRecord.HeadSHA)
+				}
+			}
 			return
 		}
 

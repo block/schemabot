@@ -191,7 +191,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 				"repo", repo, "pr", pr, "database", database, "reason", reason)
 			commentData.AutoConfirmDowngradeReason = reason
 			h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
-			headSHA, checkRunErr := h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+			headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 			if checkRunErr != nil {
 				h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
 			}
@@ -210,7 +210,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 				"repo", repo, "pr", pr, "planID", planResp.PlanID, "error", planErr)
 			commentData.AutoConfirmDowngradeReason = "Could not verify plan — confirm manually"
 			h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
-			headSHA, checkRunErr := h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+			headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 			if checkRunErr != nil {
 				h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
 			}
@@ -222,7 +222,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 
 		commentData.AutoConfirm = true
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
-		headSHA, checkErr := h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+		headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 		if checkErr != nil {
 			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkErr)
 		}
@@ -238,7 +238,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
 	// Create check run (action_required — waiting for apply-confirm) and update aggregate
-	headSHA, checkErr := h.createApplyPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+	headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 	if checkErr != nil {
 		h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkErr)
 	}
@@ -422,7 +422,7 @@ func (h *Handler) executeApply(
 	}
 
 	// Update check run to in-progress (transitions action_required → in_progress)
-	h.updateCheckRunForApplyStart(ctx, client, repo, pr, schemaResult, environment, installationID)
+	h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment)
 
 	if applyID <= 0 {
 		return
@@ -449,7 +449,10 @@ func (h *Handler) executeApply(
 		tasks, _ := h.service.Storage().Tasks().GetByApplyID(ctx, applyID)
 		summaryBody := formatSummaryComment(apply, tasks)
 		h.postComment(repo, pr, installationID, summaryBody)
-		h.updateCheckRunForApplyResult(ctx, repo, pr, installationID, apply)
+		h.updateCheckRecordForApplyResult(ctx, repo, pr, apply)
+		if checkRecord, err := h.service.Storage().Checks().Get(ctx, repo, pr, apply.Environment, apply.DatabaseType, apply.Database); err == nil && checkRecord != nil {
+			h.updateAggregateCheck(ctx, client, repo, pr, checkRecord.HeadSHA)
+		}
 		return
 	}
 
@@ -548,85 +551,47 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 	}
 }
 
-// createApplyPlanCheckRun creates or updates the check run when an apply plan is posted.
-// Uses the same check name as the plan check run so it updates the existing one.
-func (h *Handler) createApplyPlanCheckRun(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, installationID int64) (string, error) {
-	return h.createPlanCheckRun(ctx, client, repo, pr, schema, planResp, environment, installationID)
+// storeApplyPlanCheckRecord stores a check record when an apply plan is posted.
+func (h *Handler) storeApplyPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
+	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment)
 }
 
-// updateCheckRunForApplyStart updates the existing plan check run to "in_progress"
-// when an apply begins execution. This transitions the check from action_required → in_progress.
-func (h *Handler) updateCheckRunForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string, installationID int64) {
+// updateCheckRecordForApplyStart updates the stored check record to "in_progress"
+// when an apply begins execution. The aggregate check is updated to reflect the state.
+func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string) {
 	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, schema.Type, schema.Database)
 	if err != nil {
 		h.logger.Error("failed to look up check record", "error", err)
 		return
 	}
-	if check == nil || check.CheckRunID == 0 {
-		// No existing check run — create a new one
+
+	if check == nil {
+		// No existing record — create one
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 		if err != nil {
-			h.logger.Error("failed to fetch PR for check run", "error", err)
+			h.logger.Error("failed to fetch PR for check record", "error", err)
 			return
 		}
-		checkName := checkRunName(environment, schema.Type, schema.Database)
-		opts := ghclient.CheckRunOptions{
-			Name:   checkName,
-			Status: checkStatusInProgress,
-			Output: &ghclient.CheckRunOutput{
-				Title:   "Schema change in progress",
-				Summary: "Applying schema changes...",
-			},
-		}
-		checkRunID, err := client.CreateCheckRun(ctx, repo, prInfo.HeadSHA, opts)
-		if err != nil {
-			h.logger.Error("failed to create apply in-progress check run", "error", err)
-			return
-		}
-		// Store the check record so updateCheckRunForApplyResult can find it
-		newCheck := &storage.Check{
+		check = &storage.Check{
 			Repository:   repo,
 			PullRequest:  pr,
 			HeadSHA:      prInfo.HeadSHA,
 			Environment:  environment,
 			DatabaseType: schema.Type,
 			DatabaseName: schema.Database,
-			CheckRunID:   checkRunID,
 			HasChanges:   true,
 			Status:       checkStatusInProgress,
 			Conclusion:   "",
 		}
-		if err := h.service.Storage().Checks().Upsert(ctx, newCheck); err != nil {
-			h.logger.Error("failed to upsert new check record", "error", err)
-		}
-
-		// Update aggregate check to reflect in_progress state
-		h.updateAggregateCheck(ctx, client, repo, pr, prInfo.HeadSHA)
-		return
+	} else {
+		check.Status = checkStatusInProgress
+		check.Conclusion = ""
 	}
 
-	// Update existing check run to in_progress
-	checkName := checkRunName(check.Environment, check.DatabaseType, check.DatabaseName)
-	opts := ghclient.CheckRunOptions{
-		Name:   checkName,
-		Status: checkStatusInProgress,
-		Output: &ghclient.CheckRunOutput{
-			Title:   "Schema change in progress",
-			Summary: "Applying schema changes...",
-		},
-	}
-	if err := client.UpdateCheckRun(ctx, repo, check.CheckRunID, opts); err != nil {
-		h.logger.Error("failed to update check run to in_progress", "error", err)
-	}
-
-	// Update stored record
-	check.Status = checkStatusInProgress
-	check.Conclusion = ""
 	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
 		h.logger.Error("failed to upsert check record", "error", err)
 	}
 
-	// Update aggregate check to reflect in_progress state
 	h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)
 }
 

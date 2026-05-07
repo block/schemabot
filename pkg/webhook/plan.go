@@ -68,10 +68,10 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Post plan comment
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 
-	// Create check run and update aggregate
-	headSHA, checkErr := h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, environment, installationID)
+	// Store per-database check record and update aggregate
+	headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 	if checkErr != nil {
-		h.logger.Error("failed to create plan check run", "repo", repo, "pr", pr, "error", checkErr)
+		h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "error", checkErr)
 	}
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
@@ -181,10 +181,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 		commentData := buildPlanCommentData(schemaResult, planResp, env, requestedBy)
 		multiEnvData.Plans[env] = &commentData
 
-		// Create check run per environment
-		sha, checkErr := h.createPlanCheckRun(ctx, client, repo, pr, schemaResult, planResp, env, installationID)
+		// Store per-database check record per environment
+		sha, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env)
 		if checkErr != nil {
-			h.logger.Error("failed to create plan check run", "repo", repo, "pr", pr, "env", env, "error", checkErr)
+			h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "env", env, "error", checkErr)
 		}
 		if sha != "" {
 			headSHA = sha
