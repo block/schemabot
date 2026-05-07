@@ -37,7 +37,14 @@ import (
 // The input map keys are relative paths (e.g., "users.sql" or "payments/users.sql")
 // and values are file contents. Only .sql files and vschema.json are included;
 // other files (like schemabot.yaml) are skipped.
-func GroupFilesByNamespace(files map[string]string, defaultNamespace string) (SchemaFiles, error) {
+//
+// The environment parameter enables $ENV substitution in namespace names.
+// If environment is non-empty, any literal "$ENV" in namespace keys (from
+// directory names or defaultNamespace) is replaced with the environment value.
+// This allows a single directory like "bikeshare_$ENV/" to resolve to
+// "bikeshare_staging" or "bikeshare_production" depending on the target.
+// If environment is empty, "$ENV" is left as-is.
+func GroupFilesByNamespace(files map[string]string, defaultNamespace string, environment string) (SchemaFiles, error) {
 	result := make(SchemaFiles)
 	var hasFlatFile, hasNamespacedFile bool
 
@@ -55,6 +62,11 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string) (Sc
 			hasFlatFile = true
 		} else {
 			hasNamespacedFile = true
+		}
+
+		// Replace $ENV in namespace keys when environment is known.
+		if environment != "" {
+			namespace = strings.ReplaceAll(namespace, "$ENV", environment)
 		}
 
 		if result[namespace] == nil {

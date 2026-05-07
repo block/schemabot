@@ -20,7 +20,7 @@ func TestGroupFilesByNamespace_FlatLayout_UsesDirectoryName(t *testing.T) {
 		"customers.sql": "CREATE TABLE customers (...);",
 	}
 
-	result, err := GroupFilesByNamespace(files, "aurora_coffeeshop_exemplar")
+	result, err := GroupFilesByNamespace(files, "aurora_coffeeshop_exemplar", "development")
 	require.NoError(t, err)
 
 	require.Len(t, result, 1)
@@ -39,7 +39,7 @@ func TestGroupFilesByNamespace_FlatLayout_SkipsNonSchemaFiles(t *testing.T) {
 		".gitkeep":       "",
 	}
 
-	result, err := GroupFilesByNamespace(files, "myapp")
+	result, err := GroupFilesByNamespace(files, "myapp", "development")
 	require.NoError(t, err)
 	require.Len(t, result, 1)
 	assert.Len(t, result["myapp"].Files, 1)
@@ -53,7 +53,7 @@ func TestGroupFilesByNamespace_FlatLayout_IncludesVSchemaJSON(t *testing.T) {
 		"vschema.json": `{"sharded": true}`,
 	}
 
-	result, err := GroupFilesByNamespace(files, "commerce")
+	result, err := GroupFilesByNamespace(files, "commerce", "development")
 	require.NoError(t, err)
 	require.Len(t, result, 1)
 	assert.Len(t, result["commerce"].Files, 2)
@@ -76,7 +76,7 @@ func TestGroupFilesByNamespace_SubdirLayout_UsesSubdirNames(t *testing.T) {
 		"payments_audit/audit_log.sql": "CREATE TABLE audit_log (...);",
 	}
 
-	result, err := GroupFilesByNamespace(files, "ignored_because_subdirs_exist")
+	result, err := GroupFilesByNamespace(files, "ignored_because_subdirs_exist", "development")
 	require.NoError(t, err)
 	require.Len(t, result, 2)
 	assert.Contains(t, result, "payments")
@@ -93,7 +93,7 @@ func TestGroupFilesByNamespace_SubdirLayout_VSchemaInSubdir(t *testing.T) {
 		"customers/users.sql":   "CREATE TABLE users (...);",
 	}
 
-	result, err := GroupFilesByNamespace(files, "ignored")
+	result, err := GroupFilesByNamespace(files, "ignored", "development")
 	require.NoError(t, err)
 	require.Len(t, result, 2)
 	assert.Len(t, result["commerce"].Files, 2)
@@ -110,7 +110,7 @@ func TestGroupFilesByNamespace_MixedLayout_Rejected(t *testing.T) {
 		"payments/transactions.sql": "CREATE TABLE transactions (...);",
 	}
 
-	_, err := GroupFilesByNamespace(files, "mydb")
+	_, err := GroupFilesByNamespace(files, "mydb", "development")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "both flat files and namespace subdirectories")
 }
@@ -123,7 +123,7 @@ func TestGroupFilesByNamespace_SubdirLayout_NameMatchesDefault(t *testing.T) {
 		"other/items.sql":   "CREATE TABLE items (...);",
 	}
 
-	result, err := GroupFilesByNamespace(files, "schema")
+	result, err := GroupFilesByNamespace(files, "schema", "development")
 	require.NoError(t, err)
 	require.Len(t, result, 2)
 	assert.Contains(t, result, "schema")
@@ -133,7 +133,7 @@ func TestGroupFilesByNamespace_SubdirLayout_NameMatchesDefault(t *testing.T) {
 // Edge cases.
 
 func TestGroupFilesByNamespace_EmptyInput(t *testing.T) {
-	result, err := GroupFilesByNamespace(map[string]string{}, "mydb")
+	result, err := GroupFilesByNamespace(map[string]string{}, "mydb", "development")
 	require.NoError(t, err)
 	assert.Empty(t, result)
 }
@@ -145,7 +145,71 @@ func TestGroupFilesByNamespace_OnlyNonSchemaFiles(t *testing.T) {
 		"README.md":      "# docs",
 	}
 
-	result, err := GroupFilesByNamespace(files, "myapp")
+	result, err := GroupFilesByNamespace(files, "myapp", "development")
 	require.NoError(t, err)
 	assert.Empty(t, result)
+}
+
+// $ENV substitution tests.
+
+func TestGroupFilesByNamespace_EnvSubstitution_SubdirLayout(t *testing.T) {
+	// Subdirectory named "bikeshare_$ENV" becomes "bikeshare_staging" when
+	// environment is "staging".
+	files := map[string]string{
+		"bikeshare_$ENV/bikes.sql":    "CREATE TABLE bikes (...);",
+		"bikeshare_$ENV/stations.sql": "CREATE TABLE stations (...);",
+	}
+
+	result, err := GroupFilesByNamespace(files, "ignored", "staging")
+	require.NoError(t, err)
+
+	require.Len(t, result, 1)
+	assert.Contains(t, result, "bikeshare_staging")
+	assert.Len(t, result["bikeshare_staging"].Files, 2)
+	assert.Equal(t, "CREATE TABLE bikes (...);", result["bikeshare_staging"].Files["bikes.sql"])
+	assert.Equal(t, "CREATE TABLE stations (...);", result["bikeshare_staging"].Files["stations.sql"])
+}
+
+func TestGroupFilesByNamespace_EnvSubstitution_FlatLayout(t *testing.T) {
+	// Flat layout where the defaultNamespace (directory name) contains $ENV.
+	// With environment="production", "bikeshare_$ENV" → "bikeshare_production".
+	files := map[string]string{
+		"bikes.sql":    "CREATE TABLE bikes (...);",
+		"stations.sql": "CREATE TABLE stations (...);",
+	}
+
+	result, err := GroupFilesByNamespace(files, "bikeshare_$ENV", "production")
+	require.NoError(t, err)
+
+	require.Len(t, result, 1)
+	assert.Contains(t, result, "bikeshare_production")
+	assert.Len(t, result["bikeshare_production"].Files, 2)
+}
+
+func TestGroupFilesByNamespace_EnvSubstitution_EmptyEnvNoChange(t *testing.T) {
+	// When environment is empty, $ENV is left as-is (no substitution).
+	files := map[string]string{
+		"bikeshare_$ENV/bikes.sql": "CREATE TABLE bikes (...);",
+	}
+
+	result, err := GroupFilesByNamespace(files, "ignored", "")
+	require.NoError(t, err)
+
+	require.Len(t, result, 1)
+	assert.Contains(t, result, "bikeshare_$ENV")
+}
+
+func TestGroupFilesByNamespace_EnvSubstitution_MultipleNamespaces(t *testing.T) {
+	// Multiple subdirectories, some with $ENV, some without.
+	files := map[string]string{
+		"app_$ENV/users.sql":   "CREATE TABLE users (...);",
+		"analytics/events.sql": "CREATE TABLE events (...);",
+	}
+
+	result, err := GroupFilesByNamespace(files, "ignored", "staging")
+	require.NoError(t, err)
+
+	require.Len(t, result, 2)
+	assert.Contains(t, result, "app_staging")
+	assert.Contains(t, result, "analytics")
 }

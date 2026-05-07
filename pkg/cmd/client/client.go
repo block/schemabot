@@ -62,9 +62,9 @@ type PlanOptions struct {
 
 // CallPlanAPI calls the plan API by reading .sql files from schemaDir.
 // Files are grouped by namespace: subdirectories become namespace keys,
-// flat files use "default".
+// flat files use the directory name as the namespace.
 func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, opts ...PlanOptions) (*apitypes.PlanResponse, error) {
-	schemaFiles, err := ReadSchemaFiles(schemaDir)
+	schemaFiles, err := ReadSchemaFiles(schemaDir, environment)
 	if err != nil {
 		return nil, fmt.Errorf("read schema files: %w", err)
 	}
@@ -203,7 +203,11 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 // Subdirectories become namespace keys; flat files use the directory name as the
 // namespace (the MySQL database name). Only one level of subdirectories is
 // supported (matching the webhook path behavior).
-func ReadSchemaFiles(dir string) (map[string]*apitypes.SchemaFiles, error) {
+//
+// The environment parameter enables $ENV substitution in namespace names.
+// If non-empty, any "$ENV" in directory names or the default namespace is
+// replaced with the environment value (e.g., "bikeshare_$ENV" → "bikeshare_staging").
+func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.SchemaFiles, error) {
 	// Collect all files as relativePath → content
 	rawFiles := make(map[string]string)
 
@@ -257,7 +261,7 @@ func ReadSchemaFiles(dir string) (map[string]*apitypes.SchemaFiles, error) {
 
 	// Group by namespace using the shared helper.
 	// For flat files, the directory name is the database name.
-	grouped, err := schema.GroupFilesByNamespace(rawFiles, filepath.Base(dir))
+	grouped, err := schema.GroupFilesByNamespace(rawFiles, filepath.Base(dir), environment)
 	if err != nil {
 		return nil, err
 	}

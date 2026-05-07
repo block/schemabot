@@ -19,7 +19,7 @@ import (
 // subdirectory as the namespace.
 func groupFiles(t *testing.T, files map[string]string, database string) map[string]*apitypes.SchemaFiles {
 	t.Helper()
-	grouped, err := schema.GroupFilesByNamespace(files, database)
+	grouped, err := schema.GroupFilesByNamespace(files, database, "development")
 	require.NoError(t, err, "group schema files by namespace")
 	result := make(map[string]*apitypes.SchemaFiles, len(grouped))
 	for ns, nsFiles := range grouped {

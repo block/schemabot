@@ -58,7 +58,7 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 	}
 
 	// Group files by keyspace/namespace
-	schemaFiles, err := groupFilesByNamespace(files, configDir)
+	schemaFiles, err := groupFilesByNamespace(files, configDir, environment)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +79,7 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 // Files in namespace subdirectories (schema/namespace/table.sql) use the
 // subdirectory name as the namespace. Flat files (schema/table.sql) use the
 // schema directory name as the namespace (the MySQL database name).
-func groupFilesByNamespace(files []GitHubFile, schemaPath string) (map[string]*ternv1.SchemaFiles, error) {
+func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string) (map[string]*ternv1.SchemaFiles, error) {
 	// Build relativePath → content map for the shared helper.
 	// file.Path is the full path (e.g., "schema/payments/transactions.sql"),
 	// so trimming schemaPath+"/" gives the relative path ("payments/transactions.sql"
@@ -94,7 +94,7 @@ func groupFilesByNamespace(files []GitHubFile, schemaPath string) (map[string]*t
 		rawFiles[relPath] = file.Content
 	}
 
-	grouped, err := schema.GroupFilesByNamespace(rawFiles, path.Base(schemaPath))
+	grouped, err := schema.GroupFilesByNamespace(rawFiles, path.Base(schemaPath), environment)
 	if err != nil {
 		return nil, err
 	}

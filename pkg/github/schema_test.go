@@ -21,7 +21,7 @@ func TestGroupFilesByNamespace_FlatLayout_UsesDirectoryName(t *testing.T) {
 		{Path: "schema/payments/refunds.sql", Name: "refunds.sql", Content: "CREATE TABLE refunds (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "schema/payments")
+	result, err := groupFilesByNamespace(files, "schema/payments", "development")
 
 	require.NoError(t, err)
 	require.Len(t, result, 1)
@@ -45,7 +45,7 @@ func TestGroupFilesByNamespace_FlatLayout_IssueScenario(t *testing.T) {
 		{Path: "schema/aurora_coffeeshop_exemplar/customers.sql", Name: "customers.sql", Content: "CREATE TABLE customers (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "schema/aurora_coffeeshop_exemplar")
+	result, err := groupFilesByNamespace(files, "schema/aurora_coffeeshop_exemplar", "development")
 
 	require.NoError(t, err)
 	require.Len(t, result, 1)
@@ -62,7 +62,7 @@ func TestGroupFilesByNamespace_FlatLayout_TopLevelSchemaDir(t *testing.T) {
 		{Path: "schema/orders.sql", Name: "orders.sql", Content: "CREATE TABLE orders (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "schema")
+	result, err := groupFilesByNamespace(files, "schema", "development")
 
 	require.NoError(t, err)
 	require.Len(t, result, 1)
@@ -88,7 +88,7 @@ func TestGroupFilesByNamespace_SubdirLayout_MultipleNamespaces(t *testing.T) {
 		{Path: "schema/payments_audit/audit_log.sql", Name: "audit_log.sql", Content: "CREATE TABLE audit_log (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "schema")
+	result, err := groupFilesByNamespace(files, "schema", "development")
 	require.NoError(t, err)
 
 	require.Len(t, result, 2)
@@ -106,7 +106,7 @@ func TestGroupFilesByNamespace_SubdirLayout_Monorepo(t *testing.T) {
 		{Path: "payments-service/mysql/schema/payments_audit/audit_log.sql", Name: "audit_log.sql", Content: "CREATE TABLE audit_log (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "payments-service/mysql/schema")
+	result, err := groupFilesByNamespace(files, "payments-service/mysql/schema", "development")
 	require.NoError(t, err)
 
 	require.Len(t, result, 2)
@@ -123,7 +123,7 @@ func TestGroupFilesByNamespace_SubdirLayout_VitessKeyspaces(t *testing.T) {
 		{Path: "schema/customers/users.sql", Name: "users.sql", Content: "CREATE TABLE users (...);"},
 	}
 
-	result, err := groupFilesByNamespace(files, "schema")
+	result, err := groupFilesByNamespace(files, "schema", "development")
 	require.NoError(t, err)
 
 	require.Len(t, result, 2)
@@ -142,7 +142,7 @@ func TestGroupFilesByNamespace_MixedLayout_Rejected(t *testing.T) {
 		{Path: "schema/payments/transactions.sql", Name: "transactions.sql", Content: "CREATE TABLE transactions (...);"},
 	}
 
-	_, err := groupFilesByNamespace(files, "schema")
+	_, err := groupFilesByNamespace(files, "schema", "development")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "both flat files and namespace subdirectories")

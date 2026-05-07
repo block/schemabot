@@ -109,6 +109,40 @@ SchemaBot plans all keyspaces together — a single plan can contain changes acr
 
 A plan can have DDL-only changes, VSchema-only changes, or both.
 
+## `$ENV` Substitution in Namespace Names
+
+Some infrastructure names schemas with an environment suffix: `bikeshare_staging` in staging, `bikeshare_production` in production. Rather than maintaining separate directories for each environment, you can use `$ENV` in the directory name. When an environment is specified (via `-e`), `$ENV` is replaced with the environment value.
+
+### Example
+
+Directory structure:
+
+```
+myapp/schema/
+├── schemabot.yaml
+└── bikeshare_$ENV/
+    ├── bikes.sql
+    └── stations.sql
+```
+
+Running against different environments resolves the namespace accordingly:
+
+```bash
+# Namespace becomes "bikeshare_staging"
+schemabot plan -s myapp/schema -e staging
+
+# Namespace becomes "bikeshare_production"
+schemabot plan -s myapp/schema -e production
+```
+
+### Rules
+
+- `$ENV` is replaced with the environment value from `-e` (e.g., `staging`, `production`).
+- If no environment is specified, `$ENV` is left as-is (no substitution).
+- Works in both flat layout (directory name = namespace) and subdirectory layout (subdirectory names = namespaces).
+- You can mix `$ENV` directories with regular directories in the subdirectory layout.
+- When creating the directory from a shell, quote the name to prevent shell expansion: `mkdir 'bikeshare_$ENV'`
+
 ## Summary
 
 | Scenario | schemabot.yaml | Namespaces | Example |
@@ -117,6 +151,7 @@ A plan can have DDL-only changes, VSchema-only changes, or both.
 | MySQL, multiple schema names | 1 | many | `app_primary/`, `app_analytics/` |
 | MySQL, different databases | 1 per database | 1 each | separate directories |
 | Vitess, multiple keyspaces | 1 | many | `commerce/`, `commerce_sharded/` |
+| Environment-specific namespace | 1 | 1 per env | `bikeshare_$ENV/` |
 
 ## How Namespaces Flow Through the System
 
