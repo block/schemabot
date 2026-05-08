@@ -38,6 +38,10 @@ PS_COST_PER_SHARD=39
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --help|-h)
+            COMMAND="--help"
+            break
+            ;;
         --org)
             PS_ORG="$2"
             shift 2
@@ -136,11 +140,8 @@ cmd_create() {
     local token_json
     token_json=$($PSCALE service-token create --name "$token_name" --format json)
     local token_id token_secret
-    token_id=$(echo "$token_json" | jq -r '.id')
-    token_secret=$(echo "$token_json" | jq -r '.token')
-    if [ -z "$token_id" ] || [ -z "$token_secret" ]; then
-        error "Failed to parse service token output"
-    fi
+    token_id=$(echo "$token_json" | jq -re '.id') || error "Failed to parse service token ID from output"
+    token_secret=$(echo "$token_json" | jq -re '.token') || error "Failed to parse service token secret from output"
     success "Service token created: $token_id"
 
     # Step 4: Grant permissions
@@ -166,12 +167,9 @@ cmd_create() {
     local vtgate_json
     vtgate_json=$($PSCALE password create "$PS_DATABASE" main "$vtgate_name" --role reader --format json)
     local vtgate_host vtgate_user vtgate_pass
-    vtgate_host=$(echo "$vtgate_json" | jq -r '.access_host_url')
-    vtgate_user=$(echo "$vtgate_json" | jq -r '.username')
-    vtgate_pass=$(echo "$vtgate_json" | jq -r '.plain_text')
-    if [ -z "$vtgate_host" ] || [ -z "$vtgate_user" ] || [ -z "$vtgate_pass" ]; then
-        error "Failed to parse vtgate password output"
-    fi
+    vtgate_host=$(echo "$vtgate_json" | jq -re '.access_host_url') || error "Failed to parse vtgate host from output"
+    vtgate_user=$(echo "$vtgate_json" | jq -re '.username') || error "Failed to parse vtgate username from output"
+    vtgate_pass=$(echo "$vtgate_json" | jq -re '.plain_text') || error "Failed to parse vtgate password from output"
     success "Vtgate password created"
 
     # Summary

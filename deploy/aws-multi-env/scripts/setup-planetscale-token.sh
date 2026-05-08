@@ -65,7 +65,7 @@ fi
 # Derive prefix from terraform output
 # ============================================================================
 
-TF_OUTPUT=$(terraform output -json 2>/dev/null)
+TF_OUTPUT=$(terraform output -json 2>/dev/null || echo '{}')
 PREFIX=$(echo "$TF_OUTPUT" | jq -r '.storage_dsn_secret_id.value // empty' | sed 's|/storage-dsn||')
 if [ -z "$PREFIX" ]; then
     echo "Error: could not determine prefix from terraform output."
