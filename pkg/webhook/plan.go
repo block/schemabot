@@ -132,6 +132,17 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 
 	if len(environments) == 0 {
 		h.logger.Info("no environments to plan after filtering", "repo", repo, "pr", pr)
+		// Post passing aggregates so branch protection isn't blocked waiting
+		// for checks from this instance when the database doesn't have
+		// environments this instance manages.
+		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+		if err != nil {
+			h.logger.Error("failed to fetch PR for passing aggregate", "repo", repo, "pr", pr, "error", err)
+			return
+		}
+		h.postPassingAggregates(ctx, client, repo, pr, prInfo.HeadSHA,
+			"No databases for this environment",
+			"This PR has schema changes, but none of the databases have environments managed by this instance.")
 		return
 	}
 

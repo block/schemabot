@@ -2129,3 +2129,274 @@ func TestE2EWebhookMetrics(t *testing.T) {
 	assert.True(t, observedEvents["issue_comment/created"], "expected issue_comment/created metric")
 	assert.True(t, observedEvents["pull_request/opened"], "expected pull_request/opened metric")
 }
+
+// setupE2EServiceWithAllowedEnvs creates a service with AllowedEnvironments set.
+// Uses the shared SchemaBot storage DB but no target databases (for testing check run
+// posting without needing to plan).
+func setupE2EServiceWithAllowedEnvs(t *testing.T, allowedEnvs []string) *api.Service {
+	t.Helper()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = schemabotDB.Close() })
+
+	st := mysqlstore.New(schemabotDB)
+
+	// Clean up stale data
+	_, _ = schemabotDB.ExecContext(t.Context(),
+		"DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+
+	serverConfig := &api.ServerConfig{
+		AllowedEnvironments: allowedEnvs,
+	}
+
+	svc := api.New(st, serverConfig, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { _ = svc.Close() })
+
+	return svc
+}
+
+// TestE2EPassingAggregateOnNonSchemaPR verifies that when a PR doesn't touch schema
+// files and allowed_environments is configured, passing aggregate checks are posted
+// so branch protection isn't blocked.
+func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging", "production"})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// PR info
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	// PR changed files — no schema files
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new("README.md"), Status: new("modified")},
+		})
+	})
+
+	// Git tree — no schemabot.yaml
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{
+			SHA:       new("abc123"),
+			Entries:   []*gh.TreeEntry{},
+			Truncated: new(false),
+		})
+	})
+
+	// Capture check runs
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+
+	// Wait for both passing aggregates (staging + production)
+	seen := map[string]bool{}
+	for i := range 2 {
+		select {
+		case cr := <-checkRuns:
+			seen[cr.Name] = true
+			assert.Equal(t, "completed", cr.Status)
+			assert.Equal(t, "success", cr.Conclusion)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for passing aggregate check run %d/2, seen: %v", i+1, seen)
+		}
+	}
+	assert.True(t, seen["SchemaBot (staging)"], "expected SchemaBot (staging) check")
+	assert.True(t, seen["SchemaBot (production)"], "expected SchemaBot (production) check")
+}
+
+// TestE2EPassingAggregateOnSQLWithoutSchemabotYAML verifies that when a PR touches
+// .sql files but the directory has no schemabot.yaml (not onboarded), passing
+// aggregate checks are still posted.
+func TestE2EPassingAggregateOnSQLWithoutSchemabotYAML(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// PR info
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	// PR changed files — .sql file but in a directory without schemabot.yaml
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new("legacy-service/schema/users.sql"), Status: new("modified")},
+		})
+	})
+
+	// Git tree — has the .sql file but no schemabot.yaml anywhere
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{
+			SHA: new("abc123"),
+			Entries: []*gh.TreeEntry{
+				{
+					Path: new("legacy-service/schema/users.sql"),
+					Mode: new("100644"),
+					Type: new("blob"),
+					SHA:  new("blobsha001"),
+					Size: new(100),
+				},
+			},
+			Truncated: new(false),
+		})
+	})
+
+	// Capture check runs
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+
+	// Should post passing aggregate even though .sql files changed
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "SchemaBot (staging)", cr.Name)
+		assert.Equal(t, "completed", cr.Status)
+		assert.Equal(t, "success", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for passing aggregate check run")
+	}
+}
+
+// TestE2EPassingAggregateWithoutAllowedEnvs verifies that when allowed_environments
+// is not configured (single instance mode), a global "SchemaBot" passing aggregate
+// is posted for non-schema PRs.
+func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
+	dbName := "webhook_no_aggregate"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// PR info
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	// PR changed files — no schema files
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new("README.md"), Status: new("modified")},
+		})
+	})
+
+	// Git tree — empty
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{
+			SHA:       new("abc123"),
+			Entries:   []*gh.TreeEntry{},
+			Truncated: new(false),
+		})
+	})
+
+	// Capture check runs
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+
+	// Single-instance mode posts a global "SchemaBot" passing aggregate
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "SchemaBot", cr.Name)
+		assert.Equal(t, "completed", cr.Status)
+		assert.Equal(t, "success", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for passing aggregate check run")
+	}
+}

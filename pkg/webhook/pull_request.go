@@ -111,7 +111,33 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 	})
 
 	if len(configs) == 0 {
-		h.logger.Debug("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr)
+		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr)
+		// Post passing aggregates so branch protection isn't blocked on
+		// PRs that don't touch schema files. Only do this if there are no
+		// existing check records — if there are, cleanupStaleChecks already
+		// handles the aggregate update and running both would race.
+		h.goSafe(repo, pr, installationID, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			existing, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
+			if err != nil {
+				h.logger.Error("failed to check existing records", "repo", repo, "pr", pr, "error", err)
+				return
+			}
+			if len(existing) > 0 {
+				h.logger.Debug("existing check records found, cleanupStaleChecks will handle aggregate",
+					"repo", repo, "pr", pr, "count", len(existing))
+				return
+			}
+			c, err := h.ghClient.ForInstallation(installationID)
+			if err != nil {
+				h.logger.Error("failed to create GitHub client for passing aggregate", "error", err)
+				return
+			}
+			h.postPassingAggregates(ctx, c, repo, pr, headSHA,
+				"No schema changes",
+				"This PR does not modify any schema files.")
+		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "no schema files in PR"})
 		return
 	}
