@@ -36,3 +36,14 @@ databases:
     environments:
       staging:
         dsn: "secretsmanager:schemabot-staging/inventory-staging#dsn"
+
+  # Vitess (PlanetScale) — optional, requires bootstrap-planetscale.sh setup.
+  # Set organization to your PlanetScale org after running the bootstrap script.
+  # Safe to leave as-is if not using PlanetScale — credentials are resolved lazily.
+  commerce:
+    type: vitess
+    environments:
+      staging:
+        organization: "PLACEHOLDER"
+        token_secret_ref: "secretsmanager:schemabot-staging/planetscale-token#token"
+        dsn: "secretsmanager:schemabot-staging/planetscale-vtgate#dsn"
