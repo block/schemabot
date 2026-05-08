@@ -135,8 +135,8 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 				return
 			}
 			h.postPassingAggregates(ctx, c, repo, pr, headSHA,
-				"No schema changes",
-				"This PR does not modify any schema files.")
+				"No managed schema changes",
+				"This PR does not contain schema changes managed by SchemaBot.")
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "no schema files in PR"})
 		return

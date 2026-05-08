@@ -202,9 +202,19 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 		}
 	}
 
-	// Update aggregate check once after all environments are planned
+	// Update aggregate check once after all environments are planned.
+	// If all environments errored, no check records were stored and headSHA
+	// is empty. Post a failing aggregate so branch protection isn't stuck
+	// waiting for a check that will never arrive.
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+	} else if len(multiEnvData.Errors) > 0 {
+		prInfo, fetchErr := client.FetchPullRequest(ctx, repo, pr)
+		if fetchErr != nil {
+			h.logger.Error("failed to fetch PR for error aggregate", "repo", repo, "pr", pr, "error", fetchErr)
+		} else {
+			h.postFailingAggregates(ctx, client, repo, pr, prInfo.HeadSHA, multiEnvData.Errors)
+		}
 	}
 
 	// Auto-plan: skip comment if no changes and no errors (reduce PR noise)

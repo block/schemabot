@@ -559,6 +559,84 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 	}
 }
 
+// postFailingAggregates posts a failing aggregate check for each allowed environment
+// that has errors. Called when all environments fail during planning so branch
+// protection shows a clear failure instead of waiting indefinitely.
+func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string) {
+	config := h.service.Config()
+
+	type envCheck struct {
+		name        string
+		environment string
+	}
+
+	var checks []envCheck
+	if len(config.AllowedEnvironments) > 0 {
+		for _, env := range config.AllowedEnvironments {
+			if _, hasError := errors[env]; hasError {
+				checks = append(checks, envCheck{
+					name:        aggregateCheckNameForEnv(env),
+					environment: env,
+				})
+			}
+		}
+	} else {
+		checks = append(checks, envCheck{
+			name:        aggregateCheckName,
+			environment: aggregateSentinel,
+		})
+	}
+
+	for _, ec := range checks {
+		// Build summary from the error for this environment
+		summary := "Plan failed"
+		if errMsg, ok := errors[ec.environment]; ok {
+			summary = errMsg
+		} else if len(errors) > 0 {
+			// Single-instance mode: use first error
+			for _, msg := range errors {
+				summary = msg
+				break
+			}
+		}
+
+		opts := ghclient.CheckRunOptions{
+			Name:       ec.name,
+			Status:     checkStatusCompleted,
+			Conclusion: checkConclusionFailure,
+			Output: &ghclient.CheckRunOutput{
+				Title:   "Plan failed",
+				Summary: summary,
+			},
+		}
+
+		id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
+		if err != nil {
+			h.logger.Error("failed to create failing aggregate", "repo", repo, "pr", pr, "error", err)
+			continue
+		}
+
+		aggCheck := &storage.Check{
+			Repository:   repo,
+			PullRequest:  pr,
+			HeadSHA:      headSHA,
+			Environment:  ec.environment,
+			DatabaseType: aggregateSentinel,
+			DatabaseName: aggregateSentinel,
+			CheckRunID:   id,
+			HasChanges:   false,
+			Status:       checkStatusCompleted,
+			Conclusion:   checkConclusionFailure,
+		}
+		if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
+			h.logger.Error("failed to store failing aggregate check", "error", err)
+		}
+
+		h.logger.Info("posted failing aggregate",
+			"repo", repo, "pr", pr, "check_name", ec.name, "env", ec.environment)
+	}
+}
+
 // computeAggregate determines the aggregate conclusion and status from per-database checks.
 func computeAggregate(checks []*storage.Check) (conclusion, status string) {
 	// in_progress takes precedence — the aggregate should show running

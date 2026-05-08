@@ -2400,3 +2400,60 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 		t.Fatal("timed out waiting for passing aggregate check run")
 	}
 }
+
+// TestE2EFailingAggregateOnPlanError verifies that when a plan fails for all
+// environments (e.g., database not configured), a failing aggregate check is
+// posted so branch protection shows a clear failure instead of waiting forever.
+func TestE2EFailingAggregateOnPlanError(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// schemabot.yaml references a database not configured on the server
+	schemabotConfig := "database: unconfigured-db\ntype: mysql\n"
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, "unconfigured-db")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// Should get a comment with the error
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Error")
+		assert.Contains(t, body, "unconfigured-db")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for error comment")
+	}
+
+	// Should also get a failing aggregate check run
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, "SchemaBot (staging)", cr.Name)
+		assert.Equal(t, "completed", cr.Status)
+		assert.Equal(t, "failure", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for failing aggregate check run")
+	}
+}
