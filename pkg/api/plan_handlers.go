@@ -114,7 +114,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		span.SetStatus(codes.Error, "tern client")
 		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
-		return nil, fmt.Errorf("tern client: %w", err)
+		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
 	// Call Tern Plan
@@ -271,7 +271,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "tern client")
 		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
-		return nil, 0, fmt.Errorf("tern client: %w", err)
+		return nil, 0, fmt.Errorf("database %q (%s): %w", plan.Database, req.Environment, err)
 	}
 
 	// Ensure options map exists and includes environment
@@ -451,7 +451,7 @@ func (s *Service) ExecuteRollbackPlan(ctx context.Context, database, environment
 
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {
-		return nil, fmt.Errorf("tern client: %w", err)
+		return nil, fmt.Errorf("database %q (%s): %w", database, environment, err)
 	}
 
 	resp, err := client.RollbackPlan(ctx, database)

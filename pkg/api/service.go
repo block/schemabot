@@ -242,6 +242,9 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	// Fall back to gRPC mode (TernDeployments)
 	address, err := s.config.TernDeployments.Endpoint(deployment, environment)
 	if err != nil {
+		if deployment == DefaultDeployment {
+			return nil, fmt.Errorf("not found in server configuration")
+		}
 		return nil, err
 	}
 

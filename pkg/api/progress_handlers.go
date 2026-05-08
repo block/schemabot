@@ -69,6 +69,8 @@ func (s *Service) resolveDeployment(database, deployment string) string {
 	if s.config.Database(database) != nil {
 		return database
 	}
+	s.logger.Warn("database not found in config, falling back to default tern deployment",
+		"database", database)
 	return DefaultDeployment
 }
 
