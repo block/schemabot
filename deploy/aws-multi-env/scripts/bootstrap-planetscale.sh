@@ -121,7 +121,7 @@ cmd_create() {
     fi
 
     # Step 1: Create database (creates default unsharded keyspace with same name)
-    log "Step 1/5: Creating database '$PS_DATABASE' (unsharded keyspace, $PS_CLUSTER_SIZE)..."
+    log "Step 1/6: Creating database '$PS_DATABASE' (unsharded keyspace, $PS_CLUSTER_SIZE)..."
     pscale database create "$PS_DATABASE" \
         --region "$PS_REGION" \
         --cluster-size "$PS_CLUSTER_SIZE" \
@@ -130,7 +130,7 @@ cmd_create() {
     success "Database created with unsharded keyspace '$PS_DATABASE'"
 
     # Step 2: Create sharded keyspace
-    log "Step 2/5: Creating sharded keyspace '$PS_SHARDED_KEYSPACE' ($PS_SHARDED_SHARD_COUNT shards, $PS_CLUSTER_SIZE each)..."
+    log "Step 2/6: Creating sharded keyspace '$PS_SHARDED_KEYSPACE' ($PS_SHARDED_SHARD_COUNT shards, $PS_CLUSTER_SIZE each)..."
     pscale keyspace create "$PS_DATABASE" main "$PS_SHARDED_KEYSPACE" \
         --shards "$PS_SHARDED_SHARD_COUNT" \
         --cluster-size "$PS_CLUSTER_SIZE" \
