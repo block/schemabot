@@ -86,6 +86,13 @@ if [ -z "$COMMAND" ]; then
     exit 1
 fi
 
+# --env is required for create and delete (Secrets Manager access)
+if [ -z "$PS_ENV" ] && [ "$COMMAND" != "status" ] && [ "$COMMAND" != "--help" ] && [ "$COMMAND" != "-h" ]; then
+    echo "Error: --env <environment> is required for $COMMAND"
+    echo "Usage: $0 --org <org-name> --env <environment> $COMMAND"
+    exit 1
+fi
+
 if ! command -v pscale &> /dev/null; then
     echo "Error: pscale CLI not installed"
     echo "Install: brew install planetscale/tap/pscale"
@@ -175,10 +182,6 @@ store_credentials_in_sm() {
 # ============================================================================
 
 cmd_create() {
-    if [ -z "$PS_ENV" ]; then
-        error "--env is required for create (e.g., --env staging)"
-    fi
-
     log "Creating PlanetScale database '$PS_DATABASE' in org '$PS_ORG'..."
     echo ""
 
@@ -383,6 +386,26 @@ cmd_delete() {
     log "Deleting database $PS_DATABASE..."
     pscale database delete "$PS_DATABASE" --force $ORG_FLAG
     success "Database deleted"
+
+    # Clean up Secrets Manager entries
+    log "Cleaning up Secrets Manager secrets..."
+    local prefix
+    prefix=$(get_sm_prefix)
+    for secret_suffix in planetscale-token planetscale-vtgate; do
+        local secret_id="$prefix/$secret_suffix"
+        if aws secretsmanager describe-secret --region "$AWS_REGION" --secret-id "$secret_id" > /dev/null 2>&1; then
+            log "Deleting secret: $secret_id"
+            aws secretsmanager delete-secret --region "$AWS_REGION" --secret-id "$secret_id" --force-delete-without-recovery > /dev/null
+            success "Secret deleted"
+        fi
+    done
+
+    # Clean up local credentials file
+    local creds_file="$MULTI_ENV_DIR/$PS_ENV/.planetscale-credentials"
+    if [ -f "$creds_file" ]; then
+        rm "$creds_file"
+        success "Removed $creds_file"
+    fi
 }
 
 # ============================================================================
