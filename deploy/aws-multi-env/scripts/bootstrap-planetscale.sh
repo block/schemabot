@@ -72,7 +72,6 @@ done
 
 COMMAND="${1:-}"
 PS_SHARDED_KEYSPACE="${PS_DATABASE}_sharded"
-TODAY=$(date +%Y-%m-%d)
 
 if [ -z "$PS_ORG" ]; then
     echo "Error: --org <org-name> is required"
@@ -144,7 +143,7 @@ cmd_create() {
     success "Safe migrations enabled"
 
     # Step 4: Create service token
-    local token_name="schemabot-${PS_DATABASE}--${TODAY}"
+    local token_name="schemabot-${PS_DATABASE}"
     log "Step 4/6: Creating service token '$token_name'..."
     local token_json
     token_json=$(pscale service-token create --name "$token_name" --format json $ORG_FLAG)
@@ -172,7 +171,7 @@ cmd_create() {
     success "Permissions granted (11 access types)"
 
     # Step 6: Create vtgate password for progress polling (SHOW VITESS_MIGRATIONS)
-    local vtgate_name="schemabot-vtgate--${TODAY}"
+    local vtgate_name="schemabot-${PS_DATABASE}-vtgate"
     log "Step 6/6: Creating vtgate password '$vtgate_name'..."
     local vtgate_json
     vtgate_json=$(pscale password create "$PS_DATABASE" main "$vtgate_name" --role reader --format json $ORG_FLAG)
@@ -286,6 +285,7 @@ cmd_delete() {
 
     echo ""
     warn "This will DELETE the PlanetScale database: $PS_DATABASE"
+    warn "This includes all service tokens with access to this database."
     warn "Organization: $PS_ORG"
     warn "Monthly savings: ~\$$total_cost"
     echo ""
@@ -295,7 +295,22 @@ cmd_delete() {
         error "Cancelled — input did not match database name"
     fi
 
-    log "Deleting $PS_DATABASE..."
+    # Delete service token and vtgate password created by the create command.
+    log "Cleaning up service tokens..."
+    local tokens
+    tokens=$(pscale service-token list --format json $ORG_FLAG 2>/dev/null || echo '[]')
+    local token_name="schemabot-${PS_DATABASE}"
+    local tid
+    tid=$(echo "$tokens" | jq -r ".[] | select(.name == \"$token_name\") | .id")
+    if [ -n "$tid" ]; then
+        log "Deleting service token '$token_name' ($tid)..."
+        pscale service-token delete "$tid" --force $ORG_FLAG
+        success "Service token deleted"
+    else
+        warn "Service token '$token_name' not found, skipping"
+    fi
+
+    log "Deleting database $PS_DATABASE..."
     pscale database delete "$PS_DATABASE" --force $ORG_FLAG
     success "Database deleted"
 }
