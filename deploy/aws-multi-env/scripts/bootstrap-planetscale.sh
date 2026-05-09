@@ -2,23 +2,20 @@
 set -euo pipefail
 
 # Bootstrap a PlanetScale database for SchemaBot with sharded + unsharded keyspaces.
-# Credentials are saved to .planetscale-credentials (gitignored) for use by
-# setup-planetscale-token.sh. They are never printed to the console.
+# Creates the database, credentials, and stores them in AWS Secrets Manager.
 #
 # Prerequisites:
 #   - pscale CLI installed: brew install planetscale/tap/pscale
 #   - Authenticated: pscale auth login
+#   - AWS CLI configured (for Secrets Manager)
+#   - Terraform state initialized (run bootstrap.sh first)
 #
-# Usage: Run from the environment directory (e.g., staging/):
+# Usage:
+#   ../scripts/bootstrap-planetscale.sh --org <org> --env staging create
+#   ../scripts/bootstrap-planetscale.sh --org <org> --env staging delete
+#   ../scripts/bootstrap-planetscale.sh --org <org> status
 #
-#   cd deploy/aws-multi-env/staging
-#   ../scripts/bootstrap-planetscale.sh --org <org> create
-#   ../scripts/setup-planetscale-token.sh
-#
-# Commands:
-#   create    Create database, keyspaces, service token, and vtgate password
-#   status    Show database status and cost estimate
-#   delete    Delete database (with confirmation)
+# Run from the environment directory (e.g., deploy/aws-multi-env/staging/).
 
 # ============================================================================
 # Defaults
@@ -30,6 +27,8 @@ PS_REGION="us-west"
 PS_CLUSTER_SIZE="PS-10"
 PS_SHARDED_SHARD_COUNT=2
 PS_COST_PER_SHARD=39
+PS_ENV=""
+AWS_REGION="${AWS_DEFAULT_REGION:-us-west-2}"
 
 # ============================================================================
 # Parse flags
@@ -43,6 +42,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --org)
             PS_ORG="$2"
+            shift 2
+            ;;
+        --env)
+            PS_ENV="$2"
             shift 2
             ;;
         --database)
@@ -70,16 +73,16 @@ done
 COMMAND="${1:-}"
 PS_SHARDED_KEYSPACE="${PS_DATABASE}_sharded"
 
-if [ -z "$PS_ORG" ]; then
+if [ -z "$PS_ORG" ] && [ "$COMMAND" != "--help" ]; then
     echo "Error: --org <org-name> is required"
-    echo "Usage: $0 --org <org-name> [options] <command>"
+    echo "Usage: $0 --org <org-name> --env <environment> [options] <command>"
     echo "Run '$0 --help' for details."
     exit 1
 fi
 
 if [ -z "$COMMAND" ]; then
     echo "Error: command required (create, status, delete)"
-    echo "Usage: $0 --org <org-name> [options] <command>"
+    echo "Usage: $0 --org <org-name> --env <environment> [options] <command>"
     exit 1
 fi
 
@@ -91,6 +94,8 @@ if ! command -v pscale &> /dev/null; then
 fi
 
 ORG_FLAG="--org $PS_ORG"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MULTI_ENV_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Colors
 GREEN='\033[0;32m'
@@ -105,10 +110,75 @@ warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # ============================================================================
+# Secrets Manager helpers
+# ============================================================================
+
+# Derive the Secrets Manager prefix from terraform output in the environment directory.
+get_sm_prefix() {
+    local env_dir="$MULTI_ENV_DIR/$PS_ENV"
+    if [ ! -d "$env_dir" ]; then
+        error "Environment directory not found: $env_dir"
+    fi
+    local tf_output
+    tf_output=$(cd "$env_dir" && terraform output -json 2>/dev/null || echo '{}')
+    local prefix
+    prefix=$(echo "$tf_output" | jq -r '.storage_dsn_secret_id.value // empty' | sed 's|/storage-dsn||')
+    if [ -z "$prefix" ]; then
+        error "Could not determine Secrets Manager prefix from terraform output in $env_dir"
+    fi
+    echo "$prefix"
+}
+
+create_or_update_secret() {
+    local secret_id="$1"
+    local secret_value="$2"
+    local description="$3"
+
+    if aws secretsmanager describe-secret --region "$AWS_REGION" --secret-id "$secret_id" > /dev/null 2>&1; then
+        log "Updating secret: $secret_id"
+        aws secretsmanager update-secret \
+            --region "$AWS_REGION" \
+            --secret-id "$secret_id" \
+            --secret-string "$secret_value" > /dev/null
+    else
+        log "Creating secret: $secret_id"
+        aws secretsmanager create-secret \
+            --region "$AWS_REGION" \
+            --name "$secret_id" \
+            --description "$description" \
+            --secret-string "$secret_value" > /dev/null
+    fi
+}
+
+store_credentials_in_sm() {
+    local service_token="$1"
+    local vtgate_dsn="$2"
+
+    local prefix
+    prefix=$(get_sm_prefix)
+
+    log "Storing credentials in Secrets Manager (prefix: $prefix)..."
+
+    local token_value
+    token_value=$(jq -n --arg token "$service_token" '{"token": $token}')
+    create_or_update_secret "$prefix/planetscale-token" "$token_value" "PlanetScale service token for SchemaBot"
+    success "Service token stored: $prefix/planetscale-token"
+
+    local vtgate_value
+    vtgate_value=$(jq -n --arg dsn "$vtgate_dsn" '{"dsn": $dsn}')
+    create_or_update_secret "$prefix/planetscale-vtgate" "$vtgate_value" "PlanetScale vtgate credentials for SchemaBot"
+    success "Vtgate DSN stored: $prefix/planetscale-vtgate"
+}
+
+# ============================================================================
 # create
 # ============================================================================
 
 cmd_create() {
+    if [ -z "$PS_ENV" ]; then
+        error "--env is required for create (e.g., --env staging)"
+    fi
+
     log "Creating PlanetScale database '$PS_DATABASE' in org '$PS_ORG'..."
     echo ""
 
@@ -117,7 +187,7 @@ cmd_create() {
     fi
 
     # Step 1: Create database (creates default unsharded keyspace with same name)
-    log "Step 1/6: Creating database '$PS_DATABASE' (unsharded keyspace, $PS_CLUSTER_SIZE)..."
+    log "Step 1/7: Creating database '$PS_DATABASE' (unsharded keyspace, $PS_CLUSTER_SIZE)..."
     pscale database create "$PS_DATABASE" \
         --region "$PS_REGION" \
         --cluster-size "$PS_CLUSTER_SIZE" \
@@ -126,7 +196,7 @@ cmd_create() {
     success "Database created with unsharded keyspace '$PS_DATABASE'"
 
     # Step 2: Create sharded keyspace
-    log "Step 2/6: Creating sharded keyspace '$PS_SHARDED_KEYSPACE' ($PS_SHARDED_SHARD_COUNT shards, $PS_CLUSTER_SIZE each)..."
+    log "Step 2/7: Creating sharded keyspace '$PS_SHARDED_KEYSPACE' ($PS_SHARDED_SHARD_COUNT shards, $PS_CLUSTER_SIZE each)..."
     pscale keyspace create "$PS_DATABASE" main "$PS_SHARDED_KEYSPACE" \
         --shards "$PS_SHARDED_SHARD_COUNT" \
         --cluster-size "$PS_CLUSTER_SIZE" \
@@ -135,13 +205,13 @@ cmd_create() {
     success "Sharded keyspace created"
 
     # Step 3: Enable safe migrations on main branch (required for deploy requests)
-    log "Step 3/6: Enabling safe migrations on main branch..."
+    log "Step 3/7: Enabling safe migrations on main branch..."
     pscale branch safe-migrations enable "$PS_DATABASE" main $ORG_FLAG
     success "Safe migrations enabled"
 
     # Step 4: Create service token
     local token_name="schemabot-${PS_DATABASE}"
-    log "Step 4/6: Creating service token '$token_name'..."
+    log "Step 4/7: Creating service token '$token_name'..."
     local token_json
     token_json=$(pscale service-token create --name "$token_name" --format json $ORG_FLAG)
     local token_id token_secret
@@ -150,7 +220,7 @@ cmd_create() {
     success "Service token created: $token_id"
 
     # Step 5: Grant permissions
-    log "Step 5/6: Granting database permissions..."
+    log "Step 5/7: Granting database permissions..."
     pscale service-token add-access "$token_id" \
         approve_deploy_request \
         connect_branch \
@@ -169,7 +239,7 @@ cmd_create() {
 
     # Step 6: Create vtgate password for progress polling (SHOW VITESS_MIGRATIONS)
     local vtgate_name="schemabot-${PS_DATABASE}-vtgate"
-    log "Step 6/6: Creating vtgate password '$vtgate_name'..."
+    log "Step 6/7: Creating vtgate password '$vtgate_name'..."
     local vtgate_json
     vtgate_json=$(pscale password create "$PS_DATABASE" main "$vtgate_name" --role reader --format json $ORG_FLAG)
     local vtgate_host vtgate_user vtgate_pass
@@ -178,18 +248,24 @@ cmd_create() {
     vtgate_pass=$(echo "$vtgate_json" | jq -re '.plain_text') || error "Failed to parse vtgate password from output"
     success "Vtgate password created"
 
-    # Save credentials to local file (gitignored)
-    local total_shards=$((1 + PS_SHARDED_SHARD_COUNT))
-    local total_cost=$((total_shards * PS_COST_PER_SHARD))
     local service_token="${token_id}:${token_secret}"
     local vtgate_dsn="${vtgate_user}:${vtgate_pass}@tcp(${vtgate_host}:3306)/"
-    local creds_file=".planetscale-credentials"
 
+    # Step 7: Store credentials in Secrets Manager
+    log "Step 7/7: Storing credentials in AWS Secrets Manager..."
+    store_credentials_in_sm "$service_token" "$vtgate_dsn"
+
+    # Save credentials to env directory as backup (gitignored)
+    local creds_file="$MULTI_ENV_DIR/$PS_ENV/.planetscale-credentials"
     cat > "$creds_file" <<CREDS
 # Generated by bootstrap-planetscale.sh — do not commit this file.
 TOKEN='${service_token}'
 VTGATE_DSN='${vtgate_dsn}'
 CREDS
+
+    # Summary
+    local total_shards=$((1 + PS_SHARDED_SHARD_COUNT))
+    local total_cost=$((total_shards * PS_COST_PER_SHARD))
 
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
@@ -206,17 +282,14 @@ CREDS
     echo ""
     echo "  Cost: ~\$$total_cost/mo ($total_shards shards × \$$PS_COST_PER_SHARD)"
     echo ""
-    echo "  Credentials saved to: $creds_file"
-    echo "  (This file is gitignored. Do not commit it.)"
+    echo "  Credentials: stored in Secrets Manager"
+    echo "  Backup:      .planetscale-credentials (gitignored)"
     echo ""
     echo "  Next steps:"
-    echo "    1. Store credentials in Secrets Manager:"
-    echo "       ../scripts/setup-planetscale-token.sh"
-    echo ""
-    echo "    2. Update config.yaml organization field:"
+    echo "    1. Update config.yaml organization field:"
     echo "       organization: \"$PS_ORG\""
     echo ""
-    echo "    3. Redeploy SchemaBot:"
+    echo "    2. Redeploy SchemaBot:"
     echo "       ../scripts/deploy.sh"
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
@@ -256,7 +329,7 @@ cmd_status() {
         not-found)
             echo -e "  Status: ${YELLOW}not found${NC}"
             echo ""
-            echo "  Run '$0 --org $PS_ORG create' to create the database"
+            echo "  Run '$0 --org $PS_ORG --env <env> create' to create the database"
             ;;
         *)
             echo "  Status: $ps_status"
@@ -292,7 +365,7 @@ cmd_delete() {
         error "Cancelled — input did not match database name"
     fi
 
-    # Delete service token and vtgate password created by the create command.
+    # Delete service token created by the create command.
     log "Cleaning up service tokens..."
     local tokens
     tokens=$(pscale service-token list --format json $ORG_FLAG 2>/dev/null || echo '[]')
@@ -323,15 +396,18 @@ case "$COMMAND" in
     --help|-h)
         echo "Bootstrap a PlanetScale database for SchemaBot"
         echo ""
-        echo "Usage: $0 --org <org> [options] <command>"
+        echo "Usage: $0 --org <org> --env <environment> [options] <command>"
+        echo ""
+        echo "Run from the environment directory (e.g., deploy/aws-multi-env/staging/)."
         echo ""
         echo "Commands:"
-        echo "  create    Create database, keyspaces, service token, and vtgate password"
+        echo "  create    Create database, credentials, and store in Secrets Manager"
         echo "  status    Show database status and cost estimate"
-        echo "  delete    Delete database (with confirmation)"
+        echo "  delete    Delete database and service tokens (with confirmation)"
         echo ""
         echo "Required:"
         echo "  --org <org>            PlanetScale organization"
+        echo "  --env <environment>    Target environment (staging, production)"
         echo ""
         echo "Options:"
         echo "  --database <name>      Database name (default: commerce)"
@@ -351,7 +427,7 @@ case "$COMMAND" in
         ;;
     *)
         echo "Unknown command: $COMMAND"
-        echo "Usage: $0 --org <org> [options] <command>"
+        echo "Usage: $0 --org <org> --env <environment> [options] <command>"
         echo "Commands: create, status, delete"
         exit 1
         ;;
