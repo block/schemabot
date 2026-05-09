@@ -304,7 +304,7 @@ cmd_delete() {
     tid=$(echo "$tokens" | jq -r ".[] | select(.name == \"$token_name\") | .id")
     if [ -n "$tid" ]; then
         log "Deleting service token '$token_name' ($tid)..."
-        pscale service-token delete "$tid" --force $ORG_FLAG
+        pscale service-token delete "$tid" $ORG_FLAG
         success "Service token deleted"
     else
         warn "Service token '$token_name' not found, skipping"
