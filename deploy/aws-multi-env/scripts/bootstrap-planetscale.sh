@@ -9,19 +9,16 @@ set -euo pipefail
 #   - pscale CLI installed: brew install planetscale/tap/pscale
 #   - Authenticated: pscale auth login
 #
-# Usage:
-#   ./bootstrap-planetscale.sh --org <org> [--database <name>] <command>
+# Usage: Run from the environment directory (e.g., staging/):
+#
+#   cd deploy/aws-multi-env/staging
+#   ../scripts/bootstrap-planetscale.sh --org <org> create
+#   ../scripts/setup-planetscale-token.sh
 #
 # Commands:
 #   create    Create database, keyspaces, service token, and vtgate password
 #   status    Show database status and cost estimate
 #   delete    Delete database (with confirmation)
-#
-# Examples:
-#   ./bootstrap-planetscale.sh --org my-org create
-#   ./bootstrap-planetscale.sh --org my-org --database mydb --shards 4 create
-#   ./bootstrap-planetscale.sh --org my-org status
-#   ./bootstrap-planetscale.sh --org my-org delete
 
 # ============================================================================
 # Defaults
