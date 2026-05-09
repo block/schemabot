@@ -59,7 +59,14 @@ done
 # ============================================================================
 
 if [ -z "$TOKEN" ] || [ -z "$VTGATE_DSN" ]; then
-    if [ ! -f "$CREDS_FILE" ]; then
+    # Look for credentials file in current dir, parent dir, or script dir
+    if [ -f "$CREDS_FILE" ]; then
+        :
+    elif [ -f "../$CREDS_FILE" ]; then
+        CREDS_FILE="../$CREDS_FILE"
+    elif [ -f "$(dirname "$0")/../$CREDS_FILE" ]; then
+        CREDS_FILE="$(dirname "$0")/../$CREDS_FILE"
+    else
         echo "Error: $CREDS_FILE not found."
         echo "Run bootstrap-planetscale.sh first, or pass --token and --vtgate-dsn flags."
         exit 1
