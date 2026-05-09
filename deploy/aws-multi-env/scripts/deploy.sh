@@ -30,6 +30,20 @@ done
 echo "🚀 SchemaBot Deployment"
 echo "=========================="
 
+# Ensure config.yaml exists for all environments (gitignored — copy from example
+# for first-time setup). The Docker image bakes in configs from both directories.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+for env_dir in "$SCRIPT_DIR/../staging" "$SCRIPT_DIR/../production"; do
+    if [ -d "$env_dir" ] && [ ! -f "$env_dir/config.yaml" ] && [ -f "$env_dir/config.yaml.example" ]; then
+        echo "📋 Copying config.yaml.example → config.yaml in $(basename "$env_dir")/"
+        cp "$env_dir/config.yaml.example" "$env_dir/config.yaml"
+    fi
+done
+if [ ! -f config.yaml ]; then
+    echo "❌ config.yaml not found. Copy from config.yaml.example and fill in your values."
+    exit 1
+fi
+
 # CWD is the environment directory (staging/ or production/).
 TF_DIR="$(pwd)"
 REPO_ROOT="$(git -C "$TF_DIR" rev-parse --show-toplevel)"
