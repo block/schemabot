@@ -134,19 +134,26 @@ create_or_update_secret() {
     local secret_value="$2"
     local description="$3"
 
+    log "Checking if secret exists: $secret_id (region: $AWS_REGION, profile: ${AWS_PROFILE:-default})"
     if aws secretsmanager describe-secret --region "$AWS_REGION" --secret-id "$secret_id" > /dev/null 2>&1; then
-        log "Updating secret: $secret_id"
-        aws secretsmanager update-secret \
+        log "Updating existing secret: $secret_id"
+        if ! aws secretsmanager update-secret \
             --region "$AWS_REGION" \
             --secret-id "$secret_id" \
-            --secret-string "$secret_value" > /dev/null
+            --secret-string "$secret_value"; then
+            error "Failed to update secret: $secret_id"
+        fi
+        success "Secret updated: $secret_id"
     else
-        log "Creating secret: $secret_id"
-        aws secretsmanager create-secret \
+        log "Creating new secret: $secret_id"
+        if ! aws secretsmanager create-secret \
             --region "$AWS_REGION" \
             --name "$secret_id" \
             --description "$description" \
-            --secret-string "$secret_value" > /dev/null
+            --secret-string "$secret_value"; then
+            error "Failed to create secret: $secret_id"
+        fi
+        success "Secret created: $secret_id"
     fi
 }
 
@@ -157,17 +164,17 @@ store_credentials_in_sm() {
     local prefix
     prefix=$(get_sm_prefix)
 
-    log "Storing credentials in Secrets Manager (prefix: $prefix)..."
+    log "Secrets Manager prefix: $prefix"
+    log "AWS profile: ${AWS_PROFILE:-default}"
+    log "AWS region: $AWS_REGION"
 
     local token_value
     token_value=$(jq -n --arg token "$service_token" '{"token": $token}')
     create_or_update_secret "$prefix/planetscale-token" "$token_value" "PlanetScale service token for SchemaBot"
-    success "Service token stored: $prefix/planetscale-token"
 
     local vtgate_value
     vtgate_value=$(jq -n --arg dsn "$vtgate_dsn" '{"dsn": $dsn}')
     create_or_update_secret "$prefix/planetscale-vtgate" "$vtgate_value" "PlanetScale vtgate credentials for SchemaBot"
-    success "Vtgate DSN stored: $prefix/planetscale-vtgate"
 }
 
 # ============================================================================
