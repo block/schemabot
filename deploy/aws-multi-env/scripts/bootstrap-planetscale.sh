@@ -257,6 +257,7 @@ cmd_create() {
     # Step 7: Store credentials in Secrets Manager
     log "Step 7/7: Storing credentials in AWS Secrets Manager..."
     store_credentials_in_sm "$service_token" "$vtgate_dsn"
+    success "Credentials stored in Secrets Manager"
 
     # Save credentials to env directory as backup (gitignored)
     local creds_file="$MULTI_ENV_DIR/$PS_ENV/.planetscale-credentials"
