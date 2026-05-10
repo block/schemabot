@@ -390,7 +390,9 @@ cmd_delete() {
         if aws secretsmanager describe-secret --region "$AWS_REGION" --secret-id "$secret_id" > /dev/null 2>&1; then
             log "Deleting secret: $secret_id"
             aws secretsmanager delete-secret --region "$AWS_REGION" --secret-id "$secret_id" --force-delete-without-recovery > /dev/null
-            success "Secret deleted"
+            success "Secret deleted: $secret_id"
+        else
+            warn "Secret not found: $secret_id (skipping)"
         fi
     done
 
