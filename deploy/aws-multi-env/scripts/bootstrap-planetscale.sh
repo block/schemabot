@@ -48,6 +48,10 @@ while [[ $# -gt 0 ]]; do
             PS_ENV="$2"
             shift 2
             ;;
+        --aws-profile)
+            export AWS_PROFILE="$2"
+            shift 2
+            ;;
         --database)
             PS_DATABASE="$2"
             shift 2
@@ -120,20 +124,9 @@ error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 # Secrets Manager helpers
 # ============================================================================
 
-# Derive the Secrets Manager prefix from terraform output in the environment directory.
+# Secrets Manager prefix follows the naming convention: schemabot-<env>.
 get_sm_prefix() {
-    local env_dir="$MULTI_ENV_DIR/$PS_ENV"
-    if [ ! -d "$env_dir" ]; then
-        error "Environment directory not found: $env_dir"
-    fi
-    local tf_output
-    tf_output=$(cd "$env_dir" && terraform output -json 2>/dev/null || echo '{}')
-    local prefix
-    prefix=$(echo "$tf_output" | jq -r '.storage_dsn_secret_id.value // empty' | sed 's|/storage-dsn||')
-    if [ -z "$prefix" ]; then
-        error "Could not determine Secrets Manager prefix from terraform output in $env_dir"
-    fi
-    echo "$prefix"
+    echo "schemabot-${PS_ENV}"
 }
 
 create_or_update_secret() {
@@ -434,6 +427,7 @@ case "$COMMAND" in
         echo "  --env <environment>    Target environment (staging, production)"
         echo ""
         echo "Options:"
+        echo "  --aws-profile <name>   AWS CLI profile (default: \$AWS_PROFILE)"
         echo "  --database <name>      Database name (default: commerce)"
         echo "  --region <region>      PlanetScale region (default: us-west)"
         echo "  --cluster-size <size>  Cluster size (default: PS-10, \$${PS_COST_PER_SHARD}/shard/mo)"
