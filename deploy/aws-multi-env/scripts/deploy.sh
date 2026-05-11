@@ -30,8 +30,7 @@ done
 echo "🚀 SchemaBot Deployment"
 echo "=========================="
 
-# Ensure config.yaml exists for all environments (gitignored — copy from example
-# for first-time setup). The Docker image bakes in configs from both directories.
+# Ensure config.yaml exists (gitignored — copy from example for first-time setup).
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 for env_dir in "$SCRIPT_DIR/../staging" "$SCRIPT_DIR/../production"; do
     if [ -d "$env_dir" ] && [ ! -f "$env_dir/config.yaml" ] && [ -f "$env_dir/config.yaml.example" ]; then
@@ -48,8 +47,9 @@ fi
 TF_DIR="$(pwd)"
 REPO_ROOT="$(git -C "$TF_DIR" rev-parse --show-toplevel)"
 
-# Ensure working tree is clean (image is tagged by commit SHA)
-if [ "$SKIP_BUILD" = false ] && ! git -C "$REPO_ROOT" diff --quiet HEAD 2>/dev/null; then
+# Ensure working tree is clean (excluding gitignored config.yaml which has
+# per-deployment values). The image tag includes a config hash for determinism.
+if [ "$SKIP_BUILD" = false ] && ! git -C "$REPO_ROOT" diff --quiet HEAD -- ':!deploy/aws-multi-env/*/config.yaml' 2>/dev/null; then
     echo "❌ Uncommitted changes detected. Commit first — the image is tagged by commit SHA."
     exit 1
 fi
@@ -89,17 +89,20 @@ echo ""
 
 if [ "$SKIP_BUILD" = false ]; then
     GIT_SHA=$(git -C "$REPO_ROOT" rev-parse --short HEAD)
+    CONFIG_HASH=$(md5 -q config.yaml 2>/dev/null || md5sum config.yaml 2>/dev/null | cut -c1-8)
+    CONFIG_HASH="${CONFIG_HASH:0:8}"
+    IMAGE_TAG="${GIT_SHA}-${CONFIG_HASH}"
 
-    # Check if image for this commit already exists in ECR
+    # Check if image for this commit+config already exists in ECR
     REPO_NAME=$(basename "$ECR_URL")
     IMAGE_EXISTS=$(aws ecr describe-images \
         --repository-name "$REPO_NAME" \
-        --image-ids imageTag="$GIT_SHA" \
+        --image-ids imageTag="$IMAGE_TAG" \
         --region "$REGION" \
         --output text 2>/dev/null || true)
 
     if [ -n "$IMAGE_EXISTS" ]; then
-        echo "   ✅ Image for $GIT_SHA already exists, skipping build"
+        echo "   ✅ Image for $IMAGE_TAG already exists, skipping build"
     else
         # Login to ECR
         echo "🔐 Logging in to ECR..."
@@ -111,18 +114,18 @@ if [ "$SKIP_BUILD" = false ]; then
         BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
         echo ""
-        echo "🔨 Building Docker image ($GIT_SHA)..."
+        echo "🔨 Building Docker image ($IMAGE_TAG)..."
         cd "$REPO_ROOT"
         docker build --platform linux/amd64 \
-            --build-arg VERSION="$GIT_SHA" \
+            --build-arg VERSION="$IMAGE_TAG" \
             --build-arg COMMIT="$GIT_FULL_SHA" \
             --build-arg BUILD_DATE="$BUILD_DATE" \
-            -t "$ECR_URL:$GIT_SHA" -t "$ECR_URL:latest" -f deploy/Dockerfile .
+            -t "$ECR_URL:$IMAGE_TAG" -t "$ECR_URL:latest" -f deploy/Dockerfile .
 
         # Push to ECR
         echo ""
         echo "📤 Pushing to ECR..."
-        docker push "$ECR_URL:$GIT_SHA"
+        docker push "$ECR_URL:$IMAGE_TAG"
         docker push "$ECR_URL:latest"
 
         cd "$TF_DIR"

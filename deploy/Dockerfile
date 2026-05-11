@@ -50,8 +50,8 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /schemabot /app/schemabot
 
-# Copy AWS configs (for App Runner deployments where volumes can't be mounted).
-# config.yaml is gitignored — copy from config.yaml.example for first-time setup.
+# Copy configs into the image (config.yaml is gitignored but present locally;
+# CI creates it from config.yaml.example before building).
 COPY --chown=schemabot:schemabot deploy/aws/config.yaml /config/aws-example.yaml
 COPY --chown=schemabot:schemabot deploy/aws-multi-env/staging/config.yaml /config/aws-multi-env-staging.yaml
 COPY --chown=schemabot:schemabot deploy/aws-multi-env/production/config.yaml /config/aws-multi-env-production.yaml

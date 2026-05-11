@@ -93,6 +93,14 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: Create config files from examples
+        run: |
+          for dir in deploy/aws-multi-env/staging deploy/aws-multi-env/production; do
+            if [ -f "$dir/config.yaml.example" ] && [ ! -f "$dir/config.yaml" ]; then
+              cp "$dir/config.yaml.example" "$dir/config.yaml"
+            fi
+          done
+
       - name: Build and push Docker image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # docker/build-push-action@v6
         with:
