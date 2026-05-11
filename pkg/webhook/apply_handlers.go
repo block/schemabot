@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -563,9 +564,16 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 
 	statuses, err := client.GetPRCheckStatuses(ctx, repo, headSHA)
 	if err != nil {
-		h.logger.Error("failed to fetch PR check statuses, blocking apply", "repo", repo, "pr", pr, "error", err)
+		h.logger.Error("failed to fetch PR check statuses, blocking apply",
+			"repo", repo, "pr", pr, "environment", environment, "error", err)
+
+		userMsg := "Unable to verify PR check statuses. This may be a temporary issue — retry the apply command."
+		if strings.Contains(err.Error(), "Resource not accessible") {
+			userMsg = "The SchemaBot GitHub App does not have permission to read check statuses on this repository. " +
+				"Grant the app **Commit statuses: Read** permission, then retry."
+		}
 		h.postComment(repo, pr, installationID,
-			fmt.Sprintf("## ❌ Apply Blocked\n\n**Environment**: `%s`\n\nCould not verify PR check statuses. Retry the apply command.\n\n_Error: %v_", environment, err))
+			fmt.Sprintf("## ❌ Apply Blocked\n\n**Environment**: `%s`\n\n%s", environment, userMsg))
 		return true
 	}
 

@@ -169,6 +169,55 @@ func rollupGraphQLHandler(nodes []rollupNode) http.HandlerFunc {
 }
 
 func TestEnforcePassingChecks(t *testing.T) {
+	t.Run("permission error blocks with actionable message", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 10)
+
+		// Return a GraphQL permission error
+		mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"errors": []map[string]any{
+					{"message": "Resource not accessible by integration", "type": "FORBIDDEN"},
+				},
+			})
+		})
+
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
+		h := &Handler{
+			service:  service,
+			ghClient: factory,
+			logger:   testLogger(),
+		}
+
+		ctx := t.Context()
+		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		assert.True(t, blocked, "should block on permission error")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Apply Blocked")
+			assert.Contains(t, body, "Commit statuses: Read")
+			assert.NotContains(t, body, "Resource not accessible", "should not expose raw GraphQL error")
+		default:
+			// Comment may be posted async
+		}
+	})
+
 	t.Run("API failure blocks apply (fail-closed)", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
@@ -204,7 +253,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 		select {
 		case body := <-comments:
 			assert.Contains(t, body, "Apply Blocked")
-			assert.Contains(t, body, "Could not verify")
+			assert.Contains(t, body, "Unable to verify")
 		default:
 			// Comment may be posted async — the key assertion is blocked=true
 		}

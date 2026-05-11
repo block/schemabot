@@ -35,6 +35,7 @@ Under **Repository permissions**, grant:
 | Permission | Access | Used For |
 |-----------|--------|----------|
 | **Checks** | Read & Write | Create check runs on PRs showing plan results |
+| **Commit statuses** | Read | Read PR check statuses for the `require_passing_checks` gate |
 | **Contents** | Read | Read `schemabot.yaml` config and schema files from repos |
 | **Issues** | Read & Write | Post PR comments and add reactions |
 | **Metadata** | Read | Required (granted automatically) |
