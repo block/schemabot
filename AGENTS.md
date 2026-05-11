@@ -37,7 +37,7 @@ Three test layers, each with its own make target and CI job:
 - **Integration** (`make test-integration`, `-tags=integration ./...`) — A mix of Docker containers (MySQL via testcontainers) and in-process server/gRPC components. Tests cross-package interactions without requiring a full deployment. Lives in `pkg/` and `integration/`.
 - **E2E** (`make test-e2e`, `-tags=e2e ./e2e/...`) — Full docker-compose stack. All components (SchemaBot server, MySQL instances) are real containers — nothing is in-process or mocked. Tests the CLI against a running system. Lives in `e2e/local/` and `e2e/grpc/`.
 
-Integration tests are the workhorse — most test coverage lives here since they're cheaper to run than full e2e. E2e tests are more expensive (docker-compose setup/teardown) but essential for validating the CLI against a real running system. Robust automated tests across all three layers are the only safe way to evolve SchemaBot.
+Integration tests are the workhorse — most test coverage lives here since they're cheaper to run than full e2e. E2E tests are more expensive (docker-compose setup/teardown) but essential for validating the CLI against a real running system. Robust automated tests across all three layers are the only safe way to evolve SchemaBot.
 
 CI mirrors local dev exactly — each job runs the corresponding make target.
 
