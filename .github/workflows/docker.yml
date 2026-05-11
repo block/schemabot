@@ -3,7 +3,7 @@
 # Triggers:
 #   - Pull request: build Docker image (single platform) + lint Helm chart
 #   - Push to main: build + push Docker image (multi-arch, latest + sha)
-#   - Tag v*:       build + push Docker image (multi-arch) + package + push Helm chart
+#   - Tag v*:       build + push Docker image (multi-arch) + package + push Helm chart (if changed)
 #
 # Published to:
 #   - Docker: ghcr.io/block/schemabot:<tag>
@@ -16,6 +16,8 @@ on:
     tags: ["v*"]
     branches: [main]
   pull_request:
+
+permissions: {}
 
 env:
   REGISTRY: ghcr.io
@@ -37,7 +39,9 @@ jobs:
         uses: helm/chart-testing-action@0d28d3144d3a25ea2cc349d6e59901c4ff469b3b # helm/chart-testing-action@v2.7.0
 
       - name: Run chart-testing lint
-        run: ct lint --target-branch ${{ github.event.pull_request.base.ref }} --charts charts/schemabot
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: ct lint --target-branch "$BASE_REF" --charts charts/schemabot
 
       - name: Check chart version bump
         run: |
@@ -66,6 +70,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create config files from examples
+        run: |
+          for dir in deploy/aws-multi-env/staging deploy/aws-multi-env/production; do
+            if [ -f "$dir/config.yaml.example" ] && [ ! -f "$dir/config.yaml" ]; then
+              cp "$dir/config.yaml.example" "$dir/config.yaml"
+            fi
+          done
 
       - name: Set up QEMU
         if: github.event_name != 'pull_request'
@@ -132,25 +146,32 @@ jobs:
           tags: ${{ steps.localscale-meta.outputs.tags }}
           labels: ${{ steps.localscale-meta.outputs.labels }}
 
-      # Helm chart publishing (only on tags)
-      - name: Install Helm
+      # Helm chart publishing — only on tags and only if chart files changed
+      - name: Check for chart changes
         if: startsWith(github.ref, 'refs/tags/v')
+        id: chart-changes
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            echo "First tag — publishing chart"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --quiet "$PREV_TAG" -- charts/; then
+            echo "No chart changes since $PREV_TAG — skipping Helm publish"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Chart changes detected since $PREV_TAG — publishing"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Helm
+        if: startsWith(github.ref, 'refs/tags/v') && steps.chart-changes.outputs.changed == 'true'
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # azure/setup-helm@v4
 
       - name: Package and push Helm chart
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && steps.chart-changes.outputs.changed == 'true'
         run: |
-          # appVersion tracks the application release. Validate the tag matches.
-          # Chart version is independent — it tracks chart template changes.
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          APP_VERSION=$(grep '^appVersion:' charts/schemabot/Chart.yaml | awk '{print $2}' | tr -d '"')
-          APP_VERSION="${APP_VERSION#v}"
-          if [ "$TAG_VERSION" != "$APP_VERSION" ]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match Chart.yaml appVersion ${APP_VERSION}. Update appVersion before tagging."
-            exit 1
-          fi
-
-          # Package using the tag version so the published chart matches the release.
           CHART_VERSION=$(grep '^version:' charts/schemabot/Chart.yaml | awk '{print $2}')
           helm package charts/schemabot --destination ./build
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
