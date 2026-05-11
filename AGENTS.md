@@ -131,10 +131,11 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
 - **Always commit before deploying.** The Docker image is tagged by commit SHA — uncommitted changes are easy to lose and make it unclear what was deployed.
 - **Never run `terraform destroy` directly.** Use `deploy/aws/scripts/destroy.sh` which requires explicit confirmation.
 - **Always get user approval** before destroying AWS infrastructure, even when asked to "clean up" or "start fresh".
-- Use the canonical scripts for all AWS operations:
-  - `deploy/aws/scripts/bootstrap.sh [-y]` — create/update all infrastructure
-  - `deploy/aws/scripts/deploy.sh [--skip-build]` — build and deploy new image
-  - `deploy/aws/scripts/destroy.sh` — tear down all infrastructure (always interactive)
+- Use the canonical scripts for all AWS operations. Two deployment layouts exist: `deploy/aws/` (single-env) and `deploy/aws-multi-env/` (multi-env with separate staging/production instances). Each has the same scripts:
+  - `scripts/bootstrap.sh [-y]` — create/update all infrastructure
+  - `scripts/deploy.sh [--skip-build]` — build and deploy new image
+  - `scripts/destroy.sh` — tear down all infrastructure (always interactive)
+  - `scripts/bootstrap-planetscale.sh` — bootstrap PlanetScale database (multi-env only)
 
 ## Go Style
 
