@@ -434,6 +434,20 @@ const (
 // deployState is a shorthand alias for PlanetScale deploy request state constants.
 var deployState = state.DeployRequest
 
+// formatDeployRequestError builds a detailed error message for a failed deploy request,
+// including any lint errors from PlanetScale's validation.
+func formatDeployRequestError(dr *ps.DeployRequest) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "deploy request #%d failed during preparation (state: %s)", dr.Number, dr.DeploymentState)
+	if dr.Deployment != nil && len(dr.Deployment.LintErrors) > 0 {
+		for _, le := range dr.Deployment.LintErrors {
+			fmt.Fprintf(&b, "\n  [%s] %s: %s (keyspace: %s, table: %s)",
+				le.LintError, le.SubjectType, le.ErrorDescription, le.Keyspace, le.Table)
+		}
+	}
+	return b.String()
+}
+
 // psMetadata holds PlanetScale-specific state stored as JSON in ResumeState.Metadata.
 type psMetadata struct {
 	BranchName       string     `json:"branch_name"`
@@ -989,7 +1003,12 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 	}
 	if dr.DeploymentState == deployState.Error {
-		return nil, fmt.Errorf("deploy request #%d failed during preparation (state: %s)", dr.Number, dr.DeploymentState)
+		errMsg := formatDeployRequestError(dr)
+		emitEvent(engine.ApplyEvent{
+			Message:  errMsg,
+			Metadata: map[string]string{"deploy_request_id": fmt.Sprintf("%d", dr.Number)},
+		})
+		return nil, fmt.Errorf("%s", errMsg)
 	}
 	if dr.DeploymentState == deployState.NoChanges {
 		emitEvent(engine.ApplyEvent{

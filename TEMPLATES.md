@@ -2974,6 +2974,7 @@ Use 'schemabot start' to resume from checkpoint.
 └────────────────────────────────────────────────────────────────────────────────┘
 
   deploy request #42 failed during preparation (state: error)
+  [INVALID_VSCHEMA] vschema_error: table users has a changed column vindex (keyspace: myapp_sharded, table: users)
 
 
   ── myapp_sharded ──

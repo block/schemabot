@@ -425,7 +425,7 @@ func previewVitessFailedOutput() {
 		ApplyID:      "apply-a1b2c3d4e5f6",
 		Database:     "myapp",
 		Environment:  "staging",
-		ErrorMessage: "deploy request #42 failed during preparation (state: error)",
+		ErrorMessage: "deploy request #42 failed during preparation (state: error)\n  [INVALID_VSCHEMA] vschema_error: table users has a changed column vindex (keyspace: myapp_sharded, table: users)",
 		StartedAt:    previewTime.Add(-60 * time.Second).Format(time.RFC3339),
 		Metadata: map[string]string{
 			"branch_name":        "schemabot-myapp-28471035",

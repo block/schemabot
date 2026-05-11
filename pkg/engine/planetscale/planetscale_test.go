@@ -549,3 +549,76 @@ func TestIsRetryablePSError(t *testing.T) {
 		assert.False(t, isRetryablePSError(nil))
 	})
 }
+
+func TestFormatDeployRequestError(t *testing.T) {
+	t.Run("without lint errors", func(t *testing.T) {
+		dr := &ps.DeployRequest{
+			Number:          42,
+			DeploymentState: "error",
+		}
+		msg := formatDeployRequestError(dr)
+		assert.Equal(t, "deploy request #42 failed during preparation (state: error)", msg)
+	})
+
+	t.Run("with lint errors", func(t *testing.T) {
+		dr := &ps.DeployRequest{
+			Number:          102,
+			DeploymentState: "error",
+			Deployment: &ps.Deployment{
+				LintErrors: []*ps.DeploymentLintError{
+					{
+						LintError:        "INVALID_VSCHEMA",
+						SubjectType:      "vschema_error",
+						ErrorDescription: "table t1 has a changed column vindex",
+						Keyspace:         "ks_sharded",
+						Table:            "t1",
+					},
+				},
+			},
+		}
+		msg := formatDeployRequestError(dr)
+		assert.Contains(t, msg, "deploy request #102 failed during preparation")
+		assert.Contains(t, msg, "INVALID_VSCHEMA")
+		assert.Contains(t, msg, "table t1 has a changed column vindex")
+		assert.Contains(t, msg, "keyspace: ks_sharded")
+		assert.Contains(t, msg, "table: t1")
+	})
+
+	t.Run("with multiple lint errors", func(t *testing.T) {
+		dr := &ps.DeployRequest{
+			Number:          200,
+			DeploymentState: "error",
+			Deployment: &ps.Deployment{
+				LintErrors: []*ps.DeploymentLintError{
+					{
+						LintError:        "INVALID_VSCHEMA",
+						SubjectType:      "vschema_error",
+						ErrorDescription: "changed vindex on t1",
+						Keyspace:         "ks1",
+						Table:            "t1",
+					},
+					{
+						LintError:        "INVALID_VSCHEMA",
+						SubjectType:      "vschema_error",
+						ErrorDescription: "changed vindex on t2",
+						Keyspace:         "ks1",
+						Table:            "t2",
+					},
+				},
+			},
+		}
+		msg := formatDeployRequestError(dr)
+		assert.Contains(t, msg, "changed vindex on t1")
+		assert.Contains(t, msg, "changed vindex on t2")
+	})
+
+	t.Run("with nil deployment", func(t *testing.T) {
+		dr := &ps.DeployRequest{
+			Number:          99,
+			DeploymentState: "error",
+			Deployment:      nil,
+		}
+		msg := formatDeployRequestError(dr)
+		assert.Equal(t, "deploy request #99 failed during preparation (state: error)", msg)
+	})
+}
