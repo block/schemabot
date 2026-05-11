@@ -412,6 +412,62 @@ func TestIsSnapshotInProgress(t *testing.T) {
 	assert.False(t, isSnapshotInProgress(nil))
 }
 
+func TestIsRetryableEngineError(t *testing.T) {
+	t.Run("PS SDK ErrRetry is retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrRetry}
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("PS SDK ErrInternal is retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrInternal}
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("PS SDK ErrResponseMalformed is retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrResponseMalformed}
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("PS SDK ErrNotFound is NOT retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrNotFound}
+		assert.False(t, isRetryableEngineError(err))
+	})
+
+	t.Run("PS SDK ErrPermission is NOT retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrPermission}
+		assert.False(t, isRetryableEngineError(err))
+	})
+
+	t.Run("PS SDK ErrInvalid is NOT retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrInvalid}
+		assert.False(t, isRetryableEngineError(err))
+	})
+
+	t.Run("snapshot in progress is retryable", func(t *testing.T) {
+		err := fmt.Errorf("Cannot update VSchema while a schema snapshot is in progress.")
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("connection refused is retryable", func(t *testing.T) {
+		err := fmt.Errorf("connection refused")
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("wrapped network error is retryable", func(t *testing.T) {
+		err := fmt.Errorf("apply failed: %w", fmt.Errorf("i/o timeout"))
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("DDL syntax error is NOT retryable", func(t *testing.T) {
+		err := fmt.Errorf("Error 1064 (42000): You have an error in your SQL syntax")
+		assert.False(t, isRetryableEngineError(err))
+	})
+
+	t.Run("nil is NOT retryable", func(t *testing.T) {
+		assert.False(t, isRetryableEngineError(nil))
+	})
+}
+
 func TestRetryDelay(t *testing.T) {
 	t.Run("normal backoff is exponential", func(t *testing.T) {
 		d0 := retryDelay(0, fmt.Errorf("connection refused"))

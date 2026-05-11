@@ -376,3 +376,87 @@ The engine is a stateless executor. It diffs schemas, executes DDL, and reports 
 ## State Machine
 
 See [pkg/state/README.md](../pkg/state/README.md) for the full state machine documentation, including apply states, task states, and how engine states map to SchemaBot states.
+
+## Scheduler
+
+The scheduler ([`pkg/api/scheduler.go`](../pkg/api/scheduler.go)) is a background component that runs on every SchemaBot server instance. It handles two concerns:
+
+1. **Crash recovery**: When a server restarts or a worker goroutine crashes, in-progress applies are left with stale heartbeats. The scheduler detects these (heartbeat older than 1 minute) and resumes them via `ResumeApply`.
+
+2. **Retryable failures**: When an engine reports a transient error (e.g., PlanetScale API timeout), the apply transitions to `failed_retryable` instead of permanent `failed`. The scheduler re-dispatches these applies up to 10 times before permanently failing them.
+
+### How it works
+
+```
+Server startup
+    │
+    ▼
+StartScheduler(ctx)
+    │
+    ├── Worker 0 ─── poll ─── expireExhaustedRetries() ─── recoverApplies()
+    ├── Worker 1 ─── poll ─── recoverApplies()
+    └── Worker N ─── poll ─── recoverApplies()
+                       │
+                  every 10 seconds
+```
+
+Each worker independently calls `FindNextApply()` which atomically:
+- Selects one apply that needs attention (`FOR UPDATE SKIP LOCKED`)
+- Increments the attempt counter
+- Updates the heartbeat timestamp
+
+The SQL query matches two types of applies:
+- **Stale active**: `state IN (pending, running, ...) AND updated_at < NOW() - 1 MINUTE`
+- **Retryable**: `state = failed_retryable AND attempt < 10`
+
+After claiming, the worker resolves the appropriate Tern client (`LocalClient` or `GRPCClient`) and calls `ResumeApply`. For `LocalClient`, this re-executes the apply. For `GRPCClient`, this re-establishes the progress polling connection.
+
+### Worker pool
+
+The scheduler launches N concurrent workers (configured via `scheduler_workers`). Each worker is an independent goroutine running the same poll loop. Workers do not share state — concurrency safety comes from the database:
+
+- `FOR UPDATE SKIP LOCKED` ensures two workers never claim the same apply
+- Each worker claims at most one apply per poll cycle, then resumes it
+- Workers poll independently on the same 10-second interval (not synchronized)
+
+With 1 worker (default), the scheduler processes 1 apply every 10 seconds (6/minute). With 3 workers, up to 3 applies can be resumed concurrently. For most deployments, 1-3 workers is sufficient. Increase if you have many databases and frequent transient failures.
+
+### Configuration
+
+```yaml
+# config.yaml
+scheduler_workers: 3  # Number of concurrent workers (default: 1)
+```
+
+### Heartbeat
+
+Every running apply has a background goroutine that updates `updated_at` every 10 seconds. If the heartbeat fails 6 times consecutively (e.g., database connection lost), the apply context is cancelled to stop the engine cleanly. The scheduler will then pick up the stale apply on its next poll.
+
+### Retryable errors
+
+**All engine errors are retryable by default.** Engines must explicitly wrap errors with `engine.ErrNonRetryable` to mark them as permanent. This design reflects the reality that transient failures (connection drops, lock conflicts, API timeouts) are the common case — permanent failures (syntax errors, auth failures) are the exception.
+
+Examples of retryable errors (automatic, no wrapping needed):
+- MySQL connection refused, metadata lock timeout
+- PlanetScale API timeout, rate limit, schema snapshot in progress
+- Spirit checkpoint corruption (resume from clean state)
+
+Examples of non-retryable errors (engine wraps with `NewNonRetryableError`):
+- Deploy request not found after server restart (PlanetScale)
+- Authentication failure
+
+Retryable applies are re-dispatched immediately on the next scheduler poll (every 10 seconds). After 10 failed attempts, the apply transitions to permanent `failed`.
+
+### Retry granularity
+
+Retry operates at the **apply level**, not the task level. When an apply with 10 tasks fails at task 3:
+
+1. Tasks 1-2: already `completed` — preserved across retries
+2. Task 3: marked `failed_retryable`
+3. Tasks 4-10: marked `failed_retryable` (never ran)
+
+On retry, the scheduler calls `ResumeApply` which resets `failed_retryable` tasks to `pending` and re-executes with the same DDL. Completed tasks are not reset — only tasks in `failed_retryable` state are retried. The same task records are reused (no new tasks created).
+
+For crash recovery (stale heartbeat, not retryable), the path is different: `ResumeApply` calls `replanAndFilterTasks` which re-diffs desired vs current schema and filters out tasks whose DDL has already been applied.
+
+The `attempt` counter on the `applies` table controls the retry budget (max 10). Tasks also track their attempt count for debugging, but only the apply-level counter determines when to permanently fail.

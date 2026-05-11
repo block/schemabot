@@ -12,6 +12,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -430,4 +431,33 @@ type Config struct {
 	// Timeouts
 	BranchTimeout time.Duration // Timeout for branch creation/readiness
 	DeployTimeout time.Duration // Timeout for deploy operations
+}
+
+// RetryableError wraps an error to indicate it is transient and the operation
+// can be retried. Engines return this for known-recoverable failures like
+// network timeouts, schema snapshots in progress, or binlog streaming errors.
+type RetryableError struct {
+	Err error
+}
+
+func (e *RetryableError) Error() string { return e.Err.Error() }
+func (e *RetryableError) Unwrap() error { return e.Err }
+
+// NewRetryableError wraps an error as retryable.
+func NewRetryableError(err error) error {
+	return &RetryableError{Err: err}
+}
+
+// IsRetryable returns true if the error should be retried by the scheduler.
+// All errors are retryable by default — only errors explicitly wrapped with
+// ErrNonRetryable are permanent. This matches the proven pattern where
+// transient failures (connection drops, lock conflicts, API timeouts) are
+// the common case, and permanent failures (syntax errors, auth failures)
+// are the exception that engines must explicitly mark.
+func IsRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nre *ErrNonRetryable
+	return !errors.As(err, &nre)
 }

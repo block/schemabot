@@ -33,6 +33,7 @@ import (
 type testServer struct {
 	Addr    string
 	Storage *mysqlstore.Storage
+	Service *schemabotapi.Service
 }
 
 // createTestDB creates a uniquely-named test database and returns its name and DSN.
@@ -125,7 +126,7 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 		_ = schemabotDB.Close()
 	})
 
-	return testServer{Addr: addr, Storage: storage}
+	return testServer{Addr: addr, Storage: storage, Service: svc}
 }
 
 // postJSON marshals body as JSON, POSTs to url, asserts HTTP 200,
@@ -1459,3 +1460,13 @@ CREATE TABLE ccc_cancelled (
 
 	t.Log("Partial failure test passed: 1 completed, 1 failed, 1 cancelled")
 }
+
+// TestRecoveryLoop_FailedRetryable verifies that the recovery loop picks up
+// a failed_retryable apply and completes it. The test:
+//  1. Creates a plan via API (CREATE TABLE)
+//  2. Creates an apply via API — it succeeds and creates the table
+//  3. Drops the table and creates a second plan (same CREATE TABLE)
+//  4. Calls Apply API for the second plan, waits for running, then
+//     manually sets the apply to failed_retryable (simulating transient failure)
+//  5. Starts the recovery loop
+//  6. Verifies the apply transitions to completed and the table exists

@@ -200,10 +200,49 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 	}
 }
 
+// SetHeartbeatInterval sets the heartbeat polling interval.
+// For testing only — production uses the default 10s.
+func (c *LocalClient) SetHeartbeatInterval(d time.Duration) {
+	c.heartbeatInterval = d
+}
+
+// clearCancelApply resets the cancel function after a background apply goroutine exits.
+// Prevents stale references to dead goroutines.
+func (c *LocalClient) clearCancelApply() {
+	c.cancelMu.Lock()
+	c.cancelApply = nil
+	c.cancelMu.Unlock()
+}
+
 // Close closes the client and releases resources.
 func (c *LocalClient) Close() error {
-	// LocalClient doesn't own storage, so nothing to close
 	return nil
+}
+
+// parseOptionsMap converts stored apply options JSON back to a string map
+// for re-dispatching applies through executeApplyAtomic/executeApplySequential.
+func parseOptionsMap(data []byte) map[string]string {
+	opts := storage.ParseApplyOptions(data)
+	m := make(map[string]string)
+	if opts.DeferCutover {
+		m["defer_cutover"] = "true"
+	}
+	if opts.DeferDeploy {
+		m["defer_deploy"] = "true"
+	}
+	if opts.SkipRevert {
+		m["skip_revert"] = "true"
+	}
+	if opts.AllowUnsafe {
+		m["allow_unsafe"] = "true"
+	}
+	if opts.Branch != "" {
+		m["branch"] = opts.Branch
+	}
+	if opts.Volume > 0 {
+		m["volume"] = fmt.Sprintf("%d", opts.Volume)
+	}
+	return m
 }
 
 // credentials returns engine credentials from the client config.

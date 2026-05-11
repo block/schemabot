@@ -18,6 +18,7 @@ var Task = struct {
 	RevertWindow      string
 	Completed         string
 	Failed            string
+	FailedRetryable   string
 	Stopped           string
 	Reverted          string
 	Cancelled         string
@@ -30,6 +31,7 @@ var Task = struct {
 	RevertWindow:      "revert_window",
 	Completed:         "completed",
 	Failed:            "failed",
+	FailedRetryable:   "failed_retryable",
 	Stopped:           "stopped",
 	Reverted:          "reverted",
 	Cancelled:         "cancelled",
@@ -47,6 +49,7 @@ var TerminalTaskStates = []string{
 // IsTerminalTaskState returns true if the state is a terminal task state
 // where no further processing will occur.
 // Stopped is NOT terminal — a stopped task can be resumed via Start.
+// FailedRetryable is NOT terminal — the recovery loop may retry the task.
 func IsTerminalTaskState(s string) bool {
 	switch s {
 	case Task.Completed, Task.Failed, Task.Reverted, Task.Cancelled:
@@ -110,7 +113,7 @@ func NormalizeTaskStatus(raw string) string {
 
 	// Pass-through for already-normalized values
 	case Task.Pending, Task.Running, Task.Completed, Task.Stopped, Task.Failed,
-		Task.RevertWindow, Task.Reverted,
+		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.CuttingOver, Task.Cancelled:
 		return s
 

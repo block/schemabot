@@ -208,7 +208,9 @@ func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Tas
 
 // runWithRecovery wraps an apply function with panic recovery so a single panic
 // doesn't crash the entire process. On panic, all tasks and the apply are marked failed.
+// Clears cancelApply on exit so Stop() doesn't reference a dead goroutine.
 func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, fn func()) {
+	defer c.clearCancelApply()
 	defer func() {
 		if r := recover(); r != nil {
 			errMsg := fmt.Sprintf("panic in apply goroutine: %v", r)
@@ -222,7 +224,8 @@ func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply,
 // executeApplyAtomic runs all DDLs in one Spirit call for atomic cutover (--defer-cutover).
 // All tables copy together and cut over atomically.
 func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
-	defer c.startApplyHeartbeat(ctx, apply)()
+	ctx, stopHeartbeat := c.startApplyHeartbeat(ctx, apply)
+	defer stopHeartbeat()
 	creds := c.credentials()
 
 	// Extract all DDLs and table names from tasks
@@ -339,10 +342,14 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 	})
 
 	if err != nil {
-		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-		c.logger.Error("atomic apply failed", "error", err, "apply_id", apply.ApplyIdentifier)
+		c.failApplyWithTasks(ctx, apply, tasks, err.Error(), err)
+		newState := state.Apply.Failed
+		if engine.IsRetryable(err) {
+			newState = state.Apply.FailedRetryable
+		}
+		c.logger.Error("atomic apply failed", "error", err, "apply_id", apply.ApplyIdentifier, "retryable", engine.IsRetryable(err))
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Engine apply failed: %v", err), state.Apply.Pending, state.Apply.Failed)
+			fmt.Sprintf("Engine apply failed: %v", err), state.Apply.Pending, newState)
 		return
 	}
 
@@ -408,7 +415,8 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
 // Each table copies and cuts over independently.
 func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
-	defer c.startApplyHeartbeat(ctx, apply)()
+	ctx, stopHeartbeat := c.startApplyHeartbeat(ctx, apply)
+	defer stopHeartbeat()
 	seqStart := time.Now()
 	creds := c.credentials()
 	defer c.setupSpiritLogging(ctx, apply, tasks)()
@@ -583,26 +591,57 @@ type atomicPollState struct {
 	consecutiveErrors int
 }
 
-// startApplyHeartbeat starts a background goroutine that heartbeats the apply
-// every 10 seconds, preventing the recovery worker from treating it as crashed.
-// Returns a cancel function that stops the heartbeat. Must be deferred by the caller.
-func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Apply) context.CancelFunc {
-	hbCtx, cancel := context.WithCancel(ctx)
+// maxConsecutiveHeartbeatFailures is how many consecutive heartbeat failures
+// trigger cancellation of the apply context. This prevents zombie applies from
+// continuing to run while the scheduler thinks they've crashed.
+const maxConsecutiveHeartbeatFailures = 6
+
+// startApplyHeartbeat wraps the apply context with cancellation and starts a
+// background heartbeat goroutine. If heartbeat fails maxConsecutiveHeartbeatFailures
+// times in a row, the APPLY context is cancelled — stopping the engine, polling
+// loops, and any other goroutines using the returned context.
+//
+// Usage:
+//
+//	ctx, stopHeartbeat := c.startApplyHeartbeat(ctx, apply)
+//	defer stopHeartbeat()
+//	// use ctx for all apply work — it will be cancelled on heartbeat failure
+func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Apply) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		ticker := time.NewTicker(c.heartbeatInterval)
 		defer ticker.Stop()
+		consecutiveFailures := 0
 		for {
 			select {
-			case <-hbCtx.Done():
+			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := c.storage.Applies().Heartbeat(hbCtx, apply.ID); err != nil {
-					c.logger.Warn("heartbeat failed", "apply_id", apply.ApplyIdentifier, "error", err)
+				if err := c.storage.Applies().Heartbeat(ctx, apply.ID); err != nil {
+					consecutiveFailures++
+					c.logger.Warn("heartbeat failed",
+						"apply_id", apply.ApplyIdentifier,
+						"consecutive_failures", consecutiveFailures,
+						"error", err)
+					if consecutiveFailures >= maxConsecutiveHeartbeatFailures {
+						c.logger.Error("heartbeat failed too many times, cancelling apply",
+							"apply_id", apply.ApplyIdentifier,
+							"consecutive_failures", consecutiveFailures)
+						cancel()
+						return
+					}
+				} else {
+					if consecutiveFailures > 0 {
+						c.logger.Info("heartbeat recovered",
+							"apply_id", apply.ApplyIdentifier,
+							"previous_failures", consecutiveFailures)
+					}
+					consecutiveFailures = 0
 				}
 			}
 		}
 	}()
-	return cancel
+	return ctx, cancel
 }
 
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
@@ -995,7 +1034,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Ta
 				Credentials: creds,
 			})
 			if err != nil {
-				c.logger.Warn("progress check failed", "error", err, "task_id", task.TaskIdentifier)
+				c.logger.Warn("progress check failed",
+					"error", err,
+					"task_id", task.TaskIdentifier,
+					"database", task.Database,
+					"table", task.TableName)
 				continue
 			}
 
@@ -1061,8 +1104,18 @@ func (c *LocalClient) markTaskFailed(ctx context.Context, task *storage.Task, er
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.
 // If the apply is already in a terminal state (e.g., cancelled by Stop()), the
 // apply state is not overwritten.
-func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
+func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string, originalErr ...error) {
 	now := time.Now()
+
+	// Determine if the failure is retryable based on the original error.
+	retryable := len(originalErr) > 0 && originalErr[0] != nil && engine.IsRetryable(originalErr[0])
+	taskState := state.Task.Failed
+	applyState := state.Apply.Failed
+	if retryable {
+		taskState = state.Task.FailedRetryable
+		applyState = state.Apply.FailedRetryable
+	}
+
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
 			continue
@@ -1070,8 +1123,10 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 		if task.ErrorMessage == "" {
 			task.ErrorMessage = errMsg
 		}
-		task.CompletedAt = &now
-		c.transitionTaskState(ctx, task, 0, state.Task.Failed, "")
+		if !retryable {
+			task.CompletedAt = &now
+		}
+		c.transitionTaskState(ctx, task, 0, taskState, "")
 	}
 
 	// Re-read the apply from storage — Stop() may have already set a terminal
@@ -1083,12 +1138,19 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 		return
 	}
 
-	apply.State = state.Apply.Failed
+	apply.State = applyState
 	apply.ErrorMessage = errMsg
-	apply.CompletedAt = &now
+	if !retryable {
+		apply.CompletedAt = &now
+	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", applyState, "error", err)
+	}
+
+	if retryable {
+		c.logger.Info("apply marked as retryable, recovery loop will retry",
+			"apply_id", apply.ApplyIdentifier, "attempt", apply.Attempt, "error", errMsg)
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 }

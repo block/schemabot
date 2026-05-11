@@ -175,20 +175,22 @@ type ApplyStore interface {
 	GetRecent(ctx context.Context, limit int) ([]*Apply, error)
 
 	// GetInProgress returns all applies in non-terminal states.
-	// Note: For recovery, use ClaimForRecovery which handles locking.
+	// Note: For recovery, use FindNextApply which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
 
-	// ClaimForRecovery atomically claims an apply for recovery using heartbeat-based leasing.
-	// Uses FOR UPDATE SKIP LOCKED to prevent race conditions between workers.
-	// Only applies with stale heartbeats (updated_at > 1 minute ago) are claimed.
-	// Returns the claimed apply, or nil if no apply is available to claim.
-	// The caller MUST call Heartbeat periodically (every 10 seconds) to maintain the lease.
-	ClaimForRecovery(ctx context.Context) (*Apply, error)
+	// FindNextApply atomically claims the next apply that needs attention.
+	// Returns the claimed apply, or nil if nothing needs work.
+	FindNextApply(ctx context.Context) (*Apply, error)
 
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 	// Should be called every 10 seconds while working on an apply.
 	// If not called for > 1 minute, another worker can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
+
+	// ExpireRetryable transitions failed_retryable applies that have exhausted
+	// their retry budget (attempt >= maxRecoveryAttempts) to permanent failed.
+	// Returns the number of applies transitioned.
+	ExpireRetryable(ctx context.Context) (int64, error)
 
 	// GetByPR returns all applies for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Apply, error)

@@ -182,9 +182,13 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Resume requested (sequential): %d tasks to resume, %d already completed", len(resumeTasks), completedCount), oldApplyState, state.Apply.Running)
 
-		resumeCtx, cancelResume := context.WithCancel(context.Background())
+		resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
+		c.cancelMu.Lock()
 		c.cancelApply = cancelResume
-		go c.resumeApplySequential(resumeCtx, apply, resumeTasks, plan, options)
+		c.cancelMu.Unlock()
+		go c.runWithRecovery(resumeCtx, apply, resumeTasks, func() {
+			c.resumeApplySequential(resumeCtx, apply, resumeTasks, plan, options)
+		})
 	}
 
 	return &ternv1.StartResponse{
@@ -198,7 +202,8 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 // This preserves the sequential behavior of the original apply when --defer-cutover
 // was NOT used. Each task gets its own eng.Apply + pollTaskToCompletion cycle.
 func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
-	defer c.startApplyHeartbeat(ctx, apply)()
+	ctx, stopHeartbeat := c.startApplyHeartbeat(ctx, apply)
+	defer stopHeartbeat()
 	creds := c.credentials()
 	eng := c.getEngine()
 
@@ -428,10 +433,14 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 		logMessage, oldApplyState, state.Apply.Running)
 
-	stopHeartbeat := c.startApplyHeartbeat(context.Background(), apply)
+	hbCtx, stopHeartbeat := c.startApplyHeartbeat(context.WithoutCancel(ctx), apply)
+	c.cancelMu.Lock()
+	c.cancelApply = stopHeartbeat
+	c.cancelMu.Unlock()
 	go func() {
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(context.Background(), apply, tasks, creds, nil)
+		defer c.clearCancelApply()
+		c.pollForCompletionAtomic(hbCtx, apply, tasks, creds, result.ResumeState)
 	}()
 	return nil
 }
@@ -439,8 +448,105 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 // ResumeApply resumes an in-progress apply whose heartbeat has expired.
 // This can happen after a server restart or if the worker goroutine crashed.
 // Spirit's checkpoint table allows resuming from where the schema change left off.
+// retryFailedApply re-dispatches a failed_retryable apply. Loads the plan,
+// resets failed tasks to pending, transitions the apply to running, and
+// re-executes. Called by ResumeApply when the scheduler claims a retryable apply.
+func (c *LocalClient) retryFailedApply(ctx context.Context, apply *storage.Apply) error {
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil || plan == nil {
+		errMsg := "retry failed: plan not found"
+		c.logger.Error("retry: plan not found", "apply_id", apply.ApplyIdentifier, "plan_id", apply.PlanID, "error", err)
+		c.failApplyPermanently(ctx, apply, errMsg)
+		return fmt.Errorf("%s (plan_id=%d): %w", errMsg, apply.PlanID, err)
+	}
+
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		errMsg := fmt.Sprintf("retry failed: load tasks: %v", err)
+		c.logger.Error("retry: failed to load tasks", "apply_id", apply.ApplyIdentifier, "error", err)
+		c.failApplyPermanently(ctx, apply, errMsg)
+		return fmt.Errorf("%s", errMsg)
+	}
+
+	// Transition to running
+	apply.State = state.Apply.Running
+	apply.ErrorMessage = ""
+	apply.CompletedAt = nil
+	apply.UpdatedAt = time.Now()
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("retry: failed to update apply state",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return fmt.Errorf("retry: update apply state: %w", err)
+	}
+
+	// Reset failed tasks for retry
+	for _, task := range tasks {
+		if task.State == state.Task.FailedRetryable {
+			task.State = state.Task.Pending
+			task.ErrorMessage = ""
+			task.CompletedAt = nil
+			task.Attempt++
+			if err := c.storage.Tasks().Update(ctx, task); err != nil {
+				c.logger.Warn("retry: failed to reset task",
+					"task_id", task.TaskIdentifier, "error", err)
+			}
+		}
+	}
+
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Retry attempt %d: re-dispatching apply %s", apply.Attempt, apply.ApplyIdentifier), "", state.Apply.Running)
+
+	// Re-dispatch in background using the same execution mode as the original apply.
+	options := parseOptionsMap(apply.Options)
+	deferCutover := options["defer_cutover"] == "true"
+	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
+	c.cancelMu.Lock()
+	c.cancelApply = cancelApply
+	c.cancelMu.Unlock()
+	if deferCutover || c.config.Type == storage.DatabaseTypeVitess {
+		go c.runWithRecovery(applyCtx, apply, tasks, func() {
+			c.executeApplyAtomic(applyCtx, apply, tasks, plan, options)
+		})
+	} else {
+		go c.runWithRecovery(applyCtx, apply, tasks, func() {
+			c.executeApplySequential(applyCtx, apply, tasks, plan, options)
+		})
+	}
+
+	return nil
+}
+
+// failApplyPermanently marks an apply as permanently failed.
+func (c *LocalClient) failApplyPermanently(ctx context.Context, apply *storage.Apply, errMsg string) {
+	now := time.Now()
+	apply.State = state.Apply.Failed
+	apply.ErrorMessage = errMsg
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to mark apply as permanently failed",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+	}
+}
+
 func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
-	// Get tasks for this apply
+	// Re-fetch to get latest state and options (apply may have been modified
+	// by a control operation between FindNextApply and now).
+	fresh, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("refresh apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if fresh == nil {
+		return fmt.Errorf("apply %s not found during refresh", apply.ApplyIdentifier)
+	}
+	apply = fresh
+
+	// Route to the appropriate recovery path based on state
+	if apply.State == state.Apply.FailedRetryable {
+		return c.retryFailedApply(ctx, apply)
+	}
+
+	// Crash recovery path: apply was in-progress when worker crashed
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
@@ -457,7 +563,6 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		return nil
 	}
 
-	// Get the plan to retrieve original DDLs
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil || plan == nil {
 		c.logger.Warn("plan not found for apply, marking as failed",
@@ -526,7 +631,13 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"Apply resumed from checkpoint (sequential)", "", state.Apply.Running)
 
-		go c.resumeApplySequential(context.Background(), apply, activeTasks, plan, options)
+		resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
+		c.cancelMu.Lock()
+		c.cancelApply = cancelResume
+		c.cancelMu.Unlock()
+		go c.runWithRecovery(resumeCtx, apply, activeTasks, func() {
+			c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options)
+		})
 	}
 
 	return nil

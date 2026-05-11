@@ -43,6 +43,11 @@ type ServerConfig struct {
 	// When empty or nil, all environments are allowed (backwards compatible).
 	AllowedEnvironments []string `yaml:"allowed_environments"`
 
+	// SchedulerWorkers is the number of concurrent scheduler workers that claim
+	// and resume applies. Each worker independently polls FindNextApply with
+	// FOR UPDATE SKIP LOCKED to prevent races. Defaults to 1.
+	SchedulerWorkers int `yaml:"scheduler_workers"`
+
 	// RequirePassingChecks blocks apply when non-SchemaBot PR checks are failing.
 	// When enabled (default), SchemaBot verifies that all other checks (CI, linters,
 	// security scans) have passed before executing a schema change. Checks with

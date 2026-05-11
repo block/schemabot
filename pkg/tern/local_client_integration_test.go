@@ -954,7 +954,7 @@ func TestLocalClient_StartApplyHeartbeat(t *testing.T) {
 	require.NoError(t, err, "query initial updated_at")
 
 	// Start the heartbeat and let it run for >1s
-	cancel := client.startApplyHeartbeat(ctx, apply)
+	_, cancel := client.startApplyHeartbeat(ctx, apply)
 	time.Sleep(2 * time.Second)
 	cancel()
 

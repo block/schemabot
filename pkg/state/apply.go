@@ -21,6 +21,7 @@ var Apply = struct {
 	RevertWindow      string
 	Completed         string
 	Failed            string
+	FailedRetryable   string
 	Stopped           string
 	Cancelled         string
 	Reverted          string
@@ -42,6 +43,7 @@ var Apply = struct {
 	RevertWindow:      "revert_window",
 	Completed:         "completed",
 	Failed:            "failed",
+	FailedRetryable:   "failed_retryable",
 	Stopped:           "stopped",
 	Cancelled:         "cancelled",
 	Reverted:          "reverted",
@@ -82,6 +84,9 @@ func DeriveApplyState(taskStates []string) string {
 
 	if counts[Apply.Failed] > 0 {
 		return Apply.Failed
+	}
+	if counts[Apply.FailedRetryable] > 0 {
+		return Apply.FailedRetryable
 	}
 	if counts[Apply.Cancelled] > 0 {
 		return Apply.Cancelled
@@ -134,6 +139,8 @@ func normalizeApplyState(raw string) string {
 		return Apply.Completed
 	case "FAILED":
 		return Apply.Failed
+	case "FAILED_RETRYABLE":
+		return Apply.FailedRetryable
 	case "STOPPED":
 		return Apply.Stopped
 	case "CANCELLED":
@@ -164,7 +171,8 @@ func IsState(s string, expected ...string) bool {
 }
 
 // IsTerminalApplyState returns true if the state is a terminal state
-// where no further processing will occur.
+// where no further processing will occur. FailedRetryable is NOT terminal
+// — the recovery loop may re-dispatch the apply.
 func IsTerminalApplyState(s string) bool {
 	switch s {
 	case Apply.Completed, Apply.Failed, Apply.Stopped, Apply.Cancelled, Apply.Reverted:

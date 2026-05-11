@@ -11,19 +11,21 @@ package apitypes
 // constants rather than parsing error_message strings or HTTP status codes.
 // Use IsRetryableErrorCode to determine whether a given code is retryable.
 const (
-	ErrCodeInvalidRequest     = "invalid_request"      // Malformed request (missing params, bad values)
-	ErrCodeNotFound           = "not_found"            // Resource doesn't exist (unknown apply ID, database)
-	ErrCodeDeploymentNotFound = "deployment_not_found" // No tern deployment configured for database/environment
-	ErrCodeEngineError        = "engine_error"         // Schema change engine failure during execution
-	ErrCodeStorageError       = "storage_error"        // Storage backend (MySQL) read/write failure
-	ErrCodeEngineUnavailable  = "engine_unavailable"   // Schema change engine (Tern) unreachable or RPC error
-	ErrCodeStateSyncFailed    = "state_sync_failed"    // Operation succeeded but local state sync failed
+	ErrCodeInvalidRequest       = "invalid_request"        // Malformed request (missing params, bad values)
+	ErrCodeNotFound             = "not_found"              // Resource doesn't exist (unknown apply ID, database)
+	ErrCodeDeploymentNotFound   = "deployment_not_found"   // No tern deployment configured for database/environment
+	ErrCodeEngineError          = "engine_error"           // Schema change engine failure during execution (permanent)
+	ErrCodeEngineErrorRetryable = "engine_error_retryable" // Schema change engine failure that may recover on retry
+	ErrCodeStorageError         = "storage_error"          // Storage backend (MySQL) read/write failure
+	ErrCodeEngineUnavailable    = "engine_unavailable"     // Schema change engine (Tern) unreachable or RPC error
+	ErrCodeStateSyncFailed      = "state_sync_failed"      // Operation succeeded but local state sync failed
 )
 
 var retryableErrorCodes = map[string]bool{
-	ErrCodeStorageError:      true,
-	ErrCodeEngineUnavailable: true,
-	ErrCodeStateSyncFailed:   true,
+	ErrCodeEngineErrorRetryable: true,
+	ErrCodeStorageError:         true,
+	ErrCodeEngineUnavailable:    true,
+	ErrCodeStateSyncFailed:      true,
 }
 
 // IsRetryableErrorCode reports whether the given API error code represents a

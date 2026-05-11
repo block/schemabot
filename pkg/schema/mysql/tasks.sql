@@ -16,6 +16,7 @@ CREATE TABLE `tasks` (
   `state` varchar(100) NOT NULL,
   `error_message` text,
   `options` json DEFAULT NULL,
+  `attempt` int unsigned NOT NULL DEFAULT '0',
   `rows_copied` bigint DEFAULT '0',
   `rows_total` bigint DEFAULT '0',
   `progress_percent` int DEFAULT '0',

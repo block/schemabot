@@ -179,43 +179,84 @@ func RecordLockOperation(ctx context.Context, operation, database, status string
 	)
 }
 
-// RecordRecoveryCycle increments the recovery cycle counter and records
-// how many applies were recovered and how many failed in this cycle.
-func RecordRecoveryCycle(ctx context.Context, recovered, failed int) {
+// RecordSchedulerResume increments the scheduler resumed counter when an apply is
+// successfully claimed and resumed. Includes the previous state for distinguishing
+// crash recovery (stale active) from retryable recovery (failed_retryable).
+func RecordSchedulerResume(ctx context.Context, database, environment, previousState string) {
 	meter := otel.Meter(meterName)
-	cycleCounter, err := meter.Int64Counter("schemabot.recovery.cycles_total",
-		otelmetric.WithDescription("Total number of recovery worker cycles"),
-		otelmetric.WithUnit("{cycle}"),
+	counter, err := meter.Int64Counter("schemabot.scheduler.resumed_total",
+		otelmetric.WithDescription("Total number of applies resumed by the scheduler"),
+		otelmetric.WithUnit("{apply}"),
 	)
 	if err != nil {
-		slog.Warn("failed to create recovery cycles counter", "error", err)
+		slog.Warn("failed to create scheduler resumed counter", "error", err)
 		return
 	}
-	cycleCounter.Add(ctx, 1)
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+			attribute.String("environment", environment),
+			attribute.String("previous_state", previousState),
+		),
+	)
+}
 
-	if recovered > 0 {
-		recoveredCounter, err := meter.Int64Counter("schemabot.recovery.recovered_total",
-			otelmetric.WithDescription("Total number of applies recovered by the recovery worker"),
-			otelmetric.WithUnit("{apply}"),
-		)
-		if err != nil {
-			slog.Warn("failed to create recovery recovered counter", "error", err)
-			return
-		}
-		recoveredCounter.Add(ctx, int64(recovered))
+// RecordSchedulerResumeFailure increments the scheduler resume failure counter.
+func RecordSchedulerResumeFailure(ctx context.Context, database, environment, reason string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.scheduler.resume_failures_total",
+		otelmetric.WithDescription("Total number of scheduler resume attempts that failed"),
+		otelmetric.WithUnit("{apply}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create scheduler resume failure counter", "error", err)
+		return
 	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+			attribute.String("environment", environment),
+			attribute.String("reason", reason),
+		),
+	)
+}
 
-	if failed > 0 {
-		failedCounter, err := meter.Int64Counter("schemabot.recovery.failed_total",
-			otelmetric.WithDescription("Total number of recovery attempts that failed"),
-			otelmetric.WithUnit("{apply}"),
-		)
-		if err != nil {
-			slog.Warn("failed to create recovery failed counter", "error", err)
-			return
-		}
-		failedCounter.Add(ctx, int64(failed))
+// RecordSchedulerExpired increments the counter for applies that exhausted their
+// retry budget and were permanently failed by the scheduler.
+func RecordSchedulerExpired(ctx context.Context, count int64) {
+	if count <= 0 {
+		return
 	}
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.scheduler.expired_total",
+		otelmetric.WithDescription("Total number of applies expired to permanent failed (retry budget exhausted)"),
+		otelmetric.WithUnit("{apply}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create scheduler expired counter", "error", err)
+		return
+	}
+	counter.Add(ctx, count)
+}
+
+// RecordSchedulerClaimDuration records how long it took to claim and resume an apply.
+func RecordSchedulerClaimDuration(ctx context.Context, duration time.Duration, database, environment, previousState string) {
+	meter := otel.Meter(meterName)
+	hist, err := meter.Float64Histogram("schemabot.scheduler.claim_duration_seconds",
+		otelmetric.WithDescription("Duration of scheduler claim + resume operations"),
+		otelmetric.WithUnit("s"),
+	)
+	if err != nil {
+		slog.Warn("failed to create scheduler claim duration histogram", "error", err)
+		return
+	}
+	hist.Record(ctx, duration.Seconds(),
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+			attribute.String("environment", environment),
+			attribute.String("previous_state", previousState),
+		),
+	)
 }
 
 // knownWebhookEvents limits metric cardinality to expected GitHub event types.

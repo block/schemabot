@@ -17,7 +17,7 @@ import (
 // taskColumns lists all columns for SELECT queries.
 const taskColumns = `id, task_identifier, apply_id, plan_id, database_name, database_type,
 	namespace, table_name, ddl, ddl_action,
-	engine, repository, pull_request, environment, state, error_message, options,
+	engine, repository, pull_request, environment, state, error_message, options, attempt,
 	rows_copied, rows_total, progress_percent, eta_seconds,
 	is_instant, ready_to_complete, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
@@ -89,12 +89,12 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE tasks SET
-			state = ?, error_message = ?, options = ?,
+			state = ?, error_message = ?, options = ?, attempt = ?,
 			rows_copied = ?, rows_total = ?, progress_percent = ?, eta_seconds = ?,
 			is_instant = ?, ready_to_complete = ?, engine_migration_id = ?,
 			started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?
-	`, task.State, nullString(task.ErrorMessage), nullJSON(task.Options),
+	`, task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds,
 		task.IsInstant, task.ReadyToComplete, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt,
@@ -255,6 +255,7 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 		&task.State,
 		&errorMsg,
 		&options,
+		&task.Attempt,
 		&task.RowsCopied,
 		&task.RowsTotal,
 		&task.ProgressPercent,

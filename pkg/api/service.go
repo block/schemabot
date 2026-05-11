@@ -470,8 +470,8 @@ func (s *Service) Storage() storage.Storage {
 
 // Close closes the service and releases resources.
 func (s *Service) Close() error {
-	// Stop the background recovery worker first
-	s.StopRecoveryWorker()
+	// Stop the scheduler first
+	s.StopScheduler()
 
 	s.ternMu.Lock()
 	var errs []error
