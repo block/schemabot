@@ -11,8 +11,8 @@ set -e
 
 REGION="us-west-2"
 if [ -z "${AWS_PROFILE:-}" ]; then
-    echo "❌ AWS_PROFILE is not set. Export it before running this script."
-    echo "   Example: AWS_PROFILE=my-profile ../scripts/seed-large.sh"
+    echo "❌ AWS_PROFILE is not set."
+    echo "   Example: export AWS_PROFILE=my-profile"
     exit 1
 fi
 

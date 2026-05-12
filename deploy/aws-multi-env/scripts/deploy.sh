@@ -12,8 +12,8 @@ REGION="us-west-2"
 # AWS_PROFILE must be set by the caller. Each environment may use a different
 # AWS account and profile (e.g., staging and production on separate accounts).
 if [ -z "${AWS_PROFILE:-}" ]; then
-    echo "❌ AWS_PROFILE is not set. Export it before running deploy."
-    echo "   Example: AWS_PROFILE=my-profile ../scripts/deploy.sh"
+    echo "❌ AWS_PROFILE is not set."
+    echo "   Example: export AWS_PROFILE=my-profile"
     exit 1
 fi
 

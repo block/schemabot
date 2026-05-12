@@ -32,6 +32,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -c|--command)
+            if [ -z "${2:-}" ]; then
+                echo "❌ --command requires a SQL string"
+                echo "   Example: ../scripts/shell.sh -e schemabot -c 'SHOW TABLES'"
+                exit 1
+            fi
             SQL_COMMAND="$2"
             shift 2
             ;;
@@ -47,10 +52,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Set AWS profile
+# Validate flags
+if [ "$RESET_SCHEMA" = true ] && [ -n "$SQL_COMMAND" ]; then
+    echo "❌ --reset-schema and -c/--command are mutually exclusive."
+    exit 1
+fi
+
 if [ -z "${AWS_PROFILE:-}" ]; then
-    echo "❌ AWS_PROFILE is not set. Export it before running this script."
-    echo "   Example: AWS_PROFILE=my-profile ../scripts/shell.sh"
+    echo "❌ AWS_PROFILE is not set."
+    echo "   Example: export AWS_PROFILE=my-profile"
     exit 1
 fi
 
