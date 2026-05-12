@@ -2,8 +2,6 @@ package webhook
 
 import (
 	"context"
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/state"
@@ -31,8 +29,6 @@ func (h *Handler) watchApplyProgress(ctx context.Context, repo string, pr int, i
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	var lastState string
-	var lastPercent int
 	hasCutoverComment := false
 
 	for {
@@ -59,18 +55,6 @@ func (h *Handler) watchApplyProgress(ctx context.Context, repo string, pr int, i
 			h.logger.Error("failed to get tasks for progress", "applyID", applyID, "error", err)
 			continue
 		}
-
-		currentPercent := aggregatePercent(tasks)
-		stateChanged := current.State != lastState
-		// Only update on state change or 10% progress increments
-		significantProgress := currentPercent/10 != lastPercent/10
-
-		if !stateChanged && !significantProgress {
-			continue
-		}
-
-		lastState = current.State
-		lastPercent = currentPercent
 
 		if state.IsTerminalApplyState(current.State) {
 			// Edit active comment to final state
@@ -115,72 +99,8 @@ func (h *Handler) watchApplyProgress(ctx context.Context, repo string, pr int, i
 	}
 }
 
-// aggregatePercent computes a weighted average progress percentage across tasks.
-func aggregatePercent(tasks []*storage.Task) int {
-	if len(tasks) == 0 {
-		return 0
-	}
-	total := 0
-	for _, t := range tasks {
-		total += t.ProgressPercent
-	}
-	return total / len(tasks)
-}
-
-// formatProgressComment renders the progress comment body for an apply.
-func formatProgressComment(apply *storage.Apply, tasks []*storage.Task) string {
-	var sb strings.Builder
-
-	emoji := stateEmoji(apply.State)
-	fmt.Fprintf(&sb, "## %s Schema Change: `%s`\n\n", emoji, apply.Database)
-	fmt.Fprintf(&sb, "**Environment:** %s\n", apply.Environment)
-	fmt.Fprintf(&sb, "**Engine:** %s\n", apply.Engine)
-	fmt.Fprintf(&sb, "**State:** %s\n\n", formatState(apply.State))
-
-	if len(tasks) > 0 {
-		sb.WriteString("| Table | DDL | Status | Progress |\n")
-		sb.WriteString("|-------|-----|--------|----------|\n")
-		for _, t := range tasks {
-			progress := formatTaskProgress(t)
-			fmt.Fprintf(&sb, "| `%s` | `%s` | %s | %s |\n",
-				t.TableName, truncateDDL(t.DDL, 60), formatState(string(t.State)), progress)
-		}
-		sb.WriteString("\n")
-	}
-
-	if apply.ErrorMessage != "" {
-		fmt.Fprintf(&sb, "**Error:** %s\n", apply.ErrorMessage)
-	}
-
-	return sb.String()
-}
-
-// formatCutoverComment renders the cutover confirmation comment.
-func formatCutoverComment(apply *storage.Apply, tasks []*storage.Task) string {
-	var sb strings.Builder
-
-	fmt.Fprintf(&sb, "## Cutover Ready: `%s`\n\n", apply.Database)
-	fmt.Fprintf(&sb, "**Environment:** %s\n", apply.Environment)
-	fmt.Fprintf(&sb, "**State:** %s\n\n", formatState(apply.State))
-
-	if len(tasks) > 0 {
-		readyCount := 0
-		for _, t := range tasks {
-			if t.ReadyToComplete {
-				readyCount++
-			}
-		}
-		fmt.Fprintf(&sb, "%d/%d table(s) ready for cutover.\n\n", readyCount, len(tasks))
-	}
-
-	sb.WriteString("To proceed with cutover, comment:\n")
-	sb.WriteString("```\nschemabot cutover -e " + apply.Environment + "\n```\n")
-
-	return sb.String()
-}
-
-// formatSummaryComment renders the final summary comment using the dedicated template.
-func formatSummaryComment(apply *storage.Apply, tasks []*storage.Task) string {
+// buildApplyCommentData maps storage types to template data.
+func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task) templates.ApplyStatusCommentData {
 	data := templates.ApplyStatusCommentData{
 		ApplyID:      apply.ApplyIdentifier,
 		Database:     apply.Database,
@@ -208,72 +128,26 @@ func formatSummaryComment(apply *storage.Apply, tasks []*storage.Task) string {
 			RowsCopied:      t.RowsCopied,
 			RowsTotal:       t.RowsTotal,
 			PercentComplete: t.ProgressPercent,
+			ETASeconds:      int64(t.ETASeconds),
+			IsInstant:       t.IsInstant,
+			ReadyToComplete: t.ReadyToComplete,
 		})
 	}
-	return templates.RenderApplySummaryComment(data)
+	return data
 }
 
-// stateEmoji returns an emoji for the apply state.
-func stateEmoji(s string) string {
-	switch s {
-	case state.Apply.Completed:
-		return "✅"
-	case state.Apply.Failed:
-		return "❌"
-	case state.Apply.Stopped:
-		return "⏹️"
-	case state.Apply.Reverted:
-		return "↩️"
-	case state.Apply.Running:
-		return "⏳"
-	default:
-		return "🛠️"
-	}
+// formatProgressComment renders the progress comment using the template system.
+func formatProgressComment(apply *storage.Apply, tasks []*storage.Task) string {
+	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks))
 }
 
-// formatState formats a state string for display.
-func formatState(s string) string {
-	return "`" + s + "`"
+// formatCutoverComment renders the cutover confirmation comment.
+// Uses the same template — the cutover state produces the appropriate header and footer.
+func formatCutoverComment(apply *storage.Apply, tasks []*storage.Task) string {
+	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks))
 }
 
-// formatTaskProgress returns a human-readable progress string for a task.
-func formatTaskProgress(t *storage.Task) string {
-	if t.IsInstant {
-		return "instant"
-	}
-	if t.State == state.Task.Completed {
-		return "done"
-	}
-	if t.ProgressPercent > 0 {
-		s := fmt.Sprintf("%d%%", t.ProgressPercent)
-		if t.ETASeconds > 0 {
-			s += fmt.Sprintf(" (ETA %s)", formatETA(t.ETASeconds))
-		}
-		return s
-	}
-	return "-"
-}
-
-// formatETA formats seconds into a human-readable duration.
-func formatETA(seconds int) string {
-	d := time.Duration(seconds) * time.Second
-	if d < time.Minute {
-		return fmt.Sprintf("%ds", seconds)
-	}
-	if d < time.Hour {
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	}
-	return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
-}
-
-// truncateDDL truncates a DDL string for table display.
-func truncateDDL(ddl string, maxLen int) string {
-	// Take first line only
-	if idx := strings.IndexByte(ddl, '\n'); idx >= 0 {
-		ddl = ddl[:idx]
-	}
-	if len(ddl) > maxLen {
-		return ddl[:maxLen-3] + "..."
-	}
-	return ddl
+// formatSummaryComment renders the final summary comment for a terminal apply state.
+func formatSummaryComment(apply *storage.Apply, tasks []*storage.Task) string {
+	return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks))
 }

@@ -24,6 +24,7 @@ type TableProgressData struct {
 	PercentComplete int
 	ETASeconds      int64
 	IsInstant       bool
+	ReadyToComplete bool
 }
 
 // ApplyStatusCommentData contains all data needed to render an apply status PR comment.
@@ -51,6 +52,11 @@ func RenderApplyStatusComment(data ApplyStatusCommentData) string {
 
 	// Metadata line
 	writeApplyMetadata(&sb, data)
+
+	// Cutover readiness summary
+	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
+		writeCutoverSummary(&sb, data.Tables)
+	}
 
 	// Per-table progress section
 	if len(data.Tables) > 0 {
@@ -81,12 +87,28 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("## Schema Change — Waiting for Cutover\n\n")
 	case state.Apply.CuttingOver:
 		sb.WriteString("## Schema Change — Cutting Over\n\n")
+	case state.Apply.RevertWindow:
+		sb.WriteString("## Schema Change Applied (Pending Revert)\n\n")
 	case state.Apply.Completed:
 		sb.WriteString("## ✅ Schema Change Applied\n\n")
 	case state.Apply.Failed:
 		sb.WriteString("## ❌ Schema Change Failed\n\n")
 	case state.Apply.Stopped:
 		sb.WriteString("## ⏹️ Schema Change Stopped\n\n")
+	case state.Apply.Reverted:
+		sb.WriteString("## ↩️ Schema Change Reverted\n\n")
+	case state.Apply.Cancelled:
+		sb.WriteString("## Schema Change Cancelled\n\n")
+	case state.Apply.PreparingBranch:
+		sb.WriteString("## Schema Change — Preparing Branch\n\n")
+	case state.Apply.ApplyingBranchChanges:
+		sb.WriteString("## Schema Change — Applying Branch Changes\n\n")
+	case state.Apply.ValidatingBranch:
+		sb.WriteString("## Schema Change — Validating Branch\n\n")
+	case state.Apply.CreatingDeployRequest:
+		sb.WriteString("## Schema Change — Creating Deploy Request\n\n")
+	case state.Apply.ValidatingDeployRequest:
+		sb.WriteString("## Schema Change — Validating Deploy Request\n\n")
 	default:
 		fmt.Fprintf(sb, "## Schema Change — %s\n\n", capitalizeFirst(data.State))
 	}
@@ -107,6 +129,26 @@ func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 	writeAppliedByOrTimestamp(sb, data.RequestedBy)
+}
+
+// writeCutoverSummary writes a readiness summary for cutover states,
+// showing how many tables are ready to complete vs still catching up.
+func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
+	ready := 0
+	total := len(tables)
+	for _, t := range tables {
+		if t.ReadyToComplete {
+			ready++
+		}
+	}
+	if total == 0 {
+		return
+	}
+	if ready == total {
+		fmt.Fprintf(sb, "\n**%d/%d** table(s) ready for cutover\n", ready, total)
+	} else {
+		fmt.Fprintf(sb, "\n**%d/%d** table(s) ready for cutover — waiting on %d\n", ready, total, total-ready)
+	}
 }
 
 // applyElapsed returns a human-readable elapsed duration.
@@ -265,7 +307,11 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 
 	case state.Task.WaitingForCutover:
 		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(sb, "- **`%s`**: %s Waiting for cutover  \n", table.TableName, bar)
+		if table.ReadyToComplete {
+			fmt.Fprintf(sb, "- **`%s`**: %s \u2705 Ready for cutover  \n", table.TableName, bar)
+		} else {
+			fmt.Fprintf(sb, "- **`%s`**: %s Waiting for cutover  \n", table.TableName, bar)
+		}
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.CuttingOver:
@@ -280,6 +326,11 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 
 	case state.Task.Cancelled:
 		fmt.Fprintf(sb, "- **`%s`**: \u2298 Cancelled (not started)  \n", table.TableName)
+		writeDDLLine(sb, table.DDL)
+
+	case state.Task.RevertWindow:
+		bar := ui.ProgressBarWaitingCutover()
+		fmt.Fprintf(sb, "- **`%s`**: %s \u2713 Complete (pending revert)  \n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Stopped:
@@ -376,6 +427,9 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeFooterAction(sb, "To resume:", fmt.Sprintf("schemabot start %s", data.ApplyID))
 	case state.Apply.Failed:
 		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
+	case state.Apply.RevertWindow:
+		writeFooterAction(sb, "To revert:", fmt.Sprintf("schemabot revert %s", data.ApplyID))
+		sb.WriteString(fmt.Sprintf("\nTo skip revert and keep changes:\n```\nschemabot skip-revert %s\n```\n", data.ApplyID))
 	}
 }
 
