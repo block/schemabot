@@ -105,6 +105,8 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 - `_ = someFunc()` — never discard errors silently; log them even if the operation is best-effort
 - Fallback branches (e.g., "assume changed on error") — log why the fallback was taken
 
+**No ambiguous log messages.** Log messages must state what *will* happen, not what *might* happen. During a sev, operators need to know the impact immediately — "may be blocked" wastes time investigating whether it actually is. Use definitive language: "check gate will block PR applies" not "PR applies may be blocked".
+
 **No bug references in code:** When fixing a bug, write code and tests as if the correct behavior always existed. Don't add comments like `// this is where the bug was`, `// regression test for #123`, or `// without this fix, X breaks`. The git history has the context. Code and test comments should describe *what* and *why*, not the history of what was wrong.
 
 **No "what changed" comments:** Don't add comments explaining what was removed, moved, or changed. Comments like `// Previously this was X, now it's Y` or `// The first progress poll transitions to the correct state` describe the change, not the code. If the code is clear without the comment, omit it. The git diff shows what changed.

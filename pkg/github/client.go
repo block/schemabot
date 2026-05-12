@@ -28,24 +28,71 @@ type GitHubClientFactory interface {
 
 // Client handles GitHub App-level operations and creates per-installation clients.
 type Client struct {
-	appID      int64
-	privateKey []byte
-	logger     *slog.Logger
+	appID           int64
+	privateKey      []byte
+	logger          *slog.Logger
+	appSlug         string    // fetched from GitHub API at startup, used to identify own check runs
+	lastSlugAttempt time.Time // rate-limits slug fetch retries
 }
 
-// NewClient creates a new GitHub App client.
+// slugFetchRetryCooldown is how long to wait between retry attempts when the
+// app slug couldn't be fetched at startup (e.g., GitHub was temporarily down).
+const slugFetchRetryCooldown = 5 * time.Second
+
+// NewClient creates a new GitHub App client and fetches the app's slug from GitHub.
+// If the slug can't be fetched (e.g., GitHub is down), the server still starts but
+// PR applies are blocked by the check gate since we can't identify our own checks.
 func NewClient(appID int64, privateKey []byte, logger *slog.Logger) *Client {
-	return &Client{
+	c := &Client{
 		appID:      appID,
 		privateKey: privateKey,
 		logger:     logger,
 	}
+
+	// Fetch the app slug so we can identify our own check runs in statusCheckRollup.
+	// Non-fatal: if GitHub is down, the server still starts but the check gate won't
+	// exclude own checks (PR applies may be blocked until the slug is fetched).
+	c.fetchAppSlug()
+
+	return c
+}
+
+// fetchAppSlug fetches the app slug from GitHub via GET /app.
+// On failure, logs an error and leaves appSlug empty.
+func (c *Client) fetchAppSlug() {
+	c.lastSlugAttempt = time.Now()
+	transport, err := ghinstallation.NewAppsTransport(http.DefaultTransport, c.appID, c.privateKey)
+	if err != nil {
+		c.logger.Error("failed to create app transport for slug fetch", "error", err)
+		return
+	}
+	appClient := gh.NewClient(&http.Client{Transport: transport, Timeout: 10 * time.Second})
+	app, _, err := appClient.Apps.Get(context.Background(), "")
+	if err != nil {
+		c.logger.Error("failed to fetch app slug from GitHub — check gate will not exclude own checks",
+			"app_id", c.appID, "error", err)
+		return
+	}
+	c.appSlug = app.GetSlug()
+	c.logger.Info("fetched GitHub App slug", "slug", c.appSlug)
 }
 
 // ForInstallation creates a GitHub client scoped to a specific installation.
 // The ghinstallation library handles JWT generation, token exchange, caching,
 // and refresh automatically.
 func (c *Client) ForInstallation(installationID int64) (*InstallationClient, error) {
+	// Retry slug fetch if it failed at startup (e.g., GitHub was down).
+	// Rate-limited to once per 5 seconds to avoid hammering GitHub during
+	// an outage while still recovering quickly once it's back.
+	if c.appSlug == "" {
+		if time.Since(c.lastSlugAttempt) > slugFetchRetryCooldown {
+			c.logger.Info("app slug not yet fetched, retrying")
+			c.fetchAppSlug()
+		}
+		if c.appSlug == "" {
+			c.logger.Error("app slug unavailable — check gate will block PR applies if own checks are failing")
+		}
+	}
 	transport, err := ghinstallation.New(http.DefaultTransport, c.appID, installationID, c.privateKey)
 	if err != nil {
 		return nil, fmt.Errorf("create installation transport: %w", err)
@@ -53,9 +100,10 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 	httpc := &http.Client{Transport: transport, Timeout: 30 * time.Second}
 	ghClient := gh.NewClient(httpc)
 	return &InstallationClient{
-		client: ghClient,
-		gql:    githubv4.NewEnterpriseClient(graphQLURLFor(ghClient), httpc),
-		logger: c.logger,
+		client:  ghClient,
+		gql:     githubv4.NewEnterpriseClient(graphQLURLFor(ghClient), httpc),
+		logger:  c.logger,
+		appSlug: c.appSlug,
 	}, nil
 }
 
@@ -64,10 +112,16 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 // The GraphQL endpoint is derived from the go-github client's BaseURL so the same
 // httptest mux serves both REST and GraphQL.
 func NewInstallationClient(client *gh.Client, logger *slog.Logger) *InstallationClient {
+	return NewInstallationClientWithSlug(client, logger, "")
+}
+
+// NewInstallationClientWithSlug creates an InstallationClient with an explicit app slug.
+func NewInstallationClientWithSlug(client *gh.Client, logger *slog.Logger, appSlug string) *InstallationClient {
 	return &InstallationClient{
-		client: client,
-		gql:    githubv4.NewEnterpriseClient(graphQLURLFor(client), client.Client()),
-		logger: logger,
+		client:  client,
+		gql:     githubv4.NewEnterpriseClient(graphQLURLFor(client), client.Client()),
+		logger:  logger,
+		appSlug: appSlug,
 	}
 }
 
@@ -80,9 +134,10 @@ func graphQLURLFor(client *gh.Client) string {
 
 // InstallationClient wraps a go-github client scoped to a specific GitHub App installation.
 type InstallationClient struct {
-	client *gh.Client
-	gql    *githubv4.Client
-	logger *slog.Logger
+	client  *gh.Client
+	gql     *githubv4.Client
+	logger  *slog.Logger
+	appSlug string // the app's slug, used to identify own check runs
 }
 
 // IsNotFoundError checks if an error is a GitHub API 404 Not Found error.
@@ -342,10 +397,6 @@ type PRCheckStatus struct {
 	IsSchemaBot bool   // true if this is a SchemaBot check
 }
 
-// schemaBotAppSlug is the GitHub App slug used to identify SchemaBot's own
-// check runs via checkSuite.app.slug from the GraphQL statusCheckRollup.
-const schemaBotAppSlug = "schemabot"
-
 // statusCheckRollupQuery is the GraphQL query used by GetPRCheckStatuses.
 // statusCheckRollup returns check runs and commit statuses already deduped
 // and filtered to the latest run per check name.
@@ -383,6 +434,11 @@ type statusCheckRollupQuery struct {
 	} `graphql:"repository(owner: $owner, name: $repo)"`
 }
 
+// isOwnAppSlug returns true if the given slug belongs to this SchemaBot instance.
+func (ic *InstallationClient) isOwnAppSlug(slug string) bool {
+	return strings.EqualFold(slug, ic.appSlug)
+}
+
 // GetPRCheckStatuses fetches all check runs and commit statuses for a ref via
 // the GraphQL Commit.statusCheckRollup, which returns already-deduped, latest-only
 // results in a single round trip. SchemaBot's own check runs are identified via
@@ -411,7 +467,7 @@ func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo strin
 					Name:        n.CheckRun.Name,
 					Status:      strings.ToLower(n.CheckRun.Status),
 					Conclusion:  strings.ToLower(n.CheckRun.Conclusion),
-					IsSchemaBot: strings.EqualFold(n.CheckRun.CheckSuite.App.Slug, schemaBotAppSlug),
+					IsSchemaBot: ic.isOwnAppSlug(n.CheckRun.CheckSuite.App.Slug),
 				})
 			case "StatusContext":
 				status, conclusion := mapLegacyStatusState(n.StatusContext.State)
@@ -419,7 +475,7 @@ func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo strin
 					Name:        n.StatusContext.Context,
 					Status:      status,
 					Conclusion:  conclusion,
-					IsSchemaBot: strings.HasPrefix(strings.ToLower(n.StatusContext.Context), schemaBotAppSlug),
+					IsSchemaBot: false, // commit statuses don't have app slugs — never SchemaBot's own
 				})
 			}
 		}

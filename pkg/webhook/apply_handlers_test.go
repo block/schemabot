@@ -309,7 +309,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 			{Typename: "CheckRun", Name: "SchemaBot (staging)", Status: "COMPLETED", Conclusion: "ACTION_REQUIRED", AppSlug: "schemabot"},
 		}))
 
-		installClient := ghclient.NewInstallationClient(client, testLogger())
+		installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
 		factory := &fakeClientFactory{client: installClient}
 
 		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
@@ -361,6 +361,29 @@ func TestEnforcePassingChecks(t *testing.T) {
 			assert.Contains(t, body, "still running")
 		default:
 		}
+	})
+
+	t.Run("variant app slug excluded from gate", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+
+		mux.HandleFunc("POST /graphql", rollupGraphQLHandler([]rollupNode{
+			{Typename: "CheckRun", Name: "CI / tests", Status: "COMPLETED", Conclusion: "SUCCESS", AppSlug: "github-actions"},
+			{Typename: "CheckRun", Name: "SchemaBot (staging)", Status: "COMPLETED", Conclusion: "FAILURE", AppSlug: "schemabot-at-acme-staging"},
+		}))
+
+		installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot-at-acme-staging")
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
+		h := &Handler{
+			service:  service,
+			ghClient: factory,
+			logger:   testLogger(),
+		}
+
+		ctx := t.Context()
+		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		assert.False(t, blocked, "should not block on own failed check with variant slug")
 	})
 
 	t.Run("disabled by config", func(t *testing.T) {
