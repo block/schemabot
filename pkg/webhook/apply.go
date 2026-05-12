@@ -26,10 +26,21 @@ func (h *Handler) watchApplyProgress(ctx context.Context, repo string, pr int, i
 		h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, body)
 	}
 
-	ticker := time.NewTicker(5 * time.Second)
+	// Adaptive polling: 5s when progress is moving, 30s when stagnant.
+	// Reduces GitHub API calls during Spirit's throttled tail where row
+	// count barely changes for minutes.
+	const (
+		activePollInterval   = 5 * time.Second
+		stagnantPollInterval = 30 * time.Second
+		stagnantThreshold    = 3 // consecutive unchanged ticks before slowing down
+	)
+
+	ticker := time.NewTicker(activePollInterval)
 	defer ticker.Stop()
 
 	hasCutoverComment := false
+	var lastRowsCopied int64
+	stagnantTicks := 0
 
 	for {
 		select {
@@ -54,6 +65,27 @@ func (h *Handler) watchApplyProgress(ctx context.Context, repo string, pr int, i
 		if err != nil {
 			h.logger.Error("failed to get tasks for progress", "applyID", applyID, "error", err)
 			continue
+		}
+
+		// Adapt poll interval based on whether progress is moving
+		var totalRows int64
+		for _, t := range tasks {
+			totalRows += t.RowsCopied
+		}
+		if totalRows == lastRowsCopied && !state.IsTerminalApplyState(current.State) {
+			stagnantTicks++
+			if stagnantTicks == stagnantThreshold {
+				ticker.Reset(stagnantPollInterval)
+			}
+			if stagnantTicks >= stagnantThreshold {
+				continue // skip comment edit — nothing changed
+			}
+		} else {
+			if stagnantTicks >= stagnantThreshold {
+				ticker.Reset(activePollInterval)
+			}
+			stagnantTicks = 0
+			lastRowsCopied = totalRows
 		}
 
 		if state.IsTerminalApplyState(current.State) {
