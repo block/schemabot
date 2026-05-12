@@ -7,7 +7,11 @@ set -euo pipefail
 # Always requires interactive confirmation — no auto-approve flag.
 
 REGION="us-west-2"
-export AWS_PROFILE="${AWS_PROFILE:-schemabot-deployer}"
+if [ -z "${AWS_PROFILE:-}" ]; then
+    echo "❌ AWS_PROFILE is not set. Export it before running this script."
+    echo "   Example: AWS_PROFILE=my-profile ../scripts/destroy.sh"
+    exit 1
+fi
 
 cd "$(pwd)"
 

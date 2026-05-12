@@ -8,7 +8,14 @@ set -euo pipefail
 #   --skip-build    Skip Docker build, just trigger deployment
 
 REGION="us-west-2"
-export AWS_PROFILE="${AWS_PROFILE:-schemabot-deployer}"
+
+# AWS_PROFILE must be set by the caller. Each environment may use a different
+# AWS account and profile (e.g., staging and production on separate accounts).
+if [ -z "${AWS_PROFILE:-}" ]; then
+    echo "❌ AWS_PROFILE is not set. Export it before running deploy."
+    echo "   Example: AWS_PROFILE=my-profile ../scripts/deploy.sh"
+    exit 1
+fi
 
 SKIP_BUILD=false
 

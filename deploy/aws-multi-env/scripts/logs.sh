@@ -13,7 +13,11 @@ set -euo pipefail
 #   ../scripts/logs.sh --all         # Both application and service logs interleaved
 
 REGION="us-west-2"
-export AWS_PROFILE="${AWS_PROFILE:-schemabot-deployer}"
+if [ -z "${AWS_PROFILE:-}" ]; then
+    echo "❌ AWS_PROFILE is not set. Export it before running this script."
+    echo "   Example: AWS_PROFILE=my-profile ../scripts/logs.sh"
+    exit 1
+fi
 
 # Defaults
 DURATION="30m"

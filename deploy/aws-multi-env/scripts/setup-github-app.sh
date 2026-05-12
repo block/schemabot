@@ -9,7 +9,11 @@ set -euo pipefail
 # Use --deploy to build and deploy the service afterwards.
 
 DEPLOY=false
-AWS_PROFILE="${AWS_PROFILE:-schemabot-deployer}"
+if [ -z "${AWS_PROFILE:-}" ]; then
+    echo "❌ AWS_PROFILE is not set. Export it before running this script."
+    echo "   Example: AWS_PROFILE=my-profile ../scripts/setup-github-app.sh"
+    exit 1
+fi
 GITHUB_APP_SECRET_ID="${GITHUB_APP_SECRET_ID:-}"
 
 while [ $# -gt 0 ]; do

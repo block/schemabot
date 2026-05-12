@@ -10,7 +10,11 @@
 set -e
 
 REGION="us-west-2"
-export AWS_PROFILE="${AWS_PROFILE:-schemabot-deployer}"
+if [ -z "${AWS_PROFILE:-}" ]; then
+    echo "❌ AWS_PROFILE is not set. Export it before running this script."
+    echo "   Example: AWS_PROFILE=my-profile ../scripts/seed-large.sh"
+    exit 1
+fi
 
 TARGET_MB=${1:-100}
 ENV=${2:-staging}

@@ -2,10 +2,12 @@
 set -euo pipefail
 
 # Connect to RDS MySQL via SSM port forwarding
-# Usage: cd deploy/aws-multi-env/staging && ../scripts/shell.sh [-e staging|production|schemabot]
+# Usage: cd deploy/aws-multi-env/staging && ../scripts/shell.sh [-e staging|production|schemabot] [-c SQL]
 #
 # Options:
 #   -e, --env       Database (staging|production|schemabot), default: staging
+#   -c, --command   Execute SQL and exit (non-interactive)
+#   --reset-schema  Drop and recreate the database (prompts for confirmation)
 #
 # Prerequisites:
 #   - AWS CLI v2.12+
@@ -14,6 +16,8 @@ set -euo pipefail
 
 REGION="us-west-2"
 DATABASE="staging"
+SQL_COMMAND=""
+RESET_SCHEMA=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -27,16 +31,28 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
+        -c|--command)
+            SQL_COMMAND="$2"
+            shift 2
+            ;;
+        --reset-schema)
+            RESET_SCHEMA=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: ../scripts/shell.sh [-e staging|production|schemabot]"
+            echo "Usage: ../scripts/shell.sh [-e staging|production|schemabot] [-c SQL] [--reset-schema]"
             exit 1
             ;;
     esac
 done
 
 # Set AWS profile
-export AWS_PROFILE="${AWS_PROFILE:-schemabot-deployer}"
+if [ -z "${AWS_PROFILE:-}" ]; then
+    echo "❌ AWS_PROFILE is not set. Export it before running this script."
+    echo "   Example: AWS_PROFILE=my-profile ../scripts/shell.sh"
+    exit 1
+fi
 
 DATABASE_UPPER=$(echo "$DATABASE" | tr '[:lower:]' '[:upper:]')
 echo "🔌 RDS MySQL Shell (via SSM) - ${DATABASE_UPPER}"
@@ -196,6 +212,29 @@ done
 
 echo "   ✅ Tunnel established"
 echo ""
+# Handle --reset-schema
+if [ "$RESET_SCHEMA" = true ]; then
+    echo "⚠️  This will DROP and recreate the '$DB_NAME' database."
+    echo "   All data will be lost. EnsureSchema will rebuild tables on next server restart."
+    echo ""
+    read -r -p "   Type the database name to confirm: " CONFIRM
+    if [ "$CONFIRM" != "$DB_NAME" ]; then
+        echo "❌ Confirmation failed. Aborting."
+        exit 1
+    fi
+    echo ""
+    echo "🗑️  Dropping and recreating $DB_NAME..."
+    mysql --defaults-extra-file="$MYSQL_CNF" -h 127.0.0.1 -P "$LOCAL_PORT" -e "DROP DATABASE \`$DB_NAME\`; CREATE DATABASE \`$DB_NAME\`;"
+    echo "   ✅ Database reset. Restart the service to trigger EnsureSchema."
+    exit 0
+fi
+
+# Handle -c (non-interactive SQL command)
+if [ -n "$SQL_COMMAND" ]; then
+    mysql --defaults-extra-file="$MYSQL_CNF" -h 127.0.0.1 -P "$LOCAL_PORT" "$DB_NAME" -e "$SQL_COMMAND"
+    exit 0
+fi
+
 echo "🚀 Connecting to MySQL..."
 echo "   (Use 'exit' or Ctrl+D to disconnect)"
 echo ""
