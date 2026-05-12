@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.7
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.7
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.41.1
-	github.com/block/spirit v0.12.1-0.20260428210128-cd4aecfd2fcd
+	github.com/block/spirit v0.13.0
 	github.com/bradleyfalzon/ghinstallation/v2 v2.17.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -256,3 +256,6 @@ require (
 
 // needed for Strata and vtcombo OnlineDDL suppport
 replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260312213147-c2d162972c2d
+
+// needed for SPATIAL index support in Spirit v0.13.0
+replace github.com/pingcap/tidb/pkg/parser => github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8
