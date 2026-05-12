@@ -429,6 +429,7 @@ func (h *Handler) executeApply(
 		Options:        options,
 		Caller:         caller,
 		InstallationID: installationID,
+		Target:         schemaResult.Target,
 	}
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
