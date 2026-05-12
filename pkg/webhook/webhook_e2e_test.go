@@ -248,6 +248,7 @@ type planFlowResult struct {
 
 type checkRunCapture struct {
 	Name       string `json:"name"`
+	HeadSHA    string `json:"head_sha"`
 	Status     string `json:"status"`
 	Conclusion string `json:"conclusion"`
 }
@@ -2255,6 +2256,98 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	}
 	assert.True(t, seen["SchemaBot (staging)"], "expected SchemaBot (staging) check")
 	assert.True(t, seen["SchemaBot (production)"], "expected SchemaBot (production) check")
+}
+
+// TestE2EPassingAggregateSynchronizeUpdatesNewSHA verifies that when a non-schema PR
+// receives a synchronize event (force push / new commit), the passing aggregate check
+// is recreated on the new HEAD SHA — not left stale on the old commit.
+func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// PR info
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("sha1aaa")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	// PR changed files — no schema files
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new("README.md"), Status: new("modified")},
+		})
+	})
+
+	// Git tree — no schemabot.yaml
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/sha1aaa", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{
+			SHA: new("sha1aaa"), Entries: []*gh.TreeEntry{}, Truncated: new(false),
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/sha2bbb", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{
+			SHA: new("sha2bbb"), Entries: []*gh.TreeEntry{}, Truncated: new(false),
+		})
+	})
+
+	// Capture check runs with HEAD SHA
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	// Step 1: PR opened with sha1
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "sha1aaa",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "sha1aaa", cr.HeadSHA, "first aggregate should be on the opened SHA")
+		assert.Equal(t, "success", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for check run on opened event")
+	}
+
+	// Step 2: synchronize with sha2 (force push)
+	req = buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "synchronize",
+		headSHA: "sha2bbb",
+	}, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "sha2bbb", cr.HeadSHA, "aggregate must be recreated on the new SHA after synchronize")
+		assert.Equal(t, "success", cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out — aggregate was not recreated on new SHA after synchronize")
+	}
 }
 
 // TestE2EPassingAggregateOnSQLWithoutSchemabotYAML verifies that when a PR touches
