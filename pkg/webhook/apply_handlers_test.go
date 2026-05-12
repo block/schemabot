@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -213,8 +214,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 			assert.Contains(t, body, "Apply Blocked")
 			assert.Contains(t, body, "Commit statuses: Read")
 			assert.NotContains(t, body, "Resource not accessible", "should not expose raw GraphQL error")
-		default:
-			// Comment may be posted async
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for permission error comment")
 		}
 	})
 
@@ -254,8 +255,8 @@ func TestEnforcePassingChecks(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "Apply Blocked")
 			assert.Contains(t, body, "Unable to verify")
-		default:
-			// Comment may be posted async — the key assertion is blocked=true
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for API failure comment")
 		}
 	})
 

@@ -1216,7 +1216,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{})
 	})
 
-	// Capture check run creates on the new SHA
+	// Capture check run creates and updates on the new SHA
 	checkRuns := make(chan checkRunCapture, 10)
 	var checkRunIDCounter atomic.Int64
 	checkRunIDCounter.Store(300)
@@ -1227,6 +1227,12 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 		id := checkRunIDCounter.Add(1)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
+	})
+	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
 
 	h := newE2EHandler(t, svc, client)
@@ -1241,38 +1247,47 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	// cleanupStaleChecks runs async via goSafe — only the aggregate check run
-	// is created (per-database records are updated in storage only)
-	var aggCR checkRunCapture
-	select {
-	case aggCR = <-checkRuns:
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for aggregate check run after stale cleanup")
+	// Two async goroutines create check runs: cleanupStaleChecks (aggregate after
+	// marking per-database records as success) and postPassingAggregates (always
+	// runs for non-schema PRs). Both produce passing aggregates — drain both.
+	deadline := time.After(10 * time.Second)
+	received := 0
+	for received < 2 {
+		select {
+		case cr := <-checkRuns:
+			assert.Equal(t, aggregateCheckName, cr.Name)
+			assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+			received++
+		case <-deadline:
+			t.Fatalf("timed out waiting for aggregate check runs, got %d/2", received)
+		}
 	}
 
-	assert.Equal(t, aggregateCheckName, aggCR.Name)
-	assert.Equal(t, checkStatusCompleted, aggCR.Status)
-	assert.Equal(t, checkConclusionSuccess, aggCR.Conclusion)
-
-	// Verify storage records updated with new SHA
+	// Poll for per-database storage records to be updated by cleanupStaleChecks.
 	for _, env := range []string{"staging", "production"} {
-		check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, env, "mysql", dbName)
-		require.NoError(t, err)
-		require.NotNil(t, check)
-		assert.Equal(t, "newsha222", check.HeadSHA, "check should have new HEAD SHA")
-		assert.Equal(t, checkConclusionSuccess, check.Conclusion)
-		assert.False(t, check.HasChanges)
+		deadline := time.After(5 * time.Second)
+		for {
+			check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, env, "mysql", dbName)
+			if err == nil && check != nil && check.HeadSHA == "newsha222" {
+				assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+				assert.False(t, check.HasChanges)
+				break
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("timed out waiting for %s check to update to new SHA", env)
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
 	}
 
-	// Poll for aggregate storage update — the Upsert runs after the GitHub API call
-	// that sends the check run to the channel, so there's a brief race.
+	// Poll for aggregate storage update.
 	var storedAgg *storage.Check
-	var aggErr error
 	deadline2 := time.After(5 * time.Second)
 	for {
-		storedAgg, aggErr = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
+		storedAgg, _ = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1,
 			aggregateSentinel, aggregateSentinel, aggregateSentinel)
-		if aggErr == nil && storedAgg != nil && storedAgg.HeadSHA == "newsha222" {
+		if storedAgg != nil && storedAgg.HeadSHA == "newsha222" {
 			break
 		}
 		select {

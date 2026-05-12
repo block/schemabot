@@ -115,7 +115,9 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 		// Post passing aggregates on the current HEAD SHA so branch protection
 		// isn't blocked on PRs that don't touch schema files. Always post —
 		// on synchronize events the HEAD SHA changes, so the aggregate must be
-		// recreated on the new commit.
+		// recreated on the new commit. If stale per-database check records exist,
+		// cleanupStaleChecks (above) also updates the aggregate — both converge
+		// to the same result (passing aggregate on new SHA) so the overlap is safe.
 		h.goSafe(repo, pr, installationID, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
