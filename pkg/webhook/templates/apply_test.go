@@ -410,3 +410,70 @@ func TestTruncateDDL(t *testing.T) {
 	assert.Len(t, result, 80)
 	assert.True(t, strings.HasSuffix(result, "..."))
 }
+
+func TestRenderApplyStatusComment_WaitingForCutover_ReadyNotReady(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-abc123",
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.WaitingForCutover,
+		Tables: []TableProgressData{
+			{TableName: "users", Status: state.Task.WaitingForCutover, ReadyToComplete: true, DDL: "ALTER TABLE users ADD INDEX idx_email (email)"},
+			{TableName: "orders", Status: state.Task.WaitingForCutover, ReadyToComplete: true, DDL: "ALTER TABLE orders ADD INDEX idx_status (status)"},
+			{TableName: "items", Status: state.Task.WaitingForCutover, ReadyToComplete: false, DDL: "ALTER TABLE items ADD INDEX idx_price (price_cents)"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	// Header
+	assert.Contains(t, result, "Waiting for Cutover")
+
+	// Cutover summary shows ready/waiting counts
+	assert.Contains(t, result, "2/3")
+	assert.Contains(t, result, "waiting on 1")
+
+	// Per-table: ready tables show checkmark, non-ready show plain waiting
+	assert.Contains(t, result, "Ready for cutover")
+	assert.Contains(t, result, "Waiting for cutover")
+
+	// Footer has cutover command
+	assert.Contains(t, result, "schemabot cutover apply-abc123")
+}
+
+func TestRenderApplyStatusComment_WaitingForCutover_AllReady(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-abc123",
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.WaitingForCutover,
+		Tables: []TableProgressData{
+			{TableName: "users", Status: state.Task.WaitingForCutover, ReadyToComplete: true},
+			{TableName: "orders", Status: state.Task.WaitingForCutover, ReadyToComplete: true},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "2/2")
+	assert.NotContains(t, result, "waiting on")
+}
+
+func TestRenderApplyStatusComment_RevertWindow(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-abc123",
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.RevertWindow,
+		Tables: []TableProgressData{
+			{TableName: "users", Status: state.Task.RevertWindow},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "Pending Revert")
+	assert.Contains(t, result, "Complete (pending revert)")
+	assert.Contains(t, result, "schemabot revert apply-abc123")
+	assert.Contains(t, result, "schemabot skip-revert apply-abc123")
+}

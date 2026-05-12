@@ -9,6 +9,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -1077,4 +1078,233 @@ func TestLocalClient_Apply_AtomicHeartbeat(t *testing.T) {
 	}
 
 	assert.Equal(t, state.Apply.Completed, st, "apply should be completed")
+}
+
+// TestLocalClient_Apply_AtomicRejectsMultiNamespace verifies that atomic mode
+// (--defer-cutover) fails early when the plan has multiple namespaces, since
+// Spirit can only connect to one MySQL database per execution.
+func TestLocalClient_Apply_AtomicRejectsMultiNamespace(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      "mysql",
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	// Create a plan with two namespaces directly in storage
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   "mysql",
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"ns_one": {
+				Tables: []storage.TableChange{
+					{Namespace: "ns_one", Table: "users", DDL: "ALTER TABLE users ADD COLUMN x INT", Operation: "alter"},
+				},
+			},
+			"ns_two": {
+				Tables: []storage.TableChange{
+					{Namespace: "ns_two", Table: "orders", DDL: "ALTER TABLE orders ADD COLUMN y INT", Operation: "alter"},
+				},
+			},
+		},
+	}
+	_, err = stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	// Apply with defer_cutover (atomic mode) — should fail because of 2 namespaces
+	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      plan.PlanIdentifier,
+		Environment: "staging",
+		Options:     map[string]string{"defer_cutover": "true"},
+	})
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted)
+
+	// The apply should fail with multi-namespace error
+	require.Eventually(t, func() bool {
+		applies, err := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+		if err != nil || len(applies) == 0 {
+			return false
+		}
+		latest := applies[0]
+		return latest.State == state.Apply.Failed &&
+			strings.Contains(latest.ErrorMessage, "one namespace per apply")
+	}, 10*time.Second, 200*time.Millisecond, "apply should fail with multi-namespace error")
+}
+
+// TestLocalClient_Apply_SequentialNamespaceMatchesTask verifies that in sequential
+// mode, the namespace passed to the engine matches the task's namespace (not the
+// deployment database name). This ensures progress key matching works.
+func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+
+	// Create a table to alter
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE TABLE users (id INT PRIMARY KEY)")
+	require.NoError(t, err)
+	_ = db.Close()
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      "mysql",
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	// Load current schema
+	dbConn, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(dbConn)
+
+	tables, err := table.LoadSchemaFromDB(ctx, dbConn)
+	require.NoError(t, err)
+
+	schemaFiles := make(map[string]string)
+	for _, ts := range tables {
+		if ts.Name == "users" {
+			schemaFiles[ts.Name+".sql"] = "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))"
+		} else {
+			schemaFiles[ts.Name+".sql"] = ts.Schema
+		}
+	}
+
+	// Plan with namespace "testdb" (matches the DSN database name)
+	planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
+		Type:     "mysql",
+		Database: "testdb",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"testdb": {Files: schemaFiles},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, planResp.Changes)
+
+	// Apply in sequential mode (no defer_cutover)
+	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      planResp.PlanId,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted)
+
+	// Wait for completion
+	require.Eventually(t, func() bool {
+		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+		if len(applies) == 0 {
+			return false
+		}
+		return applies[0].State == state.Apply.Completed
+	}, 30*time.Second, 500*time.Millisecond, "apply should complete")
+
+	// Verify task has correct namespace and progress was persisted
+	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+	require.NotEmpty(t, applies)
+	tasks, err := stor.Tasks().GetByApplyID(ctx, applies[0].ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, tasks)
+
+	task := tasks[0]
+	assert.Equal(t, "testdb", task.Namespace, "task namespace should match schema directory")
+	assert.Equal(t, "users", task.TableName)
+	assert.Equal(t, state.Task.Completed, task.State)
+}
+
+// TestLocalClient_Apply_FailedAtomicHasErrorMessage verifies that when an atomic
+// apply fails, the error message propagates to the apply record. Uses a plan
+// with an invalid DDL (ALTER on nonexistent table) to trigger a Spirit failure.
+func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      "mysql",
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	// Create a plan with an ALTER on a table that doesn't exist
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   "mysql",
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{
+					{Namespace: "testdb", Table: "nonexistent_table", DDL: "ALTER TABLE `nonexistent_table` ADD COLUMN x INT", Operation: "alter"},
+				},
+			},
+		},
+	}
+	_, err = stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      plan.PlanIdentifier,
+		Environment: "staging",
+		Options:     map[string]string{"defer_cutover": "true"},
+	})
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted, "apply should be accepted: %s", applyResp.ErrorMessage)
+
+	// Wait for failure
+	require.Eventually(t, func() bool {
+		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+		if len(applies) == 0 {
+			return false
+		}
+		return applies[0].State == state.Apply.Failed
+	}, 30*time.Second, 500*time.Millisecond, "apply should fail")
+
+	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+	require.NotEmpty(t, applies)
+	assert.NotEmpty(t, applies[0].ErrorMessage, "apply.ErrorMessage should contain the failure reason")
+	t.Logf("apply error: %s", applies[0].ErrorMessage)
+
+	// Verify task also has error
+	tasks, err := stor.Tasks().GetByApplyID(ctx, applies[0].ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, tasks)
+	assert.NotEmpty(t, tasks[0].ErrorMessage, "task.ErrorMessage should contain the failure reason")
 }

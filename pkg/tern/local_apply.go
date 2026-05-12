@@ -253,10 +253,18 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 
 	// Build per-namespace changes from the plan. For Vitess databases, each
 	// namespace is a keyspace (e.g., "testapp", "testapp_sharded"). For MySQL,
-	// there's typically one namespace ("default" or the database name).
 	c.logger.Info("building changes from plan", "namespaces", len(plan.Namespaces), "plan_id", plan.PlanIdentifier)
 	if len(plan.Namespaces) == 0 {
 		c.failApplyWithTasks(ctx, apply, tasks, "plan has no namespace data")
+		return
+	}
+	if c.config.Type == storage.DatabaseTypeMySQL && len(plan.Namespaces) > 1 {
+		var names []string
+		for ns := range plan.Namespaces {
+			names = append(names, ns)
+		}
+		c.failApplyWithTasks(ctx, apply, tasks,
+			fmt.Sprintf("MySQL applies support one namespace per apply, but plan has %d: %v", len(plan.Namespaces), names))
 		return
 	}
 	changes := planNamespacesToChanges(plan.Namespaces)
@@ -508,7 +516,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, task *storage.Task, pla
 	result, err := c.getEngine().Apply(ctx, &engine.ApplyRequest{
 		Database: task.Database,
 		Changes: []engine.SchemaChange{{
-			Namespace:    task.Database,
+			Namespace:    task.Namespace,
 			TableChanges: []engine.TableChange{{Table: task.TableName, DDL: task.DDL}},
 		}},
 		Options:     options,
@@ -769,11 +777,30 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	if result.State.IsTerminal() {
 		apply.CompletedAt = &now
+		// Propagate error message from failed tasks to the apply record
+		if result.State == engine.StateFailed {
+			if result.ErrorMessage != "" {
+				apply.ErrorMessage = result.ErrorMessage
+			} else {
+				for _, task := range tasks {
+					if task.State == state.Task.Failed && task.ErrorMessage != "" {
+						apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", task.TableName, task.ErrorMessage)
+						break
+					}
+				}
+			}
+		}
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
 		}
 		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
-		c.logger.Info("atomic apply completed", "apply_id", apply.ApplyIdentifier, "state", result.State, "task_count", len(tasks))
+		if result.State == engine.StateFailed {
+			c.logger.Error("atomic apply failed",
+				"apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
+		} else {
+			c.logger.Info("atomic apply completed",
+				"apply_id", apply.ApplyIdentifier, "state", result.State, "task_count", len(tasks))
+		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Apply completed with state: %s", result.State), ps.lastTaskState, apply.State)
 		return true
@@ -893,6 +920,16 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 		if result.State.IsTerminal() && task.CompletedAt == nil {
 			task.CompletedAt = &now
 		}
+		if result.State == engine.StateFailed && task.ErrorMessage == "" {
+			if result.ErrorMessage != "" {
+				task.ErrorMessage = result.ErrorMessage
+			} else if result.Message != "" {
+				task.ErrorMessage = result.Message
+			}
+		}
+		if result.State == engine.StateCompleted {
+			task.ProgressPercent = 100
+		}
 		c.transitionTaskState(ctx, task, 0, newState, "")
 	}
 }
@@ -980,6 +1017,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Ta
 
 			if result.State.IsTerminal() {
 				task.CompletedAt = &now
+				if result.State == engine.StateCompleted {
+					task.ProgressPercent = 100
+				}
 				if result.State == engine.StateFailed {
 					if result.ErrorMessage != "" {
 						task.ErrorMessage = result.ErrorMessage

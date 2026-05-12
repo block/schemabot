@@ -67,7 +67,8 @@ type Engine struct {
 
 // runningMigration tracks the state of an in-progress schema change.
 type runningMigration struct {
-	database          string
+	database          string            // MySQL database name parsed from DSN
+	tableNamespace    map[string]string // table name → namespace (from ApplyRequest.Changes)
 	tables            []string
 	ddls              []string // DDL statement for each table
 	combinedStatement string   // Original combined statement passed to Spirit (for checkpoint-safe restart)
@@ -366,15 +367,27 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 
 	// Initialize running state and start background execution.
 	e.mu.Lock()
+	// Build a table→namespace lookup from the apply request. Each SchemaChange
+	// carries a namespace and a list of table changes. Spirit flattens all DDLs
+	// into one execution, so we need to map each table back to its namespace
+	// for progress key matching.
+	tableNamespace := make(map[string]string)
+	for _, sc := range req.Changes {
+		for _, tc := range sc.TableChanges {
+			tableNamespace[tc.Table] = sc.Namespace
+		}
+	}
+
 	rm := &runningMigration{
-		database:     database,
-		tables:       nil, // Tables will be populated by executeMigration
-		state:        engine.StateRunning,
-		started:      time.Now(),
-		deferCutover: deferCutover,
-		host:         host,
-		username:     username,
-		password:     password,
+		database:       database,
+		tableNamespace: tableNamespace,
+		tables:         nil, // Tables will be populated by executeMigration
+		state:          engine.StateRunning,
+		started:        time.Now(),
+		deferCutover:   deferCutover,
+		host:           host,
+		username:       username,
+		password:       password,
 	}
 	e.runningMigration = rm
 	e.mu.Unlock()
@@ -444,6 +457,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	if len(spiritProgress.Tables) > 0 {
 		for _, st := range spiritProgress.Tables {
 			tp := engine.TableProgress{
+				Namespace:  rm.tableNamespace[st.TableName],
 				Table:      st.TableName,
 				DDL:        ddlByTable[st.TableName],
 				State:      stateStr,
@@ -480,9 +494,10 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 				ddl = rm.ddls[i]
 			}
 			tp := engine.TableProgress{
-				Table: tableName,
-				DDL:   ddl,
-				State: stateStr,
+				Namespace: rm.tableNamespace[tableName],
+				Table:     tableName,
+				DDL:       ddl,
+				State:     stateStr,
 			}
 			// Only show progress detail on first table
 			if i == 0 {

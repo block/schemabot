@@ -675,6 +675,38 @@ func TestEngine_Progress_WithRunners(t *testing.T) {
 	assert.Equal(t, engine.StateRunning, result.State)
 }
 
+func TestEngine_Progress_NamespaceFromApplyChanges(t *testing.T) {
+	// Verify that TableProgress.Namespace is set from ApplyRequest.Changes,
+	// not left empty. Without this, the progress key lookup in
+	// syncAtomicTaskProgress fails silently (task has namespace="orders",
+	// engine returns namespace=""), and row progress is never persisted.
+	eng := New(Config{})
+	eng.runningMigration = &runningMigration{
+		database:       "orders",
+		tableNamespace: map[string]string{"orders": "orders", "users": "myapp"},
+		tables:         []string{"orders", "users"},
+		ddls:           []string{"ALTER TABLE orders ADD INDEX idx_status (status)", "ALTER TABLE users ADD COLUMN x INT"},
+		state:          engine.StateRunning,
+		runners:        nil, // No actual runners — testing the fallback path
+	}
+
+	result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+	require.NoError(t, err)
+	require.Len(t, result.Tables, 2)
+
+	// Each table should have the correct namespace from tableNamespace map
+	for _, tp := range result.Tables {
+		switch tp.Table {
+		case "orders":
+			assert.Equal(t, "orders", tp.Namespace, "orders table should have namespace 'orders'")
+		case "users":
+			assert.Equal(t, "myapp", tp.Namespace, "users table should have namespace 'myapp'")
+		default:
+			t.Fatalf("unexpected table: %s", tp.Table)
+		}
+	}
+}
+
 func TestEngine_FetchCurrentSchema_EmptyDatabase(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db) // Start with clean database
