@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -148,6 +149,36 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 	h.logger.Info("check record updated after apply",
 		"repo", repo, "pr", pr, "database", apply.Database,
 		"environment", apply.Environment, "conclusion", conclusion)
+}
+
+// setCheckActionRequired sets the check for a database/environment back to action_required.
+// Used after a rollback completes — the PR's schema changes need to be re-applied.
+func (h *Handler) setCheckActionRequired(repo string, pr int, environment, dbType, database string, installationID int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, dbType, database)
+	if err != nil || check == nil {
+		h.logger.Warn("no check record to update after rollback",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		return
+	}
+
+	check.Status = checkStatusCompleted
+	check.Conclusion = checkConclusionActionRequired
+	check.HasChanges = true
+	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
+		h.logger.Error("failed to set check to action_required after rollback", "error", err)
+		return
+	}
+
+	h.logger.Info("check set to action_required after rollback",
+		"repo", repo, "pr", pr, "database", database, "environment", environment)
+
+	// Update the aggregate check to reflect the rollback
+	if aggClient, err := h.ghClient.ForInstallation(installationID); err == nil {
+		h.updateAggregateCheck(ctx, aggClient, repo, pr, check.HeadSHA)
+	}
 }
 
 // checkPriorEnvironments enforces environment ordering: all environments before

@@ -1779,6 +1779,179 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	}
 }
 
+// TestE2ERollbackConfirmUpdatesCheckToActionRequired verifies that after a
+// rollback-confirm completes, the check run transitions to action_required
+// (not success) since the PR's schema changes have been undone.
+func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
+	dbName := "webhook_rb_check"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Step 1: Create initial table
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	cfg.DBName = dbName
+	cfg.MultiStatements = true
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	_ = db.Close()
+
+	// Step 2: Plan + apply adding an index
+	schemaWithIndex := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
+		Database:    dbName,
+		Environment: "staging",
+		Type:        "mysql",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			dbName: {Files: map[string]string{"users.sql": schemaWithIndex}},
+		},
+	})
+	require.NoError(t, err)
+
+	applyResp, applyID, err := svc.ExecuteApply(ctx, api.ApplyRequest{
+		PlanID:      planResp.PlanID,
+		Environment: "staging",
+		Options:     map[string]string{"allow_unsafe": "true"},
+	})
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted)
+
+	require.Eventually(t, func() bool {
+		a, err := svc.Storage().Applies().Get(ctx, applyID)
+		return err == nil && a != nil && a.State == "completed"
+	}, 30*time.Second, 500*time.Millisecond, "initial apply should complete")
+
+	// Step 3: Seed a check record (simulates what plan/apply creates)
+	err = svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		HasChanges:   false,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionSuccess,
+	})
+	require.NoError(t, err)
+
+	// Step 4: Set up fake GitHub and run rollback + rollback-confirm
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": schemaWithIndex,
+	}, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+
+	storedApply, err := svc.Storage().Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+
+	// Run rollback
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: fmt.Sprintf("schemabot rollback %s", storedApply.ApplyIdentifier),
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case <-result.comments:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for rollback plan comment")
+	}
+
+	// Run rollback-confirm
+	req = buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot rollback-confirm -e staging",
+		isPR:    true,
+	}, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// Wait for the rollback apply to complete and check to be updated
+	require.Eventually(t, func() bool {
+		check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+		return err == nil && check != nil && check.Conclusion == checkConclusionActionRequired
+	}, 30*time.Second, 500*time.Millisecond,
+		"check should transition to action_required after rollback")
+}
+
+// TestE2ERollbackIgnoredByNonOwningInstance verifies that in a multi-instance
+// setup, an instance that doesn't own the apply's environment silently ignores
+// the rollback command instead of posting "Apply Not Found".
+func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
+	dbName := "webhook_rb_multienv"
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"production"})
+	ctx := t.Context()
+
+	// Seed a completed apply for staging (owned by the other instance)
+	_, err := svc.Storage().Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-aabbccdd0011",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           "completed",
+		Engine:          "spirit",
+	})
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	// Send rollback command for the staging apply to the production instance
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot rollback apply-aabbccdd0011",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The production instance should NOT post any comment (it silently ignores
+	// the staging rollback). Wait long enough for any async handler to fire.
+	select {
+	case body := <-comments:
+		t.Fatalf("production instance should not post a comment for staging rollback, got: %s", body)
+	case <-time.After(2 * time.Second):
+		// Expected: no comment posted
+	}
+}
+
 // TestE2EPRCloseCleanup verifies that closing a PR releases locks and deletes checks.
 func TestE2EPRCloseCleanup(t *testing.T) {
 	dbName := "webhook_pr_close"
