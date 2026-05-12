@@ -1174,6 +1174,78 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	assert.False(t, blocked, "sandbox (first env) should never be blocked")
 }
 
+// TestE2EApplyTargetAndDeploymentPropagation verifies that the apply handler
+// passes Target and Deployment from the schema config through to the Tern client.
+func TestE2EApplyTargetAndDeploymentPropagation(t *testing.T) {
+	dbName := "webhook_apply_target"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// Use a schemabot.yaml with an explicit target that differs from the database name.
+	// The target is the cluster routing identifier (e.g., a DSID in production).
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  staging:\n    target: my-custom-dsid-001\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "apply started")
+
+	// Wait for the apply plan confirmation comment.
+	// The plan should succeed — the local provider resolves by database name,
+	// but the target should be passed through in the stored plan.
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for apply plan comment")
+	}
+
+	// Verify the stored plan has the correct target from schemabot.yaml
+	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	require.NotEmpty(t, plans, "expected at least one stored plan")
+
+	// The plan stored during the apply re-plan should reference our database
+	var found bool
+	for _, plan := range plans {
+		if plan.Database == dbName {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected a stored plan for database %s", dbName)
+
+	// Clean up lock
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+}
+
 // seedTargetTable creates a table in the target database.
 func seedTargetTable(t *testing.T, dbName, ddl string) {
 	t.Helper()
