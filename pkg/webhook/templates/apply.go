@@ -429,7 +429,7 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
 	case state.Apply.RevertWindow:
 		writeFooterAction(sb, "To revert:", fmt.Sprintf("schemabot revert %s", data.ApplyID))
-		sb.WriteString(fmt.Sprintf("\nTo skip revert and keep changes:\n```\nschemabot skip-revert %s\n```\n", data.ApplyID))
+		fmt.Fprintf(sb, "\nTo skip revert and keep changes:\n```\nschemabot skip-revert %s\n```\n", data.ApplyID)
 	}
 }
 
