@@ -1501,7 +1501,7 @@ func applyEmbeddedSchema(db *sql.DB, schemaFS embed.FS) error {
 
 // TestE2ERollbackPlanViaWebhook tests the full rollback flow:
 // 1. Plan + apply a schema change via the service (simulating a prior apply)
-// 2. Run "schemabot rollback -e staging" via webhook
+// 2. Run "schemabot rollback <apply-id> -e staging" via webhook
 // 3. Verify the rollback plan comment is posted with reverse DDL
 func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 	dbName := "webhook_rollback"
@@ -1576,7 +1576,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 
 	// Step 4: Send rollback command with the apply ID
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: fmt.Sprintf("schemabot rollback %s", storedApply.ApplyIdentifier),
+		comment: fmt.Sprintf("schemabot rollback %s -e staging", storedApply.ApplyIdentifier),
 		isPR:    true,
 	}, nil)
 
@@ -1612,7 +1612,7 @@ func TestE2ERollbackApplyNotFound(t *testing.T) {
 	h.service = svc
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot rollback apply_deadbeef0000",
+		comment: "schemabot rollback apply_deadbeef0000 -e staging",
 		isPR:    true,
 	}, nil)
 
@@ -1665,7 +1665,7 @@ func TestE2ERollbackConfirmNoLock(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "No Lock Found")
-		assert.Contains(t, body, "schemabot rollback -e staging")
+		assert.Contains(t, body, "schemabot rollback <apply-id> -e staging")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for no-lock comment")
 	}
@@ -1736,7 +1736,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	require.NoError(t, err)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: fmt.Sprintf("schemabot rollback %s", storedApply.ApplyIdentifier),
+		comment: fmt.Sprintf("schemabot rollback %s -e staging", storedApply.ApplyIdentifier),
 		isPR:    true,
 	}, nil)
 	rr := httptest.NewRecorder()
@@ -1858,7 +1858,7 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 
 	// Run rollback
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: fmt.Sprintf("schemabot rollback %s", storedApply.ApplyIdentifier),
+		comment: fmt.Sprintf("schemabot rollback %s -e staging", storedApply.ApplyIdentifier),
 		isPR:    true,
 	}, nil)
 	rr := httptest.NewRecorder()
@@ -1935,7 +1935,7 @@ func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 
 	// Send rollback command for the staging apply to the production instance
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot rollback apply-aabbccdd0011",
+		comment: "schemabot rollback apply-aabbccdd0011 -e staging",
 		isPR:    true,
 	}, nil)
 	rr := httptest.NewRecorder()

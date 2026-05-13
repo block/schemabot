@@ -198,6 +198,16 @@ func TestParseCommand(t *testing.T) {
 		},
 		{
 			name: "rollback without apply ID",
+			body: "schemabot rollback -e staging",
+			expected: CommandResult{
+				Action:      "rollback",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "rollback without apply ID or env",
 			body: "schemabot rollback",
 			expected: CommandResult{
 				Action:     "rollback",

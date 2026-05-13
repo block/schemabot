@@ -75,6 +75,6 @@ func RenderRollbackNoCompletedApply(database, environment string) string {
 func RenderRollbackConfirmNoLock(database, environment string) string {
 	return fmt.Sprintf("## 🔒 No Lock Found\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+
-		"No rollback lock is held. Run `schemabot rollback -e %s` first to generate a rollback plan.",
+		"No rollback lock is held. Run `schemabot rollback <apply-id> -e %s` first to generate a rollback plan.",
 		database, environment, environment)
 }

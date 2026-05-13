@@ -104,5 +104,5 @@ func TestRenderRollbackConfirmNoLock(t *testing.T) {
 	assert.Contains(t, rendered, "## 🔒 No Lock Found")
 	assert.Contains(t, rendered, "`testapp`")
 	assert.Contains(t, rendered, "`staging`")
-	assert.Contains(t, rendered, "schemabot rollback -e staging")
+	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e staging")
 }

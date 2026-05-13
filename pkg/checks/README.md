@@ -210,7 +210,7 @@ No staging check is created. Production apply is allowed directly.
 
 ### Rollback (emergency)
 
-`schemabot rollback <apply-id>` is NOT gated by staging-first. Rollbacks are emergency operations that need to execute immediately regardless of staging state.
+`schemabot rollback <apply-id> -e <environment>` is NOT gated by staging-first. Rollbacks are emergency operations that need to execute immediately regardless of staging state.
 
 ### Staging in progress
 

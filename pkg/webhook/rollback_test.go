@@ -67,7 +67,7 @@ func TestWebhookRollbackMissingApplyID(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot rollback",
+		comment: "schemabot rollback -e staging",
 		isPR:    true,
 	}, nil)
 
@@ -78,7 +78,8 @@ func TestWebhookRollbackMissingApplyID(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		assert.Contains(t, body, "Missing Environment")
+		assert.Contains(t, body, "Missing Apply ID")
+		assert.Contains(t, body, "schemabot rollback <apply-id> -e <environment>")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for comment")
 	}

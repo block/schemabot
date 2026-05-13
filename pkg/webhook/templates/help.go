@@ -12,8 +12,8 @@ func commandReference() string {
 | ` + "`schemabot stop <apply-id>`" + ` | Stop an in-progress deployment |
 | ` + "`schemabot start <apply-id>`" + ` | Resume a stopped deployment |
 | ` + "`schemabot cutover <apply-id>`" + ` | Complete a deferred cutover |
-| ` + "`schemabot rollback <apply-id>`" + ` | Generate a rollback plan |
-| ` + "`schemabot rollback-confirm <apply-id>`" + ` | Execute a rollback |
+| ` + "`schemabot rollback <apply-id> -e <env>`" + ` | Generate a rollback plan |
+| ` + "`schemabot rollback-confirm -e <env>`" + ` | Execute a rollback |
 
 **Options**: ` + "`-e <env>`" + ` environment, ` + "`-d <db>`" + ` database, ` + "`--defer-cutover`" + `, ` + "`--allow-unsafe`" + `, ` + "`--skip-revert`" + ` (Vitess)
 

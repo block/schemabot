@@ -154,7 +154,7 @@ schemabot <command> [-e <environment>] [-d <database>] [--enable-revert] [--defe
 | `cutover` | Yes | Complete deferred cutover |
 | `revert` | Yes | Revert (within revert window) |
 | `skip-revert` | Yes | Make changes permanent |
-| `rollback` | No (runs all envs) | Generate rollback plan |
+| `rollback` | Yes | Generate rollback plan |
 | `rollback-confirm` | Yes | Execute rollback |
 | `fix-lint` | No | Auto-fix lint warnings |
 | `help` | No | Show command reference |

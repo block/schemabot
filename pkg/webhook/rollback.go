@@ -13,7 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// handleRollbackCommand handles the "schemabot rollback <apply-id>" PR comment command.
+// handleRollbackCommand handles the "schemabot rollback <apply-id> -e <env>" PR comment command.
 // It looks up the specified apply, generates a rollback plan from its original schema,
 // acquires a lock, and posts the plan for confirmation.
 func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
@@ -24,7 +24,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	if applyID == "" {
 		h.postComment(repo, pr, installationID,
 			"## Missing Apply ID\n\n"+
-				"Usage: `schemabot rollback <apply-id>`\n\n"+
+				"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n"+
 				"You can find the apply ID in the summary comment of a completed apply, "+
 				"or by running `schemabot status`.")
 		return
