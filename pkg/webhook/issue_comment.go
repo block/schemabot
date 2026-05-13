@@ -122,6 +122,14 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 			return
 		}
 		if result.Action == action.Rollback {
+			if result.ApplyID == "" {
+				h.postComment(repo, pr, installationID,
+					"## Missing Arguments\n\n"+
+						"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n"+
+						"Rollback requires both an apply ID and the `-e` flag so the correct SchemaBot instance handles it.")
+				h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing rollback arguments"})
+				return
+			}
 			h.postComment(repo, pr, installationID,
 				"## Missing Environment\n\n"+
 					"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n"+

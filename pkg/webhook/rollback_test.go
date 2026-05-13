@@ -85,6 +85,29 @@ func TestWebhookRollbackMissingApplyID(t *testing.T) {
 	}
 }
 
+func TestWebhookRollbackMissingApplyIDAndEnv(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot rollback",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "missing rollback arguments")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Missing Arguments")
+		assert.Contains(t, body, "schemabot rollback <apply-id> -e <environment>")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for comment")
+	}
+}
+
 func TestWebhookApplyDispatch(t *testing.T) {
 	h, _, _ := newTestHandler(t)
 

@@ -81,7 +81,7 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 		}
 		envMatches := p.environmentRegex.FindStringSubmatch(body)
 		if len(envMatches) >= 2 {
-			result.Environment = envMatches[1]
+			result.Environment = strings.ToLower(envMatches[1])
 		}
 		if result.Environment != "" {
 			result.Found = true
