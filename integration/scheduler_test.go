@@ -665,8 +665,69 @@ func TestScheduler_FailureCancelsRemainingTasks(t *testing.T) {
 	t.Fatal("timeout: apply did not reach permanent failed state")
 }
 
-// TestScheduler_DatabaseExclusion verifies that the lock mechanism prevents
-// two applies from running on the same database simultaneously.
+// TestScheduler_ClaimOrdering verifies that FindNextApply returns applies in
+// created_at order across different databases.
+func TestScheduler_ClaimOrdering(t *testing.T) {
+	ctx := t.Context()
+
+	db1Name, _ := createTestDB(t, "ord1_")
+	db2Name, _ := createTestDB(t, "ord2_")
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err)
+	clearStorageDB(t, schemabotDB)
+	stor := mysqlstore.New(schemabotDB)
+	defer func() { _ = schemabotDB.Close() }()
+
+	now := time.Now()
+
+	// Older stale running apply on db1
+	olderApply := &storage.Apply{
+		ApplyIdentifier: "apply-order-older",
+		Database:        db1Name,
+		DatabaseType:    "mysql",
+		Engine:          "spirit",
+		State:           state.Apply.Running,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now.Add(-2 * time.Minute),
+		UpdatedAt:       now.Add(-2 * time.Minute),
+	}
+	olderID, err := stor.Applies().Create(ctx, olderApply)
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", olderID)
+	require.NoError(t, err)
+
+	// Newer failed_retryable apply on db2
+	newerApply := &storage.Apply{
+		ApplyIdentifier: "apply-order-newer",
+		Database:        db2Name,
+		DatabaseType:    "mysql",
+		Engine:          "spirit",
+		State:           state.Apply.FailedRetryable,
+		ErrorMessage:    "transient",
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	_, err = stor.Applies().Create(ctx, newerApply)
+	require.NoError(t, err)
+
+	// First claim: older stale running apply (created_at order)
+	claimed, err := stor.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, "apply-order-older", claimed.ApplyIdentifier)
+
+	// Second claim: newer retryable apply (different database, no exclusion)
+	claimed2, err := stor.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed2)
+	assert.Equal(t, "apply-order-newer", claimed2.ApplyIdentifier)
+}
+
+// TestScheduler_DatabaseExclusion verifies that FindNextApply skips applies
+// when another active apply with a fresh heartbeat exists on the same database.
 func TestScheduler_DatabaseExclusion(t *testing.T) {
 	ctx := t.Context()
 
@@ -677,25 +738,24 @@ func TestScheduler_DatabaseExclusion(t *testing.T) {
 	stor := mysqlstore.New(schemabotDB)
 	defer func() { _ = schemabotDB.Close() }()
 
-	// Seed two applies for the same database — one running (stale), one failed_retryable
 	now := time.Now()
-	runningApply := &storage.Apply{
-		ApplyIdentifier: "apply-excl-running",
+
+	// Active running apply with fresh heartbeat
+	activeApply := &storage.Apply{
+		ApplyIdentifier: "apply-excl-active",
 		Database:        appDBName,
 		DatabaseType:    "mysql",
 		Engine:          "spirit",
 		State:           state.Apply.Running,
 		Options:         []byte("{}"),
 		Environment:     "staging",
-		CreatedAt:       now.Add(-2 * time.Minute),
-		UpdatedAt:       now.Add(-2 * time.Minute), // stale
+		CreatedAt:       now,
+		UpdatedAt:       now, // fresh heartbeat
 	}
-	runningID, err := stor.Applies().Create(ctx, runningApply)
-	require.NoError(t, err)
-	// Make heartbeat stale
-	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", runningID)
+	_, err = stor.Applies().Create(ctx, activeApply)
 	require.NoError(t, err)
 
+	// Retryable apply on the same database
 	retryableApply := &storage.Apply{
 		ApplyIdentifier: "apply-excl-retryable",
 		Database:        appDBName,
@@ -705,34 +765,18 @@ func TestScheduler_DatabaseExclusion(t *testing.T) {
 		ErrorMessage:    "transient",
 		Options:         []byte("{}"),
 		Environment:     "staging",
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		CreatedAt:       now.Add(-time.Minute),
+		UpdatedAt:       now.Add(-time.Minute),
 	}
 	_, err = stor.Applies().Create(ctx, retryableApply)
 	require.NoError(t, err)
 
-	// FindNextApply should return the stale running one first (oldest by created_at)
+	// FindNextApply should return nil — the retryable apply is blocked by the
+	// active apply on the same database, and the active apply has a fresh
+	// heartbeat so it's not claimable.
 	claimed, err := stor.Applies().FindNextApply(ctx)
 	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	assert.Equal(t, "apply-excl-running", claimed.ApplyIdentifier)
-
-	// After claiming, the running apply's updated_at is refreshed (no longer stale).
-	// Second claim should return the retryable one (still eligible).
-	claimed2, err := stor.Applies().FindNextApply(ctx)
-	require.NoError(t, err)
-	require.NotNil(t, claimed2)
-	assert.Equal(t, "apply-excl-retryable", claimed2.ApplyIdentifier)
-
-	// The running apply is no longer stale (updated_at refreshed by first claim).
-	// The retryable apply still matches (attempt < max). Verify the running one
-	// is NOT re-claimed (its heartbeat is fresh).
-	claimed3, err := stor.Applies().FindNextApply(ctx)
-	require.NoError(t, err)
-	if claimed3 != nil {
-		// Only the retryable can be re-claimed (still failed_retryable with attempt < max)
-		assert.Equal(t, "apply-excl-retryable", claimed3.ApplyIdentifier)
-	}
+	assert.Nil(t, claimed, "retryable apply should be excluded while another apply is active on the same database")
 }
 
 // TestScheduler_PlanetScaleBranchStates verifies that PlanetScale branch setup
