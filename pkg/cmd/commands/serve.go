@@ -33,7 +33,7 @@ type ServeCmd struct{}
 func (cmd *ServeCmd) Run(g *Globals) error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: logLevel(),
-	})).With("version", g.Version)
+	})).With("schemabot_version", g.Version)
 	slog.SetDefault(logger)
 
 	// Load server configuration from YAML file
