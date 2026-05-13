@@ -14,6 +14,7 @@ type CommandParser struct {
 	helpRegex              *regexp.Regexp
 	commandWithoutEnvRegex *regexp.Regexp
 	rollbackRegex          *regexp.Regexp // rollback <apply-id>
+	environmentRegex       *regexp.Regexp // -e <env>
 	databaseRegex          *regexp.Regexp
 	skipRevertRegex        *regexp.Regexp
 	deferCutoverRegex      *regexp.Regexp
@@ -29,6 +30,7 @@ func NewCommandParser() *CommandParser {
 		helpRegex:              regexp.MustCompile(`(?i)schemabot\s+help\b`),
 		commandWithoutEnvRegex: regexp.MustCompile(`(?i)schemabot\s+(plan|apply|apply-confirm|unlock|stop|revert|skip-revert|cutover|rollback|rollback-confirm|fix-lint)\b`),
 		rollbackRegex:          regexp.MustCompile(`(?i)schemabot\s+rollback\s+(apply[_-][a-f0-9]+)`),
+		environmentRegex:       regexp.MustCompile(`(?i)-e\s+(staging|production)`),
 		databaseRegex:          regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
 		skipRevertRegex:        regexp.MustCompile(`(?i)--skip-revert\b`),
 		deferCutoverRegex:      regexp.MustCompile(`(?i)--defer-cutover\b`),
@@ -60,19 +62,26 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 		return CommandResult{Action: action.Help, IsHelp: true, IsMention: true}
 	}
 
-	// Check rollback <apply-id> (positional arg, no -e flag)
+	// Check rollback <apply-id> -e <env>
 	rollbackMatches := p.rollbackRegex.FindStringSubmatch(body)
 	if len(rollbackMatches) >= 2 {
 		result := CommandResult{
 			Action:       action.Rollback,
 			ApplyID:      rollbackMatches[1],
-			Found:        true,
 			IsMention:    true,
 			DeferCutover: p.deferCutoverRegex.MatchString(body),
 		}
 		dbMatches := p.databaseRegex.FindStringSubmatch(body)
 		if len(dbMatches) >= 2 {
 			result.Database = dbMatches[1]
+		}
+		// Require -e flag so the environment filter routes to the correct instance
+		envMatches := p.environmentRegex.FindStringSubmatch(body)
+		if len(envMatches) >= 2 {
+			result.Environment = envMatches[1]
+			result.Found = true
+		} else {
+			result.MissingEnv = true
 		}
 		return result
 	}

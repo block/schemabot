@@ -122,9 +122,11 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 			return
 		}
 		if result.Action == action.Rollback {
-			// Rollback without apply ID — handler will post usage message
-			go h.handleRollbackCommand(repo, pr, installationID, requestedBy, result)
-			h.writeJSON(w, http.StatusOK, map[string]string{"message": "rollback started"})
+			h.postComment(repo, pr, installationID,
+				"## Missing Environment\n\n"+
+					"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n"+
+					"The `-e` flag is required so the correct SchemaBot instance handles the rollback.")
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
 			return
 		}
 		h.postComment(repo, pr, installationID, templates.RenderMissingEnv(result.Action))
