@@ -386,9 +386,9 @@ func renderStoppedTable(sb *strings.Builder, table TableProgressData) {
 // writeDDLLine writes the DDL statement as a sql code block below the table name.
 // A blank line before the code fence is required for GitHub to render it as a
 // proper code block inside a list item (GFM spec).
-func writeDDLLine(sb *strings.Builder, ddl string) {
-	if ddl != "" {
-		fmt.Fprintf(sb, "\n  ```sql\n  %s\n  ```\n", ddl)
+func writeDDLLine(sb *strings.Builder, rawDDL string) {
+	if rawDDL != "" {
+		fmt.Fprintf(sb, "\n  ```sql\n  %s\n  ```\n", ddl.FormatDDL(rawDDL))
 	}
 }
 
