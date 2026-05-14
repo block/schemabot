@@ -1312,7 +1312,9 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	}
 	applyID, err := svc.Storage().Applies().Create(ctx, apply)
 	require.NoError(t, err)
-	apply.ID = applyID
+	apply, err = svc.Storage().Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
 
 	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
 		Repository:   "octocat/hello-world",
@@ -1373,6 +1375,12 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
 	})
+	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+	})
 
 	h := newE2EHandler(t, svc, client)
 
@@ -1388,10 +1396,10 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	case cr := <-checkRuns:
 		assert.Equal(t, aggregateCheckName, cr.Name)
 		assert.Equal(t, "newsha222", cr.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+		assert.Equal(t, checkStatusInProgress, cr.Status)
+		assert.Empty(t, cr.Conclusion)
 	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for blocking aggregate check run")
+		t.Fatal("timed out waiting for in-progress aggregate check run")
 	}
 
 	installClient := ghclient.NewInstallationClient(client, h.logger)
@@ -1408,20 +1416,31 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, check)
 	assert.Equal(t, "newsha222", check.HeadSHA)
-	assert.Equal(t, checkStatusCompleted, check.Status)
-	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+	assert.Equal(t, checkStatusInProgress, check.Status)
+	assert.Empty(t, check.Conclusion)
 	assert.True(t, check.HasChanges)
 	assert.Equal(t, applyID, check.ApplyID)
 
 	apply.State = state.Apply.Completed
 	updated, err := h.updateCheckRecordForApplyResult(ctx, "octocat/hello-world", 1, apply)
 	require.NoError(t, err)
-	assert.False(t, updated, "old apply completion must not mark the reverted PR head successful")
+	assert.True(t, updated, "old apply completion should finish the owning row without marking it successful")
 
 	check, err = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
 	require.NoError(t, err)
 	require.NotNil(t, check)
+	assert.Equal(t, checkStatusCompleted, check.Status)
 	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+
+	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "newsha222")
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for terminal blocking aggregate check run")
+	}
 }
 
 // TestE2EPlanUsesRepoDeployment verifies that the webhook plan handler routes

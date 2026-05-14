@@ -220,10 +220,14 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 
 		if checkRepresentsStartedApply(check) {
 			check.HeadSHA = headSHA
-			check.Conclusion = checkConclusionActionRequired
 			check.HasChanges = true
-			check.Status = checkStatusCompleted
-			check.ErrorMessage = "Schema changes were removed from the PR after an apply started; operator action is required before this check can pass."
+			check.ErrorMessage = checkErrorSchemaRemovedAfterApplyStarted
+			if check.Status == checkStatusInProgress {
+				check.Conclusion = ""
+			} else {
+				check.Status = checkStatusCompleted
+				check.Conclusion = checkConclusionActionRequired
+			}
 			if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
 				metrics.RecordStatusCheckOperation(ctx, "stale_cleanup", check.DatabaseName, check.Environment, "error")
 				h.logger.Error("failed to block stale check with started apply", "checkID", check.ID, "error", err)

@@ -44,6 +44,8 @@ const aggregateCheckName = "SchemaBot"
 // aggregate (no allowed_environments) uses aggregateSentinel.
 const aggregateSentinel = "_aggregate"
 
+const checkErrorSchemaRemovedAfterApplyStarted = "Schema changes were removed from the PR after an apply started; operator action is required before this check can pass."
+
 // aggregateCheckNameForEnv returns the environment-scoped aggregate check name.
 // e.g., "SchemaBot (staging)" or "SchemaBot (production)".
 func aggregateCheckNameForEnv(env string) string {
@@ -76,6 +78,10 @@ func isAggregateCheck(c *storage.Check) bool {
 
 func checkRepresentsStartedApply(c *storage.Check) bool {
 	return c.Status == checkStatusInProgress || c.ApplyID != 0
+}
+
+func checkRequiresActionAfterSchemaRemoved(c *storage.Check) bool {
+	return c.ErrorMessage == checkErrorSchemaRemovedAfterApplyStarted
 }
 
 func checkBlocksPassingAggregate(c *storage.Check) bool {
@@ -267,10 +273,12 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 	}
 
 	var conclusion string
-	switch apply.State {
-	case state.Apply.Completed:
+	switch {
+	case state.IsState(apply.State, state.Apply.Completed) && checkRequiresActionAfterSchemaRemoved(check):
+		conclusion = checkConclusionActionRequired
+	case state.IsState(apply.State, state.Apply.Completed):
 		conclusion = checkConclusionSuccess
-	case state.Apply.Failed:
+	case state.IsState(apply.State, state.Apply.Failed):
 		conclusion = checkConclusionFailure
 	default:
 		conclusion = checkConclusionFailure
