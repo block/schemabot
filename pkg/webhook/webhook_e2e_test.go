@@ -1247,20 +1247,15 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	// Two async goroutines create check runs: cleanupStaleChecks (aggregate after
-	// marking per-database records as success) and postPassingAggregates (always
-	// runs for non-schema PRs). Both produce passing aggregates — drain both.
-	deadline := time.After(10 * time.Second)
-	received := 0
-	for received < 2 {
-		select {
-		case cr := <-checkRuns:
-			assert.Equal(t, aggregateCheckName, cr.Name)
-			assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
-			received++
-		case <-deadline:
-			t.Fatalf("timed out waiting for aggregate check runs, got %d/2", received)
-		}
+	// cleanupStaleChecks marks the plan-only records as success and publishes the
+	// aggregate. The passing-aggregate path should not race ahead while stale
+	// action_required records still exist.
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for aggregate check run")
 	}
 
 	// Poll for per-database storage records to be updated by cleanupStaleChecks.
@@ -1298,6 +1293,135 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	}
 	assert.Equal(t, checkConclusionSuccess, storedAgg.Conclusion)
 	assert.False(t, storedAgg.HasChanges)
+}
+
+func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
+	dbName := "webhook_aggregate_stale_apply"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-reverted-commit",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Running,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	}))
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
+		CheckRunID:   200,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{
+				Ref: new("feature-branch"),
+				SHA: new("newsha222"),
+			},
+			Base: &gh.PullRequestBranch{
+				Ref: new("main"),
+				SHA: new("def456"),
+			},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{})
+	})
+
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+	})
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "synchronize",
+		headSHA: "newsha222",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "newsha222", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for blocking aggregate check run")
+	}
+
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "newsha222",
+		"No managed schema changes",
+		"This PR does not contain schema changes managed by SchemaBot.")
+	select {
+	case cr := <-checkRuns:
+		require.NotEqual(t, checkConclusionSuccess, cr.Conclusion, "passing aggregate must not be published while a started apply blocks the PR")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, "newsha222", check.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+	assert.True(t, check.HasChanges)
+	assert.Equal(t, applyID, check.ApplyID)
+
+	apply.State = state.Apply.Completed
+	updated, err := h.updateCheckRecordForApplyResult(ctx, "octocat/hello-world", 1, apply)
+	require.NoError(t, err)
+	assert.False(t, updated, "old apply completion must not mark the reverted PR head successful")
+
+	check, err = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
 }
 
 // TestE2EPlanUsesRepoDeployment verifies that the webhook plan handler routes

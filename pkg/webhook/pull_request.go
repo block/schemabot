@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"github.com/block/schemabot/pkg/metrics"
 )
 
 // pullRequestPayload represents the relevant fields from a GitHub pull_request webhook.
@@ -175,9 +177,10 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 	}
 }
 
-// cleanupStaleChecks marks checks for databases no longer in the PR as "success".
-// This handles the case where a user removes a schema change from the PR — the old
-// check would otherwise stay at "action_required" and block merge.
+// cleanupStaleChecks updates checks for databases no longer in the PR.
+// Plan-only checks can be marked "success" because the current PR no longer asks
+// SchemaBot to apply anything. Checks that represent a started apply remain
+// blocking because the live database may already have changed or may still change.
 //
 // On synchronize events, headSHA is the new commit SHA. Stale checks must be created
 // as new check runs on this SHA (not updated on the old SHA) so GitHub shows them
@@ -208,17 +211,35 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			continue // still affected, not stale
 		}
 
-		// This check's database is no longer in the PR — mark as success
+		// This check's database is no longer in the PR.
 		h.logger.Info("cleaning up stale check",
 			"repo", repo, "pr", pr,
 			"database", check.DatabaseName, "environment", check.Environment,
-			"previous_conclusion", check.Conclusion)
+			"previous_status", check.Status, "previous_conclusion", check.Conclusion,
+			"apply_id", check.ApplyID)
+
+		if checkRepresentsStartedApply(check) {
+			check.HeadSHA = headSHA
+			check.Conclusion = checkConclusionActionRequired
+			check.HasChanges = true
+			check.Status = checkStatusCompleted
+			check.ErrorMessage = "Schema changes were removed from the PR after an apply started; operator action is required before this check can pass."
+			if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
+				metrics.RecordStatusCheckOperation(ctx, "stale_cleanup", check.DatabaseName, check.Environment, "error")
+				h.logger.Error("failed to block stale check with started apply", "checkID", check.ID, "error", err)
+				continue
+			}
+			metrics.RecordStatusCheckOperation(ctx, "stale_cleanup", check.DatabaseName, check.Environment, "blocked")
+			cleaned = true
+			continue
+		}
 
 		// Update stored check record to success
 		check.HeadSHA = headSHA
 		check.Conclusion = checkConclusionSuccess
 		check.HasChanges = false
 		check.Status = checkStatusCompleted
+		check.ErrorMessage = ""
 		if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
 			h.logger.Error("failed to update stale check record", "checkID", check.ID, "error", err)
 		}

@@ -74,6 +74,32 @@ func isAggregateCheck(c *storage.Check) bool {
 		c.DatabaseName == aggregateSentinel
 }
 
+func checkRepresentsStartedApply(c *storage.Check) bool {
+	return c.Status == checkStatusInProgress || c.ApplyID != 0
+}
+
+func checkBlocksPassingAggregate(c *storage.Check) bool {
+	if isAggregateCheck(c) {
+		return false
+	}
+	if checkRepresentsStartedApply(c) {
+		return true
+	}
+	return c.Conclusion == checkConclusionFailure || c.Conclusion == checkConclusionActionRequired
+}
+
+func hasBlockingCheckForEnvironment(checks []*storage.Check, environment string) bool {
+	for _, c := range checks {
+		if environment != aggregateSentinel && c.Environment != environment {
+			continue
+		}
+		if checkBlocksPassingAggregate(c) {
+			return true
+		}
+	}
+	return false
+}
+
 // storePlanCheckRecord stores per-database check state after a plan is generated.
 // The state is used internally by the aggregate check to compute its overall status.
 // No per-database GitHub Check Run is created — only the aggregate is visible on the PR.
@@ -653,9 +679,16 @@ func (h *Handler) upsertAggregateCheckRun(
 // Called when this instance has no work to do for a PR — either because the PR doesn't
 // touch schema files, or because the databases don't have environments this instance
 // manages. Without this, branch protection would block indefinitely waiting for a
-// check that would never come.
+// check that would never come. It does not publish success over existing
+// per-database state that still needs operator attention.
 func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, title, summary string) {
 	config := h.service.Config()
+	storedChecks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, "aggregate_update", "", "", "error")
+		h.logger.Error("failed to fetch checks before passing aggregate", "repo", repo, "pr", pr, "error", err)
+		return
+	}
 
 	type envCheck struct {
 		name        string
@@ -681,6 +714,13 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 
 	for _, ec := range checks {
 		checkName := ec.name
+
+		if hasBlockingCheckForEnvironment(storedChecks, ec.environment) {
+			metrics.RecordStatusCheckOperation(ctx, "aggregate_update", "", ec.environment, "blocked")
+			h.logger.Info("skipping passing aggregate because stored checks still block",
+				"repo", repo, "pr", pr, "check_name", checkName, "environment", ec.environment)
+			continue
+		}
 
 		opts := ghclient.CheckRunOptions{
 			Name:       checkName,

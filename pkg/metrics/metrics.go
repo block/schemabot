@@ -303,3 +303,54 @@ func RecordWebhookEvent(ctx context.Context, eventType, action, repo, status str
 	}
 	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
 }
+
+var knownStatusCheckOperations = map[string]bool{
+	"plan_record":              true,
+	"apply_start":              true,
+	"apply_result":             true,
+	"rollback_action_required": true,
+	"aggregate_update":         true,
+	"stale_cleanup":            true,
+	"stale_reconcile":          true,
+	"config_discovery":         true,
+}
+
+var knownStatusCheckStatuses = map[string]bool{
+	"success": true,
+	"error":   true,
+	"skipped": true,
+	"stale":   true,
+	"noop":    true,
+	"blocked": true,
+}
+
+// RecordStatusCheckOperation increments the status-check operations counter.
+// Unknown operation and status values are normalized to prevent unbounded cardinality.
+func RecordStatusCheckOperation(ctx context.Context, operation, database, environment, status string) {
+	if !knownStatusCheckOperations[operation] {
+		operation = "unknown"
+	}
+	if !knownStatusCheckStatuses[status] {
+		status = "unknown"
+	}
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.status_check_operations_total",
+		otelmetric.WithDescription("Total number of status-check operations"),
+		otelmetric.WithUnit("{operation}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create status-check operations counter", "error", err)
+		return
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("operation", operation),
+		attribute.String("status", status),
+	}
+	if database != "" {
+		attrs = append(attrs, attribute.String("database", database))
+	}
+	if environment != "" {
+		attrs = append(attrs, attribute.String("environment", environment))
+	}
+	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+}
