@@ -12,28 +12,12 @@ package engine
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
 
 	"github.com/block/schemabot/pkg/schema"
 )
-
-// ErrNonRetryable wraps an error to indicate it should not be retried.
-// Engines return this from Progress when the error is permanent (e.g.,
-// deploy request not found after server restart).
-type ErrNonRetryable struct {
-	Err error
-}
-
-func (e *ErrNonRetryable) Error() string { return e.Err.Error() }
-func (e *ErrNonRetryable) Unwrap() error { return e.Err }
-
-// NewNonRetryableError wraps err as a non-retryable error.
-func NewNonRetryableError(msg string, args ...any) error {
-	return &ErrNonRetryable{Err: fmt.Errorf(msg, args...)}
-}
 
 // Engine defines the interface that all schema change backends must implement.
 //

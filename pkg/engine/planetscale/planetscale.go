@@ -829,7 +829,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		// Reuse existing branch: wait for ready, refresh schema from main, wait again
 		branchName = existingBranch
 		if branchName == main {
-			return nil, fmt.Errorf("cannot reuse the %s branch — use a development branch", main)
+			return nil, engine.NewPermanentError("cannot reuse the %s branch: use a development branch", main)
 		}
 		persistState(&psMetadata{BranchName: branchName})
 		emitEvent(engine.ApplyEvent{
@@ -1258,6 +1258,9 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 		if err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
 			lastErr = err
 			e.logger.Error(fmt.Sprintf("keyspace %s apply attempt %d failed", sc.Namespace, attempt+1), "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
+			if !isRetryableEngineError(err) {
+				return engine.NewPermanentError("apply keyspace %s: %w", sc.Namespace, err)
+			}
 			if isSnapshotInProgress(err) && maxAttempts == maxRetries {
 				maxAttempts = maxSnapshotRetries
 				e.logger.Info("schema snapshot in progress, extending retries",
@@ -1268,7 +1271,14 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 		e.logger.Info(fmt.Sprintf("keyspace %s changes applied (%s)", sc.Namespace, time.Since(start).Round(time.Second)), "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
 		return nil
 	}
-	return fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
+	finalErr := fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
+	return finalErr
+}
+
+// isRetryableEngineError returns true if the error is a transient condition
+// that may succeed on a future attempt.
+func isRetryableEngineError(err error) bool {
+	return isRetryablePSError(err) || engine.IsTransientTransportError(err)
 }
 
 // isSnapshotInProgress returns true if the error indicates PlanetScale is
@@ -1681,11 +1691,11 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	dr, err := e.getDeployRequest(ctx, client, credOrg(req.Credentials), req.Database, meta.DeployRequestID)
 	if err != nil {
-		// Deploy request not found is non-retryable (e.g., server restarted
+		// Deploy request not found is permanent (e.g., server restarted
 		// with fresh LocalScale state but stale apply record).
 		var psErr *ps.Error
 		if errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound {
-			return nil, engine.NewNonRetryableError("deploy request #%d not found: %w", meta.DeployRequestID, err)
+			return nil, engine.NewPermanentError("deploy request #%d not found: %w", meta.DeployRequestID, err)
 		}
 		return nil, fmt.Errorf("get deploy request: %w", err)
 	}

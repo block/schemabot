@@ -1,6 +1,7 @@
 package planetscale
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -15,10 +16,23 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
+	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/table"
 )
+
+type permanentVSchemaErrorClient struct {
+	psclient.PSClient
+	updateCalls int
+}
+
+var _ psclient.PSClient = (*permanentVSchemaErrorClient)(nil)
+
+func (c *permanentVSchemaErrorClient) UpdateKeyspaceVSchema(context.Context, *ps.UpdateKeyspaceVSchemaRequest) (*ps.VSchema, error) {
+	c.updateCalls++
+	return nil, &ps.Error{Code: ps.ErrInvalid}
+}
 
 func TestDeployStateToEngineState(t *testing.T) {
 	tests := []struct {
@@ -410,6 +424,111 @@ func TestIsSnapshotInProgress(t *testing.T) {
 	assert.True(t, isSnapshotInProgress(fmt.Errorf("wrapped: schema snapshot is in progress")))
 	assert.False(t, isSnapshotInProgress(fmt.Errorf("connection refused")))
 	assert.False(t, isSnapshotInProgress(nil))
+}
+
+func TestIsRetryableEngineError(t *testing.T) {
+	t.Run("PS SDK ErrRetry is retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrRetry}
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("PS SDK ErrInternal is retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrInternal}
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("PS SDK ErrResponseMalformed is retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrResponseMalformed}
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("PS SDK ErrNotFound is NOT retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrNotFound}
+		assert.False(t, isRetryableEngineError(err))
+	})
+
+	t.Run("PS SDK ErrPermission is NOT retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrPermission}
+		assert.False(t, isRetryableEngineError(err))
+	})
+
+	t.Run("PS SDK ErrInvalid is NOT retryable", func(t *testing.T) {
+		err := &ps.Error{Code: ps.ErrInvalid}
+		assert.False(t, isRetryableEngineError(err))
+	})
+
+	t.Run("snapshot in progress is retryable", func(t *testing.T) {
+		err := fmt.Errorf("Cannot update VSchema while a schema snapshot is in progress.")
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("connection refused is retryable", func(t *testing.T) {
+		err := fmt.Errorf("connection refused")
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("wrapped network error is retryable", func(t *testing.T) {
+		err := fmt.Errorf("apply failed: %w", fmt.Errorf("i/o timeout"))
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("DDL syntax error is NOT retryable", func(t *testing.T) {
+		err := fmt.Errorf("Error 1064 (42000): You have an error in your SQL syntax")
+		assert.False(t, isRetryableEngineError(err))
+	})
+
+	t.Run("nil is NOT retryable", func(t *testing.T) {
+		assert.False(t, isRetryableEngineError(nil))
+	})
+}
+
+func TestApply_MainBranchReuseIsPermanent(t *testing.T) {
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)), func(_, _ string) (psclient.PSClient, error) {
+		return nil, nil
+	})
+
+	_, err := e.Apply(t.Context(), &engine.ApplyRequest{
+		Database: "testdb",
+		Options: map[string]string{
+			"branch": "main",
+		},
+		Credentials: &engine.Credentials{
+			Metadata: map[string]string{
+				"organization": "org",
+				"token_name":   "token",
+				"token_value":  "secret",
+				"main_branch":  "main",
+			},
+		},
+	})
+
+	require.Error(t, err)
+	assert.False(t, engine.IsRetryable(err))
+	assert.Contains(t, err.Error(), "cannot reuse the main branch")
+}
+
+func TestApplyKeyspaceChanges_PermanentVSchemaErrorIsPermanent(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &permanentVSchemaErrorClient{}
+
+	err := e.applyKeyspaceChanges(t.Context(),
+		engine.SchemaChange{
+			Namespace: "testapp",
+			Metadata:  map[string]string{"vschema_changed": "true"},
+		},
+		schema.SchemaFiles{
+			"testapp": &schema.Namespace{Files: map[string]string{"vschema.json": "{}"}},
+		},
+		&ps.DatabaseBranchPassword{},
+		client,
+		"org",
+		"database",
+		"branch",
+	)
+
+	require.Error(t, err)
+	assert.False(t, engine.IsRetryable(err))
+	assert.Equal(t, 1, client.updateCalls)
 }
 
 func TestRetryDelay(t *testing.T) {

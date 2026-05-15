@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -112,4 +113,53 @@ func TestEncodeResumeState_Nil(t *testing.T) {
 	encoded, err := EncodeResumeState(nil)
 	require.NoError(t, err)
 	assert.Equal(t, "", encoded)
+}
+
+func TestIsRetryable(t *testing.T) {
+	t.Run("plain error is retryable by default", func(t *testing.T) {
+		err := fmt.Errorf("connection refused")
+		assert.True(t, IsRetryable(err))
+	})
+
+	t.Run("wrapped error is retryable by default", func(t *testing.T) {
+		err := fmt.Errorf("apply failed: %w", fmt.Errorf("network timeout"))
+		assert.True(t, IsRetryable(err))
+	})
+
+	t.Run("PermanentError is not retryable", func(t *testing.T) {
+		err := NewPermanentError("DDL syntax error")
+		assert.False(t, IsRetryable(err))
+	})
+
+	t.Run("wrapped PermanentError is not retryable", func(t *testing.T) {
+		err := fmt.Errorf("apply failed: %w", NewPermanentError("auth failure"))
+		assert.False(t, IsRetryable(err))
+	})
+
+	t.Run("nil is not retryable", func(t *testing.T) {
+		assert.False(t, IsRetryable(nil))
+	})
+
+}
+
+func TestIsTransientTransportError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "connection refused", err: fmt.Errorf("dial tcp: connection refused"), want: true},
+		{name: "connection reset", err: fmt.Errorf("read tcp: connection reset by peer"), want: true},
+		{name: "timeout", err: fmt.Errorf("proxy query: i/o timeout"), want: true},
+		{name: "deadline", err: fmt.Errorf("context deadline exceeded"), want: true},
+		{name: "rate limit", err: fmt.Errorf("Too many requests"), want: true},
+		{name: "syntax error", err: fmt.Errorf("DDL syntax error"), want: false},
+		{name: "nil", err: nil, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, IsTransientTransportError(tt.err))
+		})
+	}
 }

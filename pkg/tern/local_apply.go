@@ -634,10 +634,10 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ResumeState: resumeState,
 	})
 	if err != nil {
-		// Non-retryable errors (e.g., deploy request not found) — fail immediately.
-		var nonRetryable *engine.ErrNonRetryable
-		if errors.As(err, &nonRetryable) {
-			c.logger.Error("progress check failed with non-retryable error",
+		// Permanent errors (e.g., deploy request not found) fail immediately.
+		var permanent *engine.PermanentError
+		if errors.As(err, &permanent) {
+			c.logger.Error("progress check failed with permanent error",
 				"error", err, "apply_id", apply.ApplyIdentifier)
 			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed: %v", err))
 			return true
