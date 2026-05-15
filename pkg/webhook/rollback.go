@@ -261,29 +261,56 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 		return
 	}
 
+	if applyID <= 0 {
+		h.logger.Error("rollback apply accepted without storage apply id",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment)
+		return
+	}
+
 	// Spawn background progress watcher. After the rollback apply completes,
 	// set the check to action_required — the PR's schema changes need to be
 	// re-applied since the rollback undid them.
-	if applyID > 0 {
-		apply, err := h.service.Storage().Applies().Get(ctx, applyID)
-		if err != nil || apply == nil {
-			h.logger.Error("failed to load apply for progress watch", "applyID", applyID, "error", err)
+	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
+	if err != nil {
+		h.logger.Error("failed to load rollback apply for progress watch",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", dbType, "environment", environment,
+			"apply_id", applyID, "error", err)
+		return
+	}
+	if apply == nil {
+		h.logger.Error("rollback apply missing after accepted apply",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", dbType, "environment", environment,
+			"apply_id", applyID)
+		return
+	}
+	h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID)
+
+	go func() {
+		bgCtx := context.Background()
+		h.watchApplyProgress(bgCtx, repo, pr, installationID, apply)
+		// Re-fetch the apply to check its final state. Only set action_required
+		// if the rollback succeeded — a failed rollback should keep the failure
+		// conclusion set by watchApplyProgress.
+		final, err := h.service.Storage().Applies().Get(bgCtx, applyID)
+		if err != nil {
+			h.logger.Error("failed to re-fetch apply after rollback",
+				"repo", repo, "pr", pr, "database", apply.Database,
+				"database_type", apply.DatabaseType, "environment", apply.Environment,
+				"apply_id", applyID, "apply_identifier", apply.ApplyIdentifier,
+				"error", err)
 			return
 		}
-		go func() {
-			bgCtx := context.Background()
-			h.watchApplyProgress(bgCtx, repo, pr, installationID, apply)
-			// Re-fetch the apply to check its final state. Only set action_required
-			// if the rollback succeeded — a failed rollback should keep the failure
-			// conclusion set by watchApplyProgress.
-			final, err := h.service.Storage().Applies().Get(bgCtx, applyID)
-			if err != nil || final == nil {
-				h.logger.Error("failed to re-fetch apply after rollback", "applyID", applyID, "error", err)
-				return
-			}
-			if state.IsState(final.State, state.Apply.Completed) {
-				h.setCheckActionRequired(repo, pr, apply.Environment, apply.DatabaseType, apply.Database, installationID)
-			}
-		}()
-	}
+		if final == nil {
+			h.logger.Error("rollback apply missing after progress watch",
+				"repo", repo, "pr", pr, "database", apply.Database,
+				"database_type", apply.DatabaseType, "environment", apply.Environment,
+				"apply_id", applyID, "apply_identifier", apply.ApplyIdentifier)
+			return
+		}
+		if state.IsState(final.State, state.Apply.Completed) {
+			h.setCheckActionRequired(repo, pr, installationID, final)
+		}
+	}()
 }

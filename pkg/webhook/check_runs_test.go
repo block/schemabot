@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,8 +12,37 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+type emptyStorage struct {
+	storage.Storage
+}
+
+func (s *emptyStorage) Checks() storage.CheckStore {
+	return &emptyCheckStore{}
+}
+
+func (s *emptyStorage) Applies() storage.ApplyStore {
+	return &emptyApplyStore{}
+}
+
+type emptyCheckStore struct {
+	storage.CheckStore
+}
+
+func (s *emptyCheckStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Check, error) {
+	return nil, nil
+}
+
+type emptyApplyStore struct {
+	storage.ApplyStore
+}
+
+func (s *emptyApplyStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Apply, error) {
+	return nil, nil
+}
 
 func TestComputeAggregate(t *testing.T) {
 	tests := []struct {
@@ -190,6 +220,61 @@ func TestFilterChecksByEnvironment(t *testing.T) {
 	})
 }
 
+func TestLatestApplyByCheckKey(t *testing.T) {
+	applies := []*storage.Apply{
+		{
+			ID:           1,
+			Database:     "orders",
+			DatabaseType: "mysql",
+			Environment:  "staging",
+			State:        state.Apply.Completed,
+		},
+		{
+			ID:           2,
+			Database:     "orders",
+			DatabaseType: "mysql",
+			Environment:  "staging",
+			State:        state.Apply.Running,
+		},
+		{
+			ID:           3,
+			Database:     "orders",
+			DatabaseType: "vitess",
+			Environment:  "staging",
+			State:        state.Apply.Completed,
+		},
+		{
+			ID:           5,
+			Database:     "users",
+			DatabaseType: "mysql",
+			Environment:  "staging",
+			State:        state.Apply.Failed,
+		},
+		{
+			ID:           4,
+			Database:     "users",
+			DatabaseType: "mysql",
+			Environment:  "staging",
+			State:        state.Apply.Completed,
+		},
+	}
+
+	latest := latestApplyByCheckKey(applies)
+
+	mysqlOrders := latest[applyCheckKey{environment: "staging", databaseType: "mysql", databaseName: "orders"}]
+	require.NotNil(t, mysqlOrders)
+	assert.Equal(t, state.Apply.Running, mysqlOrders.State)
+
+	vitessOrders := latest[applyCheckKey{environment: "staging", databaseType: "vitess", databaseName: "orders"}]
+	require.NotNil(t, vitessOrders)
+	assert.Equal(t, state.Apply.Completed, vitessOrders.State)
+
+	mysqlUsers := latest[applyCheckKey{environment: "staging", databaseType: "mysql", databaseName: "users"}]
+	require.NotNil(t, mysqlUsers)
+	assert.Equal(t, int64(5), mysqlUsers.ID)
+	assert.Equal(t, state.Apply.Failed, mysqlUsers.State)
+}
+
 func TestCheckPriorEnvViaGitHub(t *testing.T) {
 	const (
 		repo    = "octocat/hello-world"
@@ -331,7 +416,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 }
 
 func TestWebhookEnvironmentFiltering(t *testing.T) {
-	t.Run("non-allowed environment silently ignored", func(t *testing.T) {
+	t.Run("non-allowed environment ignored with explicit response", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusCreated)
@@ -341,7 +426,7 @@ func TestWebhookEnvironmentFiltering(t *testing.T) {
 		installClient := ghclient.NewInstallationClient(client, testLogger())
 		factory := &fakeClientFactory{client: installClient}
 
-		service := api.New(nil, &api.ServerConfig{
+		service := api.New(&emptyStorage{}, &api.ServerConfig{
 			AllowedEnvironments: []string{"staging"},
 			Repos:               map[string]api.RepoConfig{},
 		}, nil, testLogger())
@@ -352,8 +437,8 @@ func TestWebhookEnvironmentFiltering(t *testing.T) {
 			logger:   testLogger(),
 		}
 
-		// Plan targeting production should be silently ignored by this instance
-		// because only staging is in allowed_environments.
+		// Plan targeting production should be ignored by this instance because
+		// only staging is in allowed_environments.
 		req := buildWebhookRequest(t, webhookPayloadOpts{
 			comment: "schemabot plan -e production",
 			isPR:    true,
@@ -380,7 +465,7 @@ func TestWebhookEnvironmentFiltering(t *testing.T) {
 		installClient := ghclient.NewInstallationClient(client, testLogger())
 		factory := &fakeClientFactory{client: installClient}
 
-		service := api.New(nil, &api.ServerConfig{
+		service := api.New(&emptyStorage{}, &api.ServerConfig{
 			AllowedEnvironments: []string{"staging"},
 			Repos:               map[string]api.RepoConfig{},
 		}, nil, testLogger())
@@ -422,7 +507,7 @@ func TestWebhookEnvironmentFiltering(t *testing.T) {
 		installClient := ghclient.NewInstallationClient(client, testLogger())
 		factory := &fakeClientFactory{client: installClient}
 
-		service := api.New(nil, &api.ServerConfig{
+		service := api.New(&emptyStorage{}, &api.ServerConfig{
 			Repos: map[string]api.RepoConfig{},
 		}, nil, testLogger())
 

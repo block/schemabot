@@ -245,6 +245,36 @@ func TestRecordApplyMetrics(t *testing.T) {
 	assert.True(t, names["schemabot.apply.duration_seconds"], "expected schemabot.apply.duration_seconds")
 }
 
+func TestRecordCheckOwnershipMissMetric(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordCheckOwnershipMiss(t.Context(), "complete_apply", "org/repo", "mydb", "mysql", "staging")
+	metrics.RecordCheckOwnershipMiss(t.Context(), "rollback_action_required", "org/repo", "mydb", "mysql", "staging")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	var found bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == "schemabot.check_ownership_misses_total" {
+				found = true
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				require.True(t, ok)
+				assert.Len(t, sum.DataPoints, 2, "expected one data point per operation")
+			}
+		}
+	}
+	assert.True(t, found, "schemabot.check_ownership_misses_total metric not found")
+}
+
 func TestRecordPlanDurationMetric(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))

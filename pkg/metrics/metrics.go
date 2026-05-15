@@ -100,6 +100,40 @@ func RecordApplyDuration(ctx context.Context, duration time.Duration, database, 
 	)
 }
 
+// knownCheckOwnershipOperations limits metric cardinality to expected check
+// ownership miss paths.
+var knownCheckOwnershipOperations = map[string]bool{
+	"complete_apply":           true,
+	"rollback_action_required": true,
+}
+
+// RecordCheckOwnershipMiss increments the counter for guarded check updates
+// that did not apply because stored check state no longer belonged to the
+// apply being completed.
+func RecordCheckOwnershipMiss(ctx context.Context, operation, repository, database, databaseType, environment string) {
+	if !knownCheckOwnershipOperations[operation] {
+		operation = "unknown"
+	}
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.check_ownership_misses_total",
+		otelmetric.WithDescription("Total stored check state ownership misses"),
+		otelmetric.WithUnit("{miss}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create check ownership miss counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("operation", operation),
+			attribute.String("repository", repository),
+			attribute.String("database", database),
+			attribute.String("database_type", databaseType),
+			attribute.String("environment", environment),
+		),
+	)
+}
+
 // AdjustActiveApplies increments or decrements the active applies gauge.
 // Use delta=1 when an apply is accepted and delta=-1 when it reaches a terminal state.
 func AdjustActiveApplies(ctx context.Context, delta int64, database, environment string) {

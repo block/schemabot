@@ -26,6 +26,19 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
+	// Fix checks stuck at "in_progress" from crashed applies
+	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
+		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
+		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
+			RequestedBy: requestedBy,
+			Timestamp:   time.Now().UTC().Format("2006-01-02 15:04:05"),
+			Environment: environment,
+			CommandName: action.Apply,
+			ErrorDetail: "Failed to reconcile stale status checks: " + err.Error(),
+		}))
+		return
+	}
+
 	// Discover config and fetch schema files from PR
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
 	if err != nil {
@@ -457,26 +470,47 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Update check run to in-progress (transitions action_required → in_progress)
-	h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment)
-
 	if applyID <= 0 {
+		h.logger.Error("apply accepted without stored apply id", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		return
 	}
 
 	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
-	if err != nil || apply == nil {
-		h.logger.Error("failed to load apply for progress watch", "applyID", applyID, "error", err)
+	if err != nil {
+		h.logger.Error("failed to load apply for progress watch",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", schemaResult.Type, "environment", environment,
+			"apply_id", applyID, "error", err)
 		return
 	}
+	if apply == nil {
+		h.logger.Error("apply missing after accepted apply",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", schemaResult.Type, "environment", environment,
+			"apply_id", applyID)
+		return
+	}
+
+	// Update check run to in-progress (transitions action_required → in_progress)
+	h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID)
 
 	// Wait briefly for fast results (instant DDL, immediate failures)
 	// before deciding whether to go async.
 	time.Sleep(2 * time.Second)
 
 	apply, err = h.service.Storage().Applies().Get(ctx, applyID)
-	if err != nil || apply == nil {
-		h.logger.Error("failed to reload apply after wait", "applyID", applyID, "error", err)
+	if err != nil {
+		h.logger.Error("failed to reload apply after wait",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", schemaResult.Type, "environment", environment,
+			"apply_id", applyID, "error", err)
+		return
+	}
+	if apply == nil {
+		h.logger.Error("apply missing after wait",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", schemaResult.Type, "environment", environment,
+			"apply_id", applyID)
 		return
 	}
 
@@ -485,7 +519,18 @@ func (h *Handler) executeApply(
 		tasks, _ := h.service.Storage().Tasks().GetByApplyID(ctx, applyID)
 		summaryBody := formatSummaryComment(apply, tasks)
 		h.postComment(repo, pr, installationID, summaryBody)
-		h.updateCheckRecordForApplyResult(ctx, repo, pr, apply)
+		updated, err := h.updateCheckRecordForApplyResult(ctx, repo, pr, apply)
+		if err != nil {
+			h.logger.Error("failed to update stored check state after apply", "repo", repo, "pr", pr, "apply_id", applyID, "error", err)
+			return
+		}
+		if !updated {
+			h.logger.Debug("skipping aggregate check update because apply no longer owns stored check state",
+				"repo", repo, "pr", pr, "database", apply.Database,
+				"database_type", apply.DatabaseType, "environment", apply.Environment,
+				"apply_id", applyID, "apply_identifier", apply.ApplyIdentifier)
+			return
+		}
 		if checkRecord, err := h.service.Storage().Checks().Get(ctx, repo, pr, apply.Environment, apply.DatabaseType, apply.Database); err == nil && checkRecord != nil {
 			h.updateAggregateCheck(ctx, client, repo, pr, checkRecord.HeadSHA)
 		}
@@ -679,10 +724,13 @@ func (h *Handler) storeApplyPlanCheckRecord(ctx context.Context, client *ghclien
 
 // updateCheckRecordForApplyStart updates the stored check record to "in_progress"
 // when an apply begins execution. The aggregate check is updated to reflect the state.
-func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string) {
+func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string, applyID int64) {
 	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, schema.Type, schema.Database)
 	if err != nil {
-		h.logger.Error("failed to look up check record", "error", err)
+		h.logger.Error("failed to look up check record for apply start",
+			"repo", repo, "pr", pr, "database", schema.Database,
+			"database_type", schema.Type, "environment", environment,
+			"apply_id", applyID, "error", err)
 		return
 	}
 
@@ -690,7 +738,10 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 		// No existing record — create one
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 		if err != nil {
-			h.logger.Error("failed to fetch PR for check record", "error", err)
+			h.logger.Error("failed to fetch PR for apply start check record",
+				"repo", repo, "pr", pr, "database", schema.Database,
+				"database_type", schema.Type, "environment", environment,
+				"apply_id", applyID, "error", err)
 			return
 		}
 		check = &storage.Check{
@@ -700,18 +751,28 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 			Environment:  environment,
 			DatabaseType: schema.Type,
 			DatabaseName: schema.Database,
+			ApplyID:      applyID,
 			HasChanges:   true,
 			Status:       checkStatusInProgress,
 			Conclusion:   "",
 		}
 	} else {
+		check.ApplyID = applyID
 		check.Status = checkStatusInProgress
 		check.Conclusion = ""
 	}
 
 	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
-		h.logger.Error("failed to upsert check record", "error", err)
+		h.logger.Error("failed to upsert check record for apply start",
+			"repo", repo, "pr", pr, "database", schema.Database,
+			"database_type", schema.Type, "environment", environment,
+			"apply_id", applyID, "head_sha", check.HeadSHA, "error", err)
+		return
 	}
+	h.logger.Info("check record marked in_progress for apply",
+		"repo", repo, "pr", pr, "database", schema.Database,
+		"database_type", schema.Type, "environment", environment,
+		"apply_id", applyID, "head_sha", check.HeadSHA)
 
 	h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)
 }

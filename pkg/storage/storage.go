@@ -72,31 +72,47 @@ type LockStore interface {
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Lock, error)
 }
 
-// CheckStore manages GitHub status check state.
-// One check per (PR, environment, database) combination.
-// Check name format: "SchemaBot: {env}/{type}/{database}"
+// CheckStore manages SchemaBot's stored check state.
+// Per-database rows track internal status for a PR/environment/database.
+// Aggregate rows store the GitHub check_run_id for the visible GitHub Check Run.
 type CheckStore interface {
-	// Upsert creates or updates a check record.
+	// Upsert creates or updates stored check state.
 	Upsert(ctx context.Context, check *Check) error
 
-	// Get returns a check by its unique key (PR + env + database), or nil if not found.
+	// UpsertPlanResult creates or updates stored check state from a plan result,
+	// but preserves in-progress apply state for the same PR/environment/database/head SHA.
+	UpsertPlanResult(ctx context.Context, check *Check) error
+
+	// CompleteForApply updates stored check state to a terminal state only if
+	// it still belongs to the given apply and no newer non-terminal apply exists
+	// for the same PR/environment/database. Returns false when another worker
+	// changed the stored state first.
+	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
+
+	// MarkActionRequiredForApply marks stored check state action_required after
+	// a rollback only if it still belongs to that rollback apply and no newer
+	// non-terminal apply exists for the same PR/environment/database. Returns
+	// false when another worker changed the stored state first.
+	MarkActionRequiredForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
+
+	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.
 	Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*Check, error)
 
-	// GetByCheckRunID returns a check by GitHub's check run ID, or nil if not found.
+	// GetByCheckRunID returns stored check state by GitHub's check run ID, or nil if not found.
 	// Used for handling check_run webhooks from GitHub.
 	GetByCheckRunID(ctx context.Context, checkRunID int64) (*Check, error)
 
-	// GetByPR returns all checks for a PR (for PR cleanup on close).
+	// GetByPR returns all stored check state for a PR (for PR cleanup on close).
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Check, error)
 
-	// GetByDatabase returns all checks for a database across all PRs.
+	// GetByDatabase returns all stored check state for a database across all PRs.
 	// Used for cross-PR coordination (blocking other PRs when one is applying).
 	GetByDatabase(ctx context.Context, repo, environment, dbType, database string) ([]*Check, error)
 
-	// Delete removes a check record by ID.
+	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
 
-	// DeleteByPR removes all check records for a PR.
+	// DeleteByPR removes all stored check state for a PR.
 	// Used for cleanup when a PR is closed or merged.
 	DeleteByPR(ctx context.Context, repo string, pr int) error
 }

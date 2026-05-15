@@ -11,6 +11,7 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 | `schemabot.applies.total` | Counter | database, environment, status | Total apply operations |
 | `schemabot.apply.duration_seconds` | Histogram | database, environment, status | Apply API call time |
 | `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies |
+| `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.webhook.events_total` | Counter | event_type, action, repository, status | GitHub webhook events |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.lock_operations_total` | Counter | operation, database, status | Lock acquire/release operations |
@@ -21,6 +22,8 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 ### Attribute Values
 
 **status** (plans/applies): `success`, `error`, `rejected`
+
+**operation** (check ownership): `complete_apply`, `rollback_action_required`
 
 **operation** (control): `cutover`, `stop`, `start`, `volume`, `revert`, `skip_revert`, `rollback_plan`
 
@@ -35,6 +38,36 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 **action** (webhooks): `created`, `opened`, `synchronize`, `reopened`, `closed`, `requested`, `completed` (omitted for events without actions like `ping`)
 
 **status** (webhooks): `processed`, `invalid_signature`, `ignored`
+
+### Check Ownership Misses
+
+`schemabot.check_ownership_misses_total` should normally be near zero. A spike
+means an apply or rollback worker reached a terminal path after the stored check
+state had already moved to a different owner, usually because a new commit,
+newer apply, rollback, pod restart, or recovery path raced with the older worker.
+The guarded update prevented the stale worker from overwriting current merge-gate
+state, so the metric is a near-miss signal rather than proof that check state was
+corrupted.
+
+A spike is still dangerous because the live database can keep changing after the
+PR's desired schema has moved on. For example, an apply can start for commit A,
+an agent can push commit B that removes the schema change, and commit A's apply
+can still reach the database. The guard prevents the old apply worker from
+marking the current check successful, but it does not undo live-schema drift.
+
+Operator response:
+
+1. Group by `repository`, `environment`, `database_type`, `database`, and
+   `operation` to identify whether the spike is isolated or global.
+2. For an isolated PR/database, inspect the PR timeline for new commits while an
+   apply was running, then compare the current PR head, stored check state, and
+   active apply state before allowing merge.
+3. For a global spike, check recent deploys, pod restarts, recovery activity, and
+   webhook redeliveries. A broad spike can indicate duplicate workers or a
+   service-level race, not just user commit churn.
+4. If the live schema may now differ from the PR's current declarative schema,
+   re-plan the current head and decide whether to apply again, roll back, or
+   hold the PR until drift is resolved.
 
 ## HTTP Server Metrics
 

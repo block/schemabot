@@ -1,5 +1,4 @@
-// checks.go implements CheckStore for GitHub status check tracking.
-// One check per (PR, environment, database) combination.
+// checks.go implements CheckStore for SchemaBot's stored check state.
 package mysqlstore
 
 import (
@@ -8,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -15,17 +15,51 @@ import (
 // checkColumns lists all columns for SELECT queries.
 const checkColumns = `id, repository, pull_request, head_sha,
 	environment, database_type, database_name,
-	check_run_id, has_changes, status, conclusion,
+	check_run_id, apply_id, has_changes, status, conclusion,
 	error_message, created_at, updated_at`
+
+const checkStatusInProgress = "in_progress"
 
 // checkStore implements storage.CheckStore using MySQL.
 type checkStore struct {
 	db *sql.DB
 }
 
-// Upsert creates or updates a check record.
+// Upsert creates or updates stored check state.
 func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 	// Convert CheckRunID=0 to NULL (0 is Go's zero value, not a valid check run ID)
+	var checkRunID any
+	if check.CheckRunID != 0 {
+		checkRunID = check.CheckRunID
+	}
+	var applyID any
+	if check.ApplyID != 0 {
+		applyID = check.ApplyID
+	}
+
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO checks (
+			repository, pull_request, head_sha,
+			environment, database_type, database_name,
+			check_run_id, apply_id, has_changes, status, conclusion, error_message
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			head_sha = VALUES(head_sha),
+			check_run_id = VALUES(check_run_id),
+			apply_id = VALUES(apply_id),
+			has_changes = VALUES(has_changes),
+			status = VALUES(status),
+			conclusion = VALUES(conclusion),
+			error_message = VALUES(error_message)
+	`, check.Repository, check.PullRequest, check.HeadSHA,
+		check.Environment, check.DatabaseType, check.DatabaseName,
+		checkRunID, applyID, check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage)
+	return err
+}
+
+// UpsertPlanResult stores plan-derived check state without overwriting
+// in-progress apply state for the same PR/environment/database/head SHA.
+func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check) error {
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
@@ -35,19 +69,132 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 		INSERT INTO checks (
 			repository, pull_request, head_sha,
 			environment, database_type, database_name,
-			check_run_id, has_changes, status, conclusion, error_message
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE
-			head_sha = VALUES(head_sha),
-			check_run_id = VALUES(check_run_id),
-			has_changes = VALUES(has_changes),
-			status = VALUES(status),
-			conclusion = VALUES(conclusion),
-			error_message = VALUES(error_message)
+			check_run_id, apply_id, has_changes, status, conclusion, error_message
+		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
 	`, check.Repository, check.PullRequest, check.HeadSHA,
 		check.Environment, check.DatabaseType, check.DatabaseName,
 		checkRunID, check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage)
+	// Fast path: no existing check state for this PR/environment/database, so the
+	// insert is the complete write. Any non-duplicate error is a real storage
+	// failure; duplicate key means the row exists and needs the guarded update
+	// below.
+	if err == nil {
+		return nil
+	}
+	if !isDuplicateKeyError(err) {
+		return err
+	}
+
+	// Preserve same-head in-progress apply-owned state. A plan result for that
+	// same PR head is stale relative to the apply that already started.
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET head_sha = ?,
+		    check_run_id = ?,
+		    apply_id = NULL,
+		    has_changes = ?,
+		    status = ?,
+		    conclusion = ?,
+		    error_message = ?
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND NOT (status = ? AND head_sha = ? AND apply_id IS NOT NULL)
+	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage,
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		checkStatusInProgress, check.HeadSHA)
 	return err
+}
+
+// CompleteForApply updates stored check state to a terminal state only if it
+// still belongs to the apply being completed.
+func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
+	var checkRunID any
+	if check.CheckRunID != 0 {
+		checkRunID = check.CheckRunID
+	}
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET head_sha = ?,
+		    check_run_id = ?,
+		    apply_id = ?,
+		    has_changes = ?,
+		    status = ?,
+		    conclusion = ?,
+		    error_message = ?
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND status = ?
+		  AND apply_id = ?
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM applies newer
+		    WHERE newer.repository = checks.repository
+		      AND newer.pull_request = checks.pull_request
+		      AND newer.environment = checks.environment
+		      AND newer.database_type = checks.database_type
+		      AND newer.database_name = checks.database_name
+		      AND newer.id > ?
+		      AND newer.state NOT IN (?, ?, ?, ?, ?)
+		  )
+	`, check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage,
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		checkStatusInProgress, apply.ID,
+		apply.ID, state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted)
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+// MarkActionRequiredForApply marks stored check state action_required after a
+// rollback only if it still belongs to that rollback apply.
+func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
+	var checkRunID any
+	if check.CheckRunID != 0 {
+		checkRunID = check.CheckRunID
+	}
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET head_sha = ?,
+		    check_run_id = ?,
+		    apply_id = NULL,
+		    has_changes = ?,
+		    status = ?,
+		    conclusion = ?,
+		    error_message = ?
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND apply_id = ?
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM applies newer
+		    WHERE newer.repository = checks.repository
+		      AND newer.pull_request = checks.pull_request
+		      AND newer.environment = checks.environment
+		      AND newer.database_type = checks.database_type
+		      AND newer.database_name = checks.database_name
+		      AND newer.id > ?
+		      AND newer.state NOT IN (?, ?, ?, ?, ?)
+		  )
+	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage,
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		apply.ID, apply.ID, state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted)
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
 }
 
 // Get returns a check by its unique key (PR + env + database), or nil if not found.
@@ -107,7 +254,7 @@ func (s *checkStore) GetByDatabase(ctx context.Context, repo, environment, dbTyp
 	return scanChecks(rows)
 }
 
-// Delete removes a check record by ID.
+// Delete removes stored check state by ID.
 func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM checks WHERE id = ?`, id)
 	if err != nil {
@@ -117,7 +264,7 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	return checkRowsAffected(result, storage.ErrCheckNotFound)
 }
 
-// DeleteByPR removes all check records for a PR.
+// DeleteByPR removes all stored check state for a PR.
 func (s *checkStore) DeleteByPR(ctx context.Context, repo string, pr int) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM checks WHERE repository = ? AND pull_request = ?`, repo, pr)
 	return err
@@ -148,13 +295,13 @@ func scanChecks(rows *sql.Rows) ([]*storage.Check, error) {
 // scanCheckInto scans check data from any scanner (Row or Rows).
 func scanCheckInto(s scanner) (*storage.Check, error) {
 	var check storage.Check
-	var checkRunID sql.NullInt64
+	var checkRunID, applyID sql.NullInt64
 	var conclusion, errorMessage sql.NullString
 
 	err := s.Scan(
 		&check.ID, &check.Repository, &check.PullRequest, &check.HeadSHA,
 		&check.Environment, &check.DatabaseType, &check.DatabaseName,
-		&checkRunID, &check.HasChanges, &check.Status, &conclusion,
+		&checkRunID, &applyID, &check.HasChanges, &check.Status, &conclusion,
 		&errorMessage, &check.CreatedAt, &check.UpdatedAt,
 	)
 	if err != nil {
@@ -163,6 +310,9 @@ func scanCheckInto(s scanner) (*storage.Check, error) {
 
 	if checkRunID.Valid {
 		check.CheckRunID = checkRunID.Int64
+	}
+	if applyID.Valid {
+		check.ApplyID = applyID.Int64
 	}
 	if conclusion.Valid {
 		check.Conclusion = conclusion.String

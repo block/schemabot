@@ -116,8 +116,12 @@ func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {
 
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	factory := &fakeClientFactory{client: installClient}
+	service := api.New(&emptyStorage{}, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{},
+	}, nil, testLogger())
 
 	h := &Handler{
+		service:  service,
 		ghClient: factory,
 		logger:   testLogger(),
 	}

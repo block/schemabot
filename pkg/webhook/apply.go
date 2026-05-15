@@ -102,7 +102,18 @@ func (h *Handler) watchApplyProgress(ctx context.Context, repo string, pr int, i
 			h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Summary, summaryBody)
 
 			// Update the GitHub check run to reflect the terminal state
-			h.updateCheckRecordForApplyResult(ctx, repo, pr, current)
+			updated, err := h.updateCheckRecordForApplyResult(ctx, repo, pr, current)
+			if err != nil {
+				h.logger.Error("failed to update stored check state after apply", "repo", repo, "pr", pr, "apply_id", applyID, "error", err)
+				return
+			}
+			if !updated {
+				h.logger.Debug("skipping aggregate check update because apply no longer owns stored check state",
+					"repo", repo, "pr", pr, "database", current.Database,
+					"database_type", current.DatabaseType, "environment", current.Environment,
+					"apply_id", applyID, "apply_identifier", current.ApplyIdentifier)
+				return
+			}
 			if aggClient, err := h.ghClient.ForInstallation(installationID); err == nil {
 				// Look up the head SHA from the check record
 				if checkRecord, err := h.service.Storage().Checks().Get(ctx, repo, pr, current.Environment, current.DatabaseType, current.Database); err == nil && checkRecord != nil {

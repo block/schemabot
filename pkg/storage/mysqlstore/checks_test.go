@@ -9,6 +9,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -290,4 +291,396 @@ func TestCheckStore_CheckRunIDZeroIsNull(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, retrieved)
 	require.Equal(t, int64(0), retrieved.CheckRunID)
+}
+
+func TestCheckStore_ApplyIDRoundTrip(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "vitess",
+		DatabaseName: "testdb",
+		ApplyID:      42,
+		HasChanges:   true,
+		Status:       "in_progress",
+	}
+
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "vitess", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, int64(42), retrieved.ApplyID)
+
+	check.ApplyID = 0
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	retrieved, err = store.Checks().Get(ctx, "org/repo", 123, "staging", "vitess", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, int64(0), retrieved.ApplyID)
+}
+
+func TestCheckStore_UpsertPlanResultPreservesInProgressApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-running", state.Apply.Running)
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "same-sha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       "in_progress",
+		Conclusion:   "",
+	}))
+
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "same-sha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   true,
+		Status:       "completed",
+		Conclusion:   "action_required",
+	}))
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "same-sha", retrieved.HeadSHA)
+	require.Equal(t, "in_progress", retrieved.Status)
+	require.Empty(t, retrieved.Conclusion)
+	require.Equal(t, apply.ID, retrieved.ApplyID)
+}
+
+func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheck(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "same-sha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   true,
+		Status:       "in_progress",
+		Conclusion:   "",
+	}))
+
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "same-sha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   true,
+		Status:       "completed",
+		Conclusion:   "action_required",
+	}))
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "same-sha", retrieved.HeadSHA)
+	require.Equal(t, "completed", retrieved.Status)
+	require.Equal(t, "action_required", retrieved.Conclusion)
+	require.Equal(t, int64(0), retrieved.ApplyID)
+}
+
+func TestCheckStore_UpsertPlanResultReplacesInProgressApplyOnNewHead(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-running-old-head", state.Apply.Running)
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "oldsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       "in_progress",
+		Conclusion:   "",
+	}))
+
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "newsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   true,
+		Status:       "completed",
+		Conclusion:   "action_required",
+	}))
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "newsha", retrieved.HeadSHA)
+	require.Equal(t, "completed", retrieved.Status)
+	require.Equal(t, "action_required", retrieved.Conclusion)
+	require.Equal(t, int64(0), retrieved.ApplyID)
+}
+
+func TestCheckStore_UpsertPlanResultClearsApplyIDWhenNotInProgress(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-completed-plan", state.Apply.Completed)
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "oldsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      apply.ID,
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}))
+
+	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "newsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   true,
+		Status:       "completed",
+		Conclusion:   "action_required",
+	}))
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "newsha", retrieved.HeadSHA)
+	require.Equal(t, "completed", retrieved.Status)
+	require.Equal(t, "action_required", retrieved.Conclusion)
+	require.Equal(t, int64(0), retrieved.ApplyID)
+}
+
+func TestCheckStore_CompleteForApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-complete", state.Apply.Completed)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       "in_progress",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.Status = "completed"
+	check.Conclusion = "success"
+	check.HasChanges = false
+	updated, err := store.Checks().CompleteForApply(ctx, check, apply)
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "completed", retrieved.Status)
+	require.Equal(t, "success", retrieved.Conclusion)
+	require.Equal(t, apply.ID, retrieved.ApplyID)
+}
+
+func TestCheckStore_CompleteForApplySkipsNewerRunningApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	oldApply := createCheckStoreApply(t, store, "apply-old", state.Apply.Completed)
+	newApply := createCheckStoreApply(t, store, "apply-new", state.Apply.Running)
+	require.Greater(t, newApply.ID, oldApply.ID)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      oldApply.ID,
+		HasChanges:   true,
+		Status:       "in_progress",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.Status = "completed"
+	check.Conclusion = "success"
+	check.HasChanges = false
+	updated, err := store.Checks().CompleteForApply(ctx, check, oldApply)
+	require.NoError(t, err)
+	require.False(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "in_progress", retrieved.Status)
+	require.Empty(t, retrieved.Conclusion)
+	require.Equal(t, oldApply.ID, retrieved.ApplyID)
+}
+
+func TestCheckStore_CompleteForApplySkipsUnownedCheck(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-unowned", state.Apply.Completed)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   true,
+		Status:       "in_progress",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.Status = "completed"
+	check.Conclusion = "success"
+	check.HasChanges = false
+	updated, err := store.Checks().CompleteForApply(ctx, check, apply)
+	require.NoError(t, err)
+	require.False(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "in_progress", retrieved.Status)
+	require.Empty(t, retrieved.Conclusion)
+	require.Equal(t, int64(0), retrieved.ApplyID)
+}
+
+func TestCheckStore_MarkActionRequiredForApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "rollback-complete", state.Apply.Completed)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      apply.ID,
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.HasChanges = true
+	check.Conclusion = "action_required"
+	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, apply)
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "completed", retrieved.Status)
+	require.Equal(t, "action_required", retrieved.Conclusion)
+	require.True(t, retrieved.HasChanges)
+	require.Equal(t, int64(0), retrieved.ApplyID)
+}
+
+func TestCheckStore_MarkActionRequiredForApplySkipsNewerRunningApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	rollbackApply := createCheckStoreApply(t, store, "rollback-complete-old", state.Apply.Completed)
+	newApply := createCheckStoreApply(t, store, "apply-running-new", state.Apply.Running)
+	require.Greater(t, newApply.ID, rollbackApply.ID)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      rollbackApply.ID,
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.HasChanges = true
+	check.Conclusion = "action_required"
+	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, rollbackApply)
+	require.NoError(t, err)
+	require.False(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "completed", retrieved.Status)
+	require.Equal(t, "success", retrieved.Conclusion)
+	require.False(t, retrieved.HasChanges)
+	require.Equal(t, rollbackApply.ID, retrieved.ApplyID)
+}
+
+func createCheckStoreApply(t *testing.T, store storage.Storage, applyIdentifier, applyState string) *storage.Apply {
+	t.Helper()
+	apply := &storage.Apply{
+		ApplyIdentifier: applyIdentifier,
+		Database:        "testdb",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          storage.EngineSpirit,
+		State:           applyState,
+	}
+	id, err := store.Applies().Create(t.Context(), apply)
+	require.NoError(t, err)
+
+	created, err := store.Applies().Get(t.Context(), id)
+	require.NoError(t, err)
+	require.NotNil(t, created)
+	return created
 }

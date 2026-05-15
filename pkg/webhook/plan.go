@@ -25,6 +25,20 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
+	// Fix checks stuck at "in_progress" from crashed applies
+	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
+		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
+		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
+			RequestedBy: requestedBy,
+			Timestamp:   time.Now().UTC().Format("2006-01-02 15:04:05"),
+			Environment: environment,
+			CommandName: action.Plan,
+			ErrorDetail: "Failed to reconcile stale status checks: " + err.Error(),
+		}))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "status check reconciliation failed"})
+		return
+	}
+
 	// Discover config and fetch schema files from PR
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
 	if err != nil {
@@ -92,6 +106,18 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 	client, err := h.ghClient.ForInstallation(installationID)
 	if err != nil {
 		h.logger.Error("failed to create GitHub client", "error", err)
+		return
+	}
+
+	// Fix checks stuck at "in_progress" from crashed applies
+	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
+		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
+		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
+			RequestedBy: requestedBy,
+			Timestamp:   time.Now().UTC().Format("2006-01-02 15:04:05"),
+			CommandName: action.Plan,
+			ErrorDetail: "Failed to reconcile stale status checks: " + err.Error(),
+		}))
 		return
 	}
 

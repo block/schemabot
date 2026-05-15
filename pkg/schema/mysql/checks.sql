@@ -7,6 +7,7 @@ CREATE TABLE `checks` (
   `database_type` varchar(50) NOT NULL,
   `database_name` varchar(255) NOT NULL,
   `check_run_id` bigint DEFAULT NULL,
+  `apply_id` bigint unsigned DEFAULT NULL,
   `has_changes` tinyint(1) NOT NULL DEFAULT '1',
   `status` varchar(255) NOT NULL,
   `conclusion` varchar(255) DEFAULT NULL,
@@ -17,5 +18,6 @@ CREATE TABLE `checks` (
   UNIQUE KEY `idx_check_key` (`repository`,`pull_request`,`environment`,`database_type`,`database_name`),
   KEY `idx_repo_env_db` (`repository`,`environment`,`database_type`,`database_name`),
   KEY `idx_repo_pr` (`repository`,`pull_request`),
-  KEY `idx_check_run` (`check_run_id`)
+  KEY `idx_check_run` (`check_run_id`),
+  KEY `idx_apply_id` (`apply_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

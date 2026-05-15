@@ -100,6 +100,10 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 - `_ = someFunc()` — never discard errors; check and propagate them
 - Background goroutines that cannot return errors to callers should transition to an error state (e.g., `dr.Error`) and return, not silently continue with partial results
 
+**Do not conflate causes in one branch.** Avoid guards like `if err != nil || value == nil` when the two cases have different meanings, severity, or log fields. Separate handling is always better for triage: operators should be able to tell whether storage failed, a row was missing, ownership changed, or an invariant was violated. This also avoids misleading logs such as `"error": nil`.
+
+**Name compound predicates.** When a conditional combines several checks, especially state-machine checks or 3+ boolean terms, consider extracting a small helper with a behavior-focused name. Keep error handling separate from state predicates so the caller can log or return the right cause, and the helper can read like the invariant being checked.
+
 **Wrap errors with context:** Always wrap errors with `fmt.Errorf("context: %w", err)` instead of returning bare `err`. The context should include *what was being done* and *key identifiers* — not just the method name. For example, `fmt.Errorf("proxy query %s: %w", query, err)` tells you which query failed, while `fmt.Errorf("exec query: %w", err)` just restates the function name. Include the data that will help someone debug the issue from the error message alone.
 
 **Info logging on critical paths:** Add `slog.Info` logging at key decision points and state transitions in critical-path code (server startup, request handling, background processors). Logs should include relevant identifiers (org, database, keyspace, branch) so operators can trace the flow. Don't log in hot loops or purely internal helpers — focus on boundaries and state changes.

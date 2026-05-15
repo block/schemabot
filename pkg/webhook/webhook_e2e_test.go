@@ -1832,6 +1832,7 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 		DatabaseType: "mysql",
 		DatabaseName: dbName,
 		CheckRunID:   42,
+		ApplyID:      applyID,
 		HasChanges:   false,
 		Status:       checkStatusCompleted,
 		Conclusion:   checkConclusionSuccess,
@@ -1883,9 +1884,21 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 	// Wait for the rollback apply to complete and check to be updated
 	require.Eventually(t, func() bool {
 		check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
-		return err == nil && check != nil && check.Conclusion == checkConclusionActionRequired
+		if err != nil {
+			return false
+		}
+		return isActionRequiredWithoutApplyOwnership(check)
 	}, 30*time.Second, 500*time.Millisecond,
-		"check should transition to action_required after rollback")
+		"check should transition to action_required without active apply ownership after rollback")
+}
+
+func isActionRequiredWithoutApplyOwnership(check *storage.Check) bool {
+	if check == nil {
+		return false
+	}
+	return check.Status == checkStatusCompleted &&
+		check.Conclusion == checkConclusionActionRequired &&
+		check.ApplyID == 0
 }
 
 // TestE2ERollbackIgnoredByNonOwningInstance verifies that in a multi-instance
@@ -2076,6 +2089,100 @@ func TestE2EStaleCheckCleanup(t *testing.T) {
 	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
 	require.NoError(t, err)
 	require.NotNil(t, check, "active check should still exist")
+}
+
+// TestE2EReconcileStaleInProgressCheck verifies that when a check is stuck at
+// "in_progress" from a crashed apply, the next plan or apply command reconciles
+// it to the apply's terminal state. This prevents branch protection from being
+// blocked indefinitely after a server crash mid-apply.
+func TestE2EReconcileStaleInProgressCheck(t *testing.T) {
+	dbName := "webhook_stale_inprogress"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Seed a completed apply (simulates an apply that finished but the goroutine died)
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-stale-test",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Completed,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	// Seed a check stuck at "in_progress" (the goroutine died before updating it)
+	err = svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha999",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	})
+	require.NoError(t, err)
+
+	// Seed an aggregate also stuck at in_progress
+	err = svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha999",
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
+		CheckRunID:   100,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	})
+	require.NoError(t, err)
+
+	// Set up fake GitHub
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	result := setupFakeGitHubForPlan(t, mux, nil, "", dbName)
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	require.NoError(t, h.reconcileStaleChecks(ctx, installClient, "octocat/hello-world", 1))
+
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
+
+	select {
+	case checkRun := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, checkRun.Name)
+		assert.Equal(t, "abc123", checkRun.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, checkRun.Status)
+		assert.Equal(t, checkConclusionSuccess, checkRun.Conclusion)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for aggregate check run")
+	}
+
+	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, aggregate)
+	assert.Equal(t, "abc123", aggregate.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, aggregate.Status)
+	assert.Equal(t, checkConclusionSuccess, aggregate.Conclusion)
 }
 
 // TestE2EMultiAppAutoPlan simulates a monorepo with multiple apps, each with their

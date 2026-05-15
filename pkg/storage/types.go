@@ -40,9 +40,26 @@ type Lock struct {
 	UpdatedAt time.Time
 }
 
-// Check represents a GitHub status check record.
-// One check per (PR, environment, database) combination.
-// Check name format: "SchemaBot: {env}/{type}/{database}"
+// Check terminology:
+//   - GitHub Check Run: the external GitHub Checks API object visible on a PR.
+//   - Stored check state: a row in SchemaBot's checks table.
+//
+// Check represents stored check state. SchemaBot writes per-database stored
+// state when planning, starting an apply, completing an apply, reconciling stale
+// applies, or processing rollback completion. Those per-database rows do not
+// create per-database GitHub Check Runs; they are internal inputs to aggregate
+// calculation.
+//
+// SchemaBot stores this state because GitHub only owns the visible merge-gate
+// object, not SchemaBot's per-database workflow state. Durable stored state lets
+// SchemaBot recompute aggregates, survive restarts, reconcile stale applies,
+// enforce ordering rules, clean up on PR close, and answer internal safety
+// checks without treating the GitHub API as the source of truth.
+//
+// The aggregate check path reads the per-database stored state, creates or
+// updates the visible GitHub Check Run, then writes an aggregate stored state
+// row whose CheckRunID points at that GitHub object. Later GitHub check_run
+// webhooks use CheckRunID to find the matching stored state.
 type Check struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
@@ -65,20 +82,25 @@ type Check struct {
 	// DatabaseName is the name of the database.
 	DatabaseName string
 
-	// CheckRunID is the GitHub Check Run ID used to update the check status via the GitHub API.
+	// CheckRunID is the GitHub Check Run ID used to update GitHub via the Checks API.
 	CheckRunID int64
+
+	// ApplyID is the storage apply ID this stored state currently represents.
+	// It is set while apply state is in_progress so terminal updates cannot
+	// overwrite a newer apply's stored check state.
+	ApplyID int64
 
 	// HasChanges indicates whether schema changes were detected.
 	HasChanges bool
 
-	// Status is the internal check status: "pending_apply", "applying", "completed", etc.
+	// Status is SchemaBot's stored status: "pending_apply", "applying", "completed", etc.
 	Status string
 
 	// Conclusion is the GitHub Check Run conclusion set when the check completes.
 	// Values: "success", "failure", "action_required", "neutral", "cancelled", "skipped".
 	Conclusion string
 
-	// ErrorMessage contains a human-readable explanation when the check fails.
+	// ErrorMessage contains a human-readable explanation when the check state fails.
 	// Displayed in the GitHub Check Run details and PR comment.
 	ErrorMessage string
 
