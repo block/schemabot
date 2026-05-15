@@ -20,7 +20,8 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/block/spirit/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 	"google.golang.org/grpc"
@@ -251,19 +252,36 @@ func extractTableName(content string) string {
 func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddress string, err error) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	// Create the testdb database on the target MySQL for Spirit tests
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetCfg, err := mysql.ParseDSN(targetDSN)
+	if err != nil {
+		return "", fmt.Errorf("parse target DSN: %w", err)
+	}
+	databaseName := targetCfg.DBName
+	if databaseName == "" || databaseName == "target_test" {
+		// The package-level gRPC server uses testdb so CLI-focused tests have a stable database name.
+		databaseName = "testdb"
+	}
+
+	adminCfg := *targetCfg
+	adminCfg.DBName = ""
+	adminCfg.MultiStatements = true
+
+	// Create the target database before starting the remote Tern service.
+	targetDB, err := sql.Open("mysql", adminCfg.FormatDSN())
 	if err != nil {
 		return "", fmt.Errorf("open target db: %w", err)
 	}
-	if _, err := targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS testdb"); err != nil {
-		_ = targetDB.Close()
-		return "", fmt.Errorf("create testdb: %w", err)
+	defer utils.CloseAndLog(targetDB)
+	if err := targetDB.PingContext(ctx); err != nil {
+		return "", fmt.Errorf("ping target db: %w", err)
 	}
-	_ = targetDB.Close()
+	if _, err := targetDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(databaseName))); err != nil {
+		return "", fmt.Errorf("create target database %s: %w", databaseName, err)
+	}
 
-	// Build DSN for testdb (replace database name in DSN)
-	testdbDSN := strings.Replace(targetDSN, "/target_test", "/testdb", 1)
+	clientCfg := *targetCfg
+	clientCfg.DBName = databaseName
+	clientDSN := clientCfg.FormatDSN()
 
 	// Open Tern storage (separate from SchemaBot storage, simulates production architecture)
 	storageDB, err := sql.Open("mysql", storageDSN)
@@ -275,9 +293,9 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 
 	// Create LocalClient backed by Tern storage
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
-		Database:  "testdb",
+		Database:  databaseName,
 		Type:      "mysql",
-		TargetDSN: testdbDSN,
+		TargetDSN: clientDSN,
 	}, storage, logger)
 	if err != nil {
 		return "", fmt.Errorf("create local client: %w", err)
@@ -316,6 +334,10 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	}
 
 	return grpcAddress, nil
+}
+
+func quoteIdentifier(name string) string {
+	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
 // containerName generates a unique container name based on the git branch.

@@ -238,6 +238,7 @@ func TestRecordApplyMetrics(t *testing.T) {
 
 	metrics.RecordApply(t.Context(), "mydb", "staging", "success")
 	metrics.RecordApply(t.Context(), "mydb", "staging", "error")
+	metrics.RecordApply(t.Context(), "mydb", "staging", "conflict")
 	metrics.RecordApplyDuration(t.Context(), 2*time.Second, "mydb", "staging", "success")
 
 	names := collectMetricNames(t, reader)
@@ -421,7 +422,7 @@ func TestRecordLockOperationMetric(t *testing.T) {
 	assert.True(t, names["schemabot.lock_operations_total"], "expected schemabot.lock_operations_total")
 }
 
-func TestRecordRecoveryCycleMetric(t *testing.T) {
+func TestRecordSchedulerMetrics(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	prevMP := otel.GetMeterProvider()
@@ -431,12 +432,16 @@ func TestRecordRecoveryCycleMetric(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordRecoveryCycle(t.Context(), 2, 1)
+	metrics.RecordSchedulerResume(t.Context(), "testdb", "staging", "running")
+	metrics.RecordSchedulerResumeFailure(t.Context(), "testdb", "staging", "no_client")
+	metrics.RecordSchedulerClaimFailure(t.Context(), "storage_error")
+	metrics.RecordSchedulerClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "staging", "running")
 
 	names := collectMetricNames(t, reader)
-	assert.True(t, names["schemabot.recovery.cycles_total"], "expected schemabot.recovery.cycles_total")
-	assert.True(t, names["schemabot.recovery.recovered_total"], "expected schemabot.recovery.recovered_total")
-	assert.True(t, names["schemabot.recovery.failed_total"], "expected schemabot.recovery.failed_total")
+	assert.True(t, names["schemabot.scheduler.resumed_total"], "expected schemabot.scheduler.resumed_total")
+	assert.True(t, names["schemabot.scheduler.resume_failures_total"], "expected schemabot.scheduler.resume_failures_total")
+	assert.True(t, names["schemabot.scheduler.claim_failures_total"], "expected schemabot.scheduler.claim_failures_total")
+	assert.True(t, names["schemabot.scheduler.claim_duration_seconds"], "expected schemabot.scheduler.claim_duration_seconds")
 }
 
 // setupTraceTest creates an in-memory trace exporter and configures the global

@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -29,6 +31,196 @@ type applyStore struct {
 	db *sql.DB
 }
 
+type applyWriteTx struct {
+	tx *sql.Tx
+}
+
+type queryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// claimableApplyStates returns apply states where scheduler recovery can safely
+// resume work after the heartbeat becomes stale. Pending and running states can
+// be orphaned by a server crash, and deploy/cutover/revert-window states have
+// already persisted enough engine metadata for recovery to continue from stored
+// state. Terminal states are already done, stopped requires an explicit user
+// start, and PlanetScale setup states are excluded until recovery can reload the
+// persisted branch/deploy metadata needed to resume them without restarting setup.
+func claimableApplyStates() []string {
+	return []string{
+		state.Apply.Pending,
+		state.Apply.Running,
+		state.Apply.WaitingForDeploy,
+		state.Apply.WaitingForCutover,
+		state.Apply.CuttingOver,
+		state.Apply.RevertWindow,
+	}
+}
+
+func terminalApplyStates() []string {
+	return []string{
+		state.Apply.Completed,
+		state.Apply.Failed,
+		state.Apply.Stopped,
+		state.Apply.Cancelled,
+		state.Apply.Reverted,
+	}
+}
+
+func isActiveApplyState(applyState string) bool {
+	return !state.IsTerminalApplyState(applyState)
+}
+
+func hasApplyTarget(database, dbType, environment string) bool {
+	return database != "" && dbType != "" && environment != ""
+}
+
+func placeholders(count int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
+}
+
+func stringArgs(values []string) []any {
+	args := make([]any, len(values))
+	for i, value := range values {
+		args[i] = value
+	}
+	return args
+}
+
+func nonTerminalApplyStatePredicate(column string) (string, []any) {
+	terminalStates := terminalApplyStates()
+	return fmt.Sprintf("%s NOT IN (%s)", column, placeholders(len(terminalStates))), stringArgs(terminalStates)
+}
+
+func rollbackApplyTx(ctx context.Context, tx *sql.Tx, operation string) {
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		slog.WarnContext(ctx, "failed to roll back apply transaction", "operation", operation, "error", err)
+	}
+}
+
+func beginApplyWriteTx(ctx context.Context, db *sql.DB, operation string) (*applyWriteTx, error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return nil, fmt.Errorf("begin %s transaction: %w", operation, err)
+	}
+
+	return &applyWriteTx{tx: tx}, nil
+}
+
+func (w *applyWriteTx) close(ctx context.Context, operation string) {
+	if w == nil {
+		return
+	}
+	if w.tx != nil {
+		rollbackApplyTx(ctx, w.tx, operation)
+	}
+}
+
+func (w *applyWriteTx) commit() error {
+	err := w.tx.Commit()
+	w.tx = nil
+	return err
+}
+
+// apply_target_locks rows are persistent mutex rows keyed by target. They are
+// created lazily and intentionally survive apply completion; the apply lifecycle
+// remains in applies, while this table gives first writers an exact row to lock.
+func ensureApplyTargetLockRow(ctx context.Context, db *sql.DB, database, dbType, environment string) error {
+	if !hasApplyTarget(database, dbType, environment) {
+		return fmt.Errorf("active apply target is required for %s/%s/%s", database, dbType, environment)
+	}
+
+	var id int64
+	err := db.QueryRowContext(ctx,
+		"SELECT `id` FROM `apply_target_locks` "+
+			"WHERE `database_name` = ? "+
+			"AND `database_type` = ? "+
+			"AND `environment` = ?",
+		database, dbType, environment,
+	).Scan(&id)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read apply target for %s/%s/%s: %w", database, dbType, environment, err)
+	}
+
+	_, err = db.ExecContext(ctx,
+		"INSERT IGNORE INTO `apply_target_locks` (`database_name`, `database_type`, `environment`) "+
+			"VALUES (?, ?, ?)",
+		database, dbType, environment,
+	)
+	if err != nil {
+		return fmt.Errorf("ensure apply target for %s/%s/%s: %w", database, dbType, environment, err)
+	}
+	return nil
+}
+
+func lockApplyTargetRow(ctx context.Context, tx *sql.Tx, database, dbType, environment string) error {
+	var id int64
+	err := tx.QueryRowContext(ctx,
+		"SELECT `id` FROM `apply_target_locks` "+
+			"WHERE `database_name` = ? "+
+			"AND `database_type` = ? "+
+			"AND `environment` = ? "+
+			"FOR UPDATE",
+		database, dbType, environment,
+	).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("apply target missing for %s/%s/%s", database, dbType, environment)
+	}
+	if err != nil {
+		return fmt.Errorf("lock apply target for %s/%s/%s: %w", database, dbType, environment, err)
+	}
+	return nil
+}
+
+func checkNoActiveApplyForTarget(ctx context.Context, tx *sql.Tx, database, dbType, environment string, excludeApplyID int64) error {
+	statePredicate, stateArgs := nonTerminalApplyStatePredicate("state")
+	query := fmt.Sprintf(`
+		SELECT count(*) FROM applies FORCE INDEX (idx_database_env)
+		WHERE database_name = ?
+		AND database_type = ?
+		AND environment = ?
+		AND %s
+	`, statePredicate)
+	args := append([]any{database, dbType, environment}, stateArgs...)
+	if excludeApplyID > 0 {
+		query += " AND id != ?"
+		args = append(args, excludeApplyID)
+	}
+
+	var activeCount int64
+	err := tx.QueryRowContext(ctx, query, args...).Scan(&activeCount)
+	if err != nil {
+		return fmt.Errorf("check active applies for %s/%s/%s: %w", database, dbType, environment, err)
+	}
+	if activeCount > 0 {
+		return fmt.Errorf("active apply exists for %s/%s/%s: %w", database, dbType, environment, storage.ErrActiveApplyExists)
+	}
+	return nil
+}
+
+func applyTargetForUpdate(ctx context.Context, db queryRower, apply *storage.Apply) (string, string, string, error) {
+	if hasApplyTarget(apply.Database, apply.DatabaseType, apply.Environment) {
+		return apply.Database, apply.DatabaseType, apply.Environment, nil
+	}
+
+	var database, dbType, environment string
+	err := db.QueryRowContext(ctx, `
+		SELECT database_name, database_type, environment
+		FROM applies
+		WHERE id = ?
+	`, apply.ID).Scan(&database, &dbType, &environment)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", "", nil
+	}
+	if err != nil {
+		return "", "", "", fmt.Errorf("load apply target for update %d: %w", apply.ID, err)
+	}
+	return database, dbType, environment, nil
+}
+
 // Create stores a new apply and returns its ID.
 func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, error) {
 	// Ensure options has valid JSON (empty object if nil)
@@ -37,7 +229,29 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 		options = []byte("{}")
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	lockTarget := isActiveApplyState(apply.State)
+	if lockTarget {
+		if err := ensureApplyTargetLockRow(ctx, s.db, apply.Database, apply.DatabaseType, apply.Environment); err != nil {
+			return 0, err
+		}
+	}
+
+	writeTx, err := beginApplyWriteTx(ctx, s.db, "create apply")
+	if err != nil {
+		return 0, err
+	}
+	defer writeTx.close(ctx, "create apply")
+
+	if lockTarget {
+		if err := lockApplyTargetRow(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment); err != nil {
+			return 0, err
+		}
+		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, 0); err != nil {
+			return 0, err
+		}
+	}
+
+	result, err := writeTx.tx.ExecContext(ctx, `
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
 			repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
@@ -50,14 +264,18 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	)
 	if err != nil {
 		if isDuplicateKeyError(err) {
-			return 0, storage.ErrApplyIDExists
+			return 0, fmt.Errorf("create apply %s: %w", apply.ApplyIdentifier, storage.ErrApplyIDExists)
 		}
-		return 0, err
+		return 0, fmt.Errorf("insert apply %s: %w", apply.ApplyIdentifier, err)
 	}
 
 	id, err := result.LastInsertId()
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("read inserted apply id for %s: %w", apply.ApplyIdentifier, err)
+	}
+
+	if err := writeTx.commit(); err != nil {
+		return 0, fmt.Errorf("commit create apply: %w", err)
 	}
 
 	return id, nil
@@ -114,27 +332,66 @@ func (s *applyStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Ap
 
 // Update updates apply state and fields.
 func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
-	_, err := s.db.ExecContext(ctx, `
+	lockTarget := isActiveApplyState(apply.State)
+	database, dbType, environment := apply.Database, apply.DatabaseType, apply.Environment
+	var err error
+	if lockTarget && !hasApplyTarget(database, dbType, environment) {
+		database, dbType, environment, err = applyTargetForUpdate(ctx, s.db, apply)
+		if err != nil {
+			return err
+		}
+	}
+
+	shouldLockTarget := lockTarget && hasApplyTarget(database, dbType, environment)
+	if shouldLockTarget {
+		if err := ensureApplyTargetLockRow(ctx, s.db, database, dbType, environment); err != nil {
+			return err
+		}
+	}
+
+	writeTx, err := beginApplyWriteTx(ctx, s.db, "update apply")
+	if err != nil {
+		return err
+	}
+	defer writeTx.close(ctx, "update apply")
+
+	if shouldLockTarget {
+		if err := lockApplyTargetRow(ctx, writeTx.tx, database, dbType, environment); err != nil {
+			return err
+		}
+		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, database, dbType, environment, apply.ID); err != nil {
+			return err
+		}
+	}
+
+	_, err = writeTx.tx.ExecContext(ctx, `
 		UPDATE applies
 		SET state = ?, error_message = ?,
 		    external_id = ?, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?
 	`, apply.State, apply.ErrorMessage,
 		apply.ExternalID, apply.StartedAt, apply.CompletedAt, apply.ID)
-	return err
+	if err != nil {
+		return fmt.Errorf("update apply %d: %w", apply.ID, err)
+	}
+	if err := writeTx.commit(); err != nil {
+		return fmt.Errorf("commit update apply %d: %w", apply.ID, err)
+	}
+	return nil
 }
 
 // GetInProgress returns all applies in non-terminal states.
-// Note: For recovery, use ClaimForRecovery which handles locking and heartbeat staleness.
+// Note: For recovery, use FindNextApply which handles locking and heartbeat staleness.
 func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	statePredicate, args := nonTerminalApplyStatePredicate("state")
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT `+applyColumns+`
 		FROM applies
-		WHERE state NOT IN ('completed', 'failed', 'stopped', 'reverted')
+		WHERE %s
 		ORDER BY created_at DESC
-	`)
+	`, statePredicate), args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query in-progress applies: %w", err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -157,64 +414,59 @@ func (s *applyStore) GetRecent(ctx context.Context, limit int) ([]*storage.Apply
 	return scanApplies(rows)
 }
 
-// ClaimForRecovery atomically claims an apply for recovery using heartbeat-based leasing.
-// It uses FOR UPDATE SKIP LOCKED to prevent race conditions between workers.
-// Only applies with stale heartbeats (updated_at > 1 minute ago) are claimed.
-// Returns the claimed apply, or nil if no apply is available to claim.
+// FindNextApply atomically claims the next apply that needs attention.
+// A claim selects one stale apply and refreshes its heartbeat in the same
+// transaction. That heartbeat is the scheduler's lease while it reloads state
+// and resumes the apply.
+// Returns the claimed apply, or nil if nothing needs work.
 //
-// The caller MUST call Heartbeat periodically (every 10 seconds) to maintain the lease.
-func (s *applyStore) ClaimForRecovery(ctx context.Context) (*storage.Apply, error) {
-	// Start a transaction for the claim
-	tx, err := s.db.BeginTx(ctx, nil)
+// Matches stale active applies where heartbeat expired > 1 minute. Apply
+// creation/update enforces one active apply per database/type/environment, so
+// claims only need to lease one stale row and avoid worker races on that row.
+func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) {
+	// Read committed keeps concurrent SKIP LOCKED claims from taking next-key
+	// range locks that can serialize workers across otherwise independent targets.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("begin claim apply transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer rollbackApplyTx(ctx, tx, "claim apply")
 
-	// Find an apply that:
-	// 1. Is in an active (non-terminal) state:
-	//    - pending: created but not started (server crashed before Apply spawned worker)
-	//    - running: actively copying rows
-	//    - waiting_for_cutover: copy complete, waiting for cutover trigger
-	//    - cutting_over: actively swapping tables
-	//    - revert_window: completed but monitoring for revert (optional recovery)
-	// 2. Has a stale heartbeat (updated_at > 1 minute ago) = crashed worker
-	// 3. Use FOR UPDATE SKIP LOCKED to prevent race conditions
-	row := tx.QueryRowContext(ctx, `
-		SELECT `+applyColumns+`
-		FROM applies
-		WHERE state IN (?, ?, ?, ?, ?, ?)
-		  AND updated_at < NOW() - INTERVAL 1 MINUTE
-		ORDER BY created_at
+	activeStates := claimableApplyStates()
+	activeStatePlaceholders := placeholders(len(activeStates))
+	queryArgs := stringArgs(activeStates)
+
+	// Apply creation/update enforces at most one active apply per
+	// database/type/environment. The claim query only needs to find stale work;
+	// FOR UPDATE SKIP LOCKED prevents concurrent workers from claiming the same row.
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM applies a
+		WHERE a.state IN (%s)
+		AND a.updated_at < NOW() - INTERVAL 1 MINUTE
+		ORDER BY a.created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`,
-		state.Apply.Pending,
-		state.Apply.Running,
-		state.Apply.WaitingForDeploy,
-		state.Apply.WaitingForCutover,
-		state.Apply.CuttingOver,
-		state.Apply.RevertWindow,
-	)
+	`, applyColumns, activeStatePlaceholders), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil // No apply to claim
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("query next claimable apply: %w", err)
 	}
 
-	// Claim by updating updated_at to now (this is our heartbeat)
+	// Refresh the heartbeat as part of the claim before releasing the row lock.
 	_, err = tx.ExecContext(ctx, `
 		UPDATE applies SET updated_at = NOW() WHERE id = ?
 	`, apply.ID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("refresh heartbeat for claimed apply %d: %w", apply.ID, err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("commit claim apply %d: %w", apply.ID, err)
 	}
 
 	return apply, nil
@@ -222,14 +474,17 @@ func (s *applyStore) ClaimForRecovery(ctx context.Context) (*storage.Apply, erro
 
 // Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 // Should be called every 10 seconds while working on an apply.
-// If not called for > 1 minute, another worker can claim the apply via ClaimForRecovery.
+// If not called for > 1 minute, another worker can claim the apply via FindNextApply.
 // Does not check RowsAffected — if the apply was deleted, the UPDATE matches 0 rows
 // and returns nil.
 func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE applies SET updated_at = NOW() WHERE id = ?
 	`, applyID)
-	return err
+	if err != nil {
+		return fmt.Errorf("heartbeat apply %d: %w", applyID, err)
+	}
+	return nil
 }
 
 // GetByDatabase returns applies for a specific database and optionally filtered by dbType and environment.

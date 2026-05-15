@@ -16,13 +16,16 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 | `schemabot.webhook.events_total` | Counter | event_type, action, repository, status | GitHub webhook events |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.lock_operations_total` | Counter | operation, database, status | Lock acquire/release operations |
-| `schemabot.recovery.cycles_total` | Counter | — | Recovery worker polling cycles |
-| `schemabot.recovery.recovered_total` | Counter | — | Applies recovered by the recovery worker |
-| `schemabot.recovery.failed_total` | Counter | — | Recovery attempts that failed |
+| `schemabot.scheduler.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the scheduler |
+| `schemabot.scheduler.resume_failures_total` | Counter | database, environment, reason | Scheduler resume attempts that failed |
+| `schemabot.scheduler.claim_failures_total` | Counter | reason | Scheduler claim attempts that failed |
+| `schemabot.scheduler.claim_duration_seconds` | Histogram | database, environment, previous_state | Scheduler claim and resume duration |
 
 ### Attribute Values
 
-**status** (plans/applies): `success`, `error`, `rejected`
+**status** (plans): `success`, `error`
+
+**status** (applies): `success`, `error`, `rejected`, `conflict`
 
 **operation** (check ownership): `apply_finished`, `rollback_finished`
 
@@ -43,6 +46,8 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 **action** (webhooks): `created`, `opened`, `synchronize`, `reopened`, `closed`, `requested`, `completed` (omitted for events without actions like `ping`)
 
 **status** (webhooks): `processed`, `invalid_signature`, `ignored`
+
+**reason** (scheduler claim failures): `storage_error`, `unknown`
 
 ### Check Ownership Misses
 

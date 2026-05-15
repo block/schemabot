@@ -209,6 +209,11 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 
 	resp, applyID, err := s.ExecuteApply(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, storage.ErrActiveApplyExists) {
+			s.logger.Warn("apply blocked by active apply", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply blocked by active apply: "+err.Error())
+			return
+		}
 		s.logger.Error("apply failed", "plan_id", req.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "apply failed: "+err.Error())
 		return
@@ -217,6 +222,13 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	_ = applyID // HTTP handler doesn't need the stored apply ID
 
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+func applyMetricStatusForError(err error) string {
+	if errors.Is(err, storage.ErrActiveApplyExists) {
+		return "conflict"
+	}
+	return "error"
 }
 
 // ExecuteApply executes an apply request via the Tern client, stores the result,
@@ -297,11 +309,15 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	// Time only the client.Apply call, not plan lookup or client creation.
 	applyStart := time.Now()
 	resp, err := client.Apply(ctx, ternReq)
+	applyDuration := time.Since(applyStart)
+	recordApplyResult := func(status string) {
+		metrics.RecordApply(ctx, plan.Database, req.Environment, status)
+		metrics.RecordApplyDuration(ctx, applyDuration, plan.Database, req.Environment, status)
+	}
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "apply failed")
-		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
-		metrics.RecordApplyDuration(ctx, time.Since(applyStart), plan.Database, req.Environment, "error")
+		recordApplyResult(applyMetricStatusForError(err))
 		return nil, 0, err
 	}
 	applyStatus := "success"
@@ -309,11 +325,6 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		applyStatus = "rejected"
 	}
 	span.SetAttributes(attribute.String("apply_id", resp.ApplyId), attribute.Bool("accepted", resp.Accepted))
-	metrics.RecordApply(ctx, plan.Database, req.Environment, applyStatus)
-	metrics.RecordApplyDuration(ctx, time.Since(applyStart), plan.Database, req.Environment, applyStatus)
-	if resp.Accepted {
-		metrics.AdjustActiveApplies(ctx, 1, plan.Database, req.Environment)
-	}
 
 	// Store apply and task records in SchemaBot's storage.
 	//
@@ -340,14 +351,18 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 			// records in the same database. Just look up the existing record.
 			existing, lookupErr := s.storage.Applies().GetByApplyIdentifier(ctx, resp.ApplyId)
 			if lookupErr != nil {
-				return nil, 0, fmt.Errorf("lookup local apply %s: %w", resp.ApplyId, lookupErr)
+				err := fmt.Errorf("lookup local apply %s: %w", resp.ApplyId, lookupErr)
+				recordApplyResult(applyMetricStatusForError(err))
+				return nil, 0, err
 			}
 			if existing == nil {
 				s.logger.Error("local apply not found after LocalClient.Apply()",
 					"apply_id", resp.ApplyId,
 					"accepted", resp.Accepted,
 				)
-				return nil, 0, fmt.Errorf("local apply %s not found — LocalClient should have created it", resp.ApplyId)
+				err := fmt.Errorf("local apply %s not found — LocalClient should have created it", resp.ApplyId)
+				recordApplyResult(applyMetricStatusForError(err))
+				return nil, 0, err
 			}
 			storedApplyID = existing.ID
 			applyIdentifier = existing.ApplyIdentifier
@@ -392,7 +407,9 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 			}
 			storedApplyID, err = s.storage.Applies().Create(ctx, apply)
 			if err != nil {
-				return nil, 0, fmt.Errorf("store apply: %w", err)
+				err := fmt.Errorf("store apply: %w", err)
+				recordApplyResult(applyMetricStatusForError(err))
+				return nil, 0, err
 			}
 
 			for _, ddlChange := range plan.FlatDDLChanges() {
@@ -416,7 +433,9 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 					UpdatedAt:      now,
 				}
 				if _, err := s.storage.Tasks().Create(ctx, task); err != nil {
-					return nil, 0, fmt.Errorf("store task: %w", err)
+					err := fmt.Errorf("store task: %w", err)
+					recordApplyResult(applyMetricStatusForError(err))
+					return nil, 0, err
 				}
 			}
 
@@ -429,6 +448,11 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 				s.logger.Warn("failed to start progress tracking", "apply_id", applyIdentifier, "error", err)
 			}
 		}
+	}
+
+	recordApplyResult(applyStatus)
+	if resp.Accepted {
+		metrics.AdjustActiveApplies(ctx, 1, plan.Database, req.Environment)
 	}
 
 	applyResp := &apitypes.ApplyResponse{

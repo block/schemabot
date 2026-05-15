@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -37,9 +38,38 @@ func (m *mockStorage) Settings() storage.SettingsStore               { return ni
 func (m *mockStorage) Ping(ctx context.Context) error                { return m.pingErr }
 func (m *mockStorage) Close() error                                  { return nil }
 
+type mockPlanLookupStore struct {
+	plan *storage.Plan
+	err  error
+}
+
+func (m *mockPlanLookupStore) Create(context.Context, *storage.Plan) (int64, error) { return 0, nil }
+func (m *mockPlanLookupStore) Get(context.Context, string) (*storage.Plan, error) {
+	return m.plan, m.err
+}
+func (m *mockPlanLookupStore) GetByID(context.Context, int64) (*storage.Plan, error) { return nil, nil }
+func (m *mockPlanLookupStore) GetByLock(context.Context, int64) ([]*storage.Plan, error) {
+	return nil, nil
+}
+func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.Plan, error) {
+	return nil, nil
+}
+func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
+func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
+
+type mockStorageWithPlanLookup struct {
+	mockStorage
+	plans storage.PlanStore
+}
+
+func (m *mockStorageWithPlanLookup) Plans() storage.PlanStore { return m.plans }
+
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
 	healthErr      error
+	applyResp      *ternv1.ApplyResponse
+	applyErr       error
+	applyReq       *ternv1.ApplyRequest
 	volumeResp     *ternv1.VolumeResponse
 	volumeErr      error
 	stopResp       *ternv1.StopResponse
@@ -64,7 +94,8 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 	return nil, nil
 }
 func (m *mockTernClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
-	return nil, nil
+	m.applyReq = req
+	return m.applyResp, m.applyErr
 }
 func (m *mockTernClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	return nil, nil
@@ -181,6 +212,45 @@ func TestHealth(t *testing.T) {
 func TestServiceClose(t *testing.T) {
 	svc := newTestService()
 	assert.NoError(t, svc.Close())
+}
+
+func TestApplyHandler(t *testing.T) {
+	t.Run("returns conflict when an active apply already exists", func(t *testing.T) {
+		plan := &storage.Plan{
+			ID:             42,
+			PlanIdentifier: "plan-active",
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Environment:    "staging",
+		}
+		stor := &mockStorageWithPlanLookup{
+			plans: &mockPlanLookupStore{plan: plan},
+		}
+		mock := &mockTernClient{
+			applyErr: fmt.Errorf("create apply: %w", storage.ErrActiveApplyExists),
+		}
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		ternClients := map[string]tern.Client{"default/staging": mock}
+		svc := New(stor, testServerConfig(), ternClients, logger)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"plan_id": "plan-active", "environment": "staging"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/apply", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		require.NotNil(t, mock.applyReq)
+		assert.Equal(t, "testdb", mock.applyReq.Database)
+		assert.Equal(t, storage.DatabaseTypeMySQL, mock.applyReq.Type)
+
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeActiveApplyExists, resp.ErrorCode)
+		assert.Contains(t, resp.Error, storage.ErrActiveApplyExists.Error())
+	})
 }
 
 func TestTernHealth(t *testing.T) {

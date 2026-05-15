@@ -51,7 +51,7 @@ See [`pkg/state`](../state/) for the full state hierarchy (apply states, task st
 The apply store supports crash recovery through heartbeat-based leasing:
 
 - **Heartbeat**: Workers call `Heartbeat(applyID)` every 10 seconds to signal they're alive
-- **ClaimForRecovery**: Finds applies with stale heartbeats (>1 minute since last update) using `FOR UPDATE SKIP LOCKED` to prevent races between recovery workers
+- **FindNextApply**: Claims one apply with a stale heartbeat (>1 minute since last update) by selecting it and refreshing its heartbeat in one transaction
 - If a worker crashes, its apply becomes claimable after the heartbeat times out
 
 ## Key Types

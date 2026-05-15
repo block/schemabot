@@ -61,6 +61,18 @@ tern_deployments:
 
 Routing is automatic — when a plan or apply request arrives, SchemaBot checks the `databases` config first. If the database name matches, it uses a direct connection. Otherwise, it routes to the selected Tern deployment via gRPC (defaulting to the `default` deployment key, or the repo-specific deployment configured via `repos.*.default_tern_deployment`).
 
+## Scheduler Workers
+
+SchemaBot runs a background scheduler for apply work that needs server-side coordination. By default, four workers poll for claimable work so a server can make progress across independent databases and environments concurrently.
+
+```yaml
+scheduler_workers: 4
+```
+
+Increase `scheduler_workers` when one SchemaBot server should make scheduler progress across independent databases or environments concurrently. More workers help high-scale installations with many schema changes because each worker can claim and resume a different target during the same scheduler tick. The scheduler still excludes overlapping work for the same database and environment, so this improves concurrency across independent targets, not parallel execution against one target.
+
+A scheduler claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the worker's lease while it reloads state and resumes the apply.
+
 ## Repository Allowlist
 
 By default, any repository with the GitHub App installed can use SchemaBot. Adding a `repos` section creates an allowlist — only listed repositories are permitted.

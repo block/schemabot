@@ -590,7 +590,7 @@ type atomicPollState struct {
 }
 
 // startApplyHeartbeat starts a background goroutine that heartbeats the apply
-// every 10 seconds, preventing the recovery worker from treating it as crashed.
+// every 10 seconds, preventing the scheduler from treating it as crashed.
 // Returns a cancel function that stops the heartbeat. Must be deferred by the caller.
 func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Apply) context.CancelFunc {
 	hbCtx, cancel := context.WithCancel(ctx)

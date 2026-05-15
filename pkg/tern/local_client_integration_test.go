@@ -359,8 +359,9 @@ func TestLocalClient_Plan(t *testing.T) {
 	require.NoError(t, err, "failed to create client")
 	defer utils.CloseAndLog(client)
 	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Type:        "mysql",
+		Database:    "testdb",
+		Environment: localClientTestEnvironment,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			"default": {
 				Files: map[string]string{
@@ -402,8 +403,9 @@ func TestLocalClient_Plan_UsesConfigDatabase(t *testing.T) {
 	ctx := t.Context()
 	// Even with empty database in request, LocalClient uses config.Database
 	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
-		Type:     "mysql",
-		Database: "", // ignored in local mode
+		Type:        "mysql",
+		Database:    "", // ignored in local mode
+		Environment: localClientTestEnvironment,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			"default": {
 				Files: map[string]string{
@@ -484,8 +486,9 @@ func TestLocalClient_Apply(t *testing.T) {
 	// Create a plan with desired schema (CREATE TABLE with additional column)
 	// Spirit.Diff will compute the ALTER statement from current → desired
 	planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Type:        "mysql",
+		Database:    "testdb",
+		Environment: localClientTestEnvironment,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			"default": {
 				Files: schemaFiles,
@@ -603,8 +606,9 @@ func TestLocalClient_Cutover_NoActiveMigration(t *testing.T) {
 	ctx := t.Context()
 	// Cutover without an active schema change should return an error
 	_, err = client.Cutover(ctx, &ternv1.CutoverRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Type:        "mysql",
+		Database:    "testdb",
+		Environment: localClientTestEnvironment,
 	})
 	assert.Error(t, err, "expected error for cutover without active schema change")
 }
@@ -822,8 +826,9 @@ func TestLocalClient_Apply_MultiTableSequential(t *testing.T) {
 
 	// Create a plan that modifies BOTH test tables
 	planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Type:        "mysql",
+		Database:    "testdb",
+		Environment: localClientTestEnvironment,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			"default": {
 				Files: schemaFiles,
@@ -946,8 +951,8 @@ func TestLocalClient_StartApplyHeartbeat(t *testing.T) {
 	result, err := db.ExecContext(ctx, `
 		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name,
 			database_type, repository, pull_request, environment, engine, state, options)
-		VALUES ('heartbeat-test-apply', 0, 0, 'testdb', 'mysql', '', 0, '', 'spirit', ?, '{}')
-	`, state.Apply.Running)
+		VALUES ('heartbeat-test-apply', 0, 0, 'testdb', 'mysql', '', 0, ?, 'spirit', ?, '{}')
+	`, localClientTestEnvironment, state.Apply.Running)
 	require.NoError(t, err)
 	applyID, err := result.LastInsertId()
 	require.NoError(t, err)
@@ -1021,8 +1026,9 @@ func TestLocalClient_Apply_AtomicHeartbeat(t *testing.T) {
 	})
 
 	planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Type:        "mysql",
+		Database:    "testdb",
+		Environment: localClientTestEnvironment,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			"testdb": {Files: schemaFiles},
 		},
@@ -1115,6 +1121,7 @@ func TestLocalClient_Apply_AtomicRejectsMultiNamespace(t *testing.T) {
 		PlanIdentifier: fmt.Sprintf("plan-%d", time.Now().UnixNano()),
 		Database:       "testdb",
 		DatabaseType:   "mysql",
+		Environment:    localClientTestEnvironment,
 		CreatedAt:      time.Now(),
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"ns_one": {
@@ -1135,7 +1142,7 @@ func TestLocalClient_Apply_AtomicRejectsMultiNamespace(t *testing.T) {
 	// Apply with defer_cutover (atomic mode) — should fail because of 2 namespaces
 	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
 		PlanId:      plan.PlanIdentifier,
-		Environment: "staging",
+		Environment: localClientTestEnvironment,
 		Options:     map[string]string{"defer_cutover": "true"},
 	})
 	require.NoError(t, err)
@@ -1143,7 +1150,7 @@ func TestLocalClient_Apply_AtomicRejectsMultiNamespace(t *testing.T) {
 
 	// The apply should fail with multi-namespace error
 	require.Eventually(t, func() bool {
-		applies, err := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+		applies, err := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", localClientTestEnvironment)
 		if err != nil || len(applies) == 0 {
 			return false
 		}
@@ -1205,8 +1212,9 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 
 	// Plan with namespace "testdb" (matches the DSN database name)
 	planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Type:        "mysql",
+		Database:    "testdb",
+		Environment: localClientTestEnvironment,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			"testdb": {Files: schemaFiles},
 		},
@@ -1217,14 +1225,14 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	// Apply in sequential mode (no defer_cutover)
 	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
 		PlanId:      planResp.PlanId,
-		Environment: "staging",
+		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err)
 	require.True(t, applyResp.Accepted)
 
 	// Wait for completion
 	require.Eventually(t, func() bool {
-		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", localClientTestEnvironment)
 		if len(applies) == 0 {
 			return false
 		}
@@ -1232,7 +1240,7 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	}, 30*time.Second, 500*time.Millisecond, "apply should complete")
 
 	// Verify task has correct namespace and progress was persisted
-	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", localClientTestEnvironment)
 	require.NotEmpty(t, applies)
 	tasks, err := stor.Tasks().GetByApplyID(ctx, applies[0].ID)
 	require.NoError(t, err)
@@ -1274,6 +1282,7 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 		PlanIdentifier: fmt.Sprintf("plan-%d", time.Now().UnixNano()),
 		Database:       "testdb",
 		DatabaseType:   "mysql",
+		Environment:    localClientTestEnvironment,
 		CreatedAt:      time.Now(),
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"testdb": {
@@ -1288,7 +1297,7 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 
 	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
 		PlanId:      plan.PlanIdentifier,
-		Environment: "staging",
+		Environment: localClientTestEnvironment,
 		Options:     map[string]string{"defer_cutover": "true"},
 	})
 	require.NoError(t, err)
@@ -1296,14 +1305,14 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 
 	// Wait for failure
 	require.Eventually(t, func() bool {
-		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", localClientTestEnvironment)
 		if len(applies) == 0 {
 			return false
 		}
 		return applies[0].State == state.Apply.Failed
 	}, 30*time.Second, 500*time.Millisecond, "apply should fail")
 
-	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
+	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", localClientTestEnvironment)
 	require.NotEmpty(t, applies)
 	assert.NotEmpty(t, applies[0].ErrorMessage, "apply.ErrorMessage should contain the failure reason")
 	t.Logf("apply error: %s", applies[0].ErrorMessage)

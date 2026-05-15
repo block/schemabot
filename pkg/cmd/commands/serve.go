@@ -105,6 +105,11 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 		break
 	}
 
+	// Proactively discard idle connections before MySQL's wait_timeout (default 28800s)
+	// to avoid "invalid connection" errors when the pool hands out stale connections.
+	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetConnMaxIdleTime(3 * time.Minute)
+
 	// Log config summary for debugging
 	logger.Info("config loaded",
 		"databases", len(serverConfig.Databases),
@@ -141,12 +146,12 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	// in the background so GitHub repair does not block server startup.
 	webhookRuntime.StartMissingSummaryReconciliation(ctx, logger)
 
-	// Start the recovery worker after webhook callbacks are registered.
+	// Start the scheduler worker pool after webhook callbacks are registered.
 	// This polls for stale applies every 10 seconds:
 	// - Runs immediately on startup
 	// - Recovers applies with stale heartbeats (> 1 minute) using FOR UPDATE SKIP LOCKED
 	// - STOPPED applies are NOT auto-resumed (user must call `schemabot start`)
-	svc.StartRecoveryWorker(ctx)
+	svc.StartScheduler(ctx)
 
 	// Optionally start gRPC server for Tern proto (used by docker-compose.grpc.yml)
 	var grpcServer *grpc.Server

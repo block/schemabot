@@ -33,6 +33,7 @@ import (
 type testServer struct {
 	Addr    string
 	Storage *mysqlstore.Storage
+	Service *schemabotapi.Service
 }
 
 // createTestDB creates a uniquely-named test database and returns its name and DSN.
@@ -125,7 +126,7 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 		_ = schemabotDB.Close()
 	})
 
-	return testServer{Addr: addr, Storage: storage}
+	return testServer{Addr: addr, Storage: storage, Service: svc}
 }
 
 // postJSON marshals body as JSON, POSTs to url, asserts HTTP 200,

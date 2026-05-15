@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
+	gomysql "github.com/go-sql-driver/mysql"
 )
 
 // lockColumns lists all columns for SELECT queries.
@@ -189,5 +190,9 @@ func scanLockInto(s scanner) (*storage.Lock, error) {
 
 // isDuplicateKeyError checks if the error is a MySQL duplicate key error (code 1062).
 func isDuplicateKeyError(err error) bool {
+	var mysqlErr *gomysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+		return true
+	}
 	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
 }

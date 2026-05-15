@@ -1,6 +1,6 @@
 # api
 
-Package `api` provides the SchemaBot HTTP API service. It routes requests to Tern clients, manages a lazy client pool, and runs a background recovery worker for crash detection.
+Package `api` provides the SchemaBot HTTP API service. It routes requests to Tern clients, manages a lazy client pool, and runs the background scheduler for apply coordination.
 
 ## Service
 
@@ -73,15 +73,15 @@ Lazy creation means a connection failure to one database doesn't block startup o
 | GET | `/health` | Storage connectivity check |
 | GET | `/tern-health/{deployment}/{environment}` | Tern client health |
 
-## Recovery Worker
+## Scheduler
 
-On startup, the service launches a background recovery worker (`StartRecoveryWorker`) that handles crash detection:
+On startup, the service launches a background scheduler (`StartScheduler`) that claims apply work from storage. A claim means selecting one stale apply and refreshing its heartbeat in the same transaction so the worker has a lease while it resumes the apply.
 
-1. Polls every 10 seconds for applies with stale heartbeats (no update for 1+ minute)
-2. Claims them atomically using `FOR UPDATE SKIP LOCKED`
-3. Gets the appropriate Tern client for the database/environment
-4. Calls `ResumeApply()` — the engine resumes from its checkpoint
-5. Loops until no more applies need recovery
+1. Runs immediately, then polls every 10 seconds per configured worker
+2. Finds applies with stale heartbeats (no update for 1+ minute)
+3. Claims one apply atomically by selecting it and refreshing its heartbeat in the same transaction
+4. Gets the appropriate Tern client for the database/environment
+5. Calls `ResumeApply()` so execution continues from persisted engine state
 
 Stopped applies (user called `schemabot stop`) are **not** auto-resumed. The user must explicitly call `schemabot start`.
 
@@ -102,7 +102,7 @@ See the top-level [README](../../README.md) for configuration examples.
 |------|---------|
 | `service.go` | `Service` type, Tern client pool, route registration, graceful shutdown |
 | `config.go` | `ServerConfig` loading and validation |
-| `scheduler.go` | Recovery worker (heartbeat-based crash detection) |
+| `scheduler.go` | Scheduler worker pool and background apply coordination |
 | `plan_handlers.go` | Plan and Apply HTTP handlers |
 | `control_handlers.go` | Cutover, Stop, Start, Volume, Revert handlers |
 | `progress_handlers.go` | Progress, Status, History handlers |

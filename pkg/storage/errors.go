@@ -25,6 +25,10 @@ var (
 	// ErrApplyIDExists is returned when an apply_id already exists.
 	ErrApplyIDExists = errors.New("apply already exists")
 
+	// ErrActiveApplyExists is returned when another active apply already exists
+	// for the same database, type, and environment.
+	ErrActiveApplyExists = errors.New("active apply already exists")
+
 	// ErrPlanNotFound is returned when a plan does not exist.
 	ErrPlanNotFound = errors.New("plan not found")
 

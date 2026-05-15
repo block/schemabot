@@ -94,7 +94,7 @@ func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
 }
 
 // Service is the SchemaBot API service.
-// RecoveryCallback is called after the recovery worker successfully resumes an apply.
+// RecoveryCallback is called after the scheduler claims an apply for recovery.
 // The webhook handler uses this to start watching progress and posting PR comments.
 type RecoveryCallback func(apply *storage.Apply)
 
@@ -105,12 +105,13 @@ type Service struct {
 	ternMu      sync.Mutex             // protects ternClients
 	logger      *slog.Logger
 
-	// Recovery loop management
+	// Scheduler loop management.
 	stopRecovery chan struct{}
 	recoveryWg   sync.WaitGroup
 
-	// OnApplyRecovered is called after the recovery worker resumes an apply.
-	// Set by the webhook handler to set up an observer for PR comments.
+	// OnApplyRecovered is called after the scheduler claims an apply and before
+	// ResumeApply starts the engine/poller. Set by the webhook handler to attach
+	// an observer for PR comments.
 	OnApplyRecovered RecoveryCallback
 }
 
@@ -503,8 +504,8 @@ func (s *Service) Storage() storage.Storage {
 
 // Close closes the service and releases resources.
 func (s *Service) Close() error {
-	// Stop the background recovery worker first
-	s.StopRecoveryWorker()
+	// Stop the scheduler first
+	s.StopScheduler()
 
 	s.ternMu.Lock()
 	var errs []error

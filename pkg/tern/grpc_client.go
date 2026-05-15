@@ -193,11 +193,22 @@ func (c *GRPCClient) SetPendingObserver(observer ProgressObserver) {
 // SetObserver registers a progress observer for an active apply.
 func (c *GRPCClient) SetObserver(applyID int64, observer ProgressObserver) {
 	c.observerMu.Lock()
-	defer c.observerMu.Unlock()
+	if observer == nil {
+		delete(c.observers, applyID)
+		c.observerMu.Unlock()
+		return
+	}
 	if c.observers == nil {
 		c.observers = make(map[int64]ProgressObserver)
 	}
+	_, alreadyWatching := c.observers[applyID]
 	c.observers[applyID] = observer
+	shouldStartPoller := c.storage != nil && !alreadyWatching
+	c.observerMu.Unlock()
+
+	if shouldStartPoller {
+		go c.pollAndNotifyObserver(applyID)
+	}
 }
 
 // Close closes the gRPC connection.
@@ -229,7 +240,6 @@ func (c *GRPCClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*tern
 				setter.SetApplyID(apply.ID)
 			}
 			c.SetObserver(apply.ID, obs)
-			go c.pollAndNotifyObserver(apply.ID)
 		}
 	}
 

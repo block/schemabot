@@ -436,6 +436,13 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	return nil
 }
 
+func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
+	if obs := c.getObserver(apply.ID); obs != nil {
+		obs.OnTerminal(apply, tasks)
+		c.clearObserver(apply.ID)
+	}
+}
+
 // ResumeApply resumes an in-progress apply whose heartbeat has expired.
 // This can happen after a server restart or if the worker goroutine crashed.
 // Spirit's checkpoint table allows resuming from where the schema change left off.
@@ -454,6 +461,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
 		}
+		c.notifyTerminalObserver(apply, tasks)
 		return nil
 	}
 
@@ -468,6 +476,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Failed, "error", err)
 		}
+		c.notifyTerminalObserver(apply, tasks)
 		return nil
 	}
 
@@ -500,6 +509,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
 		}
+		c.notifyTerminalObserver(apply, tasks)
 		return nil
 	}
 

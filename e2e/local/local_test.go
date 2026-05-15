@@ -954,6 +954,69 @@ CREATE TABLE %s (
 	}
 }
 
+func TestLocal_Scheduler_ServerCrashRecoversIndexAdd(t *testing.T) {
+	binPath := buildCLI(t)
+	endpoint := schemabotURL(t)
+	ensureNoActiveChange(t, endpoint)
+
+	tableName := uniqueTableName("sched_recover_events")
+	defer dropTestTable(t, tableName)
+
+	db := openTestappStaging(t)
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf(`
+		CREATE TABLE %s (
+			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			account_id BIGINT NOT NULL,
+			event_type VARCHAR(100) NOT NULL,
+			payload TEXT,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`, tableName))
+	require.NoError(t, err, "create table")
+	seedTestRows(t, db, tableName,
+		"account_id, event_type, payload",
+		"FLOOR(1 + RAND() * 100000), ELT(FLOOR(1 + RAND() * 5), 'type_a', 'type_b', 'type_c', 'type_d', 'type_e'), CONCAT('payload data ', seq)",
+		100000)
+
+	schemaDir := newSchemaDir(t)
+	writeExistingTablesSchema(t, schemaDir)
+	e2eutil.WriteFile(t, filepath.Join(schemaDir, tableName+".sql"), fmt.Sprintf(`
+CREATE TABLE %s (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    account_id BIGINT NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    payload TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_account_created (account_id, created_at)
+);
+`, tableName))
+
+	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "apply", "-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "--watch=false", "-o", "json")
+	applyID := extractApplyID(t, out)
+
+	waitForTableInProgress(t, binPath, schemaDir, endpoint, applyID, tableName, 20*time.Second)
+	stateBeforeCrash, err := fetchApplyState(endpoint, applyID)
+	require.NoError(t, err)
+	require.NotEqual(t, state.Apply.Completed, stateBeforeCrash, "apply completed before crash")
+
+	// Kill the real SchemaBot container while Spirit is adding the index. The
+	// storage heartbeat is aged after the crash so the scheduler recovery path
+	// runs immediately instead of waiting for the production heartbeat timeout.
+	crashE2ESchemaBotServer(t)
+	needsRestart := true
+	t.Cleanup(func() {
+		if needsRestart {
+			startE2ESchemaBotServer(t, endpoint)
+		}
+	})
+	markApplyHeartbeatStale(t, applyID)
+	startE2ESchemaBotServer(t, endpoint)
+	needsRestart = false
+
+	waitForApplyState(t, endpoint, applyID, state.Apply.Completed, 90*time.Second)
+	waitForIndex(t, db, tableName, "idx_account_created", 30*time.Second)
+}
+
 // TestLocal_StopStart_MultiTable_ResumeAll verifies that stopping a multi-table
 // sequential apply mid-flight and then resuming completes ALL tables — including
 // tables that hadn't started copying yet (0% progress). On resume, each table

@@ -44,9 +44,8 @@ func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webho
 		logger:        logger,
 	}
 
-	// Register recovery callback so the recovery worker can set up comment
-	// observers for recovered applies. The observer is set on the LocalClient
-	// so the progress poller (same goroutine as Spirit) posts comments.
+	// Register recovery callback so the scheduler can attach comment observers
+	// before resuming recovered applies.
 	if service != nil {
 		service.OnApplyRecovered = func(apply *storage.Apply) {
 			if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {

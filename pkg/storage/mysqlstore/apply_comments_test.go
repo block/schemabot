@@ -113,7 +113,7 @@ func TestApplyCommentStore_ListByApply_Isolation(t *testing.T) {
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply1 := createTestApply(t, store, lock, "apply_iso_1", 1)
-	apply2 := createTestApply(t, store, lock, "apply_iso_2", 2)
+	apply2 := createTestApplyWithStateAndEnv(t, store, lock, "apply_iso_2", 2, state.Apply.Completed, "staging")
 
 	// Create comments for both applies
 	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
@@ -141,7 +141,7 @@ func TestApplyCommentStore_DeleteByApply(t *testing.T) {
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply1 := createTestApply(t, store, lock, "apply_comment_del1", 1)
-	apply2 := createTestApply(t, store, lock, "apply_comment_del2", 2)
+	apply2 := createTestApplyWithStateAndEnv(t, store, lock, "apply_comment_del2", 2, state.Apply.Completed, "staging")
 
 	// Create comments for both applies
 	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{

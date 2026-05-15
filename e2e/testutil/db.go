@@ -23,6 +23,7 @@ func CreateTestTable(t *testing.T, dsn, tableName, ddl string) func() {
 	t.Helper()
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err, "open mysql for create table")
+	require.NoError(t, db.PingContext(t.Context()), "ping mysql for create table")
 
 	_, err = db.ExecContext(t.Context(), ddl)
 	utils.CloseAndLog(db)
@@ -34,8 +35,15 @@ func CreateTestTable(t *testing.T, dsn, tableName, ddl string) func() {
 			return
 		}
 		defer utils.CloseAndLog(db2)
-		//nolint:usetesting // cleanup runs after test context cancelled
-		_, _ = db2.ExecContext(context.Background(), "DROP TABLE IF EXISTS `"+tableName+"`")
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		if err := db2.PingContext(ctx); err != nil {
+			t.Logf("warning: could not ping db to drop test table %s: %v", tableName, err)
+			return
+		}
+		if _, err := db2.ExecContext(ctx, "DROP TABLE IF EXISTS `"+tableName+"`"); err != nil {
+			t.Logf("warning: could not drop test table %s: %v", tableName, err)
+		}
 	}
 }
 
@@ -124,7 +132,14 @@ func ClearAllTables(t *testing.T, dsn string) {
 	}
 	defer utils.CloseAndLog(db)
 
-	ctx := t.Context()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		t.Logf("warning: could not ping db to clear tables: %v", err)
+		return
+	}
+
 	rows, err := db.QueryContext(ctx, "SHOW TABLES")
 	if err != nil {
 		t.Logf("warning: could not list tables: %v", err)
@@ -135,11 +150,20 @@ func ClearAllTables(t *testing.T, dsn string) {
 	var tables []string
 	for rows.Next() {
 		var table string
-		_ = rows.Scan(&table)
+		if err := rows.Scan(&table); err != nil {
+			t.Logf("warning: could not scan table name: %v", err)
+			return
+		}
 		tables = append(tables, table)
+	}
+	if err := rows.Err(); err != nil {
+		t.Logf("warning: could not iterate tables: %v", err)
+		return
 	}
 
 	for _, table := range tables {
-		_, _ = db.ExecContext(ctx, "DELETE FROM `"+table+"`")
+		if _, err := db.ExecContext(ctx, "DELETE FROM `"+table+"`"); err != nil {
+			t.Logf("warning: could not clear table %s: %v", table, err)
+		}
 	}
 }

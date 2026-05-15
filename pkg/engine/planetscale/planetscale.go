@@ -135,7 +135,7 @@
 //  6. Return — the tern layer polls Progress() to track to completion
 //
 // The deploy request runs inside Vitess. If SchemaBot crashes, the deploy continues.
-// On restart, the tern layer's recovery worker calls Progress() and finds the deploy
+// On restart, the tern layer's scheduler calls Progress() and finds the deploy
 // still running — no special resume logic needed beyond polling.
 //
 // # Instant DDL

@@ -57,8 +57,8 @@ In atomic mode with `--defer-cutover`, the schema change pauses at `WaitingForCu
 
 If the SchemaBot server crashes during an apply, the recovery mechanism resumes it:
 
-1. The API service's recovery worker polls every 10 seconds for applies with stale heartbeats (no update for 1+ minute)
-2. It claims the apply using `FOR UPDATE SKIP LOCKED` to prevent races between workers
+1. The API service scheduler polls every 10 seconds for applies with stale heartbeats (no update for 1+ minute)
+2. It claims the apply by selecting it and refreshing its heartbeat in one transaction
 3. It calls `ResumeApply()` on the appropriate Tern client
 4. **LocalClient**: Calls `engine.Apply()` with the same DDL — Spirit auto-detects its checkpoint table and resumes from where it left off
 5. **GRPCClient**: Calls `Start()` on the remote Tern service, then spawns a local progress poller

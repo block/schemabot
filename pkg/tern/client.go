@@ -78,7 +78,7 @@ type Client interface {
 	SetPendingObserver(observer ProgressObserver)
 
 	// SetObserver registers a progress observer for an active apply.
-	// Used by the recovery worker to attach an observer after resuming.
+	// Used by the scheduler to attach an observer before resuming.
 	SetObserver(applyID int64, observer ProgressObserver)
 
 	// Close releases any resources held by the client.

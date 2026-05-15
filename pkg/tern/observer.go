@@ -25,7 +25,7 @@ type ProgressObserver interface {
 }
 
 // SetObserver registers a progress observer for an apply.
-// Called by the recovery worker when resuming an apply. Safe to call concurrently.
+// Called by the scheduler before resuming an apply. Safe to call concurrently.
 func (c *LocalClient) SetObserver(applyID int64, observer ProgressObserver) {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()

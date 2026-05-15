@@ -4,6 +4,9 @@ package mysqlstore
 
 import (
 	"database/sql"
+	"errors"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,10 +60,280 @@ func TestApplyStore_CreateDuplicate(t *testing.T) {
 		PullRequest:     123,
 		Environment:     "staging",
 		Engine:          "spirit",
-		State:           state.Apply.Pending,
+		State:           state.Apply.Completed,
 	}
 	_, err = store.Applies().Create(ctx, apply2)
 	require.ErrorIs(t, err, storage.ErrApplyIDExists)
+}
+
+func TestApplyStore_CreateBlocksActiveApplyForSameTarget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	active := createTestApply(t, store, lock, "apply_active", 1)
+
+	_, err := store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply_same_target",
+		LockID:          lock.ID,
+		PlanID:          2,
+		Database:        "testdb",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          "spirit",
+		State:           state.Apply.Pending,
+	})
+	require.ErrorIs(t, err, storage.ErrActiveApplyExists)
+
+	_, err = store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply_terminal_same_target",
+		LockID:          lock.ID,
+		PlanID:          3,
+		Database:        "testdb",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          "spirit",
+		State:           state.Apply.Completed,
+	})
+	require.NoError(t, err)
+
+	_, err = store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply_other_env",
+		LockID:          lock.ID,
+		PlanID:          4,
+		Database:        "testdb",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "production",
+		Engine:          "spirit",
+		State:           state.Apply.Pending,
+	})
+	require.NoError(t, err)
+
+	active.State = state.Apply.Completed
+	require.NoError(t, store.Applies().Update(ctx, active))
+
+	_, err = store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply_same_target_after_terminal",
+		LockID:          lock.ID,
+		PlanID:          5,
+		Database:        "testdb",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          "spirit",
+		State:           state.Apply.Pending,
+	})
+	require.NoError(t, err)
+}
+
+func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+
+	guardTx, err := beginApplyWriteTx(ctx, testDB, "test active apply guard")
+	require.NoError(t, err)
+	t.Cleanup(func() { guardTx.close(ctx, "test active apply guard") })
+
+	// Hold the exact target mutex row open. Active apply creation locks this row
+	// before checking applies, so a same-target create waits without relying on
+	// an empty applies range lock.
+	require.NoError(t, ensureApplyTargetLockRow(ctx, testDB, "testdb", "mysql", "staging"))
+	require.NoError(t, lockApplyTargetRow(ctx, guardTx.tx, "testdb", "mysql", "staging"))
+	require.NoError(t, checkNoActiveApplyForTarget(ctx, guardTx.tx, "testdb", "mysql", "staging", 0))
+
+	type createResult struct {
+		id  int64
+		err error
+	}
+	resultCh := make(chan createResult, 1)
+	go func() {
+		id, err := store.Applies().Create(ctx, &storage.Apply{
+			ApplyIdentifier: "apply_concurrent_same_target",
+			LockID:          lock.ID,
+			PlanID:          6,
+			Database:        "testdb",
+			DatabaseType:    "mysql",
+			Repository:      "org/repo",
+			PullRequest:     123,
+			Environment:     "staging",
+			Engine:          "spirit",
+			State:           state.Apply.Pending,
+		})
+		resultCh <- createResult{id: id, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		require.NoError(t, result.err)
+		require.Fail(t, "apply create completed before the target lock was released")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	require.NoError(t, guardTx.commit())
+
+	select {
+	case result := <-resultCh:
+		require.NoError(t, result.err)
+		assert.NotZero(t, result.id)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "apply create did not complete after the target lock was released")
+	}
+
+	applies, err := store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging")
+	require.NoError(t, err)
+	assert.Len(t, applies, 1)
+}
+
+func TestApplyStore_CreateAllowsOneConcurrentActiveApplyForSameTarget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+
+	const concurrentCreates = 8
+	start := make(chan struct{})
+	errs := make(chan error, concurrentCreates)
+
+	var wg sync.WaitGroup
+	for i := range concurrentCreates {
+		wg.Go(func() {
+			<-start
+			_, err := store.Applies().Create(ctx, &storage.Apply{
+				ApplyIdentifier: "apply_concurrent_winner_" + strconv.Itoa(i),
+				LockID:          lock.ID,
+				PlanID:          int64(10 + i),
+				Database:        "testdb",
+				DatabaseType:    "mysql",
+				Repository:      "org/repo",
+				PullRequest:     123,
+				Environment:     "staging",
+				Engine:          "spirit",
+				State:           state.Apply.Pending,
+			})
+			errs <- err
+		})
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	var successes, conflicts int
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, storage.ErrActiveApplyExists):
+			conflicts++
+		default:
+			require.NoError(t, err)
+		}
+	}
+
+	assert.Equal(t, 1, successes)
+	assert.Equal(t, concurrentCreates-1, conflicts)
+
+	applies, err := store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging")
+	require.NoError(t, err)
+	assert.Len(t, applies, 1)
+}
+
+func TestApplyStore_CreateAvoidsGapLockDeadlocksForDifferentTargets(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	type applyTarget struct {
+		database    string
+		dbType      string
+		environment string
+		engine      string
+	}
+	targets := make([]applyTarget, 0, 16)
+	for i := range 8 {
+		targets = append(targets, applyTarget{
+			database:    "testapp",
+			dbType:      "mysql",
+			environment: "env-" + strconv.Itoa(i),
+			engine:      "spirit",
+		})
+		targets = append(targets, applyTarget{
+			database:    "testapp-vitess",
+			dbType:      "vitess",
+			environment: "env-" + strconv.Itoa(i),
+			engine:      "planetscale",
+		})
+	}
+
+	locks := make(map[string]*storage.Lock)
+	for _, target := range targets {
+		key := target.database + "/" + target.dbType
+		if _, ok := locks[key]; !ok {
+			locks[key] = createTestLock(t, store, target.database, target.dbType, target.environment)
+		}
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, len(targets))
+	var wg sync.WaitGroup
+	for i, target := range targets {
+		lock := locks[target.database+"/"+target.dbType]
+		wg.Go(func() {
+			<-start
+			// If storage protects first writers by locking empty ranges in applies,
+			// these concurrent inserts can deadlock even though every target is
+			// independent. The target-lock row gives each target an exact mutex
+			// before applies is checked, so callers should not see deadlock errors.
+			_, err := store.Applies().Create(ctx, &storage.Apply{
+				ApplyIdentifier: "apply_concurrent_target_" + strconv.Itoa(i),
+				LockID:          lock.ID,
+				PlanID:          int64(20 + i),
+				Database:        target.database,
+				DatabaseType:    target.dbType,
+				Repository:      "org/repo",
+				PullRequest:     123,
+				Environment:     target.environment,
+				Engine:          target.engine,
+				State:           state.Apply.Pending,
+			})
+			errs <- err
+		})
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	close(start)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "concurrent active apply creates for different targets blocked")
+	}
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	for _, target := range targets {
+		applies, err := store.Applies().GetByDatabase(ctx, target.database, target.dbType, target.environment)
+		require.NoError(t, err)
+		assert.Len(t, applies, 1)
+	}
 }
 
 func TestApplyStore_Get(t *testing.T) {
@@ -142,8 +415,10 @@ func TestApplyStore_GetByLock(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, applies)
 
-	// Create two applies for the same lock
-	createTestApply(t, store, lock, "apply_first", 100)
+	// Create two applies for the same lock.
+	first := createTestApply(t, store, lock, "apply_first", 100)
+	first.State = state.Apply.Completed
+	require.NoError(t, store.Applies().Update(ctx, first))
 	createTestApply(t, store, lock, "apply_second", 101)
 
 	// GetByLock should return both applies
@@ -195,6 +470,23 @@ func TestApplyStore_Update(t *testing.T) {
 	require.NotNil(t, updated.StartedAt)
 }
 
+func TestApplyStore_UpdateBlocksActiveApplyForSameTarget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	active := createTestApply(t, store, lock, "apply_update_active", 301)
+	completed := createTestApplyWithStateAndEnv(t, store, lock, "apply_update_completed", 302, state.Apply.Completed, "staging")
+
+	completed.State = state.Apply.Running
+	require.ErrorIs(t, store.Applies().Update(ctx, completed), storage.ErrActiveApplyExists)
+
+	active.State = state.Apply.Completed
+	require.NoError(t, store.Applies().Update(ctx, active))
+	require.NoError(t, store.Applies().Update(ctx, completed))
+}
+
 func TestApplyStore_UpdateNonExistent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -217,21 +509,13 @@ func TestApplyStore_GetInProgress(t *testing.T) {
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
-	// Create applies with different states
 	pending := createTestApply(t, store, lock, "apply_pending", 400)
-	running := createTestApply(t, store, lock, "apply_running", 401)
-	completed := createTestApply(t, store, lock, "apply_completed", 402)
-	failed := createTestApply(t, store, lock, "apply_failed", 403)
+	running := createTestApplyWithStateAndEnv(t, store, lock, "apply_running", 401, state.Apply.Running, "production")
+	completed := createTestApplyWithStateAndEnv(t, store, lock, "apply_completed", 402, state.Apply.Completed, "staging")
+	failed := createTestApplyWithStateAndEnv(t, store, lock, "apply_failed", 403, state.Apply.Failed, "staging")
 
-	// Update states
-	running.State = state.Apply.Running
-	require.NoError(t, store.Applies().Update(ctx, running))
-
-	completed.State = state.Apply.Completed
-	require.NoError(t, store.Applies().Update(ctx, completed))
-
-	failed.State = state.Apply.Failed
-	require.NoError(t, store.Applies().Update(ctx, failed))
+	require.NotZero(t, completed.ID)
+	require.NotZero(t, failed.ID)
 
 	// GetInProgress should return only pending and running
 	applies, err := store.Applies().GetInProgress(ctx)
@@ -530,6 +814,11 @@ func createTestApply(t *testing.T, store *Storage, lock *storage.Lock, applyID s
 
 func createTestApplyWithEnv(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64, env string) *storage.Apply {
 	t.Helper()
+	return createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, env)
+}
+
+func createTestApplyWithStateAndEnv(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64, applyState, env string) *storage.Apply {
+	t.Helper()
 	ctx := t.Context()
 
 	apply := &storage.Apply{
@@ -542,7 +831,7 @@ func createTestApplyWithEnv(t *testing.T, store *Storage, lock *storage.Lock, ap
 		PullRequest:     lock.PullRequest,
 		Environment:     env,
 		Engine:          "spirit",
-		State:           state.Apply.Pending,
+		State:           applyState,
 	}
 
 	id, err := store.Applies().Create(ctx, apply)

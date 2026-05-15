@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -120,6 +121,68 @@ func findModuleRoot(t *testing.T, start string) string {
 		}
 		dir = parent
 	}
+}
+
+// runE2EComposeCommand executes docker compose against the e2e stack from the
+// repository root, so tests can control real e2e services without depending on
+// the current package working directory.
+func runE2EComposeCommand(t *testing.T, args ...string) string {
+	t.Helper()
+
+	wd, err := os.Getwd()
+	require.NoError(t, err)
+	root := findModuleRoot(t, wd)
+	composeFile := filepath.Join(root, "deploy/e2e/docker-compose.yml")
+	cmdArgs := append([]string{"compose", "-f", composeFile}, args...)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", cmdArgs...)
+	cmd.Dir = root
+	output, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "docker %s failed\nOutput: %s", strings.Join(cmdArgs, " "), string(output))
+	return string(output)
+}
+
+// crashE2ESchemaBotServer kills only the SchemaBot server process. The backing
+// MySQL containers stay up, preserving apply/task rows for scheduler recovery.
+func crashE2ESchemaBotServer(t *testing.T) {
+	t.Helper()
+	runE2EComposeCommand(t, "kill", "-s", "SIGKILL", "schemabot")
+}
+
+// startE2ESchemaBotServer starts the SchemaBot service and waits until the
+// health endpoint is ready before the test resumes polling apply state.
+func startE2ESchemaBotServer(t *testing.T, endpoint string) {
+	t.Helper()
+	runE2EComposeCommand(t, "up", "-d", "schemabot")
+	waitForSchemaBotHealth(t, endpoint, 30*time.Second)
+}
+
+func waitForSchemaBotHealth(t *testing.T, endpoint string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/health", nil)
+		require.NoError(t, err)
+		resp, err := http.DefaultClient.Do(req)
+		cancel()
+		if err == nil {
+			statusCode := resp.StatusCode
+			require.NoError(t, resp.Body.Close())
+			if statusCode == http.StatusOK {
+				return
+			}
+			lastErr = fmt.Errorf("health returned status %d", statusCode)
+		} else {
+			lastErr = err
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	require.Failf(t, "timeout", "SchemaBot did not become healthy within %s: %v", timeout, lastErr)
 }
 
 func waitForTableInProgress(t *testing.T, binPath, schemaDir, endpoint, applyID, tableName string, timeout time.Duration) {
@@ -243,6 +306,23 @@ func clearSchemaBotStateImpl() {
 		_, _ = db.ExecContext(context.Background(), "DELETE FROM `"+table+"`")
 	}
 	log.Printf("Cleared %d schemabot state tables", len(tables))
+}
+
+func markApplyHeartbeatStale(t *testing.T, applyID string) {
+	t.Helper()
+
+	db, err := sql.Open("mysql", mysqlDSN(t))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()))
+
+	result, err := db.ExecContext(t.Context(),
+		"UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_identifier = ?",
+		applyID)
+	require.NoError(t, err)
+	rowsAffected, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), rowsAffected, "expected to mark one apply heartbeat stale")
 }
 
 // localscaleMetadataQuery sends a query to the LocalScale metadata endpoint.

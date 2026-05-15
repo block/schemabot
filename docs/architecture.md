@@ -43,7 +43,7 @@ SchemaBot has three layers:
 
 - **CLI** ([`pkg/cmd`](../pkg/cmd/)): User-facing commands (`plan`, `apply`, `progress`, `stop`, `start`, `cutover`, etc.)
 - **GitHub PR Comments**: Trigger schema changes via PR comments (`schemabot plan -e staging`). See [GitHub App Setup](./github-app-setup.md)
-- **API** ([`pkg/api`](../pkg/api/)): HTTP service that manages Tern client pools and crash recovery
+- **API** ([`pkg/api`](../pkg/api/)): HTTP service that manages routes, server lifecycle, and Tern client pools
 - **Tern** ([`pkg/tern`](../pkg/tern/)): Schema change orchestration — two implementations:
   - `LocalClient`: Embedded engine (single-process, for easy deployments (recommended to start))
   - `GRPCClient`: Delegates work to remote deployments (for distributed / multi-tenant architectures)
@@ -222,6 +222,163 @@ Apply: apply-456 (state: running)
   └─ Task 3: CREATE TABLE audit_log                 (state: pending)
 ```
 
+### Progress Flow And Observers
+
+Tern's progress poller is where raw engine progress becomes SchemaBot state. On each tick, Tern asks the engine for progress, derives task state from the engine response, derives the apply state from those tasks, persists both, and notifies an optional `ProgressObserver`.
+
+```
+Engine progress
+      |
+      v
+Poller reads current engine state
+      |
+      v
+Derive task state
+  - one task per DDL
+  - rows copied, rows total, percent complete
+      |
+      v
+Derive apply state
+  - aggregate task states
+  - active, terminal, and control states
+      |
+      v
+Persist applies + tasks
+      |
+      +--> Observer.OnProgress / Observer.OnTerminal
+              |
+              v
+          GitHub PR
+          - progress comment
+          - terminal summary comment
+```
+
+The `ProgressObserver` interface (`pkg/tern/observer.go`) enables external notifications from the apply progress poller. Observers see SchemaBot's derived apply/task state, not raw engine state.
+
+```go
+type ProgressObserver interface {
+    OnProgress(apply *storage.Apply, tasks []*storage.Task)
+    OnTerminal(apply *storage.Apply, tasks []*storage.Task)
+}
+```
+
+**How it works:**
+
+```
+Webhook handler: "someone commented schemabot apply"
+    |
+    +-- Creates CommentObserver (posts PR comments)
+    +-- Calls SetPendingObserver on the client
+    +-- Calls ExecuteApply
+            |
+            v
+        Client.Apply()
+            +-- Consumes pending observer
+            +-- Registers Observer on the apply before engine starts
+            +-- Starts engine goroutine
+                    |
+                    +-- Progress tick: poll engine, derive task/apply state
+                    |   +-- Observer.OnProgress()
+                    |       +-- edits PR progress comment
+                    |
+                    +-- Terminal state: Observer.OnTerminal()
+                        +-- edits progress comment to final state
+                        +-- posts summary comment
+                        +-- updates check runs
+```
+
+**Key design properties:**
+
+- **Single progress path** — notifications are tied to the same progress path
+  that updates task and apply state. There is no unrelated watcher with its own
+  interpretation of state.
+- **Per-apply** — each apply has its own observer (or none). CLI applies have no
+  observer. Webhook applies get a `CommentObserver`.
+- **Fire-and-forget** — observer errors are logged but never block the schema
+  change. If GitHub is down, the apply continues.
+- **Reconstructable** — on recovery after restart, the observer is reconstructed
+  from the apply record's stored GitHub context (repo, PR, installation ID).
+- **Composable** — different observers for different backends (GitHub comments,
+  Slack, etc.). A `MultiObserver` can combine them.
+- **Works for both client types** — `LocalClient` notifies from the engine poller.
+  `GRPCClient` notifies from a storage-polling goroutine. The control plane posts
+  comments regardless of where the engine runs.
+
+**Missing summary recovery.** The `apply_comments` table tracks which comments
+were posted (`progress`, `summary`). On startup, the webhook runtime starts a
+best-effort reconciliation pass for completed applies with a progress comment
+but no summary comment. That means `OnTerminal` was missed during a process
+restart. The webhook runtime posts the missing summary from the apply record's
+stored GitHub context, and errors never fail server startup.
+
+### Scheduler
+
+The scheduler is part of Tern orchestration. The API service starts it on server startup because the server owns process lifecycle, configuration, and the Tern client pool, but the scheduler's work is to coordinate applies: claim storage records, refresh their heartbeat lease, and call `ResumeApply()` on the right Tern client.
+
+Each scheduler worker runs immediately on startup, then polls every 10 seconds. The worker claims at most one apply per tick and resumes it through the Tern client for that apply's deployment and environment.
+
+`scheduler_workers` controls scheduler concurrency. The default is four workers, so an untuned server can still make progress across independent databases and environments concurrently. More workers help larger installations with many independent schema changes because each worker can claim and resume a different target during the same scheduler tick.
+
+In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each scheduler has its own configurable worker pool, and every worker coordinates through shared storage before resuming an apply. When a recovered apply came from a PR comment, the worker attaches a reconstructed `ProgressObserver` before calling `ResumeApply()` so the resumed progress poller can keep updating PR comments.
+
+```
++--------------------------+      +--------------------------+
+| SchemaBot pod A          |      | SchemaBot pod B          |
+| Scheduler                |      | Scheduler                |
+| +----------------------+ |      | +----------------------+ |
+| | worker 0             | |      | | worker 0             | |
+| | claim stale apply    | |      | | claim stale apply    | |
+| | attach Observer      | |      | | attach Observer      | |
+| | ResumeApply          | |      | | ResumeApply          | |
+| +----------------------+ |      | +----------------------+ |
+| +----------------------+ |      | +----------------------+ |
+| | worker 1             | |      | | worker 1             | |
+| | claim stale apply    | |      | | claim stale apply    | |
+| | attach Observer      | |      | | attach Observer      | |
+| | ResumeApply          | |      | | ResumeApply          | |
+| +----------------------+ |      | +----------------------+ |
++------------+-------------+      +-------------+------------+
+             |                                  |
+             | claims + leases                  | claims + leases
+             v                                  v
+        +-----------------------------------------------+
+        | Shared SchemaBot storage                      |
+        | applies, tasks, apply_target_locks            |
+        | claims use FOR UPDATE SKIP LOCKED             |
+        +-----------------------------------------------+
+
+             |                                  |
+             | Observer posts/edits comments    | Observer posts/edits comments
+             v                                  v
+        +-----------------------------------------------+
+        | GitHub PR                                     |
+        | progress comment + terminal summary comment   |
+        +-----------------------------------------------+
+```
+
+The storage arrows represent scheduler coordination. The GitHub arrows represent optional observer notifications; CLI applies simply run without an observer.
+
+A **claim** is an atomic storage operation: it selects one stale apply and refreshes its `updated_at` heartbeat in the same transaction. That heartbeat refresh is the scheduler's lease while it reloads state and calls `ResumeApply()`. Claims use `FOR UPDATE SKIP LOCKED` so multiple scheduler workers can run concurrently without taking the same apply.
+
+An apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
+
+SchemaBot has two different kinds of locking:
+
+- **Database locks** are coordination state for users and automation. They make ownership visible in CLI/webhook flows and let a human intentionally hold, release, or force-release work for a database.
+- **Apply invariants** are correctness rules enforced by storage. They do not depend on a database lock being present, because direct API callers and `--no-lock` flows still must not create invalid concurrent work.
+
+SchemaBot enforces one active apply per database, database type, and environment when an apply record is created or moved back into an active state. The `applies` table is the tern-layer work table, but storage uses a small target-lock table as the serialization surface for this invariant.
+
+The target lock row lives in `apply_target_locks`. This table is internal storage infrastructure, not user-facing lock state and not apply lifecycle state. A row is created lazily the first time a target is used, then reused for every future apply for that same database/type/environment. Normal apply completion, failure, cancellation, or revert does not delete the row; the active lifecycle remains in `applies`.
+
+`apply_target_locks` exists because the first active apply for a target has no existing `applies` row to lock. Locking the absence of an active row in `applies` requires InnoDB range locks over `idx_database_env`. Those range locks can deadlock independent first-writer transactions when multiple targets are creating applies concurrently. A persistent target row gives storage an exact mutex row before it reads or writes `applies`.
+
+The target row lock is transaction-local. Same-target writers wait on the same `apply_target_locks` row, then re-check `applies` after the earlier writer commits. If an active apply now exists, the later writer fails cleanly. Different targets lock different rows, so they can create or resume applies concurrently without depending on empty-range locks in `applies`.
+
+The scheduler relies on that invariant. Additional workers increase concurrency across independent targets; they do not make one database/environment run multiple applies at once.
+
+If a worker finds no claimable apply, it waits briefly and retries once during the same tick. This lets another worker that lost a claim race pick up a different target without waiting for the next 10-second poll.
+
 ### Execution Modes
 
 Both engines automatically detect and use **[instant DDL](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html)** when possible. Instant DDL applies the change immediately via a metadata-only operation (no row copying). When instant DDL is used, the task completes in milliseconds with no copy phase.
@@ -275,66 +432,6 @@ VSchema updates are tracked as separate tasks in the `vitess_tasks` table (one p
 | (none) | DDLs run → auto-cutover → auto-skip revert → completed |
 | `--defer-cutover` | DDLs run → pause at waiting for cutover → user triggers cutover → completed |
 | `--defer-cutover --enable-revert` | DDLs run → pause → user triggers cutover → revert window → user reverts or skips → completed |
-
-### ProgressObserver
-
-The `ProgressObserver` interface (`pkg/tern/observer.go`) enables external
-notifications from the apply progress poller. The poller runs on the same
-goroutine as the engine — one goroutine handles both execution and notifications.
-
-```go
-type ProgressObserver interface {
-    OnProgress(apply *storage.Apply, tasks []*storage.Task)
-    OnTerminal(apply *storage.Apply, tasks []*storage.Task)
-}
-```
-
-**How it works:**
-
-```
-Webhook handler: "someone commented schemabot apply"
-    │
-    ├── Creates CommentObserver (posts PR comments)
-    ├── Calls SetPendingObserver on the client
-    └── Calls ExecuteApply
-            │
-            ▼
-        Client.Apply()
-            ├── Consumes pending observer
-            ├── Registers observer on the apply (before engine starts)
-            └── Starts engine goroutine
-                    │
-                    ├── On each progress tick: observer.OnProgress()
-                    │   → edits PR comment with progress bars, rows copied, ETA
-                    │
-                    └── On terminal state: observer.OnTerminal()
-                        → edits progress comment to final state
-                        → posts summary comment
-                        → updates check runs
-```
-
-**Key design properties:**
-
-- **One goroutine** — the progress poller handles both execution and notifications.
-  No separate watcher goroutine that can die independently.
-- **Per-apply** — each apply has its own observer (or none). CLI applies have no
-  observer. Webhook applies get a `CommentObserver`.
-- **Fire-and-forget** — observer errors are logged but never block the schema
-  change. If GitHub is down, the apply continues.
-- **Reconstructable** — on recovery after restart, the observer is reconstructed
-  from the apply record's stored GitHub context (repo, PR, installation ID).
-- **Composable** — different observers for different backends (GitHub comments,
-  Slack, etc.). A `MultiObserver` can combine them.
-- **Works for both client types** — `LocalClient` notifies from the engine poller.
-  `GRPCClient` notifies from a storage-polling goroutine. The control plane posts
-  comments regardless of where the engine runs.
-
-**Missing summary recovery.** The `apply_comments` table tracks which comments
-were posted (`progress`, `summary`). On startup, the webhook runtime checks for
-completed applies with a progress comment but no summary comment. This means
-`OnTerminal` was interrupted after progress was posted. It reloads the apply's
-tasks, rebuilds the summary body, posts the missing summary, and records the
-summary comment ID so reconciliation is idempotent.
 
 ### Integration Modes
 

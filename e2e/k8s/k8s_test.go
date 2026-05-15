@@ -49,6 +49,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -254,4 +255,43 @@ func TestK8s_Progress(t *testing.T) {
 	assert.Contains(t, prog.Tables[0].DDL, "idx_email", "progress DDL should reference the index being added")
 
 	testutil.WaitForState(t, ep, applyID, state.Apply.Completed, testutil.PollDeadline)
+}
+
+// TestK8s_Scheduler_DataPlanePodRestartRecoversIndexAdd verifies scheduler
+// recovery across the two-tier Kubernetes deployment. The control plane keeps
+// the user-facing apply alive while the data plane pod, which owns the Spirit
+// worker and target database access, is replaced mid-apply.
+func TestK8s_Scheduler_DataPlanePodRestartRecoversIndexAdd(t *testing.T) {
+	fixture := startRunningIndexAddApply(t, "k8s_sched_dp")
+
+	crashedPod := crashPod(t, "data-plane")
+
+	// The restarted data-plane scheduler claims stale local apply rows. Aging
+	// the heartbeat avoids waiting for the production staleness threshold.
+	markDataPlaneHeartbeatStale(t, fixture.DataPlaneApplyID)
+	waitForReplacementPodReady(t, "data-plane", crashedPod, 2*time.Minute)
+	waitForTernHealth(t, fixture.Endpoint, "data-plane", "staging", testutil.PollDeadline)
+
+	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
+	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
+}
+
+// TestK8s_Scheduler_ControlPlanePodRestartReconnectsToRunningDataPlane verifies
+// that control-plane recovery restarts only the gRPC progress poller. The data
+// plane keeps running the schema change while the control-plane pod is replaced.
+func TestK8s_Scheduler_ControlPlanePodRestartReconnectsToRunningDataPlane(t *testing.T) {
+	fixture := startRunningIndexAddApply(t, "k8s_sched_cp")
+
+	crashedPod := crashPod(t, "control-plane")
+
+	// The restarted control-plane scheduler claims the stale SchemaBot apply
+	// row, then GRPCClient resumes progress polling using the data-plane apply ID.
+	markControlPlaneHeartbeatStale(t, fixture.ApplyID)
+	waitForReplacementPodReady(t, "control-plane", crashedPod, 2*time.Minute)
+
+	recoveredEndpoint := startControlPlanePortForward(t)
+	waitForTernHealth(t, recoveredEndpoint, "data-plane", "staging", testutil.PollDeadline)
+
+	testutil.WaitForState(t, recoveredEndpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
+	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
 }

@@ -164,6 +164,8 @@ type PlanStore interface {
 // Applies are created when Apply() is called and updated during execution.
 type ApplyStore interface {
 	// Create stores a new apply and returns its ID.
+	// Returns ErrActiveApplyExists if another active apply already exists for
+	// the same database, database type, and environment.
 	Create(ctx context.Context, apply *Apply) (int64, error)
 
 	// Get returns an apply by ID, or nil if not found.
@@ -184,6 +186,9 @@ type ApplyStore interface {
 	GetByDatabase(ctx context.Context, database, dbType, environment string) ([]*Apply, error)
 
 	// Update updates apply state and fields.
+	// Returns ErrActiveApplyExists when moving an apply into an active state
+	// would overlap another active apply for the same database, database type,
+	// and environment.
 	Update(ctx context.Context, apply *Apply) error
 
 	// GetRecent returns the most recent applies across all databases, ordered by start time desc.
@@ -191,15 +196,15 @@ type ApplyStore interface {
 	GetRecent(ctx context.Context, limit int) ([]*Apply, error)
 
 	// GetInProgress returns all applies in non-terminal states.
-	// Note: For recovery, use ClaimForRecovery which handles locking.
+	// Note: For recovery, use FindNextApply which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
 
-	// ClaimForRecovery atomically claims an apply for recovery using heartbeat-based leasing.
-	// Uses FOR UPDATE SKIP LOCKED to prevent race conditions between workers.
-	// Only applies with stale heartbeats (updated_at > 1 minute ago) are claimed.
-	// Returns the claimed apply, or nil if no apply is available to claim.
-	// The caller MUST call Heartbeat periodically (every 10 seconds) to maintain the lease.
-	ClaimForRecovery(ctx context.Context) (*Apply, error)
+	// FindNextApply atomically claims the next apply that needs attention.
+	// A claim selects one stale apply and refreshes its heartbeat in the same
+	// transaction. That heartbeat is the scheduler's lease while it reloads
+	// state and resumes the apply.
+	// Returns the claimed apply, or nil if nothing needs work.
+	FindNextApply(ctx context.Context) (*Apply, error)
 
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 	// Should be called every 10 seconds while working on an apply.
