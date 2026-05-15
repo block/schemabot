@@ -44,6 +44,9 @@ const aggregateCheckName = "SchemaBot"
 // aggregate (no allowed_environments) uses aggregateSentinel.
 const aggregateSentinel = "_aggregate"
 
+// checkErrorSchemaRemovedAfterApplyStarted is stored on per-database check state
+// when the PR head no longer asks for a schema change after an apply has started.
+// The reason keeps apply completion from being treated as merge-safe success.
 const checkErrorSchemaRemovedAfterApplyStarted = "Schema changes were removed from the PR after an apply started; operator action is required before this check can pass."
 
 // aggregateCheckNameForEnv returns the environment-scoped aggregate check name.
@@ -76,6 +79,8 @@ func isAggregateCheck(c *storage.Check) bool {
 		c.DatabaseName == aggregateSentinel
 }
 
+// checkRepresentsStartedApply returns true once work may already have reached,
+// or may still reach, the live database.
 func checkRepresentsStartedApply(c *storage.Check) bool {
 	return c.Status == checkStatusInProgress || c.ApplyID != 0
 }
@@ -633,6 +638,12 @@ func (h *Handler) upsertAggregateCheckRun(
 	// Look up existing aggregate check state using the environment-specific key.
 	existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, aggregateSentinel, aggregateSentinel)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_update",
+			Repository:  repo,
+			Environment: environment,
+			Status:      "error",
+		})
 		h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "environment", environment, "error", err)
 		return
 	}
@@ -643,7 +654,17 @@ func (h *Handler) upsertAggregateCheckRun(
 	var checkRunID int64
 	if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
 		if err := client.UpdateCheckRun(ctx, repo, existing.CheckRunID, opts); err != nil {
-			h.logger.Error("failed to update aggregate check run", "checkRunID", existing.CheckRunID, "error", err)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_update",
+				Repository:  repo,
+				Environment: environment,
+				Status:      "error",
+			})
+			h.logger.Error("failed to update aggregate check run",
+				"repo", repo, "pr", pr, "check_name", checkName,
+				"environment", environment, "check_run_id", existing.CheckRunID,
+				"head_sha", headSHA, "status", status,
+				"conclusion", conclusion, "error", err)
 			return
 		}
 		checkRunID = existing.CheckRunID
@@ -655,7 +676,16 @@ func (h *Handler) upsertAggregateCheckRun(
 		}
 		id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
 		if err != nil {
-			h.logger.Error("failed to create aggregate check run", "error", err)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_update",
+				Repository:  repo,
+				Environment: environment,
+				Status:      "error",
+			})
+			h.logger.Error("failed to create aggregate check run",
+				"repo", repo, "pr", pr, "check_name", checkName,
+				"environment", environment, "head_sha", headSHA,
+				"status", status, "conclusion", conclusion, "error", err)
 			return
 		}
 		checkRunID = id
@@ -674,11 +704,29 @@ func (h *Handler) upsertAggregateCheckRun(
 		Conclusion:   conclusion,
 	}
 	if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
-		h.logger.Error("failed to store aggregate check state", "error", err)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_update",
+			Repository:  repo,
+			Environment: environment,
+			Status:      "error",
+		})
+		h.logger.Error("failed to store aggregate check state",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "check_run_id", checkRunID,
+			"head_sha", headSHA, "status", status,
+			"conclusion", conclusion, "error", err)
+		return
 	}
 
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:   "aggregate_update",
+		Repository:  repo,
+		Environment: environment,
+		Status:      "success",
+	})
 	h.logger.Info("aggregate check updated",
 		"repo", repo, "pr", pr, "check_name", checkName,
+		"environment", environment, "check_run_id", checkRunID,
 		"status", status, "conclusion", conclusion,
 		"per_database_checks", len(dbChecks))
 }
@@ -693,7 +741,11 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 	config := h.service.Config()
 	storedChecks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
-		metrics.RecordStatusCheckOperation(ctx, "aggregate_update", "", "", "error")
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "aggregate_update",
+			Repository: repo,
+			Status:     "error",
+		})
 		h.logger.Error("failed to fetch checks before passing aggregate", "repo", repo, "pr", pr, "error", err)
 		return
 	}
@@ -724,7 +776,12 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 		checkName := ec.name
 
 		if hasBlockingCheckForEnvironment(storedChecks, ec.environment) {
-			metrics.RecordStatusCheckOperation(ctx, "aggregate_update", "", ec.environment, "blocked")
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_update",
+				Repository:  repo,
+				Environment: ec.environment,
+				Status:      "blocked",
+			})
 			h.logger.Info("skipping passing aggregate because stored checks still block",
 				"repo", repo, "pr", pr, "check_name", checkName, "environment", ec.environment)
 			continue
@@ -742,12 +799,24 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 
 		existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, ec.environment, aggregateSentinel, aggregateSentinel)
 		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_update",
+				Repository:  repo,
+				Environment: ec.environment,
+				Status:      "error",
+			})
 			h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "env", ec.environment, "error", err)
 			continue
 		}
 
 		// Skip if already passing for this SHA
 		if existing != nil && existing.HeadSHA == headSHA && existing.Conclusion == checkConclusionSuccess {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_update",
+				Repository:  repo,
+				Environment: ec.environment,
+				Status:      "noop",
+			})
 			h.logger.Debug("passing aggregate already exists", "repo", repo, "pr", pr, "check_name", checkName)
 			continue
 		}
@@ -755,14 +824,31 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 		var checkRunID int64
 		if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
 			if err := client.UpdateCheckRun(ctx, repo, existing.CheckRunID, opts); err != nil {
-				h.logger.Error("failed to update passing aggregate", "error", err)
+				metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+					Operation:   "aggregate_update",
+					Repository:  repo,
+					Environment: ec.environment,
+					Status:      "error",
+				})
+				h.logger.Error("failed to update passing aggregate",
+					"repo", repo, "pr", pr, "check_name", checkName,
+					"environment", ec.environment, "check_run_id", existing.CheckRunID,
+					"head_sha", headSHA, "error", err)
 				continue
 			}
 			checkRunID = existing.CheckRunID
 		} else {
 			id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
 			if err != nil {
-				h.logger.Error("failed to create passing aggregate", "error", err)
+				metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+					Operation:   "aggregate_update",
+					Repository:  repo,
+					Environment: ec.environment,
+					Status:      "error",
+				})
+				h.logger.Error("failed to create passing aggregate",
+					"repo", repo, "pr", pr, "check_name", checkName,
+					"environment", ec.environment, "head_sha", headSHA, "error", err)
 				continue
 			}
 			checkRunID = id
@@ -781,13 +867,29 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 			Conclusion:   checkConclusionSuccess,
 		}
 		if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
-			h.logger.Error("failed to store passing aggregate check", "error", err)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_update",
+				Repository:  repo,
+				Environment: ec.environment,
+				Status:      "error",
+			})
+			h.logger.Error("failed to store passing aggregate check",
+				"repo", repo, "pr", pr, "check_name", checkName,
+				"environment", ec.environment, "check_run_id", checkRunID,
+				"head_sha", headSHA, "error", err)
+			continue
 		}
 
 		action := "created"
 		if existing != nil && existing.CheckRunID != 0 && existing.HeadSHA == headSHA {
 			action = "updated"
 		}
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_update",
+			Repository:  repo,
+			Environment: ec.environment,
+			Status:      "success",
+		})
 		h.logger.Info("posted passing aggregate",
 			"repo", repo, "pr", pr, "check_name", checkName, "env", ec.environment, "action", action)
 	}

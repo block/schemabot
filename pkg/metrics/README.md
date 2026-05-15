@@ -12,6 +12,7 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 | `schemabot.apply.duration_seconds` | Histogram | database, environment, status | Apply API call time |
 | `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies |
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
+| `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
 | `schemabot.webhook.events_total` | Counter | event_type, action, repository, status | GitHub webhook events |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.lock_operations_total` | Counter | operation, database, status | Lock acquire/release operations |
@@ -24,6 +25,10 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 **status** (plans/applies): `success`, `error`, `rejected`
 
 **operation** (check ownership): `complete_apply`, `rollback_action_required`
+
+**operation** (status checks): `plan_record`, `apply_start`, `apply_result`, `rollback_action_required`, `aggregate_update`, `stale_cleanup`, `stale_reconcile`, `config_discovery`
+
+**status** (status checks): `success`, `error`, `skipped`, `stale`, `noop`, `blocked` (operation outcome, not GitHub Check Run conclusion)
 
 **operation** (control): `cutover`, `stop`, `start`, `volume`, `revert`, `skip_revert`, `rollback_plan`
 
@@ -68,6 +73,22 @@ Operator response:
 4. If the live schema may now differ from the PR's current declarative schema,
    re-plan the current head and decide whether to apply again, roll back, or
    hold the PR until drift is resolved.
+
+### Status Check Operations
+
+`schemabot.status_check_operations_total` tracks lower-level status-check work
+that does not always involve ownership conflicts. Use it to see whether
+SchemaBot is successfully storing check state, publishing aggregate Check Runs,
+or intentionally blocking a passing aggregate because older stored state still
+requires operator attention.
+
+A spike in `status="blocked"` for `operation="aggregate_update"` or
+`operation="stale_cleanup"` means SchemaBot is fail-closing instead of allowing
+a PR head to pass while earlier check state still matters. Operators should
+inspect the affected PR/database and decide whether the target environment needs
+another apply, a rollback, or manual reconciliation. A spike in `status="error"`
+usually points to storage or GitHub API failures and should be investigated
+before relying on branch-protection state.
 
 ## HTTP Server Metrics
 

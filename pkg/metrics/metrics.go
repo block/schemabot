@@ -324,14 +324,24 @@ var knownStatusCheckStatuses = map[string]bool{
 	"blocked": true,
 }
 
+// StatusCheckOperation describes one status-check storage or GitHub operation.
+type StatusCheckOperation struct {
+	Operation    string
+	Repository   string
+	Database     string
+	DatabaseType string
+	Environment  string
+	Status       string
+}
+
 // RecordStatusCheckOperation increments the status-check operations counter.
 // Unknown operation and status values are normalized to prevent unbounded cardinality.
-func RecordStatusCheckOperation(ctx context.Context, operation, database, environment, status string) {
-	if !knownStatusCheckOperations[operation] {
-		operation = "unknown"
+func RecordStatusCheckOperation(ctx context.Context, op StatusCheckOperation) {
+	if !knownStatusCheckOperations[op.Operation] {
+		op.Operation = "unknown"
 	}
-	if !knownStatusCheckStatuses[status] {
-		status = "unknown"
+	if !knownStatusCheckStatuses[op.Status] {
+		op.Status = "unknown"
 	}
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64Counter("schemabot.status_check_operations_total",
@@ -343,14 +353,20 @@ func RecordStatusCheckOperation(ctx context.Context, operation, database, enviro
 		return
 	}
 	attrs := []attribute.KeyValue{
-		attribute.String("operation", operation),
-		attribute.String("status", status),
+		attribute.String("operation", op.Operation),
+		attribute.String("status", op.Status),
 	}
-	if database != "" {
-		attrs = append(attrs, attribute.String("database", database))
+	if op.Database != "" {
+		attrs = append(attrs, attribute.String("database", op.Database))
 	}
-	if environment != "" {
-		attrs = append(attrs, attribute.String("environment", environment))
+	if op.DatabaseType != "" {
+		attrs = append(attrs, attribute.String("database_type", op.DatabaseType))
+	}
+	if op.Environment != "" {
+		attrs = append(attrs, attribute.String("environment", op.Environment))
+	}
+	if op.Repository != "" {
+		attrs = append(attrs, attribute.String("repository", op.Repository))
 	}
 	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
 }

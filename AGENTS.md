@@ -90,6 +90,19 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 **OSS-ready code:** Never reference internal company names or proprietary details in code or comments.
 
+### PR Self-Review Bar
+
+Before handing a PR to the user, review it the way an operator will experience it during an incident:
+
+- **Safety gates first.** GitHub Check Runs are a tier-0 SchemaBot safety feature. Any code that creates, stores, reconciles, or aggregates check state must fail closed. Storage uncertainty, GitHub API uncertainty, ownership ambiguity, or in-flight apply ambiguity must never be converted into a passing check.
+- **Check Run vs stored check state.** Use precise terms. A GitHub Check Run is the visible object on the PR commit. Stored check state is SchemaBot's database record used to decide what Check Run to create or update. Comments, logs, tests, and docs should make clear which one is being changed.
+- **TOCTOU review.** For async flows, webhooks, reconciliation, and background watchers, ask what happens if the PR head changes, another pod writes first, an apply starts or finishes concurrently, or a rollback changes the target schema. Use conditional storage updates, ownership identifiers, and final state reloads where stale workers could otherwise overwrite newer state.
+- **Started applies remain authoritative.** Once an apply has started, a later PR head that removes the schema change must not make the aggregate check pass by cleanup alone. The stored state must continue to block merge until an operator reconciles the target environment.
+- **Logs must answer the triage question.** Error and warning logs on critical paths should include the identifiers an operator needs: repo, PR, head SHA when relevant, environment, database type, database, apply ID or identifier, check ID or Check Run ID, and the operation being attempted.
+- **Metrics should be actionable.** Add counters for rare or dangerous branches that operators can investigate, such as ownership misses, stale cleanup blocking, or status-check update failures. If a metric spikes, the expected operator action should be obvious from the metric name, attributes, and nearby code comments or docs.
+- **Readability is a review gate.** Extract named helpers for compound state predicates, separate error handling from state decisions, and keep comments focused on invariants and operator-facing behavior. Avoid clever SQL, dense boolean expressions, and control flow that requires reconstructing the state machine in your head.
+- **Tests must prove documented behavior.** If a PR summary or docs mention an edge case, add focused tests for it or explicitly call out why it cannot be tested in this layer. Prefer integration-style webhook/storage tests for check-run lifecycle behavior.
+
 **Engine-agnostic interfaces:** The engine interface (`pkg/engine`), tern proto (`pkg/proto`), and API types (`pkg/apitypes`) must not contain engine-specific fields (e.g., PlanetScale branch names, Spirit checkpoint details). Use generic `Metadata map[string]string` fields for engine-specific data. Engine-specific types belong in the engine package (e.g., `pkg/engine/planetscale/`).
 
 **Never silently fail:** Prefer returning errors over silently swallowing them. If a function encounters a condition it can't handle, return an error — don't log and continue. Callers should decide how to handle errors, not the callee. The `Canonicalize` / `FormatDDL` functions in `pkg/ddl/format.go` are an exception: they are best-effort display formatters where returning the original string on parse failure is acceptable.
