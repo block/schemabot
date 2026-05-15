@@ -100,6 +100,11 @@ type Check struct {
 	// Values: "success", "failure", "action_required", "neutral", "cancelled", "skipped".
 	Conclusion string
 
+	// BlockingReason is a machine-readable reason code explaining why stored
+	// check state must keep the aggregate check from passing.
+	// ErrorMessage remains human-readable display text.
+	BlockingReason string
+
 	// ErrorMessage contains a human-readable explanation when the check state fails.
 	// Displayed in the GitHub Check Run details and PR comment.
 	ErrorMessage string

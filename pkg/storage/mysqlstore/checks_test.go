@@ -19,16 +19,18 @@ func TestCheckStore_Upsert(t *testing.T) {
 	store := New(testDB)
 
 	check := &storage.Check{
-		Repository:   "org/repo",
-		PullRequest:  123,
-		HeadSHA:      "abc123",
-		Environment:  "staging",
-		DatabaseType: "vitess",
-		DatabaseName: "testdb",
-		CheckRunID:   999,
-		HasChanges:   true,
-		Status:       "pending_apply",
-		Conclusion:   "action_required",
+		Repository:     "org/repo",
+		PullRequest:    123,
+		HeadSHA:        "abc123",
+		Environment:    "staging",
+		DatabaseType:   "vitess",
+		DatabaseName:   "testdb",
+		CheckRunID:     999,
+		HasChanges:     true,
+		Status:         "pending_apply",
+		Conclusion:     "action_required",
+		BlockingReason: "schema_removed_after_apply_started",
+		ErrorMessage:   "operator action required",
 	}
 
 	// Insert
@@ -39,16 +41,22 @@ func TestCheckStore_Upsert(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, retrieved)
 	require.Equal(t, "pending_apply", retrieved.Status)
+	require.Equal(t, "schema_removed_after_apply_started", retrieved.BlockingReason)
+	require.Equal(t, "operator action required", retrieved.ErrorMessage)
 
 	// Update
 	check.Status = "completed"
 	check.Conclusion = "success"
+	check.BlockingReason = ""
+	check.ErrorMessage = ""
 	require.NoError(t, store.Checks().Upsert(ctx, check))
 
 	// Verify update
 	retrieved, err = store.Checks().Get(ctx, "org/repo", 123, "staging", "vitess", "testdb")
 	require.NoError(t, err)
 	require.Equal(t, "completed", retrieved.Status)
+	require.Empty(t, retrieved.BlockingReason)
+	require.Empty(t, retrieved.ErrorMessage)
 }
 
 func TestCheckStore_GetByCheckRunID(t *testing.T) {

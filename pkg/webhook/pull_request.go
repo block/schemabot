@@ -189,7 +189,7 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, installationID int64, affectedDatabases map[string]bool) {
 	if h.service == nil {
 		metrics.RecordStatusCheckOperation(context.Background(), metrics.StatusCheckOperation{
-			Operation:  "stale_cleanup",
+			Operation:  "stale_check_cleanup",
 			Repository: repo,
 			Status:     "error",
 		})
@@ -203,7 +203,7 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:  "stale_cleanup",
+			Operation:  "stale_check_cleanup",
 			Repository: repo,
 			Status:     "error",
 		})
@@ -235,9 +235,9 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
 			"environment", check.Environment, "head_sha", headSHA,
 			"previous_status", check.Status, "previous_conclusion", check.Conclusion,
-			"apply_id", check.ApplyID)
+			"previous_blocking_reason", check.BlockingReason, "apply_id", check.ApplyID)
 
-		if checkRepresentsStartedApply(check) {
+		if checkHasStartedApply(check) {
 			if h.blockStaleStartedApplyCheckState(ctx, repo, pr, headSHA, check) {
 				cleaned = true
 			}
@@ -254,7 +254,7 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 		client, clientErr := h.ghClient.ForInstallation(installationID)
 		if clientErr != nil {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-				Operation:  "aggregate_update",
+				Operation:  "aggregate_check_sync",
 				Repository: repo,
 				Status:     "error",
 			})
@@ -269,7 +269,8 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
 	check.HeadSHA = headSHA
 	check.HasChanges = true
-	check.ErrorMessage = checkErrorSchemaRemovedAfterApplyStarted
+	check.BlockingReason = schemaRemovedAfterApplyBlock.blockingReason
+	check.ErrorMessage = schemaRemovedAfterApplyBlock.message
 	if check.Status == checkStatusInProgress {
 		check.Conclusion = ""
 	} else {
@@ -278,7 +279,7 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 	}
 	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "stale_cleanup",
+			Operation:    "stale_check_cleanup",
 			Repository:   repo,
 			Database:     check.DatabaseName,
 			DatabaseType: check.DatabaseType,
@@ -293,7 +294,7 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 		return false
 	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-		Operation:    "stale_cleanup",
+		Operation:    "stale_check_cleanup",
 		Repository:   repo,
 		Database:     check.DatabaseName,
 		DatabaseType: check.DatabaseType,
@@ -308,10 +309,11 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 	check.Conclusion = checkConclusionSuccess
 	check.HasChanges = false
 	check.Status = checkStatusCompleted
+	check.BlockingReason = ""
 	check.ErrorMessage = ""
 	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:    "stale_cleanup",
+			Operation:    "stale_check_cleanup",
 			Repository:   repo,
 			Database:     check.DatabaseName,
 			DatabaseType: check.DatabaseType,
@@ -326,7 +328,7 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 		return false
 	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-		Operation:    "stale_cleanup",
+		Operation:    "stale_check_cleanup",
 		Repository:   repo,
 		Database:     check.DatabaseName,
 		DatabaseType: check.DatabaseType,

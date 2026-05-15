@@ -24,9 +24,9 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 
 **status** (plans/applies): `success`, `error`, `rejected`
 
-**operation** (check ownership): `complete_apply`, `rollback_action_required`
+**operation** (check ownership): `apply_finished`, `rollback_finished`
 
-**operation** (status checks): `plan_record`, `apply_start`, `apply_result`, `rollback_action_required`, `aggregate_update`, `stale_cleanup`, `stale_reconcile`, `config_discovery`
+**operation** (status checks): `plan_check_recorded`, `apply_started`, `apply_finished`, `rollback_finished`, `aggregate_check_sync`, `stale_check_cleanup`, `stale_check_reconciliation`, `schema_config_discovery`
 
 **status** (status checks): `success`, `error`, `skipped`, `stale`, `noop`, `blocked` (operation outcome, not GitHub Check Run conclusion)
 
@@ -54,6 +54,13 @@ The guarded update prevented the stale worker from overwriting current merge-gat
 state, so the metric is a near-miss signal rather than proof that check state was
 corrupted.
 
+Operation values:
+
+| Operation | Meaning |
+|---|---|
+| `apply_finished` | A worker tried to record a terminal apply result, but the stored check state no longer belonged to that apply. |
+| `rollback_finished` | A rollback worker tried to mark the check `action_required`, but the stored check state no longer belonged to that rollback apply. |
+
 A spike is still dangerous because the live database can keep changing after the
 PR's desired schema has moved on. For example, an apply can start for commit A,
 an agent can push commit B that removes the schema change, and commit A's apply
@@ -65,8 +72,8 @@ Operator response:
 1. Group by `repository`, `environment`, `database_type`, `database`, and
    `operation` to identify whether the spike is isolated or global.
 2. For an isolated PR/database, inspect the PR timeline for new commits while an
-   apply was running, then compare the current PR head, stored check state, and
-   active apply state before allowing merge.
+   apply was running, then compare the latest commit on the PR branch, stored
+   check state, and active apply state before allowing merge.
 3. For a global spike, check recent deploys, pod restarts, recovery activity, and
    webhook redeliveries. A broad spike can indicate duplicate workers or a
    service-level race, not just user commit churn.
@@ -82,13 +89,57 @@ SchemaBot is successfully storing check state, publishing aggregate Check Runs,
 or intentionally blocking a passing aggregate because older stored state still
 requires operator attention.
 
-A spike in `status="blocked"` for `operation="aggregate_update"` or
-`operation="stale_cleanup"` means SchemaBot is fail-closing instead of allowing
-a PR head to pass while earlier check state still matters. Operators should
-inspect the affected PR/database and decide whether the target environment needs
-another apply, a rollback, or manual reconciliation. A spike in `status="error"`
-usually points to storage or GitHub API failures and should be investigated
-before relying on branch-protection state.
+Operation values:
+
+| Operation | Meaning |
+|---|---|
+| `plan_check_recorded` | SchemaBot stored per-database check state for a plan result. This is the internal state later rolled into the aggregate GitHub Check Run. |
+| `apply_started` | SchemaBot marked stored check state as owned by an accepted apply and set it to `in_progress`. This is a check lifecycle event, not proof that the engine has started copying rows. |
+| `apply_finished` | SchemaBot updated stored check state after an apply reached a terminal state, such as success or failure. |
+| `rollback_finished` | SchemaBot marked stored check state `action_required` after a rollback succeeded because the PR's desired schema is no longer present in that environment. |
+| `aggregate_check_sync` | SchemaBot tried to make the visible aggregate GitHub Check Run match stored per-database check state. The status label says whether it created/updated, skipped, blocked, or failed. |
+| `stale_check_cleanup` | SchemaBot handled stored check state for a database that is no longer touched by the latest commit on the PR branch. Plan-only state can be cleared; apply-owned state stays blocked. |
+| `stale_check_reconciliation` | SchemaBot repaired stale `in_progress` stored check state by comparing it with authoritative apply state after a worker restart, crash, or race. |
+| `schema_config_discovery` | SchemaBot discovered managed schema configs for the PR before deciding what to plan or which aggregate checks to publish. |
+
+A spike in `status="blocked"` for `operation="aggregate_check_sync"` or
+`operation="stale_check_cleanup"` means SchemaBot is fail-closing instead of
+allowing the latest commit on the PR branch to pass while earlier check state
+still matters. For example, commit A can add a schema change and start an apply,
+then commit B can remove that schema change before the apply finishes. SchemaBot
+blocks the aggregate Check Run for commit B until an operator decides whether
+the target environment needs another apply, a rollback, or manual reconciliation.
+A spike in `status="error"` usually points to storage or GitHub API failures and
+should be investigated before relying on branch-protection state.
+
+### Control Operations
+
+`schemabot.control_operations_total` tracks operator commands that act on an
+existing apply or generate a rollback plan.
+
+Operation values:
+
+| Operation | Meaning |
+|---|---|
+| `cutover` | Trigger cutover for an apply that is waiting for cutover confirmation. |
+| `stop` | Request that the engine stop an apply. |
+| `start` | Request that the engine start or resume an apply. |
+| `volume` | Change the engine's throttling or volume setting for an apply. |
+| `revert` | Request that the engine revert an apply. |
+| `skip_revert` | Skip the post-deploy revert window for an apply. |
+| `rollback_plan` | Generate a rollback plan from a previous completed apply. |
+
+### Lock Operations
+
+`schemabot.lock_operations_total` tracks database-level lock acquisition and
+release attempts.
+
+Operation values:
+
+| Operation | Meaning |
+|---|---|
+| `acquire` | Try to acquire the database lock for a plan/apply workflow. |
+| `release` | Try to release the database lock, either by owner or administrative override. |
 
 ## HTTP Server Metrics
 

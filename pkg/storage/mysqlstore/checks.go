@@ -16,7 +16,7 @@ import (
 const checkColumns = `id, repository, pull_request, head_sha,
 	environment, database_type, database_name,
 	check_run_id, apply_id, has_changes, status, conclusion,
-	error_message, created_at, updated_at`
+	blocking_reason, error_message, created_at, updated_at`
 
 const checkStatusInProgress = "in_progress"
 
@@ -41,8 +41,8 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 		INSERT INTO checks (
 			repository, pull_request, head_sha,
 			environment, database_type, database_name,
-			check_run_id, apply_id, has_changes, status, conclusion, error_message
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
 			head_sha = VALUES(head_sha),
 			check_run_id = VALUES(check_run_id),
@@ -50,10 +50,11 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 			has_changes = VALUES(has_changes),
 			status = VALUES(status),
 			conclusion = VALUES(conclusion),
+			blocking_reason = VALUES(blocking_reason),
 			error_message = VALUES(error_message)
 	`, check.Repository, check.PullRequest, check.HeadSHA,
 		check.Environment, check.DatabaseType, check.DatabaseName,
-		checkRunID, applyID, check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage)
+		checkRunID, applyID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage)
 	return err
 }
 
@@ -69,11 +70,11 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check)
 		INSERT INTO checks (
 			repository, pull_request, head_sha,
 			environment, database_type, database_name,
-			check_run_id, apply_id, has_changes, status, conclusion, error_message
-		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+			check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message
+		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
 	`, check.Repository, check.PullRequest, check.HeadSHA,
 		check.Environment, check.DatabaseType, check.DatabaseName,
-		checkRunID, check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage)
+		checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage)
 	// Fast path: no existing check state for this PR/environment/database, so the
 	// insert is the complete write. Any non-duplicate error is a real storage
 	// failure; duplicate key means the row exists and needs the guarded update
@@ -85,8 +86,9 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check)
 		return err
 	}
 
-	// Preserve same-head in-progress apply-owned state. A plan result for that
-	// same PR head is stale relative to the apply that already started.
+	// Preserve in-progress apply-owned state for the same PR commit. A plan
+	// result for that same commit is stale relative to the apply that already
+	// started.
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE checks
 		SET head_sha = ?,
@@ -95,11 +97,12 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check)
 		    has_changes = ?,
 		    status = ?,
 		    conclusion = ?,
+		    blocking_reason = ?,
 		    error_message = ?
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND NOT (status = ? AND head_sha = ? AND apply_id IS NOT NULL)
-	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage,
+	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		checkStatusInProgress, check.HeadSHA)
 	return err
@@ -121,6 +124,7 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		    has_changes = ?,
 		    status = ?,
 		    conclusion = ?,
+		    blocking_reason = ?,
 		    error_message = ?
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
@@ -137,7 +141,7 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		      AND newer.id > ?
 		      AND newer.state NOT IN (?, ?, ?, ?, ?)
 		  )
-	`, check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage,
+	`, check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		checkStatusInProgress, apply.ID,
 		apply.ID, state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted)
@@ -168,6 +172,7 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		    has_changes = ?,
 		    status = ?,
 		    conclusion = ?,
+		    blocking_reason = ?,
 		    error_message = ?
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
@@ -183,7 +188,7 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		      AND newer.id > ?
 		      AND newer.state NOT IN (?, ?, ?, ?, ?)
 		  )
-	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage,
+	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		apply.ID, apply.ID, state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted)
 	if err != nil {
@@ -296,13 +301,13 @@ func scanChecks(rows *sql.Rows) ([]*storage.Check, error) {
 func scanCheckInto(s scanner) (*storage.Check, error) {
 	var check storage.Check
 	var checkRunID, applyID sql.NullInt64
-	var conclusion, errorMessage sql.NullString
+	var conclusion, blockingReason, errorMessage sql.NullString
 
 	err := s.Scan(
 		&check.ID, &check.Repository, &check.PullRequest, &check.HeadSHA,
 		&check.Environment, &check.DatabaseType, &check.DatabaseName,
 		&checkRunID, &applyID, &check.HasChanges, &check.Status, &conclusion,
-		&errorMessage, &check.CreatedAt, &check.UpdatedAt,
+		&blockingReason, &errorMessage, &check.CreatedAt, &check.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -316,6 +321,9 @@ func scanCheckInto(s scanner) (*storage.Check, error) {
 	}
 	if conclusion.Valid {
 		check.Conclusion = conclusion.String
+	}
+	if blockingReason.Valid {
+		check.BlockingReason = blockingReason.String
 	}
 	if errorMessage.Valid {
 		check.ErrorMessage = errorMessage.String

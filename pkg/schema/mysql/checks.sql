@@ -11,6 +11,7 @@ CREATE TABLE `checks` (
   `has_changes` tinyint(1) NOT NULL DEFAULT '1',
   `status` varchar(255) NOT NULL,
   `conclusion` varchar(255) DEFAULT NULL,
+  `blocking_reason` varchar(255) DEFAULT NULL,
   `error_message` text,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

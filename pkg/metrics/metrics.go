@@ -103,8 +103,8 @@ func RecordApplyDuration(ctx context.Context, duration time.Duration, database, 
 // knownCheckOwnershipOperations limits metric cardinality to expected check
 // ownership miss paths.
 var knownCheckOwnershipOperations = map[string]bool{
-	"complete_apply":           true,
-	"rollback_action_required": true,
+	"apply_finished":    true,
+	"rollback_finished": true,
 }
 
 // RecordCheckOwnershipMiss increments the counter for guarded check updates
@@ -305,14 +305,14 @@ func RecordWebhookEvent(ctx context.Context, eventType, action, repo, status str
 }
 
 var knownStatusCheckOperations = map[string]bool{
-	"plan_record":              true,
-	"apply_start":              true,
-	"apply_result":             true,
-	"rollback_action_required": true,
-	"aggregate_update":         true,
-	"stale_cleanup":            true,
-	"stale_reconcile":          true,
-	"config_discovery":         true,
+	"plan_check_recorded":        true,
+	"apply_started":              true,
+	"apply_finished":             true,
+	"rollback_finished":          true,
+	"aggregate_check_sync":       true,
+	"stale_check_cleanup":        true,
+	"stale_check_reconciliation": true,
+	"schema_config_discovery":    true,
 }
 
 var knownStatusCheckStatuses = map[string]bool{

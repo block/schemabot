@@ -1218,11 +1218,27 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 
 	// Capture check run creates and updates on the new SHA
 	checkRuns := make(chan checkRunCapture, 10)
+	stalePlanChecksCleaned := func() bool {
+		for _, env := range []string{"staging", "production"} {
+			check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, env, "mysql", dbName)
+			if err != nil || check == nil {
+				return false
+			}
+			if check.HeadSHA != "newsha222" || check.Conclusion != checkConclusionSuccess || check.HasChanges {
+				return false
+			}
+		}
+		return true
+	}
+	var prematurePassingAggregate atomic.Bool
 	var checkRunIDCounter atomic.Int64
 	checkRunIDCounter.Store(300)
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Name == aggregateCheckName && body.Conclusion == checkConclusionSuccess && !stalePlanChecksCleaned() {
+			prematurePassingAggregate.Store(true)
+		}
 		checkRuns <- body
 		id := checkRunIDCounter.Add(1)
 		w.WriteHeader(http.StatusCreated)
@@ -1231,6 +1247,9 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Name == aggregateCheckName && body.Conclusion == checkConclusionSuccess && !stalePlanChecksCleaned() {
+			prematurePassingAggregate.Store(true)
+		}
 		checkRuns <- body
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
@@ -1254,6 +1273,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	case cr := <-checkRuns:
 		assert.Equal(t, aggregateCheckName, cr.Name)
 		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+		assert.False(t, prematurePassingAggregate.Load(), "passing aggregate was published before stale per-database records were cleaned")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for aggregate check run")
 	}
@@ -1266,6 +1286,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 			if err == nil && check != nil && check.HeadSHA == "newsha222" {
 				assert.Equal(t, checkConclusionSuccess, check.Conclusion)
 				assert.False(t, check.HasChanges)
+				assert.Empty(t, check.BlockingReason)
 				break
 			}
 			select {
@@ -1293,6 +1314,7 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	}
 	assert.Equal(t, checkConclusionSuccess, storedAgg.Conclusion)
 	assert.False(t, storedAgg.HasChanges)
+	assert.False(t, prematurePassingAggregate.Load(), "passing aggregate was published before stale per-database records were cleaned")
 }
 
 func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
@@ -1420,6 +1442,8 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	assert.Empty(t, check.Conclusion)
 	assert.True(t, check.HasChanges)
 	assert.Equal(t, applyID, check.ApplyID)
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, check.BlockingReason)
+	assert.Equal(t, schemaRemovedAfterApplyBlock.message, check.ErrorMessage)
 
 	apply.State = state.Apply.Completed
 	updated, err := h.updateCheckRecordForApplyResult(ctx, "octocat/hello-world", 1, apply)
@@ -1431,6 +1455,8 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	require.NotNil(t, check)
 	assert.Equal(t, checkStatusCompleted, check.Status)
 	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, check.BlockingReason)
+	assert.Equal(t, schemaRemovedAfterApplyBlock.message, check.ErrorMessage)
 
 	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "newsha222")
 	select {
@@ -2030,18 +2056,20 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		return isActionRequiredWithoutApplyOwnership(check)
+		return isRollbackActionRequiredWithoutApplyOwnership(check)
 	}, 30*time.Second, 500*time.Millisecond,
 		"check should transition to action_required without active apply ownership after rollback")
 }
 
-func isActionRequiredWithoutApplyOwnership(check *storage.Check) bool {
+func isRollbackActionRequiredWithoutApplyOwnership(check *storage.Check) bool {
 	if check == nil {
 		return false
 	}
 	return check.Status == checkStatusCompleted &&
 		check.Conclusion == checkConclusionActionRequired &&
-		check.ApplyID == 0
+		check.ApplyID == 0 &&
+		check.BlockingReason == rollbackCompletedBlock.blockingReason &&
+		check.ErrorMessage == rollbackCompletedBlock.message
 }
 
 // TestE2ERollbackIgnoredByNonOwningInstance verifies that in a multi-instance

@@ -255,8 +255,8 @@ func TestRecordCheckOwnershipMissMetric(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordCheckOwnershipMiss(t.Context(), "complete_apply", "org/repo", "mydb", "mysql", "staging")
-	metrics.RecordCheckOwnershipMiss(t.Context(), "rollback_action_required", "org/repo", "mydb", "mysql", "staging")
+	metrics.RecordCheckOwnershipMiss(t.Context(), "apply_finished", "org/repo", "mydb", "mysql", "staging")
+	metrics.RecordCheckOwnershipMiss(t.Context(), "rollback_finished", "org/repo", "mydb", "mysql", "staging")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
@@ -286,13 +286,13 @@ func TestRecordStatusCheckOperationMetric(t *testing.T) {
 	})
 
 	metrics.RecordStatusCheckOperation(t.Context(), metrics.StatusCheckOperation{
-		Operation:   "aggregate_update",
+		Operation:   "aggregate_check_sync",
 		Repository:  "org/repo",
 		Environment: "staging",
 		Status:      "blocked",
 	})
 	metrics.RecordStatusCheckOperation(t.Context(), metrics.StatusCheckOperation{
-		Operation:    "stale_cleanup",
+		Operation:    "stale_check_cleanup",
 		Repository:   "org/repo",
 		Database:     "mydb",
 		DatabaseType: "mysql",
