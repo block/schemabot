@@ -65,6 +65,7 @@ type activeDeployRow struct {
 	vschemaApplied         bool
 	autoCutover            bool
 	instantDDLEligible     bool
+	instantDDL             bool
 	branch                 string
 	revertExpiresAtStr     sql.NullString
 	createdAtStr           string
@@ -75,7 +76,7 @@ type activeDeployRow struct {
 func (s *Server) processActiveDeployRequests(ctx context.Context) {
 	rows, err := s.metadataDB.QueryContext(ctx,
 		`SELECT org, database_name, number, deployment_state, migration_context, revert_migration_context,
-		        vschema_data, vschema_applied, auto_cutover, instant_ddl_eligible, branch, revert_expires_at, created_at
+		        vschema_data, vschema_applied, auto_cutover, instant_ddl_eligible, instant_ddl, branch, revert_expires_at, created_at
 		 FROM localscale_deploy_requests
 		 WHERE deployment_state IN ('submitting','queued','in_progress','pending_cutover','in_progress_cutover','in_progress_vschema','in_progress_cancel','in_progress_revert','in_progress_revert_vschema','complete_pending_revert')
 		 AND deployed = TRUE`)
@@ -88,7 +89,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 	for rows.Next() {
 		var r activeDeployRow
 		if err := rows.Scan(&r.org, &r.database, &r.number, &r.deployState, &r.migrationContext, &r.revertMigrationContext,
-			&r.vschemaDataSQL, &r.vschemaApplied, &r.autoCutover, &r.instantDDLEligible, &r.branch, &r.revertExpiresAtStr, &r.createdAtStr); err != nil {
+			&r.vschemaDataSQL, &r.vschemaApplied, &r.autoCutover, &r.instantDDLEligible, &r.instantDDL, &r.branch, &r.revertExpiresAtStr, &r.createdAtStr); err != nil {
 			s.logger.Warn("processor: scan deploy request row", "error", err)
 			continue
 		}
@@ -181,7 +182,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 				}
 			}
 
-			newState := deriveDeployState(migrations, cutoverRequested, r.instantDDLEligible)
+			newState := deriveDeployState(migrations, cutoverRequested, r.instantDDL)
 
 			// If the processor detects cancelled migrations while the deploy is
 			// still in queued/in_progress, route through the cancel flow instead

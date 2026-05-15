@@ -523,8 +523,6 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		fmt.Sprintf("Apply started: %s", applyIdentifier), "", state.Apply.Pending)
 
 	// Create one Task per DDLChange in the plan.
-	// For VSchema-only deploys (0 DDL changes), create a synthetic task per
-	// keyspace with VSchema changes so the progress API has something to track.
 	c.logger.Info("Apply: creating tasks",
 		"plan_id", plan.PlanIdentifier,
 		"ddl_change_count", len(ddlChanges),
@@ -537,15 +535,25 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		)
 	}
 
-	// Create VSchema tasks for namespaces with VSchema changes so the
-	// progress API and TUI can track VSchema application alongside DDL.
+	// Create vitess_tasks entries for namespaces with VSchema changes.
+	// These are tracked separately from DDL tasks because VSchema changes
+	// are metadata-only operations with their own lifecycle in PlanetScale.
 	for ns, nsData := range plan.Namespaces {
 		if len(nsData.VSchema) > 0 {
-			ddlChanges = append(ddlChanges, storage.TableChange{
-				Table:     "VSchema: " + ns,
-				Namespace: ns,
-				Operation: "vschema_update",
-			})
+			vt := &storage.VitessTask{
+				ApplyID:  applyID,
+				Keyspace: ns,
+				TaskType: "vschema",
+				State:    "pending",
+			}
+			if err := c.storage.VitessTasks().Create(ctx, vt); err != nil {
+				return nil, fmt.Errorf("create vitess_task for keyspace %s: %w", ns, err)
+			}
+			c.logger.Info("Apply: created vitess_task",
+				"apply_id", applyID,
+				"keyspace", ns,
+				"task_type", "vschema",
+			)
 		}
 	}
 
@@ -633,16 +641,17 @@ func (c *LocalClient) getEngine() engine.Engine {
 // If req.ApplyId is set, scopes to that specific apply. Otherwise queries by database.
 func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	var tasks []*storage.Task
+	var applyRecord *storage.Apply
 	var err error
 
 	if req.ApplyId != "" {
 		// Scope to specific apply.
-		apply, lookupErr := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-		if lookupErr != nil {
-			return nil, fmt.Errorf("get apply %s: %w", req.ApplyId, lookupErr)
+		applyRecord, err = c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+		if err != nil {
+			return nil, fmt.Errorf("get apply %s: %w", req.ApplyId, err)
 		}
-		if apply != nil {
-			tasks, err = c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+		if applyRecord != nil {
+			tasks, err = c.storage.Tasks().GetByApplyID(ctx, applyRecord.ID)
 			if err != nil {
 				return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, err)
 			}
@@ -717,40 +726,51 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		activeTask = latestTask
 	}
 
-	if activeTask == nil {
+	if activeTask == nil && applyRecord == nil {
 		return &ternv1.ProgressResponse{
 			State:  ternv1.State_STATE_NO_ACTIVE_CHANGE,
 			Engine: c.protoEngine(),
 		}, nil
 	}
-	c.logger.Info("Progress: selected task", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "apply_id", activeTask.ApplyID)
+
+	// Resolve the apply ID — from the active task if available, otherwise from the apply record.
+	var applyID int64
+	if activeTask != nil {
+		applyID = activeTask.ApplyID
+		c.logger.Info("Progress: selected task", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "apply_id", applyID)
+		// Ensure applyRecord is populated for vitess_tasks lookup.
+		if applyRecord == nil {
+			applyRecord, _ = c.storage.Applies().Get(ctx, applyID)
+		}
+	} else {
+		applyID = applyRecord.ID
+		c.logger.Info("Progress: no DDL tasks, using apply record", "apply_id", applyID)
+	}
 
 	// Get ALL tasks for this apply (completed + running + pending)
-	currentApplyTasks := filterTasksByApply(tasks, activeTask.ApplyID)
+	currentApplyTasks := filterTasksByApply(tasks, applyID)
 
 	creds := c.credentials()
 	eng := c.getEngine()
 
-	// Get live progress from engine for the currently running task.
-	// For Vitess, reconstruct ResumeState from vitess_apply_data so the engine
-	// can poll the deploy request and query SHOW VITESS_MIGRATIONS.
+	// Get live progress from engine. For Vitess, reconstruct ResumeState from
+	// vitess_apply_data so the engine can poll the deploy request.
 	var engineResult *engine.ProgressResult
 	var vitessApplyIsInstant bool
-	// Query engine for live progress. For Vitess, also query during pending state
-	// to surface PlanetScale states (preparing branch, deploy request, etc.).
 	queryDuringPending := c.config.Type == storage.DatabaseTypeVitess
-	if eng != nil && (activeTask.State != state.Task.Pending || queryDuringPending) {
+	shouldQueryEngine := activeTask == nil || activeTask.State != state.Task.Pending || queryDuringPending
+	if eng != nil && shouldQueryEngine {
 		progressReq := &engine.ProgressRequest{
 			Database:    c.config.Database,
 			Credentials: creds,
 		}
 		if c.config.Type == storage.DatabaseTypeVitess {
-			vad, vadErr := c.storage.VitessApplyData().GetByApplyID(ctx, activeTask.ApplyID)
+			vad, vadErr := c.storage.VitessApplyData().GetByApplyID(ctx, applyID)
 			switch {
 			case vadErr != nil:
-				c.logger.Error("failed to load VitessApplyData for progress", "apply_id", activeTask.ApplyID, "error", vadErr)
+				c.logger.Error("failed to load VitessApplyData for progress", "apply_id", applyID, "error", vadErr)
 			case vad == nil:
-				c.logger.Warn("VitessApplyData not found for progress — apply may still be initializing", "apply_id", activeTask.ApplyID)
+				c.logger.Warn("VitessApplyData not found for progress — apply may still be initializing", "apply_id", applyID)
 			default:
 				vitessApplyIsInstant = vad.IsInstant
 				meta, _ := json.Marshal(map[string]any{
@@ -769,12 +789,10 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		result, err := eng.Progress(ctx, progressReq)
 		if err == nil {
 			engineResult = result
-			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
+			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "apply_id", applyID)
 
-			// Only update task state from engine if task is not already in a terminal state.
-			// Terminal states (CANCELLED, COMPLETED, FAILED, etc.) should be preserved -
-			// they represent the final state set by the apply execution.
-			if !state.IsTerminalTaskState(activeTask.State) {
+			// Update the active DDL task state from engine if present and not terminal.
+			if activeTask != nil && !state.IsTerminalTaskState(activeTask.State) {
 				activeTask.State = engineStateToStorage(result.State)
 				now := time.Now()
 				activeTask.UpdatedAt = now
@@ -786,10 +804,8 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				}
 			}
 
-			// Also update the apply record if the engine reports a terminal state
-			// but the apply hasn't been updated yet. Only do this when ALL tasks
-			// for this apply are terminal — in sequential mode, the engine reports
-			// "completed" per-task, but the apply isn't done until all tasks finish.
+			// Update the apply record if the engine reports a terminal state
+			// and all DDL tasks are terminal (or there are none).
 			if result.State.IsTerminal() {
 				allTerminal := true
 				for _, t := range currentApplyTasks {
@@ -799,16 +815,15 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 					}
 				}
 				if allTerminal {
-					apply, _ := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-					if apply != nil && !state.IsTerminalApplyState(apply.State) {
+					if applyRecord != nil && !state.IsTerminalApplyState(applyRecord.State) {
 						now := time.Now()
-						apply.State = engineStateToStorage(result.State)
-						apply.CompletedAt = &now
-						apply.UpdatedAt = now
-						if err := c.storage.Applies().Update(ctx, apply); err != nil {
-							c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
+						applyRecord.State = engineStateToStorage(result.State)
+						applyRecord.CompletedAt = &now
+						applyRecord.UpdatedAt = now
+						if err := c.storage.Applies().Update(ctx, applyRecord); err != nil {
+							c.logger.Warn("failed to update apply from progress poll", "apply_id", applyRecord.ApplyIdentifier, "state", applyRecord.State, "apply_db_id", applyRecord.ID, "error", err)
 						}
-						c.logger.Info("apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
+						c.logger.Info("apply state updated from progress polling", "apply_id", applyRecord.ApplyIdentifier, "state", applyRecord.State)
 					}
 				}
 			}
@@ -904,6 +919,52 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tables = append(tables, tp)
 	}
 
+	// Append VSchema tasks from vitess_tasks storage. These represent
+	// non-DDL operations (VSchema, routing rules) that don't appear in
+	// SHOW VITESS_MIGRATIONS but are tracked by PlanetScale's deploy state machine.
+	{
+		vtasks, vtErr := c.storage.VitessTasks().GetByApplyID(ctx, applyID)
+		if vtErr != nil {
+			c.logger.Warn("failed to query vitess_tasks", "error", vtErr)
+		}
+		for _, vt := range vtasks {
+			tp := &ternv1.TableProgress{
+				TableName: engine.VSchemaTablePrefix + vt.Keyspace,
+				Namespace: vt.Keyspace,
+				Status:    strings.ToUpper(vt.State),
+			}
+			// Enrich with live engine state and persist state changes.
+			if engineResult != nil {
+				for _, et := range engineResult.Tables {
+					if et.Table == tp.TableName {
+						newState := strings.ToLower(et.State)
+						if newState != vt.State {
+							if updateErr := c.storage.VitessTasks().UpdateState(ctx, vt.ID, newState); updateErr != nil {
+								c.logger.Warn("failed to update vitess_task state",
+									"vitess_task_id", vt.ID,
+									"keyspace", vt.Keyspace,
+									"old_state", vt.State,
+									"new_state", newState,
+									"error", updateErr,
+								)
+							} else {
+								c.logger.Debug("updated vitess_task state",
+									"vitess_task_id", vt.ID,
+									"keyspace", vt.Keyspace,
+									"old_state", vt.State,
+									"new_state", newState,
+								)
+							}
+						}
+						tp.Status = strings.ToUpper(et.State)
+						break
+					}
+				}
+			}
+			tables = append(tables, tp)
+		}
+	}
+
 	// Derive overall state from ALL tasks in this apply.
 	// If tasks are all pending, check the apply record for a more specific state
 	// (e.g., preparing_branch, creating_deploy_request during PlanetScale setup).
@@ -913,7 +974,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// than what task states alone can derive. Check the apply record when
 	// tasks are still pending or when the overall state doesn't yet reflect
 	// real progress (e.g., engine returns "running" during setup).
-	if applyRec, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && applyRec != nil {
+	if applyRec, err := c.storage.Applies().Get(ctx, applyID); err == nil && applyRec != nil {
 		switch {
 		case state.IsBranchSetupPhase(applyRec.State):
 			c.logger.Debug("Progress: overriding task-derived state with apply record setup phase",
@@ -955,7 +1016,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 	// Populate apply_id, engine, and volume from the apply record.
 	// The apply record's engine is the source of truth (set at apply creation time).
-	if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && apply != nil {
+	if apply, err := c.storage.Applies().Get(ctx, applyID); err == nil && apply != nil {
 		resp.ApplyId = apply.ApplyIdentifier
 		if eng, err := engineNameToProto(apply.Engine); err != nil {
 			return nil, fmt.Errorf("invalid engine on apply %s: %w", apply.ApplyIdentifier, err)

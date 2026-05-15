@@ -741,3 +741,33 @@ func TestFormatDeployRequestError(t *testing.T) {
 		assert.Equal(t, "deploy request #99 failed during preparation (state: error)", msg)
 	})
 }
+
+func TestVSchemaProgressSynthesis(t *testing.T) {
+	// Verify VSchema keyspaces are encoded/decoded in metadata
+	t.Run("metadata round-trip", func(t *testing.T) {
+		meta := &psMetadata{
+			BranchName:       "test-branch",
+			DeployRequestID:  42,
+			VSchemaKeyspaces: []string{"ks_sharded", "ks_unsharded"},
+		}
+		encoded, err := encodePSMetadata(meta)
+		require.NoError(t, err)
+
+		decoded, err := decodePSMetadata(encoded)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"ks_sharded", "ks_unsharded"}, decoded.VSchemaKeyspaces)
+	})
+
+	t.Run("empty vschema keyspaces", func(t *testing.T) {
+		meta := &psMetadata{
+			BranchName:      "test-branch",
+			DeployRequestID: 42,
+		}
+		encoded, err := encodePSMetadata(meta)
+		require.NoError(t, err)
+
+		decoded, err := decodePSMetadata(encoded)
+		require.NoError(t, err)
+		assert.Empty(t, decoded.VSchemaKeyspaces)
+	})
+}

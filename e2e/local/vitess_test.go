@@ -1077,23 +1077,22 @@ func TestVitess_Apply_VSchemaTaskTracking(t *testing.T) {
 	applyID := extractApplyIDFromLog(applyOut)
 	require.NotEmpty(t, applyID)
 
-	// Poll progress until completion, verifying VSchema tasks appear
+	// Poll progress until completion, verifying VSchema tasks appear.
+	// VSchema tasks are identified by the "VSchema: " table name prefix
+	// (they're stored in vitess_tasks, not as regular DDL tasks).
 	var foundVSchemaTask bool
-	var vschemaChangeType string
 	var finalState string
 	deadline := time.Now().Add(testutil.PollDeadline)
 	for time.Now().Before(deadline) {
 		resp, err := client.GetProgress(endpoint, applyID)
 		if err == nil {
 			for _, tbl := range resp.Tables {
-				if tbl.ChangeType == "vschema_update" {
+				if strings.HasPrefix(tbl.TableName, "VSchema: ") {
 					foundVSchemaTask = true
-					vschemaChangeType = tbl.ChangeType
 				}
 			}
 			if state.IsTerminalApplyState(resp.State) {
 				finalState = resp.State
-				// Verify all tables (including VSchema) reached terminal state
 				for _, tbl := range resp.Tables {
 					assert.True(t, state.IsTerminalApplyState(state.NormalizeTaskStatus(tbl.Status)),
 						"table %s should be terminal, got %s", tbl.TableName, tbl.Status)
@@ -1105,7 +1104,6 @@ func TestVitess_Apply_VSchemaTaskTracking(t *testing.T) {
 	}
 
 	assert.True(t, foundVSchemaTask, "expected VSchema task in progress tables")
-	assert.Equal(t, "vschema_update", vschemaChangeType)
 	require.NotEmpty(t, finalState, "apply did not reach terminal state")
 	assert.Equal(t, state.Apply.Completed, finalState)
 }

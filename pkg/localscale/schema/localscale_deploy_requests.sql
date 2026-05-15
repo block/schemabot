@@ -23,6 +23,7 @@ CREATE TABLE `localscale_deploy_requests` (
   `throttle_ratio` double NOT NULL DEFAULT '0',
   `schema_before` mediumtext,
   `instant_ddl_eligible` tinyint(1) NOT NULL DEFAULT '0',
+  `instant_ddl` tinyint(1) NOT NULL DEFAULT '0',
   `revert_expires_at` timestamp NULL DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),

@@ -4,6 +4,7 @@ package storage
 
 import (
 	"context"
+	"time"
 )
 
 // Storage provides access to all stores.
@@ -34,6 +35,7 @@ type Storage interface {
 
 	// VitessApplyData returns the Vitess apply data store.
 	VitessApplyData() VitessApplyDataStore
+	VitessTasks() VitessTaskStore
 
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
@@ -299,4 +301,22 @@ type ApplyLogStore interface {
 
 	// List returns logs matching the filter criteria, ordered by created_at.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
+}
+
+// VitessTaskStore manages Vitess-specific non-DDL tasks (VSchema changes, routing rules).
+type VitessTaskStore interface {
+	Create(ctx context.Context, task *VitessTask) error
+	GetByApplyID(ctx context.Context, applyID int64) ([]*VitessTask, error)
+	UpdateState(ctx context.Context, id int64, state string) error
+}
+
+// VitessTask represents a Vitess-specific task stored in the vitess_tasks table.
+type VitessTask struct {
+	ID        int64
+	ApplyID   int64
+	Keyspace  string
+	TaskType  string // "vschema", "routing_rules"
+	State     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }

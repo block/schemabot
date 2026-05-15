@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -786,7 +787,7 @@ func appendShardSummary(kvs []string, shards []*apitypes.ShardProgressResponse) 
 
 // isVSchemaTask returns true if this is a synthetic VSchema update task.
 func isVSchemaTask(tbl *apitypes.TableProgressResponse) bool {
-	return strings.HasPrefix(tbl.TableName, "vschema:")
+	return strings.HasPrefix(tbl.TableName, engine.VSchemaTablePrefix)
 }
 
 // emitTableStateChange emits a log line for a table state transition.

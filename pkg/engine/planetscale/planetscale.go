@@ -456,6 +456,7 @@ type psMetadata struct {
 	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
 	IsInstant        bool       `json:"is_instant,omitempty"`
 	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
+	VSchemaKeyspaces []string   `json:"vschema_keyspaces,omitempty"`
 }
 
 func encodePSMetadata(m *psMetadata) (string, error) {
@@ -934,8 +935,12 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return nil, fmt.Errorf("apply changes to branch: %w", err)
 	}
 	ddlCount := 0
+	var vschemaKeyspaces []string
 	for _, sc := range req.Changes {
 		ddlCount += len(sc.TableChanges)
+		if sc.Metadata["vschema_changed"] == "true" {
+			vschemaKeyspaces = append(vschemaKeyspaces, sc.Namespace)
+		}
 	}
 	emitEvent(engine.ApplyEvent{
 		Message:  fmt.Sprintf("Applied %d DDL changes to branch %s", ddlCount, branchName),
@@ -990,6 +995,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		BranchName:       branchName,
 		DeployRequestID:  dr.Number,
 		DeployRequestURL: dr.HtmlURL,
+		VSchemaKeyspaces: vschemaKeyspaces,
 	})
 	for dr.DeploymentState == deployState.Pending {
 		select {
@@ -1171,6 +1177,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		DeployRequestID:  dr.Number,
 		DeployRequestURL: dr.HtmlURL,
 		IsInstant:        useInstant,
+		VSchemaKeyspaces: vschemaKeyspaces,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata for deploy request #%d: %w", dr.Number, err)
@@ -1776,6 +1783,33 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		)
 		for i := range result.Tables {
 			result.Tables[i].IsInstant = true
+		}
+	}
+
+	// Synthesize VSchema table entries. VSchema changes don't appear in
+	// SHOW VITESS_MIGRATIONS — they're tracked by PlanetScale's deploy state
+	// machine. Derive VSchema task state from the DR deployment state.
+	if len(meta.VSchemaKeyspaces) > 0 {
+		vsState := "pending"
+		switch dr.DeploymentState {
+		case deployState.InProgressVSchema:
+			vsState = "running"
+		case deployState.InProgress, deployState.Queued, deployState.Submitting:
+			vsState = "pending"
+		case deployState.Complete, deployState.CompletePendingRevert,
+			deployState.InProgressCutover, deployState.PendingCutover:
+			vsState = "complete"
+		case deployState.Error, deployState.CompleteError, deployState.Failed:
+			vsState = "failed"
+		case deployState.CompleteCancel, deployState.Cancelled, deployState.InProgressCancel:
+			vsState = "stopped"
+		}
+		for _, ks := range meta.VSchemaKeyspaces {
+			result.Tables = append(result.Tables, engine.TableProgress{
+				Table:     engine.VSchemaTablePrefix + ks,
+				Namespace: ks,
+				State:     vsState,
+			})
 		}
 	}
 

@@ -546,8 +546,7 @@ func TestDeploySubmittingToQueued(t *testing.T) {
 	require.NoError(t, err, "DeployDeployRequest")
 	assert.Equal(t, drState.Submitting, dr.DeploymentState, "initial deploy state should be submitting")
 
-	// Background goroutine should transition through queued → completion
-	waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert)
+	// Instant DDL skips the revert window and transitions directly to complete.
 	waitForDeployState(t, ctx, dr.Number, drState.Complete)
 
 	t.Logf("Verified submitting → queued → complete transition for deploy request %d", dr.Number)
@@ -694,9 +693,9 @@ func TestCompleteRevertError(t *testing.T) {
 	)
 
 	dr := createDeploy(t, ctx, branchName, true)
-	deploy(t, ctx, dr.Number, true)
+	deploy(t, ctx, dr.Number, false)
 	dr = waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert)
-	require.Equal(t, drState.CompletePendingRevert, dr.DeploymentState, "test uses 5s revert window, should reach complete_pending_revert")
+	require.Equal(t, drState.CompletePendingRevert, dr.DeploymentState, "non-instant deploy should reach complete_pending_revert")
 
 	// Revert should succeed with complete_revert (not complete_revert_error)
 	_, err := testClient.RevertDeployRequest(ctx, &ps.RevertDeployRequestRequest{

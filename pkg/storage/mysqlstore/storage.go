@@ -20,6 +20,7 @@ type Storage struct {
 	checks          *checkStore
 	settings        *settingsStore
 	vitessApplyData *vitessApplyDataStore
+	vitessTasks     *vitessTaskStore
 }
 
 // New creates a new MySQL storage instance.
@@ -35,6 +36,7 @@ func New(db *sql.DB) *Storage {
 		checks:          &checkStore{db: db},
 		settings:        &settingsStore{db: db},
 		vitessApplyData: &vitessApplyDataStore{db: db},
+		vitessTasks:     &vitessTaskStore{db: db},
 	}
 }
 
@@ -91,4 +93,9 @@ func (s *Storage) Ping(ctx context.Context) error {
 // Close closes the database connection.
 func (s *Storage) Close() error {
 	return s.db.Close()
+}
+
+// VitessTasks returns the Vitess task store.
+func (s *Storage) VitessTasks() storage.VitessTaskStore {
+	return s.vitessTasks
 }

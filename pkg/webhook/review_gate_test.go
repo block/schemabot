@@ -63,6 +63,7 @@ func (m *reviewGateMockStorage) Tasks() storage.TaskStore                      {
 func (m *reviewGateMockStorage) ApplyLogs() storage.ApplyLogStore              { return nil }
 func (m *reviewGateMockStorage) ApplyComments() storage.ApplyCommentStore      { return nil }
 func (m *reviewGateMockStorage) VitessApplyData() storage.VitessApplyDataStore { return nil }
+func (m *reviewGateMockStorage) VitessTasks() storage.VitessTaskStore          { return nil }
 func (m *reviewGateMockStorage) Checks() storage.CheckStore                    { return nil }
 func (m *reviewGateMockStorage) Settings() storage.SettingsStore               { return m.settings }
 func (m *reviewGateMockStorage) Ping(_ context.Context) error                  { return nil }

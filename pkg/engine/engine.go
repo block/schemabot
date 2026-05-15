@@ -319,6 +319,10 @@ const (
 
 // MessageApplyingVSchema is the engine progress message emitted during the
 // VSchema application phase of a deploy. Used to detect VSchema task transitions.
+// VSchemaTablePrefix is used to name synthetic VSchema table entries in progress.
+// Consumers (CLI, TUI) use this prefix to detect VSchema tasks vs DDL tasks.
+const VSchemaTablePrefix = "VSchema: "
+
 const MessageApplyingVSchema = "Applying VSchema changes"
 
 // IsTerminal returns true if this is a final state.

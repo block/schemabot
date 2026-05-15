@@ -113,7 +113,7 @@ func (m WatchModel) progressView() string {
 	case state.IsState(m.state, state.Apply.ValidatingDeployRequest):
 		msg := "Validating deploy request..."
 		if m.deployRequestURL != "" {
-			msg = fmt.Sprintf("Validating deploy request  %s", m.deployRequestURL)
+			msg = fmt.Sprintf("Validating deploy request %s", m.deployRequestURL)
 		}
 		b.WriteString(m.spinner.View() + msg + m.elapsed() + "\n")
 	case state.IsState(m.state, state.Apply.Pending) && !m.pastPending:

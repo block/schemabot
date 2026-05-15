@@ -131,14 +131,8 @@ func changeTypeToProto(op statement.StatementType) ternv1.ChangeType {
 }
 
 // ddlActionToProtoChangeType converts a task's DDLAction string to a proto ChangeType.
-// Handles vschema_update which doesn't come from Spirit's statement parser.
 func ddlActionToProtoChangeType(action string) ternv1.ChangeType {
-	switch action {
-	case "vschema_update":
-		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
-	default:
-		return changeTypeToProto(ddl.OpToStatementType(action))
-	}
+	return changeTypeToProto(ddl.OpToStatementType(action))
 }
 
 // filterTasksByApply returns only tasks belonging to the specified apply, sorted by ID (execution order).

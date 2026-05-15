@@ -33,6 +33,7 @@ func (m *mockStorage) Tasks() storage.TaskStore                      { return ni
 func (m *mockStorage) ApplyLogs() storage.ApplyLogStore              { return nil }
 func (m *mockStorage) ApplyComments() storage.ApplyCommentStore      { return nil }
 func (m *mockStorage) VitessApplyData() storage.VitessApplyDataStore { return nil }
+func (m *mockStorage) VitessTasks() storage.VitessTaskStore          { return nil }
 func (m *mockStorage) Checks() storage.CheckStore                    { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore               { return nil }
 func (m *mockStorage) Ping(ctx context.Context) error                { return m.pingErr }
