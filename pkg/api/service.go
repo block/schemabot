@@ -94,6 +94,10 @@ func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
 }
 
 // Service is the SchemaBot API service.
+// RecoveryCallback is called after the recovery worker successfully resumes an apply.
+// The webhook handler uses this to start watching progress and posting PR comments.
+type RecoveryCallback func(apply *storage.Apply)
+
 type Service struct {
 	storage     storage.Storage
 	config      *ServerConfig
@@ -104,6 +108,40 @@ type Service struct {
 	// Recovery loop management
 	stopRecovery chan struct{}
 	recoveryWg   sync.WaitGroup
+
+	// OnApplyRecovered is called after the recovery worker resumes an apply.
+	// Set by the webhook handler to set up an observer for PR comments.
+	OnApplyRecovered RecoveryCallback
+
+	// OnMissingSummary is called on startup for completed applies that have a
+	// progress comment but no summary comment (outbox gap from container restart).
+	// Set by the webhook handler to post the missing summary comment directly.
+	OnMissingSummary RecoveryCallback
+}
+
+// SetApplyObserver sets a progress observer on the tern client for an apply.
+// The observer receives progress and terminal notifications from the poller.
+func (s *Service) SetApplyObserver(database, deployment, environment string, applyID int64, observer tern.ProgressObserver) {
+	deployment = s.ResolveDeployment(database, deployment)
+	client, err := s.TernClient(deployment, environment)
+	if err != nil {
+		s.logger.Error("failed to get tern client for observer", "error", err)
+		return
+	}
+	client.SetObserver(applyID, observer)
+}
+
+// SetPendingObserver sets an observer that will be consumed by the next Apply()
+// call. The observer is registered before the engine starts, preventing the
+// race where the apply completes before the observer is set.
+func (s *Service) SetPendingObserver(database, deployment, environment string, observer tern.ProgressObserver) {
+	deployment = s.ResolveDeployment(database, deployment)
+	client, err := s.TernClient(deployment, environment)
+	if err != nil {
+		s.logger.Error("failed to get tern client for pending observer", "error", err)
+		return
+	}
+	client.SetPendingObserver(observer)
 }
 
 // New creates a new SchemaBot service.

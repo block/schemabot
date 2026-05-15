@@ -255,6 +255,35 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 	return scanApplies(rows)
 }
 
+// FindMissingSummaryComment returns completed/failed applies that have a progress
+// comment but no summary comment. Used to post missing summaries after restart.
+func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.Apply, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+applyColumns+`
+		FROM applies a
+		JOIN apply_comments acp ON acp.apply_id = a.id AND acp.comment_state = 'progress'
+		LEFT JOIN apply_comments acs ON acs.apply_id = a.id AND acs.comment_state = 'summary'
+		WHERE a.state IN (?, ?, ?, ?)
+		  AND a.completed_at > NOW() - INTERVAL 1 HOUR
+		  AND acs.id IS NULL
+		ORDER BY a.completed_at DESC
+	`, state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled)
+	if err != nil {
+		return nil, err
+	}
+	defer utils.CloseAndLog(rows)
+
+	var applies []*storage.Apply
+	for rows.Next() {
+		apply, err := scanApplyInto(rows)
+		if err != nil {
+			return nil, err
+		}
+		applies = append(applies, apply)
+	}
+	return applies, rows.Err()
+}
+
 // GetByPR returns all applies for a PR.
 func (s *applyStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Apply, error) {
 	rows, err := s.db.QueryContext(ctx, `

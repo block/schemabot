@@ -261,56 +261,57 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 		return
 	}
 
-	if applyID <= 0 {
-		h.logger.Error("rollback apply accepted without storage apply id",
-			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment)
-		return
-	}
-
 	// Spawn background progress watcher. After the rollback apply completes,
 	// set the check to action_required — the PR's schema changes need to be
 	// re-applied since the rollback undid them.
-	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
-	if err != nil {
-		h.logger.Error("failed to load rollback apply for progress watch",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", dbType, "environment", environment,
-			"apply_id", applyID, "error", err)
-		return
-	}
-	if apply == nil {
-		h.logger.Error("rollback apply missing after accepted apply",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", dbType, "environment", environment,
-			"apply_id", applyID)
-		return
-	}
-	h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID)
-
-	go func() {
-		bgCtx := context.Background()
-		h.watchApplyProgress(bgCtx, repo, pr, installationID, apply)
-		// Re-fetch the apply to check its final state. Only set action_required
-		// if the rollback succeeded — a failed rollback should keep the failure
-		// conclusion set by watchApplyProgress.
-		final, err := h.service.Storage().Applies().Get(bgCtx, applyID)
+	if applyID > 0 {
+		apply, err := h.service.Storage().Applies().Get(ctx, applyID)
 		if err != nil {
-			h.logger.Error("failed to re-fetch apply after rollback",
-				"repo", repo, "pr", pr, "database", apply.Database,
-				"database_type", apply.DatabaseType, "environment", apply.Environment,
-				"apply_id", applyID, "apply_identifier", apply.ApplyIdentifier,
-				"error", err)
+			h.logger.Error("failed to load rollback apply for progress watch", "applyID", applyID, "error", err)
 			return
 		}
-		if final == nil {
-			h.logger.Error("rollback apply missing after progress watch",
-				"repo", repo, "pr", pr, "database", apply.Database,
-				"database_type", apply.DatabaseType, "environment", apply.Environment,
-				"apply_id", applyID, "apply_identifier", apply.ApplyIdentifier)
+		if apply == nil {
+			h.logger.Error("rollback apply missing after accepted apply", "applyID", applyID)
 			return
 		}
-		if state.IsState(final.State, state.Apply.Completed) {
-			h.setCheckActionRequired(repo, pr, installationID, final)
-		}
-	}()
+
+		h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID)
+
+		// Post initial progress comment for the observer to edit
+		progressBody := formatProgressComment(apply, nil)
+		h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
+
+		// Set observer for rollback progress and check run updates.
+		// On successful rollback, set check to action_required (PR changes need re-applying).
+		h.service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, applyID,
+			NewCommentObserver(CommentObserverConfig{
+				GHClient:       h.ghClient,
+				Storage:        h.service.Storage(),
+				Repo:           repo,
+				PR:             pr,
+				InstallationID: installationID,
+				ApplyID:        applyID,
+				Logger:         h.logger,
+				OnTerminalHook: func(a *storage.Apply) {
+					updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, a)
+					if err != nil {
+						h.logger.Error("observer: failed to update check record for rollback", "error", err)
+						return
+					}
+					if !updated {
+						h.logger.Debug("observer: skipping aggregate check update for rollback, apply no longer owns check state",
+							"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
+						return
+					}
+					if state.IsState(a.State, state.Apply.Completed) {
+						h.setCheckActionRequired(repo, pr, installationID, a)
+					}
+					if ghInstClient, err := h.ghClient.ForInstallation(installationID); err == nil {
+						if checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, a.Environment, a.DatabaseType, a.Database); err == nil && checkRecord != nil {
+							h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
+						}
+					}
+				},
+			}))
+	}
 }

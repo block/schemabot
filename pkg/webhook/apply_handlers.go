@@ -437,6 +437,40 @@ func (h *Handler) executeApply(
 
 	caller := fmt.Sprintf("github:%s@%s#%d", requestedBy, repo, pr)
 
+	// Set observer before starting the apply — consumed by Apply() before the
+	// engine starts, so the observer is registered before any progress events fire.
+	// ApplyID is set to 0 here; LocalClient.Apply() updates it after creating
+	// the apply record.
+	observer := NewCommentObserver(CommentObserverConfig{
+		GHClient:       h.ghClient,
+		Storage:        h.service.Storage(),
+		Repo:           repo,
+		PR:             pr,
+		InstallationID: installationID,
+		DeferCutover:   options["defer_cutover"] == "true",
+		Logger:         h.logger,
+		OnTerminalHook: func(apply *storage.Apply) {
+			updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, apply)
+			if err != nil {
+				h.logger.Error("observer: failed to update check record",
+					"repo", repo, "pr", pr, "database", apply.Database,
+					"environment", apply.Environment, "apply_id", apply.ID, "error", err)
+				return
+			}
+			if !updated {
+				h.logger.Debug("observer: skipping aggregate check update, apply no longer owns check state",
+					"repo", repo, "pr", pr, "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
+				return
+			}
+			if ghInstClient, err := h.ghClient.ForInstallation(installationID); err == nil {
+				if checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, apply.Environment, apply.DatabaseType, apply.Database); err == nil && checkRecord != nil {
+					h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
+				}
+			}
+		},
+	})
+	h.service.SetPendingObserver(database, "", environment, observer)
+
 	applyReq := api.ApplyRequest{
 		PlanID:         planResp.PlanID,
 		Deployment:     h.service.TernDeployment(repo),
@@ -449,6 +483,7 @@ func (h *Handler) executeApply(
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
+		h.service.SetPendingObserver(database, "", environment, nil)
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "error", err)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
@@ -460,6 +495,7 @@ func (h *Handler) executeApply(
 	}
 
 	if !applyResp.Accepted {
+		h.service.SetPendingObserver(database, "", environment, nil)
 		h.logger.Info("apply rejected by engine", "repo", repo, "pr", pr, "database", database, "environment", environment, "error", applyResp.ErrorMessage)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
@@ -470,74 +506,27 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// Update check run to in-progress (transitions action_required → in_progress)
+	h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID)
+
 	if applyID <= 0 {
-		h.logger.Error("apply accepted without stored apply id", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		return
 	}
 
 	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
 	if err != nil {
-		h.logger.Error("failed to load apply for progress watch",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
+		h.logger.Error("failed to load apply for progress watch", "applyID", applyID, "error", err)
 		return
 	}
 	if apply == nil {
-		h.logger.Error("apply missing after accepted apply",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID)
+		h.logger.Error("apply missing after accepted apply", "applyID", applyID)
 		return
 	}
 
-	// Update check run to in-progress (transitions action_required → in_progress)
-	h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID)
-
-	// Wait briefly for fast results (instant DDL, immediate failures)
-	// before deciding whether to go async.
-	time.Sleep(2 * time.Second)
-
-	apply, err = h.service.Storage().Applies().Get(ctx, applyID)
-	if err != nil {
-		h.logger.Error("failed to reload apply after wait",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
-		return
-	}
-	if apply == nil {
-		h.logger.Error("apply missing after wait",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID)
-		return
-	}
-
-	if state.IsTerminalApplyState(apply.State) {
-		// Fast result — handle synchronously (no watcher needed)
-		tasks, _ := h.service.Storage().Tasks().GetByApplyID(ctx, applyID)
-		summaryBody := formatSummaryComment(apply, tasks)
-		h.postComment(repo, pr, installationID, summaryBody)
-		updated, err := h.updateCheckRecordForApplyResult(ctx, repo, pr, apply)
-		if err != nil {
-			h.logger.Error("failed to update stored check state after apply", "repo", repo, "pr", pr, "apply_id", applyID, "error", err)
-			return
-		}
-		if !updated {
-			h.logger.Debug("skipping aggregate check update because apply no longer owns stored check state",
-				"repo", repo, "pr", pr, "database", apply.Database,
-				"database_type", apply.DatabaseType, "environment", apply.Environment,
-				"apply_id", applyID, "apply_identifier", apply.ApplyIdentifier)
-			return
-		}
-		if checkRecord, err := h.service.Storage().Checks().Get(ctx, repo, pr, apply.Environment, apply.DatabaseType, apply.Database); err == nil && checkRecord != nil {
-			h.updateAggregateCheck(ctx, client, repo, pr, checkRecord.HeadSHA)
-		}
-		return
-	}
-
-	// Still running — post progress comment and spawn async watcher
+	// Post the progress comment immediately so the observer always has a
+	// comment to edit. This must happen before any terminal check — otherwise
+	// the apply could complete between the check and the post, leaving a
+	// stale "In Progress" comment that the observer never edits.
 	progressBody := templates.RenderApplyStarted(templates.ApplyStatusCommentData{
 		ApplyID:     applyResp.ApplyID,
 		Database:    database,
@@ -547,8 +536,6 @@ func (h *Handler) executeApply(
 		Engine:      schemaResult.Type,
 	})
 	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
-
-	go h.watchApplyProgress(context.Background(), repo, pr, installationID, apply, true)
 }
 
 // ddlMatchesStoredPlan compares the re-plan DDL against a previously stored plan.
@@ -728,9 +715,7 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, schema.Type, schema.Database)
 	if err != nil {
 		h.logger.Error("failed to look up check record for apply start",
-			"repo", repo, "pr", pr, "database", schema.Database,
-			"database_type", schema.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
+			"error", err, "apply_id", applyID)
 		return
 	}
 
@@ -739,9 +724,7 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 		if err != nil {
 			h.logger.Error("failed to fetch PR for apply start check record",
-				"repo", repo, "pr", pr, "database", schema.Database,
-				"database_type", schema.Type, "environment", environment,
-				"apply_id", applyID, "error", err)
+				"error", err, "apply_id", applyID)
 			return
 		}
 		check = &storage.Check{
@@ -764,14 +747,10 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 
 	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
 		h.logger.Error("failed to upsert check record for apply start",
-			"repo", repo, "pr", pr, "database", schema.Database,
-			"database_type", schema.Type, "environment", environment,
 			"apply_id", applyID, "head_sha", check.HeadSHA, "error", err)
 		return
 	}
 	h.logger.Info("check record marked in_progress for apply",
-		"repo", repo, "pr", pr, "database", schema.Database,
-		"database_type", schema.Type, "environment", environment,
 		"apply_id", applyID, "head_sha", check.HeadSHA)
 
 	h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)

@@ -59,10 +59,10 @@ func progressTableKey(namespace, table string) string {
 	return namespace + progressTableKeySep + table
 }
 
-// resolveDeployment determines the deployment name from a database and explicit deployment.
+// ResolveDeployment determines the deployment name from a database and explicit deployment.
 // In local mode (config-based databases), the database name is used as the deployment.
 // In gRPC mode, falls back to DefaultDeployment.
-func (s *Service) resolveDeployment(database, deployment string) string {
+func (s *Service) ResolveDeployment(database, deployment string) string {
 	if deployment != "" {
 		return deployment
 	}
@@ -138,7 +138,7 @@ func (s *Service) GetProgress(ctx context.Context, database, environment string)
 	if activeApply != nil {
 		storedDeployment = activeApply.Deployment
 	}
-	deployment := s.resolveDeployment(database, storedDeployment)
+	deployment := s.ResolveDeployment(database, storedDeployment)
 
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {
@@ -208,7 +208,7 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 	if activeApply != nil && activeApply.Deployment != "" {
 		deployment = activeApply.Deployment
 	}
-	deployment = s.resolveDeployment(database, deployment)
+	deployment = s.ResolveDeployment(database, deployment)
 
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {
@@ -274,7 +274,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	}
 
 	// Active apply — use the deployment stored on the apply record.
-	deployment := s.resolveDeployment(apply.Database, apply.Deployment)
+	deployment := s.ResolveDeployment(apply.Database, apply.Deployment)
 	s.logger.Debug("progress by apply-id: resolving client", "apply_id", applyID, "database", apply.Database, "deployment", deployment, "environment", apply.Environment)
 
 	client, err := s.TernClient(deployment, apply.Environment)
@@ -463,7 +463,7 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 	// Check gRPC mode config (TernDeployments)
 	if len(environments) == 0 && len(s.config.TernDeployments) > 0 {
 		deploymentParam := r.URL.Query().Get("deployment")
-		deployment := s.resolveDeployment(database, deploymentParam)
+		deployment := s.ResolveDeployment(database, deploymentParam)
 		if endpoints, ok := s.config.TernDeployments[deployment]; ok {
 			for env := range endpoints {
 				environments = append(environments, env)
@@ -644,7 +644,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 // per-table state into local task records. Called once for gRPC-mode applies
 // with stale task state; subsequent reads are served from local storage.
 func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
-	deployment := s.resolveDeployment(apply.Database, apply.Deployment)
+	deployment := s.ResolveDeployment(apply.Database, apply.Deployment)
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
 		return fmt.Errorf("get tern client: %w", err)

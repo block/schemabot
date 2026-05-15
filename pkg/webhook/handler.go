@@ -4,6 +4,7 @@
 package webhook
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -22,6 +23,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Handler processes GitHub webhook events.
@@ -34,12 +36,71 @@ type Handler struct {
 
 // NewHandler creates a new webhook handler.
 func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webhookSecret []byte, logger *slog.Logger) *Handler {
-	return &Handler{
+	h := &Handler{
 		service:       service,
 		ghClient:      ghClient,
 		webhookSecret: webhookSecret,
 		logger:        logger,
 	}
+
+	// Register recovery callback so the recovery worker can set up comment
+	// observers for recovered applies. The observer is set on the LocalClient
+	// so the progress poller (same goroutine as Spirit) posts comments.
+	if service != nil {
+		service.OnApplyRecovered = func(apply *storage.Apply) {
+			if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
+				return
+			}
+			logger.Info("setting comment observer for recovered apply",
+				"apply_id", apply.ApplyIdentifier,
+				"repo", apply.Repository,
+				"pr", apply.PullRequest)
+			service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, apply.ID,
+				NewCommentObserver(CommentObserverConfig{
+					GHClient:       h.ghClient,
+					Storage:        service.Storage(),
+					Repo:           apply.Repository,
+					PR:             apply.PullRequest,
+					InstallationID: apply.InstallationID,
+					ApplyID:        apply.ID,
+					Logger:         logger,
+					OnTerminalHook: func(a *storage.Apply) {
+						updated, err := h.updateCheckRecordForApplyResult(context.Background(), apply.Repository, apply.PullRequest, a)
+						if err != nil {
+							logger.Error("observer: failed to update check record for recovered apply", "error", err)
+							return
+						}
+						if !updated {
+							logger.Debug("observer: skipping aggregate check update for recovered apply, apply no longer owns check state",
+								"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
+							return
+						}
+						if ghInstClient, err := h.ghClient.ForInstallation(apply.InstallationID); err == nil {
+							if checkRecord, err := service.Storage().Checks().Get(context.Background(), apply.Repository, apply.PullRequest, a.Environment, a.DatabaseType, a.Database); err == nil && checkRecord != nil {
+								h.updateAggregateCheck(context.Background(), ghInstClient, apply.Repository, apply.PullRequest, checkRecord.HeadSHA)
+							}
+						}
+					},
+				}))
+		}
+
+		// Post missing summary comments for applies that completed during
+		// a container restart (outbox pattern).
+		service.OnMissingSummary = func(apply *storage.Apply) {
+			if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
+				return
+			}
+			tasks, err := service.Storage().Tasks().GetByApplyID(context.Background(), apply.ID)
+			if err != nil {
+				logger.Error("failed to load tasks for missing summary", "apply_id", apply.ApplyIdentifier, "error", err)
+				return
+			}
+			summaryBody := formatSummaryComment(apply, tasks)
+			h.postAndTrackComment(context.Background(), apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID, "summary", summaryBody)
+		}
+	}
+
+	return h
 }
 
 // ServeHTTP handles incoming webhook requests.

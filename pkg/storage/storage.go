@@ -206,6 +206,11 @@ type ApplyStore interface {
 	// If not called for > 1 minute, another worker can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
 
+	// FindMissingSummaryComment returns completed/failed applies that have a
+	// progress comment but no summary comment. Used by the recovery worker on
+	// startup to post missing summary comments after container restarts.
+	FindMissingSummaryComment(ctx context.Context) ([]*Apply, error)
+
 	// GetByPR returns all applies for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Apply, error)
 
@@ -259,6 +264,10 @@ type ApplyCommentStore interface {
 
 	// ListByApply returns all comments for an apply, ordered by id ascending.
 	ListByApply(ctx context.Context, applyID int64) ([]*ApplyComment, error)
+
+	// IncrementEditCount atomically increments the edit count and updates
+	// last_edited_at for a comment. Called after each successful edit.
+	IncrementEditCount(ctx context.Context, applyID int64, commentState string) error
 
 	// DeleteByApply removes all comment records for an apply.
 	DeleteByApply(ctx context.Context, applyID int64) error

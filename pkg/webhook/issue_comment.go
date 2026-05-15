@@ -287,32 +287,3 @@ func (h *Handler) postAndTrackComment(
 
 	return commentID
 }
-
-// editTrackedComment looks up a stored comment ID by (applyID, commentState) and edits it.
-func (h *Handler) editTrackedComment(
-	ctx context.Context, repo string, installationID int64,
-	applyID int64, commentState string, body string,
-) {
-	comment, err := h.service.Storage().ApplyComments().Get(ctx, applyID, commentState)
-	if err != nil {
-		h.logger.Error("failed to look up tracked comment",
-			"applyID", applyID, "commentState", commentState, "error", err)
-		return
-	}
-	if comment == nil {
-		h.logger.Warn("no tracked comment found to edit",
-			"applyID", applyID, "commentState", commentState)
-		return
-	}
-
-	client, err := h.ghClient.ForInstallation(installationID)
-	if err != nil {
-		h.logger.Error("failed to create GitHub client for edit", "error", err)
-		return
-	}
-
-	if err := client.EditIssueComment(ctx, repo, comment.GitHubCommentID, body); err != nil {
-		h.logger.Error("failed to edit tracked comment",
-			"repo", repo, "commentID", comment.GitHubCommentID, "error", err)
-	}
-}

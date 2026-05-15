@@ -129,6 +129,26 @@ Users can control a running schema change via CLI, PR comments, or PlanetScale U
 | `schemabot revert` | Roll back a completed change during the revert window (Vitess only) |
 | `schemabot skip-revert` | Close the revert window and finalize (Vitess only) |
 
+**Design principle: control operations must be stateless.** A control operation
+should work by writing to shared external state (the target database or an API),
+not by reaching into the in-memory state of a specific SchemaBot process.
+
+SchemaBot is designed for HA — multiple instances can run behind a load balancer,
+and any instance may restart at any time. A webhook or CLI request can be routed to
+any instance, so control operations cannot depend on hitting the "right" process.
+The engine's in-memory state (e.g., Spirit's `runningMigration`) is ephemeral and
+process-local.
+
+Each engine uses shared external signals for control:
+
+| Engine | Cutover signal | Stop signal | State source |
+|---|---|---|---|
+| Spirit | Drop `_spirit_sentinel` table in target DB | Cancel via context / flag table | Checkpoint table + INFORMATION_SCHEMA |
+| PlanetScale | Complete deploy request via API | Cancel deploy request via API | PlanetScale API + SHOW VITESS_MIGRATIONS |
+
+These signals are durable and accessible from any instance — the engine running in
+the background detects the signal regardless of which SchemaBot instance triggered it.
+
 ## Tern Layer (Orchestrator)
 
 Tern is the orchestration layer. It manages the schema change lifecycle: creating records, calling the engine, polling for progress, and tracking state. It defines a proto interface (`Plan`, `Apply`, `Progress`, `Cutover`, `Stop`, `Start`, `Volume`, `Revert`, `SkipRevert`).
@@ -255,6 +275,66 @@ VSchema updates are tracked as separate tasks in the `vitess_tasks` table (one p
 | (none) | DDLs run → auto-cutover → auto-skip revert → completed |
 | `--defer-cutover` | DDLs run → pause at waiting for cutover → user triggers cutover → completed |
 | `--defer-cutover --enable-revert` | DDLs run → pause → user triggers cutover → revert window → user reverts or skips → completed |
+
+### ProgressObserver
+
+The `ProgressObserver` interface (`pkg/tern/observer.go`) enables external
+notifications from the apply progress poller. The poller runs on the same
+goroutine as the engine — one goroutine handles both execution and notifications.
+
+```go
+type ProgressObserver interface {
+    OnProgress(apply *storage.Apply, tasks []*storage.Task)
+    OnTerminal(apply *storage.Apply, tasks []*storage.Task)
+}
+```
+
+**How it works:**
+
+```
+Webhook handler: "someone commented schemabot apply"
+    │
+    ├── Creates CommentObserver (posts PR comments)
+    ├── Calls SetPendingObserver on the client
+    └── Calls ExecuteApply
+            │
+            ▼
+        Client.Apply()
+            ├── Consumes pending observer
+            ├── Registers observer on the apply (before engine starts)
+            └── Starts engine goroutine
+                    │
+                    ├── On each progress tick: observer.OnProgress()
+                    │   → edits PR comment with progress bars, rows copied, ETA
+                    │
+                    └── On terminal state: observer.OnTerminal()
+                        → edits progress comment to final state
+                        → posts summary comment
+                        → updates check runs
+```
+
+**Key design properties:**
+
+- **One goroutine** — the progress poller handles both execution and notifications.
+  No separate watcher goroutine that can die independently.
+- **Per-apply** — each apply has its own observer (or none). CLI applies have no
+  observer. Webhook applies get a `CommentObserver`.
+- **Fire-and-forget** — observer errors are logged but never block the schema
+  change. If GitHub is down, the apply continues.
+- **Reconstructable** — on recovery after restart, the observer is reconstructed
+  from the apply record's stored GitHub context (repo, PR, installation ID).
+- **Composable** — different observers for different backends (GitHub comments,
+  Slack, etc.). A `MultiObserver` can combine them.
+- **Works for both client types** — `LocalClient` notifies from the engine poller.
+  `GRPCClient` notifies from a storage-polling goroutine. The control plane posts
+  comments regardless of where the engine runs.
+
+**Missing summary recovery.** The `apply_comments` table tracks which comments
+were posted (`progress`, `summary`). On startup, the recovery worker checks for
+completed applies with a progress comment but no summary comment — this means
+`OnTerminal` was missed during a container restart. It reconstructs a
+`CommentObserver` from the apply record's stored GitHub context and calls
+`OnTerminal` to post the missing summary.
 
 ### Integration Modes
 

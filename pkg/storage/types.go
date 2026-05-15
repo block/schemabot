@@ -490,6 +490,12 @@ type ApplyComment struct {
 	// GitHubCommentID is the GitHub comment ID for editing.
 	GitHubCommentID int64
 
+	// EditCount tracks how many times this comment was edited.
+	EditCount int
+
+	// LastEditedAt is when the comment was last edited via the GitHub API.
+	LastEditedAt *time.Time
+
 	// CreatedAt is when the comment was first posted.
 	CreatedAt time.Time
 

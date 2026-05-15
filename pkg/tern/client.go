@@ -72,6 +72,15 @@ type Client interface {
 	// same database — ExecuteApply reuses them.
 	IsRemote() bool
 
+	// SetPendingObserver sets an observer that will be consumed by the next
+	// Apply() call. The observer is registered before the engine starts,
+	// preventing the race where the apply completes before the observer is set.
+	SetPendingObserver(observer ProgressObserver)
+
+	// SetObserver registers a progress observer for an active apply.
+	// Used by the recovery worker to attach an observer after resuming.
+	SetObserver(applyID int64, observer ProgressObserver)
+
 	// Close releases any resources held by the client.
 	Close() error
 }

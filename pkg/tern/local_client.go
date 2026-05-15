@@ -144,6 +144,17 @@ type LocalClient struct {
 	// Protected by cancelMu since Apply and Stop run on different goroutines.
 	cancelMu    sync.Mutex
 	cancelApply context.CancelFunc
+
+	// observers holds per-apply progress observers. The progress poller notifies
+	// the observer on state changes and terminal state. Cleared on terminal state.
+	// Protected by observerMu.
+	observerMu sync.RWMutex
+	observers  map[int64]ProgressObserver // keyed by apply ID
+
+	// pendingObserver is consumed by the next Apply() call and registered
+	// before Spirit starts. Set by the webhook handler via SetPendingObserver.
+	// Protected by observerMu.
+	pendingObserver ProgressObserver
 }
 
 // Compile-time check that LocalClient implements Client.
@@ -571,6 +582,19 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			return nil, fmt.Errorf("create task for table %s: %w", ddlChange.Table, err)
 		}
 		tasks[i].ID = taskID
+	}
+
+	// Register pending observer before starting the engine — prevents race where
+	// the apply completes before the observer is set. The webhook handler calls
+	// SetPendingObserver before triggering the apply API call.
+	if obs := c.consumePendingObserver(); obs != nil {
+		// Set the apply ID on the observer if it supports it (e.g., CommentObserver
+		// needs the ID to look up tracked comments for editing).
+		type applyIDSetter interface{ SetApplyID(int64) }
+		if setter, ok := obs.(applyIDSetter); ok {
+			setter.SetApplyID(apply.ID)
+		}
+		c.SetObserver(apply.ID, obs)
 	}
 
 	// Start apply in background with cancellable context (Stop() cancels this)

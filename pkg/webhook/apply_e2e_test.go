@@ -1026,16 +1026,16 @@ func TestE2EApplyAutoConfirmExecutes(t *testing.T) {
 		t.Fatal("timed out waiting for auto-confirm plan comment")
 	}
 
-	// Second comment: summary (apply completed or failed)
-	select {
-	case body := <-result.comments:
-		hasApplied := strings.Contains(body, "Schema Change Applied")
-		hasFailed := strings.Contains(body, "Schema Change Failed")
-		assert.True(t, hasApplied || hasFailed,
-			"expected apply summary comment, got: %s", body[:min(len(body), 200)])
-	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for apply summary comment")
-	}
+	// Wait for summary comment (skip progress comment posted by observer)
+	require.Eventually(t, func() bool {
+		select {
+		case body := <-result.comments:
+			return strings.Contains(body, "Schema Change Applied") || strings.Contains(body, "Schema Change Failed")
+		default:
+			return false
+		}
+	}, 30*time.Second, 200*time.Millisecond,
+		"expected apply summary comment")
 }
 
 // TestE2EApplyAutoConfirmDowngradesOnSHAMismatch verifies that -y downgrades to

@@ -116,9 +116,12 @@ func (m *mockTernClient) RollbackPlan(ctx context.Context, database string) (*te
 func (m *mockTernClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
 	return nil
 }
-func (m *mockTernClient) Endpoint() string { return "mock" }
-func (m *mockTernClient) IsRemote() bool   { return false }
-func (m *mockTernClient) Close() error     { return nil }
+func (m *mockTernClient) Endpoint() string                                  { return "mock" }
+func (m *mockTernClient) IsRemote() bool                                    { return false }
+func (m *mockTernClient) SetPendingObserver(observer tern.ProgressObserver) {}
+func (m *mockTernClient) SetObserver(applyID int64, observer tern.ProgressObserver) {
+}
+func (m *mockTernClient) Close() error { return nil }
 
 // testServerConfig returns a minimal valid ServerConfig for testing.
 // Only includes "staging" environment - tests that need "production"

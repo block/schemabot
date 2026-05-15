@@ -13,7 +13,7 @@ import (
 )
 
 // applyCommentColumns lists all columns for SELECT queries.
-const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, created_at, updated_at`
+const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, edit_count, last_edited_at, created_at, updated_at`
 
 // applyCommentStore implements storage.ApplyCommentStore using MySQL.
 type applyCommentStore struct {
@@ -59,6 +59,16 @@ func (s *applyCommentStore) ListByApply(ctx context.Context, applyID int64) ([]*
 	return scanApplyComments(rows)
 }
 
+// IncrementEditCount atomically increments the edit count and updates last_edited_at.
+func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int64, commentState string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE apply_comments
+		SET edit_count = edit_count + 1, last_edited_at = NOW()
+		WHERE apply_id = ? AND comment_state = ?
+	`, applyID, commentState)
+	return err
+}
+
 // DeleteByApply removes all comment records for an apply.
 func (s *applyCommentStore) DeleteByApply(ctx context.Context, applyID int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM apply_comments WHERE apply_id = ?`, applyID)
@@ -92,7 +102,8 @@ func scanApplyCommentInto(s scanner) (*storage.ApplyComment, error) {
 	var comment storage.ApplyComment
 	err := s.Scan(
 		&comment.ID, &comment.ApplyID, &comment.CommentState,
-		&comment.GitHubCommentID, &comment.CreatedAt, &comment.UpdatedAt,
+		&comment.GitHubCommentID, &comment.EditCount, &comment.LastEditedAt,
+		&comment.CreatedAt, &comment.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err

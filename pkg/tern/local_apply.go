@@ -448,6 +448,12 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		)
 
 		action = c.runEngineTask(ctx, task, plan, options, creds)
+
+		// Notify observer after each task completes
+		if obs := c.getObserver(apply.ID); obs != nil {
+			obs.OnProgress(apply, tasks)
+		}
+
 		if action == taskFailed {
 			failedTask = task
 			break
@@ -803,11 +809,22 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Apply completed with state: %s", result.State), ps.lastTaskState, apply.State)
+
+		// Notify observer of terminal state, then clean up
+		if obs := c.getObserver(apply.ID); obs != nil {
+			obs.OnTerminal(apply, tasks)
+			c.clearObserver(apply.ID)
+		}
 		return true
 	}
 
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+	}
+
+	// Notify observer of progress update
+	if obs := c.getObserver(apply.ID); obs != nil {
+		obs.OnProgress(apply, tasks)
 	}
 	return false
 }
@@ -1046,6 +1063,15 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Ta
 			}
 
 			c.transitionTaskState(ctx, task, 0, engineStateToStorage(result.State), "")
+
+			// Notify observer with full apply + tasks context
+			if obs := c.getObserver(task.ApplyID); obs != nil {
+				if apply, err := c.storage.Applies().Get(ctx, task.ApplyID); err == nil && apply != nil {
+					if allTasks, err := c.storage.Tasks().GetByApplyID(ctx, task.ApplyID); err == nil {
+						obs.OnProgress(apply, allTasks)
+					}
+				}
+			}
 		}
 	}
 }
@@ -1118,6 +1144,12 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+
+	// Notify observer of terminal state, then clean up
+	if obs := c.getObserver(apply.ID); obs != nil {
+		obs.OnTerminal(apply, tasks)
+		c.clearObserver(apply.ID)
+	}
 }
 
 // deriveOverallState determines the overall state from a list of tasks.

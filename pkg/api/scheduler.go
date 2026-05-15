@@ -44,6 +44,12 @@ func (s *Service) StartRecoveryWorker(ctx context.Context) {
 
 		s.logger.Info("started recovery worker", "interval", RecoveryPollInterval)
 
+		// On startup, find completed applies that have a progress comment but
+		// no summary comment — this means OnTerminal was missed during a
+		// container restart. Post the missing summary so the PR shows the
+		// completion result.
+		s.postMissingSummaryComments(ctx)
+
 		// Run immediately on startup, then on each tick
 		s.resumeInProgressApplies(ctx)
 
@@ -99,7 +105,7 @@ func (s *Service) resumeInProgressApplies(ctx context.Context) {
 			"last_heartbeat", apply.UpdatedAt)
 
 		// Get Tern client using the deployment stored on the apply.
-		deployment := s.resolveDeployment(apply.Database, apply.Deployment)
+		deployment := s.ResolveDeployment(apply.Database, apply.Deployment)
 		client, err := s.TernClient(deployment, apply.Environment)
 		if err != nil {
 			s.logger.Error("recovery worker: failed to get client",
@@ -126,6 +132,13 @@ func (s *Service) resumeInProgressApplies(ctx context.Context) {
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"previous_state", apply.State)
+
+		// Notify the webhook handler so it can start watching progress and
+		// posting PR comments for the recovered apply.
+		if s.OnApplyRecovered != nil {
+			s.OnApplyRecovered(apply)
+		}
+
 		recovered++
 	}
 
@@ -135,5 +148,40 @@ func (s *Service) resumeInProgressApplies(ctx context.Context) {
 		s.logger.Info("recovery worker: cycle complete",
 			"recovered", recovered,
 			"failed", failed)
+	}
+}
+
+// postMissingSummaryComments finds completed applies that have a progress comment
+// but no summary comment (the observer missed it during a container restart) and
+// posts the missing summary. Uses the OnMissingSummary callback which posts
+// the summary comment directly.
+func (s *Service) postMissingSummaryComments(ctx context.Context) {
+	applies, err := s.storage.Applies().FindMissingSummaryComment(ctx)
+	if err != nil {
+		s.logger.Error("recovery worker: failed to find applies missing summary comments", "error", err)
+		return
+	}
+
+	if len(applies) == 0 {
+		return
+	}
+
+	s.logger.Info("recovery worker: found applies missing summary comments", "count", len(applies))
+
+	for _, apply := range applies {
+		if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
+			// CLI apply or missing GitHub context — can't post a PR comment.
+			continue
+		}
+
+		s.logger.Info("recovery worker: posting missing summary comment",
+			"apply_id", apply.ApplyIdentifier,
+			"repo", apply.Repository,
+			"pr", apply.PullRequest,
+			"state", apply.State)
+
+		if s.OnMissingSummary != nil {
+			s.OnMissingSummary(apply)
+		}
 	}
 }

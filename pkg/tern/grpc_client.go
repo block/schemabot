@@ -101,7 +101,9 @@ package tern
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -122,6 +124,13 @@ type GRPCClient struct {
 	client  ternv1.TernClient
 	address string          // dial address for logging/debugging
 	storage storage.Storage // SchemaBot's storage for apply/task management
+
+	// Observer support — same pattern as LocalClient.
+	// For GRPCClient, the observer is notified by the local progress poller,
+	// not by the remote engine.
+	observerMu      sync.RWMutex
+	observers       map[int64]ProgressObserver
+	pendingObserver ProgressObserver
 }
 
 // Compile-time check that GRPCClient implements Client.
@@ -174,6 +183,23 @@ func (c *GRPCClient) IsRemote() bool { return true }
 // Endpoint returns the gRPC dial address for this client.
 func (c *GRPCClient) Endpoint() string { return c.address }
 
+// SetPendingObserver sets an observer consumed by the next Apply() call.
+func (c *GRPCClient) SetPendingObserver(observer ProgressObserver) {
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	c.pendingObserver = observer
+}
+
+// SetObserver registers a progress observer for an active apply.
+func (c *GRPCClient) SetObserver(applyID int64, observer ProgressObserver) {
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	if c.observers == nil {
+		c.observers = make(map[int64]ProgressObserver)
+	}
+	c.observers[applyID] = observer
+}
+
 // Close closes the gRPC connection.
 func (c *GRPCClient) Close() error {
 	return c.conn.Close()
@@ -184,7 +210,94 @@ func (c *GRPCClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1
 }
 
 func (c *GRPCClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
-	return c.client.Apply(ctx, req)
+	resp, err := c.client.Apply(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Consume pending observer and start a storage-polling goroutine.
+	// GRPCClient delegates execution to a remote tern server via gRPC, so
+	// there's no local engine poller to call the observer. Instead, a
+	// dedicated goroutine polls apply/task records from storage (which
+	// are kept in sync by periodic Progress() gRPC calls) and notifies
+	// the observer on each tick.
+	if obs := c.consumePendingObserver(); obs != nil && c.storage != nil && resp.Accepted {
+		// Look up the apply record to get the apply ID for the observer
+		apply, lookupErr := c.storage.Applies().GetByApplyIdentifier(context.Background(), resp.ApplyId)
+		if lookupErr == nil && apply != nil {
+			if setter, ok := obs.(interface{ SetApplyID(int64) }); ok {
+				setter.SetApplyID(apply.ID)
+			}
+			c.SetObserver(apply.ID, obs)
+			go c.pollAndNotifyObserver(apply.ID)
+		}
+	}
+
+	return resp, nil
+}
+
+// consumePendingObserver returns and clears the pending observer.
+func (c *GRPCClient) consumePendingObserver() ProgressObserver {
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	obs := c.pendingObserver
+	c.pendingObserver = nil
+	return obs
+}
+
+// getObserver returns the observer for an apply, or nil.
+func (c *GRPCClient) getObserver(applyID int64) ProgressObserver {
+	c.observerMu.RLock()
+	defer c.observerMu.RUnlock()
+	return c.observers[applyID]
+}
+
+// clearObserver removes the observer for an apply.
+func (c *GRPCClient) clearObserver(applyID int64) {
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	delete(c.observers, applyID)
+}
+
+// pollAndNotifyObserver polls storage for apply state changes and notifies the
+// observer. This is the GRPCClient equivalent of LocalClient's progress poller
+// calling the observer — but driven by storage reads instead of engine polling.
+func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		obs := c.getObserver(applyID)
+		if obs == nil {
+			// Observer was cleared — apply reached terminal state and
+			// OnTerminal already ran. Stop polling.
+			return
+		}
+
+		apply, err := c.storage.Applies().Get(context.Background(), applyID)
+		if err != nil {
+			slog.Error("observer poll: failed to load apply", "apply_id", applyID, "error", err)
+			continue
+		}
+		if apply == nil {
+			slog.Error("observer poll: apply not found", "apply_id", applyID)
+			continue
+		}
+
+		tasks, err := c.storage.Tasks().GetByApplyID(context.Background(), applyID)
+		if err != nil {
+			slog.Error("observer poll: failed to load tasks", "apply_id", applyID, "error", err)
+			continue
+		}
+
+		if state.IsTerminalApplyState(apply.State) {
+			obs.OnTerminal(apply, tasks)
+			c.clearObserver(applyID)
+			return
+		}
+
+		obs.OnProgress(apply, tasks)
+	}
 }
 
 func (c *GRPCClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {

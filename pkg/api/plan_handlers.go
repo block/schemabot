@@ -106,7 +106,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 
 	planStart := time.Now()
 
-	deployment := s.resolveDeployment(req.Database, req.Deployment)
+	deployment := s.ResolveDeployment(req.Database, req.Deployment)
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
@@ -264,7 +264,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	}
 	span.SetAttributes(attribute.String("database", plan.Database))
 
-	deployment := s.resolveDeployment(plan.Database, req.Deployment)
+	deployment := s.ResolveDeployment(plan.Database, req.Deployment)
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
@@ -447,7 +447,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 // (which calls Plan internally). This is the shared implementation used by
 // both the HTTP handler and the webhook handler.
 func (s *Service) ExecuteRollbackPlan(ctx context.Context, database, environment, deployment string) (*apitypes.PlanResponse, error) {
-	deployment = s.resolveDeployment(database, deployment)
+	deployment = s.ResolveDeployment(database, deployment)
 
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {

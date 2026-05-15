@@ -211,8 +211,17 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	require.NotNil(t, comment)
 	assert.Equal(t, progressCommentID, comment.GitHubCommentID)
 
-	// Step 2: Edit the progress comment
-	h.editTrackedComment(ctx, "org/repo", 12345, applyID, state.Comment.Progress, "Updated progress: running 45%")
+	// Step 2: Edit the progress comment via observer
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        st,
+		Repo:           "org/repo",
+		PR:             42,
+		InstallationID: 12345,
+		ApplyID:        applyID,
+		Logger:         logger,
+	})
+	obs.editTrackedComment(state.Comment.Progress, "Updated progress: running 45%")
 
 	select {
 	case edited := <-capture.edits:
@@ -251,8 +260,8 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	assert.Equal(t, state.Comment.Cutover, active.CommentState)
 	assert.Equal(t, cutoverCommentID, active.GitHubCommentID)
 
-	// Step 6: Edit cutover comment
-	h.editTrackedComment(ctx, "org/repo", 12345, applyID, state.Comment.Cutover, "Cutover in progress")
+	// Step 6: Edit cutover comment via observer
+	obs.editTrackedComment(state.Comment.Cutover, "Cutover in progress")
 
 	select {
 	case edited := <-capture.edits:
@@ -389,8 +398,6 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 
 // TestE2EEditTrackedCommentNotFound tests that editing a non-existent comment is handled gracefully.
 func TestE2EEditTrackedCommentNotFound(t *testing.T) {
-	ctx := t.Context()
-
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
@@ -405,10 +412,22 @@ func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { _ = svc.Close() })
 
-	h := NewHandler(svc, factory, nil, logger)
+	_ = NewHandler(svc, factory, nil, logger)
 
-	// Try to edit a comment for a non-existent apply — should log warning but not panic
-	h.editTrackedComment(ctx, "org/repo", 12345, 99999, state.Comment.Progress, "should not reach GitHub")
+	// Try to edit a comment for a non-existent apply via observer — should be a no-op
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        st,
+		Repo:           "org/repo",
+		PR:             42,
+		InstallationID: 12345,
+		ApplyID:        99999, // non-existent
+		Logger:         logger,
+	})
+	obs.OnProgress(
+		&storage.Apply{ID: 99999, State: state.Apply.Running},
+		[]*storage.Task{{RowsCopied: 100}},
+	)
 
 	// No GitHub API call should be made
 	select {

@@ -83,7 +83,7 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, d
 			}
 		}
 	}
-	deployment = s.resolveDeployment(*database, deployment)
+	deployment = s.ResolveDeployment(*database, deployment)
 
 	client, err := s.TernClient(deployment, *environment)
 	if err != nil {
