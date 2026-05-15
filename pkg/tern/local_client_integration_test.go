@@ -255,6 +255,74 @@ func waitForApplyComplete(t *testing.T, client *LocalClient, ctx context.Context
 	t.Fatal("apply did not complete within 30s")
 }
 
+type recordingVitessEngine struct {
+	applyRequests chan *engine.ApplyRequest
+	ddl           string
+}
+
+func newRecordingVitessEngine(ddl string) *recordingVitessEngine {
+	return &recordingVitessEngine{
+		applyRequests: make(chan *engine.ApplyRequest, 1),
+		ddl:           ddl,
+	}
+}
+
+func (e *recordingVitessEngine) Name() string {
+	return storage.EnginePlanetScale
+}
+
+func (e *recordingVitessEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	return &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace: "testapp_sharded",
+			TableChanges: []engine.TableChange{{
+				Table: "users",
+				DDL:   e.ddl,
+			}},
+		}},
+	}, nil
+}
+
+func (e *recordingVitessEngine) Apply(_ context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	e.applyRequests <- req
+	return &engine.ApplyResult{
+		Accepted:    true,
+		ResumeState: req.ResumeState,
+	}, nil
+}
+
+func (e *recordingVitessEngine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{
+		State:       engine.StateCompleted,
+		Progress:    100,
+		ResumeState: req.ResumeState,
+	}, nil
+}
+
+func (e *recordingVitessEngine) Stop(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{Accepted: true, ResumeState: req.ResumeState}, nil
+}
+
+func (e *recordingVitessEngine) Start(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{Accepted: true, ResumeState: req.ResumeState}, nil
+}
+
+func (e *recordingVitessEngine) Cutover(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{Accepted: true, ResumeState: req.ResumeState}, nil
+}
+
+func (e *recordingVitessEngine) Revert(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{Accepted: true, ResumeState: req.ResumeState}, nil
+}
+
+func (e *recordingVitessEngine) SkipRevert(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{Accepted: true, ResumeState: req.ResumeState}, nil
+}
+
+func (e *recordingVitessEngine) Volume(_ context.Context, req *engine.VolumeRequest) (*engine.VolumeResult, error) {
+	return &engine.VolumeResult{Accepted: true, NewVolume: req.Volume}, nil
+}
+
 func TestLocalClient_NewLocalClient(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -508,6 +576,124 @@ func TestLocalClient_Apply(t *testing.T) {
 	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'users' AND COLUMN_NAME = 'email'").Scan(&columnCount)
 	require.NoError(t, err, "query columns")
 	assert.Equal(t, 1, columnCount, "expected email column to exist, got count %d", columnCount)
+}
+
+func TestLocalClient_ResumeApply_VitessUsesSavedResumeState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	ddl := "ALTER TABLE users ADD COLUMN resume_col BIGINT"
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeVitess,
+		TargetDSN: dsn,
+		Metadata: map[string]string{
+			"organization": "org",
+			"token_name":   "token",
+			"token_value":  "secret",
+		},
+	}, stor, logger)
+	require.NoError(t, err, "failed to create client")
+	defer utils.CloseAndLog(client)
+	fakeEngine := newRecordingVitessEngine(ddl)
+	client.planetscaleEngine = fakeEngine
+
+	ctx := t.Context()
+	now := time.Now()
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-vitess-resume-%d", now.UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Environment:    "staging",
+		SchemaFiles: schema.SchemaFiles{
+			"testapp_sharded": &schema.Namespace{
+				Files: map[string]string{
+					"users.sql": "CREATE TABLE users (id BIGINT PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+				},
+			},
+		},
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testapp_sharded": {
+				Tables: []storage.TableChange{{
+					Namespace: "testapp_sharded",
+					Table:     "users",
+					DDL:       ddl,
+					Operation: "alter",
+				}},
+			},
+		},
+		CreatedAt: now,
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-vitess-resume-%d", now.UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Engine:          storage.EnginePlanetScale,
+		State:           state.Apply.ApplyingBranchChanges,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	_, err = stor.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-vitess-resume-%d", now.UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         planID,
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Engine:         storage.EnginePlanetScale,
+		Environment:    "staging",
+		State:          state.Task.Running,
+		Namespace:      "testapp_sharded",
+		TableName:      "users",
+		DDL:            ddl,
+		DDLAction:      "alter",
+		Options:        []byte("{}"),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	err = stor.VitessApplyData().Save(ctx, &storage.VitessApplyData{
+		ApplyID:          applyID,
+		BranchName:       "branch-resume",
+		DeployRequestID:  42,
+		MigrationContext: "apply-vitess-resume-context",
+		DeployRequestURL: "http://localscale/deploy-requests/42",
+		IsInstant:        true,
+		DeferredDeploy:   true,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, client.ResumeApply(ctx, apply))
+
+	var req *engine.ApplyRequest
+	select {
+	case req = <-fakeEngine.applyRequests:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timed out waiting for engine apply")
+	}
+	require.NotNil(t, req.ResumeState)
+	assert.Equal(t, "apply-vitess-resume-context", req.ResumeState.MigrationContext)
+	assert.Contains(t, req.ResumeState.Metadata, `"branch_name":"branch-resume"`)
+	assert.Contains(t, req.ResumeState.Metadata, `"deploy_request_id":42`)
+	assert.Contains(t, req.ResumeState.Metadata, `"deferred_deploy":true`)
 }
 
 func TestLocalClient_Progress(t *testing.T) {

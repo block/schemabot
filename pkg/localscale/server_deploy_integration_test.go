@@ -83,7 +83,7 @@ func TestBranchDatabaseCleanupOnSkipRevert(t *testing.T) {
 	branchName := createBranchWithDDL(t, ctx, "cleanup",
 		map[string][]string{
 			"testapp_sharded": {
-				"ALTER TABLE users ADD COLUMN cleanup_test_col varchar(50)",
+				"ALTER TABLE users ADD INDEX idx_cleanup_test_full_name (full_name)",
 			},
 		},
 		nil,
@@ -222,9 +222,13 @@ func TestStateValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
+			ddl := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s varchar(50)", tt.table, tt.ddlCol)
+			if tt.name == "complete" {
+				ddl = fmt.Sprintf("ALTER TABLE %s ADD INDEX idx_%s (total_cents)", tt.table, tt.ddlCol)
+			}
 			branchName := createBranchWithDDL(t, ctx, "state-"+tt.name,
 				map[string][]string{
-					"testapp_sharded": {fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s varchar(50)", tt.table, tt.ddlCol)},
+					"testapp_sharded": {ddl},
 				},
 				nil,
 			)
@@ -401,7 +405,7 @@ func TestRevertWindowExpiration(t *testing.T) {
 	branchName := createBranchWithDDL(t, ctx, "revert-expiry",
 		map[string][]string{
 			"testapp": {
-				"ALTER TABLE users_seq ADD COLUMN revert_expiry_col INT",
+				"ALTER TABLE users_seq ADD INDEX idx_revert_expiry_next_id (next_id)",
 			},
 		},
 		nil,
@@ -528,7 +532,7 @@ func TestDeploySubmittingToQueued(t *testing.T) {
 
 	branchName := createBranchWithDDL(t, ctx, "submitting-queued",
 		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE users ADD COLUMN submitting_test_col VARCHAR(50) NULL"},
+			"testapp_sharded": {"ALTER TABLE users ADD INDEX idx_submitting_test_full_name (full_name)"},
 		},
 		nil,
 	)
@@ -541,7 +545,7 @@ func TestDeploySubmittingToQueued(t *testing.T) {
 		Organization: testOrg,
 		Database:     testDB,
 		Number:       dr.Number,
-		InstantDDL:   true,
+		InstantDDL:   false,
 	})
 	require.NoError(t, err, "DeployDeployRequest")
 	assert.Equal(t, drState.Submitting, dr.DeploymentState, "initial deploy state should be submitting")
@@ -688,13 +692,13 @@ func TestCompleteRevertError(t *testing.T) {
 
 	branchName := createBranchWithDDL(t, ctx, "revert-error",
 		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE users ADD COLUMN revert_error_col VARCHAR(50) NULL"},
+			"testapp_sharded": {"ALTER TABLE users ADD INDEX idx_revert_error_full_name (full_name)"},
 		},
 		nil,
 	)
 
 	dr := createDeploy(t, ctx, branchName, true)
-	deploy(t, ctx, dr.Number, true)
+	deploy(t, ctx, dr.Number, false)
 	dr = waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert)
 	require.Equal(t, drState.CompletePendingRevert, dr.DeploymentState, "test uses 5s revert window, should reach complete_pending_revert")
 

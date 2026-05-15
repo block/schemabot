@@ -300,20 +300,53 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 	}
 	if c.config.Type == storage.DatabaseTypeVitess {
 		if vad, err := c.storage.VitessApplyData().GetByApplyID(ctx, task.ApplyID); err == nil {
-			meta, _ := json.Marshal(map[string]any{
-				"branch_name":        vad.BranchName,
-				"deploy_request_id":  vad.DeployRequestID,
-				"deploy_request_url": vad.DeployRequestURL,
-				"is_instant":         vad.IsInstant,
-				"deferred_deploy":    vad.DeferredDeploy,
-			})
-			req.ResumeState = &engine.ResumeState{
-				MigrationContext: vad.MigrationContext,
-				Metadata:         string(meta),
+			resumeState, buildErr := vitessApplyDataResumeState(vad, task.TaskIdentifier)
+			if buildErr != nil {
+				c.logger.Error("failed to build Vitess resume state for control", "apply_id", task.ApplyID, "error", buildErr)
+			} else {
+				req.ResumeState = resumeState
 			}
+		} else {
+			c.logger.Error("failed to load Vitess apply data for control", "apply_id", task.ApplyID, "error", err)
 		}
 	}
 	return req
+}
+
+func vitessApplyDataResumeState(vad *storage.VitessApplyData, fallbackContext string) (*engine.ResumeState, error) {
+	if vad == nil {
+		return nil, fmt.Errorf("vitess apply data is nil")
+	}
+	resumeContext := vad.MigrationContext
+	if resumeContext == "" {
+		resumeContext = fallbackContext
+	}
+	meta, err := json.Marshal(map[string]any{
+		"branch_name":        vad.BranchName,
+		"deploy_request_id":  vad.DeployRequestID,
+		"deploy_request_url": vad.DeployRequestURL,
+		"is_instant":         vad.IsInstant,
+		"deferred_deploy":    vad.DeferredDeploy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal Vitess resume metadata: %w", err)
+	}
+	return &engine.ResumeState{
+		MigrationContext: resumeContext,
+		Metadata:         string(meta),
+	}, nil
+}
+
+func (c *LocalClient) buildVitessResumeState(ctx context.Context, apply *storage.Apply) (*engine.ResumeState, error) {
+	vad, err := c.storage.VitessApplyData().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load Vitess apply data for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	resumeState, err := vitessApplyDataResumeState(vad, apply.ApplyIdentifier)
+	if err != nil {
+		return nil, err
+	}
+	return resumeState, nil
 }
 
 // Volume modifies the schema change speed/concurrency in-flight.

@@ -238,14 +238,35 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 		return nil, err
 	}
 
-	// Claim by updating updated_at and incrementing attempt counter
-	_, err = tx.ExecContext(ctx, `
-		UPDATE applies SET updated_at = NOW(), attempt = attempt + 1 WHERE id = ?
-	`, apply.ID)
-	apply.Attempt++ // reflect the increment in the returned object
-	if err != nil {
-		return nil, err
+	// Claim by updating updated_at and incrementing attempt counter.
+	// Retryable applies move back to pending while the worker dispatches them so
+	// other workers see a fresh active lease instead of the old retryable row.
+	if apply.State == state.Apply.FailedRetryable {
+		var result sql.Result
+		result, err = tx.ExecContext(ctx, `
+			UPDATE applies
+			SET state = ?, updated_at = NOW(), attempt = attempt + 1, completed_at = NULL
+			WHERE id = ? AND state = ?
+		`, state.Apply.Pending, apply.ID, state.Apply.FailedRetryable)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if rows == 0 {
+			return nil, nil
+		}
+	} else {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE applies SET updated_at = NOW(), attempt = attempt + 1 WHERE id = ?
+		`, apply.ID)
+		if err != nil {
+			return nil, err
+		}
 	}
+	apply.Attempt++ // reflect the increment in the returned object
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -272,15 +293,38 @@ func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 // ExpireRetryable transitions failed_retryable applies that have exhausted
 // their retry budget to permanent failed. Returns the number of rows affected.
 func (s *applyStore) ExpireRetryable(ctx context.Context) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `
+		UPDATE tasks t
+		JOIN applies a ON t.apply_id = a.id
+		SET t.state = ?, t.completed_at = COALESCE(t.completed_at, NOW()), t.updated_at = NOW()
+		WHERE a.state = ? AND a.attempt >= ? AND t.state = ?
+	`, state.Task.Failed, state.Apply.FailedRetryable, maxRecoveryAttempts, state.Task.FailedRetryable)
+	if err != nil {
+		return 0, err
+	}
+
+	result, err := tx.ExecContext(ctx, `
 		UPDATE applies
-		SET state = ?, completed_at = NOW(), updated_at = NOW()
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
 		WHERE state = ? AND attempt >= ?
 	`, state.Apply.Failed, state.Apply.FailedRetryable, maxRecoveryAttempts)
 	if err != nil {
 		return 0, err
 	}
-	return result.RowsAffected()
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return rowsAffected, nil
 }
 
 // GetByDatabase returns applies for a specific database and optionally filtered by dbType and environment.

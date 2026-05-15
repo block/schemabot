@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -244,6 +245,26 @@ func TestScheduler_ExhaustedRetries(t *testing.T) {
 	applyID, err := ts.Storage.Applies().Create(ctx, exhaustedApply)
 	require.NoError(t, err)
 
+	task := &storage.Task{
+		TaskIdentifier: "task-exhausted-" + fmt.Sprintf("%d", now.UnixNano()%100000),
+		ApplyID:        applyID,
+		PlanID:         plan.ID,
+		Database:       appDBName,
+		DatabaseType:   "mysql",
+		Engine:         "spirit",
+		State:          state.Task.FailedRetryable,
+		ErrorMessage:   "transient failure after many retries",
+		TableName:      "users",
+		DDL:            string(schemaSQL),
+		DDLAction:      "create",
+		Options:        []byte("{}"),
+		Environment:    "staging",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	_, err = ts.Storage.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+
 	t.Logf("Created exhausted apply %s with attempt=%d", exhaustedApply.ApplyIdentifier, exhaustedApply.Attempt)
 
 	// Start the scheduler
@@ -257,6 +278,11 @@ func TestScheduler_ExhaustedRetries(t *testing.T) {
 		require.NoError(t, err)
 		if apply != nil && apply.State == state.Apply.Failed {
 			t.Logf("Apply permanently failed as expected (attempt %d): %s", apply.Attempt, apply.ErrorMessage)
+			updatedTask, err := ts.Storage.Tasks().Get(ctx, task.TaskIdentifier)
+			require.NoError(t, err)
+			require.NotNil(t, updatedTask)
+			assert.Equal(t, state.Task.Failed, updatedTask.State)
+			assert.NotNil(t, updatedTask.CompletedAt)
 			return
 		}
 		if apply != nil && apply.State == state.Apply.Completed {
@@ -265,6 +291,46 @@ func TestScheduler_ExhaustedRetries(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	t.Fatal("timeout: scheduler did not expire the exhausted apply within 15s")
+}
+
+// TestScheduler_FindNextApply_DoesNotReclaimRetryableImmediately verifies that
+// claiming a retryable apply creates an exclusive lease. A second scheduler
+// worker must not be able to claim the same failed_retryable row before the
+// first worker has finished dispatching it.
+func TestScheduler_FindNextApply_DoesNotReclaimRetryableImmediately(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+	defer utils.CloseAndLog(schemabotDB)
+	clearStorageDB(t, schemabotDB)
+	stor := mysqlstore.New(schemabotDB)
+
+	now := time.Now()
+	_, err = stor.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-retryable-exclusive",
+		Database:        "exclusive_db",
+		DatabaseType:    "mysql",
+		Engine:          "spirit",
+		State:           state.Apply.FailedRetryable,
+		ErrorMessage:    "transient",
+		Attempt:         1,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	claimed, err := stor.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, "apply-retryable-exclusive", claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.FailedRetryable, claimed.State)
+
+	claimedAgain, err := stor.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimedAgain, "retryable apply should not be claimed twice while the first claim is fresh")
 }
 
 // TestScheduler_BasicClaimAndResume verifies the scheduler claims a stale apply

@@ -160,7 +160,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 	options := buildApplyOptions(apply)
 	oldApplyState := apply.State
 
-	if apply.GetOptions().DeferCutover {
+	if c.shouldUseAtomicResume(apply) {
 		logMsg := fmt.Sprintf("Resume requested: %d tasks resumed, %d already completed", len(resumeTasks), completedCount)
 		if err := c.launchAtomicResume(ctx, apply, resumeTasks, plan, options, logMsg); err != nil {
 			return nil, err
@@ -378,6 +378,10 @@ func buildApplyOptions(apply *storage.Apply) map[string]string {
 	return options
 }
 
+func (c *LocalClient) shouldUseAtomicResume(apply *storage.Apply) bool {
+	return apply.GetOptions().DeferCutover || c.config.Type == storage.DatabaseTypeVitess
+}
+
 // launchAtomicResume sends all DDLs to the engine in one call, marks tasks and
 // apply as RUNNING, logs the provided message, and starts pollForCompletionAtomic
 // in a background goroutine. Used by both Start() and ResumeApply().
@@ -398,8 +402,15 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		tableChanges = append(tableChanges, engine.TableChange{DDL: ddl})
 	}
 
-	// Resume atomic apply after restart. Use apply identifier as MigrationContext
-	// so Spirit can find existing checkpoint tables from the original run.
+	resumeState := &engine.ResumeState{MigrationContext: apply.ApplyIdentifier}
+	if c.config.Type == storage.DatabaseTypeVitess {
+		var err error
+		resumeState, err = c.buildVitessResumeState(ctx, apply)
+		if err != nil {
+			return fmt.Errorf("build Vitess resume state: %w", err)
+		}
+	}
+
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
 		Database: apply.Database,
 		Changes: []engine.SchemaChange{{
@@ -407,7 +418,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			TableChanges: tableChanges,
 		}},
 		Options:     options,
-		ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
+		ResumeState: resumeState,
 		Credentials: creds,
 	})
 	if err != nil {
@@ -530,6 +541,8 @@ func (c *LocalClient) failApplyPermanently(ctx context.Context, apply *storage.A
 }
 
 func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+	claimedRetryable := apply.State == state.Apply.FailedRetryable
+
 	// Re-fetch to get latest state and options (apply may have been modified
 	// by a control operation between FindNextApply and now).
 	fresh, err := c.storage.Applies().Get(ctx, apply.ID)
@@ -542,7 +555,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	apply = fresh
 
 	// Route to the appropriate recovery path based on state
-	if apply.State == state.Apply.FailedRetryable {
+	if claimedRetryable || apply.State == state.Apply.FailedRetryable {
 		return c.retryFailedApply(ctx, apply)
 	}
 
@@ -610,7 +623,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 
 	options := buildApplyOptions(apply)
 
-	if apply.GetOptions().DeferCutover {
+	if c.shouldUseAtomicResume(apply) {
 		if err := c.launchAtomicResume(ctx, apply, activeTasks, plan, options, "Apply resumed from checkpoint (atomic)"); err != nil {
 			c.logger.Error("engine apply failed during recovery",
 				"apply_id", apply.ApplyIdentifier,

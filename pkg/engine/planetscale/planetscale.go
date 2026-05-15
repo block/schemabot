@@ -829,7 +829,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		// Reuse existing branch: wait for ready, refresh schema from main, wait again
 		branchName = existingBranch
 		if branchName == main {
-			return nil, fmt.Errorf("cannot reuse the %s branch — use a development branch", main)
+			return nil, engine.NewNonRetryableError("cannot reuse the %s branch: use a development branch", main)
 		}
 		persistState(&psMetadata{BranchName: branchName})
 		emitEvent(engine.ApplyEvent{
@@ -1258,6 +1258,9 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 		if err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
 			lastErr = err
 			e.logger.Error(fmt.Sprintf("keyspace %s apply attempt %d failed", sc.Namespace, attempt+1), "keyspace", sc.Namespace, "attempt", attempt+1, "error", err)
+			if !isRetryableEngineError(err) {
+				return engine.NewNonRetryableError("apply keyspace %s: %w", sc.Namespace, err)
+			}
 			if isSnapshotInProgress(err) && maxAttempts == maxRetries {
 				maxAttempts = maxSnapshotRetries
 				e.logger.Info("schema snapshot in progress, extending retries",
@@ -1274,7 +1277,7 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 	if isRetryableEngineError(lastErr) {
 		return engine.NewRetryableError(finalErr)
 	}
-	return finalErr
+	return engine.NewNonRetryableError("%w", finalErr)
 }
 
 // isRetryableEngineError returns true if the error is a transient condition
