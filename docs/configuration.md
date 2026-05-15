@@ -108,7 +108,8 @@ tern_deployments:
 
 When a webhook arrives from an unlisted repository:
 - If the user invoked a SchemaBot command (e.g., `schemabot plan`), a PR comment explains the repo is not registered.
-- Auto-plan events (PR open/sync) are silently ignored.
+- Auto-plan events (PR open/sync) are ignored without a PR comment because the
+  repository is outside this SchemaBot deployment's ownership.
 
 If `repos` is not configured or empty, all repositories are allowed.
 
@@ -180,7 +181,7 @@ github:
 
 ### How it works
 
-- **Environment scoping:** When `allowed_environments` is set, the instance only processes commands targeting those environments. Commands for other environments (e.g., `schemabot apply -e production` sent to the staging instance) are silently ignored — the other instance handles them from its own webhook delivery.
+- **Environment scoping:** When `allowed_environments` is set, the instance only processes commands targeting those environments. Commands for other environments (e.g., `schemabot apply -e production` sent to the staging instance) are accepted without a PR response by this deployment. A deployment that allows the requested environment must process its own webhook delivery.
 
 - **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates.
 
@@ -195,6 +196,13 @@ github:
 ### Auto-plan behavior
 
 When a PR is opened or updated, each instance auto-plans only the environments it owns. The staging instance plans staging, the production instance plans production. Each posts its own plan comment and creates its own per-environment aggregate check.
+
+If a PR changes managed schema files but a deployment's `allowed_environments`
+does not overlap any environment declared by the matching `schemabot.yaml`, that
+deployment publishes a failing aggregate check instead of treating the PR as
+safe. This usually means the repo config and server config disagree. Align the
+`schemabot.yaml` environments with the deployment's `allowed_environments`, then
+run `schemabot plan -e <environment>` or push a new commit to refresh checks.
 
 ## Secret Resolution
 

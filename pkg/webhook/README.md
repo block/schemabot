@@ -24,35 +24,52 @@ pkg/webhook/                   Webhook event handling
 
 ## Request Flow
 
-```
+```text
 GitHub sends POST /webhook
-  │
-  ├─ Validate HMAC-SHA256 signature (X-Hub-Signature-256 header)
-  ├─ Route by X-GitHub-Event header
-  │
-  └─ issue_comment event
-       │
-       ├─ Filter: only "created" actions on PRs, ignore bots
-       ├─ Parse command from comment body (CommandParser)
-       ├─ Add "eyes" reaction for instant acknowledgment
-       │
-       └─ Route by command:
-            │
-            ├─ "plan -e staging"
-            │    ├─ Discover schemabot.yaml config
-            │    ├─ Fetch schema files (Tree API + parallel blobs)
-            │    ├─ Call service.ExecutePlan() → Tern → Spirit/PlanetScale
-            │    ├─ Post plan comment on PR
-            │    └─ Create GitHub Check Run
-            │
-            ├─ "plan" (no -e)
-            │    └─ Run plan for each environment in config
-            │
-            ├─ "help"
-            │    └─ Post help comment
-            │
-            └─ Other commands (apply, cancel, etc.)
-                 └─ Phase 2 — acknowledged with CLI fallback message
+  |
+  +-- Validate HMAC-SHA256 signature (X-Hub-Signature-256 header)
+  |
+  +-- issue_comment.created on a PR
+  |     |
+  |     +-- Ignore bots and commands for environments this deployment is not
+  |     |   allowed to process
+  |     +-- Parse command from comment body
+  |     +-- Add an "eyes" reaction after this deployment accepts the command
+  |     |
+  |     +-- plan [-e <env>]
+  |     |     +-- Discover schemabot.yaml config
+  |     |     +-- Fetch schema files
+  |     |     +-- Execute plan through Tern
+  |     |     +-- Store per-database check state
+  |     |     +-- Post plan comment and sync the aggregate Check Run
+  |     |
+  |     +-- apply -e <env>
+  |     |     +-- Re-plan, enforce gates, acquire lock, and post confirmation
+  |     |
+  |     +-- apply-confirm -e <env>
+  |     |     +-- Revalidate lock/plan, start apply, store apply_id ownership,
+  |     |         and post progress updates
+  |     |
+  |     +-- rollback <apply-id> -e <env>
+  |     |     +-- Generate rollback plan and acquire lock
+  |     |
+  |     +-- rollback-confirm -e <env>
+  |     |     +-- Start rollback apply and keep the required check blocked
+  |
+  +-- pull_request.opened / synchronize / reopened
+  |     |
+  |     +-- Discover changed managed schema configs
+  |     +-- Auto-plan each affected database
+  |     +-- Clean up stale check state for databases no longer touched
+  |     +-- Publish aggregate Check Runs on the current PR head SHA
+  |
+  +-- pull_request.closed
+  |     |
+  |     +-- Release locks held by the PR and delete stored check state
+  |
+  +-- check_run
+        |
+        +-- Accepted by the webhook but not implemented today
 ```
 
 ## GitHub App Authentication
@@ -126,9 +143,9 @@ ExecutePlan(ctx, PlanRequest)
 
 ## Check Runs
 
-Check Runs are GitHub pre-merge status checks that appear on the PR's "Checks" tab. They block merging when configured as required status checks, ensuring schema changes are applied before the PR lands.
+Check Runs are GitHub pre-merge status checks that appear on the PR's "Checks" tab. SchemaBot publishes an aggregate check (`SchemaBot`, or `SchemaBot (<environment>)` when `allowed_environments` is configured) and stores per-database state internally.
 
-After a plan, a Check Run is created:
+After a plan, the aggregate reflects the rolled-up internal state:
 
 | Plan Result | Conclusion | Blocks Merge? |
 |---|---|---|
@@ -136,12 +153,12 @@ After a plan, a Check Run is created:
 | No changes | `success` | No |
 | Errors | `failure` | Yes (if required) |
 
-The check run output text contains the full DDL statements, truncated at 65,530 characters (GitHub API limit).
+See [Check Runs](../../docs/check-runs.md) for the current lifecycle, `apply_id` ownership model, stale check reconciliation, and branch protection setup.
 
 ## Command Syntax
 
-```
-schemabot <command> [-e <environment>] [-d <database>] [--enable-revert] [--defer-cutover]
+```text
+schemabot <command> [-e <environment>] [-d <database>] [--defer-cutover] [--allow-unsafe] [--skip-revert]
 ```
 
 | Command | `-e` required | Description |
@@ -150,14 +167,14 @@ schemabot <command> [-e <environment>] [-d <database>] [--enable-revert] [--defe
 | `apply` | Yes | Lock plan for deployment |
 | `apply-confirm` | Yes | Execute locked plan |
 | `unlock` | No | Discard locked plans |
-| `cancel` | Yes | Cancel in-progress apply |
-| `cutover` | Yes | Complete deferred cutover |
-| `revert` | Yes | Revert (within revert window) |
-| `skip-revert` | Yes | Make changes permanent |
 | `rollback` | Yes | Generate rollback plan |
 | `rollback-confirm` | Yes | Execute rollback |
 | `fix-lint` | No | Auto-fix lint warnings |
 | `help` | No | Show command reference |
+
+PR comments for `stop`, `cutover`, `revert`, and `skip-revert` are parsed so
+SchemaBot can return a clear "not yet available" response. Use the CLI for
+those operator controls today.
 
 ## Error Handling
 
@@ -171,10 +188,8 @@ Schema request errors are mapped to specific GitHub comment templates:
 | `DatabaseNotFoundError` | "Database Not Found" | Check database name |
 | Other | "Plan Failed" | Check error details |
 
-## Phase 2 (Future)
+## Not Implemented In Webhooks
 
-- **Apply via PR comments**: `apply`, `apply-confirm`, lock management
-- **Check Run action buttons**: "Apply Changes" / "Unlock" button clicks
-- **Auto-plan on PR open/sync**: Automatic plan when PRs are opened or updated
-- **Apply progress**: Live comment editing with progress updates
-- **Lock conflict detection**: Cross-PR blocking notifications
+- Check Run action buttons and GitHub `check_run.rerequested` handling.
+- PR-comment control operations for `stop`, `cutover`, `revert`, and
+  `skip-revert`; use the CLI for those operator actions.

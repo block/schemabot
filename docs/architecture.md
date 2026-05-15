@@ -81,11 +81,11 @@ schemabot skip-revert -d mydb -e staging    # Finalize (Vitess)
    Options like `--defer-cutover` are passed in the apply step (see [Apply Options](#apply-options))
 5. SchemaBot posts progress updates as the schema change executes
 6. If `--defer-cutover` was used, developer triggers cutover via `schemabot cutover`
-7. On PR merge/close, SchemaBot cleans up (releases locks, cancels pending changes)
+7. On PR merge/close, SchemaBot cleans up stored PR state and releases locks
 
 Users can also run `schemabot plan` manually in a PR comment to re-plan without waiting for auto-plan.
 
-**Check Runs** — SchemaBot creates GitHub check runs per (environment, database) that block merge until schema changes are applied. Production applies require staging to be clean first (staging-first enforcement). See [`pkg/checks/README.md`](../pkg/checks/README.md) for the full check run lifecycle, state transitions, and edge cases.
+**Check Runs** — SchemaBot publishes aggregate GitHub checks that block merge until managed schema changes are applied. Per-database state is stored internally and rolled up into the aggregate check. Production applies require staging to be clean first when environments are ordered. See [`check-runs.md`](check-runs.md) for the full lifecycle, race-safety model, and branch protection setup.
 
 **API** — HTTP endpoints that both CLI and webhook use internally. The SchemaBot server exposes `/v1/plan`, `/v1/apply`, `/v1/progress`, `/v1/cutover`, etc.
 
@@ -480,6 +480,11 @@ Used for: distributed deployments where SchemaBot and the database engine run on
 **Identity resolution (`apply_identifier` vs `external_id`):**
 
 In gRPC mode, SchemaBot and Tern maintain separate storage with separate IDs. When Apply succeeds, Tern returns its own ID (the remote engine's apply identifier). SchemaBot generates a separate `apply_identifier` for its HTTP callers and stores Tern's ID as `external_id`:
+
+An accepted apply must return an apply ID and must be represented in SchemaBot
+storage before webhook progress tracking or Check Run ownership can proceed.
+Without that stored ID, SchemaBot cannot safely tie terminal engine state back
+to the PR check that started the work.
 
 ```
 Apply flow:
