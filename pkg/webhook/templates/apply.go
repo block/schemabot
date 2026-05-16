@@ -90,7 +90,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.RevertWindow:
 		sb.WriteString("## Schema Change Applied (Pending Revert)\n\n")
 	case state.Apply.Completed:
-		sb.WriteString("## ✅ Schema Change Applied\n\n")
+		sb.WriteString("## Schema Change Completed\n\n")
 	case state.Apply.Failed:
 		sb.WriteString("## ❌ Schema Change Failed\n\n")
 	case state.Apply.Stopped:
@@ -198,6 +198,8 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			queued++
 		case state.Task.WaitingForCutover:
 			waiting++
+		case state.Task.Recovering:
+			running++
 		case state.Task.CuttingOver:
 			cutting++
 		case state.Task.Failed:
@@ -308,9 +310,18 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 	case state.Task.WaitingForCutover:
 		bar := ui.ProgressBarWaitingCutover()
 		if table.ReadyToComplete {
-			fmt.Fprintf(sb, "- **`%s`**: %s \u2705 Ready for cutover  \n", table.TableName, bar)
+			fmt.Fprintf(sb, "- **`%s`**: %s \u23f8\ufe0f Ready for cutover  \n", table.TableName, bar)
 		} else {
 			fmt.Fprintf(sb, "- **`%s`**: %s Waiting for cutover  \n", table.TableName, bar)
+		}
+		writeDDLLine(sb, table.DDL)
+
+	case state.Task.Recovering:
+		if table.PercentComplete > 0 {
+			bar := ui.ProgressBarWaitingCutover()
+			fmt.Fprintf(sb, "- **`%s`**: %s \U0001f504 Recovering...  \n", table.TableName, bar)
+		} else {
+			fmt.Fprintf(sb, "- **`%s`**: \U0001f504 Recovering...  \n", table.TableName)
 		}
 		writeDDLLine(sb, table.DDL)
 
@@ -415,9 +426,9 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
 	case state.Apply.WaitingForDeploy:
-		writeFooterAction(sb, "To deploy:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
+		writeFooterAction(sb, "To deploy:", fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment))
 	case state.Apply.WaitingForCutover:
-		writeFooterAction(sb, "To proceed with cutover:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
+		writeFooterAction(sb, "To proceed with the cutover:", fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment))
 	case state.Apply.CuttingOver:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
@@ -430,6 +441,8 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.RevertWindow:
 		writeFooterAction(sb, "To revert:", fmt.Sprintf("schemabot revert %s", data.ApplyID))
 		fmt.Fprintf(sb, "\nTo skip revert and keep changes:\n```\nschemabot skip-revert %s\n```\n", data.ApplyID)
+	case state.Apply.Completed:
+		sb.WriteString("\n---\n\n*See completion summary below*\n")
 	}
 }
 
@@ -477,7 +490,7 @@ func countTableOutcomes(tables []TableProgressData) (completed, failed int) {
 }
 
 func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, totalTables int) {
-	writeApplyHeader(sb, data)
+	sb.WriteString("## ✅ Schema Change Applied\n\n")
 	writeSummaryCompletedMetadata(sb, data)
 	var msg string
 	if totalTables == 1 {

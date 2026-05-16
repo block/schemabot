@@ -14,6 +14,7 @@ var Task = struct {
 	Running           string
 	WaitingForDeploy  string
 	WaitingForCutover string
+	Recovering        string
 	CuttingOver       string
 	RevertWindow      string
 	Completed         string
@@ -26,6 +27,7 @@ var Task = struct {
 	Running:           "running",
 	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
+	Recovering:        "recovering",
 	CuttingOver:       "cutting_over",
 	RevertWindow:      "revert_window",
 	Completed:         "completed",
@@ -110,7 +112,7 @@ func NormalizeTaskStatus(raw string) string {
 
 	// Pass-through for already-normalized values
 	case Task.Pending, Task.Running, Task.Completed, Task.Stopped, Task.Failed,
-		Task.RevertWindow, Task.Reverted,
+		Task.RevertWindow, Task.Reverted, Task.Recovering,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.CuttingOver, Task.Cancelled:
 		return s
 

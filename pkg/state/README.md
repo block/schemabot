@@ -23,6 +23,7 @@ Vitess OnlineDDL and Spirit report — and they are translated into Task and App
 | ValidatingDeployRequest | `validating_deploy_request` | PlanetScale is validating the deploy request diff (PlanetScale only) |
 | WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only). Without `--defer-deploy`, auto-advances immediately. |
 | WaitingForCutover | `waiting_for_cutover` | All tasks ready, waiting for manual cutover (atomic mode only — in sequential mode each task cuts over independently) |
+| Recovering | `recovering` | Engine recovering from a restart. Blocks control operations (cutover, etc.) until the engine re-establishes its state. |
 | CuttingOver | `cutting_over` | Cutover in progress (atomic mode only) |
 | Completed | `completed` | All tasks finished successfully |
 | Failed | `failed` | At least one task failed |
@@ -48,6 +49,9 @@ stateDiagram-v2
     running --> revert_window : PlanetScale only
 
     waiting_for_cutover --> cutting_over
+    waiting_for_cutover --> recovering : container restart
+    recovering --> waiting_for_cutover : Spirit catches up
+    recovering --> failed : Spirit fails during recovery
     cutting_over --> completed
 
     revert_window --> completed : auto-expires or skip-revert
@@ -69,6 +73,7 @@ Per-table execution state. Same state machine as Apply, plus `cancelled`:
 | Pending | `pending` | Task created, not yet started |
 | Running | `running` | Engine is actively executing (row copy, checksum, etc.) |
 | WaitingForCutover | `waiting_for_cutover` | Row copy complete, waiting for cutover signal |
+| Recovering | `recovering` | Engine recovering from a restart, blocks control operations until state is re-established |
 | CuttingOver | `cutting_over` | Table cutover in progress |
 | Completed | `complete` | Schema change applied successfully |
 | Failed | `failed` | Engine reported failure |
@@ -85,12 +90,13 @@ Per-table execution state. Same state machine as Apply, plus `cancelled`:
 2. Any task **stopped** → apply `stopped`
 3. Any task **reverted** → apply `reverted`
 4. All tasks **completed** → apply `completed`
-5. Any task **cutting_over** → apply `cutting_over`
-6. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
-7. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
-8. Any task **revert_window** → apply `revert_window`
-9. Any task **running** → apply `running`
-10. Otherwise → apply `pending`
+5. Any task **recovering** → apply `recovering`
+6. Any task **cutting_over** → apply `cutting_over`
+7. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
+8. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
+9. Any task **revert_window** → apply `revert_window`
+10. Any task **running** → apply `running`
+11. Otherwise → apply `pending`
 
 Terminal states (`completed`, `failed`, `reverted`, `cancelled`) are checked via `IsTerminalApplyState()`. Note: `stopped` is NOT terminal at the task level — a stopped task can be resumed via Start.
 
@@ -225,6 +231,7 @@ The rendering layer (`WriteProgress`) uses normalized states to select progress 
 | Waiting for cutover | Yellow | `🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover` |
 | Cutting over | Yellow | `🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...` |
 | Completed | Green | `🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete` |
+| Recovering | — | `🔄 Recovering...` (no progress bar) |
 | Stopped | Orange | `🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 35%` |
 | Failed | Red | `🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed` |
 
@@ -263,6 +270,8 @@ PR comment tracking for applies. Each apply can have up to 3 comments, one per c
 | Summary | `summary` | Final summary comment, created when the apply reaches a terminal state |
 
 Stored in the `apply_comments` table with `UNIQUE(apply_id, comment_state)`. Upsert semantics allow Start/resume to replace old comment IDs with fresh ones.
+
+**Outbox pattern:** The `apply_comments` table doubles as an outbox — the existence of a row indicates that a comment was successfully posted. On startup, the recovery worker checks for completed applies that have a `progress` row but no `summary` row. This means the apply completed but the summary comment was missed (e.g., container died during rolling deployment). The recovery worker posts the missing summary comment. This is idempotent — if the summary row exists, it's already posted.
 
 ### How it works
 
@@ -363,6 +372,11 @@ In both cases:
   SchemaBot marks the task as failed with an abandonment message.
 - **`stopped` and `cancelled` are SchemaBot-owned.** These are set by user action (stop command) or
   SchemaBot logic (earlier failure cancels remaining tasks in sequential mode), not reported by engines.
+- **Recovery after restart.** When a task was in `waiting_for_cutover` and the engine reports a
+  different state after a restart, SchemaBot checks for durable signals (e.g., Spirit's sentinel
+  table) to determine whether the engine is recovering or the operation already completed. If
+  recovering, the task enters `recovering` state which blocks control operations until the engine
+  re-establishes its state. See `reconcileTaskStateFromEngine()` in `pkg/tern/local_client.go`.
 - **Stop checkpoints conservatively.** When a user requests stop, SchemaBot marks all non-terminal
   tasks as `stopped` regardless of engine sub-state — even if row copy is 100% done. A schema
   change isn't complete until cutover finishes, so SchemaBot won't promote a task to `completed`

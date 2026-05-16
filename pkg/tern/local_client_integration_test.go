@@ -1308,3 +1308,218 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	require.NotEmpty(t, tasks)
 	assert.NotEmpty(t, tasks[0].ErrorMessage, "task.ErrorMessage should contain the failure reason")
 }
+
+// TestLocalClient_Progress_WaitingForCutoverState verifies the sentinel-based
+// recovery logic: when a task is in waiting_for_cutover and the sentinel table
+// exists but Spirit reports a non-WaitingOnSentinelTable state (e.g., after a
+// restart), the task transitions to recovering.
+func TestLocalClient_Progress_WaitingForCutoverState(t *testing.T) {
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	// Use a unique database name to isolate from setupStorageSchema's Spirit DDL
+	dbName := fmt.Sprintf("wfc_%d", time.Now().UnixNano()%100000)
+
+	// Create the database and sentinel table so the reconciliation logic
+	// recognizes the task as legitimately waiting for cutover (not stale).
+	targetDB, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(targetDB)
+	_, err = targetDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", dbName))
+	require.NoError(t, err)
+	_, err = targetDB.ExecContext(ctx, fmt.Sprintf("CREATE TABLE `%s`.`_spirit_sentinel` (id int NOT NULL PRIMARY KEY)", dbName))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = targetDB.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName))
+	})
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  dbName,
+		Type:      "mysql",
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	// Create a task in waiting_for_cutover state (simulates post-row-copy)
+	taskID := fmt.Sprintf("task-%d", time.Now().UnixNano())
+	applyID := fmt.Sprintf("apply-%d", time.Now().UnixNano())
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: applyID,
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "test/repo",
+		PullRequest:     1,
+		State:           state.Apply.WaitingForCutover,
+		Engine:          "spirit",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	dbApplyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	task := &storage.Task{
+		TaskIdentifier:  taskID,
+		ApplyID:         dbApplyID,
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Namespace:       dbName,
+		TableName:       "orders",
+		DDL:             "ALTER TABLE orders ADD INDEX idx_test (id)",
+		DDLAction:       "alter",
+		Engine:          "spirit",
+		Repository:      "test/repo",
+		PullRequest:     1,
+		Environment:     "staging",
+		State:           state.Task.WaitingForCutover,
+		ProgressPercent: 100,
+		ReadyToComplete: true,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	_, err = stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+
+	// Call Progress with the apply ID — with no active engine, it reads from storage
+	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
+		Type:     "mysql",
+		Database: dbName,
+		ApplyId:  applyID,
+	})
+	require.NoError(t, err)
+
+	require.NotEmpty(t, resp.Tables, "expected at least one table in progress response")
+
+	// With sentinel existing and engine not at WaitingOnSentinelTable, the task
+	// transitions to recovering (blocking cutover until Spirit catches up).
+	updatedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Recovering, updatedTask.State,
+		"task should transition to recovering when sentinel exists but engine not at WaitingOnSentinelTable")
+}
+
+// TestLocalClient_SentinelRecovery_CutoverBlockedDuringRecovery verifies that
+// Cutover() is rejected when a task is in the recovering state.
+func TestLocalClient_SentinelRecovery_CutoverBlockedDuringRecovery(t *testing.T) {
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	dbName := fmt.Sprintf("recov_%d", time.Now().UnixNano()%100000)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  dbName,
+		Type:      "mysql",
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	now := time.Now()
+	applyID := fmt.Sprintf("apply-recov-%d", now.UnixNano())
+	apply := &storage.Apply{
+		ApplyIdentifier: applyID,
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "test/repo",
+		PullRequest:     1,
+		State:           state.Apply.Recovering,
+		Engine:          "spirit",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	dbApplyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	task := &storage.Task{
+		TaskIdentifier:  fmt.Sprintf("task-recov-%d", now.UnixNano()),
+		ApplyID:         dbApplyID,
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Namespace:       dbName,
+		TableName:       "orders",
+		DDL:             "ALTER TABLE orders ADD INDEX idx_test (id)",
+		DDLAction:       "alter",
+		Engine:          "spirit",
+		Repository:      "test/repo",
+		PullRequest:     1,
+		Environment:     "staging",
+		State:           state.Task.Recovering,
+		ProgressPercent: 100,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	_, err = stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+
+	// Verify task persisted correctly
+	freshTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.Equal(t, state.Task.Recovering, freshTask.State, "task should persist as recovering")
+
+	// Cutover should be rejected — task is recovering.
+	resp, err := client.Cutover(ctx, &ternv1.CutoverRequest{
+		ApplyId:     applyID,
+		Database:    dbName,
+		Environment: "staging",
+	})
+	require.NoError(t, err, "recovering guard should return a response, not an error")
+	require.NotNil(t, resp)
+	assert.False(t, resp.Accepted, "cutover should be rejected during recovery")
+	assert.Contains(t, resp.ErrorMessage, "recovering from a restart")
+}
+
+// TestLocalClient_SentinelRecovery_SentinelTableExists verifies the sentinel
+// table check helper works correctly against a real MySQL instance.
+func TestLocalClient_SentinelRecovery_SentinelTableExists(t *testing.T) {
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      "mysql",
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	// No sentinel table initially
+	exists, err := client.sentinelTableExists(ctx)
+	require.NoError(t, err)
+	assert.False(t, exists, "sentinel should not exist initially")
+
+	// Create sentinel table
+	targetDB, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(targetDB)
+	_, err = targetDB.ExecContext(ctx, "CREATE TABLE `testdb`.`_spirit_sentinel` (id int NOT NULL PRIMARY KEY)")
+	require.NoError(t, err)
+
+	exists, err = client.sentinelTableExists(ctx)
+	require.NoError(t, err)
+	assert.True(t, exists, "sentinel should exist after creation")
+
+	// Drop sentinel table
+	_, err = targetDB.ExecContext(ctx, "DROP TABLE `testdb`.`_spirit_sentinel`")
+	require.NoError(t, err)
+
+	exists, err = client.sentinelTableExists(ctx)
+	require.NoError(t, err)
+	assert.False(t, exists, "sentinel should not exist after drop")
+}

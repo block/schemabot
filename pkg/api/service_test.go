@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -152,4 +153,82 @@ func TestTernConfig_Endpoint_EmptyEndpoint(t *testing.T) {
 
 	_, err := config.Endpoint("", "production")
 	assert.Error(t, err)
+}
+
+// TestDeploymentResolution_ConsistentAcrossHandlers verifies that the recovery
+// worker and webhook handlers resolve to the same TernClient cache key for a
+// given database. This prevents the bug where different code paths created
+// separate LocalClient instances with separate Spirit engine instances, causing
+// "no active schema change to cutover" after crash recovery.
+func TestDeploymentResolution_ConsistentAcrossHandlers(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(nil, nil))
+
+	// Local mode: database registered in config, no TernDeployments
+	svc := New(nil, &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {Type: "mysql"},
+		},
+	}, nil, logger)
+
+	// Recovery worker path: ResolveDeployment(database, "")
+	recoveryDeployment := svc.ResolveDeployment("orders", "")
+
+	// Webhook cutover path: TernDeployment(repo) → "" → ResolveDeployment(database, "")
+	webhookDeployment := svc.TernDeployment("myorg/myrepo")
+	cutoverDeployment := svc.ResolveDeployment("orders", webhookDeployment)
+
+	assert.Equal(t, recoveryDeployment, cutoverDeployment,
+		"recovery worker and cutover handler must resolve to the same deployment key; "+
+			"different keys create separate Spirit engine instances that don't share runningMigration state")
+
+	// Also verify the actual key value
+	assert.Equal(t, "orders", recoveryDeployment,
+		"in local mode, deployment should be the database name")
+}
+
+// TestDeploymentResolution_WithExplicitDeployment verifies that when an apply
+// has an explicit deployment stored, both paths use it directly.
+func TestDeploymentResolution_WithExplicitDeployment(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(nil, nil))
+
+	svc := New(nil, &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {Type: "mysql"},
+		},
+	}, nil, logger)
+
+	// Both paths should use the explicit deployment directly
+	assert.Equal(t,
+		svc.ResolveDeployment("orders", "my-cluster"),
+		svc.ResolveDeployment("orders", "my-cluster"),
+	)
+	assert.Equal(t, "my-cluster", svc.ResolveDeployment("orders", "my-cluster"))
+}
+
+// TestDeploymentResolution_GRPCMode verifies deployment resolution when
+// TernDeployments is configured (gRPC mode).
+func TestDeploymentResolution_GRPCMode(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(nil, nil))
+
+	svc := New(nil, &ServerConfig{
+		TernDeployments: TernConfig{
+			"tern-prod": {
+				"staging": "http://tern:8080",
+			},
+		},
+		Repos: map[string]RepoConfig{
+			"myorg/myrepo": {DefaultTernDeployment: "tern-prod"},
+		},
+	}, nil, logger)
+
+	// In gRPC mode, TernDeployment uses the repo mapping
+	webhookDeployment := svc.TernDeployment("myorg/myrepo")
+	assert.Equal(t, "tern-prod", webhookDeployment)
+
+	// Recovery worker uses ResolveDeployment with the stored deployment from the apply
+	recoveryDeployment := svc.ResolveDeployment("orders", "tern-prod")
+	assert.Equal(t, "tern-prod", recoveryDeployment)
+
+	assert.Equal(t, webhookDeployment, recoveryDeployment,
+		"gRPC mode: recovery and webhook should resolve to the same deployment")
 }

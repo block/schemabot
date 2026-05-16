@@ -43,10 +43,35 @@ func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (
 		return nil, fmt.Errorf("no active schema change")
 	}
 
+	if task.State == state.Task.Recovering {
+		return &ternv1.CutoverResponse{
+			Accepted:     false,
+			ErrorMessage: "Schema change is recovering from a restart. Cutover will be available once recovery completes.",
+		}, nil
+	}
+
 	creds := c.credentials()
 	eng := c.getEngine()
 	if eng == nil {
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+
+	// Verify the engine has an active migration before triggering cutover.
+	// After a container restart or rolling deployment, Spirit's in-memory state
+	// is gone until the recovery worker resumes it (heartbeat timeout + poll
+	// interval). If the engine reports no active migration but storage says
+	// waiting_for_cutover, recovery is still in progress.
+	if task.State == state.Task.WaitingForCutover && c.config.Type == storage.DatabaseTypeMySQL {
+		progress, _ := eng.Progress(ctx, &engine.ProgressRequest{
+			Database:    c.config.Database,
+			Credentials: creds,
+		})
+		if progress != nil && progress.State == engine.StatePending {
+			return &ternv1.CutoverResponse{
+				Accepted:     false,
+				ErrorMessage: "Schema change is being recovered after a restart. The recovery worker will resume it shortly — try again in a moment.",
+			}, nil
+		}
 	}
 
 	// Log cutover triggered

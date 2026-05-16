@@ -178,6 +178,9 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 	oldState := task.State
 	task.State = newState
 	task.UpdatedAt = time.Now()
+	if newState == state.Task.WaitingForCutover {
+		task.ReadyToComplete = true
+	}
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
 		c.logger.Error("failed to update task state", "task_id", task.TaskIdentifier, "state", newState, "error", err)
 	}
@@ -1178,6 +1181,9 @@ func deriveOverallState(tasks []*storage.Task) string {
 		case state.Task.CuttingOver:
 			hasRunning = true
 			runningState = state.Task.CuttingOver
+		case state.Task.Recovering:
+			hasRunning = true
+			runningState = state.Task.Recovering
 		case state.Task.Pending:
 			hasPending = true
 		case state.Task.Stopped:

@@ -15,6 +15,7 @@ type CommandParser struct {
 	commandWithoutEnvRegex *regexp.Regexp
 	rollbackCommandRegex   *regexp.Regexp
 	rollbackRegex          *regexp.Regexp // rollback <apply-id>
+	cutoverRegex           *regexp.Regexp // cutover [apply-id]
 	environmentRegex       *regexp.Regexp // -e <env>
 	databaseRegex          *regexp.Regexp
 	skipRevertRegex        *regexp.Regexp
@@ -26,12 +27,13 @@ type CommandParser struct {
 // NewCommandParser creates a new command parser.
 func NewCommandParser() *CommandParser {
 	return &CommandParser{
-		commandRegex:           regexp.MustCompile(`(?i)schemabot\s+(plan|apply|apply-confirm|unlock|stop|revert|skip-revert|cutover|rollback-confirm)\s+(?:.*?-e\s+(staging|production))`),
+		commandRegex:           regexp.MustCompile(`(?i)schemabot\s+(plan|apply|apply-confirm|unlock|stop|revert|skip-revert|rollback-confirm)\s+(?:.*?-e\s+(staging|production))`),
 		mentionRegex:           regexp.MustCompile(`(?i)\bschemabot\b`),
 		helpRegex:              regexp.MustCompile(`(?i)schemabot\s+help\b`),
-		commandWithoutEnvRegex: regexp.MustCompile(`(?i)schemabot\s+(plan|apply|apply-confirm|unlock|stop|revert|skip-revert|cutover|rollback|rollback-confirm|fix-lint)\b`),
+		commandWithoutEnvRegex: regexp.MustCompile(`(?i)schemabot\s+(plan|apply|apply-confirm|unlock|stop|revert|skip-revert|rollback|rollback-confirm|fix-lint)\b`),
 		rollbackCommandRegex:   regexp.MustCompile(`(?i)schemabot\s+rollback(?:\s|$)`),
 		rollbackRegex:          regexp.MustCompile(`(?i)schemabot\s+rollback\s+(apply[_-][a-f0-9]+)`),
+		cutoverRegex:           regexp.MustCompile(`(?i)schemabot\s+cutover(?:\s+(apply[_-][a-f0-9]+))?(?:\s|$)`),
 		environmentRegex:       regexp.MustCompile(`(?i)-e\s+(staging|production)`),
 		databaseRegex:          regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
 		skipRevertRegex:        regexp.MustCompile(`(?i)--skip-revert\b`),
@@ -87,6 +89,31 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 			result.Found = true
 		} else {
 			result.MissingEnv = true
+		}
+		return result
+	}
+
+	// Check cutover — requires <apply-id> and -e <env>
+	cutoverMatches := p.cutoverRegex.FindStringSubmatch(body)
+	if len(cutoverMatches) >= 2 {
+		applyID := cutoverMatches[1] // empty when apply ID omitted
+		result := CommandResult{
+			Action:    action.Cutover,
+			ApplyID:   applyID,
+			IsMention: true,
+		}
+		envMatches := p.environmentRegex.FindStringSubmatch(body)
+		if len(envMatches) >= 2 {
+			result.Environment = envMatches[1]
+		}
+		switch {
+		case applyID == "":
+			// Missing apply ID — always an error, but parse -e for instance routing
+			result.MissingEnv = true
+		case result.Environment == "":
+			result.MissingEnv = true
+		default:
+			result.Found = true
 		}
 		return result
 	}

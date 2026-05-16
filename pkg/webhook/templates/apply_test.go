@@ -67,12 +67,13 @@ func TestRenderApplyStatusComment_Completed(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "## ✅ Schema Change Applied")
+	assert.Contains(t, result, "## Schema Change Completed")
 	assert.Contains(t, result, "### Table Progress")
 	// Progress summary line
 	assert.Contains(t, result, "📊 2/2 complete")
-	// Each table has "✓ Complete" = 2 total
-	assert.Equal(t, 2, strings.Count(result, "Complete"))
+	// Each table has "✓ Complete" + header "Completed" + footer "completion" = check table instances
+	assert.Contains(t, result, "✓ Complete")
+	assert.Contains(t, result, "See completion summary below")
 }
 
 func TestRenderApplyStatusComment_Failed(t *testing.T) {
@@ -249,8 +250,9 @@ func TestPreviewCommentApplyProgress(t *testing.T) {
 func TestPreviewCommentApplyCompleted(t *testing.T) {
 	result := PreviewCommentApplyCompleted()
 
-	assert.Contains(t, result, "Schema Change Applied")
+	assert.Contains(t, result, "Schema Change Completed")
 	assert.Contains(t, result, "### Table Progress")
+	assert.Contains(t, result, "See completion summary below")
 }
 
 func TestPreviewCommentApplyFailed(t *testing.T) {
@@ -505,6 +507,41 @@ func TestRenderApplyStatusComment_WaitingForCutover_AllReady(t *testing.T) {
 
 	assert.Contains(t, result, "2/2")
 	assert.NotContains(t, result, "waiting on")
+}
+
+func TestRenderApplyStatusComment_Recovering(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-abc123",
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Recovering,
+		Tables: []TableProgressData{
+			{TableName: "orders", Status: state.Task.Recovering, PercentComplete: 100, DDL: "ALTER TABLE orders ADD INDEX idx_status (status)"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "Recovering...")
+	assert.Contains(t, result, "🟨", "should show yellow bar at last known progress")
+	assert.Contains(t, result, "orders")
+}
+
+func TestRenderApplyStatusComment_RecoveringNoProgress(t *testing.T) {
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-abc123",
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Recovering,
+		Tables: []TableProgressData{
+			{TableName: "orders", Status: state.Task.Recovering, DDL: "ALTER TABLE orders ADD INDEX idx_status (status)"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "Recovering...")
+	assert.NotContains(t, result, "🟨", "should not show progress bar without prior progress")
 }
 
 func TestRenderApplyStatusComment_RevertWindow(t *testing.T) {

@@ -316,6 +316,50 @@ func TestWebhookEyesReaction(t *testing.T) {
 	}
 }
 
+func TestWebhookCutoverMissingApplyID(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot cutover -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Missing Apply ID")
+		assert.Contains(t, body, "schemabot cutover <apply-id> -e <environment>")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error comment")
+	}
+}
+
+func TestWebhookCutoverMissingEnv(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot cutover apply_abc123",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Missing Environment")
+		assert.Contains(t, body, "-e")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error comment")
+	}
+}
+
 func TestWebhookPhase2CommandNotYetAvailable(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
@@ -326,7 +370,6 @@ func TestWebhookPhase2CommandNotYetAvailable(t *testing.T) {
 	}{
 		{"schemabot stop -e staging", "stop"},
 		{"schemabot revert -e staging", "revert"},
-		{"schemabot cutover -e staging", "cutover"},
 	}
 
 	for _, cmd := range cmds {

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,7 +21,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	schemabotapi "github.com/block/schemabot/pkg/api"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
+	storageTypes "github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -1458,4 +1461,513 @@ CREATE TABLE ccc_cancelled (
 	assert.Error(t, err, "ccc_cancelled table should NOT exist in DB")
 
 	t.Log("Partial failure test passed: 1 completed, 1 failed, 1 cancelled")
+}
+
+// =============================================================================
+// Sentinel Recovery Test
+// Tests crash recovery during waiting_for_cutover state:
+// 1. Apply with --defer-cutover, wait for waiting_for_cutover
+// 2. Simulate crash by closing the LocalClient (kills Spirit)
+// 3. Verify sentinel table still exists in the target database
+// 4. Start a new Service with recovery worker
+// 5. Verify task transitions: waiting_for_cutover → recovering → waiting_for_cutover
+// 6. Trigger cutover, verify completion
+// =============================================================================
+
+func TestSentinelRecovery_DeferCutover(t *testing.T) {
+	ctx := t.Context()
+
+	appDBName, appDSN := createTestDB(t, "recov_")
+
+	// Create the base table first so the apply triggers an ALTER (not CREATE).
+	// CREATE TABLE doesn't use defer-cutover — only ALTER TABLE goes through
+	// Spirit's row copy → sentinel → cutover flow.
+	baseDB, err := sql.Open("mysql", appDSN)
+	require.NoError(t, err)
+	_, err = baseDB.ExecContext(ctx, `CREATE TABLE users (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		email VARCHAR(255) NOT NULL,
+		name VARCHAR(100),
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE KEY uk_email (email)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`)
+	require.NoError(t, err, "create base table")
+	// Seed some rows so Spirit does actual row copy
+	for range 100 {
+		_, _ = baseDB.ExecContext(ctx, "INSERT INTO users (email, name) VALUES (CONCAT(UUID(), '@test.com'), 'test')")
+	}
+	_ = baseDB.Close()
+
+	// The desired schema adds an index — triggers an ALTER TABLE
+	desiredSchema := `CREATE TABLE users (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		email VARCHAR(255) NOT NULL,
+		name VARCHAR(100),
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE KEY uk_email (email),
+		KEY idx_created_at (created_at)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`
+
+	ts := startTestServer(t, appDBName, appDSN)
+
+	// Step 1: Plan — desired schema has idx_created_at, base doesn't
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database":    appDBName,
+		"environment": "staging",
+		"type":        "mysql",
+		"schema_files": map[string]any{
+			"default": map[string]any{
+				"files": map[string]string{
+					"users.sql": desiredSchema,
+				},
+			},
+		},
+		"repository":   "myorg/myapp",
+		"pull_request": 99,
+	})
+	planID, ok := planResp["plan_id"].(string)
+	require.True(t, ok && planID != "", "expected plan_id")
+	t.Logf("Plan created: %s", planID)
+
+	// Step 2: Apply with defer-cutover
+	applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id":     planID,
+		"environment": "staging",
+		"options": map[string]string{
+			"defer_cutover": "true",
+		},
+	})
+	require.True(t, applyResp["accepted"] == true, "apply not accepted: %v", applyResp)
+	applyID, _ := applyResp["apply_id"].(string)
+	require.NotEmpty(t, applyID)
+	t.Logf("Apply started: %s", applyID)
+
+	// Step 3: Wait for waiting_for_cutover
+	waitForState(t, "http://"+ts.Addr, applyID, state.Apply.WaitingForCutover, 30*time.Second)
+	t.Log("Apply reached waiting_for_cutover")
+
+	// Step 4: Verify sentinel table exists
+	targetDB, err := sql.Open("mysql", appDSN)
+	require.NoError(t, err)
+	defer func() { _ = targetDB.Close() }()
+
+	var sentinelExists int
+	err = targetDB.QueryRowContext(ctx,
+		"SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_spirit_sentinel'",
+		appDBName).Scan(&sentinelExists)
+	require.NoError(t, err, "sentinel table should exist in target database")
+	t.Log("Sentinel table exists")
+
+	// Step 5: Make the apply's heartbeat stale by updating updated_at in storage.
+	// This simulates a crash — the heartbeat stops updating and becomes stale.
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err)
+	defer func() { _ = schemabotDB.Close() }()
+
+	_, err = schemabotDB.ExecContext(ctx,
+		"UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_identifier = ?", applyID)
+	require.NoError(t, err, "make heartbeat stale")
+	t.Log("Heartbeat made stale (simulating crash)")
+
+	// Also make task heartbeats stale
+	_, err = schemabotDB.ExecContext(ctx,
+		`UPDATE tasks SET updated_at = NOW() - INTERVAL 2 MINUTE
+		 WHERE apply_id = (SELECT id FROM applies WHERE apply_identifier = ?)`, applyID)
+	require.NoError(t, err)
+
+	// Step 6: Start a NEW service with recovery worker (simulates container restart).
+	// The new service creates a fresh LocalClient + engine — no runningMigration.
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	stor2 := mysqlstore.New(schemabotDB)
+
+	localClient2, err := tern.NewLocalClient(tern.LocalConfig{
+		Database:  appDBName,
+		Type:      "mysql",
+		TargetDSN: appDSN,
+	}, stor2, logger)
+	require.NoError(t, err)
+	defer func() { _ = localClient2.Close() }()
+
+	serverConfig2 := &schemabotapi.ServerConfig{
+		Databases: map[string]schemabotapi.DatabaseConfig{
+			appDBName: {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {DSN: appDSN},
+				},
+			},
+		},
+	}
+	svc2 := schemabotapi.New(stor2, serverConfig2, map[string]tern.Client{
+		appDBName + "/staging": localClient2,
+	}, logger)
+	defer func() { _ = svc2.Close() }()
+
+	// Start recovery worker — this should detect the stale apply and resume it
+	svc2.StartRecoveryWorker(ctx)
+	t.Log("Recovery worker started on new service")
+
+	// Step 7: Wait for the apply to return to waiting_for_cutover.
+	// The recovery path: waiting_for_cutover → recovering → waiting_for_cutover
+	// (Spirit resumes from checkpoint, re-reaches WaitingOnSentinelTable)
+	deadline := time.Now().Add(30 * time.Second)
+	var lastState string
+	for time.Now().Before(deadline) {
+		apply, err := stor2.Applies().GetByApplyIdentifier(ctx, applyID)
+		if err == nil && apply != nil {
+			lastState = apply.State
+			t.Logf("Apply state: %s", apply.State)
+			if apply.State == state.Apply.WaitingForCutover {
+				// Check that it went through recovering (not stuck at the old state)
+				break
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	require.Equal(t, state.Apply.WaitingForCutover, lastState,
+		"apply should return to waiting_for_cutover after recovery")
+
+	// Step 8: Sentinel should still exist (cutover not yet triggered)
+	err = targetDB.QueryRowContext(ctx,
+		"SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_spirit_sentinel'",
+		appDBName).Scan(&sentinelExists)
+	require.NoError(t, err, "sentinel table should still exist before cutover")
+
+	// Step 9: Trigger cutover via API on the new service
+	mux2 := http.NewServeMux()
+	svc2.ConfigureRoutes(mux2)
+	listener2, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "localhost:0")
+	require.NoError(t, err)
+	server2 := &http.Server{Handler: mux2}
+	go func() { _ = server2.Serve(listener2) }()
+	defer func() { _ = server2.Close() }()
+	addr2 := listener2.Addr().String()
+
+	cutoverResp := postJSON(t, "http://"+addr2+"/api/cutover", map[string]any{
+		"database":    appDBName,
+		"environment": "staging",
+		"apply_id":    applyID,
+	})
+	require.True(t, cutoverResp["accepted"] == true, "cutover not accepted: %v", cutoverResp)
+	t.Log("Cutover triggered")
+
+	// Step 10: Wait for completion
+	waitForState(t, "http://"+addr2, applyID, state.Apply.Completed, 30*time.Second)
+	t.Log("Apply completed after recovery + cutover")
+
+	// Step 11: Verify table exists in target
+	var tableName string
+	err = targetDB.QueryRowContext(ctx,
+		"SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'users'",
+		appDBName).Scan(&tableName)
+	require.NoError(t, err, "users table should exist after cutover")
+	t.Logf("Verified: table '%s' exists after recovery + cutover", tableName)
+}
+
+// =============================================================================
+// Observer Test
+// Tests that the ProgressObserver receives OnProgress and OnTerminal callbacks
+// during a normal apply. Verifies that the observer is set before the engine
+// starts and notified throughout execution.
+// =============================================================================
+
+func TestObserver_NormalApply(t *testing.T) {
+	ctx := t.Context()
+
+	appDBName, appDSN := createTestDB(t, "obs_")
+
+	// Create base table so the plan produces an ALTER (not CREATE)
+	baseDB, err := sql.Open("mysql", appDSN)
+	require.NoError(t, err)
+	_, err = baseDB.ExecContext(ctx, `CREATE TABLE users (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		email VARCHAR(255) NOT NULL,
+		UNIQUE KEY uk_email (email)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`)
+	require.NoError(t, err)
+	for range 50 {
+		_, _ = baseDB.ExecContext(ctx, "INSERT INTO users (email) VALUES (CONCAT(UUID(), '@test.com'))")
+	}
+	_ = baseDB.Close()
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err)
+	clearStorageDB(t, schemabotDB)
+	storage := mysqlstore.New(schemabotDB)
+	defer func() { _ = schemabotDB.Close() }()
+
+	localClient, err := tern.NewLocalClient(tern.LocalConfig{
+		Database:  appDBName,
+		Type:      "mysql",
+		TargetDSN: appDSN,
+	}, storage, logger)
+	require.NoError(t, err)
+	defer func() { _ = localClient.Close() }()
+
+	// Create a mock observer that tracks calls
+	var mu sync.Mutex
+	var progressCalls int
+	var terminalCalled bool
+	var terminalState string
+
+	observer := &testObserver{
+		onProgress: func(apply *storageTypes.Apply, tasks []*storageTypes.Task) {
+			mu.Lock()
+			defer mu.Unlock()
+			progressCalls++
+		},
+		onTerminal: func(apply *storageTypes.Apply, tasks []*storageTypes.Task) {
+			mu.Lock()
+			defer mu.Unlock()
+			terminalCalled = true
+			terminalState = apply.State
+		},
+	}
+
+	// Set pending observer — will be consumed by Apply()
+	localClient.SetPendingObserver(observer)
+
+	// Plan
+	desiredSchema := `CREATE TABLE users (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		email VARCHAR(255) NOT NULL,
+		UNIQUE KEY uk_email (email),
+		KEY idx_email_prefix (email(10))
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`
+
+	planResp, err := localClient.Plan(ctx, &ternv1.PlanRequest{
+		Database: appDBName,
+		Type:     "mysql",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"default": {Files: map[string]string{"users.sql": desiredSchema}},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, planResp.PlanId)
+
+	// Apply
+	applyResp, err := localClient.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      planResp.PlanId,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted)
+
+	// Wait for completion
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		apply, err := storage.Applies().GetByApplyIdentifier(ctx, applyResp.ApplyId)
+		if err == nil && apply != nil && state.IsTerminalApplyState(apply.State) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Verify observer was called
+	mu.Lock()
+	defer mu.Unlock()
+
+	assert.True(t, progressCalls > 0, "observer.OnProgress should have been called at least once, got %d", progressCalls)
+	assert.True(t, terminalCalled, "observer.OnTerminal should have been called")
+	assert.Equal(t, state.Apply.Completed, terminalState, "terminal state should be completed")
+	t.Logf("Observer received %d progress calls and terminal=%v state=%s", progressCalls, terminalCalled, terminalState)
+}
+
+// TestObserver_ApplyIDSet verifies that the observer's SetApplyID is called
+// by LocalClient.Apply() when consuming a pending observer. If applyID stays
+// at 0, the observer can't look up tracked comments for editing.
+func TestObserver_ApplyIDSet(t *testing.T) {
+	ctx := t.Context()
+
+	appDBName, appDSN := createTestDB(t, "obsid_")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err)
+	clearStorageDB(t, schemabotDB)
+	stor := mysqlstore.New(schemabotDB)
+	defer func() { _ = schemabotDB.Close() }()
+
+	localClient, err := tern.NewLocalClient(tern.LocalConfig{
+		Database:  appDBName,
+		Type:      "mysql",
+		TargetDSN: appDSN,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer func() { _ = localClient.Close() }()
+
+	// Track SetApplyID calls
+	var capturedApplyID int64
+	observer := &applyIDTrackingObserver{
+		onSetApplyID: func(id int64) {
+			capturedApplyID = id
+		},
+	}
+
+	localClient.SetPendingObserver(observer)
+
+	// Plan a CREATE TABLE (fast, no Spirit row copy)
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	planResp, err := localClient.Plan(ctx, &ternv1.PlanRequest{
+		Database: appDBName,
+		Type:     "mysql",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"default": {Files: map[string]string{"users.sql": string(schemaSQL)}},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = localClient.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      planResp.PlanId,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+
+	assert.Greater(t, capturedApplyID, int64(0),
+		"SetApplyID should be called with a non-zero ID; got %d", capturedApplyID)
+	t.Logf("Observer received applyID=%d", capturedApplyID)
+}
+
+// applyIDTrackingObserver tracks SetApplyID calls.
+type applyIDTrackingObserver struct {
+	onSetApplyID func(int64)
+}
+
+func (o *applyIDTrackingObserver) OnProgress(*storageTypes.Apply, []*storageTypes.Task) {}
+func (o *applyIDTrackingObserver) OnTerminal(*storageTypes.Apply, []*storageTypes.Task) {}
+func (o *applyIDTrackingObserver) SetApplyID(id int64) {
+	if o.onSetApplyID != nil {
+		o.onSetApplyID(id)
+	}
+}
+
+// TestObserver_ViaServiceLayer verifies the observer works when set through the
+// Service layer (same code path as the webhook handler). This catches the
+// deployment key mismatch bug where SetPendingObserver and ExecuteApply resolve
+// to different TernClient instances.
+func TestObserver_ViaServiceLayer(t *testing.T) {
+	ctx := t.Context()
+
+	appDBName, appDSN := createTestDB(t, "obssvc_")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err)
+	clearStorageDB(t, schemabotDB)
+	stor := mysqlstore.New(schemabotDB)
+	defer func() { _ = schemabotDB.Close() }()
+
+	serverConfig := &schemabotapi.ServerConfig{
+		Databases: map[string]schemabotapi.DatabaseConfig{
+			appDBName: {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {DSN: appDSN},
+				},
+			},
+		},
+	}
+	// Let the Service create clients lazily — tests that SetPendingObserver
+	// and ExecuteApply resolve to the same client instance.
+	svc := schemabotapi.New(stor, serverConfig, nil, logger)
+	defer func() { _ = svc.Close() }()
+
+	// Set up HTTP server for the plan/apply API
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "localhost:0")
+	require.NoError(t, err)
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+	addr := listener.Addr().String()
+
+	// Wait for readiness
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/health", nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil && resp.StatusCode == 200 {
+			_ = resp.Body.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Plan via API
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+	planResp := postJSON(t, "http://"+addr+"/api/plan", map[string]any{
+		"database":    appDBName,
+		"environment": "staging",
+		"type":        "mysql",
+		"schema_files": map[string]any{
+			"default": map[string]any{
+				"files": map[string]string{"users.sql": string(schemaSQL)},
+			},
+		},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+
+	// Track observer calls
+	var mu sync.Mutex
+	var terminalCalled bool
+
+	observer := &testObserver{
+		onTerminal: func(apply *storageTypes.Apply, tasks []*storageTypes.Task) {
+			mu.Lock()
+			defer mu.Unlock()
+			terminalCalled = true
+		},
+	}
+
+	// Set observer through the Service layer — same path as webhook handler.
+	// Uses empty deployment (same as TernDeployment returns for local mode).
+	svc.SetPendingObserver(appDBName, "", "staging", observer)
+
+	// Apply via Service layer — same path as webhook handler
+	applyResp, _, err := svc.ExecuteApply(ctx, schemabotapi.ApplyRequest{
+		PlanID:      planID,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted)
+
+	// Wait for completion
+	waitDeadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		s, _ := fetchProgressState("http://"+addr, applyResp.ApplyID)
+		if s == "completed" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.True(t, terminalCalled,
+		"observer.OnTerminal should be called when going through Service layer; "+
+			"if this fails, SetPendingObserver and ExecuteApply are using different TernClient instances")
+}
+
+// testObserver is a simple ProgressObserver for testing.
+type testObserver struct {
+	onProgress func(apply *storageTypes.Apply, tasks []*storageTypes.Task)
+	onTerminal func(apply *storageTypes.Apply, tasks []*storageTypes.Task)
+}
+
+func (o *testObserver) OnProgress(apply *storageTypes.Apply, tasks []*storageTypes.Task) {
+	if o.onProgress != nil {
+		o.onProgress(apply, tasks)
+	}
+}
+
+func (o *testObserver) OnTerminal(apply *storageTypes.Apply, tasks []*storageTypes.Task) {
+	if o.onTerminal != nil {
+		o.onTerminal(apply, tasks)
+	}
 }

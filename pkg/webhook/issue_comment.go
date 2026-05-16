@@ -130,6 +130,21 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
 			return
 		}
+		if result.Action == action.Cutover {
+			// If we have -e, check if this instance owns the environment before responding
+			if result.Environment != "" && h.service != nil && !h.service.Config().IsEnvironmentAllowed(result.Environment) {
+				h.writeJSON(w, http.StatusOK, map[string]string{"message": "environment handled by another instance"})
+				return
+			}
+			h.addReaction(payload.Comment.ID, installationID, repo)
+			if result.ApplyID == "" {
+				h.postComment(repo, pr, installationID, templates.RenderCutoverMissingApplyID())
+			} else {
+				h.postComment(repo, pr, installationID, templates.RenderCutoverMissingEnvironment())
+			}
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing cutover arguments"})
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderMissingEnv(result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
 		return
@@ -167,20 +182,7 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 	// Add acknowledgment reaction now that we know this instance will handle
 	// the command. Placed after all skip/filter checks so only the owning
 	// instance reacts — avoids duplicate reactions in multi-instance setups.
-	if payload.Comment.ID > 0 && h.ghClient != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			client, err := h.ghClient.ForInstallation(installationID)
-			if err != nil {
-				h.logger.Error("failed to create GitHub client for reaction", "error", err)
-				return
-			}
-			if err := client.AddReactionToComment(ctx, repo, payload.Comment.ID, "eyes"); err != nil {
-				h.logger.Error("failed to add acknowledgment reaction", "error", err)
-			}
-		}()
-	}
+	h.addReaction(payload.Comment.ID, installationID, repo)
 
 	// Reject -y/--yes on commands that don't support it
 	if result.Action != action.Apply && parser.autoConfirmRegex.MatchString(payload.Comment.Body) {
@@ -227,8 +229,13 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 			h.handleRollbackConfirmCommand(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "rollback-confirm started"})
+	case action.Cutover:
+		h.goSafe(repo, pr, installationID, func() {
+			h.handleCutoverCommand(repo, pr, result.ApplyID, result.Environment, installationID, requestedBy)
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cutover started"})
 	// Phase 2 commands — acknowledge but not yet implemented
-	case action.Stop, action.Revert, action.SkipRevert, action.Cutover:
+	case action.Stop, action.Revert, action.SkipRevert:
 		h.postComment(repo, pr, installationID,
 			templates.RenderCommandNotYetAvailable(result.Action, result.Environment))
 		h.writeJSON(w, http.StatusOK, map[string]string{
@@ -238,6 +245,25 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid command"})
 	}
+}
+
+// addReaction adds an eyes reaction to a comment. Safe to call when ghClient is nil.
+func (h *Handler) addReaction(commentID int64, installationID int64, repo string) {
+	if commentID <= 0 || h.ghClient == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		client, err := h.ghClient.ForInstallation(installationID)
+		if err != nil {
+			h.logger.Error("failed to create GitHub client for reaction", "error", err)
+			return
+		}
+		if err := client.AddReactionToComment(ctx, repo, commentID, "eyes"); err != nil {
+			h.logger.Error("failed to add acknowledgment reaction", "error", err)
+		}
+	}()
 }
 
 // postComment posts a comment on a PR.

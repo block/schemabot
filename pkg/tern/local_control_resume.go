@@ -482,6 +482,46 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Recovering apply (heartbeat expired, was in %s state)", apply.State), "", "")
 
+	// If the apply was waiting for cutover and the sentinel table still exists,
+	// Spirit just needs to resume from checkpoint and re-reach WaitingOnSentinelTable.
+	// Skip the re-plan — row copy was already done. Transition to recovering state
+	// which blocks cutover until Spirit catches up.
+	if apply.State == state.Apply.WaitingForCutover && c.config.Type == storage.DatabaseTypeMySQL {
+		exists, err := c.sentinelTableExists(ctx)
+		if err != nil {
+			c.logger.Warn("sentinel check failed during recovery, falling through to re-plan",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+		} else if exists {
+			c.logger.Info("sentinel table exists — entering recovery state",
+				"apply_id", apply.ApplyIdentifier)
+
+			// Transition tasks and apply to recovering
+			for _, task := range tasks {
+				if task.State == state.Task.WaitingForCutover {
+					c.transitionTaskState(ctx, task, apply.ID, state.Task.Recovering,
+						"Entering recovery: sentinel table exists, resuming from checkpoint")
+				}
+			}
+			apply.State = state.Apply.Recovering
+			apply.UpdatedAt = time.Now()
+			if err := c.storage.Applies().Update(ctx, apply); err != nil {
+				c.logger.Error("failed to update apply to recovering",
+					"apply_id", apply.ApplyIdentifier, "error", err)
+			}
+
+			// Launch Spirit resume — it will re-reach WaitingOnSentinelTable from checkpoint.
+			// The Progress poller will transition recovering → waiting_for_cutover when Spirit catches up.
+			options := buildApplyOptions(apply)
+			if err := c.launchAtomicResume(ctx, apply, tasks, plan, options,
+				"Recovering from restart: resuming from checkpoint"); err != nil {
+				c.logger.Error("engine resume failed during sentinel recovery",
+					"apply_id", apply.ApplyIdentifier, "error", err)
+				return fmt.Errorf("sentinel recovery resume failed: %w", err)
+			}
+			return nil
+		}
+	}
+
 	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)
 	if err != nil {
 		c.logger.Error("re-plan failed during recovery", "apply_id", apply.ApplyIdentifier, "error", err)

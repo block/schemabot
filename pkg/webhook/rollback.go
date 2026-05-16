@@ -233,6 +233,41 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 		options["defer_cutover"] = "true"
 	}
 
+	// Set observer before starting the apply — consumed by Apply() before the
+	// engine starts, preventing the race where a fast apply completes before
+	// the observer is registered.
+	observer := NewCommentObserver(CommentObserverConfig{
+		GHClient:       h.ghClient,
+		Storage:        h.service.Storage(),
+		Repo:           repo,
+		PR:             pr,
+		InstallationID: installationID,
+		DeferCutover:   result.DeferCutover,
+		Logger:         h.logger,
+		OnTerminalHook: func(a *storage.Apply) {
+			updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, a)
+			if err != nil {
+				h.logger.Error("observer: failed to update check record for rollback",
+					"repo", repo, "pr", pr, "apply_id", a.ID, "error", err)
+				return
+			}
+			if !updated {
+				h.logger.Debug("observer: skipping aggregate check update for rollback, apply no longer owns check state",
+					"repo", repo, "pr", pr, "apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
+				return
+			}
+			if state.IsState(a.State, state.Apply.Completed) {
+				h.setCheckActionRequired(repo, pr, installationID, a)
+			}
+			if ghInstClient, err := h.ghClient.ForInstallation(installationID); err == nil {
+				if checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, a.Environment, a.DatabaseType, a.Database); err == nil && checkRecord != nil {
+					h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
+				}
+			}
+		},
+	})
+	h.service.SetPendingObserver(database, "", environment, observer)
+
 	// Execute apply with the rollback plan
 	applyReq := api.ApplyRequest{
 		PlanID:         planResp.PlanID,
@@ -244,6 +279,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
+		h.service.SetPendingObserver(database, "", environment, nil)
 		h.logger.Error("rollback apply failed", "repo", repo, "pr", pr, "error", err)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
@@ -256,14 +292,12 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 	}
 
 	if !applyResp.Accepted {
+		h.service.SetPendingObserver(database, "", environment, nil)
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackNotAccepted(database, environment, applyResp.ErrorMessage))
 		return
 	}
 
-	// Spawn background progress watcher. After the rollback apply completes,
-	// set the check to action_required — the PR's schema changes need to be
-	// re-applied since the rollback undid them.
 	if applyID > 0 {
 		apply, err := h.service.Storage().Applies().Get(ctx, applyID)
 		if err != nil {
@@ -277,41 +311,8 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 
 		h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID)
 
-		// Post initial progress comment for the observer to edit
+		// Post progress comment for the observer to edit
 		progressBody := formatProgressComment(apply, nil)
 		h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
-
-		// Set observer for rollback progress and check run updates.
-		// On successful rollback, set check to action_required (PR changes need re-applying).
-		h.service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, applyID,
-			NewCommentObserver(CommentObserverConfig{
-				GHClient:       h.ghClient,
-				Storage:        h.service.Storage(),
-				Repo:           repo,
-				PR:             pr,
-				InstallationID: installationID,
-				ApplyID:        applyID,
-				Logger:         h.logger,
-				OnTerminalHook: func(a *storage.Apply) {
-					updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, a)
-					if err != nil {
-						h.logger.Error("observer: failed to update check record for rollback", "error", err)
-						return
-					}
-					if !updated {
-						h.logger.Debug("observer: skipping aggregate check update for rollback, apply no longer owns check state",
-							"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
-						return
-					}
-					if state.IsState(a.State, state.Apply.Completed) {
-						h.setCheckActionRequired(repo, pr, installationID, a)
-					}
-					if ghInstClient, err := h.ghClient.ForInstallation(installationID); err == nil {
-						if checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, a.Environment, a.DatabaseType, a.Database); err == nil && checkRecord != nil {
-							h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
-						}
-					}
-				},
-			}))
 	}
 }

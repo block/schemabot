@@ -17,6 +17,7 @@ var Apply = struct {
 	Running           string
 	WaitingForDeploy  string
 	WaitingForCutover string
+	Recovering        string
 	CuttingOver       string
 	RevertWindow      string
 	Completed         string
@@ -38,6 +39,7 @@ var Apply = struct {
 	Running:           "running",
 	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
+	Recovering:        "recovering",
 	CuttingOver:       "cutting_over",
 	RevertWindow:      "revert_window",
 	Completed:         "completed",

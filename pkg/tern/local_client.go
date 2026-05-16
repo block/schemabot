@@ -87,13 +87,16 @@ package tern
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/google/uuid"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -149,7 +152,7 @@ type LocalClient struct {
 	// the observer on state changes and terminal state. Cleared on terminal state.
 	// Protected by observerMu.
 	observerMu sync.RWMutex
-	observers  map[int64]ProgressObserver // keyed by apply ID
+	observers  map[int64]ProgressObserver // keyed by apply DB ID
 
 	// pendingObserver is consumed by the next Apply() call and registered
 	// before Spirit starts. Set by the webhook handler via SetPendingObserver.
@@ -223,6 +226,136 @@ func (c *LocalClient) credentials() *engine.Credentials {
 		DSN:      c.config.TargetDSN,
 		Metadata: c.config.Metadata,
 	}
+}
+
+// sentinelTableExists checks whether Spirit's _spirit_sentinel table exists
+// in the target database. Used during progress polling to determine whether a
+// task in waiting_for_cutover should enter the recovering state after a restart.
+func (c *LocalClient) sentinelTableExists(ctx context.Context) (bool, error) {
+	db, err := sql.Open("mysql", c.config.TargetDSN)
+	if err != nil {
+		return false, fmt.Errorf("open target database: %w", err)
+	}
+	defer utils.CloseAndLog(db)
+
+	var exists int
+	err = db.QueryRowContext(ctx,
+		"SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_spirit_sentinel'",
+		c.config.Database,
+	).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("query sentinel table: %w", err)
+	}
+	return true, nil
+}
+
+// reconcileTaskStateFromEngine decides whether to update the stored task state
+// based on what the engine reports. For early states (pending/running), the engine
+// is always trusted. For waiting_for_cutover, the sentinel table is checked to
+// distinguish "Spirit is recovering from restart" from "cutover already happened".
+// The recovering state blocks cutover until Spirit re-reaches WaitingOnSentinelTable.
+//
+// Why the sentinel check: Spirit's migration state is in-memory only (atomic int32
+// on the Runner struct). After a container restart, Spirit resumes from its checkpoint
+// table and briefly reports CopyRows/Initial before re-reaching WaitingOnSentinelTable.
+// The sentinel table (_spirit_sentinel) is the durable on-disk signal — if it exists,
+// Spirit was in deferred cutover mode and will re-reach WaitingOnSentinelTable.
+// If it's gone, cutover already happened.
+//
+// Future: block/spirit#844 will add a `resume` field to the progress API, providing
+// a cleaner signal directly from Spirit. Once available, the sentinel table check
+// can be replaced with the resume field.
+func (c *LocalClient) reconcileTaskStateFromEngine(ctx context.Context, task *storage.Task, result *engine.ProgressResult) {
+	engineState := engineStateToStorage(result.State)
+
+	switch {
+	case task.State == state.Task.Pending || task.State == state.Task.Running:
+		// Early states — always trust engine
+		task.State = engineState
+		now := time.Now()
+		task.UpdatedAt = now
+		if result.State.IsTerminal() && task.CompletedAt == nil {
+			task.CompletedAt = &now
+		}
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			c.logger.Warn("failed to update task state from engine", "task_id", task.TaskIdentifier, "state", task.State, "error", err)
+		}
+
+	case task.State == state.Task.WaitingForCutover && engineState != state.Task.WaitingForCutover:
+		// Task was waiting for cutover but engine disagrees.
+		// For Spirit/MySQL: check sentinel to decide recovery vs completion.
+		if c.config.Type == storage.DatabaseTypeMySQL {
+			exists, err := c.sentinelTableExists(ctx)
+			if err != nil {
+				c.logger.Warn("sentinel check failed, keeping stored state",
+					"task_id", task.TaskIdentifier, "error", err)
+				return
+			}
+			if exists {
+				// Sentinel exists + engine not at WaitingOnSentinelTable → recovering.
+				// Block cutover until Spirit catches up.
+				c.transitionTaskState(ctx, task, task.ApplyID, state.Task.Recovering,
+					"Entering recovery: sentinel table exists but engine not ready")
+				c.logger.Info("entering recovery: sentinel exists, Spirit not ready",
+					"task_id", task.TaskIdentifier, "engine_state", result.State)
+			} else {
+				// Sentinel gone → cutover already happened. Trust engine.
+				task.State = engineState
+				now := time.Now()
+				task.UpdatedAt = now
+				if result.State.IsTerminal() && task.CompletedAt == nil {
+					task.CompletedAt = &now
+				}
+				if err := c.storage.Tasks().Update(ctx, task); err != nil {
+					c.logger.Warn("failed to update task state from engine", "task_id", task.TaskIdentifier, "state", task.State, "error", err)
+				}
+			}
+		}
+		// Vitess: keep stored state (no sentinel mechanism)
+
+	case task.State == state.Task.Recovering:
+		// Already in recovery — poll until Spirit catches up or fails.
+		if engineState == state.Task.WaitingForCutover {
+			// Spirit caught up → transition back to waiting_for_cutover
+			c.transitionTaskState(ctx, task, task.ApplyID, state.Task.WaitingForCutover,
+				"Recovery complete: engine reached WaitingOnSentinelTable")
+			c.logger.Info("recovery complete: Spirit reached WaitingOnSentinelTable",
+				"task_id", task.TaskIdentifier)
+		} else if state.IsTerminalTaskState(engineState) {
+			// Spirit failed during recovery → trust terminal state
+			task.State = engineState
+			now := time.Now()
+			task.UpdatedAt = now
+			task.CompletedAt = &now
+			if result.ErrorMessage != "" {
+				task.ErrorMessage = result.ErrorMessage
+			}
+			if err := c.storage.Tasks().Update(ctx, task); err != nil {
+				c.logger.Warn("failed to update task state from engine", "task_id", task.TaskIdentifier, "state", task.State, "error", err)
+			}
+		}
+		// Otherwise: still recovering, keep polling.
+
+	case state.IsTerminalTaskState(engineState) && !state.IsTerminalTaskState(task.State):
+		// Engine reports terminal and task is not already terminal.
+		// Catches Spirit fatalError() during recovery.
+		task.State = engineState
+		now := time.Now()
+		task.UpdatedAt = now
+		if task.CompletedAt == nil {
+			task.CompletedAt = &now
+		}
+		if result.ErrorMessage != "" {
+			task.ErrorMessage = result.ErrorMessage
+		}
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			c.logger.Warn("failed to update task state from engine", "task_id", task.TaskIdentifier, "state", task.State, "error", err)
+		}
+	}
+	// All other stored states (cutting_over, revert_window, etc.): keep stored state
 }
 
 // Health checks the service health.
@@ -777,20 +910,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			engineResult = result
 			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
 
-			// Only update task state from engine if task is not already in a terminal state.
-			// Terminal states (CANCELLED, COMPLETED, FAILED, etc.) should be preserved -
-			// they represent the final state set by the apply execution.
-			if !state.IsTerminalTaskState(activeTask.State) {
-				activeTask.State = engineStateToStorage(result.State)
-				now := time.Now()
-				activeTask.UpdatedAt = now
-				if result.State.IsTerminal() && activeTask.CompletedAt == nil {
-					activeTask.CompletedAt = &now
-				}
-				if err := c.storage.Tasks().Update(ctx, activeTask); err != nil {
-					c.logger.Warn("failed to update task state from progress poll", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "error", err)
-				}
-			}
+			c.reconcileTaskStateFromEngine(ctx, activeTask, result)
 
 			// Also update the apply record if the engine reports a terminal state
 			// but the apply hasn't been updated yet. Only do this when ALL tasks
@@ -837,19 +957,20 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 	for _, t := range currentApplyTasks {
 		tp := &ternv1.TableProgress{
-			TableName:  t.TableName,
-			Ddl:        t.DDL,
-			Namespace:  t.Namespace,
-			Status:     t.State,
-			TaskId:     t.TaskIdentifier,
-			IsInstant:  t.IsInstant || vitessApplyIsInstant,
-			ChangeType: ddlActionToProtoChangeType(t.DDLAction),
+			TableName:       t.TableName,
+			Ddl:             t.DDL,
+			Namespace:       t.Namespace,
+			Status:          t.State,
+			TaskId:          t.TaskIdentifier,
+			IsInstant:       t.IsInstant || vitessApplyIsInstant,
+			ChangeType:      ddlActionToProtoChangeType(t.DDLAction),
+			ReadyToComplete: t.ReadyToComplete,
 		}
 
 		// Look up engine progress for this table
 		if et, ok := engineProgressForTask(engineTableProgress, t); ok {
-			// Use live progress from engine (uppercase to match storage convention)
-			tp.Status = strings.ToUpper(et.State)
+			// Use live progress from engine, normalized to canonical task state
+			tp.Status = state.NormalizeTaskStatus(et.State)
 			tp.PercentComplete = int32(et.Progress)
 			tp.RowsCopied = et.RowsCopied
 			tp.RowsTotal = et.RowsTotal

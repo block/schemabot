@@ -459,6 +459,19 @@ func FormatTableProgress(t TableProgress) string {
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
+	case state.Apply.Recovering:
+		if t.PercentComplete > 0 {
+			bar := ui.ProgressBarWaitingCutover() // yellow — last known state
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔄 Recovering...\n", t.TableName, bar)
+		} else {
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: 🔄 Recovering...\n", t.TableName)
+		}
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
 	case state.Apply.CuttingOver:
 		bar := ui.ProgressBarRowCopy(100) // blue — still in progress
 		label := "Cutting over..."
@@ -870,6 +883,8 @@ func StateLabel(s string) string {
 		return "Waiting for cutover"
 	case state.Apply.CuttingOver:
 		return "Cutting over"
+	case state.Apply.Recovering:
+		return "Recovering"
 	case state.Apply.Stopped:
 		return "Stopped"
 	case state.Apply.Pending:
@@ -904,7 +919,7 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIRed)
 	case state.Apply.Running:
 		return colorWrap(ANSICyan)
-	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.CuttingOver:
+	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering:
 		return colorWrap(ANSIYellow)
 	case state.Apply.Stopped:
 		return colorWrap(ANSIOrange)

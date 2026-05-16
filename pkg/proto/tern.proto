@@ -361,6 +361,7 @@ message TableProgress {
   repeated ShardProgress shards = 11;
   string progress_detail = 12;
   ChangeType change_type = 13;
+  bool ready_to_complete = 14;
 }
 
 // ProgressResponse contains detailed progress information.

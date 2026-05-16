@@ -27,6 +27,8 @@ func taskStateToApplyState(ts string) string {
 		return state.Apply.WaitingForDeploy
 	case state.Task.WaitingForCutover:
 		return state.Apply.WaitingForCutover
+	case state.Task.Recovering:
+		return state.Apply.Recovering
 	case state.Task.CuttingOver:
 		return state.Apply.CuttingOver
 	case state.Task.RevertWindow:

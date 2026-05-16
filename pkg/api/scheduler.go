@@ -44,10 +44,8 @@ func (s *Service) StartRecoveryWorker(ctx context.Context) {
 
 		s.logger.Info("started recovery worker", "interval", RecoveryPollInterval)
 
-		// On startup, find completed applies that have a progress comment but
-		// no summary comment — this means OnTerminal was missed during a
-		// container restart. Post the missing summary so the PR shows the
-		// completion result.
+		// Post missing summary comments for applies that completed during a
+		// container restart (outbox pattern — see pkg/state/README.md).
 		s.postMissingSummaryComments(ctx)
 
 		// Run immediately on startup, then on each tick
@@ -153,8 +151,8 @@ func (s *Service) resumeInProgressApplies(ctx context.Context) {
 
 // postMissingSummaryComments finds completed applies that have a progress comment
 // but no summary comment (the observer missed it during a container restart) and
-// posts the missing summary. Uses the OnMissingSummary callback which posts
-// the summary comment directly.
+// posts the missing summary. Uses the OnApplyRecovered callback which sets up
+// an observer that calls OnTerminal to post the summary.
 func (s *Service) postMissingSummaryComments(ctx context.Context) {
 	applies, err := s.storage.Applies().FindMissingSummaryComment(ctx)
 	if err != nil {
@@ -170,7 +168,6 @@ func (s *Service) postMissingSummaryComments(ctx context.Context) {
 
 	for _, apply := range applies {
 		if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
-			// CLI apply or missing GitHub context — can't post a PR comment.
 			continue
 		}
 

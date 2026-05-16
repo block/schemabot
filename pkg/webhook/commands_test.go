@@ -146,13 +146,43 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "cutover",
+			name: "cutover with apply ID and env",
+			body: "schemabot cutover apply_abc123 -e staging",
+			expected: CommandResult{
+				Action:      "cutover",
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "cutover missing env",
+			body: "schemabot cutover apply_abc123",
+			expected: CommandResult{
+				Action:     "cutover",
+				ApplyID:    "apply_abc123",
+				IsMention:  true,
+				MissingEnv: true,
+			},
+		},
+		{
+			name: "cutover without apply ID",
 			body: "schemabot cutover -e staging",
 			expected: CommandResult{
 				Action:      "cutover",
 				Environment: "staging",
-				Found:       true,
 				IsMention:   true,
+				MissingEnv:  true,
+			},
+		},
+		{
+			name: "cutover bare (no apply ID, no env)",
+			body: "schemabot cutover",
+			expected: CommandResult{
+				Action:     "cutover",
+				IsMention:  true,
+				MissingEnv: true,
 			},
 		},
 		{

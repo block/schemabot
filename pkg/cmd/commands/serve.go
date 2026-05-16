@@ -109,13 +109,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	svc := api.New(storage, serverConfig, nil, logger)
 	defer utils.CloseAndLog(svc)
 
-	// Start the recovery worker.
-	// This unified approach polls for stale applies every 10 seconds:
-	// - Runs immediately on startup
-	// - Recovers applies with stale heartbeats (> 1 minute) using FOR UPDATE SKIP LOCKED
-	// - STOPPED applies are NOT auto-resumed (user must call `schemabot start`)
 	ctx := context.Background()
-	svc.StartRecoveryWorker(ctx)
 
 	// Optionally start gRPC server for Tern proto (used by docker-compose.grpc.yml)
 	var grpcServer *grpc.Server
@@ -152,6 +146,11 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 		return err
 	}
 	mux.Handle("POST /webhook", webhookHandler)
+
+	// Start the recovery worker AFTER the webhook handler is registered.
+	// The webhook handler sets svc.OnApplyRecovered so recovered applies
+	// get PR comment progress watchers. Starting before would miss the callback.
+	svc.StartRecoveryWorker(ctx)
 
 	// Wrap mux with OTel HTTP instrumentation for automatic request
 	// duration, request body size, and response body size metrics.

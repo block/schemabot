@@ -118,6 +118,40 @@ func TestIsVSchemaTask_Variants(t *testing.T) {
 	assert.False(t, isVSchemaTask(TableProgress{TableName: "users"}))
 }
 
+func TestStateLabel_Recovering(t *testing.T) {
+	assert.Equal(t, "Recovering", StateLabel(state.Apply.Recovering))
+}
+
+func TestFormatTableProgress_RecoveringWithProgress(t *testing.T) {
+	tp := TableProgress{
+		TableName:       "orders",
+		ChangeType:      "alter",
+		Status:          state.Apply.Recovering,
+		PercentComplete: 100,
+		DDL:             "ALTER TABLE orders ADD INDEX idx_status (status)",
+	}
+	output := FormatTableProgress(tp)
+	assert.Contains(t, output, "Recovering...")
+	assert.Contains(t, output, "🟨", "should show yellow progress bar at last known progress")
+	assert.Contains(t, output, "orders")
+}
+
+func TestFormatTableProgress_RecoveringWithoutProgress(t *testing.T) {
+	tp := TableProgress{
+		TableName:  "orders",
+		ChangeType: "alter",
+		Status:     state.Apply.Recovering,
+	}
+	output := FormatTableProgress(tp)
+	assert.Contains(t, output, "Recovering...")
+	assert.NotContains(t, output, "🟨", "should not show progress bar when no progress recorded")
+}
+
+func TestStateColorFunc_Recovering(t *testing.T) {
+	fn := stateColorFunc(state.Apply.Recovering)
+	assert.NotNil(t, fn, "recovering should have a color function (yellow)")
+}
+
 func TestStateColorFunc_PlanetScalePhases(t *testing.T) {
 	for _, s := range []string{
 		state.Apply.PreparingBranch,

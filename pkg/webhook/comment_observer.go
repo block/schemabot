@@ -100,22 +100,20 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	now := time.Now()
 	currentState := apply.State
 
-	// Check if a cutover comment was posted by an external handler.
+	// Check if a cutover comment was posted by the cutover handler.
 	// This must happen before the CuttingOver branch below — without it,
-	// the observer would post a duplicate cutover comment.
+	// the observer would post a duplicate cutover comment because it doesn't
+	// know the handler already posted one.
 	if !o.hasCutoverComment {
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		cutover, err := o.stor.ApplyComments().Get(checkCtx, o.applyID, state.Comment.Cutover)
-		if err != nil {
-			o.logger.Error("observer: failed to check for cutover comment", "error", err)
-		} else if cutover != nil {
+		if cutover, _ := o.stor.ApplyComments().Get(checkCtx, o.applyID, state.Comment.Cutover); cutover != nil {
 			o.hasCutoverComment = true
 		}
 		checkCancel()
 	}
 
-	// Post cutover comment when entering cutting_over with defer_cutover,
-	// but only if one hasn't been posted already.
+	// Create cutover comment when entering cutting_over with defer_cutover,
+	// but only if one hasn't been posted already (by the cutover handler).
 	if currentState == state.Apply.CuttingOver && o.deferCutover && !o.hasCutoverComment {
 		body := formatCutoverComment(apply, tasks)
 		o.postAndTrackComment(state.Comment.Cutover, body)
@@ -171,15 +169,13 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 // and updates check runs.
 func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task) {
 	// Determine which comment to edit to final state.
-	// If a cutover comment exists, edit that and leave the progress comment
-	// frozen at its last state. Otherwise edit the progress comment.
+	// If a cutover comment exists (from the cutover handler), edit that and
+	// leave the progress comment frozen at its last state.
+	// Otherwise edit the progress comment.
 	activeCommentState := state.Comment.Progress
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cutover, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Cutover)
-	if err != nil {
-		o.logger.Error("observer: failed to check for cutover comment on terminal", "error", err)
-	} else if cutover != nil {
+	if cutover, _ := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Cutover); cutover != nil {
 		activeCommentState = state.Comment.Cutover
 	}
 
@@ -216,14 +212,7 @@ func (o *CommentObserver) editTrackedComment(commentState string, body string) {
 	defer cancel()
 
 	comment, err := o.stor.ApplyComments().Get(ctx, o.applyID, commentState)
-	if err != nil {
-		o.logger.Error("observer: failed to look up comment for edit", "error", err, "comment_state", commentState)
-		return
-	}
-	if comment == nil {
-		// No tracked comment for this state — nothing to edit.
-		// This is expected when the progress comment hasn't been posted yet
-		// (e.g., first OnProgress tick before the handler posts it).
+	if err != nil || comment == nil {
 		return
 	}
 
@@ -272,23 +261,15 @@ func (o *CommentObserver) postAndTrackComment(commentState string, body string) 
 }
 
 // markSummaryPosted upserts a summary marker record in apply_comments.
-// Used for cutover applies where the cutover comment serves as the summary —
-// no separate summary is posted, but the marker satisfies the
-// FindMissingSummaryComment outbox query.
+// The marker uses the same GitHub comment ID as the edited comment so
+// FindMissingSummaryComment knows OnTerminal ran. Used for cutover applies
+// where no separate summary comment is posted.
 func (o *CommentObserver) markSummaryPosted(editedCommentState string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	edited, err := o.stor.ApplyComments().Get(ctx, o.applyID, editedCommentState)
-	if err != nil {
-		o.logger.Error("observer: failed to look up comment for summary marker", "error", err)
-		return
-	}
-	if edited == nil {
-		// The edited comment doesn't exist in storage — can't create a marker
-		// without a GitHub comment ID to reference.
-		o.logger.Error("observer: no comment found to create summary marker from",
-			"comment_state", editedCommentState, "apply_id", o.applyID)
+	if err != nil || edited == nil {
 		return
 	}
 

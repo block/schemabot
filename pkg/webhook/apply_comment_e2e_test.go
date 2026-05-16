@@ -211,7 +211,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	require.NotNil(t, comment)
 	assert.Equal(t, progressCommentID, comment.GitHubCommentID)
 
-	// Step 2: Edit the progress comment via observer
+	// Step 2: Edit the progress comment via observer OnProgress
 	obs := NewCommentObserver(CommentObserverConfig{
 		GHClient:       factory,
 		Storage:        st,
@@ -221,12 +221,15 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 		ApplyID:        applyID,
 		Logger:         logger,
 	})
-	obs.editTrackedComment(state.Comment.Progress, "Updated progress: running 45%")
+	obs.OnProgress(
+		&storage.Apply{ID: applyID, State: state.Apply.Running},
+		[]*storage.Task{{RowsCopied: 45000, RowsTotal: 100000}},
+	)
 
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, progressCommentID, edited.CommentID)
-		assert.Equal(t, "Updated progress: running 45%", edited.Body)
+		assert.Contains(t, edited.Body, "Schema Change")
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for progress comment edit")
 	}
@@ -260,18 +263,34 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	assert.Equal(t, state.Comment.Cutover, active.CommentState)
 	assert.Equal(t, cutoverCommentID, active.GitHubCommentID)
 
-	// Step 6: Edit cutover comment via observer
-	obs.editTrackedComment(state.Comment.Cutover, "Cutover in progress")
+	// Step 6: Verify progress comment is frozen after cutover.
+	// OnProgress returns early when hasCutoverComment=true — the progress
+	// comment stays at its last state. Cutover comment editing happens in OnTerminal.
+	obsWithCutover := NewCommentObserver(CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        st,
+		Repo:           "org/repo",
+		PR:             42,
+		InstallationID: 12345,
+		ApplyID:        applyID,
+		DeferCutover:   true,
+		Logger:         logger,
+	})
+	obsWithCutover.hasCutoverComment = true // already created
+	obsWithCutover.lastState = state.Apply.CuttingOver
+	obsWithCutover.OnProgress(
+		&storage.Apply{ID: applyID, State: state.Apply.CuttingOver},
+		[]*storage.Task{},
+	)
 
 	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, cutoverCommentID, edited.CommentID)
-		assert.Equal(t, "Cutover in progress", edited.Body)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for cutover comment edit")
+	case <-capture.edits:
+		t.Fatal("progress comment should be frozen after cutover — no edits expected")
+	case <-time.After(500 * time.Millisecond):
+		// expected: no edit
 	}
 
-	// Step 7: Post summary comment (terminal state)
+	// Step 7: Post summary comment directly (testing storage tracking)
 	summaryCommentID := h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Summary, "Schema change completed")
 
 	select {
@@ -396,6 +415,243 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	assert.Len(t, allComments, 2, "upsert should not create duplicate entries")
 }
 
+// TestE2ECutoverCommentFreezesProgress tests the full deferred cutover comment lifecycle:
+// 1. Progress comment is posted and edited during row copy
+// 2. When cutover is triggered, progress comment stops being edited (frozen)
+// 3. On terminal state, the cutover comment is edited to summary format
+// 4. No separate summary comment is posted — the cutover comment IS the summary
+// 5. Edit counts reflect the behavior
+func TestE2ECutoverCommentFreezesProgress(t *testing.T) {
+	ctx := t.Context()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = schemabotDB.Close() })
+
+	st := mysqlstore.New(schemabotDB)
+
+	// Clean up stale data
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM apply_comments")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM tasks WHERE repository = 'org/cutover-test'")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'org/cutover-test'")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'org/cutover-test'")
+
+	// Create lock and apply
+	lock := &storage.Lock{
+		DatabaseName: "e2e_cutover_db",
+		DatabaseType: "mysql",
+		Repository:   "org/cutover-test",
+		PullRequest:  99,
+		Owner:        "org/cutover-test#99",
+	}
+	require.NoError(t, st.Locks().Acquire(ctx, lock))
+	lock, err = st.Locks().Get(ctx, "e2e_cutover_db", "mysql")
+	require.NoError(t, err)
+
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply_cutover_%d", time.Now().UnixNano()),
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "e2e_cutover_db",
+		DatabaseType:    "mysql",
+		Repository:      "org/cutover-test",
+		PullRequest:     99,
+		Environment:     "staging",
+		InstallationID:  12345,
+		Engine:          "spirit",
+		State:           state.Apply.Pending,
+	}
+	applyID, err := st.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	now := time.Now()
+	task := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task_cutover_%d", now.UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         1,
+		Database:       "e2e_cutover_db",
+		DatabaseType:   "mysql",
+		Engine:         "spirit",
+		Repository:     "org/cutover-test",
+		PullRequest:    99,
+		Environment:    "staging",
+		State:          state.Task.Pending,
+		TableName:      "orders",
+		DDL:            "ALTER TABLE orders ADD COLUMN status VARCHAR(32)",
+		DDLAction:      "alter",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	_, err = st.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+
+	// Set up fake GitHub
+	installClient, capture := setupFakeGitHubForComments(t)
+	factory := &fakeClientFactory{client: installClient}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	serverConfig := &api.ServerConfig{}
+	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
+	t.Cleanup(func() { _ = svc.Close() })
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	// Step 1: Post initial progress comment (simulates what apply_handlers does)
+	progressCommentID := h.postAndTrackComment(ctx, "org/cutover-test", 99, 12345, applyID, state.Comment.Progress, "Schema Change Starting")
+
+	select {
+	case created := <-capture.creates:
+		assert.Equal(t, progressCommentID, created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for progress comment create")
+	}
+
+	// Step 2: Create observer with defer_cutover=true (simulates the real flow)
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        st,
+		Repo:           "org/cutover-test",
+		PR:             99,
+		InstallationID: 12345,
+		ApplyID:        applyID,
+		DeferCutover:   true,
+		Logger:         logger,
+	})
+
+	// Step 3: Simulate progress during row copy — observer should edit the progress comment
+	obs.OnProgress(
+		&storage.Apply{ID: applyID, State: state.Apply.Running},
+		[]*storage.Task{{RowsCopied: 25000, RowsTotal: 100000}},
+	)
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressCommentID, edited.CommentID, "should edit progress comment")
+		assert.Contains(t, edited.Body, "Schema Change")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for progress edit during row copy")
+	}
+
+	// Verify edit was tracked
+	progressComment, err := st.ApplyComments().Get(ctx, applyID, state.Comment.Progress)
+	require.NoError(t, err)
+	assert.Equal(t, 1, progressComment.EditCount, "progress edit count should be 1 after first edit")
+
+	// Step 4: Simulate more progress — second edit
+	time.Sleep(6 * time.Second) // exceed the 5s active interval
+	obs.OnProgress(
+		&storage.Apply{ID: applyID, State: state.Apply.Running},
+		[]*storage.Task{{RowsCopied: 75000, RowsTotal: 100000}},
+	)
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressCommentID, edited.CommentID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for second progress edit")
+	}
+
+	progressComment, err = st.ApplyComments().Get(ctx, applyID, state.Comment.Progress)
+	require.NoError(t, err)
+	assert.Equal(t, 2, progressComment.EditCount, "progress edit count should be 2 after second edit")
+
+	// Step 5: Cutover is triggered — post cutover comment via handler (simulates cutover.go)
+	cutoverCommentID := h.postAndTrackComment(ctx, "org/cutover-test", 99, 12345, applyID, state.Comment.Cutover, "Cutover Triggered")
+
+	select {
+	case created := <-capture.creates:
+		assert.Equal(t, cutoverCommentID, created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for cutover comment create")
+	}
+
+	// Step 6: Progress continues — observer should detect cutover comment and FREEZE progress
+	time.Sleep(6 * time.Second) // exceed interval
+	obs.OnProgress(
+		&storage.Apply{ID: applyID, State: state.Apply.CuttingOver},
+		[]*storage.Task{{RowsCopied: 100000, RowsTotal: 100000}},
+	)
+
+	// Verify no edit was made — progress comment is frozen
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("progress comment should be frozen after cutover, but got edit to comment %d: %s",
+			edited.CommentID, edited.Body[:min(50, len(edited.Body))])
+	case <-time.After(1 * time.Second):
+		// expected: no edit, progress comment is frozen
+	}
+
+	// Verify progress edit count stayed at 2 (no new edits)
+	progressComment, err = st.ApplyComments().Get(ctx, applyID, state.Comment.Progress)
+	require.NoError(t, err)
+	assert.Equal(t, 2, progressComment.EditCount, "progress edit count should still be 2 after freeze")
+
+	// Step 7: Terminal state — OnTerminal should edit cutover comment to summary format
+	completedAt := time.Now()
+	obs.OnTerminal(
+		&storage.Apply{
+			ID:              applyID,
+			ApplyIdentifier: apply.ApplyIdentifier,
+			Database:        "e2e_cutover_db",
+			Environment:     "staging",
+			Engine:          "spirit",
+			State:           state.Apply.Completed,
+			CompletedAt:     &completedAt,
+		},
+		[]*storage.Task{{
+			TableName:  "orders",
+			DDL:        "ALTER TABLE orders ADD COLUMN status VARCHAR(32)",
+			State:      state.Task.Completed,
+			RowsCopied: 100000,
+			RowsTotal:  100000,
+		}},
+	)
+
+	// Verify the cutover comment was edited to summary format
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, cutoverCommentID, edited.CommentID, "terminal should edit cutover comment, not progress")
+		assert.Contains(t, edited.Body, "Schema Change Applied", "cutover comment should show summary format")
+		assert.Contains(t, edited.Body, apply.ApplyIdentifier, "summary should include Apply ID")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for cutover comment to be edited to summary")
+	}
+
+	// Step 8: Verify NO separate summary comment was created
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("no separate summary comment should be created when cutover comment exists, but got: %s",
+			created.Body[:min(50, len(created.Body))])
+	case <-time.After(1 * time.Second):
+		// expected: no summary comment created
+	}
+
+	// Step 9: Verify final state in storage
+	allComments, err := st.ApplyComments().ListByApply(ctx, applyID)
+	require.NoError(t, err)
+	assert.Len(t, allComments, 3, "should have 3 records: progress + cutover + summary marker")
+
+	commentsByState := make(map[string]*storage.ApplyComment)
+	for _, c := range allComments {
+		commentsByState[c.CommentState] = c
+	}
+
+	// Progress comment: 2 edits then frozen
+	assert.Equal(t, progressCommentID, commentsByState[state.Comment.Progress].GitHubCommentID)
+	assert.Equal(t, 2, commentsByState[state.Comment.Progress].EditCount, "progress frozen at 2 edits")
+
+	// Cutover comment: 1 edit (terminal summary)
+	assert.Equal(t, cutoverCommentID, commentsByState[state.Comment.Cutover].GitHubCommentID)
+	assert.Equal(t, 1, commentsByState[state.Comment.Cutover].EditCount, "cutover edited once for summary")
+	assert.NotNil(t, commentsByState[state.Comment.Cutover].LastEditedAt, "cutover last_edited_at should be set")
+
+	// Summary marker exists — same GitHub comment ID as cutover (the edited comment)
+	require.NotNil(t, commentsByState[state.Comment.Summary], "summary marker should exist")
+	assert.Equal(t, cutoverCommentID, commentsByState[state.Comment.Summary].GitHubCommentID,
+		"summary marker should reference the cutover comment")
+}
+
 // TestE2EEditTrackedCommentNotFound tests that editing a non-existent comment is handled gracefully.
 func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
@@ -411,8 +667,6 @@ func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 	serverConfig := &api.ServerConfig{}
 	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { _ = svc.Close() })
-
-	_ = NewHandler(svc, factory, nil, logger)
 
 	// Try to edit a comment for a non-existent apply via observer — should be a no-op
 	obs := NewCommentObserver(CommentObserverConfig{

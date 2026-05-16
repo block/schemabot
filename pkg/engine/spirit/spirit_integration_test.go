@@ -448,6 +448,113 @@ func TestEngine_Cutover_NoActiveMigration(t *testing.T) {
 	require.Error(t, err, "expected error for cutover without active schema change")
 }
 
+// TestEngine_DeferCutover_CutoverWhileWaiting tests the full defer-cutover flow:
+// Apply with defer_cutover → wait for WaitingOnSentinelTable → Cutover → Completed.
+// This verifies that runningMigration is set and eng.Cutover() works while
+// Spirit is waiting on the sentinel table.
+func TestEngine_DeferCutover_CutoverWhileWaiting(t *testing.T) {
+	ctx := t.Context()
+
+	dbName := fmt.Sprintf("cutover_%d", time.Now().UnixNano()%100000)
+	db, err := sql.Open("mysql", sharedDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+
+	_, err = db.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+dbName+"`")
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "DROP DATABASE IF EXISTS `"+dbName+"`") })
+
+	// Create base table with some rows
+	dsn := strings.Replace(sharedDSN, "/testdb", "/"+dbName, 1)
+	appDB, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(appDB)
+
+	_, err = appDB.ExecContext(ctx, `CREATE TABLE users (
+		id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		email VARCHAR(255) NOT NULL
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`)
+	require.NoError(t, err)
+	for range 50 {
+		_, _ = appDB.ExecContext(ctx, "INSERT INTO users (email) VALUES (CONCAT(UUID(), '@test.com'))")
+	}
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))})
+	defer eng.Drain()
+
+	creds := &engine.Credentials{DSN: dsn}
+
+	// Apply with defer_cutover
+	result, err := eng.Apply(ctx, &engine.ApplyRequest{
+		Database: dbName,
+		Changes: []engine.SchemaChange{{
+			Namespace:    dbName,
+			TableChanges: []engine.TableChange{{DDL: "ALTER TABLE users ADD INDEX idx_email (email)"}},
+		}},
+		Options:     map[string]string{"defer_cutover": "true"},
+		Credentials: creds,
+	})
+	require.NoError(t, err)
+	require.True(t, result.Accepted)
+	t.Log("Apply accepted")
+
+	// Poll until WaitingOnSentinelTable
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		progress, err := eng.Progress(ctx, &engine.ProgressRequest{
+			Database:    dbName,
+			Credentials: creds,
+		})
+		require.NoError(t, err)
+		t.Logf("Progress: state=%s message=%q", progress.State, progress.Message)
+
+		if progress.State == engine.StateWaitingForCutover {
+			t.Log("Spirit reached WaitingOnSentinelTable")
+			break
+		}
+		if progress.State == engine.StateFailed {
+			t.Fatalf("Spirit failed: %s", progress.ErrorMessage)
+		}
+		if progress.State == engine.StateCompleted {
+			t.Fatal("Spirit completed without waiting for cutover — defer_cutover not respected")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Verify runningMigration is set
+	eng.mu.Lock()
+	hasRM := eng.runningMigration != nil
+	eng.mu.Unlock()
+	require.True(t, hasRM, "runningMigration should be set while waiting on sentinel")
+
+	// Now trigger cutover — this is the critical test
+	cutoverResp, err := eng.Cutover(ctx, &engine.ControlRequest{
+		Database:    dbName,
+		Credentials: creds,
+	})
+	require.NoError(t, err, "eng.Cutover() should succeed while Spirit is waiting on sentinel")
+	require.True(t, cutoverResp.Accepted, "cutover should be accepted")
+	t.Log("Cutover triggered successfully")
+
+	// Wait for completion
+	for time.Now().Before(deadline) {
+		progress, err := eng.Progress(ctx, &engine.ProgressRequest{
+			Database:    dbName,
+			Credentials: creds,
+		})
+		require.NoError(t, err)
+		if progress.State == engine.StateCompleted {
+			t.Log("Spirit completed after cutover")
+			return
+		}
+		if progress.State == engine.StateFailed {
+			t.Fatalf("Spirit failed after cutover: %s", progress.ErrorMessage)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatal("timeout waiting for completion after cutover")
+}
+
 func TestEngine_Revert_NotSupported(t *testing.T) {
 	eng := New(Config{})
 
