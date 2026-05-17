@@ -19,7 +19,7 @@ else
   GOTEST := go test
 endif
 
-.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -396,6 +396,11 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 	echo "Tearing down gRPC e2e environment..."; \
 	$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
 	exit $$TEST_EXIT_CODE
+
+# Run k8s e2e tests on minikube. Starts minikube if needed.
+# Tests the two-tier gRPC architecture (control plane → data plane) deployed via Helm chart.
+test-e2e-k8s: ## Run k8s e2e tests on minikube
+	@e2e/k8s/e2e-test.sh
 
 # Start local dev environment with gRPC backend (separate Tern server)
 up-grpc:

@@ -1,0 +1,41 @@
+# Data plane Helm values for k8s e2e tests.
+#
+# SchemaBot with LocalClient + Spirit engine — executes DDL against the target
+# database. Exposes gRPC for the control plane to reach.
+
+image:
+  repository: schemabot
+  tag: test
+  pullPolicy: Never
+
+grpc:
+  enabled: true
+  port: 13370
+
+config:
+  storage:
+    dsn: "env:MYSQL_DSN"
+  databases:
+    testapp:
+      type: mysql
+      environments:
+        staging:
+          dsn: "env:TERN_TARGET_DSN"
+
+env:
+  - name: MYSQL_DSN
+    value: "root:testpassword@tcp(mysql-data-plane:3306)/tern?parseTime=true&multiStatements=true"
+  - name: TERN_TARGET_DSN
+    value: "root:testpassword@tcp(mysql-data-plane:3306)/testapp?parseTime=true&multiStatements=true"
+  - name: TERN_ENVIRONMENT
+    value: "staging"
+  - name: LOG_LEVEL
+    value: "debug"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi

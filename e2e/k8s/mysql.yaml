@@ -1,0 +1,151 @@
+# MySQL instances for k8s e2e tests.
+#
+# Two Deployments mirror the docker-compose gRPC architecture:
+#   - mysql-control-plane: SchemaBot storage (schemabot DB)
+#   - mysql-data-plane: data plane storage (tern DB) + Spirit target (testapp DB)
+
+---
+# Control plane MySQL — SchemaBot's internal storage
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-control-plane
+  labels:
+    app: mysql-control-plane
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-control-plane
+  template:
+    metadata:
+      labels:
+        app: mysql-control-plane
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: testpassword
+            - name: MYSQL_DATABASE
+              value: schemabot
+            - name: MYSQL_INITDB_SKIP_TZINFO
+              value: "1"
+          ports:
+            - containerPort: 3306
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-ptestpassword"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: mysql-config
+              mountPath: /etc/mysql/conf.d/schemabot.cnf
+              subPath: my.cnf
+      volumes:
+        - name: mysql-config
+          configMap:
+            name: mysql-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-control-plane
+spec:
+  selector:
+    app: mysql-control-plane
+  ports:
+    - port: 3306
+      targetPort: 3306
+
+---
+# Data plane MySQL — tern storage + testapp (Spirit target)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-data-plane
+  labels:
+    app: mysql-data-plane
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-data-plane
+  template:
+    metadata:
+      labels:
+        app: mysql-data-plane
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: testpassword
+            - name: MYSQL_DATABASE
+              value: tern
+            - name: MYSQL_INITDB_SKIP_TZINFO
+              value: "1"
+          ports:
+            - containerPort: 3306
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-ptestpassword"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: mysql-config
+              mountPath: /etc/mysql/conf.d/schemabot.cnf
+              subPath: my.cnf
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: mysql-config
+          configMap:
+            name: mysql-config
+        - name: init-scripts
+          configMap:
+            name: mysql-init-data-plane
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-data-plane
+spec:
+  selector:
+    app: mysql-data-plane
+  ports:
+    - port: 3306
+      targetPort: 3306
+
+---
+# MySQL config — Spirit requires ROW binlog and performance_schema
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+data:
+  my.cnf: |
+    [mysqld]
+    binlog_format = ROW
+    binlog_row_image = FULL
+    log_bin = ON
+    server_id = 1
+    gtid_mode = ON
+    enforce_gtid_consistency = ON
+    performance_schema = ON
+
+---
+# Init script for the data plane MySQL — creates the testapp database
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-data-plane
+data:
+  init-tern.sql: |
+    CREATE DATABASE IF NOT EXISTS testapp;
+    GRANT ALL PRIVILEGES ON testapp.* TO 'root'@'%';
+    FLUSH PRIVILEGES;

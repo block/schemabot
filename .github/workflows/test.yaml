@@ -219,6 +219,54 @@ jobs:
         if: failure()
         run: |
           docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
+  e2e-k8s:
+    name: "E2E K8s Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - name: "Start minikube"
+        uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
+        with:
+          driver: docker
+          cpus: 2
+          memory: 2048
+      - name: "Build and load image"
+        run: |
+          CGO_ENABLED=0 GOOS=linux go build -o bin/schemabot-linux ./pkg/cmd
+          cp bin/schemabot-linux deploy/local/schemabot-dev
+          eval $(minikube docker-env)
+          docker build -t schemabot:test -f deploy/local/Dockerfile.dev deploy/local/
+          rm -f deploy/local/schemabot-dev
+      - name: "Deploy and test"
+        run: e2e/k8s/e2e-test.sh
+      - name: "Pod logs on failure"
+        if: failure()
+        run: |
+          echo "=== Control Plane ==="
+          kubectl logs -n schemabot-e2e -l app.kubernetes.io/instance=control-plane --tail=200 2>/dev/null || true
+          echo "=== Data Plane ==="
+          kubectl logs -n schemabot-e2e -l app.kubernetes.io/instance=data-plane --tail=200 2>/dev/null || true
+          echo "=== MySQL Control Plane ==="
+          kubectl logs -n schemabot-e2e -l app=mysql-control-plane --tail=50 2>/dev/null || true
+          echo "=== MySQL Data Plane ==="
+          kubectl logs -n schemabot-e2e -l app=mysql-data-plane --tail=50 2>/dev/null || true
+          echo "=== All pods ==="
+          kubectl get pods -n schemabot-e2e -o wide 2>/dev/null || true
+
   # Rollup jobs that match the old required check names.
   # Remove these after updating branch protection to use the new job names.
   e2e-rollup:

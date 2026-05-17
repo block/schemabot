@@ -46,9 +46,18 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            {{- if .Values.grpc.enabled }}
+            - name: grpc
+              containerPort: {{ .Values.grpc.port }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: PORT
               value: "8080"
+            {{- if .Values.grpc.enabled }}
+            - name: GRPC_PORT
+              value: {{ .Values.grpc.port | quote }}
+            {{- end }}
             - name: SCHEMABOT_CONFIG_FILE
               value: /config/config.yaml
             {{- with .Values.env }}

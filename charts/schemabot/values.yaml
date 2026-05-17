@@ -20,6 +20,12 @@ service:
   port: 8080
   annotations: {}
 
+# Optional gRPC port for data plane (Tern) deployments.
+# When set, the container exposes this port and the Service routes to it.
+grpc:
+  enabled: false
+  port: 13370
+
 # SchemaBot config file contents. Rendered into a ConfigMap and mounted
 # at /config/config.yaml. See docs/configuration.md for all options.
 #

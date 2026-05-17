@@ -1,0 +1,30 @@
+# Control plane Helm values for k8s e2e tests.
+#
+# SchemaBot with GRPCClient — routes plan/apply to the data plane over gRPC.
+# No databases config (that's on the data plane).
+
+image:
+  repository: schemabot
+  tag: test
+  pullPolicy: Never
+
+config:
+  storage:
+    dsn: "env:MYSQL_DSN"
+  tern_deployments:
+    data-plane:
+      staging: "data-plane-schemabot:13370"
+
+env:
+  - name: MYSQL_DSN
+    value: "root:testpassword@tcp(mysql-control-plane:3306)/schemabot?parseTime=true&multiStatements=true"
+  - name: LOG_LEVEL
+    value: "debug"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi

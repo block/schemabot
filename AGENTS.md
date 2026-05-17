@@ -168,11 +168,13 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
 - **Always use testify** (`require` and `assert` from `github.com/stretchr/testify`) in tests. Never use raw `if err != nil { t.Fatalf(...) }` patterns.
   - Use `require` for preconditions and setup where failure should stop the test.
   - Use `assert` for verification checks where you want all assertions to run (e.g., checking multiple fields).
-- **Use `t.Context()`** instead of `context.Background()` or `context.TODO()` in tests. This ties the context to the test lifecycle — the context is cancelled when the test ends. Test helper functions that need a context must accept `*testing.T` and use `t.Context()` — never `context.Background()`.
+- **Use `t.Context()`** instead of `context.Background()` or `context.TODO()` in tests. This ties the context to the test lifecycle — the context is cancelled when the test ends. Test helper functions that need a context must accept `*testing.T` and use `t.Context()` — never `context.Background()`. **Exception: cleanup code** (`t.Cleanup` callbacks and deferred functions that run after the test finishes) must use `context.Background()` because `t.Context()` is already cancelled by the time cleanup runs.
 - **Prefer integration tests** with MySQL testcontainers over unit tests when possible.
 - **No `time.Sleep` for readiness waits.** Never use a fixed sleep to wait for a server or service to be ready. Instead, poll with a deadline (e.g., retry a health check endpoint in a loop with a short sleep between attempts). For testcontainers, use built-in wait strategies.
 - **All timeouts must hard-fail.** Every operation in test code must have a bounded timeout (max 30s for any single operation). When a timeout fires, the test must fail immediately with a clear error — never silently continue or hang. No test should ever run longer than 30s for a single operation. Use `context.WithTimeout` and `require.NoError` on the result.
 - **Reduce duplication.** Look for opportunities to extract shared helpers when the same pattern appears 3+ times. In tests, prefer small composable helpers over copy-pasting setup boilerplate.
+- **Assert on specific values, not just existence.** Don't check `assert.NotEmpty(result)` when you know what the value should be. Verify the specific table name, column name, DDL content, and state. For example, check both `strings.Contains(ddl, "ADD COLUMN")` and `strings.Contains(ddl, "email")` — not just one. Vague assertions pass when they shouldn't and make failures harder to diagnose.
+- **Seed enough test data to avoid races.** When testing progress or in-flight behavior, seed enough rows that the operation takes measurably longer than a poll interval. If Spirit can finish before the first progress poll, the test is racy. Use `testutil.SeedRows` with 500k+ rows for operations that need to be observed mid-flight.
 
 ### State Comparisons
 

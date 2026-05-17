@@ -16,5 +16,12 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
+    {{- if .Values.grpc.enabled }}
+    - port: {{ .Values.grpc.port }}
+      targetPort: grpc
+      protocol: TCP
+      name: grpc
+      appProtocol: grpc
+    {{- end }}
   selector:
     {{- include "schemabot.selectorLabels" . | nindent 4 }}
