@@ -161,6 +161,22 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 	}
 }
 
+// SetSchedulerPollInterval sets the scheduler worker poll interval.
+// Most deployments should use the default interval; this is a low-level
+// embedding hook for callers that need to tune the scheduler loop directly.
+// Call before StartScheduler so workers create their tickers with the intended
+// interval.
+func (s *Service) SetSchedulerPollInterval(interval time.Duration) error {
+	if interval <= 0 {
+		return fmt.Errorf("scheduler poll interval must be positive")
+	}
+	if s.stopRecovery != nil {
+		return fmt.Errorf("scheduler already running")
+	}
+	s.schedulerPollInterval = interval
+	return nil
+}
+
 // TernDeployment returns the Tern deployment name for the given repository.
 // In gRPC mode (TernDeployments configured), this reads the repo-specific
 // mapping from server config, falling back to DefaultDeployment.

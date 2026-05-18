@@ -431,7 +431,7 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 	}, logger)
 
 	schedulerPollInterval := 500 * time.Millisecond
-	require.NoError(t, svc.SetSchedulerPollIntervalForTest(schedulerPollInterval))
+	require.NoError(t, svc.SetSchedulerPollInterval(schedulerPollInterval))
 
 	svc.StartScheduler(ctx)
 	defer func() {
