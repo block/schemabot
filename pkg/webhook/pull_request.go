@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -65,6 +66,7 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 
 	repo := payload.Repository.FullName
 	pr := payload.PullRequest.Number
+	headSHA := payload.PullRequest.Head.SHA
 
 	// Reject webhooks from repositories not in the configured allowlist
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
@@ -79,7 +81,7 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 		"action", payload.Action,
 		"repo", repo,
 		"pr", pr,
-		"head_sha", payload.PullRequest.Head.SHA,
+		"head_sha", headSHA,
 	)
 
 	// Discover all configs matching changed schema files in this PR
@@ -96,6 +98,7 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 	configs, err := client.FindAllConfigsForPR(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "error", err)
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "config discovery failed"})
 		return
 	}
@@ -108,7 +111,6 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 
 	// Clean up stale checks from databases no longer in the PR.
 	// Pass the new HEAD SHA so cleanup can create new check runs on the correct commit.
-	headSHA := payload.PullRequest.Head.SHA
 	h.goSafe(repo, pr, installationID, func() {
 		h.cleanupStaleChecks(repo, pr, headSHA, installationID, affectedDatabases)
 	})
@@ -146,6 +148,37 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 	}
 
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan started"})
+}
+
+func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error) {
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:  "schema_config_discovery",
+		Repository: repo,
+		Status:     "error",
+	})
+
+	block := configDiscoveryFailedBlock
+	if ghclient.IsUnavailableError(discoveryErr) {
+		block = githubConfigDiscoveryUnavailableBlock
+	}
+	h.logger.Info("posting failing aggregate for config discovery failure",
+		"repo", repo, "pr", pr, "head_sha", headSHA,
+		"blocking_reason", block.blockingReason)
+	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA,
+		h.aggregateMessagesForAllEnvironments(block.message), block)
+}
+
+func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string]string {
+	allowed := h.service.Config().AllowedEnvironments
+	if len(allowed) == 0 {
+		return map[string]string{aggregateSentinel: message}
+	}
+
+	messages := make(map[string]string, len(allowed))
+	for _, env := range allowed {
+		messages[env] = message
+	}
+	return messages
 }
 
 // handlePRClosed cleans up resources when a PR is closed (merged or unmerged).
@@ -187,8 +220,11 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 // as new check runs on this SHA (not updated on the old SHA) so GitHub shows them
 // on the current commit.
 func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, installationID int64, affectedDatabases map[string]bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	if h.service == nil {
-		metrics.RecordStatusCheckOperation(context.Background(), metrics.StatusCheckOperation{
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "stale_check_cleanup",
 			Repository: repo,
 			Status:     "error",
@@ -196,9 +232,29 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 		h.logger.Error("cannot clean up stale checks without service", "repo", repo, "pr", pr, "head_sha", headSHA)
 		return
 	}
+	if h.service.Storage() == nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "stale_check_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("cannot clean up stale checks without storage", "repo", repo, "pr", pr, "head_sha", headSHA)
+		return
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	client, clientErr := h.ghClient.ForInstallation(installationID)
+	if clientErr != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "stale_check_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("failed to create GitHub client for stale cleanup", "repo", repo, "pr", pr, "head_sha", headSHA, "error", clientErr)
+		return
+	}
+	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "stale_check_cleanup") {
+		return
+	}
 
 	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
@@ -251,18 +307,13 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 
 	// Recompute aggregate on the new HEAD SHA after cleaning up stale checks
 	if cleaned {
-		client, clientErr := h.ghClient.ForInstallation(installationID)
-		if clientErr != nil {
-			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-				Operation:  "aggregate_check_sync",
-				Repository: repo,
-				Status:     "error",
-			})
-			h.logger.Error("failed to create GitHub client for aggregate update after stale cleanup",
-				"repo", repo, "pr", pr, "head_sha", headSHA, "error", clientErr)
-			return
-		}
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+	} else {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "stale_check_cleanup",
+			Repository: repo,
+			Status:     "noop",
+		})
 	}
 }
 

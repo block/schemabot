@@ -3,12 +3,16 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -42,6 +46,26 @@ type emptyApplyStore struct {
 
 func (s *emptyApplyStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Apply, error) {
 	return nil, nil
+}
+
+type failingStorage struct {
+	emptyStorage
+}
+
+func (s *failingStorage) Close() error {
+	return nil
+}
+
+func (s *failingStorage) Checks() storage.CheckStore {
+	return &failingCheckStore{}
+}
+
+type failingCheckStore struct {
+	storage.CheckStore
+}
+
+func (s *failingCheckStore) Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*storage.Check, error) {
+	return nil, errors.New("storage read failed")
 }
 
 func TestComputeAggregate(t *testing.T) {
@@ -113,6 +137,47 @@ func TestComputeAggregate(t *testing.T) {
 			assert.Equal(t, tt.wantConclusion, conclusion)
 			assert.Equal(t, tt.wantStatus, status)
 		})
+	}
+}
+
+func TestCheckPriorEnvViaLocalFailsClosedOnStorageError(t *testing.T) {
+	const (
+		repo = "octocat/hello-world"
+		pr   = 1
+	)
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	service := api.New(&failingStorage{}, &api.ServerConfig{}, nil, testLogger())
+	t.Cleanup(func() { utils.CloseAndLog(service) })
+
+	h := &Handler{
+		service:  service,
+		ghClient: &fakeClientFactory{client: installClient},
+		logger:   testLogger(),
+	}
+
+	blocked := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345)
+	assert.True(t, blocked, "storage read failure should block apply")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Apply Blocked")
+		assert.Contains(t, body, "Could not verify staging status")
+		assert.Contains(t, body, "storage read failed")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for fail-closed comment")
 	}
 }
 

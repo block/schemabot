@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"path"
 	"strings"
@@ -149,6 +150,61 @@ func IsNotFoundError(err error) bool {
 	return false
 }
 
+// ErrGitHubUnavailable identifies GitHub API availability failures that should
+// be retried once GitHub becomes reachable again.
+var ErrGitHubUnavailable = errors.New("github unavailable")
+
+type githubUnavailableError struct {
+	err error
+}
+
+func (e *githubUnavailableError) Error() string {
+	return fmt.Sprintf("%s: %v", ErrGitHubUnavailable, e.err)
+}
+
+func (e *githubUnavailableError) Unwrap() error {
+	return e.err
+}
+
+func (e *githubUnavailableError) Is(target error) bool {
+	return target == ErrGitHubUnavailable
+}
+
+// IsUnavailableError returns true when the error chain contains a GitHub API
+// availability failure such as a network failure, timeout, or 5xx response.
+func IsUnavailableError(err error) bool {
+	return errors.Is(err, ErrGitHubUnavailable)
+}
+
+func classifyGitHubAPIError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isGitHubUnavailable(err) {
+		return &githubUnavailableError{err: err}
+	}
+	return err
+}
+
+func isGitHubUnavailable(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var ghErr *gh.ErrorResponse
+	if errors.As(err, &ghErr) && ghErr.Response != nil {
+		status := ghErr.Response.StatusCode
+		return status >= http.StatusInternalServerError
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr)
+}
+
 // splitRepo splits "owner/repo" into owner and repo parts.
 func splitRepo(repo string) (owner, repoName string) {
 	parts := strings.SplitN(repo, "/", 2)
@@ -206,7 +262,7 @@ func (ic *InstallationClient) FetchPullRequest(ctx context.Context, repo string,
 	owner, repoName := splitRepo(repo)
 	ghPR, _, err := ic.client.PullRequests.Get(ctx, owner, repoName, pr)
 	if err != nil {
-		return nil, fmt.Errorf("fetch pull request: %w", err)
+		return nil, fmt.Errorf("fetch pull request: %w", classifyGitHubAPIError(err))
 	}
 	return &PullRequestInfo{
 		HeadRef: ghPR.GetHead().GetRef(),
@@ -232,7 +288,7 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 	for {
 		ghFiles, resp, err := ic.client.PullRequests.ListFiles(ctx, owner, repoName, pr, opts)
 		if err != nil {
-			return nil, fmt.Errorf("list PR files: %w", err)
+			return nil, fmt.Errorf("list PR files: %w", classifyGitHubAPIError(err))
 		}
 		for _, f := range ghFiles {
 			allFiles = append(allFiles, PRFile{
@@ -520,7 +576,7 @@ func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA st
 	owner, repoName := splitRepo(repo)
 	ghTree, _, err := ic.client.Git.GetTree(ctx, owner, repoName, treeSHA, true)
 	if err != nil {
-		return nil, false, fmt.Errorf("fetch git tree: %w", err)
+		return nil, false, fmt.Errorf("fetch git tree: %w", classifyGitHubAPIError(err))
 	}
 
 	entries := make([]TreeEntry, len(ghTree.Entries))
@@ -541,7 +597,7 @@ func (ic *InstallationClient) FetchBlobContent(ctx context.Context, repo, blobSH
 	owner, repoName := splitRepo(repo)
 	blob, _, err := ic.client.Git.GetBlob(ctx, owner, repoName, blobSHA)
 	if err != nil {
-		return "", fmt.Errorf("fetch blob: %w", err)
+		return "", fmt.Errorf("fetch blob: %w", classifyGitHubAPIError(err))
 	}
 
 	content := blob.GetContent()
@@ -561,7 +617,7 @@ func (ic *InstallationClient) FetchFileContent(ctx context.Context, repo, filePa
 	opts := &gh.RepositoryContentGetOptions{Ref: ref}
 	fileContent, _, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, filePath, opts)
 	if err != nil {
-		return "", fmt.Errorf("fetch file content: %w", err)
+		return "", fmt.Errorf("fetch file content: %w", classifyGitHubAPIError(err))
 	}
 	if fileContent == nil {
 		return "", fmt.Errorf("file not found: %s", filePath)

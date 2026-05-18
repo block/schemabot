@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"slices"
@@ -385,7 +386,10 @@ func (ic *InstallationClient) FindAllConfigsForPR(ctx context.Context, repo stri
 
 	configsByPath := make(map[string]DiscoveredConfig)
 	for _, schemaFile := range schemaFiles {
-		config, configDir := ic.findNearestConfig(ctx, repo, prInfo.HeadSHA, schemaFile)
+		config, configDir, err := ic.findNearestConfig(ctx, repo, prInfo.HeadSHA, schemaFile)
+		if err != nil {
+			return nil, err
+		}
 		if config != nil {
 			if _, exists := configsByPath[configDir]; !exists {
 				configsByPath[configDir] = newDiscoveredConfig(config, configDir)
@@ -442,23 +446,29 @@ func filterSchemaFiles(files []string) []string {
 	return result
 }
 
-func (ic *InstallationClient) findNearestConfig(ctx context.Context, repo, ref, filePath string) (*SchemabotConfig, string) {
+func (ic *InstallationClient) findNearestConfig(ctx context.Context, repo, ref, filePath string) (*SchemabotConfig, string, error) {
 	dir := path.Dir(filePath)
 
-	// Check same directory (MySQL structure)
-	if config, err := ic.FetchConfig(ctx, repo, configPathForDir(dir), ref); err == nil {
-		return config, dir
-	}
-
-	// Check parent directory (Vitess structure with keyspace subdirectories)
-	parentDir := path.Dir(dir)
-	if parentDir != "" && parentDir != dir {
-		if config, err := ic.FetchConfig(ctx, repo, configPathForDir(parentDir), ref); err == nil {
-			return config, parentDir
+	for {
+		config, err := ic.FetchConfig(ctx, repo, configPathForDir(dir), ref)
+		if err == nil {
+			return config, dir, nil
 		}
+		if !errors.Is(err, ErrNoConfig) {
+			return nil, "", err
+		}
+
+		if dir == "." || dir == "" {
+			break
+		}
+		parentDir := path.Dir(dir)
+		if parentDir == dir {
+			break
+		}
+		dir = parentDir
 	}
 
-	return nil, ""
+	return nil, "", nil
 }
 
 func configPathForDir(dir string) string {

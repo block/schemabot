@@ -2737,10 +2737,15 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	// PR info
+	var currentHead atomic.Value
+	currentHead.Store("sha1aaa")
+
+	// PR info. This endpoint represents the current head SHA for the PR, so
+	// update it before sending each webhook event.
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		headSHA := currentHead.Load().(string)
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
-			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("sha1aaa")},
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: &headSHA},
 			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
 			User: &gh.User{Login: new("testuser")},
 		})
@@ -2799,6 +2804,7 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 	}
 
 	// Step 2: synchronize with sha2 (force push)
+	currentHead.Store("sha2bbb")
 	req = buildPRWebhookRequest(t, prWebhookPayloadOpts{
 		action:  "synchronize",
 		headSHA: "sha2bbb",

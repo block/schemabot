@@ -20,6 +20,7 @@ type SchemaRequestResult struct {
 	Repository   string
 	PullRequest  int
 	SchemaPath   string
+	HeadSHA      string // Commit SHA used to fetch schema files
 	Target       string // Opaque endpoint discovery identifier from config
 }
 
@@ -71,6 +72,7 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 		Repository:   repo,
 		PullRequest:  pr,
 		SchemaPath:   configDir,
+		HeadSHA:      prInfo.HeadSHA,
 		Target:       config.GetTarget(environment),
 	}, nil
 }

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -139,12 +138,10 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		      AND newer.database_type = checks.database_type
 		      AND newer.database_name = checks.database_name
 		      AND newer.id > ?
-		      AND newer.state NOT IN (?, ?, ?, ?, ?)
 		  )
 	`, check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-		checkStatusInProgress, apply.ID,
-		apply.ID, state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted)
+		checkStatusInProgress, apply.ID, apply.ID)
 	if err != nil {
 		return false, err
 	}
@@ -157,7 +154,8 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 }
 
 // MarkActionRequiredForApply marks stored check state action_required after a
-// rollback only if it still belongs to that rollback apply.
+// rollback only if it still belongs to that rollback apply and no newer apply
+// exists for the same PR/environment/database.
 func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	var checkRunID any
 	if check.CheckRunID != 0 {
@@ -186,11 +184,10 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		      AND newer.database_type = checks.database_type
 		      AND newer.database_name = checks.database_name
 		      AND newer.id > ?
-		      AND newer.state NOT IN (?, ?, ?, ?, ?)
 		  )
 	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-		apply.ID, apply.ID, state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted)
+		apply.ID, apply.ID)
 	if err != nil {
 		return false, err
 	}

@@ -564,6 +564,43 @@ func TestCheckStore_CompleteForApplySkipsNewerRunningApply(t *testing.T) {
 	require.Equal(t, oldApply.ID, retrieved.ApplyID)
 }
 
+func TestCheckStore_CompleteForApplySkipsNewerTerminalApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	oldApply := createCheckStoreApply(t, store, "apply-old-terminal", state.Apply.Completed)
+	newApply := createCheckStoreApply(t, store, "apply-new-terminal", state.Apply.Failed)
+	require.Greater(t, newApply.ID, oldApply.ID)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      oldApply.ID,
+		HasChanges:   true,
+		Status:       "in_progress",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.Status = "completed"
+	check.Conclusion = "success"
+	check.HasChanges = false
+	updated, err := store.Checks().CompleteForApply(ctx, check, oldApply)
+	require.NoError(t, err)
+	require.False(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "in_progress", retrieved.Status)
+	require.Empty(t, retrieved.Conclusion)
+	require.Equal(t, oldApply.ID, retrieved.ApplyID)
+}
+
 func TestCheckStore_CompleteForApplySkipsUnownedCheck(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -641,6 +678,44 @@ func TestCheckStore_MarkActionRequiredForApplySkipsNewerRunningApply(t *testing.
 
 	rollbackApply := createCheckStoreApply(t, store, "rollback-complete-old", state.Apply.Completed)
 	newApply := createCheckStoreApply(t, store, "apply-running-new", state.Apply.Running)
+	require.Greater(t, newApply.ID, rollbackApply.ID)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      rollbackApply.ID,
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.HasChanges = true
+	check.Conclusion = "action_required"
+	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, rollbackApply)
+	require.NoError(t, err)
+	require.False(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "completed", retrieved.Status)
+	require.Equal(t, "success", retrieved.Conclusion)
+	require.False(t, retrieved.HasChanges)
+	require.Equal(t, rollbackApply.ID, retrieved.ApplyID)
+}
+
+func TestCheckStore_MarkActionRequiredForApplySkipsNewerTerminalApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	rollbackApply := createCheckStoreApply(t, store, "rollback-complete-old", state.Apply.Completed)
+	newApply := createCheckStoreApply(t, store, "apply-terminal-new", state.Apply.Failed)
 	require.Greater(t, newApply.ID, rollbackApply.ID)
 
 	check := &storage.Check{

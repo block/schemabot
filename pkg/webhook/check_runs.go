@@ -66,6 +66,24 @@ var rollbackCompletedBlock = checkBlockReason{
 	message:        "Schema changes were rolled back in this environment; apply again before this check can pass.",
 }
 
+// githubConfigDiscoveryUnavailableBlock is used when GitHub is unavailable
+// while SchemaBot is discovering which managed schema changes exist. The
+// aggregate check must fail closed until SchemaBot can read PR metadata and
+// repository contents.
+var githubConfigDiscoveryUnavailableBlock = checkBlockReason{
+	blockingReason: "github_schema_config_discovery_unavailable",
+	message:        "SchemaBot failed this check closed because GitHub was unavailable while inspecting the PR schema files. Retry the check.",
+}
+
+// configDiscoveryFailedBlock is used when SchemaBot cannot inspect PR schema
+// files well enough to know which managed schema changes exist for a reason
+// other than GitHub availability. The aggregate check must fail closed until
+// SchemaBot can determine the managed schema configuration.
+var configDiscoveryFailedBlock = checkBlockReason{
+	blockingReason: "schema_config_discovery_failed",
+	message:        "SchemaBot failed this check closed because it could not determine the managed schema configuration for this PR. Review the SchemaBot configuration and retry the check.",
+}
+
 // aggregateCheckNameForEnv returns the environment-scoped aggregate check name.
 // e.g., "SchemaBot (staging)" or "SchemaBot (production)".
 func aggregateCheckNameForEnv(env string) string {
@@ -132,11 +150,45 @@ func hasBlockingCheckForEnvironment(checks []*storage.Check, environment string)
 // storePlanCheckRecord stores per-database check state after a plan is generated.
 // The state is used internally by the aggregate check to compute its overall status.
 // No per-database GitHub Check Run is created — only the aggregate is visible on the PR.
-// Returns the latest commit SHA on the PR branch. Failures are non-fatal.
+// Returns the commit SHA used for the plan. Failures are non-fatal.
 func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
+	headSHA := schema.HeadSHA
+	if headSHA == "" {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
+		return "", fmt.Errorf("schema request missing head SHA for stored check state repo %s pr %d environment %s database_type %s database %s",
+			repo, pr, environment, schema.Type, schema.Database)
+	}
+
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
 		return "", fmt.Errorf("fetch PR for stored check state: %w", err)
+	}
+	if prInfo.HeadSHA != headSHA {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "stale",
+		})
+		return headSHA, fmt.Errorf("skip stale plan check record for repo %s pr %d environment %s database_type %s database %s: plan head SHA %s no longer matches current head SHA for PR %s",
+			repo, pr, environment, schema.Type, schema.Database, headSHA, prInfo.HeadSHA)
 	}
 
 	tables := planResp.FlatTables()
@@ -155,7 +207,7 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 	check := &storage.Check{
 		Repository:   repo,
 		PullRequest:  pr,
-		HeadSHA:      prInfo.HeadSHA,
+		HeadSHA:      headSHA,
 		Environment:  environment,
 		DatabaseType: schema.Type,
 		DatabaseName: schema.Database,
@@ -164,10 +216,26 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 		Conclusion:   conclusion,
 	}
 	if err := h.service.Storage().Checks().UpsertPlanResult(ctx, check); err != nil {
-		return prInfo.HeadSHA, fmt.Errorf("store check state: %w", err)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
+		return headSHA, fmt.Errorf("store check state: %w", err)
 	}
 
-	return prInfo.HeadSHA, nil
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:    "plan_check_recorded",
+		Repository:   repo,
+		Database:     schema.Database,
+		DatabaseType: schema.Type,
+		Environment:  environment,
+		Status:       "success",
+	})
+	return headSHA, nil
 }
 
 type applyCheckKey struct {
@@ -207,11 +275,21 @@ func isApplyNewer(candidate, existing *storage.Apply) bool {
 func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int) error {
 	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "stale_check_reconciliation",
+			Repository: repo,
+			Status:     "error",
+		})
 		return fmt.Errorf("fetch checks for stale reconciliation repo %s pr %d: %w", repo, pr, err)
 	}
 
 	applies, err := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "stale_check_reconciliation",
+			Repository: repo,
+			Status:     "error",
+		})
 		return fmt.Errorf("look up applies for stale checks repo %s pr %d: %w", repo, pr, err)
 	}
 	latestApplies := latestApplyByCheckKey(applies)
@@ -260,19 +338,45 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 
 		updated, err := h.updateCheckRecordForApplyResult(ctx, repo, pr, apply)
 		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:    "stale_check_reconciliation",
+				Repository:   repo,
+				Database:     check.DatabaseName,
+				DatabaseType: check.DatabaseType,
+				Environment:  check.Environment,
+				Status:       "error",
+			})
 			return err
 		}
 		if updated {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:    "stale_check_reconciliation",
+				Repository:   repo,
+				Database:     check.DatabaseName,
+				DatabaseType: check.DatabaseType,
+				Environment:  check.Environment,
+				Status:       "success",
+			})
 			reconciled = true
 		}
 	}
 
 	if !reconciled {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "stale_check_reconciliation",
+			Repository: repo,
+			Status:     "noop",
+		})
 		return nil
 	}
 
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "stale_check_reconciliation",
+			Repository: repo,
+			Status:     "error",
+		})
 		return fmt.Errorf("fetch latest PR commit SHA for stale reconciliation aggregate repo %s pr %d: %w", repo, pr, err)
 	}
 	if prInfo.HeadSHA != "" {
@@ -287,10 +391,26 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo string, pr int, apply *storage.Apply) (bool, error) {
 	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_finished",
+			Repository:   repo,
+			Database:     apply.Database,
+			DatabaseType: apply.DatabaseType,
+			Environment:  apply.Environment,
+			Status:       "error",
+		})
 		return false, fmt.Errorf("look up check for apply result repo %s pr %d environment %s database_type %s database %s: %w",
 			repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
 	}
 	if check == nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_finished",
+			Repository:   repo,
+			Database:     apply.Database,
+			DatabaseType: apply.DatabaseType,
+			Environment:  apply.Environment,
+			Status:       "error",
+		})
 		return false, fmt.Errorf("no stored check state found to update after apply repo %s pr %d environment %s database_type %s database %s",
 			repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
 	}
@@ -310,13 +430,33 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 	check.Status = checkStatusCompleted
 	check.Conclusion = conclusion
 	check.HasChanges = conclusion != checkConclusionSuccess
+	if conclusion == checkConclusionSuccess {
+		check.BlockingReason = ""
+		check.ErrorMessage = ""
+	}
 	updated, err := h.service.Storage().Checks().CompleteForApply(ctx, check, apply)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_finished",
+			Repository:   repo,
+			Database:     apply.Database,
+			DatabaseType: apply.DatabaseType,
+			Environment:  apply.Environment,
+			Status:       "error",
+		})
 		return false, fmt.Errorf("update stored check state after apply repo %s pr %d environment %s database_type %s database %s: %w",
 			repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
 	}
 	if !updated {
 		metrics.RecordCheckOwnershipMiss(ctx, "apply_finished", repo, apply.Database, apply.DatabaseType, apply.Environment)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_finished",
+			Repository:   repo,
+			Database:     apply.Database,
+			DatabaseType: apply.DatabaseType,
+			Environment:  apply.Environment,
+			Status:       "skipped",
+		})
 		h.logger.Warn("skipping check state update because stored state no longer belongs to apply",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
@@ -332,6 +472,14 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
 		"apply_state", apply.State, "conclusion", conclusion,
 		"blocking_reason", check.BlockingReason)
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:    "apply_finished",
+		Repository:   repo,
+		Database:     apply.Database,
+		DatabaseType: apply.DatabaseType,
+		Environment:  apply.Environment,
+		Status:       "success",
+	})
 	return true, nil
 }
 
@@ -343,6 +491,14 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 
 	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "rollback_finished",
+			Repository:   repo,
+			Database:     apply.Database,
+			DatabaseType: apply.DatabaseType,
+			Environment:  apply.Environment,
+			Status:       "error",
+		})
 		h.logger.Error("failed to look up stored check state after rollback",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
@@ -351,6 +507,14 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 		return
 	}
 	if check == nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "rollback_finished",
+			Repository:   repo,
+			Database:     apply.Database,
+			DatabaseType: apply.DatabaseType,
+			Environment:  apply.Environment,
+			Status:       "error",
+		})
 		h.logger.Warn("no stored check state to update after rollback",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
@@ -365,6 +529,14 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 	check.ErrorMessage = rollbackCompletedBlock.message
 	updated, err := h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "rollback_finished",
+			Repository:   repo,
+			Database:     apply.Database,
+			DatabaseType: apply.DatabaseType,
+			Environment:  apply.Environment,
+			Status:       "error",
+		})
 		h.logger.Error("failed to set check to action_required after rollback",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
@@ -375,6 +547,14 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 	}
 	if !updated {
 		metrics.RecordCheckOwnershipMiss(ctx, "rollback_finished", repo, apply.Database, apply.DatabaseType, apply.Environment)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "rollback_finished",
+			Repository:   repo,
+			Database:     apply.Database,
+			DatabaseType: apply.DatabaseType,
+			Environment:  apply.Environment,
+			Status:       "skipped",
+		})
 		h.logger.Warn("skipping rollback action_required update because check no longer belongs to apply",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
@@ -389,10 +569,24 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 		"database_type", apply.DatabaseType, "environment", apply.Environment,
 		"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
 		"apply_state", apply.State)
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:    "rollback_finished",
+		Repository:   repo,
+		Database:     apply.Database,
+		DatabaseType: apply.DatabaseType,
+		Environment:  apply.Environment,
+		Status:       "success",
+	})
 
 	// Update the aggregate check to reflect the rollback
 	if aggClient, err := h.ghClient.ForInstallation(installationID); err == nil {
 		h.updateAggregateCheck(ctx, aggClient, repo, pr, check.HeadSHA)
+	} else {
+		h.logger.Error("failed to create GitHub client for rollback aggregate update",
+			"repo", repo, "pr", pr, "database", apply.Database,
+			"database_type", apply.DatabaseType, "environment", apply.Environment,
+			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
+			"error", err)
 	}
 }
 
@@ -460,19 +654,32 @@ func (h *Handler) checkPriorEnvViaLocal(
 	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, priorEnv, dbType, database)
 	if err != nil {
 		h.logger.Error("failed to look up prior environment check",
-			"environment", priorEnv, "error", err)
-		// Graceful degradation: allow proceed if check lookup fails
-		return false
+			"repo", repo, "pr", pr,
+			"database", database, "database_type", dbType,
+			"environment", environment, "prior_environment", priorEnv,
+			"error", err)
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "read SchemaBot storage", err))
+		return true
 	}
 
 	if check == nil {
 		// No check exists for this prior environment — it may not have changes.
 		// This is OK (e.g., staging has no changes but production does).
+		h.logger.Debug("no prior environment check found, allowing apply",
+			"repo", repo, "pr", pr,
+			"database", database, "database_type", dbType,
+			"environment", environment, "prior_environment", priorEnv)
 		return false
 	}
 
 	switch {
 	case check.Conclusion == checkConclusionSuccess:
+		h.logger.Debug("prior environment check passed, allowing apply",
+			"repo", repo, "pr", pr,
+			"database", database, "database_type", dbType,
+			"environment", environment, "prior_environment", priorEnv,
+			"check_status", check.Status, "check_conclusion", check.Conclusion)
 		return false
 	case check.Status == checkStatusInProgress:
 		h.postComment(repo, pr, installationID,
@@ -569,6 +776,46 @@ func (h *Handler) checkPriorEnvViaGitHub(
 	}
 }
 
+// verifyHeadSHAStillCurrentForPR returns false when writing status check state
+// for headSHA would be unsafe because the PR now points at a different commit
+// SHA. It records a metric and logs the reason before every false return so
+// callers can stop without adding duplicate log noise.
+func (h *Handler) verifyHeadSHAStillCurrentForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, operation string) bool {
+	if headSHA == "" {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  operation,
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("refusing to update status check without head SHA", "repo", repo, "pr", pr, "operation", operation)
+		return false
+	}
+
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  operation,
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("failed to verify status check head SHA before update",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "operation", operation, "error", err)
+		return false
+	}
+	if prInfo.HeadSHA != headSHA {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  operation,
+			Repository: repo,
+			Status:     "stale",
+		})
+		h.logger.Info("skipping stale status check update because head SHA is no longer current for PR",
+			"repo", repo, "pr", pr, "operation", operation,
+			"stale_head_sha", headSHA, "current_head_sha", prInfo.HeadSHA)
+		return false
+	}
+	return true
+}
+
 // updateAggregateCheck recomputes and creates/updates aggregate check runs that roll
 // up per-database checks for a PR.
 //
@@ -578,7 +825,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 // conflicting with each other.
 //
 // When allowed_environments is NOT configured, a single "SchemaBot" aggregate is
-// created that rolls up all per-database checks (backwards compatible).
+// created that rolls up all per-database checks.
 //
 // Aggregate logic (first match wins):
 //   - ANY check "in_progress"     → aggregate status "in_progress"
@@ -587,8 +834,17 @@ func (h *Handler) checkPriorEnvViaGitHub(
 //   - ALL checks "success"        → aggregate "success"
 //   - NO per-database checks      → no aggregate (PR doesn't touch schema)
 func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) {
+	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
+		return
+	}
+
 	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "aggregate_check_sync",
+			Repository: repo,
+			Status:     "error",
+		})
 		h.logger.Error("failed to fetch checks for aggregate", "repo", repo, "pr", pr, "error", err)
 		return
 	}
@@ -604,6 +860,11 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	// No per-database checks means the PR doesn't touch schema files (or all check
 	// records were already deleted by PR close cleanup). No aggregate to create.
 	if len(dbChecks) == 0 {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "aggregate_check_sync",
+			Repository: repo,
+			Status:     "noop",
+		})
 		h.logger.Debug("no per-database checks for aggregate", "repo", repo, "pr", pr)
 		return
 	}
@@ -623,8 +884,8 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, envChecks, checkName, env)
 		}
 	} else {
-		// Single aggregate: backwards-compatible behavior. Uses aggregateSentinel
-		// for the environment field since there is no per-environment scoping.
+		// Single aggregate. Uses aggregateSentinel for the environment field
+		// since there is no per-environment scoping.
 		h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, aggregateCheckName, aggregateSentinel)
 	}
 }
@@ -759,6 +1020,10 @@ func (h *Handler) upsertAggregateCheckRun(
 // check that would never come. It does not publish success over existing
 // per-database state that still needs operator attention.
 func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, title, summary string) {
+	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
+		return
+	}
+
 	config := h.service.Config()
 	storedChecks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
@@ -920,6 +1185,16 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 // that has errors. Called when all environments fail during planning so branch
 // protection shows a clear failure instead of waiting indefinitely.
 func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string) {
+	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, errors, checkBlockReason{})
+}
+
+// postFailingAggregatesWithBlock stores a blocking reason only for callers with
+// a stable failure class. Generic plan errors should use postFailingAggregates.
+func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string, block checkBlockReason) {
+	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
+		return
+	}
+
 	config := h.service.Config()
 
 	type envCheck struct {
@@ -942,6 +1217,16 @@ func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.In
 			name:        aggregateCheckName,
 			environment: aggregateSentinel,
 		})
+	}
+
+	if len(checks) == 0 {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "aggregate_check_sync",
+			Repository: repo,
+			Status:     "noop",
+		})
+		h.logger.Debug("no failing aggregate checks to post", "repo", repo, "pr", pr)
+		return
 	}
 
 	for _, ec := range checks {
@@ -969,6 +1254,12 @@ func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.In
 
 		id, err := client.CreateCheckRun(ctx, repo, headSHA, opts)
 		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_check_sync",
+				Repository:  repo,
+				Environment: ec.environment,
+				Status:      "error",
+			})
 			h.logger.Error("failed to create failing aggregate", "repo", repo, "pr", pr, "error", err)
 			continue
 		}
@@ -985,10 +1276,27 @@ func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.In
 			Status:       checkStatusCompleted,
 			Conclusion:   checkConclusionFailure,
 		}
+		if block.blockingReason != "" {
+			aggCheck.BlockingReason = block.blockingReason
+			aggCheck.ErrorMessage = summary
+		}
 		if err := h.service.Storage().Checks().Upsert(ctx, aggCheck); err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:   "aggregate_check_sync",
+				Repository:  repo,
+				Environment: ec.environment,
+				Status:      "error",
+			})
 			h.logger.Error("failed to store failing aggregate check", "error", err)
+			continue
 		}
 
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:   "aggregate_check_sync",
+			Repository:  repo,
+			Environment: ec.environment,
+			Status:      "success",
+		})
 		h.logger.Info("posted failing aggregate",
 			"repo", repo, "pr", pr, "check_name", ec.name, "env", ec.environment)
 	}
