@@ -84,6 +84,15 @@ var configDiscoveryFailedBlock = checkBlockReason{
 	message:        "SchemaBot failed this check closed because it could not determine the managed schema configuration for this PR. Review the SchemaBot configuration and retry the check.",
 }
 
+// noAllowedConfiguredEnvironmentsBlock is used when schema files changed but
+// the environments declared by schemabot.yaml do not overlap this service's
+// allowed_environments. SchemaBot cannot safely plan the schema change in that
+// configuration, so the aggregate check must fail closed.
+var noAllowedConfiguredEnvironmentsBlock = checkBlockReason{
+	blockingReason: "no_allowed_configured_environments",
+	message:        "SchemaBot found schema changes, but no environment declared by schemabot.yaml is allowed for this SchemaBot deployment. Align schemabot.yaml with allowed_environments, then retry the check.",
+}
+
 // aggregateCheckNameForEnv returns the environment-scoped aggregate check name.
 // e.g., "SchemaBot (staging)" or "SchemaBot (production)".
 func aggregateCheckNameForEnv(env string) string {

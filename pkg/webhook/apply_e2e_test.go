@@ -362,6 +362,146 @@ func TestE2EUnlock(t *testing.T) {
 	}
 }
 
+// TestE2EUnlockDoesNotPassAggregateWithPendingChanges verifies that releasing
+// a PR lock does not make the aggregate SchemaBot check pass while the PR still
+// has unapplied schema changes.
+func TestE2EUnlockDoesNotPassAggregateWithPendingChanges(t *testing.T) {
+	dbName := "webhook_unlock_pending"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Seed the state after `schemabot apply` has planned work and acquired the
+	// PR-owned lock, but before those changes have been applied.
+	err := svc.Storage().Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName: dbName,
+		DatabaseType: "mysql",
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		Owner:        "octocat/hello-world#1",
+	})
+	require.NoError(t, err)
+
+	// Both the per-database stored check state and the visible aggregate check
+	// are action_required because schema changes are still waiting for apply.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionActionRequired,
+	}))
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "abc123",
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
+		CheckRunID:   43,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionActionRequired,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// The current PR commit is still the same commit that owns the pending plan.
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{
+				Ref: new("feature-branch"),
+				SHA: new("abc123"),
+			},
+			Base: &gh.PullRequestBranch{
+				Ref: new("main"),
+				SHA: new("def456"),
+			},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	comments := make(chan string, 10)
+	checkRuns := make(chan checkRunCapture, 10)
+
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot unlock",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Lock Released")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for unlock comment")
+	}
+
+	lock, err := svc.Storage().Locks().Get(ctx, dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock)
+
+	// Unlock updates the command-specific "SchemaBot Apply" check to neutral,
+	// but must not make the aggregate safety gate pass.
+	select {
+	case cr := <-checkRuns:
+		assert.Contains(t, cr.Name, "SchemaBot Apply")
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionNeutral, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for unlock check run")
+	}
+
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+
+	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, aggregate)
+	assert.Equal(t, checkConclusionActionRequired, aggregate.Conclusion)
+}
+
 func TestE2EApplyConfirmExecutesApply(t *testing.T) {
 	dbName := "webhook_confirm_apply"
 	svc := setupE2EService(t, dbName)

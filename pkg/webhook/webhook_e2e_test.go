@@ -104,6 +104,11 @@ var (
 	e2eSchemabotDSN string
 )
 
+const (
+	webhookIntegrationPollDeadline     = 30 * time.Second
+	webhookIntegrationCheckRunDeadline = 10 * time.Second
+)
+
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
@@ -247,10 +252,11 @@ type planFlowResult struct {
 }
 
 type checkRunCapture struct {
-	Name       string `json:"name"`
-	HeadSHA    string `json:"head_sha"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
+	Name       string                   `json:"name"`
+	HeadSHA    string                   `json:"head_sha"`
+	Status     string                   `json:"status"`
+	Conclusion string                   `json:"conclusion"`
+	Output     *ghclient.CheckRunOutput `json:"output"`
 }
 
 // registerPassingChecks adds a mock GraphQL endpoint for PR check statuses that
@@ -831,6 +837,68 @@ func TestE2EAutoPlan(t *testing.T) {
 	}
 }
 
+// TestE2EReopenedPRAutoPlansCurrentHead verifies that reopening a PR follows
+// the same auto-plan path as a new PR and records checks on the current commit.
+func TestE2EReopenedPRAutoPlansCurrentHead(t *testing.T) {
+	dbName := "webhook_reopened_autoplan"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	// Fake GitHub returns schema files and PR metadata for the reopened commit.
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "reopened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Change Plan")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for reopened auto-plan comment")
+	}
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for reopened auto-plan check run")
+	}
+
+	// The stored check state must be tied to the reopened commit SHA, not any
+	// stale SHA from before the PR was closed.
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+}
+
 func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	dbName := "webhook_autoplan_lint"
 	svc := setupE2EService(t, dbName)
@@ -1005,6 +1073,145 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+}
+
+// TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates
+// verifies that SchemaBot fails closed when it can verify the PR commit but
+// cannot inspect changed files because GitHub returns an availability error.
+func TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging", "production"})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// PR metadata is available, so SchemaBot knows the current commit SHA and
+	// can safely publish failing aggregate checks against that SHA.
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{
+				Ref: new("feature-branch"),
+				SHA: new("abc123"),
+			},
+			Base: &gh.PullRequestBranch{
+				Ref: new("main"),
+				SHA: new("def456"),
+			},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	// Changed-file discovery fails after the PR commit is known. This is a
+	// fail-closed condition for every configured environment.
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "config discovery failed")
+
+	seen := map[string]bool{}
+	for i := range 2 {
+		select {
+		case cr := <-checkRuns:
+			seen[cr.Name] = true
+			assert.Equal(t, checkStatusCompleted, cr.Status)
+			assert.Equal(t, checkConclusionFailure, cr.Conclusion)
+			assert.Equal(t, "abc123", cr.HeadSHA)
+		case <-time.After(webhookIntegrationCheckRunDeadline):
+			t.Fatalf("timed out waiting for failing aggregate check run %d/2, seen: %v", i+1, seen)
+		}
+	}
+	assert.True(t, seen["SchemaBot (staging)"])
+	assert.True(t, seen["SchemaBot (production)"])
+
+	// Each aggregate stores a machine-readable GitHub-unavailable blocking
+	// reason so operators can distinguish this from a schema/config error.
+	for _, env := range []string{"staging", "production"} {
+		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, aggregateSentinel, aggregateSentinel)
+		require.NoError(t, err)
+		require.NotNil(t, check)
+		assert.Equal(t, githubConfigDiscoveryUnavailableBlock.blockingReason, check.BlockingReason)
+		assert.Contains(t, check.ErrorMessage, githubConfigDiscoveryUnavailableBlock.message)
+	}
+}
+
+// TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun verifies that
+// SchemaBot does not create or store a check run when it cannot verify the
+// current PR commit SHA at all.
+func TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// The initial PR lookup fails, so SchemaBot does not know which commit SHA
+	// a check run should target.
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	checkRuns := make(chan checkRunCapture, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "config discovery failed")
+
+	// Publishing a check run without a verified head SHA could mark the wrong
+	// commit, so no GitHub or stored aggregate check should be created.
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("GitHub outage should not publish a check run, got: %+v", cr)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	assert.Nil(t, aggregate)
 }
 
 // setupE2EServiceMultiEnv creates a real api.Service with staging and production environments.
@@ -1315,6 +1522,122 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	assert.Equal(t, checkConclusionSuccess, storedAgg.Conclusion)
 	assert.False(t, storedAgg.HasChanges)
 	assert.False(t, prematurePassingAggregate.Load(), "passing aggregate was published before stale per-database records were cleaned")
+}
+
+// TestE2ENewHeadPlanReplacesInProgressApplyOwnership verifies the case where
+// an older commit has a running apply, then a newer commit still contains schema
+// changes and produces a fresh plan result. The old apply must not own or update
+// the new commit's check state.
+func TestE2ENewHeadPlanReplacesInProgressApplyOwnership(t *testing.T) {
+	dbName := "webhook_new_head_replans"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Seed the old commit's running apply. In production this is the apply that
+	// started before the author pushed a newer commit to the PR branch.
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-old-head",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Running,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply, err = svc.Storage().Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+
+	// Seed old check state owned by that apply. ApplyID makes terminal updates
+	// conditional, so the apply can only complete the check state it owns.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	}))
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
+		CheckRunID:   200,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	}))
+
+	// Fake GitHub now serves the newer PR commit and schema files. Auto-plan
+	// should replace the old apply-owned check state with a new plan result.
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "synchronize",
+		headSHA: "abc123",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The new commit has a plan result but no started apply yet, so ApplyID is
+	// cleared while the check remains action_required.
+	require.Eventually(t, func() bool {
+		check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+		return err == nil && check != nil &&
+			check.HeadSHA == "abc123" &&
+			check.Status == checkStatusCompleted &&
+			check.Conclusion == checkConclusionActionRequired &&
+			check.ApplyID == 0
+	}, webhookIntegrationPollDeadline, 200*time.Millisecond, "new-head plan should replace old apply ownership")
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for new-head aggregate check run")
+	}
+
+	// The old apply finishing later is an ownership miss. It must not overwrite
+	// the newer commit's action_required plan result.
+	apply.State = state.Apply.Completed
+	updated, err := h.updateCheckRecordForApplyResult(ctx, "octocat/hello-world", 1, apply)
+	require.NoError(t, err)
+	assert.False(t, updated, "old apply completion should not overwrite the new-head plan result")
+
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+	assert.Equal(t, int64(0), check.ApplyID)
 }
 
 func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
@@ -1743,6 +2066,20 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, storedApply)
 
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		ApplyID:      applyID,
+		HasChanges:   false,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionSuccess,
+	}))
+
 	// Step 4: Send rollback command with the apply ID
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: fmt.Sprintf("schemabot rollback %s -e staging", storedApply.ApplyIdentifier),
@@ -1770,6 +2107,19 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, lock, "lock should be held after rollback command")
 	assert.Equal(t, "octocat/hello-world#1", lock.Owner)
+
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
+
+	select {
+	case cr := <-result.checkRuns:
+		t.Fatalf("rollback planning should not update check runs before confirmation, got: %+v", cr)
+	case <-time.After(500 * time.Millisecond):
+	}
 }
 
 // TestE2ERollbackApplyNotFound tests rollback with a nonexistent apply ID.
@@ -1933,7 +2283,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	// This is the critical assertion — if repo/PR/installationID are wrong,
 	// the comment goes to the wrong URL and never reaches the channel.
 	gotSummary := false
-	deadline := time.After(30 * time.Second)
+	deadline := time.After(webhookIntegrationPollDeadline)
 	for !gotSummary {
 		select {
 		case body := <-result.comments:
@@ -2037,7 +2387,7 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 
 	select {
 	case <-result.comments:
-	case <-time.After(30 * time.Second):
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for rollback plan comment")
 	}
 
@@ -2057,8 +2407,22 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 			return false
 		}
 		return isRollbackActionRequiredWithoutApplyOwnership(check)
-	}, 30*time.Second, 500*time.Millisecond,
+	}, webhookIntegrationPollDeadline, 500*time.Millisecond,
 		"check should transition to action_required without active apply ownership after rollback")
+
+	deadline := time.After(webhookIntegrationPollDeadline)
+	for {
+		select {
+		case cr := <-result.checkRuns:
+			if cr.Name == aggregateCheckName &&
+				cr.Status == checkStatusCompleted &&
+				cr.Conclusion == checkConclusionActionRequired {
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for rollback aggregate to become action_required")
+		}
+	}
 }
 
 func isRollbackActionRequiredWithoutApplyOwnership(check *storage.Check) bool {
@@ -2165,6 +2529,18 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	applyID, err := svc.Storage().Applies().Create(t.Context(), &storage.Apply{
+		ApplyIdentifier: "apply-close-running",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Running,
+		Engine:          "spirit",
+	})
+	require.NoError(t, err)
+
 	h := NewHandler(svc, nil, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	// Send PR closed webhook
@@ -2186,6 +2562,11 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
 		return err == nil && check == nil
 	}, 5*time.Second, 100*time.Millisecond, "check should be deleted on PR close")
+
+	apply, err := svc.Storage().Applies().Get(t.Context(), applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.Equal(t, state.Apply.Running, apply.State)
 }
 
 // TestE2EStaleCheckCleanup verifies that checks for databases no longer in the PR
@@ -2344,7 +2725,7 @@ func TestE2EReconcileStaleInProgressCheck(t *testing.T) {
 		assert.Equal(t, "abc123", checkRun.HeadSHA)
 		assert.Equal(t, checkStatusCompleted, checkRun.Status)
 		assert.Equal(t, checkConclusionSuccess, checkRun.Conclusion)
-	case <-time.After(30 * time.Second):
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for aggregate check run")
 	}
 
@@ -2354,6 +2735,95 @@ func TestE2EReconcileStaleInProgressCheck(t *testing.T) {
 	assert.Equal(t, "abc123", aggregate.HeadSHA)
 	assert.Equal(t, checkStatusCompleted, aggregate.Status)
 	assert.Equal(t, checkConclusionSuccess, aggregate.Conclusion)
+}
+
+// TestE2EReconcileStaleInProgressCheckFailure verifies startup/webhook
+// reconciliation for a check that is still in_progress even though its apply
+// already failed. Reconciliation must publish the failure instead of leaving
+// branch protection pending forever.
+func TestE2EReconcileStaleInProgressCheckFailure(t *testing.T) {
+	dbName := "webhook_stale_inprogress_failed"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Seed the terminal apply. This models a worker that reached a failed apply
+	// state, then crashed before it updated GitHub check state.
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-stale-failed",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Failed,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	// The stored per-database and aggregate check state still say in_progress.
+	// The per-database row points at the failed apply that reconciliation should
+	// use as the source of truth.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha999",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   42,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	}))
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha999",
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
+		CheckRunID:   100,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// Fake GitHub provides current PR metadata so reconciliation can safely
+	// update the aggregate check on the current commit SHA.
+	result := setupFakeGitHubForPlan(t, mux, nil, "", dbName)
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	require.NoError(t, h.reconcileStaleChecks(ctx, installClient, "octocat/hello-world", 1))
+
+	// Reconciliation should copy the failed apply result into the stored
+	// per-database check while preserving ownership by the original apply.
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionFailure, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
+
+	select {
+	case checkRun := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, checkRun.Name)
+		assert.Equal(t, "abc123", checkRun.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, checkRun.Status)
+		assert.Equal(t, checkConclusionFailure, checkRun.Conclusion)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for failing aggregate check run")
+	}
 }
 
 // TestE2EMultiAppAutoPlan simulates a monorepo with multiple apps, each with their
@@ -2642,6 +3112,75 @@ func setupE2EServiceWithAllowedEnvs(t *testing.T, allowedEnvs []string) *api.Ser
 	return svc
 }
 
+// TestE2EAutoPlanFailsWhenRepoEnvironmentsAreNotAllowed verifies that
+// SchemaBot fails closed when schema files changed, but the repo's
+// schemabot.yaml only names environments this service is not allowed to
+// process. This is a configuration mismatch, not "no work".
+func TestE2EAutoPlanFailsWhenRepoEnvironmentsAreNotAllowed(t *testing.T) {
+	dbName := "webhook_no_owned_envs"
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"sandbox"})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// The repo config asks for staging and production, but this test service is
+	// configured to process only sandbox. SchemaBot cannot safely plan this
+	// schema change because none of the repo-configured environments are allowed.
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n  - production\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	// The webhook still accepts the PR event asynchronously, but auto-plan posts
+	// a failing aggregate because this service cannot process any environment
+	// named by schemabot.yaml.
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, "SchemaBot (sandbox)", cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionFailure, cr.Conclusion)
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, noAllowedConfiguredEnvironmentsBlock.message, cr.Output.Summary)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for failing aggregate for allowed environment")
+	}
+
+	require.Eventually(t, func() bool {
+		aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "sandbox", aggregateSentinel, aggregateSentinel)
+		return err == nil && aggregate != nil &&
+			aggregate.Conclusion == checkConclusionFailure &&
+			aggregate.BlockingReason == noAllowedConfiguredEnvironmentsBlock.blockingReason &&
+			aggregate.ErrorMessage == noAllowedConfiguredEnvironmentsBlock.message
+	}, 5*time.Second, 100*time.Millisecond, "failing aggregate should be stored for allowed environment")
+
+	// There should be no plan comment because no environment reached planning.
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no plan comment when no repo-configured environments are allowed, got: %s", body)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
 // TestE2EPassingAggregateOnNonSchemaPR verifies that when a PR doesn't touch schema
 // files and allowed_environments is configured, passing aggregate checks are posted
 // so branch protection isn't blocked.
@@ -2820,6 +3359,122 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out — aggregate was not recreated on new SHA after synchronize")
 	}
+}
+
+// TestE2EAggregateUpdateSkipsStaleHeadSHA verifies that aggregate updates are
+// gated by the current PR commit SHA. A stale worker must not publish a check
+// run for an older commit after the PR branch has moved.
+func TestE2EAggregateUpdateSkipsStaleHeadSHA(t *testing.T) {
+	dbName := "webhook_stale_sha_guard"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Seed per-database check state from an older commit. The aggregate update
+	// below will try to use this old SHA.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionActionRequired,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// GitHub reports that the PR is now on a newer commit.
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{
+				Ref: new("feature-branch"),
+				SHA: new("newsha222"),
+			},
+			Base: &gh.PullRequestBranch{
+				Ref: new("main"),
+				SHA: new("def456"),
+			},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+
+	checkRuns := make(chan checkRunCapture, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "oldsha111")
+
+	// The old-SHA aggregate update should be skipped entirely: no GitHub check
+	// run and no stored aggregate row.
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("stale aggregate update should not publish a check run, got: %+v", cr)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	assert.Nil(t, aggregate)
+}
+
+// TestE2EPassingAggregateRequiresGitHubHeadVerification verifies that passing
+// aggregate paths still verify the current PR commit before publishing a check.
+func TestE2EPassingAggregateRequiresGitHubHeadVerification(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+	ctx := t.Context()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// The helper cannot verify the PR head because GitHub is unavailable.
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	checkRuns := make(chan checkRunCapture, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123",
+		"No managed schema changes",
+		"This PR does not contain schema changes managed by SchemaBot.")
+
+	// Without head verification, SchemaBot must not publish or store a passing
+	// aggregate check that could incorrectly unblock branch protection.
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("passing aggregate should not publish without current head verification, got: %+v", cr)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	assert.Nil(t, aggregate)
 }
 
 // TestE2EPassingAggregateOnSQLWithoutSchemabotYAML verifies that when a PR touches

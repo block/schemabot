@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -478,11 +479,30 @@ func (h *Handler) executeApply(
 					"repo", repo, "pr", pr, "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
 				return
 			}
-			if ghInstClient, err := h.ghClient.ForInstallation(installationID); err == nil {
-				if checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, apply.Environment, apply.DatabaseType, apply.Database); err == nil && checkRecord != nil {
-					h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
-				}
+			ghInstClient, err := h.ghClient.ForInstallation(installationID)
+			if err != nil {
+				h.logger.Error("observer: failed to create GitHub client",
+					"repo", repo, "pr", pr, "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
+					"installation_id", installationID, "error", err)
+				return
 			}
+			checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
+			if err != nil {
+				h.logger.Error("observer: failed to load check record for aggregate update",
+					"repo", repo, "pr", pr, "database", apply.Database,
+					"database_type", apply.DatabaseType, "environment", apply.Environment,
+					"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
+					"error", err)
+				return
+			}
+			if checkRecord == nil {
+				h.logger.Warn("observer: check record missing for aggregate update",
+					"repo", repo, "pr", pr, "database", apply.Database,
+					"database_type", apply.DatabaseType, "environment", apply.Environment,
+					"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
+				return
+			}
+			h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
 		},
 	})
 	h.service.SetPendingObserver(database, "", environment, observer)
@@ -522,20 +542,36 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Update check run to in-progress (transitions action_required → in_progress)
-	h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID)
-
+	// ExecuteApply rejects accepted applies unless SchemaBot stored its own
+	// apply row. Keep this guard fail-closed in case that invariant changes.
 	if applyID <= 0 {
+		h.service.SetPendingObserver(database, "", environment, nil)
+		h.logger.Error("accepted apply did not return an apply id",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", schemaResult.Type, "environment", environment)
+		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
+			RequestedBy: requestedBy,
+			Timestamp:   time.Now().UTC().Format("2006-01-02 15:04:05"),
+			Environment: environment,
+			CommandName: action.Apply,
+			ErrorDetail: "Apply was accepted, but SchemaBot did not receive a stored apply ID. SchemaBot cannot safely track progress or update required status checks. An operator must reconcile the apply state before retrying.",
+		}))
 		return
 	}
 
 	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
 	if err != nil {
-		h.logger.Error("failed to load apply for progress watch", "applyID", applyID, "error", err)
+		h.logger.Error("failed to load apply after accepted apply",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", schemaResult.Type, "environment", environment,
+			"apply_id", applyID, "error", err)
 		return
 	}
 	if apply == nil {
-		h.logger.Error("apply missing after accepted apply", "applyID", applyID)
+		h.logger.Error("apply missing after accepted apply",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", schemaResult.Type, "environment", environment,
+			"apply_id", applyID)
 		return
 	}
 
@@ -552,6 +588,22 @@ func (h *Handler) executeApply(
 		Engine:      schemaResult.Type,
 	})
 	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
+
+	// Update stored check state to in_progress (transitions action_required to in_progress).
+	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID); err != nil {
+		h.logger.Error("failed to mark check in_progress for apply",
+			"repo", repo, "pr", pr, "database", database,
+			"database_type", schemaResult.Type, "environment", environment,
+			"apply_id", applyID, "error", err)
+		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
+			RequestedBy: requestedBy,
+			Timestamp:   time.Now().UTC().Format("2006-01-02 15:04:05"),
+			Environment: environment,
+			CommandName: action.Apply,
+			ErrorDetail: "Apply was accepted, but SchemaBot could not update the required status check: " + err.Error(),
+		}))
+		return
+	}
 }
 
 // ddlMatchesStoredPlan compares the re-plan DDL against a previously stored plan.
@@ -725,23 +777,37 @@ func (h *Handler) storeApplyPlanCheckRecord(ctx context.Context, client *ghclien
 	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment)
 }
 
-// updateCheckRecordForApplyStart updates the stored check record to "in_progress"
+// updateCheckRecordForApplyStart updates the stored check state to "in_progress"
 // when an apply begins execution. The aggregate check is updated to reflect the state.
-func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string, applyID int64) {
+func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string, applyID int64) error {
 	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, schema.Type, schema.Database)
 	if err != nil {
-		h.logger.Error("failed to look up check record for apply start",
-			"error", err, "apply_id", applyID)
-		return
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_started",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
+		return fmt.Errorf("look up stored check state for apply start repo %s pr %d environment %s database_type %s database %s apply_id %d: %w",
+			repo, pr, environment, schema.Type, schema.Database, applyID, err)
 	}
 
 	if check == nil {
-		// No existing record — create one
+		// No existing record: create one using the current PR head.
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 		if err != nil {
-			h.logger.Error("failed to fetch PR for apply start check record",
-				"error", err, "apply_id", applyID)
-			return
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:    "apply_started",
+				Repository:   repo,
+				Database:     schema.Database,
+				DatabaseType: schema.Type,
+				Environment:  environment,
+				Status:       "error",
+			})
+			return fmt.Errorf("fetch PR for apply start check repo %s pr %d environment %s database_type %s database %s apply_id %d: %w",
+				repo, pr, environment, schema.Type, schema.Database, applyID, err)
 		}
 		check = &storage.Check{
 			Repository:   repo,
@@ -757,19 +823,40 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 		}
 	} else {
 		check.ApplyID = applyID
+		check.HasChanges = true
 		check.Status = checkStatusInProgress
 		check.Conclusion = ""
+		check.BlockingReason = ""
+		check.ErrorMessage = ""
 	}
 
 	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
-		h.logger.Error("failed to upsert check record for apply start",
-			"apply_id", applyID, "head_sha", check.HeadSHA, "error", err)
-		return
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_started",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
+		return fmt.Errorf("upsert stored check state for apply start repo %s pr %d environment %s database_type %s database %s apply_id %d head_sha %s: %w",
+			repo, pr, environment, schema.Type, schema.Database, applyID, check.HeadSHA, err)
 	}
 	h.logger.Info("check record marked in_progress for apply",
+		"repo", repo, "pr", pr, "database", schema.Database,
+		"database_type", schema.Type, "environment", environment,
 		"apply_id", applyID, "head_sha", check.HeadSHA)
 
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:    "apply_started",
+		Repository:   repo,
+		Database:     schema.Database,
+		DatabaseType: schema.Type,
+		Environment:  environment,
+		Status:       "success",
+	})
 	h.updateAggregateCheck(ctx, client, repo, pr, check.HeadSHA)
+	return nil
 }
 
 // updateCheckRunAfterUnlock updates a check run to neutral after lock release.

@@ -309,20 +309,28 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	// Time only the client.Apply call, not plan lookup or client creation.
 	applyStart := time.Now()
 	resp, err := client.Apply(ctx, ternReq)
-	applyDuration := time.Since(applyStart)
 	recordApplyResult := func(status string) {
 		metrics.RecordApply(ctx, plan.Database, req.Environment, status)
-		metrics.RecordApplyDuration(ctx, applyDuration, plan.Database, req.Environment, status)
+		metrics.RecordApplyDuration(ctx, time.Since(applyStart), plan.Database, req.Environment, status)
+	}
+	recordApplyError := func(status string, err error) {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, status)
+		recordApplyResult(applyMetricStatusForError(err))
 	}
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "apply failed")
-		recordApplyResult(applyMetricStatusForError(err))
+		recordApplyError("apply failed", err)
 		return nil, 0, err
 	}
-	applyStatus := "success"
-	if !resp.Accepted {
-		applyStatus = "rejected"
+	if resp == nil {
+		applyErr := fmt.Errorf("apply returned nil response")
+		recordApplyError("apply missing response", applyErr)
+		return nil, 0, applyErr
+	}
+	if resp.Accepted && resp.ApplyId == "" {
+		applyErr := fmt.Errorf("accepted apply missing apply_id")
+		recordApplyError("apply missing id", applyErr)
+		return nil, 0, applyErr
 	}
 	span.SetAttributes(attribute.String("apply_id", resp.ApplyId), attribute.Bool("accepted", resp.Accepted))
 
@@ -345,24 +353,24 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	//   after the record is created above.
 	var storedApplyID int64
 	applyIdentifier := resp.ApplyId
-	if resp.Accepted && resp.ApplyId != "" {
+	if resp.Accepted {
 		if !client.IsRemote() {
 			// Local mode: LocalClient.Apply() already created the apply + task
 			// records in the same database. Just look up the existing record.
 			existing, lookupErr := s.storage.Applies().GetByApplyIdentifier(ctx, resp.ApplyId)
 			if lookupErr != nil {
-				err := fmt.Errorf("lookup local apply %s: %w", resp.ApplyId, lookupErr)
-				recordApplyResult(applyMetricStatusForError(err))
-				return nil, 0, err
+				applyErr := fmt.Errorf("lookup local apply %s: %w", resp.ApplyId, lookupErr)
+				recordApplyError("lookup local apply", applyErr)
+				return nil, 0, applyErr
 			}
 			if existing == nil {
+				applyErr := fmt.Errorf("local apply %s not found: LocalClient should have created it", resp.ApplyId)
 				s.logger.Error("local apply not found after LocalClient.Apply()",
 					"apply_id", resp.ApplyId,
 					"accepted", resp.Accepted,
 				)
-				err := fmt.Errorf("local apply %s not found — LocalClient should have created it", resp.ApplyId)
-				recordApplyResult(applyMetricStatusForError(err))
-				return nil, 0, err
+				recordApplyError("local apply missing", applyErr)
+				return nil, 0, applyErr
 			}
 			storedApplyID = existing.ID
 			applyIdentifier = existing.ApplyIdentifier
@@ -382,7 +390,13 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 			}
 
 			var lockID int64
-			if lock, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType); err == nil && lock != nil {
+			lock, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
+			if err != nil {
+				applyErr := fmt.Errorf("lookup lock for %s/%s: %w", plan.Database, plan.DatabaseType, err)
+				recordApplyError("lookup lock", applyErr)
+				return nil, 0, applyErr
+			}
+			if lock != nil {
 				lockID = lock.ID
 			}
 
@@ -407,9 +421,9 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 			}
 			storedApplyID, err = s.storage.Applies().Create(ctx, apply)
 			if err != nil {
-				err := fmt.Errorf("store apply: %w", err)
-				recordApplyResult(applyMetricStatusForError(err))
-				return nil, 0, err
+				applyErr := fmt.Errorf("store apply: %w", err)
+				recordApplyError("store apply", applyErr)
+				return nil, 0, applyErr
 			}
 
 			for _, ddlChange := range plan.FlatDDLChanges() {
@@ -433,9 +447,9 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 					UpdatedAt:      now,
 				}
 				if _, err := s.storage.Tasks().Create(ctx, task); err != nil {
-					err := fmt.Errorf("store task: %w", err)
-					recordApplyResult(applyMetricStatusForError(err))
-					return nil, 0, err
+					applyErr := fmt.Errorf("store task: %w", err)
+					recordApplyError("store task", applyErr)
+					return nil, 0, applyErr
 				}
 			}
 
@@ -449,7 +463,16 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 			}
 		}
 	}
+	if resp.Accepted && storedApplyID <= 0 {
+		applyErr := fmt.Errorf("accepted apply missing stored apply id")
+		recordApplyError("apply missing stored id", applyErr)
+		return nil, 0, applyErr
+	}
 
+	applyStatus := "success"
+	if !resp.Accepted {
+		applyStatus = "rejected"
+	}
 	recordApplyResult(applyStatus)
 	if resp.Accepted {
 		metrics.AdjustActiveApplies(ctx, 1, plan.Database, req.Environment)
