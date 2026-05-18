@@ -3,10 +3,12 @@
 package integration
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,15 +24,58 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// These tests exercise scheduler behavior at two levels: the full worker loop in
-// TestScheduler_BasicClaimAndResume, and the atomic claim query through
-// FindNextApply. Scheduler workers use FindNextApply before calling ResumeApply,
-// so direct calls keep claim policy tests focused without waiting for ticks.
+// These tests exercise scheduler behavior at two levels: the full worker loop
+// in the resume tests, and the atomic claim query through FindNextApply.
+// Scheduler workers use FindNextApply before calling ResumeApply, so direct
+// calls keep claim policy tests focused without waiting for ticks.
 
 type schedulerClaimFixture struct {
 	appDBName string
 	storageDB *sql.DB
 	store     *mysqlstore.Storage
+}
+
+type blockingResumeClient struct {
+	tern.Client
+
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func newBlockingResumeClient(client tern.Client, release <-chan struct{}) *blockingResumeClient {
+	return &blockingResumeClient{
+		Client:  client,
+		started: make(chan struct{}, 1),
+		release: release,
+	}
+}
+
+func (c *blockingResumeClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.release:
+	}
+
+	return c.Client.ResumeApply(ctx, apply)
+}
+
+func (c *blockingResumeClient) waitForResume(t *testing.T, timeout time.Duration) {
+	t.Helper()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-c.started:
+	case <-timer.C:
+		require.Failf(t, "timeout", "scheduler did not claim blocked apply within %s", timeout)
+	}
 }
 
 // newSchedulerClaimFixture creates a real target database plus a clean SchemaBot
@@ -348,8 +393,21 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 
 	plan1 := planCreateTableForScheduler(t, client1, stor, db1Name, "scheduler_worker_a")
 	plan2 := planCreateTableForScheduler(t, client2, stor, db2Name, "scheduler_worker_b")
-	apply1ID := seedStaleSchedulerApply(t, stor, schemabotDB, db1Name, plan1)
-	apply2ID := seedStaleSchedulerApply(t, stor, schemabotDB, db2Name, plan2)
+	apply1ID := seedStaleSchedulerApply(t, stor, schemabotDB, db1Name, plan1, time.Now().Add(-3*time.Minute))
+	apply2ID := seedStaleSchedulerApply(t, stor, schemabotDB, db2Name, plan2, time.Now().Add(-2*time.Minute))
+
+	blockedResume := make(chan struct{})
+	var releaseBlockedResume sync.Once
+	releaseBlockedClient := func() {
+		releaseBlockedResume.Do(func() {
+			close(blockedResume)
+		})
+	}
+
+	// The first client blocks after the scheduler claims its apply. That keeps
+	// one worker occupied across the next poll, so completion of the second
+	// apply proves another worker can claim independent work.
+	blockingClient1 := newBlockingResumeClient(client1, blockedResume)
 
 	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{
 		SchedulerWorkers: 2,
@@ -368,16 +426,30 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 			},
 		},
 	}, map[string]tern.Client{
-		db1Name + "/staging": client1,
+		db1Name + "/staging": blockingClient1,
 		db2Name + "/staging": client2,
 	}, logger)
 
-	// With multiple workers, different stale targets should be resumed on the
-	// startup scheduler tick. The timeout is intentionally below the normal
-	// scheduler poll interval, so this fails if only one worker makes progress.
 	svc.StartScheduler(ctx)
-	defer svc.StopScheduler()
-	waitForSchedulerAppliesCompleted(t, stor, []int64{apply1ID, apply2ID}, 5*time.Second)
+	defer func() {
+		releaseBlockedClient()
+		svc.StopScheduler()
+	}()
+
+	blockingClient1.waitForResume(t, 5*time.Second)
+
+	// A worker can miss work on the startup claim and pick it up on the next
+	// poll. The important behavior is that the second apply completes while the
+	// first worker is still blocked.
+	waitForSchedulerAppliesCompleted(t, stor, []int64{apply2ID}, schemabotapi.SchedulerPollInterval+5*time.Second)
+
+	blockedApply, err := stor.Applies().Get(ctx, apply1ID)
+	require.NoError(t, err)
+	require.NotNil(t, blockedApply)
+	assert.Equal(t, state.Apply.Running, blockedApply.State)
+
+	releaseBlockedClient()
+	waitForSchedulerAppliesCompleted(t, stor, []int64{apply1ID}, 5*time.Second)
 }
 
 func planCreateTableForScheduler(t *testing.T, client tern.Client, stor *mysqlstore.Storage, dbName, tableName string) *storage.Plan {
@@ -410,7 +482,14 @@ CREATE TABLE %s (
 	return plan
 }
 
-func seedStaleSchedulerApply(t *testing.T, stor *mysqlstore.Storage, db *sql.DB, dbName string, plan *storage.Plan) int64 {
+func seedStaleSchedulerApply(
+	t *testing.T,
+	stor *mysqlstore.Storage,
+	db *sql.DB,
+	dbName string,
+	plan *storage.Plan,
+	createdAt time.Time,
+) int64 {
 	t.Helper()
 
 	now := time.Now()
@@ -447,7 +526,12 @@ func seedStaleSchedulerApply(t *testing.T, stor *mysqlstore.Storage, db *sql.DB,
 		require.NoError(t, err)
 	}
 
-	_, err = db.ExecContext(t.Context(), "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", applyID)
+	_, err = db.ExecContext(
+		t.Context(),
+		"UPDATE applies SET created_at = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?",
+		createdAt,
+		applyID,
+	)
 	require.NoError(t, err)
 
 	return applyID
