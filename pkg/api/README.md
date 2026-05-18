@@ -54,6 +54,7 @@ Lazy creation means a connection failure to one database doesn't block startup o
 | GET | `/api/status` | `handleStatus` | All active schema changes |
 | GET | `/api/history/{database}` | `handleDatabaseHistory` | Apply history for a database |
 | GET | `/api/databases/{database}/environments` | `handleDatabaseEnvironments` | List environments |
+| GET | `/api/mysql/databases` | `handleListMysqlDatabases` | List configured MySQL databases |
 | GET | `/api/logs/{database}` | `handleLogs` | Apply logs for a database |
 | GET | `/api/logs` | `handleLogsWithoutDatabase` | Logs by apply ID |
 
@@ -106,6 +107,7 @@ See the top-level [README](../../README.md) for configuration examples.
 | `plan_handlers.go` | Plan and Apply HTTP handlers |
 | `control_handlers.go` | Cutover, Stop, Start, Volume, Revert handlers |
 | `progress_handlers.go` | Progress, Status, History handlers |
+| `mysql_handlers.go` | MySQL inventory handlers |
 | `health_handlers.go` | Health checks and JSON helpers |
 | `lock_handlers.go` | Lock acquire/release/list handlers |
 | `log_handlers.go` | Apply log handlers |

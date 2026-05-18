@@ -398,6 +398,7 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 
 	// Config API (for CLI to discover environments)
 	mux.HandleFunc("GET /api/databases/{database}/environments", s.handleDatabaseEnvironments)
+	mux.HandleFunc("GET /api/mysql/databases", s.handleListMysqlDatabases)
 
 	// Orchestration API
 	mux.HandleFunc("POST /api/plan", s.handlePlan)

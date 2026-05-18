@@ -210,6 +210,20 @@ type TableChangeResponse struct {
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
 func (t *TableChangeResponse) GetTableName() string { return t.TableName }
 
+// MysqlDatabaseResponse represents a MySQL database known to SchemaBot.
+type MysqlDatabaseResponse struct {
+	Database     string   `json:"database"`
+	DatabaseType string   `json:"database_type"`
+	Deployment   string   `json:"deployment,omitempty"`
+	Environments []string `json:"environments"`
+}
+
+// ListMysqlDatabasesResponse is the response for GET /api/mysql/databases.
+type ListMysqlDatabasesResponse struct {
+	Databases []*MysqlDatabaseResponse `json:"databases"`
+	Count     int                      `json:"count"`
+}
+
 // LintViolationResponse represents a lint violation in the HTTP response.
 type LintViolationResponse struct {
 	Message  string `json:"message"`
