@@ -12,11 +12,6 @@ const (
 	// SchedulerPollInterval is how often each worker polls for applies that need attention.
 	SchedulerPollInterval = 10 * time.Second
 
-	// schedulerEmptyClaimRetryDelay is the short backoff after a worker finds no
-	// claimable apply. Concurrent workers can race on the oldest claimable row;
-	// one retry lets workers claim other targets during the same scheduler tick.
-	schedulerEmptyClaimRetryDelay = 100 * time.Millisecond
-
 	// HeartbeatTimeout is how long since last heartbeat before
 	// an apply is considered to have a crashed worker and needs recovery.
 	// FindNextApply uses this (via SQL: updated_at < NOW() - INTERVAL 1 MINUTE).
@@ -25,20 +20,6 @@ const (
 	// DefaultSchedulerWorkers is the number of concurrent scheduler workers
 	// when not configured via scheduler_workers in the server config.
 	DefaultSchedulerWorkers = 4
-)
-
-type schedulerClaimResult int
-
-const (
-	// schedulerClaimResultClaimed means the worker claimed an apply lease and
-	// handed it to the Tern client for resume.
-	schedulerClaimResultClaimed schedulerClaimResult = iota
-	// schedulerClaimResultEmpty means storage had no claimable applies for this
-	// worker at the time of the claim attempt.
-	schedulerClaimResultEmpty
-	// schedulerClaimResultError means the worker could not complete the claim
-	// query. The error is logged and counted before returning this result.
-	schedulerClaimResultError
 )
 
 // StartScheduler starts the background scheduler worker pool.
@@ -86,15 +67,15 @@ func (s *Service) StopScheduler() {
 	s.stopRecovery = nil
 }
 
-// schedulerWorker is a single worker that polls for applies on each tick.
+// schedulerWorker is a single worker that claims at most one apply on startup
+// and on each scheduler poll tick.
 func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan struct{}) {
 	ticker := time.NewTicker(SchedulerPollInterval)
 	defer ticker.Stop()
 
 	s.logger.Debug("scheduler worker started", "worker", workerID)
 
-	// Run immediately on startup, then on each tick
-	s.schedulerTick(ctx, workerID, stop)
+	s.recoverApplies(ctx, workerID)
 
 	for {
 		select {
@@ -105,53 +86,24 @@ func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan
 			s.logger.Debug("scheduler worker context cancelled", "worker", workerID)
 			return
 		case <-ticker.C:
-			s.schedulerTick(ctx, workerID, stop)
+			s.recoverApplies(ctx, workerID)
 		}
 	}
 }
 
-// schedulerTick runs one scheduler cycle for a single worker.
-//
-// A tick attempts one normal claim. If work is claimed, the worker lets
-// ResumeApply drive that apply until it returns; other workers can claim other
-// applies concurrently. If the claim attempt finds no work, the worker retries
-// once after a short delay so workers that lost a concurrent claim race do not
-// wait for the next poll interval before checking again.
-func (s *Service) schedulerTick(ctx context.Context, workerID int, stop <-chan struct{}) {
-	claimResult := s.recoverApplies(ctx, workerID)
-	if claimResult != schedulerClaimResultEmpty {
-		return
-	}
-
-	timer := time.NewTimer(schedulerEmptyClaimRetryDelay)
-	defer timer.Stop()
-
-	select {
-	case <-stop:
-		s.logger.Debug("scheduler worker stopping before claim retry", "worker", workerID)
-		return
-	case <-ctx.Done():
-		s.logger.Debug("scheduler worker context cancelled before claim retry", "worker", workerID)
-		return
-	case <-timer.C:
-	}
-
-	s.recoverApplies(ctx, workerID)
-}
-
 // recoverApplies claims and resumes applies that need attention.
 // Each call claims one apply (if available) to keep the scheduling loop responsive.
-func (s *Service) recoverApplies(ctx context.Context, workerID int) schedulerClaimResult {
+func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 	apply, err := s.storage.Applies().FindNextApply(ctx)
 	if err != nil {
 		s.logger.Error("scheduler: failed to claim apply", "worker", workerID, "error", err)
 		metrics.RecordSchedulerClaimFailure(ctx, "storage_error")
-		return schedulerClaimResultError
+		return
 	}
 
 	if apply == nil {
 		s.logger.Debug("scheduler: no apply to claim", "worker", workerID)
-		return schedulerClaimResultEmpty
+		return
 	}
 
 	start := time.Now()
@@ -175,7 +127,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) schedulerCla
 			"environment", apply.Environment,
 			"error", err)
 		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, "no_client")
-		return schedulerClaimResultClaimed
+		return
 	}
 
 	if s.OnApplyRecovered != nil {
@@ -189,7 +141,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) schedulerCla
 			"database", apply.Database,
 			"error", err)
 		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, "resume_error")
-		return schedulerClaimResultClaimed
+		return
 	}
 
 	duration := time.Since(start)
@@ -202,5 +154,4 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) schedulerCla
 		"duration", duration)
 	metrics.RecordSchedulerResume(ctx, apply.Database, apply.Environment, previousState)
 	metrics.RecordSchedulerClaimDuration(ctx, duration, apply.Database, apply.Environment, previousState)
-	return schedulerClaimResultClaimed
 }
