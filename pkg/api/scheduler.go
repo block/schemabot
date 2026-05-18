@@ -9,7 +9,7 @@ import (
 
 // Scheduler constants.
 const (
-	// SchedulerPollInterval is how often each worker polls for applies that need attention.
+	// SchedulerPollInterval is the default interval for polling applies that need attention.
 	SchedulerPollInterval = 10 * time.Second
 
 	// HeartbeatTimeout is how long since last heartbeat before
@@ -52,7 +52,7 @@ func (s *Service) StartScheduler(ctx context.Context) {
 		})
 	}
 
-	s.logger.Info("scheduler started", "workers", workers, "interval", SchedulerPollInterval)
+	s.logger.Info("scheduler started", "workers", workers, "interval", s.schedulerPollInterval)
 }
 
 // StopScheduler stops the background scheduler and waits for all workers to finish.
@@ -70,7 +70,7 @@ func (s *Service) StopScheduler() {
 // schedulerWorker is a single worker that claims at most one apply on startup
 // and on each scheduler poll tick.
 func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan struct{}) {
-	ticker := time.NewTicker(SchedulerPollInterval)
+	ticker := time.NewTicker(s.schedulerPollInterval)
 	defer ticker.Stop()
 
 	s.logger.Debug("scheduler worker started", "worker", workerID)

@@ -106,8 +106,9 @@ type Service struct {
 	logger      *slog.Logger
 
 	// Scheduler loop management.
-	stopRecovery chan struct{}
-	recoveryWg   sync.WaitGroup
+	stopRecovery          chan struct{}
+	recoveryWg            sync.WaitGroup
+	schedulerPollInterval time.Duration
 
 	// OnApplyRecovered is called after the scheduler claims an apply and before
 	// ResumeApply starts the engine/poller. Set by the webhook handler to attach
@@ -152,10 +153,11 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		ternClients = make(map[string]tern.Client)
 	}
 	return &Service{
-		storage:     st,
-		config:      config,
-		ternClients: ternClients,
-		logger:      logger,
+		storage:               st,
+		config:                config,
+		ternClients:           ternClients,
+		logger:                logger,
+		schedulerPollInterval: SchedulerPollInterval,
 	}
 }
 

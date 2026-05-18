@@ -430,6 +430,9 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 		db2Name + "/staging": client2,
 	}, logger)
 
+	schedulerPollInterval := 500 * time.Millisecond
+	require.NoError(t, svc.SetSchedulerPollIntervalForTest(schedulerPollInterval))
+
 	svc.StartScheduler(ctx)
 	defer func() {
 		releaseBlockedClient()
@@ -441,7 +444,7 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 	// A worker can miss work on the startup claim and pick it up on the next
 	// poll. The important behavior is that the second apply completes while the
 	// first worker is still blocked.
-	waitForSchedulerAppliesCompleted(t, stor, []int64{apply2ID}, schemabotapi.SchedulerPollInterval+5*time.Second)
+	waitForSchedulerAppliesCompleted(t, stor, []int64{apply2ID}, schedulerPollInterval+5*time.Second)
 
 	blockedApply, err := stor.Applies().Get(ctx, apply1ID)
 	require.NoError(t, err)
