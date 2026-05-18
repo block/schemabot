@@ -30,8 +30,14 @@ const (
 type schedulerClaimResult int
 
 const (
+	// schedulerClaimResultClaimed means the worker claimed an apply lease and
+	// handed it to the Tern client for resume.
 	schedulerClaimResultClaimed schedulerClaimResult = iota
+	// schedulerClaimResultEmpty means storage had no claimable applies for this
+	// worker at the time of the claim attempt.
 	schedulerClaimResultEmpty
+	// schedulerClaimResultError means the worker could not complete the claim
+	// query. The error is logged and counted before returning this result.
 	schedulerClaimResultError
 )
 
@@ -104,9 +110,16 @@ func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan
 	}
 }
 
-// schedulerTick runs one scheduler cycle.
+// schedulerTick runs one scheduler cycle for a single worker.
+//
+// A tick attempts one normal claim. If work is claimed, the worker lets
+// ResumeApply drive that apply until it returns; other workers can claim other
+// applies concurrently. If the claim attempt finds no work, the worker retries
+// once after a short delay so workers that lost a concurrent claim race do not
+// wait for the next poll interval before checking again.
 func (s *Service) schedulerTick(ctx context.Context, workerID int, stop <-chan struct{}) {
-	if s.recoverApplies(ctx, workerID) != schedulerClaimResultEmpty {
+	claimResult := s.recoverApplies(ctx, workerID)
+	if claimResult != schedulerClaimResultEmpty {
 		return
 	}
 
