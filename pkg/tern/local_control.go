@@ -410,13 +410,6 @@ func (c *LocalClient) RollbackPlan(ctx context.Context, database string) (*ternv
 	if plan == nil {
 		return nil, fmt.Errorf("plan not found for completed task")
 	}
-	environment := plan.Environment
-	if environment == "" {
-		environment = latestCompletedTask.Environment
-	}
-	if environment == "" {
-		return nil, fmt.Errorf("rollback plan environment is required")
-	}
 
 	originalSchema := plan.FlatOriginalSchema()
 	if len(originalSchema) == 0 {
@@ -440,7 +433,6 @@ func (c *LocalClient) RollbackPlan(ctx context.Context, database string) (*ternv
 	return c.Plan(ctx, &ternv1.PlanRequest{
 		Database:    c.config.Database,
 		Type:        c.config.Type,
-		Environment: environment,
 		SchemaFiles: schemaFiles,
 	})
 }
