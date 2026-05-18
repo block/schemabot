@@ -432,6 +432,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	if req.PlanId == "" {
 		return nil, fmt.Errorf("plan_id is required")
 	}
+	if req.Environment == "" {
+		return nil, fmt.Errorf("environment is required")
+	}
 
 	// Look up the plan
 	plan, err := c.storage.Plans().Get(ctx, req.PlanId)
@@ -468,17 +471,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	now := time.Now()
 
-	// Options come directly as a map from proto
 	options := req.Options
-	if options == nil {
-		options = make(map[string]string)
-	}
 
-	// Read environment and caller from proto fields (preferred), fall back to options.
-	environment := req.Environment
-	if environment == "" {
-		environment = options["environment"]
-	}
 	caller := req.Caller
 	if caller == "" {
 		caller = options["caller"]
@@ -510,7 +504,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		Deployment:      c.config.Database,
 		Repository:      plan.Repository,
 		PullRequest:     plan.PullRequest,
-		Environment:     environment,
+		Environment:     req.Environment,
 		Caller:          caller,
 		Engine:          eng.Name(),
 		State:           state.Apply.Pending,
@@ -567,7 +561,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			Engine:         eng.Name(),
 			Repository:     plan.Repository,
 			PullRequest:    plan.PullRequest,
-			Environment:    options["environment"],
+			Environment:    req.Environment,
 			State:          state.Task.Pending,
 			Options:        optionsJSON,
 			TableName:      ddlChange.Table,

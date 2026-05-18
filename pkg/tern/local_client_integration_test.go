@@ -36,6 +36,8 @@ var (
 	sharedDSN       string
 )
 
+const localClientTestEnvironment = "development"
+
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
@@ -436,7 +438,8 @@ func TestLocalClient_Apply_PlanNotFound(t *testing.T) {
 
 	ctx := t.Context()
 	resp, err := client.Apply(ctx, &ternv1.ApplyRequest{
-		PlanId: "nonexistent-plan-id",
+		PlanId:      "nonexistent-plan-id",
+		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err, "Apply() returned error")
 	assert.False(t, resp.Accepted, "expected apply to be rejected for nonexistent plan")
@@ -494,7 +497,8 @@ func TestLocalClient_Apply(t *testing.T) {
 
 	// Now apply the plan
 	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
-		PlanId: planResp.PlanId,
+		PlanId:      planResp.PlanId,
+		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err, "Apply() returned error")
 
@@ -850,7 +854,8 @@ func TestLocalClient_Apply_MultiTableSequential(t *testing.T) {
 
 	// Apply the plan in sequential mode (no defer_cutover)
 	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
-		PlanId: planResp.PlanId,
+		PlanId:      planResp.PlanId,
+		Environment: localClientTestEnvironment,
 		// No options means sequential mode
 	})
 	require.NoError(t, err, "Apply() returned error")
@@ -1026,8 +1031,9 @@ func TestLocalClient_Apply_AtomicHeartbeat(t *testing.T) {
 	require.NotEmpty(t, planResp.PlanId)
 
 	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
-		PlanId:  planResp.PlanId,
-		Options: map[string]string{"defer_cutover": "true"},
+		PlanId:      planResp.PlanId,
+		Environment: localClientTestEnvironment,
+		Options:     map[string]string{"defer_cutover": "true"},
 	})
 	require.NoError(t, err)
 	require.True(t, applyResp.Accepted, "apply rejected: %s", applyResp.ErrorMessage)
@@ -1063,7 +1069,7 @@ func TestLocalClient_Apply_AtomicHeartbeat(t *testing.T) {
 	// Trigger cutover to complete the apply
 	_, err = client.Cutover(ctx, &ternv1.CutoverRequest{
 		Database:    "testdb",
-		Environment: "",
+		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err, "cutover")
 
