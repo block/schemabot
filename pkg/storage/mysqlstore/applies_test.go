@@ -247,6 +247,76 @@ func TestApplyStore_GetInProgress(t *testing.T) {
 	assert.True(t, applyIDs[running.ApplyIdentifier], "expected running apply")
 }
 
+func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestination(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	now := time.Now()
+	startedAt := now.Add(-time.Minute)
+
+	githubLock := createTestLockWithPR(t, store, "github_db", storage.DatabaseTypeMySQL, "staging", "org/repo", 123)
+	githubApply := &storage.Apply{
+		ApplyIdentifier: "apply_missing_summary_github",
+		LockID:          githubLock.ID,
+		PlanID:          600,
+		Database:        githubLock.DatabaseName,
+		DatabaseType:    githubLock.DatabaseType,
+		Repository:      githubLock.Repository,
+		PullRequest:     githubLock.PullRequest,
+		Environment:     "staging",
+		Caller:          "org/repo#123",
+		InstallationID:  12345,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Completed,
+	}
+	githubApplyID, err := store.Applies().Create(ctx, githubApply)
+	require.NoError(t, err)
+	githubApply.ID = githubApplyID
+	githubApply.StartedAt = &startedAt
+	githubApply.CompletedAt = &now
+	require.NoError(t, store.Applies().Update(ctx, githubApply))
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         githubApply.ID,
+		CommentState:    state.Comment.Progress,
+		GitHubCommentID: 1001,
+	}))
+
+	cliLock := createTestLockWithPR(t, store, "cli_db", storage.DatabaseTypeMySQL, "staging", "", 0)
+	cliApply := &storage.Apply{
+		ApplyIdentifier: "apply_missing_summary_cli",
+		LockID:          cliLock.ID,
+		PlanID:          601,
+		Database:        cliLock.DatabaseName,
+		DatabaseType:    cliLock.DatabaseType,
+		Repository:      cliLock.Repository,
+		PullRequest:     cliLock.PullRequest,
+		Environment:     "staging",
+		Caller:          "cli:user@host",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Completed,
+	}
+	cliApplyID, err := store.Applies().Create(ctx, cliApply)
+	require.NoError(t, err)
+	cliApply.ID = cliApplyID
+	cliApply.StartedAt = &startedAt
+	cliApply.CompletedAt = &now
+	require.NoError(t, store.Applies().Update(ctx, cliApply))
+
+	// Even if a CLI-style apply somehow has a progress marker, it cannot be
+	// reconciled into a GitHub summary without repository, PR, and installation ID.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         cliApply.ID,
+		CommentState:    state.Comment.Progress,
+		GitHubCommentID: 1002,
+	}))
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, githubApply.ApplyIdentifier, applies[0].ApplyIdentifier)
+}
+
 func TestApplyStore_GetByPR(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

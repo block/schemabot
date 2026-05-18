@@ -20,6 +20,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/spirit/pkg/utils"
+
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
@@ -121,7 +123,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	// Set up SchemaBot storage
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
 	st := mysqlstore.New(schemabotDB)
 
@@ -294,6 +296,129 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	assert.Equal(t, progressCommentID, commentStates[state.Comment.Progress])
 	assert.Equal(t, cutoverCommentID, commentStates[state.Comment.Cutover])
 	assert.Equal(t, summaryCommentID, commentStates[state.Comment.Summary])
+}
+
+func TestE2EReconcileMissingSummaryCommentsPostsSummary(t *testing.T) {
+	ctx := t.Context()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+
+	st := mysqlstore.New(schemabotDB)
+
+	// The storage database is shared by this integration package. Clear the
+	// rows this scenario owns so the missing-summary query only sees this apply.
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM apply_comments")
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM tasks WHERE repository = 'org/reconcile-summary'")
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'org/reconcile-summary'")
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'org/reconcile-summary'")
+	require.NoError(t, err)
+
+	lock := &storage.Lock{
+		DatabaseName: "e2e_reconcile_summary_db",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Repository:   "org/reconcile-summary",
+		PullRequest:  44,
+		Owner:        "org/reconcile-summary#44",
+	}
+	require.NoError(t, st.Locks().Acquire(ctx, lock))
+	lock, err = st.Locks().Get(ctx, "e2e_reconcile_summary_db", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+
+	// Startup reconciliation only posts summaries for GitHub-backed applies.
+	// CLI applies normally do not create apply_comments rows, and any candidate
+	// row still needs repository, pull request number, and installation ID so
+	// the reconciler knows where to post.
+	now := time.Now()
+	startedAt := now.Add(-time.Minute)
+	applyIdentifier := fmt.Sprintf("apply_reconcile_summary_%d", now.UnixNano())
+	apply := &storage.Apply{
+		ApplyIdentifier: applyIdentifier,
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "e2e_reconcile_summary_db",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/reconcile-summary",
+		PullRequest:     44,
+		Environment:     "staging",
+		Caller:          "org/reconcile-summary#44",
+		InstallationID:  12345,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Completed,
+	}
+	applyID, err := st.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+	apply.StartedAt = &startedAt
+	apply.CompletedAt = &now
+	require.NoError(t, st.Applies().Update(ctx, apply))
+
+	// The reconciler reloads tasks from storage to render the summary comment,
+	// so seed the task state that should appear in the posted body.
+	task := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task_reconcile_summary_%d", now.UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         1,
+		Database:       "e2e_reconcile_summary_db",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		Repository:     "org/reconcile-summary",
+		PullRequest:    44,
+		Environment:    "staging",
+		State:          state.Task.Completed,
+		TableName:      "reconcile_users",
+		DDL:            "ALTER TABLE reconcile_users ADD COLUMN email VARCHAR(255)",
+		DDLAction:      "alter",
+		RowsCopied:     10,
+		RowsTotal:      10,
+		CreatedAt:      startedAt,
+		UpdatedAt:      now,
+		StartedAt:      &startedAt,
+		CompletedAt:    &now,
+	}
+	_, err = st.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+
+	// A progress marker without a summary marker represents a process restart
+	// between progress comment posting and terminal summary comment posting.
+	require.NoError(t, st.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         applyID,
+		CommentState:    state.Comment.Progress,
+		GitHubCommentID: 9001,
+	}))
+
+	installClient, capture := setupFakeGitHubForComments(t)
+	factory := &fakeClientFactory{client: installClient}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	svc := api.New(st, &api.ServerConfig{}, map[string]tern.Client{}, logger)
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
+
+	h := NewHandler(svc, factory, nil, logger)
+	// Run startup reconciliation directly; the fake GitHub server captures the
+	// summary comment that would be posted during server startup.
+	h.ReconcileMissingSummaryComments(ctx)
+
+	var created commentCreate
+	select {
+	case created = <-capture.creates:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for missing summary comment")
+	}
+	assert.Contains(t, created.Body, "Schema Change Applied")
+	assert.Contains(t, created.Body, "reconcile_users")
+	assert.Contains(t, created.Body, applyIdentifier)
+
+	// Recording the summary marker keeps future startup reconciliation passes
+	// from posting a duplicate terminal summary comment.
+	summaryComment, err := st.ApplyComments().Get(ctx, applyID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summaryComment)
+	assert.Equal(t, created.ID, summaryComment.GitHubCommentID)
 }
 
 // TestE2EApplyCommentUpsertOnResume tests that Start/resume replaces old comment IDs.

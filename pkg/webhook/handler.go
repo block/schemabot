@@ -23,6 +23,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -84,23 +85,49 @@ func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webho
 				}))
 		}
 
-		// Post missing summary comments for applies that completed during
-		// a container restart (outbox pattern).
-		service.OnMissingSummary = func(apply *storage.Apply) {
-			if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
-				return
-			}
-			tasks, err := service.Storage().Tasks().GetByApplyID(context.Background(), apply.ID)
-			if err != nil {
-				logger.Error("failed to load tasks for missing summary", "apply_id", apply.ApplyIdentifier, "error", err)
-				return
-			}
-			summaryBody := formatSummaryComment(apply, tasks)
-			h.postAndTrackComment(context.Background(), apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID, "summary", summaryBody)
-		}
 	}
 
 	return h
+}
+
+// ReconcileMissingSummaryComments repairs the apply_comments outbox on startup.
+// It finds applies with a progress comment but no summary comment, then posts
+// the missing summary so the PR shows the final result after a restart.
+func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
+	if h.service == nil {
+		h.logger.Debug("skipping missing summary reconciliation without service")
+		return
+	}
+
+	applies, err := h.service.Storage().Applies().FindMissingSummaryComment(ctx)
+	if err != nil {
+		h.logger.Error("failed to find applies missing summary comments", "error", err)
+		return
+	}
+
+	if len(applies) == 0 {
+		h.logger.Debug("no missing summary comments found")
+		return
+	}
+
+	h.logger.Info("found applies missing summary comments", "count", len(applies))
+
+	for _, apply := range applies {
+		tasks, err := h.service.Storage().Tasks().GetByApplyID(ctx, apply.ID)
+		if err != nil {
+			h.logger.Error("failed to load tasks for missing summary reconciliation", "apply_id", apply.ApplyIdentifier, "error", err)
+			continue
+		}
+
+		h.logger.Info("posting missing summary comment",
+			"apply_id", apply.ApplyIdentifier,
+			"repo", apply.Repository,
+			"pr", apply.PullRequest,
+			"state", apply.State)
+
+		summaryBody := formatSummaryComment(apply, tasks)
+		h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID, state.Comment.Summary, summaryBody)
+	}
 }
 
 // ServeHTTP handles incoming webhook requests.

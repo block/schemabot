@@ -19,6 +19,11 @@ const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, dat
 	state, error_message, options,
 	created_at, started_at, completed_at, updated_at`
 
+const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_id, a.database_name, a.database_type,
+	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.engine,
+	a.state, a.error_message, a.options,
+	a.created_at, a.started_at, a.completed_at, a.updated_at`
+
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
 	db *sql.DB
@@ -255,15 +260,19 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 	return scanApplies(rows)
 }
 
-// FindMissingSummaryComment returns completed/failed applies that have a progress
-// comment but no summary comment. Used to post missing summaries after restart.
+// FindMissingSummaryComment returns GitHub-backed applies that should have a
+// terminal summary comment but only have a progress comment. Used to post missing
+// summaries after restart.
 func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.Apply, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+applyColumns+`
+		SELECT `+applyColumnsForApplyAlias+`
 		FROM applies a
 		JOIN apply_comments acp ON acp.apply_id = a.id AND acp.comment_state = 'progress'
 		LEFT JOIN apply_comments acs ON acs.apply_id = a.id AND acs.comment_state = 'summary'
 		WHERE a.state IN (?, ?, ?, ?)
+		  AND a.repository != ''
+		  AND a.pull_request > 0
+		  AND a.installation_id > 0
 		  AND a.completed_at > NOW() - INTERVAL 1 HOUR
 		  AND acs.id IS NULL
 		ORDER BY a.completed_at DESC

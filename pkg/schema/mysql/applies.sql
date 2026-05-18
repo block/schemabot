@@ -26,5 +26,6 @@ CREATE TABLE `applies` (
   KEY `idx_plan_id` (`plan_id`),
   KEY `idx_database_env` (`database_name`,`database_type`,`environment`),
   KEY `idx_repo_pr` (`repository`,`pull_request`),
+  KEY `idx_completed_at_state` (`completed_at`,`state`),
   KEY `idx_state` (`state`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

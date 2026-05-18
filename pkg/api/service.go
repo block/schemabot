@@ -112,11 +112,6 @@ type Service struct {
 	// OnApplyRecovered is called after the recovery worker resumes an apply.
 	// Set by the webhook handler to set up an observer for PR comments.
 	OnApplyRecovered RecoveryCallback
-
-	// OnMissingSummary is called on startup for completed applies that have a
-	// progress comment but no summary comment (outbox gap from container restart).
-	// Set by the webhook handler to post the missing summary comment directly.
-	OnMissingSummary RecoveryCallback
 }
 
 // SetApplyObserver sets a progress observer on the tern client for an apply.

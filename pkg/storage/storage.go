@@ -206,9 +206,9 @@ type ApplyStore interface {
 	// If not called for > 1 minute, another worker can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
 
-	// FindMissingSummaryComment returns completed/failed applies that have a
-	// progress comment but no summary comment. Used by the recovery worker on
-	// startup to post missing summary comments after container restarts.
+	// FindMissingSummaryComment returns GitHub-backed applies that should have
+	// a terminal summary comment but only have a progress comment. Used by
+	// startup reconciliation to post missing summary comments after restarts.
 	FindMissingSummaryComment(ctx context.Context) ([]*Apply, error)
 
 	// GetByPR returns all applies for a PR.

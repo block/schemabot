@@ -26,6 +26,23 @@ import (
 	"github.com/block/schemabot/pkg/webhook"
 )
 
+type webhookRuntime struct {
+	handler                         http.Handler
+	reconcileMissingSummaryComments func(context.Context)
+}
+
+func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, logger *slog.Logger) {
+	if r.reconcileMissingSummaryComments == nil {
+		logger.Debug("missing summary reconciliation disabled")
+		return
+	}
+
+	reconcileCtx := context.WithoutCancel(ctx)
+	go func() {
+		r.reconcileMissingSummaryComments(reconcileCtx)
+	}()
+}
+
 // ServeCmd starts the SchemaBot HTTP API server.
 type ServeCmd struct{}
 
@@ -109,12 +126,26 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	svc := api.New(storage, serverConfig, nil, logger)
 	defer utils.CloseAndLog(svc)
 
-	// Start the recovery worker.
-	// This unified approach polls for stale applies every 10 seconds:
+	ctx := context.Background()
+
+	// Build the webhook runtime before recovery starts so recovered applies can
+	// attach PR comment observers. If GitHub is not configured, the runtime
+	// serves a disabled webhook endpoint and skips comment reconciliation.
+	webhookRuntime, err := buildWebhookRuntime(serverConfig, svc, logger)
+	if err != nil {
+		return err
+	}
+
+	// On startup, find applies that have a progress comment but no summary
+	// comment. This means terminal comment handling was interrupted; reconcile
+	// in the background so GitHub repair does not block server startup.
+	webhookRuntime.StartMissingSummaryReconciliation(ctx, logger)
+
+	// Start the recovery worker after webhook callbacks are registered.
+	// This polls for stale applies every 10 seconds:
 	// - Runs immediately on startup
 	// - Recovers applies with stale heartbeats (> 1 minute) using FOR UPDATE SKIP LOCKED
 	// - STOPPED applies are NOT auto-resumed (user must call `schemabot start`)
-	ctx := context.Background()
 	svc.StartRecoveryWorker(ctx)
 
 	// Optionally start gRPC server for Tern proto (used by docker-compose.grpc.yml)
@@ -146,12 +177,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	svc.ConfigureRoutes(mux)
 	mux.Handle("GET /metrics", telemetry.MetricsHandler)
 
-	// Register GitHub webhook handler if GitHub App is configured
-	webhookHandler, err := buildWebhookHandler(serverConfig, svc, logger)
-	if err != nil {
-		return err
-	}
-	mux.Handle("POST /webhook", webhookHandler)
+	mux.Handle("POST /webhook", webhookRuntime.handler)
 
 	// Wrap mux with OTel HTTP instrumentation for automatic request
 	// duration, request body size, and response body size metrics.
@@ -250,35 +276,40 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 	return grpcSrv, nil
 }
 
-func buildWebhookHandler(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (http.Handler, error) {
+func buildWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {
 	if !serverConfig.GitHub.Configured() {
 		if serverConfig.GitHub.PrivateKey != "" {
 			logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled")
 		}
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		return webhookRuntime{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(`{"error":"GitHub App credentials not available — webhook endpoint is disabled"}`)) //nolint:errcheck
-		}), nil
+			if _, err := w.Write([]byte(`{"error":"GitHub App credentials not available — webhook endpoint is disabled"}`)); err != nil {
+				logger.Error("failed to write disabled webhook response", "error", err)
+			}
+		})}, nil
 	}
 
 	ghPrivateKey, err := serverConfig.GitHub.ResolvePrivateKey()
 	if err != nil {
-		return nil, fmt.Errorf("resolve GitHub private key: %w", err)
+		return webhookRuntime{}, fmt.Errorf("resolve GitHub private key: %w", err)
 	}
 	ghWebhookSecret, err := serverConfig.GitHub.ResolveWebhookSecret()
 	if err != nil {
-		return nil, fmt.Errorf("resolve GitHub webhook secret: %w", err)
+		return webhookRuntime{}, fmt.Errorf("resolve GitHub webhook secret: %w", err)
 	}
 	if ghWebhookSecret == "" {
-		return nil, fmt.Errorf("GitHub App is configured but webhook secret is empty — set github.webhook_secret to secure the /webhook endpoint")
+		return webhookRuntime{}, fmt.Errorf("GitHub App is configured but webhook secret is empty — set github.webhook_secret to secure the /webhook endpoint")
 	}
 
 	appID := serverConfig.GitHub.ResolveAppID()
 	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger)
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger)
 	logger.Info("GitHub webhook endpoint registered", "app_id", appID)
-	return handler, nil
+	return webhookRuntime{
+		handler:                         handler,
+		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
+	}, nil
 }
 
 func getEnv(key, defaultValue string) string {

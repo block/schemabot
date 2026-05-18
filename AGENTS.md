@@ -135,6 +135,8 @@ Before handing a PR to the user, review it the way an operator will experience i
 
 **No PR/issue links in code comments.** Don't reference GitHub issues or PRs (e.g., `// fixes #147`) in code comments — they go stale and provide no value to future readers. The git history links commits to issues; code comments should describe *what* and *why*, not *when* or *which ticket*.
 
+**Preserve useful comments.** When moving or refactoring code, move the relevant comments with the code or update them to match the new structure. Delete comments only when they are truly out of date, misleading, or redundant after the change. Comments that explain operational behavior, invariants, or rationale should not be dropped just because the code moved.
+
 **No fragile comments.** Don't include specific counts, thresholds, external project names, or implementation details that will go stale when the code changes. For example, `// 100k rows` will be wrong when someone changes the count. `// uses the misk pattern` means nothing to someone who doesn't know misk. Comments should describe *intent* — the *what* and *why* — not restate the code or reference external context that may not persist.
 
 **No `nolint` directives.** Always fix the underlying lint issue rather than suppressing it with `//nolint:`. If the linter flags something, the code should be changed to satisfy it.

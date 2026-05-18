@@ -330,11 +330,11 @@ Webhook handler: "someone commented schemabot apply"
   comments regardless of where the engine runs.
 
 **Missing summary recovery.** The `apply_comments` table tracks which comments
-were posted (`progress`, `summary`). On startup, the recovery worker checks for
-completed applies with a progress comment but no summary comment — this means
-`OnTerminal` was missed during a container restart. It reconstructs a
-`CommentObserver` from the apply record's stored GitHub context and calls
-`OnTerminal` to post the missing summary.
+were posted (`progress`, `summary`). On startup, the webhook runtime checks for
+completed applies with a progress comment but no summary comment. This means
+`OnTerminal` was interrupted after progress was posted. It reloads the apply's
+tasks, rebuilds the summary body, posts the missing summary, and records the
+summary comment ID so reconciliation is idempotent.
 
 ### Integration Modes
 
