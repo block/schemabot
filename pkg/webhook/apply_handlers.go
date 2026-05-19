@@ -454,10 +454,9 @@ func (h *Handler) executeApply(
 
 	caller := fmt.Sprintf("github:%s@%s#%d", requestedBy, repo, pr)
 
-	// Set observer before starting the apply — consumed by Apply() before the
-	// engine starts, so the observer is registered before any progress events fire.
-	// ApplyID is set to 0 here; LocalClient.Apply() updates it after creating
-	// the apply record.
+	// Set observer before queueing the apply so ExecuteApply can attach it to
+	// the stored apply before any scheduler worker starts engine work.
+	// ApplyID is set after the apply record is created.
 	observer := NewCommentObserver(CommentObserverConfig{
 		GHClient:       h.ghClient,
 		Storage:        h.service.Storage(),

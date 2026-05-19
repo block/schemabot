@@ -151,8 +151,8 @@ type LocalClient struct {
 	observerMu sync.RWMutex
 	observers  map[int64]ProgressObserver // keyed by apply ID
 
-	// pendingObserver is consumed by the next Apply() call and registered
-	// before Spirit starts. Set by the webhook handler via SetPendingObserver.
+	// pendingObserver is consumed by direct Apply callers and registered before
+	// Spirit starts.
 	// Protected by observerMu.
 	pendingObserver ProgressObserver
 }
@@ -478,20 +478,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		caller = options["caller"]
 	}
 
-	// Detect atomic mode (--defer-cutover)
-	deferCutover := options["defer_cutover"] == "true"
-	allowUnsafe := options["allow_unsafe"] == "true"
-
-	// Build typed ApplyOptions for storage (booleans, not strings).
-	// Revert window is ON by default — only disabled when skip_revert is explicitly set.
-	skipRevert := options["skip_revert"] == "true"
-	deferDeploy := options["defer_deploy"] == "true"
-	applyOpts := storage.ApplyOptions{
-		DeferCutover: deferCutover,
-		DeferDeploy:  deferDeploy,
-		AllowUnsafe:  allowUnsafe,
-		SkipRevert:   skipRevert,
-	}
+	applyOpts := storage.ApplyOptionsFromMap(options)
 	optionsJSON := storage.MarshalApplyOptions(applyOpts)
 
 	// Create Apply record first (1 Apply -> N Tasks)
@@ -578,25 +565,16 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		tasks[i].ID = taskID
 	}
 
-	// Register pending observer before starting the engine — prevents race where
-	// the apply completes before the observer is set. The webhook handler calls
-	// SetPendingObserver before triggering the apply API call.
-	if obs := c.consumePendingObserver(); obs != nil {
-		// Set the apply ID on the observer if it supports it (e.g., CommentObserver
-		// needs the ID to look up tracked comments for editing).
-		type applyIDSetter interface{ SetApplyID(int64) }
-		if setter, ok := obs.(applyIDSetter); ok {
-			setter.SetApplyID(apply.ID)
-		}
-		c.SetObserver(apply.ID, obs)
-	}
+	// Register pending observer before starting the engine to prevent the apply
+	// completing before the observer is set.
+	c.registerPendingObserver(apply.ID)
 
 	// Start apply in background with cancellable context (Stop() cancels this)
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
 	c.cancelMu.Lock()
 	c.cancelApply = cancelApply
 	c.cancelMu.Unlock()
-	if deferCutover || c.config.Type == storage.DatabaseTypeVitess {
+	if applyOpts.DeferCutover || c.config.Type == storage.DatabaseTypeVitess {
 		// Atomic mode: all DDLs in one engine call.
 		// For Spirit: atomic cutover (--defer-cutover).
 		// For Vitess: always atomic — one deploy request per apply.
@@ -770,19 +748,15 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		if err == nil {
 			engineResult = result
 			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
+			taskState := c.engineResultTaskState(result)
 
 			// Only update task state from engine if task is not already in a terminal state.
 			// Terminal states (CANCELLED, COMPLETED, FAILED, etc.) should be preserved -
 			// they represent the final state set by the apply execution.
 			if !state.IsTerminalTaskState(activeTask.State) {
-				activeTask.State = engineStateToStorage(result.State)
-				now := time.Now()
-				activeTask.UpdatedAt = now
-				if result.State.IsTerminal() && activeTask.CompletedAt == nil {
-					activeTask.CompletedAt = &now
-				}
-				if err := c.storage.Tasks().Update(ctx, activeTask); err != nil {
-					c.logger.Warn("failed to update task state from progress poll", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "error", err)
+				c.syncTaskFromEngineProgress(ctx, activeTask, result, taskState)
+				if isRetryableProgressFailure(result, taskState) {
+					c.syncRetryableApplyFromProgress(ctx, req.ApplyId, result)
 				}
 			}
 
@@ -790,7 +764,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			// but the apply hasn't been updated yet. Only do this when ALL tasks
 			// for this apply are terminal — in sequential mode, the engine reports
 			// "completed" per-task, but the apply isn't done until all tasks finish.
-			if result.State.IsTerminal() {
+			if result.State.IsTerminal() && !isRetryableProgressFailure(result, taskState) {
 				allTerminal := true
 				for _, t := range currentApplyTasks {
 					if !state.IsTerminalTaskState(t.State) {
@@ -799,8 +773,15 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 					}
 				}
 				if allTerminal {
-					apply, _ := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-					if apply != nil && !state.IsTerminalApplyState(apply.State) {
+					apply, applyErr := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+					switch {
+					case applyErr != nil:
+						c.logger.Warn("failed to load apply for terminal progress update", "apply_id", req.ApplyId, "error", applyErr)
+					case apply == nil:
+						c.logger.Warn("apply not found for terminal progress update", "apply_id", req.ApplyId)
+					case state.IsTerminalApplyState(apply.State):
+						c.logger.Debug("skipping terminal progress update for terminal apply", "apply_id", apply.ApplyIdentifier, "state", apply.State)
+					default:
 						now := time.Now()
 						apply.State = engineStateToStorage(result.State)
 						apply.CompletedAt = &now
@@ -927,7 +908,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// If no error from engine, check stored task errors (for restart recovery)
 	if errorMessage == "" {
 		for _, t := range currentApplyTasks {
-			if t.State == state.Task.Failed && t.ErrorMessage != "" {
+			if (t.State == state.Task.Failed || t.State == state.Task.FailedRetryable) && t.ErrorMessage != "" {
 				errorMessage = t.ErrorMessage
 				break
 			}
@@ -981,6 +962,59 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	}
 
 	return resp, nil
+}
+
+func (c *LocalClient) syncTaskFromEngineProgress(ctx context.Context, task *storage.Task, result *engine.ProgressResult, taskState string) {
+	now := time.Now()
+	task.State = taskState
+	task.UpdatedAt = now
+
+	if isRetryableProgressFailure(result, taskState) {
+		task.CompletedAt = nil
+		if task.ErrorMessage == "" {
+			if msg := progressErrorMessage(result); msg != "" {
+				task.ErrorMessage = msg
+			}
+		}
+	} else if result.State.IsTerminal() && task.CompletedAt == nil {
+		task.CompletedAt = &now
+	}
+
+	if err := c.storage.Tasks().Update(ctx, task); err != nil {
+		c.logger.Warn("failed to update task state from progress poll", "task_id", task.TaskIdentifier, "state", task.State, "error", err)
+	}
+}
+
+func isRetryableProgressFailure(result *engine.ProgressResult, taskState string) bool {
+	return result.State == engine.StateFailed && taskState == state.Task.FailedRetryable
+}
+
+func (c *LocalClient) syncRetryableApplyFromProgress(ctx context.Context, applyIdentifier string, result *engine.ProgressResult) {
+	apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	switch {
+	case err != nil:
+		c.logger.Warn("failed to load apply for retryable progress update", "apply_id", applyIdentifier, "error", err)
+		return
+	case apply == nil:
+		c.logger.Warn("apply not found for retryable progress update", "apply_id", applyIdentifier)
+		return
+	case state.IsTerminalApplyState(apply.State):
+		c.logger.Debug("skipping retryable progress update for terminal apply", "apply_id", apply.ApplyIdentifier, "state", apply.State)
+		return
+	}
+
+	now := time.Now()
+	apply.State = state.Apply.FailedRetryable
+	apply.CompletedAt = nil
+	apply.UpdatedAt = now
+	if msg := progressErrorMessage(result); msg != "" {
+		apply.ErrorMessage = msg
+	}
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Warn("failed to update retryable apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
+		return
+	}
+	c.logger.Info("retryable apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
 }
 
 func ensureMetadata(m map[string]string) map[string]string {

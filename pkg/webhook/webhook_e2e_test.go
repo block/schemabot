@@ -208,6 +208,8 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	svc := api.New(st, serverConfig, map[string]tern.Client{
 		appDBName + "/staging": localClient,
 	}, logger)
+	require.NoError(t, svc.SetSchedulerPollInterval(200*time.Millisecond))
+	svc.StartScheduler(t.Context())
 	t.Cleanup(func() { _ = svc.Close() })
 
 	return svc
@@ -1288,6 +1290,8 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 		appDBName + "/staging":    stagingClient,
 		appDBName + "/production": productionClient,
 	}, logger)
+	require.NoError(t, svc.SetSchedulerPollInterval(200*time.Millisecond))
+	svc.StartScheduler(t.Context())
 	t.Cleanup(func() { _ = svc.Close() })
 
 	return svc

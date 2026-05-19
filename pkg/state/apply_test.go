@@ -24,6 +24,7 @@ func TestDeriveApplyState_AllCompleted(t *testing.T) {
 func TestDeriveApplyState_AnyFailed(t *testing.T) {
 	testCases := [][]string{
 		{"FAILED"},
+		{"FAILED", "FAILED_RETRYABLE"},
 		{"RUNNING", "FAILED"},
 		{"COMPLETED", "FAILED"},
 		{"WAITING_FOR_CUTOVER", "FAILED", "COMPLETED"},
@@ -32,6 +33,21 @@ func TestDeriveApplyState_AnyFailed(t *testing.T) {
 
 	for _, states := range testCases {
 		assert.Equal(t, Apply.Failed, DeriveApplyState(states), "input: %v", states)
+	}
+}
+
+// TestDeriveApplyState_FailedRetryable verifies that a retryable task failure
+// rolls the apply up to failed_retryable unless a permanent failed task exists.
+func TestDeriveApplyState_FailedRetryable(t *testing.T) {
+	testCases := [][]string{
+		{"FAILED_RETRYABLE"},
+		{"COMPLETED", "FAILED_RETRYABLE"},
+		{"PENDING", "FAILED_RETRYABLE"},
+		{"failed_retryable"},
+	}
+
+	for _, states := range testCases {
+		assert.Equal(t, Apply.FailedRetryable, DeriveApplyState(states), "input: %v", states)
 	}
 }
 
@@ -168,6 +184,7 @@ func TestIsTerminalApplyState(t *testing.T) {
 	nonTerminalStates := []string{
 		Apply.Pending,
 		Apply.Running,
+		Apply.FailedRetryable,
 		Apply.WaitingForCutover,
 		Apply.CuttingOver,
 		Apply.RevertWindow,
@@ -197,6 +214,8 @@ func TestNormalizeState(t *testing.T) {
 		{"completed", Apply.Completed},
 		{"FAILED", Apply.Failed},
 		{"failed", Apply.Failed},
+		{"FAILED_RETRYABLE", Apply.FailedRetryable},
+		{"failed_retryable", Apply.FailedRetryable},
 		{"STOPPED", Apply.Stopped},
 		{"stopped", Apply.Stopped},
 		{"REVERTED", Apply.Reverted},

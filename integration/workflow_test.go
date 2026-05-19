@@ -36,6 +36,13 @@ type testServer struct {
 	Service *schemabotapi.Service
 }
 
+func startTestScheduler(t *testing.T, svc *schemabotapi.Service) {
+	t.Helper()
+
+	require.NoError(t, svc.SetSchedulerPollInterval(200*time.Millisecond))
+	svc.StartScheduler(t.Context())
+}
+
 // createTestDB creates a uniquely-named test database and returns its name and DSN.
 // Cleanup is registered via t.Cleanup.
 func createTestDB(t *testing.T, prefix string) (appDBName, appDSN string) {
@@ -91,6 +98,7 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 	svc := schemabotapi.New(storage, serverConfig, map[string]tern.Client{
 		appDBName + "/staging": localClient,
 	}, logger)
+	startTestScheduler(t, svc)
 
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
@@ -1310,8 +1318,9 @@ CREATE TABLE orders (
 	t.Logf("Correctly captured MySQL error: %s", errorMessage)
 }
 
-// TestFullWorkflow_Spirit_PartialFailure tests that when one task fails in sequential mode,
-// remaining tasks are marked as CANCELLED and the error is properly surfaced.
+// TestFullWorkflow_Spirit_PartialFailure tests that when one task fails retryably
+// in sequential mode, later tasks remain pending for scheduler recovery and the
+// error is properly surfaced.
 func TestFullWorkflow_Spirit_PartialFailure(t *testing.T) {
 	ctx := t.Context()
 
@@ -1322,8 +1331,8 @@ func TestFullWorkflow_Spirit_PartialFailure(t *testing.T) {
 
 	// Three tables in sequential mode (alphabetical order determines execution):
 	// 1. aaa_first - will succeed (simple table)
-	// 2. bbb_fails - will FAIL (FK to non-existent table)
-	// 3. ccc_cancelled - should be CANCELLED (never started)
+	// 2. bbb_fails - will fail retryably (FK to non-existent table)
+	// 3. ccc_cancelled - remains pending until scheduler retry
 	schemaFiles := map[string]string{
 		"aaa_first.sql": `
 CREATE TABLE aaa_first (
@@ -1425,9 +1434,9 @@ CREATE TABLE ccc_cancelled (
 		t.Logf("Table %s: %s", name, status)
 	}
 
-	assert.Equal(t, "completed", tableStates["aaa_first"], "aaa_first")
-	assert.Equal(t, "failed", tableStates["bbb_fails"], "bbb_fails")
-	assert.Equal(t, "cancelled", tableStates["ccc_cancelled"], "ccc_cancelled")
+	assert.Equal(t, state.Task.Completed, tableStates["aaa_first"], "aaa_first")
+	assert.Equal(t, state.Task.FailedRetryable, tableStates["bbb_fails"], "bbb_fails")
+	assert.Equal(t, state.Task.Pending, tableStates["ccc_cancelled"], "ccc_cancelled")
 
 	// Verify aaa_first table was actually created in DB (partial success committed)
 	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
@@ -1451,12 +1460,12 @@ CREATE TABLE ccc_cancelled (
 	`, appDBName).Scan(&tableName)
 	assert.Error(t, err, "bbb_fails table should NOT exist in DB")
 
-	// Verify ccc_cancelled table was NOT created
+	// Verify pending work was NOT created
 	err = targetDB.QueryRowContext(ctx, `
 		SELECT TABLE_NAME FROM information_schema.TABLES
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'ccc_cancelled'
 	`, appDBName).Scan(&tableName)
 	assert.Error(t, err, "ccc_cancelled table should NOT exist in DB")
 
-	t.Log("Partial failure test passed: 1 completed, 1 failed, 1 cancelled")
+	t.Log("Partial failure test passed: 1 completed, 1 retryable failure, 1 pending retry")
 }

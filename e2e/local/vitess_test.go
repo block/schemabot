@@ -1610,6 +1610,43 @@ func TestVitess_Apply_DeferDeploy_StartTooEarly(t *testing.T) {
 	waitForApplyState(t, endpoint, applyResp.ApplyID, state.Apply.Completed, testutil.PollDeadline)
 }
 
+// TestVitess_Apply_MainBranchReuseFailsPermanently exercises a known permanent
+// PlanetScale validation failure. Reusing the main branch should fail the apply
+// without entering scheduler retry.
+func TestVitess_Apply_MainBranchReuseFailsPermanently(t *testing.T) {
+	vitessAvailable(t)
+	clearSchemaBotState(t)
+
+	endpoint := schemabotURL(t)
+	colName := fmt.Sprintf("main_branch_col_%d", time.Now().UnixMilli()%100000)
+	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
+		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
+	}))
+
+	planResp, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0)
+	require.NoError(t, err)
+	require.NotEmpty(t, planResp.PlanID)
+	require.NotEmpty(t, planResp.Changes)
+
+	// Passing branch=main intentionally violates the engine's branch reuse
+	// rules so this path proves known permanent errors bypass retry handling.
+	applyResp, err := client.CallApplyAPI(endpoint, planResp.PlanID, vitessDB, "staging", "e2e-test",
+		map[string]string{"branch": "main", "skip_revert": "true"})
+	require.NoError(t, err)
+	require.NotEmpty(t, applyResp.ApplyID)
+
+	finalState := waitForApplyAnyState(t, endpoint, applyResp.ApplyID,
+		[]string{state.Apply.Failed, state.Apply.FailedRetryable}, testutil.PollDeadline)
+	assert.Equal(t, state.Apply.Failed, finalState)
+
+	progress, err := client.GetProgress(endpoint, applyResp.ApplyID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(progress.State, state.Apply.Failed))
+	assert.Equal(t, apitypes.ErrCodeEngineError, progress.ErrorCode)
+	assert.NotEqual(t, apitypes.ErrCodeEngineErrorRetryable, progress.ErrorCode)
+	assert.Contains(t, progress.ErrorMessage, "cannot reuse the main branch")
+}
+
 func TestVitess_Apply_BranchReuse(t *testing.T) {
 	vitessAvailable(t)
 	clearSchemaBotState(t)

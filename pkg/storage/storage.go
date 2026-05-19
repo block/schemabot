@@ -211,6 +211,10 @@ type ApplyStore interface {
 	// If not called for > 1 minute, another worker can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
 
+	// ExpireRetryable transitions failed_retryable applies that exhausted their
+	// retry budget to permanent failed. Returns the applies updated.
+	ExpireRetryable(ctx context.Context) ([]*Apply, error)
+
 	// FindMissingSummaryComment returns GitHub-backed applies that should have
 	// a terminal summary comment but only have a progress comment. Used by
 	// startup reconciliation to post missing summary comments after restarts.

@@ -269,10 +269,9 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
    `IsComplete`.
 
 4. **Crash recovery loses up to 500ms of progress.** The pollers write to storage every 500ms.
-   On crash, the last persisted snapshot may be up to 500ms stale. The recovery loop
-   (`Service.RecoverInProgress`) finds applies with stale heartbeats and calls
-   `Tern.ResumeApply()`, which re-plans against the actual DB state to determine what still needs
-   to be done.
+   On crash, the last persisted snapshot may be up to 500ms stale. Scheduler workers find
+   applies with stale heartbeats and call `Tern.ResumeApply()`, which re-plans against the
+   actual DB state to determine what still needs to be done.
 
 5. **ETA is only available via `ProgressDetail` parsing.** Spirit embeds ETA in its summary string.
    The engine layer doesn't extract it into a separate field — it flows through as `ProgressDetail`

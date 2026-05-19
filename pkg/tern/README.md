@@ -36,11 +36,11 @@ Request/response types are protobuf-generated (`pkg/proto/ternv1`).
 
 ### 1. Plan
 
-The CLI or API calls `Plan()` with the desired schema files. The Tern client passes them to the engine, which diffs against the live database and returns DDL statements with lint warnings. The plan is stored in SchemaBot's storage for later use by `Apply()`.
+The CLI or API calls `Plan()` with the desired schema files. The Tern client passes them to the engine, which diffs against the live database and returns DDL statements with lint warnings. The plan is stored in SchemaBot's storage for later apply dispatch.
 
 ### 2. Apply
 
-`Apply()` creates an Apply record (one Apply contains N Tasks, one per table) and launches background execution in one of two modes:
+The API apply path creates an Apply record plus Task records, then returns once that work is durably queued. Scheduler workers claim queued applies and call `ResumeApply()` on the appropriate Tern client, which launches background execution in one of two modes:
 
 - **Sequential mode** (default): Each table's DDL is executed one at a time. Each task runs through Spirit independently and cuts over before the next starts.
 - **Atomic mode** (`--defer-cutover`): All DDLs are passed to Spirit in a single call. All tables copy in parallel and cut over together when the user triggers cutover.
@@ -55,13 +55,13 @@ In atomic mode with `--defer-cutover`, the schema change pauses at `WaitingForCu
 
 ## Recovery
 
-If the SchemaBot server crashes during an apply, the recovery mechanism resumes it:
+If the SchemaBot server crashes during an apply, an apply is queued but not yet dispatched, or an engine error is classified as retryable, the recovery mechanism resumes it:
 
-1. The API service scheduler polls every 10 seconds for applies with stale heartbeats (no update for 1+ minute)
+1. The API service wakes a scheduler worker when new work is queued; workers also poll every 10 seconds for queued pending applies, applies with stale heartbeats (no update for 1+ minute), or retryable failures
 2. It claims the apply by selecting it and refreshing its heartbeat in one transaction
 3. It calls `ResumeApply()` on the appropriate Tern client
-4. **LocalClient**: Calls `engine.Apply()` with the same DDL — Spirit auto-detects its checkpoint table and resumes from where it left off
-5. **GRPCClient**: Calls `Start()` on the remote Tern service, then spawns a local progress poller
+4. **LocalClient**: Calls `engine.Apply()` with the same DDL. For fresh queued work this starts the engine; for stale work Spirit auto-detects its checkpoint table and resumes from where it left off
+5. **GRPCClient**: For fresh queued work, calls remote Tern `Apply()` and stores the remote apply ID as `external_id`; for stale remote work, resumes tracking or sends control RPCs as needed
 
 Stopped applies (user called `stop`) are not auto-resumed — the user must explicitly call `start`.
 

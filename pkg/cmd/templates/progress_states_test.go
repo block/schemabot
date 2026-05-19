@@ -15,6 +15,7 @@ func TestStateLabel_PlanetScalePhases(t *testing.T) {
 	assert.Equal(t, "Creating deploy request", StateLabel(state.Apply.CreatingDeployRequest))
 	assert.Equal(t, "Validating deploy request", StateLabel(state.Apply.ValidatingDeployRequest))
 	assert.Equal(t, "Cancelled", StateLabel(state.Apply.Cancelled))
+	assert.Equal(t, "Retrying", StateLabel(state.Apply.FailedRetryable))
 }
 
 func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
@@ -24,6 +25,7 @@ func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
 	assert.Contains(t, FormatProgressState(state.Apply.CreatingDeployRequest), "Creating deploy request")
 	assert.Contains(t, FormatProgressState(state.Apply.ValidatingDeployRequest), "Validating deploy request")
 	assert.Contains(t, FormatProgressState(state.Apply.Cancelled), "Cancelled")
+	assert.Contains(t, FormatProgressState(state.Apply.FailedRetryable), "Retrying")
 }
 
 func TestProgressSymbol(t *testing.T) {

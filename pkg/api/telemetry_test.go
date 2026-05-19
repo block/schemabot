@@ -436,12 +436,14 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 	metrics.RecordSchedulerResumeFailure(t.Context(), "testdb", "staging", "no_client")
 	metrics.RecordSchedulerClaimFailure(t.Context(), "storage_error")
 	metrics.RecordSchedulerClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "staging", "running")
+	metrics.RecordSchedulerExpired(t.Context(), "testdb", "staging")
 
 	names := collectMetricNames(t, reader)
 	assert.True(t, names["schemabot.scheduler.resumed_total"], "expected schemabot.scheduler.resumed_total")
 	assert.True(t, names["schemabot.scheduler.resume_failures_total"], "expected schemabot.scheduler.resume_failures_total")
 	assert.True(t, names["schemabot.scheduler.claim_failures_total"], "expected schemabot.scheduler.claim_failures_total")
 	assert.True(t, names["schemabot.scheduler.claim_duration_seconds"], "expected schemabot.scheduler.claim_duration_seconds")
+	assert.True(t, names["schemabot.scheduler.expired_retryable_total"], "expected schemabot.scheduler.expired_retryable_total")
 }
 
 // setupTraceTest creates an in-memory trace exporter and configures the global

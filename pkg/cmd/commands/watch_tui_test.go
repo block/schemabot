@@ -228,6 +228,12 @@ func TestFetchProgress_ErrorCodeClassification(t *testing.T) {
 			retryable: true,
 		},
 		{
+			name:      "engine_error_retryable is retryable",
+			status:    http.StatusInternalServerError,
+			body:      `{"error":"transient engine error","error_code":"engine_error_retryable"}`,
+			retryable: true,
+		},
+		{
 			name:      "not_found is permanent",
 			status:    http.StatusNotFound,
 			body:      `{"error":"apply not found: abc123","error_code":"not_found"}`,

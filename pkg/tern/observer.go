@@ -35,10 +35,8 @@ func (c *LocalClient) SetObserver(applyID int64, observer ProgressObserver) {
 	c.observers[applyID] = observer
 }
 
-// SetPendingObserver sets an observer that will be consumed by the next Apply()
-// call. The observer is registered on the apply record before the engine starts,
-// preventing the race where the apply completes before the observer is set.
-// Called by the webhook handler before triggering the apply API call.
+// SetPendingObserver sets an observer consumed by direct Apply callers. API
+// callers register observers through Service.SetPendingObserver.
 func (c *LocalClient) SetPendingObserver(observer ProgressObserver) {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()
@@ -53,6 +51,16 @@ func (c *LocalClient) consumePendingObserver() ProgressObserver {
 	obs := c.pendingObserver
 	c.pendingObserver = nil
 	return obs
+}
+
+func (c *LocalClient) registerPendingObserver(applyID int64) {
+	if obs := c.consumePendingObserver(); obs != nil {
+		type applyIDSetter interface{ SetApplyID(int64) }
+		if setter, ok := obs.(applyIDSetter); ok {
+			setter.SetApplyID(applyID)
+		}
+		c.SetObserver(applyID, obs)
+	}
 }
 
 // getObserver returns the observer for an apply, or nil if none is set.

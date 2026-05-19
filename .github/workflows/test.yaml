@@ -162,11 +162,37 @@ jobs:
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Test"
-        run: make test-e2e-mysql test-e2e-grpc
+        run: make test-e2e-mysql
       - name: "Container logs on failure"
         if: failure()
         run: |
           docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
+
+  e2e-grpc:
+    name: "E2E gRPC Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - name: "Test"
+        run: make test-e2e-grpc
+      - name: "Container logs on failure"
+        if: failure()
+        run: |
+          docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --tail=300 2>/dev/null || true
 
   e2e-vitess-matrix:
     name: "E2E Vitess Matrix"
@@ -271,12 +297,12 @@ jobs:
   # Remove these after updating branch protection to use the new job names.
   e2e-rollup:
     name: "E2E Tests"
-    needs: [e2e-mysql, e2e-vitess]
+    needs: [e2e-mysql, e2e-grpc, e2e-vitess]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - run: |
-          if [ "${{ needs.e2e-mysql.result }}" != "success" ] || [ "${{ needs.e2e-vitess.result }}" != "success" ]; then
+          if [ "${{ needs.e2e-mysql.result }}" != "success" ] || [ "${{ needs.e2e-grpc.result }}" != "success" ] || [ "${{ needs.e2e-vitess.result }}" != "success" ]; then
             exit 1
           fi
 

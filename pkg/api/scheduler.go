@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Scheduler constants.
@@ -26,13 +28,16 @@ const (
 //
 // Scheduler workers claim apply work from storage so one server can make
 // progress across independent databases and environments concurrently. This
-// currently includes crash recovery for applies with stale heartbeats.
+// includes crash recovery for applies with stale heartbeats and retry recovery
+// for transient engine failures.
 //
 // Launches N concurrent workers (configured via scheduler_workers in config).
 // Each worker independently claims applies using FOR UPDATE SKIP LOCKED.
 // Call StopScheduler to gracefully stop.
 func (s *Service) StartScheduler(ctx context.Context) {
+	s.schedulerMu.Lock()
 	if s.stopRecovery != nil {
+		s.schedulerMu.Unlock()
 		s.logger.Info("scheduler already running")
 		return
 	}
@@ -42,13 +47,16 @@ func (s *Service) StartScheduler(ctx context.Context) {
 		workers = DefaultSchedulerWorkers
 	}
 
-	s.stopRecovery = make(chan struct{})
+	stop := make(chan struct{})
+	wake := make(chan struct{}, workers)
+	s.stopRecovery = stop
+	s.schedulerWake = wake
+	s.schedulerMu.Unlock()
 
 	for i := range workers {
 		workerID := i
-		stop := s.stopRecovery
 		s.recoveryWg.Go(func() {
-			s.schedulerWorker(ctx, workerID, stop)
+			s.schedulerWorker(ctx, workerID, stop, wake)
 		})
 	}
 
@@ -58,24 +66,57 @@ func (s *Service) StartScheduler(ctx context.Context) {
 // StopScheduler stops the background scheduler and waits for all workers to finish.
 // Safe to call multiple times.
 func (s *Service) StopScheduler() {
+	s.schedulerMu.Lock()
 	if s.stopRecovery == nil {
+		s.schedulerMu.Unlock()
 		return
 	}
 	stop := s.stopRecovery
+	s.stopRecovery = nil
+	s.schedulerWake = nil
+	s.schedulerMu.Unlock()
+
 	close(stop)
 	s.recoveryWg.Wait()
-	s.stopRecovery = nil
+}
+
+func (s *Service) wakeScheduler(applyIdentifier, database, environment string) {
+	s.schedulerMu.Lock()
+	wake := s.schedulerWake
+	running := s.stopRecovery != nil
+	s.schedulerMu.Unlock()
+
+	if !running || wake == nil {
+		s.logger.Debug("scheduler wake skipped because scheduler is not running",
+			"apply_id", applyIdentifier,
+			"database", database,
+			"environment", environment)
+		return
+	}
+
+	select {
+	case wake <- struct{}{}:
+		s.logger.Debug("scheduler wake queued",
+			"apply_id", applyIdentifier,
+			"database", database,
+			"environment", environment)
+	default:
+		s.logger.Debug("scheduler wake already pending",
+			"apply_id", applyIdentifier,
+			"database", database,
+			"environment", environment)
+	}
 }
 
 // schedulerWorker is a single worker that claims at most one apply on startup
 // and on each scheduler poll tick.
-func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan struct{}) {
+func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan struct{}, wake <-chan struct{}) {
 	ticker := time.NewTicker(s.schedulerPollInterval)
 	defer ticker.Stop()
 
 	s.logger.Debug("scheduler worker started", "worker", workerID)
 
-	s.recoverApplies(ctx, workerID)
+	s.schedulerTick(ctx, workerID)
 
 	for {
 		select {
@@ -85,10 +126,46 @@ func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan
 		case <-ctx.Done():
 			s.logger.Debug("scheduler worker context cancelled", "worker", workerID)
 			return
+		case <-wake:
+			s.logger.Debug("scheduler worker woke for queued apply", "worker", workerID)
+			s.schedulerTick(ctx, workerID)
 		case <-ticker.C:
-			s.recoverApplies(ctx, workerID)
+			s.schedulerTick(ctx, workerID)
 		}
 	}
+}
+
+// schedulerTick expires exhausted retries, then attempts one claim/resume.
+func (s *Service) schedulerTick(ctx context.Context, workerID int) {
+	if workerID == 0 {
+		s.expireExhaustedRetries(ctx)
+	}
+	s.recoverApplies(ctx, workerID)
+}
+
+// expireExhaustedRetries marks failed_retryable applies as permanently failed
+// after their scheduler retry budget is exhausted.
+func (s *Service) expireExhaustedRetries(ctx context.Context) {
+	expired, err := s.storage.Applies().ExpireRetryable(ctx)
+	if err != nil {
+		s.logger.Error("scheduler: failed to expire retryable applies", "error", err)
+		metrics.RecordSchedulerClaimFailure(ctx, "storage_error")
+		return
+	}
+	if len(expired) == 0 {
+		return
+	}
+	for _, apply := range expired {
+		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+		s.logger.Warn("scheduler: retry budget exhausted, marking apply failed",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"attempt", apply.Attempt,
+			"error", apply.ErrorMessage)
+		metrics.RecordSchedulerExpired(ctx, apply.Database, apply.Environment)
+	}
+	s.logger.Info("scheduler: expired exhausted retryable applies", "count", len(expired))
 }
 
 // recoverApplies claims and resumes applies that need attention.
@@ -126,6 +203,9 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"error", err)
+		if apply.State == state.Apply.FailedRetryable {
+			s.failApply(ctx, apply, "scheduler: no client available for retry")
+		}
 		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, "no_client")
 		return
 	}
@@ -154,4 +234,36 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		"duration", duration)
 	metrics.RecordSchedulerResume(ctx, apply.Database, apply.Environment, previousState)
 	metrics.RecordSchedulerClaimDuration(ctx, duration, apply.Database, apply.Environment, previousState)
+}
+
+// failApply permanently fails an apply that cannot be retried.
+func (s *Service) failApply(ctx context.Context, apply *storage.Apply, errMsg string) {
+	now := time.Now()
+	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		s.logger.Error("scheduler: failed to load tasks before failing apply",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+	} else {
+		for _, task := range tasks {
+			if state.IsTerminalTaskState(task.State) {
+				continue
+			}
+			task.State = state.Task.Failed
+			task.ErrorMessage = errMsg
+			task.CompletedAt = &now
+			if err := s.storage.Tasks().Update(ctx, task); err != nil {
+				s.logger.Error("scheduler: failed to mark task permanently failed",
+					"task_id", task.TaskIdentifier, "apply_id", apply.ApplyIdentifier, "error", err)
+			}
+		}
+	}
+	apply.State = state.Apply.Failed
+	apply.ErrorMessage = errMsg
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := s.storage.Applies().Update(ctx, apply); err != nil {
+		s.logger.Error("scheduler: failed to mark apply permanently failed",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+	}
+	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 }

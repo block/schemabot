@@ -35,6 +35,8 @@ func taskStateToApplyState(ts string) string {
 		return state.Apply.Completed
 	case state.Task.Failed:
 		return state.Apply.Failed
+	case state.Task.FailedRetryable:
+		return state.Apply.FailedRetryable
 	case state.Task.Stopped:
 		return state.Apply.Stopped
 	case state.Task.Reverted:
@@ -92,6 +94,8 @@ func storageStateToProto(ts string) ternv1.State {
 	case state.Task.Completed:
 		return ternv1.State_STATE_COMPLETED
 	case state.Task.Failed:
+		return ternv1.State_STATE_FAILED
+	case state.Task.FailedRetryable, state.Apply.FailedRetryable:
 		return ternv1.State_STATE_FAILED
 	case state.Task.Stopped:
 		return ternv1.State_STATE_STOPPED

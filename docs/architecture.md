@@ -195,13 +195,21 @@ An **apply** executes a previously created plan. One apply can have multiple **t
 ```
 schemabot apply (after confirming plan)
 
-CLI → API → Tern.Apply(PlanID)
-               │
-               ├─ looks up Plan from storage
-               ├─ creates Apply record (links to Plan)
-               ├─ creates Task records (one per DDL statement)
-               └─ starts execution (mode depends on engine and flags)
+CLI → API → storage
+           │
+           ├─ looks up Plan
+           ├─ creates Apply record (pending)
+           ├─ creates Task records (pending, one per DDL statement)
+           └─ returns accepted once work is durably queued
+
+Scheduler worker → Tern.ResumeApply()
+                       │
+                       └─ starts execution (mode depends on engine and flags)
 ```
+
+The request path only queues durable work. Scheduler workers own dispatch so a
+request timeout or server restart after `/apply` cannot leave in-memory work
+orphaned.
 
 ### Apply vs Task
 
@@ -268,14 +276,17 @@ type ProgressObserver interface {
 Webhook handler: "someone commented schemabot apply"
     |
     +-- Creates CommentObserver (posts PR comments)
-    +-- Calls SetPendingObserver on the client
+    +-- Calls SetPendingObserver on the API service
     +-- Calls ExecuteApply
             |
             v
-        Client.Apply()
-            +-- Consumes pending observer
-            +-- Registers Observer on the apply before engine starts
-            +-- Starts engine goroutine
+        Queue Apply + Tasks
+            +-- Registers Observer on the stored apply
+            |
+            v
+        Scheduler claims queued apply
+            +-- Calls ResumeApply()
+            +-- Starts engine goroutine or remote Tern dispatch
                     |
                     +-- Progress tick: poll engine, derive task/apply state
                     |   +-- Observer.OnProgress()
@@ -315,7 +326,7 @@ stored GitHub context, and errors never fail server startup.
 
 The scheduler is part of Tern orchestration. The API service starts it on server startup because the server owns process lifecycle, configuration, and the Tern client pool, but the scheduler's work is to coordinate applies: claim storage records, refresh their heartbeat lease, and call `ResumeApply()` on the right Tern client.
 
-Each scheduler worker runs immediately on startup, then polls every 10 seconds. The worker claims at most one apply per tick and resumes it through the Tern client for that apply's deployment and environment.
+Each scheduler worker runs immediately on startup, wakes when new apply work is queued, and polls every 10 seconds as a fallback. The worker claims at most one apply per wake or tick and resumes it through the Tern client for that apply's deployment and environment. Worker 0 also expires retryable failures that have exhausted their retry budget.
 
 `scheduler_workers` controls scheduler concurrency. The default is four workers, so an untuned server can still make progress across independent databases and environments concurrently. More workers help larger installations with many independent schema changes because each worker can claim and resume a different target during the same scheduler tick.
 
@@ -327,13 +338,13 @@ In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each sche
 | Scheduler                |      | Scheduler                |
 | +----------------------+ |      | +----------------------+ |
 | | worker 0             | |      | | worker 0             | |
-| | claim stale apply    | |      | | claim stale apply    | |
+| | claim apply work     | |      | | claim apply work     | |
 | | attach Observer      | |      | | attach Observer      | |
 | | ResumeApply          | |      | | ResumeApply          | |
 | +----------------------+ |      | +----------------------+ |
 | +----------------------+ |      | +----------------------+ |
 | | worker 1             | |      | | worker 1             | |
-| | claim stale apply    | |      | | claim stale apply    | |
+| | claim apply work     | |      | | claim apply work     | |
 | | attach Observer      | |      | | attach Observer      | |
 | | ResumeApply          | |      | | ResumeApply          | |
 | +----------------------+ |      | +----------------------+ |
@@ -343,7 +354,7 @@ In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each sche
              v                                  v
         +-----------------------------------------------+
         | Shared SchemaBot storage                      |
-        | applies, tasks, apply_target_locks            |
+        | applies, tasks, MySQL named locks             |
         | claims use FOR UPDATE SKIP LOCKED             |
         +-----------------------------------------------+
 
@@ -358,26 +369,32 @@ In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each sche
 
 The storage arrows represent scheduler coordination. The GitHub arrows represent optional observer notifications; CLI applies simply run without an observer.
 
-A **claim** is an atomic storage operation: it selects one stale apply and refreshes its `updated_at` heartbeat in the same transaction. That heartbeat refresh is the scheduler's lease while it reloads state and calls `ResumeApply()`. Claims use `FOR UPDATE SKIP LOCKED` so multiple scheduler workers can run concurrently without taking the same apply.
+A **claim** is an atomic storage operation: it selects one apply that needs scheduler work and refreshes its `updated_at` heartbeat in the same transaction. That heartbeat refresh is the scheduler's lease while it reloads state and calls `ResumeApply()`. Claims use `FOR UPDATE SKIP LOCKED` so multiple scheduler workers can run concurrently without taking the same apply.
 
-An apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
+A queued `pending` apply is claimable as soon as its task rows exist. Claiming it moves the row to `running` and gives the worker a lease before dispatch. Already-running applies become claimable after their heartbeat has been stale for more than one minute and they are in a state that can be resumed from persisted metadata. A `failed_retryable` apply is also claimable while it still has retry budget; claiming it moves the row to `running`, increments the retry attempt counter, and gives the worker a fresh lease before re-dispatch. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
+
+Retryable failures are for engine errors that are expected to clear without user action, such as transient transport failures. Engines mark known permanent failures explicitly so they become `failed` immediately. When a retryable apply reaches the retry limit, the scheduler expires it to `failed` and updates retryable tasks to `failed` as well.
+
+Task and apply `failed_retryable` states are related but not identical. A retryable task marks the specific table work that needs another dispatch attempt. A retryable apply marks the whole apply as paused for scheduler recovery and carries the retry attempt count. Attempts are counted at the apply level, so one scheduler retry can include multiple pending or retryable tasks. Pending tasks are unfinished work that is not currently running; they stay attached to the apply until the next dispatch.
+
+The scheduler handles retryable work at the apply level. It claims the `failed_retryable` apply, reloads its tasks, resets only `failed_retryable` tasks back to `pending`, leaves `completed` tasks completed, and re-dispatches the apply through Tern. In sequential mode, this means a table that already completed is skipped on retry, the table that failed retryably is tried again, and later pending tables remain eligible to run after it.
 
 SchemaBot has two different kinds of locking:
 
 - **Database locks** are coordination state for users and automation. They make ownership visible in CLI/webhook flows and let a human intentionally hold, release, or force-release work for a database.
 - **Apply invariants** are correctness rules enforced by storage. They do not depend on a database lock being present, because direct API callers and `--no-lock` flows still must not create invalid concurrent work.
 
-SchemaBot enforces one active apply per database, database type, and environment when an apply record is created or moved back into an active state. The `applies` table is the tern-layer work table, but storage uses a small target-lock table as the serialization surface for this invariant.
+SchemaBot enforces one active apply per database, database type, and environment when an apply record is created or moved back into an active state. The `applies` table is the Tern-layer work table, but storage serializes active apply writes with a per-target MySQL named lock before it checks or writes `applies`.
 
-The target lock row lives in `apply_target_locks`. This table is internal storage infrastructure, not user-facing lock state and not apply lifecycle state. A row is created lazily the first time a target is used, then reused for every future apply for that same database/type/environment. Normal apply completion, failure, cancellation, or revert does not delete the row; the active lifecycle remains in `applies`.
+The named lock is internal storage infrastructure, not user-facing lock state and not apply lifecycle state. Storage holds the lock on a dedicated connection while it runs the active-apply transaction, then releases it before returning the connection to the pool.
 
-`apply_target_locks` exists because the first active apply for a target has no existing `applies` row to lock. Locking the absence of an active row in `applies` requires InnoDB range locks over `idx_database_env`. Those range locks can deadlock independent first-writer transactions when multiple targets are creating applies concurrently. A persistent target row gives storage an exact mutex row before it reads or writes `applies`.
+The storage schema may include an `apply_target_locks` table, but active apply serialization does not depend on rows in that table. The correctness boundary is the per-target named lock plus the active-apply check in `applies`.
 
-The target row lock is transaction-local. Same-target writers wait on the same `apply_target_locks` row, then re-check `applies` after the earlier writer commits. If an active apply now exists, the later writer fails cleanly. Different targets lock different rows, so they can create or resume applies concurrently without depending on empty-range locks in `applies`.
+The first active apply for a target has no existing `applies` row to lock. Locking the absence of an active row in `applies` requires InnoDB range locks over `idx_database_env`, and creating a separate mutex row on the apply hot path can block behind unrelated storage-table contention. A named lock gives storage a target-specific serialization point before it reads or writes `applies`, without bootstrapping rows during an apply request.
+
+Same-target writers wait on the same named lock, then re-check `applies` after the earlier writer commits. If an active apply now exists, the later writer fails cleanly. Different targets use different lock names, so they can create or resume applies concurrently without depending on empty-range locks in `applies`.
 
 The scheduler relies on that invariant. Additional workers increase concurrency across independent targets; they do not make one database/environment run multiple applies at once.
-
-If a worker finds no claimable apply, it waits briefly and retries once during the same tick. This lets another worker that lost a claim race pick up a different target without waiting for the next 10-second poll.
 
 ### Execution Modes
 
@@ -479,14 +496,18 @@ Used for: distributed deployments where SchemaBot and the database engine run on
 
 **Identity resolution (`apply_identifier` vs `external_id`):**
 
-In gRPC mode, SchemaBot and Tern maintain separate storage with separate IDs. When Apply succeeds, Tern returns its own ID (the remote engine's apply identifier). SchemaBot generates a separate `apply_identifier` for its HTTP callers and stores Tern's ID as `external_id`:
+In gRPC mode, SchemaBot and Tern maintain separate storage with separate IDs. The API request creates SchemaBot's local apply first and returns that `apply_identifier` to HTTP callers. When the scheduler dispatches the queued apply to remote Tern, Tern returns its own ID and SchemaBot stores it as `external_id`:
 
 ```
 Apply flow:
-  ExecuteApply → client.Apply() → Tern returns ApplyId:"tern-42"
-    → SchemaBot generates apply_identifier="apply-abc123"
-    → stores external_id="tern-42"
+  ExecuteApply
+    → stores apply_identifier="apply-abc123", external_id=""
     → returns apply_id="apply-abc123" to HTTP caller
+
+  Scheduler claims apply-abc123
+    → GRPCClient calls remote Tern Apply()
+    → Tern returns ApplyId:"tern-42"
+    → SchemaBot stores external_id="tern-42"
 
 Subsequent RPCs (Progress, Stop, Start, Cutover, Volume):
   HTTP caller sends apply_id="apply-abc123"
@@ -495,19 +516,16 @@ Subsequent RPCs (Progress, Stop, Start, Cutover, Volume):
     → GRPCClient sends ApplyId:"tern-42" to Tern
 ```
 
-In local mode (`client.IsRemote() == false`), `LocalClient` runs in the same process and writes to the same database as the API layer:
+In local mode, `LocalClient` runs in the same process and writes to the same database as the API layer. There is no remote ID, so `external_id` stays empty:
 
 ```
 Apply flow (local):
-  ExecuteApply checks client.IsRemote() → false
-  ExecuteApply → client.Apply()
-    → LocalClient creates apply in DB:
-        apply_identifier="apply-def456", external_id="" (not set — no remote Tern)
-    → returns ApplyId:"apply-def456"
-  ExecuteApply gets resp.ApplyId="apply-def456"
-    → IsRemote()==false, so looks up existing record directly
-    → reuses LocalClient's apply record
+  ExecuteApply
+    → stores apply_identifier="apply-def456", external_id=""
     → returns apply_id="apply-def456" to HTTP caller
+
+  Scheduler claims apply-def456
+    → LocalClient starts engine work from the stored apply/tasks
 
 Subsequent RPCs (local):
   HTTP caller sends apply_id="apply-def456"
@@ -517,8 +535,6 @@ Subsequent RPCs (local):
     → LocalClient receives ApplyId:"apply-def456"
     → scopes task lookup to that apply
 ```
-
-The `IsRemote()` method on the `tern.Client` interface makes this branching explicit.
 
 Both modes implement the same `tern.Client` interface — callers don't know which mode is active.
 

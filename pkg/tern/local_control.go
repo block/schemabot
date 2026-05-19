@@ -2,7 +2,6 @@ package tern
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -53,7 +52,13 @@ func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (
 	c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 		"Cutover triggered", "", "")
 
-	_, err = eng.Cutover(ctx, c.buildControlRequest(ctx, task, creds))
+	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	if err != nil {
+		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Cutover failed: %v", err), "", "")
+		return nil, fmt.Errorf("cutover failed: %w", err)
+	}
+	_, err = eng.Cutover(ctx, controlReq)
 	if err != nil {
 		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cutover failed: %v", err), "", "")
@@ -166,7 +171,10 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 		if task.State == state.Task.Running ||
 			task.State == state.Task.WaitingForCutover ||
 			task.State == state.Task.CuttingOver {
-			req := c.buildControlRequest(ctx, task, creds)
+			req, err := c.buildControlRequest(ctx, task, creds)
+			if err != nil {
+				return err
+			}
 			if _, err := eng.Stop(ctx, req); err != nil {
 				c.logger.Warn("engine stop returned error (runner may have already exited)",
 					"task_id", task.TaskIdentifier, "error", err)
@@ -293,27 +301,23 @@ func (c *LocalClient) controlSetup(ctx context.Context) (*storage.Task, *engine.
 // buildControlRequest creates a ControlRequest with ResumeState from VitessApplyData.
 // For PlanetScale, the engine needs the deploy request ID (in ResumeState.Metadata)
 // to execute control operations (cutover, revert, skip-revert).
-func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Task, creds *engine.Credentials) *engine.ControlRequest {
+func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Task, creds *engine.Credentials) (*engine.ControlRequest, error) {
 	req := &engine.ControlRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
 	}
 	if c.config.Type == storage.DatabaseTypeVitess {
-		if vad, err := c.storage.VitessApplyData().GetByApplyID(ctx, task.ApplyID); err == nil {
-			meta, _ := json.Marshal(map[string]any{
-				"branch_name":        vad.BranchName,
-				"deploy_request_id":  vad.DeployRequestID,
-				"deploy_request_url": vad.DeployRequestURL,
-				"is_instant":         vad.IsInstant,
-				"deferred_deploy":    vad.DeferredDeploy,
-			})
-			req.ResumeState = &engine.ResumeState{
-				MigrationContext: vad.MigrationContext,
-				Metadata:         string(meta),
-			}
+		vad, err := c.storage.VitessApplyData().GetByApplyID(ctx, task.ApplyID)
+		if err != nil {
+			return nil, fmt.Errorf("load Vitess apply data for control task %s: %w", task.TaskIdentifier, err)
 		}
+		resumeState, err := vitessApplyDataResumeState(vad, task.TaskIdentifier)
+		if err != nil {
+			return nil, fmt.Errorf("build Vitess resume state for control task %s: %w", task.TaskIdentifier, err)
+		}
+		req.ResumeState = resumeState
 	}
-	return req
+	return req, nil
 }
 
 // Volume modifies the schema change speed/concurrency in-flight.
@@ -350,7 +354,11 @@ func (c *LocalClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*t
 		return nil, err
 	}
 
-	if _, err = eng.Revert(ctx, c.buildControlRequest(ctx, task, creds)); err != nil {
+	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	if err != nil {
+		return nil, fmt.Errorf("revert failed: %w", err)
+	}
+	if _, err = eng.Revert(ctx, controlReq); err != nil {
 		return nil, fmt.Errorf("revert failed: %w", err)
 	}
 	return &ternv1.RevertResponse{Accepted: true}, nil
@@ -363,7 +371,11 @@ func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequ
 		return nil, err
 	}
 
-	if _, err = eng.SkipRevert(ctx, c.buildControlRequest(ctx, task, creds)); err != nil {
+	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	if err != nil {
+		return nil, fmt.Errorf("skip revert failed: %w", err)
+	}
+	if _, err = eng.SkipRevert(ctx, controlReq); err != nil {
 		return nil, fmt.Errorf("skip revert failed: %w", err)
 	}
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil

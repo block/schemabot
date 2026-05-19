@@ -24,6 +24,8 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
+const schedulerTestPollInterval = 200 * time.Millisecond
+
 // These tests exercise scheduler behavior at two levels: the full worker loop
 // in the resume tests, and the atomic claim query through FindNextApply.
 // Scheduler workers use FindNextApply before calling ResumeApply, so direct
@@ -127,6 +129,7 @@ func TestScheduler_BasicClaimAndResume(t *testing.T) {
 	require.True(t, applyResp["accepted"] == true)
 	applyID, _ := applyResp["apply_id"].(string)
 	waitForState(t, "http://"+ts.Addr, applyID, "completed", 15*time.Second)
+	ts.Service.StopScheduler()
 
 	// Remove the table so the second plan contains DDL that recovery can resume.
 	targetConn, err := sql.Open("mysql", appDSN)
@@ -191,19 +194,127 @@ func TestScheduler_BasicClaimAndResume(t *testing.T) {
 	}
 
 	// Scheduler recovery should claim the stale apply and resume it to completion.
+	require.NoError(t, ts.Service.SetSchedulerPollInterval(schedulerTestPollInterval))
 	ts.Service.StartScheduler(t.Context())
 	defer ts.Service.StopScheduler()
 
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		apply, err := ts.Storage.Applies().Get(ctx, staleID)
-		require.NoError(t, err)
-		if apply != nil && apply.State == state.Apply.Completed {
-			return
-		}
-		time.Sleep(500 * time.Millisecond)
+	waitForSchedulerAppliesCompleted(t, ts.Storage, []int64{staleID}, schedulerTestPollInterval+5*time.Second)
+}
+
+func TestScheduler_QueuedApplyDispatchesToCompletion(t *testing.T) {
+	ctx := t.Context()
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	appDBName, appDSN := createTestDB(t, "queued_sched_")
+	ts := startTestServer(t, appDBName, appDSN)
+	ts.Service.StopScheduler()
+
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+
+	applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id": planID, "environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true)
+	applyIdentifier, _ := applyResp["apply_id"].(string)
+	require.NotEmpty(t, applyIdentifier)
+
+	queuedApply, err := ts.Storage.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, queuedApply)
+	assert.Equal(t, state.Apply.Pending, queuedApply.State)
+	assert.Nil(t, queuedApply.StartedAt)
+
+	tasks, err := ts.Storage.Tasks().GetByApplyID(ctx, queuedApply.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, tasks)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Pending, task.State)
 	}
-	t.Fatal("timeout: scheduler did not resume stale apply")
+
+	// Once workers start, the scheduler should claim the queued apply,
+	// dispatch the local engine work, and drive the apply to completion.
+	require.NoError(t, ts.Service.SetSchedulerPollInterval(schedulerTestPollInterval))
+	ts.Service.StartScheduler(ctx)
+	defer ts.Service.StopScheduler()
+
+	waitForSchedulerAppliesCompleted(t, ts.Storage, []int64{queuedApply.ID}, schedulerTestPollInterval+5*time.Second)
+}
+
+func TestScheduler_PendingClaimCrashWindowDispatchesToCompletion(t *testing.T) {
+	ctx := t.Context()
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	appDBName, appDSN := createTestDB(t, "pending_crash_")
+	ts := startTestServer(t, appDBName, appDSN)
+	ts.Service.StopScheduler()
+
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+	plan, err := ts.Storage.Plans().Get(ctx, planID)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	now := time.Now()
+	applyID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-pending-crash-%d", now.UnixNano()%100000),
+		PlanID:          plan.ID,
+		Database:        appDBName,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+	defer utils.CloseAndLog(schemabotDB)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", applyID)
+	require.NoError(t, err)
+
+	for _, tc := range plan.FlatDDLChanges() {
+		_, err := ts.Storage.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier: fmt.Sprintf("task-pending-crash-%d", time.Now().UnixNano()%100000),
+			ApplyID:        applyID,
+			PlanID:         plan.ID,
+			Database:       appDBName,
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Engine:         storage.EngineSpirit,
+			State:          state.Task.Pending,
+			TableName:      tc.Table,
+			DDL:            tc.DDL,
+			DDLAction:      tc.Operation,
+			Options:        []byte("{}"),
+			Environment:    "staging",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		})
+		require.NoError(t, err)
+	}
+
+	// This is the durable state left if a worker claimed a queued apply and
+	// crashed before starting the engine. Recovery should dispatch it exactly
+	// like a fresh pending apply, not look for existing engine metadata.
+	require.NoError(t, ts.Service.SetSchedulerPollInterval(schedulerTestPollInterval))
+	ts.Service.StartScheduler(ctx)
+	defer ts.Service.StopScheduler()
+
+	waitForSchedulerAppliesCompleted(t, ts.Storage, []int64{applyID}, schedulerTestPollInterval+5*time.Second)
 }
 
 func TestScheduler_ClaimOrdering(t *testing.T) {
@@ -273,6 +384,7 @@ func TestScheduler_ClaimableStates(t *testing.T) {
 	}{
 		{name: "pending", applyState: state.Apply.Pending, databaseType: "mysql", engine: "spirit", wantClaim: true},
 		{name: "running", applyState: state.Apply.Running, databaseType: "mysql", engine: "spirit", wantClaim: true},
+		{name: "failed retryable", applyState: state.Apply.FailedRetryable, databaseType: "mysql", engine: "spirit", wantClaim: true},
 		{name: "waiting for deploy", applyState: state.Apply.WaitingForDeploy, databaseType: "vitess", engine: "planetscale", wantClaim: true},
 		{name: "waiting for cutover", applyState: state.Apply.WaitingForCutover, databaseType: "vitess", engine: "planetscale", wantClaim: true},
 		{name: "cutting over", applyState: state.Apply.CuttingOver, databaseType: "vitess", engine: "planetscale", wantClaim: true},
@@ -294,7 +406,7 @@ func TestScheduler_ClaimableStates(t *testing.T) {
 			fixture.resetStorage(t)
 
 			applyIdentifier := fmt.Sprintf("apply-claim-state-%d", i)
-			_, err := stor.Applies().Create(ctx, &storage.Apply{
+			applyID, err := stor.Applies().Create(ctx, &storage.Apply{
 				ApplyIdentifier: applyIdentifier,
 				Database:        appDBName,
 				DatabaseType:    tc.databaseType,
@@ -304,6 +416,25 @@ func TestScheduler_ClaimableStates(t *testing.T) {
 				Environment:     "staging",
 			})
 			require.NoError(t, err)
+			if tc.applyState == state.Apply.Pending {
+				// Pending represents a fully queued apply only after tasks are
+				// persisted; workers ignore partially written apply rows.
+				now := time.Now()
+				_, err = stor.Tasks().Create(ctx, &storage.Task{
+					TaskIdentifier: "task-" + applyIdentifier,
+					ApplyID:        applyID,
+					Database:       appDBName,
+					DatabaseType:   tc.databaseType,
+					Engine:         tc.engine,
+					State:          state.Task.Pending,
+					Environment:    "staging",
+					TableName:      "users",
+					DDLAction:      "CREATE",
+					CreatedAt:      now,
+					UpdatedAt:      now,
+				})
+				require.NoError(t, err)
+			}
 			_, err = schemabotDB.ExecContext(ctx,
 				"UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_identifier = ?",
 				applyIdentifier)
@@ -361,6 +492,289 @@ func TestScheduler_ClaimRefreshesHeartbeat(t *testing.T) {
 	reclaimed, err := stor.Applies().FindNextApply(ctx)
 	require.NoError(t, err)
 	assert.Nil(t, reclaimed, "freshly claimed apply should not be claimable again")
+}
+
+// TestScheduler_RetryableApplyResumesToCompletion seeds storage with a
+// retryable apply and retryable task, then starts the scheduler. The scheduler
+// should claim the apply, reset retryable work, dispatch it through Tern, and
+// complete both the apply and task while incrementing attempt counters once.
+func TestScheduler_RetryableApplyResumesToCompletion(t *testing.T) {
+	ctx := t.Context()
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	appDBName, appDSN := createTestDB(t, "retryable_sched_")
+	ts := startTestServer(t, appDBName, appDSN)
+	ts.Service.StopScheduler()
+
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+	plan, err := ts.Storage.Plans().Get(ctx, planID)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	// The persisted state represents an apply whose previous engine dispatch
+	// stopped on a retryable error before scheduler recovery picked it up.
+	now := time.Now()
+	retryApply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-retryable-%d", now.UnixNano()%100000),
+		PlanID:          plan.ID,
+		Database:        appDBName,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.FailedRetryable,
+		ErrorMessage:    "transient engine error",
+		Options:         []byte("{}"),
+		Environment:     "staging",
+	}
+	applyID, err := ts.Storage.Applies().Create(ctx, retryApply)
+	require.NoError(t, err)
+
+	for _, tc := range plan.FlatDDLChanges() {
+		_, err := ts.Storage.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier: fmt.Sprintf("task-retryable-%d", time.Now().UnixNano()%100000),
+			ApplyID:        applyID,
+			PlanID:         plan.ID,
+			Database:       appDBName,
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Engine:         storage.EngineSpirit,
+			State:          state.Task.FailedRetryable,
+			ErrorMessage:   "transient engine error",
+			TableName:      tc.Table,
+			DDL:            tc.DDL,
+			DDLAction:      tc.Operation,
+			Options:        []byte("{}"),
+			Environment:    "staging",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		})
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, ts.Service.SetSchedulerPollInterval(schedulerTestPollInterval))
+	ts.Service.StartScheduler(ctx)
+	defer ts.Service.StopScheduler()
+
+	waitForSchedulerAppliesCompleted(t, ts.Storage, []int64{applyID}, schedulerTestPollInterval+5*time.Second)
+
+	apply, err := ts.Storage.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.Equal(t, 1, apply.Attempt)
+
+	tasks, err := ts.Storage.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.NotEmpty(t, tasks)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Completed, task.State)
+		assert.Equal(t, 1, task.Attempt)
+	}
+}
+
+// TestScheduler_RetryableApplyClaimCrashWindowResumesToCompletion models the
+// state left if a worker claims failed_retryable work and crashes before Tern
+// prepares the retry. The apply is already leased as running, but the task still
+// carries failed_retryable; recovery should still use the retry path.
+func TestScheduler_RetryableApplyClaimCrashWindowResumesToCompletion(t *testing.T) {
+	ctx := t.Context()
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	appDBName, appDSN := createTestDB(t, "retry_crash_")
+	ts := startTestServer(t, appDBName, appDSN)
+	ts.Service.StopScheduler()
+
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+	plan, err := ts.Storage.Plans().Get(ctx, planID)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	now := time.Now()
+	applyID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-retry-crash-%d", now.UnixNano()%100000),
+		PlanID:          plan.ID,
+		Database:        appDBName,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+		ErrorMessage:    "transient engine error",
+		Attempt:         1,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		StartedAt:       &now,
+	})
+	require.NoError(t, err)
+
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+	defer utils.CloseAndLog(schemabotDB)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", applyID)
+	require.NoError(t, err)
+
+	for _, tc := range plan.FlatDDLChanges() {
+		_, err := ts.Storage.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier: fmt.Sprintf("task-retry-crash-%d", time.Now().UnixNano()%100000),
+			ApplyID:        applyID,
+			PlanID:         plan.ID,
+			Database:       appDBName,
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Engine:         storage.EngineSpirit,
+			State:          state.Task.FailedRetryable,
+			ErrorMessage:   "transient engine error",
+			TableName:      tc.Table,
+			DDL:            tc.DDL,
+			DDLAction:      tc.Operation,
+			Options:        []byte("{}"),
+			Environment:    "staging",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		})
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, ts.Service.SetSchedulerPollInterval(schedulerTestPollInterval))
+	ts.Service.StartScheduler(ctx)
+	defer ts.Service.StopScheduler()
+
+	waitForSchedulerAppliesCompleted(t, ts.Storage, []int64{applyID}, schedulerTestPollInterval+5*time.Second)
+
+	apply, err := ts.Storage.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.Equal(t, 1, apply.Attempt)
+
+	tasks, err := ts.Storage.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.NotEmpty(t, tasks)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Completed, task.State)
+		assert.Equal(t, 1, task.Attempt)
+	}
+}
+
+// TestScheduler_ExhaustedRetryableApplyExpiresToFailed seeds a retryable apply
+// at the retry limit. The scheduler should stop retrying it and finalize the
+// apply and unfinished tasks as failed.
+func TestScheduler_ExhaustedRetryableApplyExpiresToFailed(t *testing.T) {
+	ctx := t.Context()
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	appDBName, appDSN := createTestDB(t, "retry_exhaust_")
+	ts := startTestServer(t, appDBName, appDSN)
+	ts.Service.StopScheduler()
+
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+	plan, err := ts.Storage.Plans().Get(ctx, planID)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	// Attempt is already at the retry limit, so this apply is eligible for
+	// expiration instead of another scheduler dispatch.
+	now := time.Now()
+	applyID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-exhausted-%d", now.UnixNano()%100000),
+		PlanID:          plan.ID,
+		Database:        appDBName,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.FailedRetryable,
+		ErrorMessage:    "transient engine error after retries",
+		Attempt:         10,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+	})
+	require.NoError(t, err)
+
+	taskID := fmt.Sprintf("task-exhausted-%d", time.Now().UnixNano()%100000)
+	_, err = ts.Storage.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: taskID,
+		ApplyID:        applyID,
+		PlanID:         plan.ID,
+		Database:       appDBName,
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		State:          state.Task.FailedRetryable,
+		ErrorMessage:   "transient engine error after retries",
+		TableName:      "users",
+		DDL:            string(schemaSQL),
+		DDLAction:      "create",
+		Options:        []byte("{}"),
+		Environment:    "staging",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, ts.Service.SetSchedulerPollInterval(schedulerTestPollInterval))
+	ts.Service.StartScheduler(ctx)
+	defer ts.Service.StopScheduler()
+
+	deadline := time.Now().Add(schedulerTestPollInterval + 5*time.Second)
+	for time.Now().Before(deadline) {
+		apply, err := ts.Storage.Applies().Get(ctx, applyID)
+		require.NoError(t, err)
+		if apply != nil && apply.State == state.Apply.Failed {
+			assert.NotNil(t, apply.CompletedAt)
+			task, err := ts.Storage.Tasks().Get(ctx, taskID)
+			require.NoError(t, err)
+			require.NotNil(t, task)
+			assert.Equal(t, state.Task.Failed, task.State)
+			assert.NotNil(t, task.CompletedAt)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.Fail(t, "scheduler did not expire exhausted retryable apply")
+}
+
+// TestScheduler_FindNextApplyDoesNotReclaimRetryableImmediately verifies the
+// storage claim lease for retryable applies. After one worker claims the row,
+// the refreshed heartbeat should prevent another immediate claim of the same
+// apply.
+func TestScheduler_FindNextApplyDoesNotReclaimRetryableImmediately(t *testing.T) {
+	ctx := t.Context()
+
+	fixture := newSchedulerClaimFixture(t, "retry_claim_")
+	stor := fixture.store
+
+	_, err := stor.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-retryable-exclusive",
+		Database:        fixture.appDBName,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.FailedRetryable,
+		ErrorMessage:    "transient engine error",
+		Options:         []byte("{}"),
+		Environment:     "staging",
+	})
+	require.NoError(t, err)
+
+	claimed, err := stor.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, "apply-retryable-exclusive", claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.FailedRetryable, claimed.State)
+	assert.Equal(t, 1, claimed.Attempt)
+
+	claimedAgain, err := stor.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimedAgain, "claimed retryable apply should have a fresh active lease")
 }
 
 func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
@@ -430,7 +844,7 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 		db2Name + "/staging": client2,
 	}, logger)
 
-	schedulerPollInterval := 500 * time.Millisecond
+	schedulerPollInterval := schedulerTestPollInterval
 	require.NoError(t, svc.SetSchedulerPollInterval(schedulerPollInterval))
 
 	svc.StartScheduler(ctx)

@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/e2e/testutil"
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/e2eutil"
 	"github.com/block/schemabot/pkg/state"
@@ -439,6 +440,57 @@ CREATE TABLE %s (
 	`, tableName).Scan(&count)
 	require.NoError(t, err, "query for table")
 	assert.Equalf(t, 1, count, "table %s should exist after apply", tableName)
+}
+
+// TestLocal_Apply_SpiritEngineFailureIsRetryable exercises the local CLI/API
+// path with a real Spirit execution failure. The plan is valid when created,
+// but the live table changes before apply starts, so the engine failure should
+// be surfaced as retryable progress instead of a permanent apply failure.
+func TestLocal_Apply_SpiritEngineFailureIsRetryable(t *testing.T) {
+	clearSchemaBotState(t)
+	t.Cleanup(func() { clearSchemaBotState(t) })
+
+	endpoint := schemabotURL(t)
+	tableName := uniqueTableName("spirit_retry")
+	columnName := "retryable_col"
+	createTestTable(t, tableName, fmt.Sprintf(`
+CREATE TABLE %s (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+`, tableName))
+
+	db := openTestappStaging(t)
+	schemaDir := newSchemaDir(t)
+	writeExistingTablesSchema(t, schemaDir)
+	e2eutil.WriteFile(t, filepath.Join(schemaDir, tableName+".sql"), fmt.Sprintf(`
+CREATE TABLE %s (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    %s BIGINT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+`, tableName, columnName))
+
+	planResp, err := client.CallPlanAPI(endpoint, "testapp", "mysql", "staging", schemaDir, "", 0)
+	require.NoError(t, err)
+	require.NotEmpty(t, planResp.PlanID)
+	require.NotEmpty(t, planResp.Changes)
+
+	// Mutate the live table after planning so the accepted apply fails while
+	// Spirit executes the planned DDL, not during plan generation.
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("ALTER TABLE `%s` ADD COLUMN `%s` BIGINT NULL", tableName, columnName))
+	require.NoError(t, err)
+
+	applyResp, err := client.CallApplyAPI(endpoint, planResp.PlanID, "testapp", "staging", "e2e-test", nil)
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted, "apply not accepted: %s", applyResp.ErrorMessage)
+
+	waitForApplyAnyState(t, endpoint, applyResp.ApplyID, []string{state.Apply.FailedRetryable}, 8*time.Second)
+	progress, err := client.GetProgress(endpoint, applyResp.ApplyID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.FailedRetryable, progress.State)
+	assert.Equal(t, apitypes.ErrCodeEngineErrorRetryable, progress.ErrorCode)
+	assert.Contains(t, progress.ErrorMessage, "Duplicate column")
 }
 
 func TestLocal_Apply_CreateMultipleTables(t *testing.T) {

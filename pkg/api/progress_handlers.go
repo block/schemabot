@@ -35,7 +35,13 @@ func changeTypeToString(ct ternv1.ChangeType) string {
 // deriveErrorCode returns an error code based on apply state
 // and error message. Returns empty string when no error code applies.
 func deriveErrorCode(applyState, errorMessage string) string {
-	if errorMessage != "" && state.IsState(applyState, state.Apply.Failed) {
+	if errorMessage == "" {
+		return ""
+	}
+	if state.IsState(applyState, state.Apply.FailedRetryable) {
+		return apitypes.ErrCodeEngineErrorRetryable
+	}
+	if state.IsState(applyState, state.Apply.Failed) {
 		return apitypes.ErrCodeEngineError
 	}
 	return ""
@@ -136,6 +142,9 @@ func (s *Service) GetProgress(ctx context.Context, database, environment string)
 	// Use deployment from the stored apply if available.
 	var storedDeployment string
 	if activeApply != nil {
+		if state.IsState(activeApply.State, state.Apply.FailedRetryable) {
+			return s.progressFromLocalStorage(ctx, activeApply)
+		}
 		storedDeployment = activeApply.Deployment
 	}
 	deployment := s.ResolveDeployment(database, storedDeployment)
@@ -202,6 +211,17 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if activeApply != nil && state.IsState(activeApply.State, state.Apply.FailedRetryable) {
+		httpResp, err := s.progressFromLocalStorage(r.Context(), activeApply)
+		if err != nil {
+			s.logger.Error("failed to read retryable apply from storage", "apply_id", activeApply.ApplyIdentifier, "error", err)
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read apply: "+err.Error())
+			return
+		}
+		s.writeJSON(w, http.StatusOK, httpResp)
+		return
+	}
+
 	// Deployment is a plan-time decision stored on the apply record.
 	// Use the stored deployment if an apply exists, otherwise fall back to default resolution.
 	var deployment string
@@ -261,8 +281,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// For terminal applies, serve from local storage (no RPC needed).
-	if state.IsTerminalApplyState(apply.State) {
+	// For terminal or retry-waiting applies, serve from local storage (no RPC needed).
+	if state.IsTerminalApplyState(apply.State) || state.IsState(apply.State, state.Apply.FailedRetryable) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
 			s.logger.Error("failed to read tasks from storage for terminal apply", "apply_id", applyID, "error", err)
@@ -570,10 +590,12 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	// Check if any tasks are stale (non-terminal and not matching the apply
 	// state). A stopped task on a stopped apply is expected, not stale.
 	stale := false
-	for _, task := range tasks {
-		if !state.IsTerminalTaskState(task.State) && task.State != apply.State {
-			stale = true
-			break
+	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
+		for _, task := range tasks {
+			if !state.IsTerminalTaskState(task.State) && task.State != apply.State {
+				stale = true
+				break
+			}
 		}
 	}
 

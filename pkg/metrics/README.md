@@ -20,6 +20,7 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 | `schemabot.scheduler.resume_failures_total` | Counter | database, environment, reason | Scheduler resume attempts that failed |
 | `schemabot.scheduler.claim_failures_total` | Counter | reason | Scheduler claim attempts that failed |
 | `schemabot.scheduler.claim_duration_seconds` | Histogram | database, environment, previous_state | Scheduler claim and resume duration |
+| `schemabot.scheduler.expired_retryable_total` | Counter | database, environment | Retryable applies expired after exhausting retry budget |
 
 ### Attribute Values
 

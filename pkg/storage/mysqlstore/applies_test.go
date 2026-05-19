@@ -3,6 +3,7 @@
 package mysqlstore
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"strconv"
@@ -141,16 +142,13 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
-	guardTx, err := beginApplyWriteTx(ctx, testDB, "test active apply guard")
+	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, "testdb", "mysql", "staging")
 	require.NoError(t, err)
-	t.Cleanup(func() { guardTx.close(ctx, "test active apply guard") })
-
-	// Hold the exact target mutex row open. Active apply creation locks this row
-	// before checking applies, so a same-target create waits without relying on
-	// an empty applies range lock.
-	require.NoError(t, ensureApplyTargetLockRow(ctx, testDB, "testdb", "mysql", "staging"))
-	require.NoError(t, lockApplyTargetRow(ctx, guardTx.tx, "testdb", "mysql", "staging"))
-	require.NoError(t, checkNoActiveApplyForTarget(ctx, guardTx.tx, "testdb", "mysql", "staging", 0))
+	t.Cleanup(func() {
+		if guardConn != nil {
+			releaseApplyTargetLockConn(ctx, guardConn, guardLockName, "test active apply guard")
+		}
+	})
 
 	type createResult struct {
 		id  int64
@@ -180,7 +178,8 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 
-	require.NoError(t, guardTx.commit())
+	releaseApplyTargetLockConn(ctx, guardConn, guardLockName, "test active apply guard")
+	guardConn = nil
 
 	select {
 	case result := <-resultCh:
@@ -193,6 +192,46 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	applies, err := store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging")
 	require.NoError(t, err)
 	assert.Len(t, applies, 1)
+}
+
+func TestApplyStore_CreateActiveApplyDoesNotWaitForTargetLockRowBootstrap(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "bootstrapdb", "mysql", "staging")
+
+	guardTx, err := testDB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	require.NoError(t, err)
+	t.Cleanup(func() { rollbackApplyTx(ctx, guardTx, "test apply target bootstrap guard") })
+
+	var id int64
+	err = guardTx.QueryRowContext(ctx, `
+		SELECT id FROM apply_target_locks FORCE INDEX (idx_apply_target)
+		WHERE database_name >= ?
+		ORDER BY database_name, database_type, environment
+		LIMIT 1
+		FOR UPDATE
+	`, "").Scan(&id)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
+	createCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	id, err = store.Applies().Create(createCtx, &storage.Apply{
+		ApplyIdentifier: "apply_no_bootstrap_wait",
+		LockID:          lock.ID,
+		PlanID:          7,
+		Database:        "bootstrapdb",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          "spirit",
+		State:           state.Apply.Pending,
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, id)
 }
 
 func TestApplyStore_CreateAllowsOneConcurrentActiveApplyForSameTarget(t *testing.T) {
@@ -292,10 +331,6 @@ func TestApplyStore_CreateAvoidsGapLockDeadlocksForDifferentTargets(t *testing.T
 		lock := locks[target.database+"/"+target.dbType]
 		wg.Go(func() {
 			<-start
-			// If storage protects first writers by locking empty ranges in applies,
-			// these concurrent inserts can deadlock even though every target is
-			// independent. The target-lock row gives each target an exact mutex
-			// before applies is checked, so callers should not see deadlock errors.
 			_, err := store.Applies().Create(ctx, &storage.Apply{
 				ApplyIdentifier: "apply_concurrent_target_" + strconv.Itoa(i),
 				LockID:          lock.ID,
@@ -531,6 +566,145 @@ func TestApplyStore_GetInProgress(t *testing.T) {
 	assert.True(t, applyIDs[running.ApplyIdentifier], "expected running apply")
 }
 
+// TestApplyStore_FindNextApplyClaimsRetryable verifies the storage-level retry
+// claim behavior. The caller sees the retryable state that was claimed, while
+// the stored row is leased as running with an incremented apply attempt.
+func TestApplyStore_FindNextApplyClaimsRetryable(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_claim", 500, state.Apply.FailedRetryable, "staging")
+
+	claimed, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.FailedRetryable, claimed.State)
+	assert.Equal(t, 1, claimed.Attempt)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Running, persisted.State)
+	assert.Equal(t, 1, persisted.Attempt)
+
+	claimedAgain, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimedAgain)
+}
+
+func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_pending_claim", 502, state.Apply.Pending, "staging")
+
+	claimedBeforeTasks, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimedBeforeTasks, "pending applies are not ready for scheduler dispatch until their tasks are persisted")
+
+	now := time.Now()
+	_, err = store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_pending_claim",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Pending,
+		TableName:      "users",
+		DDL:            "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+		DDLAction:      "CREATE",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.Pending, claimed.State)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Running, persisted.State)
+}
+
+// TestApplyStore_ExpireRetryable verifies retry budget exhaustion at the
+// storage layer. A retryable apply that has used all attempts becomes failed,
+// and unfinished tasks are finalized as failed with completion timestamps.
+func TestApplyStore_ExpireRetryable(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_expired", 501, state.Apply.FailedRetryable, "staging")
+	apply.Attempt = maxRecoveryAttempts
+	require.NoError(t, store.Applies().Update(ctx, apply))
+
+	now := time.Now()
+	_, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_retryable_expired",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.FailedRetryable,
+		Options:        []byte("{}"),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+	_, err = store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_retryable_pending",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Pending,
+		TableName:      "posts",
+		Options:        []byte("{}"),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	expired, err := store.Applies().ExpireRetryable(ctx)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, apply.ApplyIdentifier, expired[0].ApplyIdentifier)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Failed, persisted.State)
+	assert.NotNil(t, persisted.CompletedAt)
+
+	task, err := store.Tasks().Get(ctx, "task_retryable_expired")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.NotNil(t, task.CompletedAt)
+
+	pendingTask, err := store.Tasks().Get(ctx, "task_retryable_pending")
+	require.NoError(t, err)
+	require.NotNil(t, pendingTask)
+	assert.Equal(t, state.Task.Failed, pendingTask.State)
+	assert.NotNil(t, pendingTask.CompletedAt)
+}
+
 func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestination(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -733,6 +907,7 @@ func TestApplyStore_AllFields(t *testing.T) {
 		Engine:          "spirit",
 		State:           state.Apply.WaitingForCutover,
 		ErrorMessage:    "test error",
+		Attempt:         3,
 	}
 	apply.SetOptions(storage.ApplyOptions{
 		AllowUnsafe:  true,
@@ -769,6 +944,7 @@ func TestApplyStore_AllFields(t *testing.T) {
 	assert.Equal(t, "spirit", retrieved.Engine)
 	assert.Equal(t, state.Apply.Completed, retrieved.State)
 	assert.Equal(t, "test error", retrieved.ErrorMessage)
+	assert.Equal(t, 3, retrieved.Attempt)
 	assert.NotNil(t, retrieved.StartedAt)
 	assert.NotNil(t, retrieved.CompletedAt)
 

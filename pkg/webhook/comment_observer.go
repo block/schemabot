@@ -70,7 +70,6 @@ type CommentObserverConfig struct {
 }
 
 // SetApplyID sets the apply ID after the apply record is created.
-// Called by LocalClient.Apply() when consuming a pending observer.
 func (o *CommentObserver) SetApplyID(id int64) {
 	o.applyID = id
 }

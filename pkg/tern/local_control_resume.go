@@ -2,10 +2,13 @@ package tern
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -81,7 +84,10 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		if eng == nil {
 			return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 		}
-		controlReq := c.buildControlRequest(ctx, applyTasks[0], creds)
+		controlReq, err := c.buildControlRequest(ctx, applyTasks[0], creds)
+		if err != nil {
+			return nil, fmt.Errorf("build deferred deploy request: %w", err)
+		}
 		result, err := eng.Start(ctx, controlReq)
 		if err != nil {
 			return nil, fmt.Errorf("start deferred deploy: %w", err)
@@ -160,7 +166,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 	options := buildApplyOptions(apply)
 	oldApplyState := apply.State
 
-	if apply.GetOptions().DeferCutover {
+	if c.shouldUseAtomicResume(apply) {
 		logMsg := fmt.Sprintf("Resume requested: %d tasks resumed, %d already completed", len(resumeTasks), completedCount)
 		if err := c.launchAtomicResume(ctx, apply, resumeTasks, plan, options, logMsg); err != nil {
 			return nil, err
@@ -362,15 +368,43 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 
 // buildApplyOptions converts apply options to the string map used by the engine.
 func buildApplyOptions(apply *storage.Apply) map[string]string {
-	opts := apply.GetOptions()
-	options := make(map[string]string)
-	if opts.DeferCutover {
-		options["defer_cutover"] = "true"
+	return apply.GetOptions().Map()
+}
+
+func (c *LocalClient) shouldUseAtomicResume(apply *storage.Apply) bool {
+	return apply.GetOptions().DeferCutover || c.config.Type == storage.DatabaseTypeVitess
+}
+
+func (c *LocalClient) buildVitessResumeState(ctx context.Context, apply *storage.Apply) (*engine.ResumeState, error) {
+	vad, err := c.storage.VitessApplyData().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load Vitess apply data for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	if opts.AllowUnsafe {
-		options["allow_unsafe"] = "true"
+	return vitessApplyDataResumeState(vad, apply.ApplyIdentifier)
+}
+
+func vitessApplyDataResumeState(vad *storage.VitessApplyData, fallbackContext string) (*engine.ResumeState, error) {
+	if vad == nil {
+		return nil, fmt.Errorf("missing Vitess apply data")
 	}
-	return options
+	resumeContext := vad.MigrationContext
+	if resumeContext == "" {
+		resumeContext = fallbackContext
+	}
+	meta, err := json.Marshal(map[string]any{
+		"branch_name":        vad.BranchName,
+		"deploy_request_id":  vad.DeployRequestID,
+		"deploy_request_url": vad.DeployRequestURL,
+		"is_instant":         vad.IsInstant,
+		"deferred_deploy":    vad.DeferredDeploy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encode Vitess resume metadata: %w", err)
+	}
+	return &engine.ResumeState{
+		MigrationContext: resumeContext,
+		Metadata:         string(meta),
+	}, nil
 }
 
 // launchAtomicResume sends all DDLs to the engine in one call, marks tasks and
@@ -378,31 +412,47 @@ func buildApplyOptions(apply *storage.Apply) map[string]string {
 // in a background goroutine. Used by both Start() and ResumeApply().
 func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.Apply,
 	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string) error {
-
-	var ddls []string
-	for _, t := range tasks {
-		ddls = append(ddls, t.DDL)
-	}
-
 	creds := c.credentials()
 	eng := c.getEngine()
 
-	// Build table changes from the DDL list
-	var tableChanges []engine.TableChange
-	for _, ddl := range ddls {
-		tableChanges = append(tableChanges, engine.TableChange{DDL: ddl})
+	changesByNamespace := make(map[string][]engine.TableChange)
+	for _, task := range tasks {
+		namespace := task.Namespace
+		if namespace == "" {
+			namespace = plan.Database
+		}
+		changesByNamespace[namespace] = append(changesByNamespace[namespace], engine.TableChange{
+			Table: task.TableName,
+			DDL:   task.DDL,
+		})
+	}
+	namespaces := make([]string, 0, len(changesByNamespace))
+	for namespace := range changesByNamespace {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+	changes := make([]engine.SchemaChange, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		changes = append(changes, engine.SchemaChange{
+			Namespace:    namespace,
+			TableChanges: changesByNamespace[namespace],
+		})
 	}
 
-	// Resume atomic apply after restart. Use apply identifier as MigrationContext
-	// so Spirit can find existing checkpoint tables from the original run.
+	resumeState := &engine.ResumeState{MigrationContext: apply.ApplyIdentifier}
+	if c.config.Type == storage.DatabaseTypeVitess {
+		var err error
+		resumeState, err = c.buildVitessResumeState(ctx, apply)
+		if err != nil {
+			return err
+		}
+	}
+
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
-		Database: apply.Database,
-		Changes: []engine.SchemaChange{{
-			Namespace:    apply.Database,
-			TableChanges: tableChanges,
-		}},
+		Database:    apply.Database,
+		Changes:     changes,
 		Options:     options,
-		ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
+		ResumeState: resumeState,
 		Credentials: creds,
 	})
 	if err != nil {
@@ -431,9 +481,129 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	stopHeartbeat := c.startApplyHeartbeat(context.Background(), apply)
 	go func() {
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(context.Background(), apply, tasks, creds, nil)
+		c.pollForCompletionAtomic(context.Background(), apply, tasks, creds, result.ResumeState)
 	}()
 	return nil
+}
+
+// retryFailedApply re-dispatches an apply after a retryable engine failure.
+// Completed tasks are preserved; retryable tasks are reset to pending.
+func (c *LocalClient) retryFailedApply(ctx context.Context, apply *storage.Apply) error {
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		c.failApplyPermanently(ctx, apply, fmt.Sprintf("retry failed: load plan %d: %v", apply.PlanID, err))
+		return fmt.Errorf("load plan %d for retry apply %s: %w", apply.PlanID, apply.ApplyIdentifier, err)
+	}
+	if plan == nil {
+		errMsg := fmt.Sprintf("retry failed: plan %d not found", apply.PlanID)
+		c.failApplyPermanently(ctx, apply, errMsg)
+		return fmt.Errorf("retry apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
+
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		c.failApplyPermanently(ctx, apply, fmt.Sprintf("retry failed: load tasks: %v", err))
+		return fmt.Errorf("load tasks for retry apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(tasks) == 0 {
+		errMsg := "retry failed: no tasks found"
+		c.failApplyPermanently(ctx, apply, errMsg)
+		return fmt.Errorf("%s for apply %s", errMsg, apply.ApplyIdentifier)
+	}
+
+	resetTasks := 0
+	completedTasks := 0
+	pendingTasks := 0
+	for _, task := range tasks {
+		switch task.State {
+		case state.Task.Completed:
+			completedTasks++
+		case state.Task.Pending:
+			pendingTasks++
+		case state.Task.FailedRetryable:
+			resetTasks++
+		}
+		if task.State != state.Task.FailedRetryable {
+			continue
+		}
+		task.State = state.Task.Pending
+		task.ErrorMessage = ""
+		task.CompletedAt = nil
+		task.Attempt++
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			return fmt.Errorf("reset retryable task %s: %w", task.TaskIdentifier, err)
+		}
+	}
+
+	now := time.Now()
+	apply.State = state.Apply.Running
+	apply.ErrorMessage = ""
+	apply.CompletedAt = nil
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return fmt.Errorf("mark retry apply %s running: %w", apply.ApplyIdentifier, err)
+	}
+
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Retry attempt %d: re-dispatching apply", apply.Attempt), state.Apply.FailedRetryable, state.Apply.Running)
+	c.logger.Info("retrying failed apply",
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"environment", apply.Environment,
+		"attempt", apply.Attempt,
+		"reset_tasks", resetTasks,
+		"pending_tasks", pendingTasks,
+		"completed_tasks", completedTasks,
+		"task_count", len(tasks))
+
+	options := buildApplyOptions(apply)
+	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
+	c.cancelMu.Lock()
+	c.cancelApply = cancelApply
+	c.cancelMu.Unlock()
+	if c.shouldUseAtomicResume(apply) {
+		go c.runWithRecovery(applyCtx, apply, tasks, func() {
+			c.executeApplyAtomic(applyCtx, apply, tasks, plan, options)
+		})
+	} else {
+		go c.runWithRecovery(applyCtx, apply, tasks, func() {
+			c.executeApplySequential(applyCtx, apply, tasks, plan, options)
+		})
+	}
+
+	return nil
+}
+
+// failApplyPermanently marks an apply as permanently failed.
+func (c *LocalClient) failApplyPermanently(ctx context.Context, apply *storage.Apply, errMsg string) {
+	now := time.Now()
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		c.logger.Error("failed to load tasks before permanent apply failure",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+	} else {
+		for _, task := range tasks {
+			if state.IsTerminalTaskState(task.State) {
+				continue
+			}
+			task.State = state.Task.Failed
+			task.ErrorMessage = errMsg
+			task.CompletedAt = &now
+			if err := c.storage.Tasks().Update(ctx, task); err != nil {
+				c.logger.Error("failed to mark task as permanently failed",
+					"task_id", task.TaskIdentifier, "apply_id", apply.ApplyIdentifier, "error", err)
+			}
+		}
+	}
+	apply.State = state.Apply.Failed
+	apply.ErrorMessage = errMsg
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to mark apply as permanently failed",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+	}
+	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
@@ -447,6 +617,21 @@ func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*stor
 // This can happen after a server restart or if the worker goroutine crashed.
 // Spirit's checkpoint table allows resuming from where the schema change left off.
 func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+	claimedRetryable := apply.State == state.Apply.FailedRetryable
+
+	fresh, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("refresh apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if fresh == nil {
+		return fmt.Errorf("apply %s not found during refresh", apply.ApplyIdentifier)
+	}
+	apply = fresh
+
+	if claimedRetryable || apply.State == state.Apply.FailedRetryable {
+		return c.retryFailedApply(ctx, apply)
+	}
+
 	// Get tasks for this apply
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
@@ -463,6 +648,24 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		}
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
+	}
+
+	if shouldDispatchPendingApply(apply, tasks) {
+		c.logger.Info("dispatching queued apply",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"task_count", len(tasks))
+		return c.dispatchPendingApply(ctx, apply, tasks)
+	}
+
+	if hasRetryableTask(tasks) {
+		c.logger.Info("retryable tasks found during apply recovery, using retry path",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"state", apply.State)
+		return c.retryFailedApply(ctx, apply)
 	}
 
 	// Get the plan to retrieve original DDLs
@@ -515,7 +718,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 
 	options := buildApplyOptions(apply)
 
-	if apply.GetOptions().DeferCutover {
+	if c.shouldUseAtomicResume(apply) {
 		if err := c.launchAtomicResume(ctx, apply, activeTasks, plan, options, "Apply resumed from checkpoint (atomic)"); err != nil {
 			c.logger.Error("engine apply failed during recovery",
 				"apply_id", apply.ApplyIdentifier,
@@ -540,4 +743,59 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	}
 
 	return nil
+}
+
+func shouldDispatchPendingApply(apply *storage.Apply, tasks []*storage.Task) bool {
+	if apply.StartedAt != nil {
+		return false
+	}
+	if apply.State != state.Apply.Pending && apply.State != state.Apply.Running {
+		return false
+	}
+	for _, task := range tasks {
+		if task.State != state.Task.Pending {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *LocalClient) dispatchPendingApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		c.failApplyPermanently(ctx, apply, fmt.Sprintf("queued apply failed: load plan %d: %v", apply.PlanID, err))
+		return fmt.Errorf("load plan %d for queued apply %s: %w", apply.PlanID, apply.ApplyIdentifier, err)
+	}
+	if plan == nil {
+		errMsg := fmt.Sprintf("queued apply failed: plan %d not found", apply.PlanID)
+		c.failApplyPermanently(ctx, apply, errMsg)
+		return fmt.Errorf("queued apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
+
+	c.registerPendingObserver(apply.ID)
+
+	options := buildApplyOptions(apply)
+	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
+	c.cancelMu.Lock()
+	c.cancelApply = cancelApply
+	c.cancelMu.Unlock()
+	if c.shouldUseAtomicResume(apply) {
+		go c.runWithRecovery(applyCtx, apply, tasks, func() {
+			c.executeApplyAtomic(applyCtx, apply, tasks, plan, options)
+		})
+	} else {
+		go c.runWithRecovery(applyCtx, apply, tasks, func() {
+			c.executeApplySequential(applyCtx, apply, tasks, plan, options)
+		})
+	}
+	return nil
+}
+
+func hasRetryableTask(tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if task.State == state.Task.FailedRetryable {
+			return true
+		}
+	}
+	return false
 }

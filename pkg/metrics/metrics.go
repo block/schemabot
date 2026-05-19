@@ -299,6 +299,26 @@ func RecordSchedulerClaimDuration(ctx context.Context, duration time.Duration, d
 	)
 }
 
+// RecordSchedulerExpired increments the counter for a retryable apply whose
+// retry budget was exhausted by the scheduler.
+func RecordSchedulerExpired(ctx context.Context, database, environment string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.scheduler.expired_retryable_total",
+		otelmetric.WithDescription("Total number of retryable applies expired by the scheduler"),
+		otelmetric.WithUnit("{apply}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create scheduler expired retryable counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+			attribute.String("environment", environment),
+		),
+	)
+}
+
 // knownWebhookEvents limits metric cardinality to expected GitHub event types.
 var knownWebhookEvents = map[string]bool{
 	"issue_comment": true,

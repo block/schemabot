@@ -1143,13 +1143,12 @@ func TestLocalClient_Apply_AtomicRejectsMultiNamespace(t *testing.T) {
 
 	// The apply should fail with multi-namespace error
 	require.Eventually(t, func() bool {
-		applies, err := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
-		if err != nil || len(applies) == 0 {
+		apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyResp.ApplyId)
+		if err != nil || apply == nil {
 			return false
 		}
-		latest := applies[0]
-		return latest.State == state.Apply.Failed &&
-			strings.Contains(latest.ErrorMessage, "one namespace per apply")
+		return apply.State == state.Apply.Failed &&
+			strings.Contains(apply.ErrorMessage, "one namespace per apply")
 	}, 10*time.Second, 200*time.Millisecond, "apply should fail with multi-namespace error")
 }
 
@@ -1224,17 +1223,18 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 
 	// Wait for completion
 	require.Eventually(t, func() bool {
-		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
-		if len(applies) == 0 {
+		apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyResp.ApplyId)
+		if err != nil || apply == nil {
 			return false
 		}
-		return applies[0].State == state.Apply.Completed
+		return apply.State == state.Apply.Completed
 	}, 30*time.Second, 500*time.Millisecond, "apply should complete")
 
 	// Verify task has correct namespace and progress was persisted
-	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
-	require.NotEmpty(t, applies)
-	tasks, err := stor.Tasks().GetByApplyID(ctx, applies[0].ID)
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyResp.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotEmpty(t, tasks)
 
@@ -1244,9 +1244,10 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, task.State)
 }
 
-// TestLocalClient_Apply_FailedAtomicHasErrorMessage verifies that when an atomic
-// apply fails, the error message propagates to the apply record. Uses a plan
-// with an invalid DDL (ALTER on nonexistent table) to trigger a Spirit failure.
+// TestLocalClient_Apply_FailedAtomicHasErrorMessage verifies that a retryable
+// atomic apply failure keeps the error message on the apply record. The plan
+// uses an ALTER on a nonexistent table so the failure happens during Spirit
+// execution.
 func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -1294,23 +1295,25 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, applyResp.Accepted, "apply should be accepted: %s", applyResp.ErrorMessage)
 
-	// Wait for failure
+	// Wait for the retryable failure state the scheduler can claim later.
 	require.Eventually(t, func() bool {
-		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
-		if len(applies) == 0 {
+		apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyResp.ApplyId)
+		if err != nil || apply == nil {
 			return false
 		}
-		return applies[0].State == state.Apply.Failed
-	}, 30*time.Second, 500*time.Millisecond, "apply should fail")
+		return apply.State == state.Apply.FailedRetryable
+	}, 30*time.Second, 500*time.Millisecond, "apply should fail retryably")
 
-	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
-	require.NotEmpty(t, applies)
-	assert.NotEmpty(t, applies[0].ErrorMessage, "apply.ErrorMessage should contain the failure reason")
-	t.Logf("apply error: %s", applies[0].ErrorMessage)
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyResp.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.NotEmpty(t, apply.ErrorMessage, "apply.ErrorMessage should contain the failure reason")
+	t.Logf("apply error: %s", apply.ErrorMessage)
 
 	// Verify task also has error
-	tasks, err := stor.Tasks().GetByApplyID(ctx, applies[0].ID)
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotEmpty(t, tasks)
+	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
 	assert.NotEmpty(t, tasks[0].ErrorMessage, "task.ErrorMessage should contain the failure reason")
 }

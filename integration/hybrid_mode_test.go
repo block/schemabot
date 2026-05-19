@@ -131,6 +131,7 @@ func TestHybridMode_LocalAndGRPC(t *testing.T) {
 		"default/staging": grpcClient,
 	}, logger)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
+	startTestScheduler(t, svc)
 
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)

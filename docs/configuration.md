@@ -71,7 +71,7 @@ scheduler_workers: 4
 
 Increase `scheduler_workers` when one SchemaBot server should make scheduler progress across independent databases or environments concurrently. More workers help high-scale installations with many schema changes because each worker can claim and resume a different target during the same scheduler tick. The scheduler still excludes overlapping work for the same database and environment, so this improves concurrency across independent targets, not parallel execution against one target.
 
-A scheduler claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the worker's lease while it reloads state and resumes the apply.
+A scheduler claim means selecting one queued, stale, or retryable apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the worker's lease while it reloads state and starts or resumes the apply.
 
 ## Repository Allowlist
 

@@ -178,7 +178,10 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 	defer utils.CloseAndLog(schemabotDB)
 	schemabotStorage := schemabotmysql.New(schemabotDB)
 
-	ternClient, err := tern.NewGRPCClient(tern.Config{Address: ternGRPCAddr})
+	ternClient, err := tern.NewGRPCClient(tern.Config{
+		Address: ternGRPCAddr,
+		Storage: schemabotStorage,
+	})
 	require.NoError(t, err, "create tern client")
 	defer utils.CloseAndLog(ternClient)
 
@@ -191,6 +194,7 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 		"default/staging": ternClient,
 	}, logger)
 	defer utils.CloseAndLog(svc)
+	startTestScheduler(t, svc)
 
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
@@ -257,10 +261,19 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 	applyID, ok := applyResult["apply_id"].(string)
 	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResult)
 
-	// Step 3: Verify external_id is stored in SchemaBot's storage
-	storedApply, err := schemabotStorage.Applies().GetByApplyIdentifier(ctx, applyID)
-	require.NoError(t, err, "get apply by identifier")
-	require.NotNil(t, storedApply, "apply %s not found in storage", applyID)
+	// Step 3: Scheduler dispatch stores the remote Tern ID after the worker
+	// claims the queued apply.
+	var storedApply *storage.Apply
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		storedApply, err = schemabotStorage.Applies().GetByApplyIdentifier(ctx, applyID)
+		require.NoError(t, err, "get apply by identifier")
+		require.NotNil(t, storedApply, "apply %s not found in storage", applyID)
+		if storedApply.ExternalID != "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	assert.NotEmpty(t, storedApply.ExternalID, "external_id is empty, expected it to be set from remote Tern's apply_id")
 	assert.NotEqual(t, applyID, storedApply.ExternalID,
@@ -317,6 +330,7 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 		"default/staging": ternClient,
 	}, logger)
 	defer utils.CloseAndLog(svc)
+	startTestScheduler(t, svc)
 
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
@@ -496,7 +510,10 @@ func TestGRPC_Deployment_StoredOnApply(t *testing.T) {
 	defer utils.CloseAndLog(schemabotDB)
 	schemabotStorage := schemabotmysql.New(schemabotDB)
 
-	ternClient, err := tern.NewGRPCClient(tern.Config{Address: ternGRPCAddr})
+	ternClient, err := tern.NewGRPCClient(tern.Config{
+		Address: ternGRPCAddr,
+		Storage: schemabotStorage,
+	})
 	require.NoError(t, err, "create tern client")
 	defer utils.CloseAndLog(ternClient)
 
@@ -510,6 +527,7 @@ func TestGRPC_Deployment_StoredOnApply(t *testing.T) {
 		"us-west/staging": ternClient,
 	}, logger)
 	defer utils.CloseAndLog(svc)
+	startTestScheduler(t, svc)
 
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)

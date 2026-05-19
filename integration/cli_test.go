@@ -866,6 +866,7 @@ func startSchemaBotLocal(t *testing.T) string {
 
 	svc := schemabotapi.New(storage, config, ternClients, logger)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
+	startTestScheduler(t, svc)
 
 	// Start HTTP server
 	mux := http.NewServeMux()
@@ -947,6 +948,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 
 	svc := schemabotapi.New(storage, config, ternClients, logger)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
+	startTestScheduler(t, svc)
 
 	// Start HTTP server
 	mux := http.NewServeMux()
@@ -985,7 +987,10 @@ func startSchemaBotWithGRPC(t *testing.T) string {
 	storage := mysqlstore.New(db)
 
 	// Create gRPC client to connect to the Tern gRPC server
-	ternClient, err := tern.NewGRPCClient(tern.Config{Address: grpcAddr})
+	ternClient, err := tern.NewGRPCClient(tern.Config{
+		Address: grpcAddr,
+		Storage: storage,
+	})
 	require.NoError(t, err, "create tern client")
 	t.Cleanup(func() { utils.CloseAndLog(ternClient) })
 
@@ -1006,6 +1011,7 @@ func startSchemaBotWithGRPC(t *testing.T) string {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := schemabotapi.New(storage, config, ternClients, logger)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
+	startTestScheduler(t, svc)
 
 	// Start HTTP server
 	mux := http.NewServeMux()

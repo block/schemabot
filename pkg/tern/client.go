@@ -51,10 +51,9 @@ type Client interface {
 	// Health checks the service health.
 	Health(ctx context.Context) error
 
-	// ResumeApply resumes an in-progress apply whose heartbeat has expired.
-	// Uses checkpoint/resume capabilities of the underlying engine.
-	// This is called by Service.RecoverInProgress on startup for applies
-	// with stale heartbeats (crashed workers).
+	// ResumeApply starts or resumes apply work claimed by the scheduler.
+	// Pending applies are fresh queued work. Stale active applies use
+	// checkpoint/resume capabilities of the underlying engine.
 	ResumeApply(ctx context.Context, apply *storage.Apply) error
 
 	// Endpoint returns the address this client connects to.
@@ -65,16 +64,15 @@ type Client interface {
 	// IsRemote reports whether this client delegates to a separate Tern
 	// service with its own storage.
 	//
-	// When true (GRPCClient): ExecuteApply creates apply/task records in
-	// SchemaBot's storage and stores Tern's apply_id as external_id.
+	// When true (GRPCClient): scheduler dispatch stores the remote Tern apply_id
+	// as external_id after remote Tern accepts the apply.
 	//
-	// When false (LocalClient): Apply() already created the records in the
-	// same database — ExecuteApply reuses them.
+	// When false (LocalClient): execution uses SchemaBot's local apply_id.
 	IsRemote() bool
 
-	// SetPendingObserver sets an observer that will be consumed by the next
-	// Apply() call. The observer is registered before the engine starts,
-	// preventing the race where the apply completes before the observer is set.
+	// SetPendingObserver sets an observer that direct client Apply callers can
+	// consume before engine work starts. API callers register observers through
+	// Service.SetPendingObserver.
 	SetPendingObserver(observer ProgressObserver)
 
 	// SetObserver registers a progress observer for an active apply.

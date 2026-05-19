@@ -10,13 +10,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -57,21 +60,20 @@ func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.
 func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
 func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
 
-type mockStorageWithPlanLookup struct {
-	mockStorage
-	plans storage.PlanStore
-}
-
-func (m *mockStorageWithPlanLookup) Plans() storage.PlanStore { return m.plans }
-
 type mockStorageWithApplyStores struct {
 	mockStorage
-	plans   storage.PlanStore
-	applies storage.ApplyStore
+	plans     storage.PlanStore
+	applies   storage.ApplyStore
+	tasks     storage.TaskStore
+	locks     storage.LockStore
+	applyLogs storage.ApplyLogStore
 }
 
-func (m *mockStorageWithApplyStores) Plans() storage.PlanStore    { return m.plans }
-func (m *mockStorageWithApplyStores) Applies() storage.ApplyStore { return m.applies }
+func (m *mockStorageWithApplyStores) Plans() storage.PlanStore         { return m.plans }
+func (m *mockStorageWithApplyStores) Applies() storage.ApplyStore      { return m.applies }
+func (m *mockStorageWithApplyStores) Tasks() storage.TaskStore         { return m.tasks }
+func (m *mockStorageWithApplyStores) Locks() storage.LockStore         { return m.locks }
+func (m *mockStorageWithApplyStores) ApplyLogs() storage.ApplyLogStore { return m.applyLogs }
 
 type staticPlanStore struct {
 	storage.PlanStore
@@ -83,14 +85,75 @@ func (s *staticPlanStore) Get(context.Context, string) (*storage.Plan, error) {
 	return s.plan, s.err
 }
 
-type staticApplyStore struct {
+type capturingApplyStore struct {
 	storage.ApplyStore
-	apply *storage.Apply
+	mu      sync.Mutex
+	apply   *storage.Apply
+	claimed bool
+	findCh  chan struct{}
+	err     error
+}
+
+func (s *capturingApplyStore) Create(_ context.Context, apply *storage.Apply) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.apply = apply
+	if s.err != nil {
+		return 0, s.err
+	}
+	return 123, nil
+}
+
+func (s *capturingApplyStore) FindNextApply(context.Context) (*storage.Apply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.findCh != nil {
+		select {
+		case s.findCh <- struct{}{}:
+		default:
+		}
+	}
+	if s.apply == nil || s.claimed {
+		return nil, nil
+	}
+	s.claimed = true
+	apply := *s.apply
+	apply.ID = 123
+	return &apply, nil
+}
+
+func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.Apply, error) {
+	return nil, nil
+}
+
+type capturingTaskStore struct {
+	storage.TaskStore
+	tasks []*storage.Task
 	err   error
 }
 
-func (s *staticApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
-	return s.apply, s.err
+func (s *capturingTaskStore) Create(_ context.Context, task *storage.Task) (int64, error) {
+	s.tasks = append(s.tasks, task)
+	if s.err != nil {
+		return 0, s.err
+	}
+	return int64(len(s.tasks)), nil
+}
+
+type emptyLockStore struct {
+	storage.LockStore
+}
+
+func (s *emptyLockStore) Get(context.Context, string, string) (*storage.Lock, error) {
+	return nil, nil
+}
+
+type noopApplyLogStore struct {
+	storage.ApplyLogStore
+}
+
+func (s *noopApplyLogStore) Append(context.Context, *storage.ApplyLog) error {
+	return nil
 }
 
 // mockTernClient implements tern.Client for testing.
@@ -116,6 +179,10 @@ type mockTernClient struct {
 	skipRevertResp *ternv1.SkipRevertResponse
 	skipRevertErr  error
 	skipRevertReq  *ternv1.SkipRevertRequest // captured request
+	resumeMu       sync.Mutex
+	resumeErr      error
+	resumeApply    *storage.Apply
+	resumeCh       chan *storage.Apply
 	isRemote       bool
 }
 
@@ -178,7 +245,19 @@ func (m *mockTernClient) RollbackPlan(ctx context.Context, database string) (*te
 	return nil, nil
 }
 func (m *mockTernClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
-	return nil
+	m.resumeMu.Lock()
+	m.resumeApply = apply
+	resumeCh := m.resumeCh
+	resumeErr := m.resumeErr
+	m.resumeMu.Unlock()
+
+	if resumeCh != nil {
+		select {
+		case resumeCh <- apply:
+		default:
+		}
+	}
+	return resumeErr
 }
 func (m *mockTernClient) Endpoint() string                                  { return "mock" }
 func (m *mockTernClient) IsRemote() bool                                    { return m.isRemote }
@@ -222,14 +301,18 @@ func executeApplyTestPlan() *storage.Plan {
 	}
 }
 
-func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) *Service {
+func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) (*Service, *capturingTaskStore) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
 	return New(&mockStorageWithApplyStores{
-		plans:   &staticPlanStore{plan: executeApplyTestPlan()},
-		applies: applies,
+		plans:     &staticPlanStore{plan: executeApplyTestPlan()},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
 	}, testServerConfig(), map[string]tern.Client{
 		"default/staging": client,
-	}, logger)
+	}, logger), tasks
 }
 
 func newTestService() *Service {
@@ -237,42 +320,64 @@ func newTestService() *Service {
 	return New(&mockStorage{}, testServerConfig(), nil, logger)
 }
 
-func TestExecuteApplyRequiresApplyIDs(t *testing.T) {
-	t.Run("accepted response requires engine apply id", func(t *testing.T) {
-		svc := newExecuteApplyTestService(&mockTernClient{
-			applyResp: &ternv1.ApplyResponse{Accepted: true},
-		}, nil)
+func TestExecuteApplyQueuesApplyForScheduler(t *testing.T) {
+	applies := &capturingApplyStore{}
+	mock := &mockTernClient{}
+	svc, tasks := newExecuteApplyTestService(mock, applies)
 
-		resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
-			PlanID:      "plan-1",
-			Environment: "staging",
-		})
-
-		require.Error(t, err)
-		assert.Nil(t, resp)
-		assert.Zero(t, applyID)
-		assert.Contains(t, err.Error(), "accepted apply missing apply_id")
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+		Target:      "target-1",
 	})
 
-	t.Run("accepted response requires stored apply id", func(t *testing.T) {
-		svc := newExecuteApplyTestService(&mockTernClient{
-			applyResp: &ternv1.ApplyResponse{Accepted: true, ApplyId: "apply-123"},
-		}, &staticApplyStore{
-			apply: &storage.Apply{
-				ApplyIdentifier: "apply-123",
-			},
-		})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(123), applyID)
+	assert.NotEmpty(t, resp.ApplyID)
+	require.NotNil(t, applies.apply)
+	assert.Equal(t, state.Apply.Pending, applies.apply.State)
+	assert.Equal(t, storage.EngineSpirit, applies.apply.Engine)
+	assert.Equal(t, "target-1", applies.apply.GetOptions().Target)
+	assert.Nil(t, mock.applyReq, "request path should enqueue work without dispatching the engine")
+	require.Len(t, tasks.tasks, 1)
+	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
+}
 
-		resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
-			PlanID:      "plan-1",
-			Environment: "staging",
-		})
+func TestExecuteApplyWakesSchedulerForQueuedApply(t *testing.T) {
+	applies := &capturingApplyStore{findCh: make(chan struct{}, 1)}
+	mock := &mockTernClient{resumeCh: make(chan *storage.Apply, 1)}
+	svc, _ := newExecuteApplyTestService(mock, applies)
+	svc.config.SchedulerWorkers = 1
+	require.NoError(t, svc.SetSchedulerPollInterval(time.Hour))
+	svc.StartScheduler(t.Context())
+	t.Cleanup(svc.StopScheduler)
 
-		require.Error(t, err)
-		assert.Nil(t, resp)
-		assert.Zero(t, applyID)
-		assert.Contains(t, err.Error(), "accepted apply missing stored apply id")
+	select {
+	case <-applies.findCh:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "scheduler did not perform startup claim")
+	}
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+		Target:      "target-1",
 	})
+
+	require.NoError(t, err)
+	require.True(t, resp.Accepted)
+	assert.Equal(t, int64(123), applyID)
+
+	select {
+	case resumedApply := <-mock.resumeCh:
+		assert.Equal(t, int64(123), resumedApply.ID)
+		assert.Equal(t, state.Apply.Pending, resumedApply.State)
+		assert.Equal(t, "testdb", resumedApply.Database)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "scheduler did not resume queued apply after wake")
+	}
 }
 
 func TestHealth(t *testing.T) {
@@ -326,11 +431,13 @@ func TestApplyHandler(t *testing.T) {
 			DatabaseType:   storage.DatabaseTypeMySQL,
 			Environment:    "staging",
 		}
-		stor := &mockStorageWithPlanLookup{
-			plans: &mockPlanLookupStore{plan: plan},
-		}
-		mock := &mockTernClient{
-			applyErr: fmt.Errorf("create apply: %w", storage.ErrActiveApplyExists),
+		mock := &mockTernClient{}
+		stor := &mockStorageWithApplyStores{
+			plans:     &mockPlanLookupStore{plan: plan},
+			applies:   &capturingApplyStore{err: fmt.Errorf("create apply: %w", storage.ErrActiveApplyExists)},
+			tasks:     &capturingTaskStore{},
+			locks:     &emptyLockStore{},
+			applyLogs: &noopApplyLogStore{},
 		}
 		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 		ternClients := map[string]tern.Client{"default/staging": mock}
@@ -345,9 +452,7 @@ func TestApplyHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
-		require.NotNil(t, mock.applyReq)
-		assert.Equal(t, "testdb", mock.applyReq.Database)
-		assert.Equal(t, storage.DatabaseTypeMySQL, mock.applyReq.Type)
+		assert.Nil(t, mock.applyReq, "request path should not dispatch apply work")
 
 		var resp apitypes.ErrorResponse
 		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
@@ -824,6 +929,7 @@ func TestDeriveErrorCode(t *testing.T) {
 	}{
 		{"failed with error", "failed", "Spirit: table copy failed", apitypes.ErrCodeEngineError},
 		{"failed without error", "failed", "", ""},
+		{"retryable failed with error", state.Apply.FailedRetryable, "connection reset", apitypes.ErrCodeEngineErrorRetryable},
 		{"running with error", "running", "something", ""},
 		{"completed", "completed", "", ""},
 		{"stopped", "stopped", "", ""},

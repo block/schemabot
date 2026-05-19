@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	schemabotapi "github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/storage"
 	schemabotmysql "github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -65,6 +66,7 @@ func TestResolveApplyID_ControlOperations(t *testing.T) {
 		"default/staging": ternClient,
 	}, logger)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
+	startTestScheduler(t, svc)
 
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
@@ -130,10 +132,18 @@ func TestResolveApplyID_ControlOperations(t *testing.T) {
 	applyIdentifier, ok := applyResult["apply_id"].(string)
 	require.True(t, ok && applyIdentifier != "", "apply response missing apply_id")
 
-	// 5. Verify apply_identifier != external_id.
-	storedApply, err := st.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
-	require.NoError(t, err)
-	require.NotNil(t, storedApply, "apply not found in storage")
+	// 5. Scheduler dispatch stores the remote Tern ID after claiming the apply.
+	var storedApply *storage.Apply
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		storedApply, err = st.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, storedApply, "apply not found in storage")
+		if storedApply.ExternalID != "" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	require.NotEmpty(t, storedApply.ExternalID, "external_id should be set by remote Tern")
 	require.NotEqual(t, applyIdentifier, storedApply.ExternalID,
 		"apply_identifier and external_id must differ — resolveApplyID translates between them")

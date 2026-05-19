@@ -531,6 +531,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		State:        state,
 		Message:      message,
 		ErrorMessage: rm.errorMessage,
+		Retryable:    state == engine.StateFailed,
 		Tables:       tableProgress,
 		ResumeState:  req.ResumeState,
 	}, nil

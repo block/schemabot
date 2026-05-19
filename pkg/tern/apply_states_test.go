@@ -244,6 +244,14 @@ func TestDeriveOverallState(t *testing.T) {
 			},
 			wantState: state.Task.Failed,
 		},
+		{
+			name: "retryable failure takes priority over pending",
+			tasks: []*storage.Task{
+				{State: state.Task.Pending},
+				{State: state.Task.FailedRetryable},
+			},
+			wantState: state.Task.FailedRetryable,
+		},
 	}
 
 	for _, tt := range tests {
@@ -252,6 +260,84 @@ func TestDeriveOverallState(t *testing.T) {
 			assert.Equal(t, tt.wantState, got)
 		})
 	}
+}
+
+func TestEngineResultTaskState_RetryableProgress(t *testing.T) {
+	c := &LocalClient{}
+
+	tests := []struct {
+		name   string
+		result *engine.ProgressResult
+		want   string
+	}{
+		{
+			name:   "failed retryable progress maps to failed_retryable task",
+			result: &engine.ProgressResult{State: engine.StateFailed, Retryable: true},
+			want:   state.Task.FailedRetryable,
+		},
+		{
+			name:   "failed permanent progress maps to failed task",
+			result: &engine.ProgressResult{State: engine.StateFailed},
+			want:   state.Task.Failed,
+		},
+		{
+			name:   "non-failed progress follows state conversion",
+			result: &engine.ProgressResult{State: engine.StateRunning},
+			want:   state.Task.Running,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, c.engineResultTaskState(tt.result))
+		})
+	}
+}
+
+// TestBuildApplyOptionsPreservesStoredOptions verifies that retry and resume
+// dispatches rebuild the engine option map from persisted apply metadata.
+func TestBuildApplyOptionsPreservesStoredOptions(t *testing.T) {
+	apply := &storage.Apply{}
+	apply.SetOptions(storage.ApplyOptions{
+		AllowUnsafe:  true,
+		Branch:       "schema-change-branch",
+		DeferCutover: true,
+		DeferDeploy:  true,
+		SkipRevert:   true,
+		Volume:       7,
+	})
+
+	assert.Equal(t, map[string]string{
+		"allow_unsafe":  "true",
+		"branch":        "schema-change-branch",
+		"defer_cutover": "true",
+		"defer_deploy":  "true",
+		"skip_revert":   "true",
+		"volume":        "7",
+	}, buildApplyOptions(apply))
+}
+
+// TestVitessApplyDataResumeState verifies that persisted Vitess metadata is
+// converted back into generic resume metadata before scheduler recovery calls
+// the engine.
+func TestVitessApplyDataResumeState(t *testing.T) {
+	resumeState, err := vitessApplyDataResumeState(&storage.VitessApplyData{
+		BranchName:       "schema-change-branch",
+		DeployRequestID:  42,
+		DeployRequestURL: "http://localhost/deploy-requests/42",
+		IsInstant:        true,
+		DeferredDeploy:   true,
+	}, "fallback-context")
+	require.NoError(t, err)
+
+	assert.Equal(t, "fallback-context", resumeState.MigrationContext)
+	var metadata map[string]any
+	require.NoError(t, json.Unmarshal([]byte(resumeState.Metadata), &metadata))
+	assert.Equal(t, "schema-change-branch", metadata["branch_name"])
+	assert.Equal(t, float64(42), metadata["deploy_request_id"])
+	assert.Equal(t, "http://localhost/deploy-requests/42", metadata["deploy_request_url"])
+	assert.Equal(t, true, metadata["is_instant"])
+	assert.Equal(t, true, metadata["deferred_deploy"])
 }
 
 func TestVSchemaTasksCreatedAlongsideDDL(t *testing.T) {

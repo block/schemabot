@@ -70,7 +70,7 @@ package tern
 //   - external_id: Tern's apply_id (the remote engine's apply identifier), used in all
 //     gRPC calls to the remote Tern (Progress, Stop, Start, Cutover, etc.).
 //
-// gRPC mode flow:
+// gRPC mode progress flow after scheduler dispatch:
 //
 //	CLI/caller
 //	    │ apply_identifier="apply-abc123"
@@ -87,16 +87,14 @@ package tern
 //	    ▼
 //	ProgressResponse
 //
-// The API layer (plan_handlers.go) generates apply_identifier as a SchemaBot
-// UUID and stores Tern's resp.ApplyId as external_id. The resolveApplyID
-// helper translates apply_identifier → external_id before calling Tern.
+// The API layer generates apply_identifier as a SchemaBot UUID when it queues
+// the apply. The scheduler later dispatches the queued apply to remote Tern and
+// stores Tern's ApplyId as external_id. The resolveApplyID helper translates
+// apply_identifier → external_id before calling Tern.
 //
-// In local mode (client.IsRemote() == false), the LocalClient runs in the
-// same process and writes to the same database as the API layer. It creates
-// the apply record (with no external_id) before ExecuteApply runs.
-// ExecuteApply sees IsRemote() == false and keeps applyIdentifier =
-// resp.ApplyId, leaving external_id empty. LocalClient uses apply_id
-// when provided, falling back to database lookup.
+// In local mode, LocalClient runs in the same process and writes to the same
+// database as the API layer. There is no remote Tern ID, so external_id stays
+// empty and resolveApplyID falls through to the SchemaBot apply_identifier.
 
 import (
 	"context"
@@ -109,6 +107,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -183,7 +183,7 @@ func (c *GRPCClient) IsRemote() bool { return true }
 // Endpoint returns the gRPC dial address for this client.
 func (c *GRPCClient) Endpoint() string { return c.address }
 
-// SetPendingObserver sets an observer consumed by the next Apply() call.
+// SetPendingObserver sets an observer consumed by direct Apply callers.
 func (c *GRPCClient) SetPendingObserver(observer ProgressObserver) {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()
@@ -253,6 +253,16 @@ func (c *GRPCClient) consumePendingObserver() ProgressObserver {
 	obs := c.pendingObserver
 	c.pendingObserver = nil
 	return obs
+}
+
+func (c *GRPCClient) registerPendingObserver(applyID int64) {
+	if obs := c.consumePendingObserver(); obs != nil {
+		type applyIDSetter interface{ SetApplyID(int64) }
+		if setter, ok := obs.(applyIDSetter); ok {
+			setter.SetApplyID(applyID)
+		}
+		c.SetObserver(applyID, obs)
+	}
 }
 
 // getObserver returns the observer for an apply, or nil.
@@ -350,20 +360,18 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 	return err
 }
 
-// ResumeApply starts background progress tracking for an apply.
-//
-// Called from two places:
-//   - ExecuteApply (fresh apply): the apply was just created in SchemaBot's
-//     storage but the background poller hasn't started yet. State is "pending".
-//   - RecoverInProgress (crash recovery): the apply's heartbeat expired,
-//     indicating the previous poller died. State may be "stopped" (needs
-//     Start RPC) or still "running"/"pending" (just needs a new poller).
-//
-// In contrast, LocalClient doesn't need this — it starts its own poller
-// inside LocalClient.Apply() because it shares the same storage.
+// ResumeApply starts or resumes background tracking for work claimed by the
+// scheduler. Fresh queued applies have no external_id yet, so this method first
+// dispatches them to remote Tern and stores the returned ID. Stale remote
+// applies already have external_id and only need progress tracking or control
+// RPCs restored.
 func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
 	if c.storage == nil {
 		return fmt.Errorf("storage not configured for GRPCClient")
+	}
+
+	if apply.ExternalID == "" && !state.IsTerminalApplyState(apply.State) {
+		return c.dispatchPendingApply(ctx, apply)
 	}
 
 	// Check the real state from Tern before deciding what to do. Local state
@@ -406,6 +414,159 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 	go c.pollForCompletion(context.Background(), apply)
 
 	return nil
+}
+
+func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Apply) error {
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		c.markDispatchFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load plan %d: %v", apply.PlanID, err), false)
+		return fmt.Errorf("load plan %d for queued gRPC apply %s: %w", apply.PlanID, apply.ApplyIdentifier, err)
+	}
+	if plan == nil {
+		errMsg := fmt.Sprintf("queued gRPC apply failed: plan %d not found", apply.PlanID)
+		c.markDispatchFailed(ctx, apply, nil, errMsg, false)
+		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
+
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		c.markDispatchFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load tasks: %v", err), false)
+		return fmt.Errorf("load tasks for queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(tasks) == 0 {
+		errMsg := "queued gRPC apply failed: no tasks found"
+		c.markDispatchFailed(ctx, apply, nil, errMsg, false)
+		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
+	if err := c.prepareDispatchTasks(ctx, apply, tasks); err != nil {
+		return err
+	}
+
+	options := apply.GetOptions().Map()
+	target := options["target"]
+	if target == "" {
+		target = apply.Database
+	}
+
+	resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      plan.PlanIdentifier,
+		Options:     options,
+		Database:    apply.Database,
+		Type:        apply.DatabaseType,
+		DdlChanges:  tasksToProtoTableChanges(tasks),
+		Environment: apply.Environment,
+		Target:      target,
+		Caller:      apply.Caller,
+	})
+	if err != nil {
+		c.markDispatchFailed(ctx, apply, tasks, err.Error(), engine.IsRetryable(err))
+		return fmt.Errorf("apply queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if resp == nil {
+		errMsg := "remote apply returned nil response"
+		c.markDispatchFailed(ctx, apply, tasks, errMsg, false)
+		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
+	if !resp.Accepted {
+		errMsg := resp.ErrorMessage
+		if errMsg == "" {
+			errMsg = "remote apply was not accepted"
+		}
+		c.markDispatchFailed(ctx, apply, tasks, errMsg, false)
+		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
+	if resp.ApplyId == "" {
+		errMsg := "remote apply accepted without apply_id"
+		c.markDispatchFailed(ctx, apply, tasks, errMsg, false)
+		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
+
+	now := time.Now()
+	apply.ExternalID = resp.ApplyId
+	apply.State = state.Apply.Running
+	apply.ErrorMessage = ""
+	apply.CompletedAt = nil
+	if apply.StartedAt == nil {
+		apply.StartedAt = &now
+	}
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return fmt.Errorf("store remote apply id for %s: %w", apply.ApplyIdentifier, err)
+	}
+
+	c.registerPendingObserver(apply.ID)
+	go c.pollForCompletion(context.Background(), apply)
+	return nil
+}
+
+func (c *GRPCClient) prepareDispatchTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
+	for _, task := range tasks {
+		if task.State != state.Task.FailedRetryable {
+			continue
+		}
+		task.State = state.Task.Pending
+		task.ErrorMessage = ""
+		task.CompletedAt = nil
+		task.Attempt++
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			return fmt.Errorf("reset retryable task %s for queued gRPC apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
+	}
+	return nil
+}
+
+func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
+	changes := make([]*ternv1.TableChange, 0, len(tasks))
+	for _, task := range tasks {
+		changes = append(changes, &ternv1.TableChange{
+			TableName:  task.TableName,
+			Ddl:        task.DDL,
+			ChangeType: ddlActionToProtoChangeType(task.DDLAction),
+			Namespace:  task.Namespace,
+		})
+	}
+	return changes
+}
+
+func (c *GRPCClient) markDispatchFailed(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, message string, retryable bool) {
+	now := time.Now()
+	taskState := state.Task.Failed
+	applyState := state.Apply.Failed
+	if retryable {
+		taskState = state.Task.FailedRetryable
+		applyState = state.Apply.FailedRetryable
+	}
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			continue
+		}
+		task.State = taskState
+		task.ErrorMessage = message
+		if !retryable {
+			task.CompletedAt = &now
+		}
+		task.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			slog.Error("failed to update task after gRPC dispatch failure",
+				"apply_id", apply.ApplyIdentifier,
+				"task_id", task.TaskIdentifier,
+				"error", err)
+		}
+	}
+	apply.State = applyState
+	apply.ErrorMessage = message
+	if !retryable {
+		apply.CompletedAt = &now
+	}
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		slog.Error("failed to update apply after gRPC dispatch failure",
+			"apply_id", apply.ApplyIdentifier,
+			"error", err)
+	}
+	if !retryable {
+		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+	}
 }
 
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
@@ -471,6 +632,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 			_ = c.storage.Applies().Update(ctx, apply)
 			if terminal {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 				return
 			}
 		}

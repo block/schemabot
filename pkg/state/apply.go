@@ -21,6 +21,7 @@ var Apply = struct {
 	RevertWindow      string
 	Completed         string
 	Failed            string
+	FailedRetryable   string
 	Stopped           string
 	Cancelled         string
 	Reverted          string
@@ -42,6 +43,7 @@ var Apply = struct {
 	RevertWindow:      "revert_window",
 	Completed:         "completed",
 	Failed:            "failed",
+	FailedRetryable:   "failed_retryable",
 	Stopped:           "stopped",
 	Cancelled:         "cancelled",
 	Reverted:          "reverted",
@@ -57,15 +59,16 @@ var Apply = struct {
 //
 // State priority (highest to lowest):
 //  1. Any task FAILED → Apply FAILED
-//  2. Any task STOPPED → Apply STOPPED
-//  3. Any task REVERTED → Apply REVERTED
-//  4. All tasks COMPLETED → Apply COMPLETED
-//  5. Any task CUTTING_OVER → Apply CUTTING_OVER
-//  6. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
-//  7. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
-//  8. Any task REVERT_WINDOW → Apply REVERT_WINDOW
-//  9. Any task RUNNING → Apply RUNNING
-//  10. Otherwise → Apply PENDING
+//  2. Any task FAILED_RETRYABLE → Apply FAILED_RETRYABLE
+//  3. Any task STOPPED → Apply STOPPED
+//  4. Any task REVERTED → Apply REVERTED
+//  5. All tasks COMPLETED → Apply COMPLETED
+//  6. Any task CUTTING_OVER → Apply CUTTING_OVER
+//  7. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
+//  8. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
+//  9. Any task REVERT_WINDOW → Apply REVERT_WINDOW
+//  10. Any task RUNNING → Apply RUNNING
+//  11. Otherwise → Apply PENDING
 //
 // taskStates should be the State field from each Task. Empty slice returns PENDING.
 func DeriveApplyState(taskStates []string) string {
@@ -82,6 +85,9 @@ func DeriveApplyState(taskStates []string) string {
 
 	if counts[Apply.Failed] > 0 {
 		return Apply.Failed
+	}
+	if counts[Apply.FailedRetryable] > 0 {
+		return Apply.FailedRetryable
 	}
 	if counts[Apply.Cancelled] > 0 {
 		return Apply.Cancelled
@@ -134,6 +140,8 @@ func normalizeApplyState(raw string) string {
 		return Apply.Completed
 	case "FAILED":
 		return Apply.Failed
+	case "FAILED_RETRYABLE":
+		return Apply.FailedRetryable
 	case "STOPPED":
 		return Apply.Stopped
 	case "CANCELLED":
@@ -164,7 +172,8 @@ func IsState(s string, expected ...string) bool {
 }
 
 // IsTerminalApplyState returns true if the state is a terminal state
-// where no further processing will occur.
+// where no further processing will occur. FailedRetryable is not terminal;
+// scheduler workers may claim and retry it.
 func IsTerminalApplyState(s string) bool {
 	switch s {
 	case Apply.Completed, Apply.Failed, Apply.Stopped, Apply.Cancelled, Apply.Reverted:

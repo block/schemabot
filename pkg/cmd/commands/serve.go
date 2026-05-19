@@ -147,10 +147,8 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	webhookRuntime.StartMissingSummaryReconciliation(ctx, logger)
 
 	// Start the scheduler worker pool after webhook callbacks are registered.
-	// This polls for stale applies every 10 seconds:
-	// - Runs immediately on startup
-	// - Recovers applies with stale heartbeats (> 1 minute) using FOR UPDATE SKIP LOCKED
-	// - STOPPED applies are NOT auto-resumed (user must call `schemabot start`)
+	// Workers claim queued applies, retryable failures, and stale in-progress
+	// applies using shared storage so every server instance can coordinate work.
 	svc.StartScheduler(ctx)
 
 	// Optionally start gRPC server for Tern proto (used by docker-compose.grpc.yml)

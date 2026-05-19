@@ -75,13 +75,13 @@ Lazy creation means a connection failure to one database doesn't block startup o
 
 ## Scheduler
 
-On startup, the service launches a background scheduler (`StartScheduler`) that claims apply work from storage. A claim means selecting one stale apply and refreshing its heartbeat in the same transaction so the worker has a lease while it resumes the apply.
+On startup, the service launches a background scheduler (`StartScheduler`) that claims apply work from storage. `/api/apply` queues an apply and its tasks durably; scheduler workers own the actual local-engine or remote-Tern dispatch. A claim means selecting one queued, stale, or retryable apply and refreshing its heartbeat in the same transaction so the worker has a lease while it resumes the apply.
 
-1. Runs immediately, then polls every 10 seconds per configured worker
-2. Finds applies with stale heartbeats (no update for 1+ minute)
+1. Runs immediately, wakes when `/api/apply` queues new work, then polls every 10 seconds per configured worker as a fallback
+2. Finds queued pending applies with tasks, applies with stale heartbeats (no update for 1+ minute), or retryable failures with retry budget remaining
 3. Claims one apply atomically by selecting it and refreshing its heartbeat in the same transaction
 4. Gets the appropriate Tern client for the database/environment
-5. Calls `ResumeApply()` so execution continues from persisted engine state
+5. Calls `ResumeApply()` so execution starts or continues from persisted state
 
 Stopped applies (user called `schemabot stop`) are **not** auto-resumed. The user must explicitly call `schemabot start`.
 
