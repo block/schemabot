@@ -410,7 +410,7 @@ func (c *LocalScaleContainer) GetTLSCerts(ctx context.Context) (*TLSCerts, error
 	return &certs, nil
 }
 
-// postAdmin sends a POST request to an admin endpoint and checks for success.
+// getAdmin sends a GET request to an admin endpoint and returns the response body.
 func (c *LocalScaleContainer) getAdmin(ctx context.Context, path string) (json.RawMessage, error) {
 	reqCtx, cancel := localScaleAdminContext(ctx)
 	defer cancel()
@@ -434,6 +434,7 @@ func (c *LocalScaleContainer) getAdmin(ctx context.Context, path string) (json.R
 	return body, nil
 }
 
+// postAdmin sends a POST request to an admin endpoint and checks for success.
 func (c *LocalScaleContainer) postAdmin(ctx context.Context, path string, body any) error {
 	var bodyReader *bytes.Reader
 	if body != nil {

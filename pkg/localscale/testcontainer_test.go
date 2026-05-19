@@ -11,15 +11,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	adminRequestTestTimeout = 75 * time.Millisecond
+	adminRequestHandlerWait = 500 * time.Millisecond
+)
+
 func TestLocalScaleContainerAdminRequestDefaultDeadline(t *testing.T) {
 	oldTimeout := localScaleAdminRequestTimeout
-	localScaleAdminRequestTimeout = 10 * time.Millisecond
+	localScaleAdminRequestTimeout = adminRequestTestTimeout
 	t.Cleanup(func() {
 		localScaleAdminRequestTimeout = oldTimeout
 	})
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(adminRequestHandlerWait)
 		w.WriteHeader(http.StatusGatewayTimeout)
 	}))
 	t.Cleanup(server.Close)
@@ -47,7 +52,7 @@ func TestLocalScaleContainerAdminRequestKeepsCallerDeadline(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), adminRequestTestTimeout)
 	defer cancel()
 
 	container := NewTestHelper(server.URL)
