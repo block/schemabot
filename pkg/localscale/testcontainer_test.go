@@ -41,7 +41,7 @@ func TestLocalScaleContainerAdminRequestDefaultDeadline(t *testing.T) {
 
 func TestLocalScaleContainerAdminRequestKeepsCallerDeadline(t *testing.T) {
 	oldTimeout := localScaleAdminRequestTimeout
-	localScaleAdminRequestTimeout = time.Hour
+	localScaleAdminRequestTimeout = 10 * time.Second
 	t.Cleanup(func() {
 		localScaleAdminRequestTimeout = oldTimeout
 	})
