@@ -541,7 +541,7 @@ func TestDeploySubmittingToQueued(t *testing.T) {
 		Organization: testOrg,
 		Database:     testDB,
 		Number:       dr.Number,
-		InstantDDL:   true,
+		InstantDDL:   false,
 	})
 	require.NoError(t, err, "DeployDeployRequest")
 	assert.Equal(t, drState.Submitting, dr.DeploymentState, "initial deploy state should be submitting")
@@ -694,7 +694,7 @@ func TestCompleteRevertError(t *testing.T) {
 	)
 
 	dr := createDeploy(t, ctx, branchName, true)
-	deploy(t, ctx, dr.Number, true)
+	deploy(t, ctx, dr.Number, false)
 	dr = waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert)
 	require.Equal(t, drState.CompletePendingRevert, dr.DeploymentState, "test uses 5s revert window, should reach complete_pending_revert")
 

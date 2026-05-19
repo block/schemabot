@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/state"
 )
 
 func TestAddAlgorithmInstant(t *testing.T) {
@@ -89,6 +91,13 @@ func TestHasAlterTableStatements(t *testing.T) {
 		"testapp":         {"CREATE TABLE foo (id INT PRIMARY KEY)"},
 		"testapp_sharded": {"ALTER TABLE users ADD COLUMN age INT"},
 	}))
+}
+
+func TestDeriveDeployState_InstantDDLRequestedControlsRevertWindow(t *testing.T) {
+	migrations := []migrationInfo{{status: state.Vitess.Complete}}
+
+	require.Equal(t, dr.CompletePendingRevert, deriveDeployState(migrations, true, false))
+	require.Equal(t, dr.Complete, deriveDeployState(migrations, true, true))
 }
 
 func TestQualifyAlterTableName(t *testing.T) {

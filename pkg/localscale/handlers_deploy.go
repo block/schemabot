@@ -220,9 +220,9 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	migrationContext := fmt.Sprintf("localscale:%d_%d", number, time.Now().UnixMilli()%1000000)
 	result, err := s.metadataDB.ExecContext(r.Context(),
 		`UPDATE localscale_deploy_requests
-		 SET deployed = TRUE, migration_context = ?, deployment_state = ?
+		 SET deployed = TRUE, migration_context = ?, instant_ddl = ?, deployment_state = ?
 		 WHERE org = ? AND database_name = ? AND number = ? AND deployed = FALSE`,
-		migrationContext, dr.Submitting, org, database, number,
+		migrationContext, body.InstantDDL, dr.Submitting, org, database, number,
 	)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update deploy request: %v", err)
