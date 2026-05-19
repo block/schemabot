@@ -18,11 +18,14 @@ import (
 )
 
 const (
-	defaultImage          = "localscale:latest"
-	defaultAPIPort        = "8080"
-	defaultProxyPortStart = 19100
-	defaultProxyPortEnd   = 19150
+	defaultImage               = "localscale:latest"
+	defaultAPIPort             = "8080"
+	defaultProxyPortStart      = 19100
+	defaultProxyPortEnd        = 19150
+	defaultAdminRequestTimeout = 15 * time.Second
 )
+
+var localScaleAdminRequestTimeout = defaultAdminRequestTimeout
 
 // LocalScaleContainer wraps a testcontainers.Container with LocalScale-specific helpers.
 type LocalScaleContainer struct {
@@ -239,7 +242,10 @@ func (c *LocalScaleContainer) SeedDDLWithStrategy(ctx context.Context, org, data
 	if migrationContext != "" {
 		body["migration_context"] = migrationContext
 	}
-	return c.postAdmin(ctx, "/admin/seed-ddl", body)
+	if err := c.postAdmin(ctx, "/admin/seed-ddl", body); err != nil {
+		return fmt.Errorf("seed DDL for %s/%s/%s: %w", org, database, keyspace, err)
+	}
+	return nil
 }
 
 // SeedVSchema applies a VSchema (as JSON) to a keyspace via vtctldclient gRPC.
@@ -250,7 +256,10 @@ func (c *LocalScaleContainer) SeedVSchema(ctx context.Context, org, database, ke
 		"keyspace": keyspace,
 		"vschema":  json.RawMessage(vschema),
 	}
-	return c.postAdmin(ctx, "/admin/seed-vschema", body)
+	if err := c.postAdmin(ctx, "/admin/seed-vschema", body); err != nil {
+		return fmt.Errorf("seed vschema for %s/%s/%s: %w", org, database, keyspace, err)
+	}
+	return nil
 }
 
 // SchemaDir seeds schema from a directory structure where each subdirectory is a
@@ -334,7 +343,11 @@ func (c *LocalScaleContainer) VtgateExec(ctx context.Context, org, database, key
 	if len(args) > 0 {
 		body["args"] = args
 	}
-	return c.postAdminResult(ctx, "/admin/vtgate-exec", body)
+	result, err := c.postAdminResult(ctx, "/admin/vtgate-exec", body)
+	if err != nil {
+		return nil, fmt.Errorf("vtgate exec %s/%s/%s query %q: %w", org, database, keyspace, query, err)
+	}
+	return result, nil
 }
 
 // MetadataQuery executes a SQL query against the metadata database.
@@ -345,13 +358,20 @@ func (c *LocalScaleContainer) MetadataQuery(ctx context.Context, query string, a
 	if len(args) > 0 {
 		body["args"] = args
 	}
-	return c.postAdminResult(ctx, "/admin/metadata-query", body)
+	result, err := c.postAdminResult(ctx, "/admin/metadata-query", body)
+	if err != nil {
+		return nil, fmt.Errorf("metadata query %q: %w", query, err)
+	}
+	return result, nil
 }
 
 // ResetState cancels all running Vitess migrations, waits for terminal state,
 // and truncates metadata tables.
 func (c *LocalScaleContainer) ResetState(ctx context.Context) error {
-	return c.postAdmin(ctx, "/admin/reset-state", nil)
+	if err := c.postAdmin(ctx, "/admin/reset-state", nil); err != nil {
+		return fmt.Errorf("reset LocalScale state: %w", err)
+	}
+	return nil
 }
 
 // BranchDBQuery executes a SQL query against a branch database.
@@ -361,7 +381,11 @@ func (c *LocalScaleContainer) BranchDBQuery(ctx context.Context, branch, keyspac
 		"keyspace": keyspace,
 		"query":    query,
 	}
-	return c.postAdminResult(ctx, "/admin/branch-db-query", body)
+	result, err := c.postAdminResult(ctx, "/admin/branch-db-query", body)
+	if err != nil {
+		return nil, fmt.Errorf("branch database query %s/%s %q: %w", branch, keyspace, query, err)
+	}
+	return result, nil
 }
 
 // TLSCerts fetches the TLS certificate contents from the container. Returns
@@ -388,13 +412,16 @@ func (c *LocalScaleContainer) GetTLSCerts(ctx context.Context) (*TLSCerts, error
 
 // postAdmin sends a POST request to an admin endpoint and checks for success.
 func (c *LocalScaleContainer) getAdmin(ctx context.Context, path string) (json.RawMessage, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url+path, nil)
+	reqCtx, cancel := localScaleAdminContext(ctx)
+	defer cancel()
+	start := time.Now()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, c.url+path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request for %s: %w", path, err)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", path, err)
+		return nil, fmt.Errorf("GET %s after %s: %w", path, elapsed(start), err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -418,16 +445,19 @@ func (c *LocalScaleContainer) postAdmin(ctx context.Context, path string, body a
 	} else {
 		bodyReader = bytes.NewReader([]byte("{}"))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url+path, bodyReader)
+	reqCtx, cancel := localScaleAdminContext(ctx)
+	defer cancel()
+	start := time.Now()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.url+path, bodyReader)
 	if err != nil {
 		return fmt.Errorf("create request for %s: %w", path, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("POST %s: %w", path, err)
+		return fmt.Errorf("POST %s after %s: %w", path, elapsed(start), err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		var errBody map[string]any
 		_ = json.NewDecoder(resp.Body).Decode(&errBody)
@@ -442,16 +472,19 @@ func (c *LocalScaleContainer) postAdminResult(ctx context.Context, path string, 
 	if err != nil {
 		return nil, fmt.Errorf("marshal request body for %s: %w", path, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url+path, bytes.NewReader(bodyJSON))
+	reqCtx, cancel := localScaleAdminContext(ctx)
+	defer cancel()
+	start := time.Now()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.url+path, bytes.NewReader(bodyJSON))
 	if err != nil {
 		return nil, fmt.Errorf("create request for %s: %w", path, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("POST %s: %w", path, err)
+		return nil, fmt.Errorf("POST %s after %s: %w", path, elapsed(start), err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		var errBody map[string]any
 		_ = json.NewDecoder(resp.Body).Decode(&errBody)
@@ -462,6 +495,17 @@ func (c *LocalScaleContainer) postAdminResult(ctx context.Context, path string, 
 		return nil, fmt.Errorf("decode response from %s: %w", path, err)
 	}
 	return &result, nil
+}
+
+func localScaleAdminContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= localScaleAdminRequestTimeout {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, localScaleAdminRequestTimeout)
+}
+
+func elapsed(start time.Time) time.Duration {
+	return time.Since(start).Round(time.Millisecond)
 }
 
 // postProxyPortMap sends the internal->external port mapping to the LocalScale admin endpoint.
