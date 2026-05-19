@@ -22,6 +22,43 @@ func controlStatus(accepted bool) string {
 	return "rejected"
 }
 
+// logControlOperation appends an apply log entry for a control operation (cutover, stop, start, revert, etc.).
+func (s *Service) logControlOperation(r *http.Request, applyID, caller, eventType, message string) {
+	if applyID == "" {
+		s.logger.Debug("skipping control operation log — no apply ID", "event", eventType)
+		return
+	}
+	applyStore := s.storage.Applies()
+	if applyStore == nil {
+		s.logger.Error("apply store not available for control operation log", "apply_id", applyID, "event", eventType)
+		return
+	}
+	apply, err := applyStore.GetByApplyIdentifier(r.Context(), applyID)
+	if err != nil {
+		s.logger.Error("failed to look up apply for control operation log", "apply_id", applyID, "event", eventType, "error", err)
+		return
+	}
+	if apply == nil {
+		s.logger.Warn("apply not found for control operation log", "apply_id", applyID, "event", eventType)
+		return
+	}
+	logStore := s.storage.ApplyLogs()
+	if logStore == nil {
+		s.logger.Error("apply log store not available for control operation log", "apply_id", applyID, "event", eventType)
+		return
+	}
+	logMessage := fmt.Sprintf("%s (caller: %s)", message, caller)
+	if err := logStore.Append(r.Context(), &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelInfo,
+		EventType: eventType,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   logMessage,
+	}); err != nil {
+		s.logger.Error("failed to append control operation log", "apply_id", apply.ID, "event", eventType, "error", err)
+	}
+}
+
 // writeControlError logs and writes an HTTP error for a control operation.
 func (s *Service) writeControlError(w http.ResponseWriter, opName, database string, err error) {
 	s.logger.Error(opName+" failed", "database", database, "error", err)
@@ -104,6 +141,7 @@ type CutoverRequest struct {
 	Database    string `json:"database"`
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id,omitempty"`
+	Caller      string `json:"caller,omitempty"`
 }
 
 // handleCutover handles POST /api/cutover requests.
@@ -125,6 +163,9 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.RecordControlOperation(r.Context(), "cutover", req.Database, req.Environment, controlStatus(resp.Accepted))
+	if resp.Accepted {
+		s.logControlOperation(r, applyID, req.Caller, storage.LogEventCutoverTriggered, "Cutover triggered by user")
+	}
 
 	s.writeJSON(w, http.StatusOK, &apitypes.ControlResponse{
 		Accepted:     resp.Accepted,
@@ -137,6 +178,7 @@ type StopRequest struct {
 	Database    string `json:"database"`
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id,omitempty"`
+	Caller      string `json:"caller,omitempty"`
 }
 
 // handleStop handles POST /api/stop requests.
@@ -159,6 +201,9 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.RecordControlOperation(r.Context(), "stop", req.Database, req.Environment, controlStatus(resp.Accepted))
+	if resp.Accepted {
+		s.logControlOperation(r, applyID, req.Caller, storage.LogEventStopRequested, "Stop requested by user")
+	}
 
 	s.writeJSON(w, http.StatusOK, &apitypes.StopResponse{
 		Accepted:     resp.Accepted,
@@ -173,6 +218,7 @@ type StartRequest struct {
 	Database    string `json:"database"`
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id,omitempty"`
+	Caller      string `json:"caller,omitempty"`
 }
 
 // handleStart handles POST /api/start requests.
@@ -194,6 +240,9 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.RecordControlOperation(r.Context(), "start", req.Database, req.Environment, controlStatus(resp.Accepted))
+	if resp.Accepted {
+		s.logControlOperation(r, applyID, req.Caller, storage.LogEventStartRequested, "Start requested by user")
+	}
 
 	// For remote (gRPC) clients, update local apply state and restart the
 	// background progress poller. Without this, the local applies.state stays
@@ -275,6 +324,7 @@ type RevertRequest struct {
 	Database    string `json:"database"`
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id,omitempty"`
+	Caller      string `json:"caller,omitempty"`
 }
 
 // handleRevert handles POST /api/revert requests.
@@ -295,6 +345,9 @@ func (s *Service) handleRevert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.RecordControlOperation(r.Context(), "revert", req.Database, req.Environment, controlStatus(resp.Accepted))
+	if resp.Accepted {
+		s.logControlOperation(r, applyID, req.Caller, storage.LogEventRevertTriggered, "Revert triggered by user")
+	}
 
 	s.writeJSON(w, http.StatusOK, &apitypes.ControlResponse{
 		Accepted:     resp.Accepted,
@@ -307,6 +360,7 @@ type SkipRevertRequest struct {
 	Database    string `json:"database"`
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id,omitempty"`
+	Caller      string `json:"caller,omitempty"`
 }
 
 // handleSkipRevert handles POST /api/skip-revert requests.
@@ -340,16 +394,10 @@ func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			if err := s.storage.ApplyLogs().Append(r.Context(), &storage.ApplyLog{
-				ApplyID:   apply.ID,
-				Level:     storage.LogLevelInfo,
-				EventType: storage.LogEventSkipRevertTriggered,
-				Source:    storage.LogSourceSchemaBot,
-				Message:   "Skip-revert triggered by user",
-			}); err != nil {
-				s.logger.Error("failed to append apply log", "apply_id", apply.ID, "error", err)
-			}
 		}
+	}
+	if resp.Accepted {
+		s.logControlOperation(r, applyID, req.Caller, storage.LogEventSkipRevertTriggered, "Skip-revert triggered by user")
 	}
 
 	s.writeJSON(w, http.StatusOK, &apitypes.ControlResponse{

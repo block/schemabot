@@ -520,6 +520,7 @@ const (
 	LogEventDeployTriggered     = "deploy_triggered"
 	LogEventCutoverTriggered    = "cutover_triggered"
 	LogEventSkipRevertTriggered = "skip_revert_triggered"
+	LogEventRevertTriggered     = "revert_triggered"
 	LogEventError               = "error"
 	LogEventInfo                = "info"
 	LogEventProgress            = "progress"

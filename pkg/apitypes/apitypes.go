@@ -81,6 +81,7 @@ type ControlRequest struct {
 	Deployment  string `json:"deployment,omitempty"`
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id,omitempty"`
+	Caller      string `json:"caller,omitempty"`
 }
 
 // VolumeRequest is the HTTP request body for POST /api/volume.
