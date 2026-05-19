@@ -18,6 +18,8 @@ ifdef GOTESTSUM
 else
   GOTEST := go test
 endif
+E2E_TEST_TIMEOUT ?= 10m
+E2E_TEST_FLAGS ?=
 
 .PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
@@ -338,7 +340,7 @@ endif
 	E2E_MYSQL_DSN="root:testpassword@tcp(localhost:14371)/schemabot" \
 	E2E_TESTAPP_STAGING_DSN="root:testpassword@tcp(localhost:14372)/testapp" \
 	E2E_TESTAPP_PRODUCTION_DSN="root:testpassword@tcp(localhost:14373)/testapp" \
-	$(GOTEST) -count=1 -timeout=10m -tags=e2e $(if $(RUN),-run '$(RUN)') ./e2e/local/...
+	$(GOTEST) -count=1 -timeout=$(E2E_TEST_TIMEOUT) -tags=e2e $(E2E_TEST_FLAGS) $(if $(RUN),-run '$(RUN)') ./e2e/local/...
 
 # Run only MySQL e2e tests (Spirit engine, no LocalScale/vtcombo needed)
 test-e2e-mysql: ## Run MySQL-only e2e tests
