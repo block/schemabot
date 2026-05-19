@@ -12,6 +12,8 @@ import (
 const (
 	PreviewErrorFirstFailed  = "Error 1061: Duplicate key name 'idx_user_id'"
 	PreviewErrorMiddleFailed = "lock wait timeout exceeded; try restarting transaction"
+	previewRepository        = "block/schemabot"
+	previewHeadSHA           = "abcdef1234567890abcdef1234567890abcdef12"
 )
 
 // PreviewCommentPlan renders a sample plan comment with DDL changes and lint violations.
@@ -20,6 +22,8 @@ func PreviewCommentPlan() string {
 		Database:    "testapp",
 		SchemaName:  "testapp",
 		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
 		RequestedBy: "aparajon",
 		IsMySQL:     true,
 		Changes: []KeyspaceChangeData{
@@ -45,6 +49,8 @@ func PreviewCommentPlanNoChanges() string {
 		Database:    "testapp",
 		SchemaName:  "testapp",
 		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
 		RequestedBy: "aparajon",
 		IsMySQL:     true,
 		Changes:     nil,
@@ -243,6 +249,8 @@ func PreviewCommentUnsafeBlocked() string {
 		Database:    "testapp",
 		SchemaName:  "testapp",
 		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
 		RequestedBy: "aparajon",
 		IsMySQL:     true,
 		Changes: []KeyspaceChangeData{
@@ -268,6 +276,8 @@ func PreviewCommentApplyPlan() string {
 		Database:     "testapp",
 		SchemaName:   "testapp",
 		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
 		RequestedBy:  "aparajon",
 		IsMySQL:      true,
 		Changes:      samplePlanChanges(),
@@ -283,6 +293,8 @@ func PreviewCommentApplyPlanOptions() string {
 		Database:     "testapp",
 		SchemaName:   "testapp",
 		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
 		RequestedBy:  "aparajon",
 		IsMySQL:      true,
 		Changes:      samplePlanChanges(),
@@ -300,6 +312,8 @@ func PreviewCommentApplyPlanUnsafe() string {
 		Database:    "testapp",
 		SchemaName:  "testapp",
 		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
 		RequestedBy: "aparajon",
 		IsMySQL:     true,
 		Changes: []KeyspaceChangeData{
@@ -384,6 +398,8 @@ func PreviewCommentVitessPlan() string {
 		Database:    "commerce",
 		SchemaName:  "commerce",
 		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
 		RequestedBy: "aparajon",
 		IsMySQL:     false,
 		Changes:     sampleVitessPlanChanges(),
@@ -396,6 +412,8 @@ func PreviewCommentVitessApplyPlan() string {
 		Database:     "commerce",
 		SchemaName:   "commerce",
 		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
 		RequestedBy:  "aparajon",
 		IsMySQL:      false,
 		Changes:      sampleVitessPlanChanges(),
@@ -412,6 +430,8 @@ func PreviewCommentMySQLMultiSchema() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:    "myapp",
 		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
 		RequestedBy: "aparajon",
 		IsMySQL:     true,
 		Changes: []KeyspaceChangeData{
@@ -443,6 +463,8 @@ func PreviewCommentMultiEnvPlan() string {
 	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
 		IsMySQL:      true,
 		RequestedBy:  "aparajon",
 		Environments: []string{"staging", "production"},
@@ -477,6 +499,8 @@ func PreviewCommentMultiEnvPlanLint() string {
 	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
 		IsMySQL:      true,
 		RequestedBy:  "",
 		Environments: []string{"staging", "production"},
@@ -495,6 +519,8 @@ func PreviewCommentMultiEnvPlanError() string {
 	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
 		IsMySQL:      true,
 		RequestedBy:  "aparajon",
 		Environments: []string{"staging", "production"},
@@ -519,6 +545,8 @@ func PreviewCommentMultiEnvPlanDiff() string {
 	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
 		IsMySQL:      true,
 		RequestedBy:  "aparajon",
 		Environments: []string{"staging", "production"},

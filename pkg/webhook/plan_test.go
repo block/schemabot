@@ -46,8 +46,10 @@ func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 
 func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
 	schema := &ghclient.SchemaRequestResult{
-		Database: "testdb",
-		Type:     "mysql",
+		Database:   "testdb",
+		Type:       "mysql",
+		HeadSHA:    "abcdef1234567890",
+		Repository: "block/schemabot",
 	}
 
 	planResp := &apitypes.PlanResponse{
@@ -66,6 +68,8 @@ func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
 
 	assert.False(t, data.HasUnsafeChanges)
 	assert.Empty(t, data.UnsafeChanges)
+	assert.Equal(t, "abcdef1234567890", data.HeadSHA)
+	assert.Equal(t, "block/schemabot", data.Repository)
 }
 
 func TestBuildPlanCommentData_MixedSafeAndUnsafe(t *testing.T) {
@@ -166,6 +170,44 @@ func TestRenderPlanComment_NoUnsafe_NoWarning(t *testing.T) {
 	rendered := templates.RenderPlanComment(data)
 
 	assert.NotContains(t, rendered, "Unsafe")
+}
+
+func TestRenderPlanComment_ShowsPRHeadSHA(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		HeadSHA:     "abcdef1234567890",
+		Repository:  "block/schemabot",
+		IsMySQL:     true,
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890)")
+	assert.NotContains(t, rendered, "**PR head SHA**")
+}
+
+func TestRenderMultiEnvPlanComment_ShowsPRHeadSHA(t *testing.T) {
+	data := templates.MultiEnvPlanCommentData{
+		Database:     "testdb",
+		HeadSHA:      "abcdef1234567890",
+		Repository:   "block/schemabot",
+		IsMySQL:      true,
+		Environments: []string{"staging"},
+		Plans: map[string]*templates.PlanCommentData{
+			"staging": {
+				Database:    "testdb",
+				Environment: "staging",
+				IsMySQL:     true,
+			},
+		},
+		Errors: map[string]string{},
+	}
+
+	rendered := templates.RenderMultiEnvPlanComment(data)
+
+	assert.Contains(t, rendered, "planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890)")
+	assert.NotContains(t, rendered, "**PR head SHA**")
 }
 
 func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {

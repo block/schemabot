@@ -51,11 +51,15 @@ func writeAppliedByOrTimestamp(sb *strings.Builder, appliedBy string) {
 
 // writeAttributionLine writes a "*Verb by @user at timestamp*" line.
 func writeAttributionLine(sb *strings.Builder, verb, user string) {
+	writeAttributionLineWithSuffix(sb, verb, user, "")
+}
+
+func writeAttributionLineWithSuffix(sb *strings.Builder, verb, user, suffix string) {
 	ts := currentTimestamp()
 	if user != "" {
-		fmt.Fprintf(sb, "\n*%s by @%s at %s*\n", verb, user, ts)
+		fmt.Fprintf(sb, "\n*%s by @%s at %s%s*\n", verb, user, ts, suffix)
 	} else {
-		fmt.Fprintf(sb, "\n*Started at %s*\n", ts)
+		fmt.Fprintf(sb, "\n*Started at %s%s*\n", ts, suffix)
 	}
 }
 

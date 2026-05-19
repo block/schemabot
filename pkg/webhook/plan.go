@@ -196,6 +196,8 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 		// Set database/type from first successful result
 		if multiEnvData.Database == "" {
 			multiEnvData.Database = schemaResult.Database
+			multiEnvData.HeadSHA = schemaResult.HeadSHA
+			multiEnvData.Repository = schemaResult.Repository
 			multiEnvData.IsMySQL = schemaResult.Type == "mysql"
 		}
 
@@ -309,6 +311,8 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 	data := templates.PlanCommentData{
 		Database:    schema.Database,
 		Environment: environment,
+		HeadSHA:     schema.HeadSHA,
+		Repository:  schema.Repository,
 		RequestedBy: requestedBy,
 		IsMySQL:     schema.Type == "mysql",
 	}

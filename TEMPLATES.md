@@ -15,7 +15,7 @@ All templates rendered with sample data.
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -66,7 +66,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ✅ **No schema changes detected**
 
@@ -80,7 +80,7 @@ schemabot apply -e staging
 
 **Database**: `commerce` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Keyspace: `commerce`
 #### VSchema
@@ -168,7 +168,7 @@ schemabot apply -e staging
 
 **Database**: `commerce` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -265,7 +265,7 @@ schemabot unlock
 
 **Database**: `myapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Schema Name: `app_primary`
 ```sql
@@ -308,7 +308,7 @@ schemabot apply -e staging
 
 **Database**: `testapp`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging & Production
 
@@ -361,7 +361,7 @@ schemabot apply -e production
 
 **Database**: `testapp`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging
 
@@ -413,7 +413,7 @@ schemabot apply -e production
 
 **Database**: `testapp`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging
 
@@ -471,7 +471,7 @@ schemabot plan -e production
 
 **Database**: `testapp`
 
-*Started at 2026-01-01 00:00:00 UTC*
+*Started at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging & Production
 
@@ -1270,7 +1270,7 @@ No active locks.
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -1324,7 +1324,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -1380,7 +1380,7 @@ schemabot unlock
 
 **Database**: `commerce` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -1498,7 +1498,7 @@ Schema changes are being applied. Progress updates will be posted as new comment
 - **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+  ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
   ```
   Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
 
@@ -1527,7 +1527,7 @@ schemabot stop apply-a1b2c3d4e5f6
 - **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+  ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
   ```
 
 
@@ -1548,7 +1548,7 @@ schemabot stop apply-a1b2c3d4e5f6
 - **`users`**: 🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+  ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
   ```
 
 
@@ -1578,7 +1578,7 @@ schemabot apply -e staging
 - **`users`**: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)
+  ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
   ```
   Rows: 156,342 / 397,453
 
@@ -1609,19 +1609,19 @@ schemabot start apply-a1b2c3d4e5f6
 - **`orders`**: ⏳ Queued  
 
   ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   ```
 
 - **`users`**: ⏳ Queued  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email` (`email`)
+  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
   ```
 
 - **`products`**: ⏳ Queued  
 
   ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
   ```
 
 
@@ -1651,20 +1651,20 @@ schemabot stop apply-a1b2c3d4e5f6
 - **`orders`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 22%  
 
   ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   ```
   Rows: 321,450 / 1,466,232 · ETA: 5m 40s
 
 - **`users`**: ⏳ Queued  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email` (`email`)
+  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
   ```
 
 - **`products`**: ⏳ Queued  
 
   ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
   ```
 
 
@@ -1694,20 +1694,20 @@ schemabot stop apply-a1b2c3d4e5f6
 - **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email` (`email`)
+  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
   ```
   Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 
 - **`products`**: ⏳ Queued  
 
   ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
   ```
 
 - **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
 
   ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   ```
 
 
@@ -1737,20 +1737,20 @@ schemabot stop apply-a1b2c3d4e5f6
 - **`products`**: 🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 17%  
 
   ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
   ```
   Rows: 87,231 / 523,140 · ETA: 7m 0s
 
 - **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
 
   ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   ```
 
 - **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email` (`email`)
+  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
   ```
 
 
@@ -1780,19 +1780,19 @@ schemabot stop apply-a1b2c3d4e5f6
 - **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
 
   ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   ```
 
 - **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email` (`email`)
+  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
   ```
 
 - **`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
 
   ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
   ```
 
 
@@ -1815,19 +1815,19 @@ schemabot stop apply-a1b2c3d4e5f6
 - **`orders`**: 🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed  
 
   ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   ```
 
 - **`users`**: ⊘ Cancelled (not started)  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email` (`email`)
+  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
   ```
 
 - **`products`**: ⊘ Cancelled (not started)  
 
   ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
   ```
 
 
@@ -1859,19 +1859,19 @@ schemabot apply -e staging
 - **`users`**: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email` (`email`)
+  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
   ```
 
 - **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
 
   ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   ```
 
 - **`products`**: ⊘ Cancelled (not started)  
 
   ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
   ```
 
 
@@ -1903,14 +1903,14 @@ schemabot apply -e staging
 - **`users`**: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72%  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email` (`email`)
+  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
   ```
   Rows: 1,055,687 / 1,466,232
 
 - **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
 
   ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   ```
 
 
@@ -1933,6 +1933,8 @@ schemabot start apply-a1b2c3d4e5f6
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
+**0/3** table(s) ready for cutover — waiting on 3
+
 📊 3 waiting for cutover
 
 ### Table Progress
@@ -1940,19 +1942,19 @@ schemabot start apply-a1b2c3d4e5f6
 - **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover  
 
   ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   ```
 
 - **`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email` (`email`)
+  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
   ```
 
 - **`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover  
 
   ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
   ```
 
 
@@ -1975,6 +1977,8 @@ schemabot cutover apply-a1b2c3d4e5f6
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
+**0/3** table(s) ready for cutover — waiting on 3
+
 📊 3 cutting over
 
 ### Table Progress
@@ -1982,19 +1986,19 @@ schemabot cutover apply-a1b2c3d4e5f6
 - **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...  
 
   ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)
+  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   ```
 
 - **`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...  
 
   ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email` (`email`)
+  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
   ```
 
 - **`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...  
 
   ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)
+  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
   ```
 
 
@@ -3821,7 +3825,7 @@ No schema changes found for database 'new-db'
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -3876,7 +3880,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 

@@ -41,7 +41,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	fmt.Fprintf(&sb, "## %s Schema Change Plan\n\n", dbTypeLabel)
 
 	writePlanMetadata(&sb, data)
-	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+	writePlanAttribution(&sb, data)
 	sb.WriteString("\n")
 
 	// Count and show changes

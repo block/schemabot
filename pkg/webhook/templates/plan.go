@@ -29,6 +29,8 @@ type PlanCommentData struct {
 	Database    string
 	SchemaName  string // Schema directory name (e.g. filepath.Base of schema dir)
 	Environment string
+	HeadSHA     string
+	Repository  string
 	RequestedBy string // Empty means auto-generated
 	IsMySQL     bool
 
@@ -79,7 +81,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	}
 
 	writePlanMetadata(&sb, data)
-	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+	writePlanAttribution(&sb, data)
 
 	if data.IsLocked && data.LockOwner != "" {
 		fmt.Fprintf(&sb, "\n🔒 **Lock acquired by** `%s`", data.LockOwner)
@@ -181,6 +183,32 @@ func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
 		parts = append(parts, fmt.Sprintf("**Environment**: `%s`", data.Environment))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
+}
+
+func writePlanAttribution(sb *strings.Builder, data PlanCommentData) {
+	writeAttributionLineWithSuffix(sb, "Requested", data.RequestedBy, planCommitSuffix(data.Repository, data.HeadSHA))
+}
+
+func planCommitSuffix(repository, sha string) string {
+	if sha == "" {
+		return ""
+	}
+	return fmt.Sprintf(" · planned from %s", formatCommitRef(repository, sha))
+}
+
+func formatCommitRef(repository, sha string) string {
+	short := shortSHA(sha)
+	if repository == "" {
+		return fmt.Sprintf("`%s`", short)
+	}
+	return fmt.Sprintf("[`%s`](https://github.com/%s/commit/%s)", short, repository, sha)
+}
+
+func shortSHA(sha string) string {
+	if len(sha) <= 7 {
+		return sha
+	}
+	return sha[:7]
 }
 
 // writeOptions writes the options line if any options are enabled.
@@ -358,6 +386,8 @@ func pluralize(singular string, count int) string {
 type MultiEnvPlanCommentData struct {
 	Database    string
 	SchemaName  string
+	HeadSHA     string
+	Repository  string
 	IsMySQL     bool
 	RequestedBy string
 
@@ -384,7 +414,11 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	fmt.Fprintf(&sb, "## %s Schema Change Plan\n\n", dbTypeLabel)
 
 	writePlanMetadata(&sb, PlanCommentData{Database: data.Database, SchemaName: data.SchemaName})
-	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+	writePlanAttribution(&sb, PlanCommentData{
+		HeadSHA:     data.HeadSHA,
+		Repository:  data.Repository,
+		RequestedBy: data.RequestedBy,
+	})
 	sb.WriteString("\n")
 
 	// Check which environments have changes
