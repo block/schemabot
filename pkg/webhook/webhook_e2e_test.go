@@ -911,9 +911,9 @@ func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
 	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	// Use tinyint PK (triggers primary_key linter — tinyint is not in allowed types)
+	// Use a FLOAT column (triggers has_float linter at warning severity, not unsafe).
 	schemaFiles := map[string]string{
-		"bad_table.sql": "CREATE TABLE `bad_table` (\n  `id` tinyint NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"bad_table.sql": "CREATE TABLE `bad_table` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `amount` float NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
 
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)

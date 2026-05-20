@@ -195,11 +195,17 @@ func (p *branchProxy) handleConn(clientConn net.Conn) {
 	// go-mysql handles the full MySQL protocol: greeting, auth, command loop.
 	// Accept both root (vtgate) and vt_dba_tcp (managed mysqld) with no password,
 	// matching the credentials returned by handleCreateBranchPassword.
-	credProvider := server.NewInMemoryProvider()
-	credProvider.AddUser("root", "")
-	credProvider.AddUser(managedMySQLTCPUser, "")
+	authHandler := server.NewInMemoryAuthenticationHandler()
+	if err := authHandler.AddUser("root", ""); err != nil {
+		p.logger.Error("proxy: register root credential", "error", err)
+		return
+	}
+	if err := authHandler.AddUser(managedMySQLTCPUser, ""); err != nil {
+		p.logger.Error("proxy: register managed mysqld credential", "user", managedMySQLTCPUser, "error", err)
+		return
+	}
 
-	mysqlConn, err := p.mysqlServer.NewCustomizedConn(clientConn, credProvider, handler)
+	mysqlConn, err := p.mysqlServer.NewCustomizedConn(clientConn, authHandler, handler)
 	if err != nil {
 		p.logger.Debug("proxy: handshake failed", "error", err)
 		// go-mysql already closed clientConn on handshake failure
