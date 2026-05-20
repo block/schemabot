@@ -73,7 +73,7 @@ func vitessApplyAndWait(t *testing.T, schemaDir, env string, extraArgs ...string
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	args := []string{"apply", "-s", ".", "-e", env, "--endpoint", endpoint, "-y", "-o", "log", "--no-watch", "--allow-unsafe"}
+	args := []string{"apply", "-s", ".", "-e", env, "--endpoint", endpoint, "-y", "-o", "log", "--no-watch", "--allow-unsafe", "--skip-revert"}
 	args = append(args, extraArgs...)
 	t.Logf("vitessApplyAndWait: starting CLI apply (elapsed=%s)", time.Since(start))
 	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, args...)
@@ -551,8 +551,8 @@ func TestVitess_Apply_ConsecutiveApplies(t *testing.T) {
 
 	clearSchemaBotState(t)
 
-	// Second apply immediately after — tests that previous deploy's revert window
-	// is auto-completed and VReplication streams are cleaned up.
+	// Second apply immediately after verifies that the previous deploy is fully
+	// finalized and VReplication streams are cleaned up.
 	idx2 := fmt.Sprintf("idx_c2_%d", time.Now().UnixMilli()%100000)
 	schemaDir2 := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
@@ -1081,7 +1081,7 @@ func TestVitess_Apply_VSchemaTaskTracking(t *testing.T) {
 	binPath := buildCLI(t)
 	applyOut := e2eutil.RunCLI(t, binPath, schemaDir, "apply",
 		"-s", ".", "-e", "staging", "--endpoint", endpoint,
-		"-y", "-o", "log", "--no-watch", "--allow-unsafe",
+		"-y", "-o", "log", "--no-watch", "--allow-unsafe", "--skip-revert",
 	)
 	applyID := extractApplyIDFromLog(applyOut)
 	require.NotEmpty(t, applyID)
@@ -1260,7 +1260,7 @@ func TestVitess_Progress_DeployRequestMetadata(t *testing.T) {
 		"-s", ".",
 		"-e", "staging",
 		"--endpoint", endpoint,
-		"-y", "-o", "log", "--no-watch", "--allow-unsafe",
+		"-y", "-o", "log", "--no-watch", "--allow-unsafe", "--skip-revert",
 	)
 	applyID := extractApplyIDFromLog(applyOut)
 	require.NotEmpty(t, applyID, "expected apply ID in output")

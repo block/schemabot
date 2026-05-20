@@ -22,7 +22,7 @@ const (
 	defaultAPIPort             = "8080"
 	defaultProxyPortStart      = 19100
 	defaultProxyPortEnd        = 19150
-	defaultAdminRequestTimeout = 15 * time.Second
+	defaultAdminRequestTimeout = 10 * time.Second
 )
 
 var localScaleAdminRequestTimeout = defaultAdminRequestTimeout
