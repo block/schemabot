@@ -3,6 +3,7 @@
 package mysqlstore
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"strconv"
@@ -141,16 +142,11 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
-	guardTx, err := beginApplyWriteTx(ctx, testDB, "test active apply guard")
+	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, "testdb", "mysql", "staging")
 	require.NoError(t, err)
-	t.Cleanup(func() { guardTx.close(ctx, "test active apply guard") })
-
-	// Hold the exact target mutex row open. Active apply creation locks this row
-	// before checking applies, so a same-target create waits without relying on
-	// an empty applies range lock.
-	require.NoError(t, ensureApplyTargetLockRow(ctx, testDB, "testdb", "mysql", "staging"))
-	require.NoError(t, lockApplyTargetRow(ctx, guardTx.tx, "testdb", "mysql", "staging"))
-	require.NoError(t, checkNoActiveApplyForTarget(ctx, guardTx.tx, "testdb", "mysql", "staging", 0))
+	t.Cleanup(func() {
+		releaseApplyTargetLockConn(ctx, guardConn, guardLockName, "test active apply guard")
+	})
 
 	type createResult struct {
 		id  int64
@@ -180,7 +176,8 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 
-	require.NoError(t, guardTx.commit())
+	releaseApplyTargetLockConn(ctx, guardConn, guardLockName, "test active apply guard")
+	guardConn = nil
 
 	select {
 	case result := <-resultCh:
@@ -193,6 +190,46 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	applies, err := store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging")
 	require.NoError(t, err)
 	assert.Len(t, applies, 1)
+}
+
+func TestApplyStore_CreateActiveApplyDoesNotWaitForTargetLockRowBootstrap(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "bootstrapdb", "mysql", "staging")
+
+	guardTx, err := testDB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	require.NoError(t, err)
+	t.Cleanup(func() { rollbackApplyTx(ctx, guardTx, "test apply target bootstrap guard") })
+
+	var id int64
+	err = guardTx.QueryRowContext(ctx, `
+		SELECT id FROM apply_target_locks FORCE INDEX (idx_apply_target)
+		WHERE database_name >= ?
+		ORDER BY database_name, database_type, environment
+		LIMIT 1
+		FOR UPDATE
+	`, "").Scan(&id)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
+	createCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	id, err = store.Applies().Create(createCtx, &storage.Apply{
+		ApplyIdentifier: "apply_no_bootstrap_wait",
+		LockID:          lock.ID,
+		PlanID:          7,
+		Database:        "bootstrapdb",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          "spirit",
+		State:           state.Apply.Pending,
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, id)
 }
 
 func TestApplyStore_CreateAllowsOneConcurrentActiveApplyForSameTarget(t *testing.T) {
@@ -292,10 +329,6 @@ func TestApplyStore_CreateAvoidsGapLockDeadlocksForDifferentTargets(t *testing.T
 		lock := locks[target.database+"/"+target.dbType]
 		wg.Go(func() {
 			<-start
-			// If storage protects first writers by locking empty ranges in applies,
-			// these concurrent inserts can deadlock even though every target is
-			// independent. The target-lock row gives each target an exact mutex
-			// before applies is checked, so callers should not see deadlock errors.
 			_, err := store.Applies().Create(ctx, &storage.Apply{
 				ApplyIdentifier: "apply_concurrent_target_" + strconv.Itoa(i),
 				LockID:          lock.ID,
