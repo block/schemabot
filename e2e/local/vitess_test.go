@@ -299,6 +299,15 @@ func vitessAdminDDL(t *testing.T, localscaleURL, org, keyspace, ddl string) {
 	}
 }
 
+func vitessAdminDDLRequire(t *testing.T, localscaleURL, org, keyspace, ddl string) {
+	t.Helper()
+	_ = localscaleURL // preserved for call-site compatibility; localscaleAdminPost reads the env var
+	body := fmt.Sprintf(`{"org":%q,"database":%q,"keyspace":%q,"statements":[%q]}`,
+		org, vitessDB, keyspace, ddl)
+	_, err := localscaleAdminPost(t, "/admin/seed-ddl", body)
+	require.NoError(t, err, "seed DDL %s", ddl)
+}
+
 // extractApplyIDFromLog extracts the apply ID from log mode output.
 // Handles both "Apply started: apply-xxx" text and "apply_id=apply-xxx" logfmt.
 func extractApplyIDFromLog(output string) string {
@@ -1119,19 +1128,9 @@ func TestVitess_Apply_DropIndex_BlockedWithoutFlag(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	// First add an index
 	indexName := fmt.Sprintf("idx_drop_%d", time.Now().UnixMilli()%100000)
-	addSchema := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
-		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
-  `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  `+"`email`"+` varchar(255) NOT NULL,
-  `+"`full_name`"+` varchar(255) NULL,
-  `+"`created_at`"+` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX `+"`idx_email`"+` (`+"`email`"+`),
-  INDEX `+"`%s`"+` (`+"`full_name`"+`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, indexName),
-	}))
-	vitessApplyAndWait(t, addSchema, "staging")
+	vitessAdminDDLRequire(t, os.Getenv("LOCALSCALE_URL"), "localscale-staging", "testapp_sharded",
+		fmt.Sprintf("ALTER TABLE `users` ADD INDEX `%s` (`full_name`)", indexName))
 	clearSchemaBotState(t)
 
 	// Now try to drop it without --allow-unsafe — should be blocked
