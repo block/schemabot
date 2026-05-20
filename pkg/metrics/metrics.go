@@ -352,14 +352,15 @@ func RecordWebhookEvent(ctx context.Context, eventType, action, repo, status str
 }
 
 var knownStatusCheckOperations = map[string]bool{
-	"plan_check_recorded":        true,
-	"apply_started":              true,
-	"apply_finished":             true,
-	"rollback_finished":          true,
-	"aggregate_check_sync":       true,
-	"stale_check_cleanup":        true,
-	"stale_check_reconciliation": true,
-	"schema_config_discovery":    true,
+	"plan_check_recorded":                  true,
+	"apply_started":                        true,
+	"apply_finished":                       true,
+	"rollback_finished":                    true,
+	"aggregate_check_sync":                 true,
+	"stale_check_cleanup":                  true,
+	"stale_check_reconciliation":           true,
+	"schema_config_discovery":              true,
+	"schema_config_environment_validation": true,
 }
 
 var knownStatusCheckStatuses = map[string]bool{

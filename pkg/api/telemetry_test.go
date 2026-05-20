@@ -301,6 +301,12 @@ func TestRecordStatusCheckOperationMetric(t *testing.T) {
 		Status:       "success",
 	})
 	metrics.RecordStatusCheckOperation(t.Context(), metrics.StatusCheckOperation{
+		Operation:   "schema_config_environment_validation",
+		Repository:  "org/repo",
+		Environment: "staging",
+		Status:      "error",
+	})
+	metrics.RecordStatusCheckOperation(t.Context(), metrics.StatusCheckOperation{
 		Operation:    "not_real",
 		Repository:   "org/repo",
 		Database:     "mydb",
@@ -322,7 +328,7 @@ func TestRecordStatusCheckOperationMetric(t *testing.T) {
 			found = true
 			sum, ok := m.Data.(metricdata.Sum[int64])
 			require.True(t, ok)
-			assert.Len(t, sum.DataPoints, 3, "expected one data point per operation/status attribute set")
+			assert.Len(t, sum.DataPoints, 4, "expected one data point per operation/status attribute set")
 			for _, dp := range sum.DataPoints {
 				operation, hasOperation := dp.Attributes.Value(attribute.Key("operation"))
 				status, hasStatus := dp.Attributes.Value(attribute.Key("status"))
