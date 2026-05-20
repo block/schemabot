@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // Scheduler constants.
@@ -94,6 +95,22 @@ func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan
 // recoverApplies claims and resumes applies that need attention.
 // Each call claims one apply (if available) to keep the scheduling loop responsive.
 func (s *Service) recoverApplies(ctx context.Context, workerID int) {
+	expired, err := s.storage.Applies().ExpireRetryable(ctx)
+	if err != nil {
+		s.logger.Error("scheduler: failed to expire retryable applies", "worker", workerID, "error", err)
+		metrics.RecordSchedulerClaimFailure(ctx, "expire_retryable_error")
+		return
+	}
+	for _, apply := range expired {
+		s.logger.Error("scheduler: retry budget exhausted",
+			"worker", workerID,
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"attempt", apply.Attempt)
+		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, "retry_budget_exhausted")
+	}
+
 	apply, err := s.storage.Applies().FindNextApply(ctx)
 	if err != nil {
 		s.logger.Error("scheduler: failed to claim apply", "worker", workerID, "error", err)
@@ -144,6 +161,10 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		s.OnApplyRecovered(apply)
 	}
 
+	retryableClaim := previousState == state.Apply.FailedRetryable
+	if retryableClaim {
+		metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Environment)
+	}
 	if err := client.ResumeApply(ctx, apply); err != nil {
 		s.logger.Error("scheduler: failed to resume apply",
 			"worker", workerID,
@@ -151,6 +172,9 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 			"database", apply.Database,
 			"error", err)
 		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, "resume_error")
+		if retryableClaim {
+			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+		}
 		return
 	}
 

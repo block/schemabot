@@ -47,7 +47,9 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 
 **status** (webhooks): `processed`, `invalid_signature`, `ignored`
 
-**reason** (scheduler claim failures): `storage_error`, `unknown`
+**reason** (scheduler claim failures): `storage_error`, `expire_retryable_error`, `unknown`
+
+**reason** (scheduler resume failures): `missing_deployment`, `no_client`, `resume_error`, `retry_budget_exhausted`
 
 ### Check Ownership Misses
 

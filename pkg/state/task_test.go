@@ -52,8 +52,8 @@ func TestNormalizeTaskStatus_VitessStates(t *testing.T) {
 
 func TestNormalizeTaskStatus_PassThrough(t *testing.T) {
 	for _, s := range []string{
-		Task.Pending, Task.Running, Task.Stopped, Task.Failed,
-		Task.RevertWindow, Task.Reverted,
+		Task.Pending, Task.Running, Task.Completed, Task.Stopped, Task.Failed,
+		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.CuttingOver, Task.Cancelled,
 	} {
 		assert.Equal(t, s, NormalizeTaskStatus(s), "NormalizeTaskStatus(%q)", s)
@@ -63,6 +63,9 @@ func TestNormalizeTaskStatus_PassThrough(t *testing.T) {
 func TestNormalizeTaskStatus_StatePrefix(t *testing.T) {
 	assert.Equal(t, Task.Running, NormalizeTaskStatus("STATE_running"))
 	assert.Equal(t, Task.Completed, NormalizeTaskStatus("state_complete"))
+	assert.Equal(t, Task.Completed, NormalizeTaskStatus("STATE_COMPLETED"))
+	assert.Equal(t, Task.FailedRetryable, NormalizeTaskStatus("STATE_FAILED_RETRYABLE"))
+	assert.Equal(t, Task.WaitingForCutover, NormalizeTaskStatus("STATE_WAITING_FOR_CUTOVER"))
 }
 
 func TestNormalizeTaskStatus_StorageCompleted(t *testing.T) {

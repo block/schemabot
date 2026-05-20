@@ -219,11 +219,36 @@ func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply,
 	fn()
 }
 
-// executeApplyAtomic runs all DDLs in one Spirit call for atomic cutover (--defer-cutover).
-// All tables copy together and cut over atomically.
+func groupedApplyMode(apply *storage.Apply) string {
+	opts := apply.GetOptions()
+	switch {
+	case apply.DatabaseType == storage.DatabaseTypeMySQL && opts.DeferCutover:
+		return "spirit_atomic_cutover"
+	case apply.DatabaseType == storage.DatabaseTypeVitess:
+		return "vitess_deploy_request"
+	default:
+		return "grouped_engine_apply"
+	}
+}
+
+func groupedApplyModeDescription(apply *storage.Apply) string {
+	switch groupedApplyMode(apply) {
+	case "spirit_atomic_cutover":
+		return "Spirit atomic cutover"
+	case "vitess_deploy_request":
+		return "Vitess deploy request"
+	default:
+		return "grouped engine apply"
+	}
+}
+
+// executeApplyAtomic runs all DDLs in one engine operation. For Spirit with
+// defer_cutover, this is atomic cutover; for Vitess, this is one deploy request.
 func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
 	defer c.startApplyHeartbeat(ctx, apply)()
 	creds := c.credentials()
+	mode := groupedApplyMode(apply)
+	modeDescription := groupedApplyModeDescription(apply)
 
 	// Extract all DDLs and table names from tasks
 	ddl := make([]string, len(tasks))
@@ -233,16 +258,8 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 		tableNames[i] = t.TableName
 	}
 
-	// Log atomic mode start
-	deferCutover := options["defer_cutover"] == "true"
-	var modeDesc string
-	if deferCutover {
-		modeDesc = "atomic mode (defer-cutover)"
-	} else {
-		modeDesc = "atomic mode"
-	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Starting %s with %d tables: %v", modeDesc, len(tasks), tableNames), "", "")
+		fmt.Sprintf("Starting %s with %d tables: %v", modeDescription, len(tasks), tableNames), "", "")
 
 	eng := c.getEngine()
 	defer c.setupSpiritLogging(ctx, apply, tasks)()
@@ -291,8 +308,8 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 		c.logger.Error("failed to set started_at", "apply_id", apply.ApplyIdentifier, "error", err)
 	}
 
-	// Atomic mode: all DDLs in one engine call. Use the apply identifier as
-	// MigrationContext so all migrations share one context for progress tracking.
+	// Grouped mode: all DDLs in one engine call. Use the apply identifier as
+	// MigrationContext so all table work shares one context for progress tracking.
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
 		Database:    apply.Database,
 		PlanID:      plan.PlanIdentifier,
@@ -339,10 +356,24 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 	})
 
 	if err != nil {
-		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-		c.logger.Error("atomic apply failed", "error", err, "apply_id", apply.ApplyIdentifier)
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Engine apply failed: %v", err), state.Apply.Pending, state.Apply.Failed)
+		newState := state.Apply.Failed
+		if c.shouldRetryEngineError(err) {
+			c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
+			newState = state.Apply.FailedRetryable
+		} else {
+			c.failApplyWithTasks(ctx, apply, tasks, err.Error())
+		}
+		if newState == state.Apply.FailedRetryable {
+			c.logger.Warn("apply paused for scheduler retry", "mode", mode, "error", err, "apply_id", apply.ApplyIdentifier)
+		} else {
+			c.logger.Error("apply failed", "mode", mode, "error", err, "apply_id", apply.ApplyIdentifier)
+		}
+		logLevel := storage.LogLevelError
+		if newState == state.Apply.FailedRetryable {
+			logLevel = storage.LogLevelWarn
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, logLevel, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Engine apply failed: %v", err), state.Apply.Pending, newState)
 		return
 	}
 
@@ -397,7 +428,7 @@ func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.App
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
 	}
-	c.logger.Info("atomic apply started", "apply_id", apply.ApplyIdentifier, "task_count", len(tasks))
+	c.logger.Info("apply started", "mode", mode, "apply_id", apply.ApplyIdentifier, "task_count", len(tasks))
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 		fmt.Sprintf("All %d tables started copying in parallel", len(tasks)), state.Apply.Pending, apply.State)
 
@@ -531,7 +562,11 @@ func (c *LocalClient) runEngineTask(ctx context.Context, task *storage.Task, pla
 	})
 
 	if err != nil {
-		c.markTaskFailed(ctx, task, err.Error())
+		if c.shouldRetryEngineError(err) {
+			c.markTaskRetryable(ctx, task, err.Error())
+		} else {
+			c.markTaskFailed(ctx, task, err.Error())
+		}
 		c.logger.Error("task failed", "error", err, "task_id", task.TaskIdentifier, "table", task.TableName)
 		return taskFailed
 	}
@@ -551,7 +586,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, task *storage.Task, pla
 	c.pollTaskToCompletion(ctx, task, creds)
 
 	switch task.State {
-	case state.Task.Failed:
+	case state.Task.Failed, state.Task.FailedRetryable:
 		return taskFailed
 	case state.Task.Stopped:
 		return taskStopped
@@ -652,6 +687,12 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		c.logger.Warn("progress check failed",
 			"error", err, "apply_id", apply.ApplyIdentifier, "consecutive_errors", ps.consecutiveErrors)
 		if ps.consecutiveErrors >= 10 {
+			if c.shouldRetryEngineError(err) {
+				c.logger.Warn("progress polling failed repeatedly, pausing apply for scheduler retry",
+					"apply_id", apply.ApplyIdentifier, "consecutive_errors", ps.consecutiveErrors)
+				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
+				return true
+			}
 			c.logger.Error("progress polling failed repeatedly, failing apply",
 				"apply_id", apply.ApplyIdentifier, "consecutive_errors", ps.consecutiveErrors)
 			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
@@ -668,7 +709,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	}
 
 	now := time.Now()
-	newState := engineStateToStorage(result.State)
+	newState := taskStateFromProgressResult(result)
 
 	// Log state transitions and track when waiting states are entered (for timeouts)
 	if newState != ps.lastTaskState {
@@ -782,14 +823,19 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	apply.UpdatedAt = now
 
 	if result.State.IsTerminal() {
-		apply.CompletedAt = &now
+		retryableFailure := state.IsState(newState, state.Task.FailedRetryable)
+		if retryableFailure {
+			apply.CompletedAt = nil
+		} else {
+			apply.CompletedAt = &now
+		}
 		// Propagate error message from failed tasks to the apply record
 		if result.State == engine.StateFailed {
-			if result.ErrorMessage != "" {
-				apply.ErrorMessage = result.ErrorMessage
+			if msg := progressFailureMessage(result); msg != "" {
+				apply.ErrorMessage = msg
 			} else {
 				for _, task := range tasks {
-					if task.State == state.Task.Failed && task.ErrorMessage != "" {
+					if (task.State == state.Task.Failed || task.State == state.Task.FailedRetryable) && task.ErrorMessage != "" {
 						apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", task.TableName, task.ErrorMessage)
 						break
 					}
@@ -800,15 +846,30 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
 		}
 		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
-		if result.State == engine.StateFailed {
-			c.logger.Error("atomic apply failed",
-				"apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
-		} else {
-			c.logger.Info("atomic apply completed",
-				"apply_id", apply.ApplyIdentifier, "state", result.State, "task_count", len(tasks))
+		switch {
+		case retryableFailure:
+			c.logger.Warn("apply paused for scheduler retry",
+				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
+		case result.State == engine.StateFailed:
+			c.logger.Error("apply failed",
+				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
+		default:
+			c.logger.Info("apply completed",
+				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "state", result.State, "task_count", len(tasks))
+		}
+		eventMessage := fmt.Sprintf("Apply completed with state: %s", result.State)
+		if retryableFailure {
+			eventMessage = "Apply paused for scheduler retry after retryable engine failure"
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Apply completed with state: %s", result.State), ps.lastTaskState, apply.State)
+			eventMessage, ps.lastTaskState, apply.State)
+
+		if retryableFailure {
+			if obs := c.getObserver(apply.ID); obs != nil {
+				obs.OnProgress(apply, tasks)
+			}
+			return true
+		}
 
 		// Notify observer of terminal state, then clean up
 		if obs := c.getObserver(apply.ID); obs != nil {
@@ -893,6 +954,7 @@ func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Appl
 // syncAtomicTaskProgress updates all tasks with engine state and per-table progress.
 func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) {
 	tableProgress := indexEngineTableProgress(result.Tables)
+	retryableFailure := state.IsState(newState, state.Task.FailedRetryable)
 	instantFromMetadata := false
 	if result.ResumeState != nil && result.ResumeState.Metadata != "" {
 		if meta, err := decodePSMetadataForStorage(result.ResumeState.Metadata); err == nil && meta != nil {
@@ -901,6 +963,9 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 	}
 
 	for _, task := range tasks {
+		if retryableFailure && state.IsTerminalTaskState(task.State) {
+			continue
+		}
 		// VSchema tasks follow deploy-request-level state, not per-migration state.
 		// They have no SHOW VITESS_MIGRATIONS rows. Their state transitions are:
 		// pending → running (during in_progress_vschema) → completed/failed.
@@ -922,26 +987,24 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 			if tp.StartedAt != nil && task.StartedAt == nil {
 				task.StartedAt = tp.StartedAt
 			}
-			if tp.CompletedAt != nil && task.CompletedAt == nil {
+			if tp.CompletedAt != nil && !retryableFailure && task.CompletedAt == nil {
 				task.CompletedAt = tp.CompletedAt
 			}
 		} else if instantFromMetadata {
 			task.IsInstant = true
-			if result.State.IsTerminal() {
+			if result.State.IsTerminal() && !retryableFailure {
 				task.ProgressPercent = 100
 			}
 		}
 		if task.StartedAt == nil && newState != state.Task.Pending {
 			task.StartedAt = &now
 		}
-		if result.State.IsTerminal() && task.CompletedAt == nil {
+		if result.State.IsTerminal() && !retryableFailure && task.CompletedAt == nil {
 			task.CompletedAt = &now
 		}
 		if result.State == engine.StateFailed && task.ErrorMessage == "" {
-			if result.ErrorMessage != "" {
-				task.ErrorMessage = result.ErrorMessage
-			} else if result.Message != "" {
-				task.ErrorMessage = result.Message
+			if msg := progressFailureMessage(result); msg != "" {
+				task.ErrorMessage = msg
 			}
 		}
 		if result.State == engine.StateCompleted {
@@ -961,6 +1024,11 @@ func (c *LocalClient) deriveVSchemaTaskState(task *storage.Task, result *engine.
 	}
 
 	switch {
+	case state.IsState(taskState, state.Task.FailedRetryable):
+		if task.ErrorMessage == "" {
+			task.ErrorMessage = progressFailureMessage(result)
+		}
+		return state.Task.FailedRetryable
 	case result.Message == engine.MessageApplyingVSchema:
 		if task.StartedAt == nil {
 			task.StartedAt = &now
@@ -1018,8 +1086,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Ta
 
 			now := time.Now()
 			prevState := task.State
-			task.State = engineStateToStorage(result.State)
+			task.State = taskStateFromProgressResult(result)
 			task.UpdatedAt = now
+			retryableFailure := state.IsState(task.State, state.Task.FailedRetryable)
 
 			// Update progress fields from engine result
 			if len(result.Tables) > 0 {
@@ -1033,24 +1102,26 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Ta
 			}
 
 			if result.State.IsTerminal() {
-				task.CompletedAt = &now
+				if retryableFailure {
+					task.CompletedAt = nil
+				} else {
+					task.CompletedAt = &now
+				}
 				if result.State == engine.StateCompleted {
 					task.ProgressPercent = 100
 				}
 				if result.State == engine.StateFailed {
-					if result.ErrorMessage != "" {
-						task.ErrorMessage = result.ErrorMessage
-					} else if result.Message != "" {
-						task.ErrorMessage = result.Message
+					if msg := progressFailureMessage(result); msg != "" {
+						task.ErrorMessage = msg
 					}
 				}
 				logMsg := ""
 				if task.ApplyID > 0 {
-					logMsg = fmt.Sprintf("Task %s completed: engine_state=%s message=%q rows=%d/%d",
+					logMsg = fmt.Sprintf("Task %s finished: engine_state=%s message=%q rows=%d/%d",
 						task.TaskIdentifier, result.State, result.Message, task.RowsCopied, task.RowsTotal)
 				}
-				c.transitionTaskState(ctx, task, task.ApplyID, engineStateToStorage(result.State), logMsg)
-				c.logger.Info("task completed",
+				c.transitionTaskState(ctx, task, task.ApplyID, task.State, logMsg)
+				c.logger.Info("task finished",
 					"task_id", task.TaskIdentifier,
 					"table", task.TableName,
 					"engine_state", result.State,
@@ -1062,7 +1133,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Ta
 				return
 			}
 
-			c.transitionTaskState(ctx, task, 0, engineStateToStorage(result.State), "")
+			c.transitionTaskState(ctx, task, 0, task.State, "")
 
 			// Notify observer with full apply + tasks context
 			if obs := c.getObserver(task.ApplyID); obs != nil {
@@ -1082,6 +1153,17 @@ func (c *LocalClient) markTaskFailed(ctx context.Context, task *storage.Task, er
 	task.ErrorMessage = errMsg
 	task.CompletedAt = &now
 	c.transitionTaskState(ctx, task, 0, state.Task.Failed, "")
+}
+
+// markTaskRetryable records a task failure that scheduler recovery may retry.
+func (c *LocalClient) markTaskRetryable(ctx context.Context, task *storage.Task, errMsg string) {
+	task.ErrorMessage = errMsg
+	task.CompletedAt = nil
+	c.transitionTaskState(ctx, task, 0, state.Task.FailedRetryable, "")
+}
+
+func (c *LocalClient) shouldRetryEngineError(err error) bool {
+	return c.config.Type == storage.DatabaseTypeMySQL && engine.IsRetryable(err)
 }
 
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.
@@ -1119,11 +1201,53 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 }
 
+// markApplyRetryableWithTasks pauses an apply after a retryable engine failure.
+// Non-terminal tasks move to failed_retryable so scheduler recovery can decide
+// which work to re-dispatch on the next attempt.
+func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			continue
+		}
+		if task.ErrorMessage == "" {
+			task.ErrorMessage = errMsg
+		}
+		task.CompletedAt = nil
+		c.transitionTaskState(ctx, task, 0, state.Task.FailedRetryable, "")
+	}
+
+	// Re-read the apply from storage; Stop() may have already moved it to a
+	// terminal state between the engine error and this update.
+	fresh, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err == nil && fresh != nil && state.IsTerminalApplyState(fresh.State) {
+		c.logger.Debug("apply already in terminal state, not marking retryable",
+			"apply_id", apply.ApplyIdentifier, "state", fresh.State)
+		return
+	}
+
+	apply.State = state.Apply.FailedRetryable
+	apply.ErrorMessage = errMsg
+	apply.CompletedAt = nil
+	apply.UpdatedAt = time.Now()
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.FailedRetryable, "error", err)
+	}
+	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+	if obs := c.getObserver(apply.ID); obs != nil {
+		obs.OnProgress(apply, tasks)
+	}
+}
+
 // finalizeSequentialApply updates the apply state based on sequential task outcomes.
-// On failure, remaining PENDING tasks are cancelled.
+// Permanent failures cancel remaining pending tasks; retryable failures leave
+// pending tasks queued for scheduler recovery.
 func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) {
 	now := time.Now()
 	switch {
+	case failedTask != nil && failedTask.State == state.Task.FailedRetryable:
+		apply.State = state.Apply.FailedRetryable
+		apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", failedTask.TableName, failedTask.ErrorMessage)
+		apply.CompletedAt = nil
 	case failedTask != nil:
 		apply.State = state.Apply.Failed
 		apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", failedTask.TableName, failedTask.ErrorMessage)
@@ -1145,6 +1269,13 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 
+	if apply.State == state.Apply.FailedRetryable {
+		if obs := c.getObserver(apply.ID); obs != nil {
+			obs.OnProgress(apply, tasks)
+		}
+		return
+	}
+
 	// Notify observer of terminal state, then clean up
 	if obs := c.getObserver(apply.ID); obs != nil {
 		obs.OnTerminal(apply, tasks)
@@ -1155,16 +1286,17 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 // deriveOverallState determines the overall state from a list of tasks.
 // Priority order:
 // 1. RUNNING/WAITING_FOR_CUTOVER/CUTTING_OVER - active work in progress
-// 2. PENDING - more work queued
-// 3. STOPPED - apply was stopped (even if some tasks completed)
-// 4. FAILED - at least one task failed (CANCELLED tasks also indicate failure)
-// 5. COMPLETED - all tasks completed successfully
+// 2. FAILED - at least one task failed (CANCELLED tasks also indicate failure)
+// 3. FAILED_RETRYABLE - scheduler recovery may retry failed task work
+// 4. PENDING - more work queued
+// 5. STOPPED - apply was stopped (even if some tasks completed)
+// 6. COMPLETED - all tasks completed successfully
 func deriveOverallState(tasks []*storage.Task) string {
 	if len(tasks) == 0 {
 		return state.Task.Pending
 	}
 
-	var hasRunning, hasPending, hasStopped, hasFailed, hasCancelled, hasCompleted, hasRevertWindow bool
+	var hasRunning, hasPending, hasStopped, hasFailed, hasRetryableFailed, hasCancelled, hasCompleted, hasRevertWindow bool
 	var runningState string
 
 	for _, t := range tasks {
@@ -1184,6 +1316,8 @@ func deriveOverallState(tasks []*storage.Task) string {
 			hasStopped = true
 		case state.Task.Failed:
 			hasFailed = true
+		case state.Task.FailedRetryable:
+			hasRetryableFailed = true
 		case state.Task.Cancelled:
 			hasCancelled = true
 		case state.Task.Completed:
@@ -1197,16 +1331,19 @@ func deriveOverallState(tasks []*storage.Task) string {
 	if hasRunning {
 		return runningState
 	}
+	if hasFailed || hasCancelled {
+		// Cancelled implies a prior task failed (sequential mode), so overall is failed.
+		// For Vitess cancellation (user-initiated), the apply state is set directly.
+		return state.Task.Failed
+	}
+	if hasRetryableFailed {
+		return state.Task.FailedRetryable
+	}
 	if hasPending {
 		return state.Task.Pending
 	}
 	if hasStopped {
 		return state.Task.Stopped
-	}
-	if hasFailed || hasCancelled {
-		// Cancelled implies a prior task failed (sequential mode), so overall is failed.
-		// For Vitess cancellation (user-initiated), the apply state is set directly.
-		return state.Task.Failed
 	}
 	if hasRevertWindow {
 		return state.Task.RevertWindow

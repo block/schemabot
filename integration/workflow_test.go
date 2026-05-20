@@ -1310,8 +1310,10 @@ CREATE TABLE orders (
 	t.Logf("Correctly captured MySQL error: %s", errorMessage)
 }
 
-// TestFullWorkflow_Spirit_PartialFailure tests that when one task fails in sequential mode,
-// remaining tasks are marked as CANCELLED and the error is properly surfaced.
+// TestFullWorkflow_Spirit_PartialFailure verifies sequential apply behavior
+// when one table fails with a retryable Spirit error. Completed work remains
+// completed, the failed table pauses in failed_retryable, and later table work
+// stays pending for the scheduler retry.
 func TestFullWorkflow_Spirit_PartialFailure(t *testing.T) {
 	ctx := t.Context()
 
@@ -1320,10 +1322,10 @@ func TestFullWorkflow_Spirit_PartialFailure(t *testing.T) {
 
 	endpoint := "http://" + ts.Addr
 
-	// Three tables in sequential mode (alphabetical order determines execution):
-	// 1. aaa_first - will succeed (simple table)
-	// 2. bbb_fails - will FAIL (FK to non-existent table)
-	// 3. ccc_cancelled - should be CANCELLED (never started)
+	// Three tables in sequential mode. Alphabetical order determines execution:
+	// 1. aaa_first runs first and completes.
+	// 2. bbb_fails fails with a retryable Spirit error.
+	// 3. ccc_cancelled is not reached, so it stays pending for the retry.
 	schemaFiles := map[string]string{
 		"aaa_first.sql": `
 CREATE TABLE aaa_first (
@@ -1371,11 +1373,13 @@ CREATE TABLE ccc_cancelled (
 	})
 	t.Logf("Apply started: %v", applyResp["apply_id"])
 
-	// Step 3: Poll progress until we see failed state
+	// Step 3: Poll progress until the retryable failure is durable in storage.
+	// The request that observes the engine failure can briefly return failed
+	// before the background worker persists failed_retryable.
 	var lastState string
 	var errorMessage string
 	var finalTables []any
-	for range 60 { // Longer timeout for 3 tables
+	for range 60 {
 		progressHTTPReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/api/progress/"+appDBName+"?environment=staging", nil)
 		require.NoError(t, err, "create progress request")
 		resp, err := http.DefaultClient.Do(progressHTTPReq)
@@ -1398,18 +1402,18 @@ CREATE TABLE ccc_cancelled (
 
 		t.Logf("Progress state: %s", lastState)
 
-		if lastState == state.Apply.Failed {
+		if lastState == state.Apply.FailedRetryable {
 			break
 		}
 		if lastState == state.Apply.Completed {
-			require.Fail(t, "expected failed but got completed")
+			require.Fail(t, "expected retryable failure but got completed")
 		}
 
 		time.Sleep(300 * time.Millisecond)
 	}
 
 	// Verify overall state
-	assert.Equal(t, state.Apply.Failed, lastState)
+	assert.Equal(t, state.Apply.FailedRetryable, lastState)
 	assert.NotEmpty(t, errorMessage, "expected error_message to be set")
 	t.Logf("Error message: %s", errorMessage)
 
@@ -1426,8 +1430,8 @@ CREATE TABLE ccc_cancelled (
 	}
 
 	assert.Equal(t, "completed", tableStates["aaa_first"], "aaa_first")
-	assert.Equal(t, "failed", tableStates["bbb_fails"], "bbb_fails")
-	assert.Equal(t, "cancelled", tableStates["ccc_cancelled"], "ccc_cancelled")
+	assert.Equal(t, state.Task.FailedRetryable, tableStates["bbb_fails"], "bbb_fails")
+	assert.Equal(t, state.Task.Pending, tableStates["ccc_cancelled"], "ccc_cancelled")
 
 	// Verify aaa_first table was actually created in DB (partial success committed)
 	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
@@ -1458,5 +1462,5 @@ CREATE TABLE ccc_cancelled (
 	`, appDBName).Scan(&tableName)
 	assert.Error(t, err, "ccc_cancelled table should NOT exist in DB")
 
-	t.Log("Partial failure test passed: 1 completed, 1 failed, 1 cancelled")
+	t.Log("Partial failure test passed: 1 completed, 1 retryable failed, 1 pending")
 }

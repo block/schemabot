@@ -257,6 +257,34 @@ func waitForApplyComplete(t *testing.T, client *LocalClient, ctx context.Context
 	t.Fatal("apply did not complete within 30s")
 }
 
+type retryableFailureEngine struct {
+	engine.Engine
+}
+
+func (e *retryableFailureEngine) Name() string { return "retryable-failure" }
+
+func (e *retryableFailureEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	return &engine.PlanResult{}, nil
+}
+
+func (e *retryableFailureEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	return &engine.ApplyResult{Accepted: true}, nil
+}
+
+func (e *retryableFailureEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{
+		State:        engine.StateFailed,
+		Retryable:    true,
+		ErrorMessage: "temporary engine failure",
+		Tables: []engine.TableProgress{{
+			Namespace: "testdb",
+			Table:     "users",
+			State:     state.Task.FailedRetryable,
+			Progress:  45,
+		}},
+	}, nil
+}
+
 func TestLocalClient_NewLocalClient(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -1244,9 +1272,9 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, task.State)
 }
 
-// TestLocalClient_Apply_FailedAtomicHasErrorMessage verifies that when an atomic
-// apply fails, the error message propagates to the apply record. Uses a plan
-// with an invalid DDL (ALTER on nonexistent table) to trigger a Spirit failure.
+// TestLocalClient_Apply_FailedAtomicHasErrorMessage verifies that when Spirit
+// reports an atomic apply failure, the apply pauses for scheduler retry and the
+// failure reason is persisted on both the apply and task records.
 func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -1294,14 +1322,15 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, applyResp.Accepted, "apply should be accepted: %s", applyResp.ErrorMessage)
 
-	// Wait for failure
+	// Spirit failures are retryable by default. The first failure should pause
+	// in failed_retryable instead of becoming permanently failed.
 	require.Eventually(t, func() bool {
 		applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
 		if len(applies) == 0 {
 			return false
 		}
-		return applies[0].State == state.Apply.Failed
-	}, 30*time.Second, 500*time.Millisecond, "apply should fail")
+		return applies[0].State == state.Apply.FailedRetryable
+	}, 30*time.Second, 500*time.Millisecond, "apply should pause for scheduler retry")
 
 	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
 	require.NotEmpty(t, applies)
@@ -1312,5 +1341,166 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	tasks, err := stor.Tasks().GetByApplyID(ctx, applies[0].ID)
 	require.NoError(t, err)
 	require.NotEmpty(t, tasks)
+	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
+	assert.Nil(t, tasks[0].CompletedAt)
 	assert.NotEmpty(t, tasks[0].ErrorMessage, "task.ErrorMessage should contain the failure reason")
+}
+
+func TestLocalClient_AtomicRetryableFailureQueuesSchedulerRetry(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+	client.spiritEngine = &retryableFailureEngine{}
+
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-retryable-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    "development",
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{
+					{Namespace: "testdb", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN retry_note VARCHAR(255)", Operation: "alter"},
+				},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-retryable-%d", time.Now().UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     "development",
+		StartedAt:       &now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	tasks := []*storage.Task{
+		{
+			TaskIdentifier: fmt.Sprintf("task-retryable-users-%d", time.Now().UnixNano()),
+			ApplyID:        applyID,
+			PlanID:         planID,
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Engine:         storage.EngineSpirit,
+			State:          state.Task.Running,
+			TableName:      "users",
+			Namespace:      "testdb",
+			DDL:            "ALTER TABLE `users` ADD COLUMN retry_note VARCHAR(255)",
+			DDLAction:      "alter",
+			Options:        []byte("{}"),
+			Environment:    "development",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+		{
+			TaskIdentifier:  fmt.Sprintf("task-retryable-orders-%d", time.Now().UnixNano()),
+			ApplyID:         applyID,
+			PlanID:          planID,
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Engine:          storage.EngineSpirit,
+			State:           state.Task.Completed,
+			TableName:       "orders",
+			Namespace:       "testdb",
+			DDL:             "ALTER TABLE `orders` ADD COLUMN retry_note VARCHAR(255)",
+			DDLAction:       "alter",
+			ProgressPercent: 100,
+			Options:         []byte("{}"),
+			Environment:     "development",
+			CompletedAt:     &now,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		},
+	}
+	for _, task := range tasks {
+		taskID, err := stor.Tasks().Create(ctx, task)
+		require.NoError(t, err)
+		task.ID = taskID
+	}
+
+	// The engine reports a failed result with Retryable=true. The local Tern
+	// worker should stop this attempt, keep the apply non-terminal, and leave
+	// already-completed task work untouched for the scheduler retry.
+	client.pollForCompletionAtomic(ctx, apply, tasks, &engine.Credentials{DSN: dsn}, nil)
+
+	failedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, failedApply)
+	assert.Equal(t, state.Apply.FailedRetryable, failedApply.State)
+	assert.Nil(t, failedApply.CompletedAt)
+	assert.Equal(t, "temporary engine failure", failedApply.ErrorMessage)
+
+	failedTasks, err := stor.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, failedTasks, 2)
+	var retryTask, completedTask *storage.Task
+	for _, task := range failedTasks {
+		switch task.TableName {
+		case "users":
+			retryTask = task
+		case "orders":
+			completedTask = task
+		}
+	}
+	require.NotNil(t, retryTask)
+	require.NotNil(t, completedTask)
+	assert.Equal(t, state.Task.FailedRetryable, retryTask.State)
+	assert.Nil(t, retryTask.CompletedAt)
+	assert.Equal(t, "temporary engine failure", retryTask.ErrorMessage)
+	assert.Equal(t, state.Task.Completed, completedTask.State)
+	assert.NotNil(t, completedTask.CompletedAt)
+
+	// When the scheduler claims this apply, retryable tasks are queued for the
+	// next dispatch attempt. Completed tasks stay completed so successful table
+	// work is not repeated.
+	client.prepareRetryableTasksForResume(ctx, failedApply, failedTasks)
+
+	preparedTasks, err := stor.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	for _, task := range preparedTasks {
+		switch task.TableName {
+		case "users":
+			assert.Equal(t, state.Task.Pending, task.State)
+			assert.Empty(t, task.ErrorMessage)
+			assert.Nil(t, task.CompletedAt)
+			assert.Equal(t, 1, task.Attempt)
+		case "orders":
+			assert.Equal(t, state.Task.Completed, task.State)
+			assert.Equal(t, 0, task.Attempt)
+		}
+	}
 }

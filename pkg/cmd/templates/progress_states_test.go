@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -15,6 +16,7 @@ func TestStateLabel_PlanetScalePhases(t *testing.T) {
 	assert.Equal(t, "Creating deploy request", StateLabel(state.Apply.CreatingDeployRequest))
 	assert.Equal(t, "Validating deploy request", StateLabel(state.Apply.ValidatingDeployRequest))
 	assert.Equal(t, "Cancelled", StateLabel(state.Apply.Cancelled))
+	assert.Equal(t, "Retrying", StateLabel(state.Apply.FailedRetryable))
 }
 
 func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
@@ -24,6 +26,7 @@ func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
 	assert.Contains(t, FormatProgressState(state.Apply.CreatingDeployRequest), "Creating deploy request")
 	assert.Contains(t, FormatProgressState(state.Apply.ValidatingDeployRequest), "Validating deploy request")
 	assert.Contains(t, FormatProgressState(state.Apply.Cancelled), "Cancelled")
+	assert.Contains(t, FormatProgressState(state.Apply.FailedRetryable), "Retrying")
 }
 
 func TestProgressSymbol(t *testing.T) {
@@ -85,6 +88,32 @@ func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	}
 	output := FormatTableProgress(tp)
 	assert.Contains(t, output, "Cutting over...")
+}
+
+func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
+	t.Run("with progress", func(t *testing.T) {
+		tp := TableProgress{
+			TableName:       "users",
+			ChangeType:      "alter",
+			Status:          state.Apply.FailedRetryable,
+			PercentComplete: 45,
+		}
+
+		output := FormatTableProgress(tp)
+		assert.Contains(t, output, ui.ProgressBar(45, ui.ColorYellow)+" Retrying")
+	})
+
+	t.Run("without progress", func(t *testing.T) {
+		tp := TableProgress{
+			TableName:  "users",
+			ChangeType: "alter",
+			Status:     state.Apply.FailedRetryable,
+		}
+
+		output := FormatTableProgress(tp)
+		assert.Contains(t, output, "users: Retrying")
+		assert.NotContains(t, output, ui.ColorYellow)
+	})
 }
 
 func TestVSchemaStatusLabel(t *testing.T) {

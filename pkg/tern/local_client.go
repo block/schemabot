@@ -487,7 +487,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		caller = options["caller"]
 	}
 
-	// Detect atomic mode (--defer-cutover)
+	// Detect deferred cutover. Spirit uses this for atomic cutover; Vitess
+	// always uses the grouped engine apply path for deploy requests.
 	deferCutover := options["defer_cutover"] == "true"
 	allowUnsafe := options["allow_unsafe"] == "true"
 
@@ -606,9 +607,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	c.cancelApply = cancelApply
 	c.cancelMu.Unlock()
 	if deferCutover || c.config.Type == storage.DatabaseTypeVitess {
-		// Atomic mode: all DDLs in one engine call.
-		// For Spirit: atomic cutover (--defer-cutover).
-		// For Vitess: always atomic — one deploy request per apply.
+		// Grouped mode: all DDLs are sent in one engine call. For Spirit this
+		// is atomic cutover when defer_cutover is enabled; for Vitess this
+		// creates one deploy request per apply.
 		go c.runWithRecovery(applyCtx, apply, tasks, func() {
 			c.executeApplyAtomic(applyCtx, apply, tasks, plan, options)
 		})
@@ -779,16 +780,20 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		if err == nil {
 			engineResult = result
 			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
+			taskState := taskStateFromProgressResult(result)
 
 			// Only update task state from engine if task is not already in a terminal state.
 			// Terminal states (CANCELLED, COMPLETED, FAILED, etc.) should be preserved -
 			// they represent the final state set by the apply execution.
 			if !state.IsTerminalTaskState(activeTask.State) {
-				activeTask.State = engineStateToStorage(result.State)
+				activeTask.State = taskState
 				now := time.Now()
 				activeTask.UpdatedAt = now
-				if result.State.IsTerminal() && activeTask.CompletedAt == nil {
+				if result.State.IsTerminal() && !state.IsState(taskState, state.Task.FailedRetryable) && activeTask.CompletedAt == nil {
 					activeTask.CompletedAt = &now
+				}
+				if result.State == engine.StateFailed && activeTask.ErrorMessage == "" {
+					activeTask.ErrorMessage = progressFailureMessage(result)
 				}
 				if err := c.storage.Tasks().Update(ctx, activeTask); err != nil {
 					c.logger.Warn("failed to update task state from progress poll", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "error", err)
@@ -800,19 +805,27 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			// for this apply are terminal — in sequential mode, the engine reports
 			// "completed" per-task, but the apply isn't done until all tasks finish.
 			if result.State.IsTerminal() {
-				allTerminal := true
+				retryableFailure := state.IsState(taskState, state.Task.FailedRetryable)
+				allTerminal := !retryableFailure
 				for _, t := range currentApplyTasks {
 					if !state.IsTerminalTaskState(t.State) {
 						allTerminal = false
 						break
 					}
 				}
-				if allTerminal {
+				if retryableFailure || allTerminal {
 					apply, _ := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
 					if apply != nil && !state.IsTerminalApplyState(apply.State) {
 						now := time.Now()
-						apply.State = engineStateToStorage(result.State)
-						apply.CompletedAt = &now
+						apply.State = taskStateToApplyState(taskState)
+						if retryableFailure {
+							apply.CompletedAt = nil
+						} else {
+							apply.CompletedAt = &now
+						}
+						if result.State == engine.StateFailed {
+							apply.ErrorMessage = progressFailureMessage(result)
+						}
 						apply.UpdatedAt = now
 						if err := c.storage.Applies().Update(ctx, apply); err != nil {
 							c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
@@ -928,6 +941,8 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			c.logger.Debug("Progress: overriding task-derived state with apply record setup phase",
 				"task_derived", overallState, "apply_record", applyRec.State)
 			overallState = applyRec.State
+		case state.IsState(applyRec.State, state.Apply.FailedRetryable):
+			overallState = applyRec.State
 		case state.IsTerminalApplyState(applyRec.State):
 			overallState = applyRec.State
 		}
@@ -936,7 +951,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// If no error from engine, check stored task errors (for restart recovery)
 	if errorMessage == "" {
 		for _, t := range currentApplyTasks {
-			if t.State == state.Task.Failed && t.ErrorMessage != "" {
+			if (t.State == state.Task.Failed || t.State == state.Task.FailedRetryable) && t.ErrorMessage != "" {
 				errorMessage = t.ErrorMessage
 				break
 			}
@@ -944,8 +959,8 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	}
 
 	// Clamp per-table status to match overall state. Engine per-table progress
-	// can report individual migrations as completed while the deploy request is
-	// still in revert window. All tasks share one deploy request in atomic mode.
+	// can report individual table work as completed while the grouped apply is
+	// still in revert window.
 	if state.IsState(overallState, state.Apply.RevertWindow) {
 		for _, tp := range tables {
 			if state.IsState(tp.Status, state.Apply.Completed) {

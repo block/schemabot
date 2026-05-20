@@ -396,6 +396,8 @@ func FormatProgressState(s string) string {
 		return ANSICyan + "🔄 Cutting over..." + ANSIReset
 	case state.Apply.Completed:
 		return ANSIGreen + "✓ Completed" + ANSIReset
+	case state.Apply.FailedRetryable:
+		return ANSIYellow + "↻ Retrying" + ANSIReset
 	case state.Apply.Failed:
 		return ANSIRed + "✗ Failed" + ANSIReset
 	case state.Apply.Stopped:
@@ -476,6 +478,19 @@ func FormatTableProgress(t TableProgress) string {
 	case state.Apply.Failed:
 		bar := ui.ProgressBarFailed(t.PercentComplete)
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ❌ Failed\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
+	case state.Apply.FailedRetryable:
+		if t.PercentComplete > 0 {
+			bar := ui.ProgressBar(t.PercentComplete, ui.ColorYellow)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Retrying\n", t.TableName, bar)
+		} else {
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Retrying\n", t.TableName)
+		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
@@ -862,6 +877,8 @@ func StateLabel(s string) string {
 		return "Completed"
 	case state.Apply.Failed:
 		return "Failed"
+	case state.Apply.FailedRetryable:
+		return "Retrying"
 	case state.Apply.Running:
 		return "Running"
 	case state.Apply.WaitingForDeploy:
@@ -902,6 +919,8 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIGreen)
 	case state.Apply.Failed:
 		return colorWrap(ANSIRed)
+	case state.Apply.FailedRetryable:
+		return colorWrap(ANSIYellow)
 	case state.Apply.Running:
 		return colorWrap(ANSICyan)
 	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.CuttingOver:

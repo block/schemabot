@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"maps"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/block/schemabot/pkg/schema"
@@ -330,6 +331,10 @@ type Apply struct {
 	// Use ParseApplyOptions() to get typed access.
 	Options []byte
 
+	// Attempt tracks scheduler retry attempts for failed_retryable applies.
+	// Once the retry budget is exhausted, the apply becomes failed.
+	Attempt int
+
 	// CreatedAt is when the apply was created.
 	CreatedAt time.Time
 
@@ -367,6 +372,56 @@ type ApplyOptions struct {
 
 	// Volume controls schema change aggressiveness (1-11).
 	Volume int `json:"volume,omitempty"`
+
+	// Target is the opaque endpoint-discovery target forwarded to Tern.
+	// Defaults to the apply database when empty.
+	Target string `json:"target,omitempty"`
+}
+
+// ApplyOptionsFromMap converts API/proto option strings into typed storage options.
+func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
+	opts := ApplyOptions{
+		AllowUnsafe:  options["allow_unsafe"] == "true",
+		Branch:       options["branch"],
+		DeferCutover: options["defer_cutover"] == "true",
+		DeferDeploy:  options["defer_deploy"] == "true",
+		SkipRevert:   options["skip_revert"] == "true",
+		Target:       options["target"],
+	}
+	if rawVolume := options["volume"]; rawVolume != "" {
+		volume, err := strconv.Atoi(rawVolume)
+		if err == nil && volume >= 1 && volume <= 11 {
+			opts.Volume = volume
+		}
+	}
+	return opts
+}
+
+// Map converts typed storage options back into API/proto option strings.
+func (opts ApplyOptions) Map() map[string]string {
+	options := make(map[string]string)
+	if opts.AllowUnsafe {
+		options["allow_unsafe"] = "true"
+	}
+	if opts.Branch != "" {
+		options["branch"] = opts.Branch
+	}
+	if opts.DeferCutover {
+		options["defer_cutover"] = "true"
+	}
+	if opts.DeferDeploy {
+		options["defer_deploy"] = "true"
+	}
+	if opts.SkipRevert {
+		options["skip_revert"] = "true"
+	}
+	if opts.Volume > 0 {
+		options["volume"] = strconv.Itoa(opts.Volume)
+	}
+	if opts.Target != "" {
+		options["target"] = opts.Target
+	}
+	return options
 }
 
 // ParseApplyOptions parses the JSON options into ApplyOptions.
@@ -444,6 +499,9 @@ type Task struct {
 
 	// Options contains engine-specific options as JSON.
 	Options []byte
+
+	// Attempt tracks how many times this task has been retried by scheduler recovery.
+	Attempt int
 
 	// Namespace is the schema name (MySQL) or keyspace (Vitess) this table belongs to.
 	Namespace string

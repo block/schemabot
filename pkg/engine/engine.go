@@ -269,6 +269,7 @@ type ProgressResult struct {
 	Progress     int    // 0-100 percent complete
 	Message      string // Human-readable status
 	ErrorMessage string // Error details when State is StateFailed
+	Retryable    bool   // True when a failed progress result can be retried
 	Tables       []TableProgress
 	ResumeState  *ResumeState // Updated resume state (engines may update MigrationContext/Metadata during polling)
 }

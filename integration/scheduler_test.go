@@ -297,7 +297,8 @@ func TestScheduler_ClaimableStates(t *testing.T) {
 			fixture.resetStorage(t)
 
 			applyIdentifier := fmt.Sprintf("apply-claim-state-%d", i)
-			_, err := stor.Applies().Create(ctx, &storage.Apply{
+			now := time.Now()
+			applyID, err := stor.Applies().Create(ctx, &storage.Apply{
 				ApplyIdentifier: applyIdentifier,
 				Database:        appDBName,
 				DatabaseType:    tc.databaseType,
@@ -306,8 +307,30 @@ func TestScheduler_ClaimableStates(t *testing.T) {
 				State:           tc.applyState,
 				Options:         []byte("{}"),
 				Environment:     "staging",
+				CreatedAt:       now,
+				UpdatedAt:       now,
 			})
 			require.NoError(t, err)
+			if tc.applyState == state.Apply.Pending {
+				// Pending applies become scheduler work only after task creation
+				// finishes; a bare pending apply is still in request setup.
+				_, err := stor.Tasks().Create(ctx, &storage.Task{
+					TaskIdentifier: fmt.Sprintf("task-%s", applyIdentifier),
+					ApplyID:        applyID,
+					Database:       appDBName,
+					DatabaseType:   tc.databaseType,
+					Engine:         tc.engine,
+					State:          state.Task.Pending,
+					TableName:      "claimable_pending",
+					DDL:            "ALTER TABLE claimable_pending ADD COLUMN note VARCHAR(255)",
+					DDLAction:      "alter",
+					Options:        []byte("{}"),
+					Environment:    "staging",
+					CreatedAt:      now,
+					UpdatedAt:      now,
+				})
+				require.NoError(t, err)
+			}
 			_, err = schemabotDB.ExecContext(ctx,
 				"UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_identifier = ?",
 				applyIdentifier)
@@ -366,6 +389,68 @@ func TestScheduler_ClaimRefreshesHeartbeat(t *testing.T) {
 	reclaimed, err := stor.Applies().FindNextApply(ctx)
 	require.NoError(t, err)
 	assert.Nil(t, reclaimed, "freshly claimed apply should not be claimable again")
+}
+
+func TestScheduler_ExpiresRetryableBudget(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	fixture := newSchedulerClaimFixture(t, "retry_budget_")
+	appDBName := fixture.appDBName
+	stor := fixture.store
+
+	now := time.Now()
+	applyID, err := stor.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-retry-budget-exhausted",
+		Database:        appDBName,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      appDBName,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.FailedRetryable,
+		ErrorMessage:    "temporary engine failure",
+		Options:         []byte("{}"),
+		Attempt:         999,
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+	_, err = stor.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task-retry-budget-exhausted",
+		ApplyID:        applyID,
+		Database:       appDBName,
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		State:          state.Task.FailedRetryable,
+		ErrorMessage:   "temporary engine failure",
+		TableName:      "users",
+		Namespace:      appDBName,
+		DDL:            "ALTER TABLE users ADD COLUMN retry_note VARCHAR(255)",
+		DDLAction:      "alter",
+		Options:        []byte("{}"),
+		Environment:    "staging",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{SchedulerWorkers: 1}, nil, logger)
+	require.NoError(t, svc.SetSchedulerPollInterval(50*time.Millisecond))
+	svc.StartScheduler(ctx)
+	defer svc.StopScheduler()
+
+	// The scheduler should convert retry-waiting work to permanent failure once
+	// the retry budget is exhausted, instead of leaving it claimable forever.
+	require.Eventually(t, func() bool {
+		apply, err := stor.Applies().Get(ctx, applyID)
+		require.NoError(t, err)
+		return apply != nil && apply.State == state.Apply.Failed
+	}, 5*time.Second, 100*time.Millisecond)
+
+	tasks, err := stor.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, state.Task.Failed, tasks[0].State)
 }
 
 func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {

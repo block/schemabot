@@ -35,6 +35,8 @@ func taskStateToApplyState(ts string) string {
 		return state.Apply.Completed
 	case state.Task.Failed:
 		return state.Apply.Failed
+	case state.Task.FailedRetryable:
+		return state.Apply.FailedRetryable
 	case state.Task.Stopped:
 		return state.Apply.Stopped
 	case state.Task.Reverted:
@@ -74,6 +76,29 @@ func engineStateToStorage(es engine.State) string {
 	}
 }
 
+// taskStateFromProgressResult converts an engine progress result to the task
+// state Tern should persist. Engines use Retryable to opt a failed result into
+// scheduler recovery instead of permanent failure.
+func taskStateFromProgressResult(result *engine.ProgressResult) string {
+	if result == nil {
+		return state.Task.Pending
+	}
+	if result.State == engine.StateFailed && result.Retryable {
+		return state.Task.FailedRetryable
+	}
+	return engineStateToStorage(result.State)
+}
+
+func progressFailureMessage(result *engine.ProgressResult) string {
+	if result == nil {
+		return ""
+	}
+	if result.ErrorMessage != "" {
+		return result.ErrorMessage
+	}
+	return result.Message
+}
+
 // storageStateToProto converts a task state string to proto State enum.
 func storageStateToProto(ts string) ternv1.State {
 	switch ts {
@@ -92,6 +117,8 @@ func storageStateToProto(ts string) ternv1.State {
 	case state.Task.Completed:
 		return ternv1.State_STATE_COMPLETED
 	case state.Task.Failed:
+		return ternv1.State_STATE_FAILED
+	case state.Task.FailedRetryable, state.Apply.FailedRetryable:
 		return ternv1.State_STATE_FAILED
 	case state.Task.Stopped:
 		return ternv1.State_STATE_STOPPED

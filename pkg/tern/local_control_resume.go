@@ -373,6 +373,26 @@ func buildApplyOptions(apply *storage.Apply) map[string]string {
 	return options
 }
 
+// prepareRetryableTasksForResume queues only the task work that previously
+// stopped on a retryable engine failure. Completed tasks remain completed, and
+// pending tasks remain queued behind the retried work.
+func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
+	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
+		return
+	}
+	apply.ErrorMessage = ""
+	for _, task := range tasks {
+		if !state.IsState(task.State, state.Task.FailedRetryable) {
+			continue
+		}
+		task.Attempt++
+		task.ErrorMessage = ""
+		task.CompletedAt = nil
+		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier))
+	}
+}
+
 // launchAtomicResume sends all DDLs to the engine in one call, marks tasks and
 // apply as RUNNING, logs the provided message, and starts pollForCompletionAtomic
 // in a background goroutine. Used by both Start() and ResumeApply().
@@ -393,8 +413,9 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		tableChanges = append(tableChanges, engine.TableChange{DDL: ddl})
 	}
 
-	// Resume atomic apply after restart. Use apply identifier as MigrationContext
-	// so Spirit can find existing checkpoint tables from the original run.
+	// Resume the grouped apply after restart. Use apply identifier as
+	// MigrationContext so Spirit can find existing checkpoint tables from the
+	// original run.
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
 		Database: apply.Database,
 		Changes: []engine.SchemaChange{{
@@ -513,10 +534,19 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		return nil
 	}
 
+	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
+
 	options := buildApplyOptions(apply)
 
 	if apply.GetOptions().DeferCutover {
-		if err := c.launchAtomicResume(ctx, apply, activeTasks, plan, options, "Apply resumed from checkpoint (atomic)"); err != nil {
+		if err := c.launchAtomicResume(ctx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply))); err != nil {
+			if c.shouldRetryEngineError(err) {
+				c.logger.Warn("engine apply failed during recovery, pausing apply for scheduler retry",
+					"apply_id", apply.ApplyIdentifier,
+					"error", err)
+				c.markApplyRetryableWithTasks(ctx, apply, activeTasks, err.Error())
+				return nil
+			}
 			c.logger.Error("engine apply failed during recovery",
 				"apply_id", apply.ApplyIdentifier,
 				"error", err)

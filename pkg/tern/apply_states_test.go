@@ -101,6 +101,18 @@ func TestDeriveApplyPhase(t *testing.T) {
 	}
 }
 
+func TestTaskStateFromProgressResult(t *testing.T) {
+	t.Run("retryable failed result becomes scheduler-retryable task state", func(t *testing.T) {
+		result := &engine.ProgressResult{State: engine.StateFailed, Retryable: true}
+		assert.Equal(t, state.Task.FailedRetryable, taskStateFromProgressResult(result))
+	})
+
+	t.Run("failed result without retry hint stays permanent", func(t *testing.T) {
+		result := &engine.ProgressResult{State: engine.StateFailed}
+		assert.Equal(t, state.Task.Failed, taskStateFromProgressResult(result))
+	})
+}
+
 func TestApplyEventStateTransition(t *testing.T) {
 	logger := slog.Default()
 	succeedUpdate := func(_ *storage.Apply) error { return nil }
@@ -244,6 +256,22 @@ func TestDeriveOverallState(t *testing.T) {
 			},
 			wantState: state.Task.Failed,
 		},
+		{
+			name: "retryable failed waits for scheduler with completed work",
+			tasks: []*storage.Task{
+				{State: state.Task.FailedRetryable},
+				{State: state.Task.Completed},
+			},
+			wantState: state.Task.FailedRetryable,
+		},
+		{
+			name: "retryable failed waits for scheduler with pending work",
+			tasks: []*storage.Task{
+				{State: state.Task.FailedRetryable},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.FailedRetryable,
+		},
 	}
 
 	for _, tt := range tests {
@@ -333,6 +361,15 @@ func TestDeriveVSchemaTaskState(t *testing.T) {
 		result := &engine.ProgressResult{State: engine.StateFailed}
 		got := c.deriveVSchemaTaskState(task, result, state.Task.Failed, now)
 		assert.Equal(t, state.Task.Failed, got)
+	})
+
+	t.Run("transitions to retryable failure when scheduler can recover", func(t *testing.T) {
+		task := &storage.Task{State: state.Task.Running}
+		result := &engine.ProgressResult{State: engine.StateFailed, Retryable: true, ErrorMessage: "temporary engine failure"}
+		got := c.deriveVSchemaTaskState(task, result, state.Task.FailedRetryable, now)
+		assert.Equal(t, state.Task.FailedRetryable, got)
+		assert.Equal(t, "temporary engine failure", task.ErrorMessage)
+		assert.Nil(t, task.CompletedAt)
 	})
 
 	t.Run("stays pending during cutover since VSchema is applied after", func(t *testing.T) {

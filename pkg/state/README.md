@@ -26,6 +26,7 @@ Vitess OnlineDDL and Spirit report — and they are translated into Task and App
 | CuttingOver | `cutting_over` | Cutover in progress (atomic mode only) |
 | Completed | `completed` | All tasks finished successfully |
 | Failed | `failed` | At least one task failed |
+| FailedRetryable | `failed_retryable` | A retryable engine error occurred; scheduler recovery can retry it |
 | Stopped | `stopped` | User requested stop, resumable via start (engine-dependent) |
 | RevertWindow | `revert_window` | Schema change applied, revert available. Only meaningful for PlanetScale; Spirit doesn't support revert so SchemaBot auto-advances to completed |
 | Reverted | `reverted` | Schema change was reverted |
@@ -42,10 +43,13 @@ stateDiagram-v2
     waiting_for_deploy --> running : deploy triggered
     running --> completed
     running --> failed
+    running --> failed_retryable
     running --> stopped : resumable (Spirit only)
     running --> cancelled : permanent (PlanetScale only)
     running --> waiting_for_cutover : atomic mode
     running --> revert_window : PlanetScale only
+    failed_retryable --> running : scheduler retry
+    failed_retryable --> failed : retry budget exhausted
 
     waiting_for_cutover --> cutting_over
     cutting_over --> completed
@@ -58,6 +62,7 @@ stateDiagram-v2
 - `waiting_for_cutover`/`cutting_over`: Only with `--defer-cutover` or atomic mode (Spirit). Note: `--defer-cutover` is a no-op for instant DDL (no cutover exists).
 - `revert_window`: Only with `--enable-revert`. Spirit auto-advances through it; PlanetScale holds until expiry or user action. Maps from PlanetScale's `complete_pending_revert` deploy state
 - `stopped`: Spirit only — resumable via `schemabot start`. Spirit checkpoints progress for resume.
+- `failed_retryable`: transient engine failure. Scheduler workers retry while the retry budget remains, then move the apply to `failed`.
 - `cancelled`: PlanetScale only — permanent. Cancels the deploy request; the underlying Vitess migrations are cancelled. Not resumable — start a new apply instead.
 
 ## Task states
@@ -70,29 +75,75 @@ Per-table execution state. Same state machine as Apply, plus `cancelled`:
 | Running | `running` | Engine is actively executing (row copy, checksum, etc.) |
 | WaitingForCutover | `waiting_for_cutover` | Row copy complete, waiting for cutover signal |
 | CuttingOver | `cutting_over` | Table cutover in progress |
-| Completed | `complete` | Schema change applied successfully |
+| Completed | `completed` | Schema change applied successfully |
 | Failed | `failed` | Engine reported failure |
+| FailedRetryable | `failed_retryable` | Retryable engine error; reset to pending on scheduler retry |
 | Stopped | `stopped` | User requested stop, checkpoint saved |
 | RevertWindow | `revert_window` | Schema change applied, revert available (PlanetScale only) |
 | Reverted | `reverted` | Schema change was reverted |
 | Cancelled | `cancelled` | Task never executed due to earlier failure (sequential mode) |
+
+### Retryable failure relationship
+
+`failed_retryable` exists at both task and apply levels, but each level answers a different question:
+
+- A **task** in `failed_retryable` means one table's work hit a retryable engine error. The task is not terminal because scheduler recovery may run that table work again.
+- An **apply** in `failed_retryable` means the whole apply is paused and waiting for scheduler recovery. The apply owns the retry attempt counter and retry budget.
+- A **pending task** is unfinished work that is not currently running. It remains attached to the apply and is eligible to run the next time the apply is dispatched.
+
+The apply state rolls up from task state: any `failed_retryable` task makes the apply `failed_retryable` unless a permanent `failed` task is present. Atomic execution can also mark the apply `failed_retryable` while updating the affected tasks from the same retryable engine result.
+
+When the scheduler claims a retryable apply, it refreshes the apply heartbeat as a lease, increments the apply attempt, and re-dispatches the apply. That attempt count is the apply-level dispatch count for the whole retry cycle; it is not a per-task counter.
+
+The scheduler does not claim tasks directly. It claims the `failed_retryable` apply, reloads that apply's tasks, then prepares the retry by clearing only the tasks in `failed_retryable`. Those tasks move back to `pending`, their error message is cleared, and their task attempt count increments. Completed tasks are left alone because their table work already succeeded.
+
+On retry, tasks are handled by their current state:
+
+- `completed` tasks stay completed and are skipped.
+- `failed_retryable` tasks reset to `pending` so they can run again.
+- `pending` tasks remain pending and can run on the next dispatch.
+
+For example, in sequential mode, if table A completed, table B failed retryably, and table C never started, the retry starts from B/C work. Table A is not run again. If the retry budget is exhausted, the scheduler moves the apply to `failed` and converts unfinished tasks to `failed`.
+
+```text
+Before scheduler retry:
+
+  apply: failed_retryable
+
+  task A: completed          (already succeeded)
+  task B: failed_retryable   (retryable engine error)
+  task C: pending            (not reached yet)
+
+Scheduler retry preparation:
+
+  claim apply -> increment apply attempt -> reload tasks
+
+  task A: completed          -> completed   (skipped)
+  task B: failed_retryable   -> pending     (will run again)
+  task C: pending            -> pending     (still waiting)
+
+Next dispatch:
+
+  run pending work: task B, then task C
+```
 
 ## Deriving apply state
 
 `DeriveApplyState()` computes the apply state from the collective task states. Priority rules (highest to lowest):
 
 1. Any task **failed** → apply `failed`
-2. Any task **stopped** → apply `stopped`
-3. Any task **reverted** → apply `reverted`
-4. All tasks **completed** → apply `completed`
-5. Any task **cutting_over** → apply `cutting_over`
-6. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
-7. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
-8. Any task **revert_window** → apply `revert_window`
-9. Any task **running** → apply `running`
-10. Otherwise → apply `pending`
+2. Any task **failed_retryable** → apply `failed_retryable`
+3. Any task **stopped** → apply `stopped`
+4. Any task **reverted** → apply `reverted`
+5. All tasks **completed** → apply `completed`
+6. Any task **cutting_over** → apply `cutting_over`
+7. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
+8. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
+9. Any task **revert_window** → apply `revert_window`
+10. Any task **running** → apply `running`
+11. Otherwise → apply `pending`
 
-Terminal states (`completed`, `failed`, `reverted`, `cancelled`) are checked via `IsTerminalApplyState()`. Note: `stopped` is NOT terminal at the task level — a stopped task can be resumed via Start.
+Terminal states (`completed`, `failed`, `reverted`, `cancelled`) are checked via `IsTerminalApplyState()`. Note: `failed_retryable` is not terminal because scheduler recovery can retry it, and `stopped` is not terminal at the task level because a stopped task can be resumed via Start.
 
 ## Spirit states
 

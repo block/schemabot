@@ -35,10 +35,22 @@ func changeTypeToString(ct ternv1.ChangeType) string {
 // deriveErrorCode returns an error code based on apply state
 // and error message. Returns empty string when no error code applies.
 func deriveErrorCode(applyState, errorMessage string) string {
-	if errorMessage != "" && state.IsState(applyState, state.Apply.Failed) {
+	if errorMessage == "" {
+		return ""
+	}
+	if state.IsState(applyState, state.Apply.FailedRetryable) {
+		return apitypes.ErrCodeEngineErrorRetryable
+	}
+	if state.IsState(applyState, state.Apply.Failed) {
 		return apitypes.ErrCodeEngineError
 	}
 	return ""
+}
+
+// shouldServeProgressFromStorage returns true when storage has the authoritative
+// progress state and there is no active Tern work to poll.
+func shouldServeProgressFromStorage(applyState string) bool {
+	return state.IsTerminalApplyState(applyState) || state.IsState(applyState, state.Apply.FailedRetryable)
 }
 
 // engineName converts a protobuf Engine enum to a display-friendly name.
@@ -146,6 +158,9 @@ func (s *Service) GetProgress(ctx context.Context, database, environment string)
 	// the server-side database target registry for this environment.
 	deployment := ""
 	if activeApply != nil {
+		if shouldServeProgressFromStorage(activeApply.State) {
+			return s.progressFromLocalStorage(ctx, activeApply)
+		}
 		deployment = activeApply.Deployment
 	}
 	deployment, err = s.deploymentForDatabaseEnvironment(database, deployment, environment)
@@ -215,6 +230,17 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if activeApply != nil && shouldServeProgressFromStorage(activeApply.State) {
+		httpResp, err := s.progressFromLocalStorage(r.Context(), activeApply)
+		if err != nil {
+			s.logger.Error("failed to read apply progress from storage", "apply_id", activeApply.ApplyIdentifier, "state", activeApply.State, "error", err)
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read apply: "+err.Error())
+			return
+		}
+		s.writeJSON(w, http.StatusOK, httpResp)
+		return
+	}
+
 	// Deployment is a plan-time decision stored on the apply record. If no
 	// apply record exists yet, route by the server-side database target config.
 	var deployment string
@@ -278,11 +304,10 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// For terminal applies, serve from local storage (no RPC needed).
-	if state.IsTerminalApplyState(apply.State) {
+	if shouldServeProgressFromStorage(apply.State) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
-			s.logger.Error("failed to read tasks from storage for terminal apply", "apply_id", applyID, "error", err)
+			s.logger.Error("failed to read apply progress from storage", "apply_id", applyID, "state", apply.State, "error", err)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
@@ -567,7 +592,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // progressFromLocalStorage builds a ProgressResponse from local apply + task
-// records. Used for terminal applies where the Tern RPC is unnecessary.
+// records when there is no active Tern work to poll.
 //
 // If any local task records are stale (non-terminal state on a terminal apply),
 // this method syncs them from a one-time Tern RPC before building the response.
@@ -581,10 +606,12 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	// Check if any tasks are stale (non-terminal and not matching the apply
 	// state). A stopped task on a stopped apply is expected, not stale.
 	stale := false
-	for _, task := range tasks {
-		if !state.IsTerminalTaskState(task.State) && task.State != apply.State {
-			stale = true
-			break
+	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
+		for _, task := range tasks {
+			if !state.IsTerminalTaskState(task.State) && task.State != apply.State {
+				stale = true
+				break
+			}
 		}
 	}
 

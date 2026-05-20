@@ -22,13 +22,17 @@ import (
 // applyColumns lists all columns for SELECT queries.
 const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, database_type,
 	repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
-	state, error_message, options,
+	state, error_message, options, attempt,
 	created_at, started_at, completed_at, updated_at`
 
 const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_id, a.database_name, a.database_type,
 	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.engine,
-	a.state, a.error_message, a.options,
+	a.state, a.error_message, a.options, a.attempt,
 	a.created_at, a.started_at, a.completed_at, a.updated_at`
+
+// maxRecoveryAttempts is the retry budget for failed_retryable applies. The
+// original apply attempt is separate; this counts scheduler redispatches.
+const maxRecoveryAttempts = 10
 
 const (
 	applyTargetLockWait           = 10 * time.Second
@@ -54,16 +58,15 @@ type txBeginner interface {
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 }
 
-// claimableApplyStates returns apply states where scheduler recovery can safely
-// resume work after the heartbeat becomes stale. Pending and running states can
-// be orphaned by a server crash, and deploy/cutover/revert-window states have
-// already persisted enough engine metadata for recovery to continue from stored
-// state. Terminal states are already done, stopped requires an explicit user
-// start, and PlanetScale setup states are excluded until recovery can reload the
-// persisted branch/deploy metadata needed to resume them without restarting setup.
+// claimableApplyStates returns active apply states where scheduler recovery can
+// safely resume work after the heartbeat becomes stale. Pending has a separate
+// queue path and does not need to be stale before a worker claims it. Terminal
+// states are already done, failed_retryable has its own retry path, stopped
+// requires an explicit user start, and PlanetScale setup states are excluded
+// until recovery can reload the persisted branch/deploy metadata needed to
+// resume them without restarting setup.
 func claimableApplyStates() []string {
 	return []string{
-		state.Apply.Pending,
 		state.Apply.Running,
 		state.Apply.WaitingForDeploy,
 		state.Apply.WaitingForCutover,
@@ -316,12 +319,12 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
 			repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
-			state, error_message, options
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			state, error_message, options, attempt
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		apply.ApplyIdentifier, apply.LockID, apply.PlanID, apply.Database, apply.DatabaseType,
 		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, apply.Engine,
-		apply.State, apply.ErrorMessage, string(options),
+		apply.State, apply.ErrorMessage, string(options), apply.Attempt,
 	)
 	if err != nil {
 		if isDuplicateKeyError(err) {
@@ -426,10 +429,10 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 
 	_, err = writeTx.tx.ExecContext(ctx, `
 		UPDATE applies
-		SET state = ?, error_message = ?,
+		SET state = ?, error_message = ?, attempt = ?,
 		    external_id = ?, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?
-	`, apply.State, apply.ErrorMessage,
+	`, apply.State, apply.ErrorMessage, apply.Attempt,
 		apply.ExternalID, apply.StartedAt, apply.CompletedAt, apply.ID)
 	if err != nil {
 		return fmt.Errorf("update apply %d: %w", apply.ID, err)
@@ -480,9 +483,11 @@ func (s *applyStore) GetRecent(ctx context.Context, limit int) ([]*storage.Apply
 // and resumes the apply.
 // Returns the claimed apply, or nil if nothing needs work.
 //
-// Matches stale active applies where heartbeat expired > 1 minute. Apply
-// creation/update enforces one active apply per database/type/environment, so
-// claims only need to lease one stale row and avoid worker races on that row.
+// Matches queued pending applies with persisted tasks, stale active applies
+// where heartbeat expired > 1 minute, and failed_retryable applies that still
+// have retry budget. Apply creation/update enforces one active apply per
+// database/type/environment, so claims only need to lease one row and avoid
+// worker races on that row.
 func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) {
 	// Read committed keeps concurrent SKIP LOCKED claims from taking next-key
 	// range locks that can serialize workers across otherwise independent targets.
@@ -494,7 +499,9 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
-	queryArgs := stringArgs(activeStates)
+	queryArgs := []any{state.Apply.Pending}
+	queryArgs = append(queryArgs, stringArgs(activeStates)...)
+	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts)
 
 	// Apply creation/update enforces at most one active apply per
 	// database/type/environment. The claim query only needs to find stale work;
@@ -502,8 +509,11 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
-		WHERE a.state IN (%s)
-		AND a.updated_at < NOW() - INTERVAL 1 MINUTE
+		WHERE (
+			(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
+			OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
+			OR (a.state = ? AND a.attempt < ?)
+		)
 		ORDER BY a.created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
@@ -518,11 +528,41 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 	}
 
 	// Refresh the heartbeat as part of the claim before releasing the row lock.
-	_, err = tx.ExecContext(ctx, `
-		UPDATE applies SET updated_at = NOW() WHERE id = ?
-	`, apply.ID)
-	if err != nil {
-		return nil, fmt.Errorf("refresh heartbeat for claimed apply %d: %w", apply.ID, err)
+	// Pending and retryable applies become running while dispatch starts, so
+	// the leased row remains in the stale-recovery state family if the worker
+	// crashes before the engine starts.
+	if apply.State == state.Apply.Pending || apply.State == state.Apply.FailedRetryable {
+		var result sql.Result
+		nextState := state.Apply.Running
+		result, err = tx.ExecContext(ctx, `
+			UPDATE applies
+			SET state = ?, updated_at = NOW(),
+			    attempt = CASE WHEN ? = ? THEN attempt + 1 ELSE attempt END,
+			    completed_at = NULL,
+			    error_message = CASE WHEN ? = ? THEN '' ELSE error_message END
+			WHERE id = ? AND state = ?
+		`, nextState, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.ID, apply.State)
+		if err != nil {
+			return nil, fmt.Errorf("claim apply %d in state %s: %w", apply.ID, apply.State, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("read claim rows affected for apply %d: %w", apply.ID, err)
+		}
+		if rows == 0 {
+			return nil, nil
+		}
+		if apply.State == state.Apply.FailedRetryable {
+			apply.Attempt++
+			apply.ErrorMessage = ""
+		}
+	} else {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE applies SET updated_at = NOW() WHERE id = ?
+		`, apply.ID)
+		if err != nil {
+			return nil, fmt.Errorf("refresh heartbeat for claimed apply %d: %w", apply.ID, err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -545,6 +585,74 @@ func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 		return fmt.Errorf("heartbeat apply %d: %w", applyID, err)
 	}
 	return nil
+}
+
+// ExpireRetryable transitions failed_retryable applies that exhausted their
+// retry budget to permanent failed. Returns the applies updated.
+func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.Apply, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin expire retryable applies transaction: %w", err)
+	}
+	defer rollbackApplyTx(ctx, tx, "expire retryable applies")
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+applyColumns+`
+		FROM applies
+		WHERE state = ? AND attempt >= ?
+		FOR UPDATE
+	`, state.Apply.FailedRetryable, maxRecoveryAttempts)
+	if err != nil {
+		return nil, fmt.Errorf("query exhausted retryable applies: %w", err)
+	}
+	applies, err := scanApplies(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan exhausted retryable applies: %w", err)
+	}
+	if len(applies) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit empty expire retryable applies: %w", err)
+		}
+		return nil, nil
+	}
+
+	applyIDs := make([]any, 0, len(applies))
+	for _, apply := range applies {
+		applyIDs = append(applyIDs, apply.ID)
+	}
+
+	taskArgs := []any{state.Task.Failed}
+	taskArgs = append(taskArgs, stringArgs(state.TerminalTaskStates)...)
+	taskArgs = append(taskArgs, applyIDs...)
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE tasks t
+		SET t.state = ?, t.completed_at = COALESCE(t.completed_at, NOW()), t.updated_at = NOW()
+		WHERE t.state NOT IN (%s) AND t.apply_id IN (%s)
+	`, placeholders(len(state.TerminalTaskStates)), placeholders(len(applyIDs))), taskArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("expire retryable tasks: %w", err)
+	}
+
+	applyArgs := append([]any{state.Apply.Failed}, applyIDs...)
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE applies
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE id IN (%s)
+	`, placeholders(len(applyIDs))), applyArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("expire retryable applies: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit expire retryable applies: %w", err)
+	}
+	now := time.Now()
+	for _, apply := range applies {
+		apply.State = state.Apply.Failed
+		apply.CompletedAt = &now
+		apply.UpdatedAt = now
+	}
+	return applies, nil
 }
 
 // GetByDatabase returns applies for a specific database and optionally filtered by dbType and environment.
@@ -677,7 +785,7 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 		&apply.Database, &apply.DatabaseType,
 		&apply.Repository, &apply.PullRequest, &apply.Environment, &apply.Deployment,
 		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &apply.Engine,
-		&apply.State, &apply.ErrorMessage, &options,
+		&apply.State, &apply.ErrorMessage, &options, &apply.Attempt,
 		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt,
 	)
 	if err != nil {
