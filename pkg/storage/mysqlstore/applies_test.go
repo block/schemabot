@@ -3,8 +3,8 @@
 package mysqlstore
 
 import (
+	"context"
 	"database/sql"
-	"errors"
 	"strconv"
 	"sync"
 	"testing"
@@ -141,116 +141,64 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
-	guardTx, err := beginApplyWriteTx(ctx, testDB, "test active apply guard")
+	// Hold the same target lock that the create path must acquire. The creates
+	// below use the public store API; a result before release means active
+	// apply writes are not serialized by the per-target lock.
+	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, "testdb", "mysql", "staging")
 	require.NoError(t, err)
-	t.Cleanup(func() { guardTx.close(ctx, "test active apply guard") })
-
-	// Hold the exact target mutex row open. Active apply creation locks this row
-	// before checking applies, so a same-target create waits without relying on
-	// an empty applies range lock.
-	require.NoError(t, ensureApplyTargetLockRow(ctx, testDB, "testdb", "mysql", "staging"))
-	require.NoError(t, lockApplyTargetRow(ctx, guardTx.tx, "testdb", "mysql", "staging"))
-	require.NoError(t, checkNoActiveApplyForTarget(ctx, guardTx.tx, "testdb", "mysql", "staging", 0))
-
-	type createResult struct {
-		id  int64
-		err error
-	}
-	resultCh := make(chan createResult, 1)
-	go func() {
-		id, err := store.Applies().Create(ctx, &storage.Apply{
-			ApplyIdentifier: "apply_concurrent_same_target",
-			LockID:          lock.ID,
-			PlanID:          6,
-			Database:        "testdb",
-			DatabaseType:    "mysql",
-			Repository:      "org/repo",
-			PullRequest:     123,
-			Environment:     "staging",
-			Engine:          "spirit",
-			State:           state.Apply.Pending,
-		})
-		resultCh <- createResult{id: id, err: err}
-	}()
-
-	select {
-	case result := <-resultCh:
-		require.NoError(t, result.err)
-		require.Fail(t, "apply create completed before the target lock was released")
-	case <-time.After(300 * time.Millisecond):
-	}
-
-	require.NoError(t, guardTx.commit())
-
-	select {
-	case result := <-resultCh:
-		require.NoError(t, result.err)
-		assert.NotZero(t, result.id)
-	case <-time.After(5 * time.Second):
-		require.Fail(t, "apply create did not complete after the target lock was released")
-	}
-
-	applies, err := store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging")
-	require.NoError(t, err)
-	assert.Len(t, applies, 1)
-}
-
-func TestApplyStore_CreateAllowsOneConcurrentActiveApplyForSameTarget(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := New(testDB)
-
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
-
-	const concurrentCreates = 8
-	start := make(chan struct{})
-	errs := make(chan error, concurrentCreates)
-
-	var wg sync.WaitGroup
-	for i := range concurrentCreates {
-		wg.Go(func() {
-			<-start
-			_, err := store.Applies().Create(ctx, &storage.Apply{
-				ApplyIdentifier: "apply_concurrent_winner_" + strconv.Itoa(i),
-				LockID:          lock.ID,
-				PlanID:          int64(10 + i),
-				Database:        "testdb",
-				DatabaseType:    "mysql",
-				Repository:      "org/repo",
-				PullRequest:     123,
-				Environment:     "staging",
-				Engine:          "spirit",
-				State:           state.Apply.Pending,
-			})
-			errs <- err
-		})
-	}
-
-	close(start)
-	wg.Wait()
-	close(errs)
-
-	var successes, conflicts int
-	for err := range errs {
-		switch {
-		case err == nil:
-			successes++
-		case errors.Is(err, storage.ErrActiveApplyExists):
-			conflicts++
-		default:
-			require.NoError(t, err)
+	releaseGuard := func() {
+		if guardConn == nil {
+			return
 		}
+		releaseApplyTargetLockConn(ctx, guardConn, guardLockName, "test active apply guard")
+		guardConn = nil
 	}
+	t.Cleanup(releaseGuard)
 
-	assert.Equal(t, 1, successes)
-	assert.Equal(t, concurrentCreates-1, conflicts)
+	createCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	_, err = store.Applies().Create(createCtx, &storage.Apply{
+		ApplyIdentifier: "apply_waiting_same_target",
+		LockID:          lock.ID,
+		PlanID:          6,
+		Database:        "testdb",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          "spirit",
+		State:           state.Apply.Pending,
+	})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 
 	applies, err := store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging")
+	require.NoError(t, err)
+	assert.Empty(t, applies)
+
+	releaseGuard()
+
+	id, err := store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply_after_target_lock_release",
+		LockID:          lock.ID,
+		PlanID:          7,
+		Database:        "testdb",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          "spirit",
+		State:           state.Apply.Pending,
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, id)
+
+	applies, err = store.Applies().GetByDatabase(ctx, "testdb", "mysql", "staging")
 	require.NoError(t, err)
 	assert.Len(t, applies, 1)
 }
 
-func TestApplyStore_CreateAvoidsGapLockDeadlocksForDifferentTargets(t *testing.T) {
+func TestApplyStore_CreateAllowsConcurrentActiveAppliesForDifferentTargets(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := New(testDB)
@@ -292,10 +240,10 @@ func TestApplyStore_CreateAvoidsGapLockDeadlocksForDifferentTargets(t *testing.T
 		lock := locks[target.database+"/"+target.dbType]
 		wg.Go(func() {
 			<-start
-			// If storage protects first writers by locking empty ranges in applies,
-			// these concurrent inserts can deadlock even though every target is
-			// independent. The target-lock row gives each target an exact mutex
-			// before applies is checked, so callers should not see deadlock errors.
+			// These creates all start at the same time, but every apply targets
+			// a different database/type/environment. Storage should serialize
+			// only same-target active applies, so every independent target can
+			// create its first active apply successfully.
 			_, err := store.Applies().Create(ctx, &storage.Apply{
 				ApplyIdentifier: "apply_concurrent_target_" + strconv.Itoa(i),
 				LockID:          lock.ID,

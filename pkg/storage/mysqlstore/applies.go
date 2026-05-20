@@ -4,11 +4,15 @@ package mysqlstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -26,17 +30,28 @@ const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_i
 	a.state, a.error_message, a.options,
 	a.created_at, a.started_at, a.completed_at, a.updated_at`
 
+const (
+	applyTargetLockWait           = 10 * time.Second
+	applyTargetLockReleaseTimeout = 5 * time.Second
+)
+
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
 	db *sql.DB
 }
 
 type applyWriteTx struct {
-	tx *sql.Tx
+	tx             *sql.Tx
+	targetLockConn *sql.Conn
+	targetLockName string
 }
 
 type queryRower interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+type txBeginner interface {
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 }
 
 // claimableApplyStates returns apply states where scheduler recovery can safely
@@ -98,13 +113,29 @@ func rollbackApplyTx(ctx context.Context, tx *sql.Tx, operation string) {
 	}
 }
 
-func beginApplyWriteTx(ctx context.Context, db *sql.DB, operation string) (*applyWriteTx, error) {
-	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+func beginApplyWriteTx(ctx context.Context, beginner txBeginner, operation string) (*applyWriteTx, error) {
+	tx, err := beginner.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
 		return nil, fmt.Errorf("begin %s transaction: %w", operation, err)
 	}
 
 	return &applyWriteTx{tx: tx}, nil
+}
+
+func beginApplyTargetWriteTx(ctx context.Context, db *sql.DB, operation, database, dbType, environment string) (*applyWriteTx, error) {
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, database, dbType, environment)
+	if err != nil {
+		return nil, err
+	}
+
+	writeTx, err := beginApplyWriteTx(ctx, conn, operation)
+	if err != nil {
+		releaseApplyTargetLockConn(ctx, conn, lockName, operation)
+		return nil, err
+	}
+	writeTx.targetLockConn = conn
+	writeTx.targetLockName = lockName
+	return writeTx, nil
 }
 
 func (w *applyWriteTx) close(ctx context.Context, operation string) {
@@ -114,6 +145,10 @@ func (w *applyWriteTx) close(ctx context.Context, operation string) {
 	if w.tx != nil {
 		rollbackApplyTx(ctx, w.tx, operation)
 	}
+	if w.targetLockConn != nil {
+		releaseApplyTargetLockConn(ctx, w.targetLockConn, w.targetLockName, operation)
+		w.targetLockConn = nil
+	}
 }
 
 func (w *applyWriteTx) commit() error {
@@ -122,57 +157,83 @@ func (w *applyWriteTx) commit() error {
 	return err
 }
 
-// apply_target_locks rows are persistent mutex rows keyed by target. They are
-// created lazily and intentionally survive apply completion; the apply lifecycle
-// remains in applies, while this table gives first writers an exact row to lock.
-func ensureApplyTargetLockRow(ctx context.Context, db *sql.DB, database, dbType, environment string) error {
-	if !hasApplyTarget(database, dbType, environment) {
-		return fmt.Errorf("active apply target is required for %s/%s/%s", database, dbType, environment)
-	}
-
-	var id int64
-	err := db.QueryRowContext(ctx,
-		"SELECT `id` FROM `apply_target_locks` "+
-			"WHERE `database_name` = ? "+
-			"AND `database_type` = ? "+
-			"AND `environment` = ?",
-		database, dbType, environment,
-	).Scan(&id)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("read apply target for %s/%s/%s: %w", database, dbType, environment, err)
-	}
-
-	_, err = db.ExecContext(ctx,
-		"INSERT IGNORE INTO `apply_target_locks` (`database_name`, `database_type`, `environment`) "+
-			"VALUES (?, ?, ?)",
-		database, dbType, environment,
-	)
-	if err != nil {
-		return fmt.Errorf("ensure apply target for %s/%s/%s: %w", database, dbType, environment, err)
-	}
-	return nil
+func applyTargetLockName(database, dbType, environment string) string {
+	sum := sha256.Sum256([]byte(database + "\x00" + dbType + "\x00" + environment))
+	return "schemabot_apply_" + hex.EncodeToString(sum[:16])
 }
 
-func lockApplyTargetRow(ctx context.Context, tx *sql.Tx, database, dbType, environment string) error {
-	var id int64
-	err := tx.QueryRowContext(ctx,
-		"SELECT `id` FROM `apply_target_locks` "+
-			"WHERE `database_name` = ? "+
-			"AND `database_type` = ? "+
-			"AND `environment` = ? "+
-			"FOR UPDATE",
-		database, dbType, environment,
-	).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("apply target missing for %s/%s/%s", database, dbType, environment)
+func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, database, dbType, environment string) (*sql.Conn, string, error) {
+	if !hasApplyTarget(database, dbType, environment) {
+		return nil, "", fmt.Errorf("active apply target is required for %s/%s/%s", database, dbType, environment)
 	}
+
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("lock apply target for %s/%s/%s: %w", database, dbType, environment, err)
+		return nil, "", fmt.Errorf("get apply target connection for %s/%s/%s: %w", database, dbType, environment, err)
 	}
-	return nil
+
+	lockName := applyTargetLockName(database, dbType, environment)
+	var result sql.NullInt64
+	err = conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, int(applyTargetLockWait.Seconds())).Scan(&result)
+	if err != nil {
+		slog.WarnContext(ctx, "failed to acquire apply target lock",
+			"database", database,
+			"database_type", dbType,
+			"environment", environment,
+			"lock", lockName,
+			"wait", applyTargetLockWait,
+			"error", err)
+		closeApplyTargetLockConn(ctx, conn, lockName, "acquire apply target lock")
+		return nil, "", fmt.Errorf("acquire apply target lock for %s/%s/%s: %w", database, dbType, environment, err)
+	}
+	if !result.Valid || result.Int64 != 1 {
+		slog.WarnContext(ctx, "timed out waiting for apply target lock",
+			"database", database,
+			"database_type", dbType,
+			"environment", environment,
+			"lock", lockName,
+			"wait", applyTargetLockWait,
+			"result", result)
+		closeApplyTargetLockConn(ctx, conn, lockName, "acquire apply target lock")
+		return nil, "", fmt.Errorf("timed out waiting for apply target lock for %s/%s/%s", database, dbType, environment)
+	}
+	return conn, lockName, nil
+}
+
+func releaseApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
+	if conn == nil {
+		return
+	}
+
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTargetLockReleaseTimeout)
+	defer cancel()
+
+	var result sql.NullInt64
+	err := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&result)
+	if err != nil || !result.Valid || result.Int64 != 1 {
+		slog.WarnContext(releaseCtx, "failed to release apply target lock; discarding connection",
+			"operation", operation,
+			"lock", lockName,
+			"result", result,
+			"error", err)
+		if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
+			slog.WarnContext(releaseCtx, "failed to discard apply target lock connection",
+				"operation", operation,
+				"lock", lockName,
+				"error", rawErr)
+		}
+	}
+
+	closeApplyTargetLockConn(releaseCtx, conn, lockName, operation)
+}
+
+func closeApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, operation string) {
+	if err := conn.Close(); err != nil {
+		slog.WarnContext(ctx, "failed to close apply target lock connection",
+			"operation", operation,
+			"lock", lockName,
+			"error", err)
+	}
 }
 
 func checkNoActiveApplyForTarget(ctx context.Context, tx *sql.Tx, database, dbType, environment string, excludeApplyID int64) error {
@@ -230,22 +291,22 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	}
 
 	lockTarget := isActiveApplyState(apply.State)
+	var writeTx *applyWriteTx
+	var err error
 	if lockTarget {
-		if err := ensureApplyTargetLockRow(ctx, s.db, apply.Database, apply.DatabaseType, apply.Environment); err != nil {
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, "create apply", apply.Database, apply.DatabaseType, apply.Environment)
+		if err != nil {
 			return 0, err
 		}
-	}
-
-	writeTx, err := beginApplyWriteTx(ctx, s.db, "create apply")
-	if err != nil {
-		return 0, err
+	} else {
+		writeTx, err = beginApplyWriteTx(ctx, s.db, "create apply")
+		if err != nil {
+			return 0, err
+		}
 	}
 	defer writeTx.close(ctx, "create apply")
 
 	if lockTarget {
-		if err := lockApplyTargetRow(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment); err != nil {
-			return 0, err
-		}
 		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, 0); err != nil {
 			return 0, err
 		}
@@ -343,22 +404,21 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	}
 
 	shouldLockTarget := lockTarget && hasApplyTarget(database, dbType, environment)
+	var writeTx *applyWriteTx
 	if shouldLockTarget {
-		if err := ensureApplyTargetLockRow(ctx, s.db, database, dbType, environment); err != nil {
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, "update apply", database, dbType, environment)
+		if err != nil {
 			return err
 		}
-	}
-
-	writeTx, err := beginApplyWriteTx(ctx, s.db, "update apply")
-	if err != nil {
-		return err
+	} else {
+		writeTx, err = beginApplyWriteTx(ctx, s.db, "update apply")
+		if err != nil {
+			return err
+		}
 	}
 	defer writeTx.close(ctx, "update apply")
 
 	if shouldLockTarget {
-		if err := lockApplyTargetRow(ctx, writeTx.tx, database, dbType, environment); err != nil {
-			return err
-		}
 		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, database, dbType, environment, apply.ID); err != nil {
 			return err
 		}

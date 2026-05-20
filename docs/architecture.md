@@ -343,7 +343,7 @@ In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each sche
              v                                  v
         +-----------------------------------------------+
         | Shared SchemaBot storage                      |
-        | applies, tasks, apply_target_locks            |
+        | applies, tasks, named apply-target locks      |
         | claims use FOR UPDATE SKIP LOCKED             |
         +-----------------------------------------------+
 
@@ -367,13 +367,11 @@ SchemaBot has two different kinds of locking:
 - **Database locks** are coordination state for users and automation. They make ownership visible in CLI/webhook flows and let a human intentionally hold, release, or force-release work for a database.
 - **Apply invariants** are correctness rules enforced by storage. They do not depend on a database lock being present, because direct API callers and `--no-lock` flows still must not create invalid concurrent work.
 
-SchemaBot enforces one active apply per database, database type, and environment when an apply record is created or moved back into an active state. The `applies` table is the tern-layer work table, but storage uses a small target-lock table as the serialization surface for this invariant.
+SchemaBot enforces one active apply per database, database type, and environment when an apply is created or moved back into an active state. Storage takes a per-target MySQL named lock, checks `applies`, writes the row, and releases the lock before returning.
 
-The target lock row lives in `apply_target_locks`. This table is internal storage infrastructure, not user-facing lock state and not apply lifecycle state. A row is created lazily the first time a target is used, then reused for every future apply for that same database/type/environment. Normal apply completion, failure, cancellation, or revert does not delete the row; the active lifecycle remains in `applies`.
+The named lock is internal storage infrastructure, not user-facing lock state or apply lifecycle state. It gives first writers a target-specific serialization point without creating mutex rows during the apply request. Same-target writers wait and re-check `applies`; different targets use different lock names and can proceed concurrently.
 
-`apply_target_locks` exists because the first active apply for a target has no existing `applies` row to lock. Locking the absence of an active row in `applies` requires InnoDB range locks over `idx_database_env`. Those range locks can deadlock independent first-writer transactions when multiple targets are creating applies concurrently. A persistent target row gives storage an exact mutex row before it reads or writes `applies`.
-
-The target row lock is transaction-local. Same-target writers wait on the same `apply_target_locks` row, then re-check `applies` after the earlier writer commits. If an active apply now exists, the later writer fails cleanly. Different targets lock different rows, so they can create or resume applies concurrently without depending on empty-range locks in `applies`.
+If storage cannot acquire the named lock within the bounded wait, the write fails before changing `applies`. If storage cannot confirm lock release, it discards the connection so MySQL releases the session-scoped lock.
 
 The scheduler relies on that invariant. Additional workers increase concurrency across independent targets; they do not make one database/environment run multiple applies at once.
 
