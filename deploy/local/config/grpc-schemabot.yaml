@@ -1,13 +1,25 @@
 # SchemaBot Configuration (gRPC Mode - SchemaBot server)
 #
-# SchemaBot reads tern_deployments to route requests to Tern services via gRPC.
-# It does NOT need databases config — that's for the Tern services.
+# SchemaBot reads databases to resolve the server-side target/deployment for
+# each database/environment, then uses tern_deployments to find that deployment's
+# gRPC endpoint.
 
 # SchemaBot's own storage database
 storage:
   dsn: "env:MYSQL_DSN"
 
 # gRPC mode: separate Tern services per environment
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        target: testapp
+        deployment: default
+      production:
+        target: testapp
+        deployment: default
+
 tern_deployments:
   default:
     staging: "tern-staging:9090"

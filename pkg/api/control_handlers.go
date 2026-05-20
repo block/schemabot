@@ -72,7 +72,9 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName, database stri
 func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, dest any,
 	database, environment, applyID *string) (tern.Client, string, bool) {
 
-	if err := json.NewDecoder(r.Body).Decode(dest); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dest); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return nil, "", false
 	}
@@ -88,39 +90,58 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, d
 	// apply for the database/environment. This ensures we always use the deployment
 	// stored on the apply, even when the caller only provides database+environment.
 	var resolvedApplyID string
-	var deployment string
+	var apply *storage.Apply
 	applyIdentifier := *applyID
 	if applyIdentifier == "" {
 		// No explicit apply_id — find the active apply for this database/environment.
-		_, activeApply, err := s.findActiveApplyID(r.Context(), *database, *environment)
+		ternApplyID, activeApply, err := s.findActiveApplyID(r.Context(), *database, *environment)
 		if err != nil {
 			s.writeError(w, http.StatusNotFound, fmt.Sprintf("no active schema change for %s/%s: %v", *database, *environment, err))
 			return nil, "", false
 		}
-		if activeApply != nil {
-			applyIdentifier = activeApply.ApplyIdentifier
-			deployment = activeApply.Deployment
-		}
-	}
-	if applyIdentifier != "" {
-		resolved, err := s.resolveApplyID(r.Context(), applyIdentifier)
-		if err != nil {
-			s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("resolve apply_id: %v", err))
+		if activeApply == nil {
+			s.writeError(w, http.StatusNotFound, fmt.Sprintf("no active schema change for %s/%s", *database, *environment))
 			return nil, "", false
 		}
-		resolvedApplyID = resolved
-
-		// If we didn't get the deployment from findActiveApplyID, look it up now.
-		if deployment == "" {
-			if applyStore := s.storage.Applies(); applyStore != nil {
-				apply, err := applyStore.GetByApplyIdentifier(r.Context(), applyIdentifier)
-				if err == nil && apply != nil {
-					deployment = apply.Deployment
-				}
-			}
+		apply = activeApply
+		applyIdentifier = activeApply.ApplyIdentifier
+		resolvedApplyID = ternApplyID
+	} else {
+		applyStore := s.storage.Applies()
+		if applyStore == nil {
+			s.writeError(w, http.StatusInternalServerError, "apply store is not available")
+			return nil, "", false
+		}
+		var err error
+		apply, err = applyStore.GetByApplyIdentifier(r.Context(), applyIdentifier)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to look up apply %q: %v", applyIdentifier, err))
+			return nil, "", false
+		}
+		if apply == nil {
+			s.writeError(w, http.StatusNotFound, "apply not found: "+applyIdentifier)
+			return nil, "", false
+		}
+		resolvedApplyID = apply.ApplyIdentifier
+		if apply.ExternalID != "" {
+			resolvedApplyID = apply.ExternalID
 		}
 	}
-	deployment = s.ResolveDeployment(*database, deployment)
+	if apply.Database != *database || apply.Environment != *environment {
+		s.writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("apply %q belongs to %s/%s, not %s/%s", applyIdentifier, apply.Database, apply.Environment, *database, *environment))
+		return nil, "", false
+	}
+	deployment, err := storedDeploymentForApply(apply)
+	if err != nil {
+		s.logger.Error("control request apply is missing stored deployment metadata",
+			"apply_id", applyIdentifier,
+			"database", *database,
+			"environment", *environment,
+			"error", err)
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return nil, "", false
+	}
 
 	client, err := s.TernClient(deployment, *environment)
 	if err != nil {
@@ -416,7 +437,9 @@ type RollbackPlanRequest struct {
 // a plan to revert to the schema state before that apply.
 func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 	var req RollbackPlanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}

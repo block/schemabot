@@ -106,6 +106,15 @@ func startSchemaBot(t *testing.T, ternGRPCAddr string) string {
 
 	// Create SchemaBot with real MySQL storage and real Tern client
 	serverConfig := &schemabotapi.ServerConfig{
+		Databases: map[string]schemabotapi.DatabaseConfig{
+			"testapp": {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging":    {Target: "testapp-staging", Deployment: "default"},
+					"production": {Target: "testapp-production", Deployment: "default"},
+				},
+			},
+		},
 		TernDeployments: schemabotapi.TernConfig{
 			"default": {"staging": ternGRPCAddr, "production": ternGRPCAddr},
 		},
@@ -183,6 +192,14 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 	defer utils.CloseAndLog(ternClient)
 
 	serverConfig := &schemabotapi.ServerConfig{
+		Databases: map[string]schemabotapi.DatabaseConfig{
+			appDBName: {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {Target: appDBName + "-target", Deployment: "default"},
+				},
+			},
+		},
 		TernDeployments: schemabotapi.TernConfig{
 			"default": {"staging": ternGRPCAddr},
 		},
@@ -309,6 +326,14 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 	defer utils.CloseAndLog(ternClient)
 
 	serverConfig := &schemabotapi.ServerConfig{
+		Databases: map[string]schemabotapi.DatabaseConfig{
+			appDBName: {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {Target: appDBName + "-target", Deployment: "default"},
+				},
+			},
+		},
 		TernDeployments: schemabotapi.TernConfig{
 			"default": {"staging": ternGRPCAddr},
 		},
@@ -405,12 +430,11 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 	}
 }
 
-// TestGRPC_TargetInPlanRequest verifies that the target field threads through
-// the HTTP API → gRPC proto layer without breaking the plan flow.
-// It sends a plan request with target via HTTP, then verifies the plan succeeds
-// and the target value reaches the gRPC layer by calling Plan directly.
-func TestGRPC_TargetInPlanRequest(t *testing.T) {
-	// Part 1: Verify target threads through HTTP API to gRPC
+// TestGRPC_ServerSideTargetPlan verifies that HTTP plan succeeds when the
+// target is configured server-side. The Tern proto still exposes target for
+// remote implementations, but SchemaBot HTTP callers do not provide it.
+func TestGRPC_ServerSideTargetPlan(t *testing.T) {
+	// Part 1: Verify HTTP API plans use the server-configured target.
 	schemabotAddr := startSchemaBot(t, grpcAddr)
 
 	schemaSQL := `CREATE TABLE target_test (
@@ -421,7 +445,6 @@ func TestGRPC_TargetInPlanRequest(t *testing.T) {
 		"database":    "testapp",
 		"environment": "staging",
 		"type":        "mysql",
-		"target":      "test-cluster-001",
 		"schema_files": map[string]any{
 			"default": map[string]any{
 				"files": map[string]string{
@@ -450,7 +473,7 @@ func TestGRPC_TargetInPlanRequest(t *testing.T) {
 
 	var planResult map[string]any
 	require.NoError(t, json.NewDecoder(planResp.Body).Decode(&planResult), "decode plan response")
-	assert.NotEmpty(t, planResult["plan_id"], "plan with target should return plan_id")
+	assert.NotEmpty(t, planResult["plan_id"], "plan should return plan_id")
 
 	// Part 2: Verify target is accessible on the proto request via gRPC client
 	ternReq := &ternv1.PlanRequest{
@@ -469,9 +492,9 @@ func TestGRPC_TargetInPlanRequest(t *testing.T) {
 	assert.NotEmpty(t, grpcResp.PlanId, "gRPC plan with target should return plan_id")
 }
 
-// TestGRPC_Deployment_StoredOnApply verifies that when a plan/apply request
-// includes a deployment field, the deployment is persisted on the apply record.
-func TestGRPC_Deployment_StoredOnApply(t *testing.T) {
+// TestGRPC_ServerSideDeploymentStoredOnApply verifies that the server-resolved
+// deployment is persisted on the apply record.
+func TestGRPC_ServerSideDeploymentStoredOnApply(t *testing.T) {
 	ctx := t.Context()
 
 	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
@@ -500,8 +523,16 @@ func TestGRPC_Deployment_StoredOnApply(t *testing.T) {
 	require.NoError(t, err, "create tern client")
 	defer utils.CloseAndLog(ternClient)
 
-	// Configure with a named deployment (not "default")
+	// Configure the database target with a named deployment.
 	serverConfig := &schemabotapi.ServerConfig{
+		Databases: map[string]schemabotapi.DatabaseConfig{
+			appDBName: {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {Target: appDBName + "-target", Deployment: "us-west"},
+				},
+			},
+		},
 		TernDeployments: schemabotapi.TernConfig{
 			"us-west": {"staging": ternGRPCAddr},
 		},
@@ -521,13 +552,11 @@ func TestGRPC_Deployment_StoredOnApply(t *testing.T) {
 	schemabotAddr := listener.Addr().String()
 	time.Sleep(50 * time.Millisecond)
 
-	// Plan with explicit deployment
 	schemaSQL := "CREATE TABLE widgets (\n\tid BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,\n\tname VARCHAR(255) NOT NULL\n);"
 	planReq := map[string]any{
 		"database":    appDBName,
 		"environment": "staging",
 		"type":        "mysql",
-		"deployment":  "us-west",
 		"schema_files": map[string]any{
 			"default": map[string]any{
 				"files": map[string]string{"widgets.sql": schemaSQL},
@@ -551,11 +580,9 @@ func TestGRPC_Deployment_StoredOnApply(t *testing.T) {
 	planID, ok := planResult["plan_id"].(string)
 	require.True(t, ok && planID != "", "plan response missing plan_id: %v", planResult)
 
-	// Apply with explicit deployment
 	applyReq := map[string]any{
 		"plan_id":     planID,
 		"environment": "staging",
-		"deployment":  "us-west",
 	}
 	applyBody, _ := json.Marshal(applyReq)
 	applyHTTPReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+schemabotAddr+"/api/apply", bytes.NewReader(applyBody))
@@ -573,7 +600,6 @@ func TestGRPC_Deployment_StoredOnApply(t *testing.T) {
 	applyID, ok := applyResult["apply_id"].(string)
 	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResult)
 
-	// Verify deployment is stored on the apply record
 	storedApply, err := schemabotStorage.Applies().GetByApplyIdentifier(ctx, applyID)
 	require.NoError(t, err, "get apply by identifier")
 	require.NotNil(t, storedApply, "apply %s not found in storage", applyID)

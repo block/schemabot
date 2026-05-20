@@ -203,7 +203,7 @@ func TestGRPC_PlanApply_AddColumn(t *testing.T) {
 	require.True(t, found, "expected ADD COLUMN DDL for %s, got tables: %+v", tableName, planTables)
 
 	// Apply
-	apply := grpcApply(t, plan.PlanID, "testapp", "staging", nil)
+	apply := grpcApply(t, plan.PlanID, "staging", nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
 	// Wait for completion
@@ -236,7 +236,7 @@ func TestGRPC_StopStart(t *testing.T) {
 			`CREATE TABLE %s (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT);`, tableName),
 	}
 	plan := grpcPlan(t, "testapp", "staging", schemaFiles)
-	apply := grpcApply(t, plan.PlanID, "testapp", "staging", nil)
+	apply := grpcApply(t, plan.PlanID, "staging", nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
 	// Wait for it to be running (not just planned)
@@ -296,7 +296,7 @@ func TestGRPC_StopStart_LocalStateSync(t *testing.T) {
 			`CREATE TABLE %s (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT);`, tableName),
 	}
 	plan := grpcPlan(t, "testapp", "staging", schemaFiles)
-	apply := grpcApply(t, plan.PlanID, "testapp", "staging", nil)
+	apply := grpcApply(t, plan.PlanID, "staging", nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 	require.NotEmpty(t, apply.ApplyID, "expected non-empty apply_id")
 
@@ -372,7 +372,7 @@ func TestGRPC_Volume(t *testing.T) {
 			`CREATE TABLE %s (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT);`, tableName),
 	}
 	plan := grpcPlan(t, "testapp", "staging", schemaFiles)
-	apply := grpcApply(t, plan.PlanID, "testapp", "staging", nil)
+	apply := grpcApply(t, plan.PlanID, "staging", nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
 	grpcWaitForAnyState(t, "testapp", "staging", []string{"APPLYING", "COPY", "COMPLETED"}, 60*time.Second)
@@ -425,7 +425,7 @@ func TestGRPC_DeferCutover(t *testing.T) {
 	plan := grpcPlan(t, "testapp", "staging", schemaFiles)
 
 	// Apply with defer_cutover
-	apply := grpcApply(t, plan.PlanID, "testapp", "staging", map[string]string{
+	apply := grpcApply(t, plan.PlanID, "staging", map[string]string{
 		"defer_cutover": "true",
 	})
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
@@ -478,7 +478,7 @@ func TestGRPC_Status_StaleState(t *testing.T) {
 	require.NotEmpty(t, plan.PlanID)
 
 	// Apply
-	apply := grpcApply(t, plan.PlanID, "testapp", "staging", nil)
+	apply := grpcApply(t, plan.PlanID, "staging", nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
 	// Wait for completion via progress (this calls Tern's Progress RPC)
@@ -530,7 +530,7 @@ func TestGRPC_CrossService_PlanApply_Production(t *testing.T) {
 	require.NotEmpty(t, plan.PlanID, "expected non-empty plan_id")
 
 	// Apply
-	apply := grpcApply(t, plan.PlanID, "testapp", "production", nil)
+	apply := grpcApply(t, plan.PlanID, "production", nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
 	// Wait for completion

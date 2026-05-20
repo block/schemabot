@@ -40,30 +40,21 @@ func ResolveEndpoint(flag string, configEndpoint ...string) string {
 }
 
 // GetEnvironments fetches the list of environments for a database from the API.
-func GetEnvironments(endpoint, database, deployment string) ([]string, error) {
+func GetEnvironments(endpoint, database string) ([]string, error) {
 	var result struct {
 		Environments []string `json:"environments"`
 	}
 	path := fmt.Sprintf("/api/databases/%s/environments", url.PathEscape(database))
-	if deployment != "" {
-		path += "?" + url.Values{"deployment": {deployment}}.Encode()
-	}
 	if err := doGetInto(endpoint, path, &result); err != nil {
 		return nil, err
 	}
 	return result.Environments, nil
 }
 
-// PlanOptions holds optional parameters for CallPlanAPI.
-type PlanOptions struct {
-	Target     string
-	Deployment string
-}
-
 // CallPlanAPI calls the plan API by reading .sql files from schemaDir.
 // Files are grouped by namespace: subdirectories become namespace keys,
 // flat files use the directory name as the namespace.
-func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, opts ...PlanOptions) (*apitypes.PlanResponse, error) {
+func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int) (*apitypes.PlanResponse, error) {
 	schemaFiles, err := ReadSchemaFiles(schemaDir, environment)
 	if err != nil {
 		return nil, fmt.Errorf("read schema files: %w", err)
@@ -71,11 +62,11 @@ func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string
 	if len(schemaFiles) == 0 {
 		return nil, fmt.Errorf("no .sql files found in %s", schemaDir)
 	}
-	return CallPlanAPIWithFiles(endpoint, database, dbType, environment, schemaFiles, repo, pr, opts...)
+	return CallPlanAPIWithFiles(endpoint, database, dbType, environment, schemaFiles, repo, pr)
 }
 
 // CallPlanAPIWithFiles calls the plan API with pre-loaded, namespace-grouped schema files.
-func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, opts ...PlanOptions) (*apitypes.PlanResponse, error) {
+func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
 		Database:    database,
 		Type:        dbType,
@@ -86,14 +77,6 @@ func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schema
 	if pr != 0 {
 		prVal := int32(pr)
 		req.PullRequest = &prVal
-	}
-	if len(opts) > 0 {
-		if opts[0].Target != "" {
-			req.Target = opts[0].Target
-		}
-		if opts[0].Deployment != "" {
-			req.Deployment = opts[0].Deployment
-		}
 	}
 	var result apitypes.PlanResponse
 	if err := doPostInto(endpoint, "/api/plan", req, &result); err != nil {
@@ -116,21 +99,12 @@ func CallRollbackPlanAPI(endpoint, applyID string) (*apitypes.PlanResponse, erro
 }
 
 // CallApplyAPI calls the apply API and returns the typed result.
-func CallApplyAPI(endpoint, planID, database, environment, caller string, options map[string]string, opts ...PlanOptions) (*apitypes.ApplyResponse, error) {
+func CallApplyAPI(endpoint, planID, environment, caller string, options map[string]string) (*apitypes.ApplyResponse, error) {
 	req := apitypes.ApplyRequest{
 		PlanID:      planID,
-		Database:    database,
 		Environment: environment,
 		Caller:      caller,
 		Options:     options,
-	}
-	if len(opts) > 0 {
-		if opts[0].Target != "" {
-			req.Target = opts[0].Target
-		}
-		if opts[0].Deployment != "" {
-			req.Deployment = opts[0].Deployment
-		}
 	}
 	var result apitypes.ApplyResponse
 	if err := doPostInto(endpoint, "/api/apply", req, &result); err != nil {

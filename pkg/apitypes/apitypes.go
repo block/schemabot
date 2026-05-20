@@ -54,31 +54,25 @@ type SchemaFiles struct {
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
 	Database    string                  `json:"database"`
-	Deployment  string                  `json:"deployment,omitempty"`
 	Environment string                  `json:"environment"`
 	Type        string                  `json:"type"`
 	SchemaFiles map[string]*SchemaFiles `json:"schema_files"`
 	Repository  string                  `json:"repository,omitempty"`
 	PullRequest *int32                  `json:"pull_request,omitempty"`
-	Target      string                  `json:"target,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
 type ApplyRequest struct {
 	PlanID      string            `json:"plan_id"`
-	Database    string            `json:"database,omitempty"`
-	Deployment  string            `json:"deployment,omitempty"`
 	Environment string            `json:"environment"`
 	Caller      string            `json:"caller,omitempty"`
 	Options     map[string]string `json:"options,omitempty"`
-	Target      string            `json:"target,omitempty"`
 }
 
 // ControlRequest is the HTTP request body for control operations
 // (stop, start, cutover, revert, skip-revert).
 type ControlRequest struct {
 	Database    string `json:"database"`
-	Deployment  string `json:"deployment,omitempty"`
 	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id,omitempty"`
 	Caller      string `json:"caller,omitempty"`
@@ -88,7 +82,6 @@ type ControlRequest struct {
 type VolumeRequest struct {
 	ApplyID     string `json:"apply_id,omitempty"`
 	Database    string `json:"database"`
-	Deployment  string `json:"deployment,omitempty"`
 	Environment string `json:"environment"`
 	Volume      int32  `json:"volume"`
 }

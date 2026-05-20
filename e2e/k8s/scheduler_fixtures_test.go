@@ -118,7 +118,7 @@ func startRunningIndexAddApply(t *testing.T, tablePrefix string) runningIndexApp
 			`CREATE TABLE %s (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, account_id BIGINT NOT NULL, event_type VARCHAR(100) NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY idx_account_created (account_id, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, tableName),
 	}
 
-	_, applyID := testutil.PlanAndApply(t, ep, "testapp", "mysql", "staging", schemaFiles, nil, deployOpts)
+	_, applyID := testutil.PlanAndApply(t, ep, "testapp", "mysql", "staging", schemaFiles, nil)
 	dataPlaneApplyID := waitForApplyExternalID(t, applyID, testutil.PollDeadline)
 
 	// The index add keeps Spirit observable long enough for the test to replace

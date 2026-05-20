@@ -1,7 +1,8 @@
 # Control plane Helm values for k8s e2e tests.
 #
 # SchemaBot with GRPCClient — routes plan/apply to the data plane over gRPC.
-# No databases config (that's on the data plane).
+# The database registry owns the server-side target/deployment route. The data
+# plane still owns the direct target DSN.
 
 image:
   repository: schemabot
@@ -11,6 +12,17 @@ image:
 config:
   storage:
     dsn: "env:MYSQL_DSN"
+  databases:
+    testapp:
+      type: mysql
+      environments:
+        staging:
+          # target is opaque metadata for the selected data-plane Tern service.
+          # The Spirit fixture still gets its database connection from the
+          # data-plane DSN; this value is the route metadata stored with the plan.
+          target: testapp
+          # deployment selects which gRPC data plane receives the request.
+          deployment: data-plane
   tern_deployments:
     data-plane:
       staging: "data-plane-schemabot:13370"

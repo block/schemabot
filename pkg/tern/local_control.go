@@ -433,6 +433,8 @@ func (c *LocalClient) RollbackPlan(ctx context.Context, database string) (*ternv
 	return c.Plan(ctx, &ternv1.PlanRequest{
 		Database:    c.config.Database,
 		Type:        c.config.Type,
+		Environment: plan.Environment,
+		Target:      plan.Target,
 		SchemaFiles: schemaFiles,
 	})
 }

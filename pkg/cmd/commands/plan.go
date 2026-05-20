@@ -55,7 +55,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 	// If environment is not specified, get all environments and plan for each
 	var environments []string
 	if cmd.Environment == "" {
-		envs, err := client.GetEnvironments(ep, cfg.Database, cfg.Deployment)
+		envs, err := client.GetEnvironments(ep, cfg.Database)
 		if err != nil {
 			if cmd.JSON {
 				return client.ExitWithJSON("api_error", err.Error())
@@ -70,8 +70,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 	// Collect results for all environments
 	allResults := make(map[string]*apitypes.PlanResponse)
 	for _, env := range environments {
-		opts := client.PlanOptions{Target: cfg.GetTarget(env), Deployment: cfg.Deployment}
-		result, err := client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, opts)
+		result, err := client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest)
 		if err != nil {
 			if cmd.JSON {
 				return client.ExitWithJSON("api_error", err.Error())

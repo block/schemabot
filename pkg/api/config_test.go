@@ -14,13 +14,22 @@ func TestLoadServerConfig(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+      production:
+        target: testapp-production
+        deployment: default
 tern_deployments:
   default:
     staging: "localhost:9090"
     production: "localhost:9091"
 repos:
-  org/repo:
-    default_tern_deployment: default
+  org/repo: {}
 default_reviewers:
   - team/schema-reviewers
 `
@@ -48,14 +57,23 @@ func TestLoadServerConfigFromFile(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
 	content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      production:
+        target: testapp-production
+        deployment: default
+      staging:
+        target: testapp-staging
+        deployment: secondary
 tern_deployments:
   default:
     production: "tern-prod:9090"
   secondary:
     staging: "tern-staging:9090"
 repos:
-  org/repo:
-    default_tern_deployment: secondary
+  org/repo: {}
 `
 	err := os.WriteFile(configPath, []byte(content), 0644)
 	require.NoError(t, err, "write config file")
@@ -64,7 +82,7 @@ repos:
 	require.NoError(t, err, "LoadServerConfigFromFile")
 
 	assert.Equal(t, 2, len(cfg.TernDeployments))
-	assert.Equal(t, "secondary", cfg.Repos["org/repo"].DefaultTernDeployment)
+	assert.Contains(t, cfg.Repos, "org/repo")
 }
 
 func TestLoadServerConfigFromFile_NotFound(t *testing.T) {
@@ -82,6 +100,59 @@ func TestLoadServerConfigFromFile_InvalidYAML(t *testing.T) {
 	assert.Error(t, err, "expected error for invalid YAML")
 }
 
+func TestLoadServerConfigFromFile_RejectsUnknownFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "top-level field",
+			content: `
+tern_deployments:
+  default:
+    staging: "localhost:9090"
+default_tern_deployment: default
+`,
+		},
+		{
+			name: "repo deployment routing",
+			content: `
+tern_deployments:
+  default:
+    staging: "localhost:9090"
+repos:
+  org/repo:
+    default_tern_deployment: default
+`,
+		},
+		{
+			name: "database environment field",
+			content: `
+databases:
+  testdb:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/testdb"
+        extra_field: ignored
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.yaml")
+			err := os.WriteFile(configPath, []byte(tt.content), 0644)
+			require.NoError(t, err, "write config file")
+
+			_, err = LoadServerConfigFromFile(configPath)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "field")
+		})
+	}
+}
+
 func TestServerConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -89,13 +160,13 @@ func TestServerConfig_Validate(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "valid config",
+			name: "tern deployments without databases",
 			cfg: ServerConfig{
 				TernDeployments: TernConfig{
 					"default": {"production": "localhost:9090"},
 				},
 			},
-			wantErr: false,
+			wantErr: true,
 		},
 		{
 			name: "empty deployments",
@@ -107,6 +178,14 @@ func TestServerConfig_Validate(t *testing.T) {
 		{
 			name: "deployment with no environments",
 			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {Target: "cluster-staging-001", Deployment: "default"},
+						},
+					},
+				},
 				TernDeployments: TernConfig{
 					"default": {},
 				},
@@ -116,6 +195,14 @@ func TestServerConfig_Validate(t *testing.T) {
 		{
 			name: "deployment with empty address",
 			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {Target: "cluster-staging-001", Deployment: "default"},
+						},
+					},
+				},
 				TernDeployments: TernConfig{
 					"default": {"production": ""},
 				},
@@ -123,26 +210,22 @@ func TestServerConfig_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "repo references unknown deployment",
+			name: "repo allowlist does not affect deployment validation",
 			cfg: ServerConfig{
-				TernDeployments: TernConfig{
-					"default": {"production": "localhost:9090"},
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"production": {Target: "cluster-production-001", Deployment: "default"},
+						},
+					},
 				},
-				Repos: map[string]RepoConfig{
-					"org/repo": {DefaultTernDeployment: "nonexistent"},
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "repo references valid deployment",
-			cfg: ServerConfig{
 				TernDeployments: TernConfig{
 					"default":   {"production": "localhost:9090"},
 					"secondary": {"staging": "localhost:9091"},
 				},
 				Repos: map[string]RepoConfig{
-					"org/repo": {DefaultTernDeployment: "secondary"},
+					"org/repo": {},
 				},
 			},
 			wantErr: false,
@@ -160,6 +243,91 @@ func TestServerConfig_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "remote database target",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {Target: "cluster-staging-001", Deployment: "tenant-a"},
+						},
+					},
+				},
+				TernDeployments: TernConfig{
+					"tenant-a": {"staging": "localhost:9090"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "remote database target missing target",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {Deployment: "tenant-a"},
+						},
+					},
+				},
+				TernDeployments: TernConfig{
+					"tenant-a": {"staging": "localhost:9090"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "remote database target missing deployment",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {Target: "cluster-staging-001"},
+						},
+					},
+				},
+				TernDeployments: TernConfig{
+					"tenant-a": {"staging": "localhost:9090"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "remote database target references deployment without environment endpoint",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"production": {Target: "cluster-production-001", Deployment: "tenant-a"},
+						},
+					},
+				},
+				TernDeployments: TernConfig{
+					"tenant-a": {"staging": "localhost:9090"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "database environment cannot mix local dsn and remote target",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", Target: "cluster-staging-001", Deployment: "tenant-a"},
+						},
+					},
+				},
+				TernDeployments: TernConfig{
+					"tenant-a": {"staging": "localhost:9090"},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			name: "both databases and tern_deployments (hybrid mode)",
 			cfg: ServerConfig{
 				Databases: map[string]DatabaseConfig{
@@ -175,7 +343,7 @@ func TestServerConfig_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "hybrid mode: repo references valid deployment",
+			name: "hybrid mode: repo allowlist",
 			cfg: ServerConfig{
 				Databases: map[string]DatabaseConfig{
 					"local-db": {
@@ -187,31 +355,13 @@ func TestServerConfig_Validate(t *testing.T) {
 					"remote-cluster": {"staging": "localhost:9090"},
 				},
 				Repos: map[string]RepoConfig{
-					"org/repo": {DefaultTernDeployment: "remote-cluster"},
+					"org/repo": {},
 				},
 			},
 			wantErr: false,
 		},
 		{
-			name: "hybrid mode: repo references nonexistent deployment",
-			cfg: ServerConfig{
-				Databases: map[string]DatabaseConfig{
-					"local-db": {
-						Type:         "mysql",
-						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/localdb"}},
-					},
-				},
-				TernDeployments: TernConfig{
-					"default": {"staging": "localhost:9090"},
-				},
-				Repos: map[string]RepoConfig{
-					"org/repo": {DefaultTernDeployment: "nonexistent"},
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name:    "neither databases nor tern_deployments",
+			name:    "missing databases",
 			cfg:     ServerConfig{},
 			wantErr: true,
 		},
@@ -229,24 +379,90 @@ func TestServerConfig_Validate(t *testing.T) {
 	}
 }
 
-func TestServerConfig_TernDeployment(t *testing.T) {
+func TestServerConfig_ResolveDatabaseTarget(t *testing.T) {
 	cfg := ServerConfig{
-		TernDeployments: TernConfig{
-			"default":   {"production": "localhost:9090"},
-			"secondary": {"staging": "localhost:9091"},
+		Databases: map[string]DatabaseConfig{
+			"localdb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/localdb"},
+				},
+			},
+			"remotedb": {
+				Type: "vitess",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "cluster-production-001", Deployment: "tenant-a"},
+				},
+			},
 		},
-		Repos: map[string]RepoConfig{
-			"org/custom-repo": {DefaultTernDeployment: "secondary"},
+		TernDeployments: TernConfig{
+			"tenant-a": {"production": "localhost:9090"},
 		},
 	}
 
-	// Test repo with custom deployment
-	dep := cfg.TernDeployment("org/custom-repo")
-	assert.Equal(t, "secondary", dep)
+	local, err := cfg.ResolveDatabaseTarget("localdb", "staging")
+	require.NoError(t, err)
+	assert.Equal(t, "mysql", local.DatabaseType)
+	assert.Equal(t, "localdb", local.Deployment)
+	assert.Equal(t, "localdb", local.Target)
 
-	// Test repo without custom deployment (falls back to default)
-	dep = cfg.TernDeployment("org/other-repo")
-	assert.Equal(t, DefaultDeployment, dep)
+	remote, err := cfg.ResolveDatabaseTarget("remotedb", "production")
+	require.NoError(t, err)
+	assert.Equal(t, "vitess", remote.DatabaseType)
+	assert.Equal(t, "tenant-a", remote.Deployment)
+	assert.Equal(t, "cluster-production-001", remote.Target)
+
+	_, err = cfg.ResolveDatabaseTarget("missing", "staging")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not configured")
+}
+
+func TestServerConfig_EnvironmentIsolatedConfigMaps(t *testing.T) {
+	stagingConfig := ServerConfig{
+		AllowedEnvironments: []string{"staging"},
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {Target: "payments-staging-target", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"staging": "tern-staging:9090"},
+		},
+	}
+	require.NoError(t, stagingConfig.Validate())
+
+	staging, err := stagingConfig.ResolveDatabaseTarget("payments", "staging")
+	require.NoError(t, err)
+	assert.Equal(t, "primary", staging.Deployment)
+	assert.Equal(t, "payments-staging-target", staging.Target)
+
+	_, err = stagingConfig.ResolveDatabaseTarget("payments", "production")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "production")
+
+	productionConfig := ServerConfig{
+		AllowedEnvironments: []string{"production"},
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "payments-production-target", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern-production:9090"},
+		},
+	}
+	require.NoError(t, productionConfig.Validate())
+
+	production, err := productionConfig.ResolveDatabaseTarget("payments", "production")
+	require.NoError(t, err)
+	assert.Equal(t, "primary", production.Deployment)
+	assert.Equal(t, "payments-production-target", production.Target)
 }
 
 func TestLoadServerConfigFromFile_InvalidConfig(t *testing.T) {
@@ -255,8 +471,7 @@ func TestLoadServerConfigFromFile_InvalidConfig(t *testing.T) {
 	// Valid YAML but invalid config (no deployments)
 	content := `
 repos:
-  org/repo:
-    default_tern_deployment: default
+  org/repo: {}
 `
 	err := os.WriteFile(configPath, []byte(content), 0644)
 	require.NoError(t, err, "write config file")
@@ -399,7 +614,7 @@ func TestServerConfig_IsRepoAllowed(t *testing.T) {
 		cfg := ServerConfig{
 			Repos: map[string]RepoConfig{
 				"org/repo-a": {},
-				"org/repo-b": {DefaultTernDeployment: "secondary"},
+				"org/repo-b": {},
 			},
 		}
 		assert.True(t, cfg.IsRepoAllowed("org/repo-a"))
@@ -467,9 +682,12 @@ func TestServerConfig_IsEnvironmentAllowed(t *testing.T) {
 		dir := t.TempDir()
 		configPath := filepath.Join(dir, "config.yaml")
 		content := `
-tern_deployments:
-  default:
-    staging: "localhost:9090"
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/testapp"
 allowed_environments:
   - staging
 `
@@ -509,9 +727,12 @@ func TestServerConfig_ShouldRequirePassingChecks(t *testing.T) {
 		dir := t.TempDir()
 		configPath := filepath.Join(dir, "config.yaml")
 		content := `
-tern_deployments:
-  default:
-    staging: "localhost:9090"
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/testapp"
 require_passing_checks: false
 `
 		err := os.WriteFile(configPath, []byte(content), 0644)

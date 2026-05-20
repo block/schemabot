@@ -31,17 +31,17 @@ func groupFiles(t *testing.T, files map[string]string, database string) map[stri
 // ApplySchemaAndWait plans and applies schema files, polling until completion or
 // failure. Returns the apply ID. If the plan detects no changes, returns empty
 // string with no error. Files are grouped by namespace using the shared helper.
-func ApplySchemaAndWait(t *testing.T, endpoint, database, dbType, env string, schemaFiles map[string]string, timeout time.Duration, opts ...client.PlanOptions) string {
+func ApplySchemaAndWait(t *testing.T, endpoint, database, dbType, env string, schemaFiles map[string]string, timeout time.Duration) string {
 	t.Helper()
 
-	resp, err := client.CallPlanAPIWithFiles(endpoint, database, dbType, env, groupFiles(t, schemaFiles, database), "", 0, opts...)
+	resp, err := client.CallPlanAPIWithFiles(endpoint, database, dbType, env, groupFiles(t, schemaFiles, database), "", 0)
 	require.NoError(t, err, "plan API call")
 
 	if resp.PlanID == "" {
 		return "" // no changes needed
 	}
 
-	applyResp, err := client.CallApplyAPI(endpoint, resp.PlanID, database, env, "", nil, opts...)
+	applyResp, err := client.CallApplyAPI(endpoint, resp.PlanID, env, "", nil)
 	require.NoError(t, err, "apply API call")
 	require.True(t, applyResp.Accepted, "apply not accepted: %s", applyResp.ErrorMessage)
 
@@ -53,16 +53,16 @@ func ApplySchemaAndWait(t *testing.T, endpoint, database, dbType, env string, sc
 // Returns the plan ID and apply ID. Useful when you need to interact with the
 // apply mid-flight (stop, cutover, etc.). Files are grouped by namespace using
 // the shared helper.
-func PlanAndApply(t *testing.T, endpoint, database, dbType, env string, schemaFiles map[string]string, applyOpts map[string]string, opts ...client.PlanOptions) (planID, applyID string) {
+func PlanAndApply(t *testing.T, endpoint, database, dbType, env string, schemaFiles map[string]string, applyOpts map[string]string) (planID, applyID string) {
 	t.Helper()
 
-	resp, err := client.CallPlanAPIWithFiles(endpoint, database, dbType, env, groupFiles(t, schemaFiles, database), "", 0, opts...)
+	resp, err := client.CallPlanAPIWithFiles(endpoint, database, dbType, env, groupFiles(t, schemaFiles, database), "", 0)
 	require.NoError(t, err, "plan API call")
 	if resp.PlanID == "" {
 		t.Fatal("plan returned no changes")
 	}
 
-	applyResp, err := client.CallApplyAPI(endpoint, resp.PlanID, database, env, "", applyOpts, opts...)
+	applyResp, err := client.CallApplyAPI(endpoint, resp.PlanID, env, "", applyOpts)
 	require.NoError(t, err, "apply API call")
 	require.True(t, applyResp.Accepted, "apply not accepted: %s", applyResp.ErrorMessage)
 

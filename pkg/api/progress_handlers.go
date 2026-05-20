@@ -59,19 +59,28 @@ func progressTableKey(namespace, table string) string {
 	return namespace + progressTableKeySep + table
 }
 
-// ResolveDeployment determines the deployment name from a database and explicit deployment.
-// In local mode (config-based databases), the database name is used as the deployment.
-// In gRPC mode, falls back to DefaultDeployment.
-func (s *Service) ResolveDeployment(database, deployment string) string {
+func storedDeploymentForApply(apply *storage.Apply) (string, error) {
+	if apply == nil {
+		return "", fmt.Errorf("apply is required")
+	}
+	if apply.Deployment == "" {
+		return "", fmt.Errorf("apply %q is missing stored deployment metadata", apply.ApplyIdentifier)
+	}
+	return apply.Deployment, nil
+}
+
+// deploymentForDatabaseEnvironment resolves the Tern deployment that owns a
+// database/environment. Stored apply deployment is authoritative for existing
+// work because it records the route used when the apply started.
+func (s *Service) deploymentForDatabaseEnvironment(database, deployment, environment string) (string, error) {
 	if deployment != "" {
-		return deployment
+		return deployment, nil
 	}
-	if s.config.Database(database) != nil {
-		return database
+	resolved, err := s.config.ResolveDatabaseTarget(database, environment)
+	if err != nil {
+		return "", err
 	}
-	s.logger.Warn("database not found in config, falling back to default tern deployment",
-		"database", database)
-	return DefaultDeployment
+	return resolved.Deployment, nil
 }
 
 // progressResponseFromProto converts a protobuf ProgressResponse to an HTTP ProgressResponse.
@@ -133,12 +142,16 @@ func (s *Service) GetProgress(ctx context.Context, database, environment string)
 		return nil, fmt.Errorf("resolve active apply for %s: %w", database, err)
 	}
 
-	// Use deployment from the stored apply if available.
-	var storedDeployment string
+	// Use deployment from the stored apply if available; otherwise route by
+	// the server-side database target registry for this environment.
+	deployment := ""
 	if activeApply != nil {
-		storedDeployment = activeApply.Deployment
+		deployment = activeApply.Deployment
 	}
-	deployment := s.ResolveDeployment(database, storedDeployment)
+	deployment, err = s.deploymentForDatabaseEnvironment(database, deployment, environment)
+	if err != nil {
+		return nil, fmt.Errorf("resolve deployment for %s/%s: %w", database, environment, err)
+	}
 
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {
@@ -202,13 +215,17 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Deployment is a plan-time decision stored on the apply record.
-	// Use the stored deployment if an apply exists, otherwise fall back to default resolution.
+	// Deployment is a plan-time decision stored on the apply record. If no
+	// apply record exists yet, route by the server-side database target config.
 	var deployment string
 	if activeApply != nil && activeApply.Deployment != "" {
 		deployment = activeApply.Deployment
 	}
-	deployment = s.ResolveDeployment(database, deployment)
+	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
+	if err != nil {
+		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound, err.Error())
+		return
+	}
 
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {
@@ -274,7 +291,13 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	}
 
 	// Active apply — use the deployment stored on the apply record.
-	deployment := s.ResolveDeployment(apply.Database, apply.Deployment)
+	deployment, err := storedDeploymentForApply(apply)
+	if err != nil {
+		s.logger.Error("active apply is missing stored deployment metadata",
+			"apply_id", applyID, "database", apply.Database, "environment", apply.Environment, "error", err)
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, err.Error())
+		return
+	}
 	s.logger.Debug("progress by apply-id: resolving client", "apply_id", applyID, "database", apply.Database, "deployment", deployment, "environment", apply.Environment)
 
 	client, err := s.TernClient(deployment, apply.Environment)
@@ -453,40 +476,28 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 
 	var environments []string
 
-	// Check local mode config (Databases)
+	// Databases is the server-side registry for both local DSN and remote Tern targets.
 	if dbConfig := s.config.Database(database); dbConfig != nil {
 		for env := range dbConfig.Environments {
 			environments = append(environments, env)
 		}
 	}
 
-	// Check gRPC mode config (TernDeployments)
-	if len(environments) == 0 && len(s.config.TernDeployments) > 0 {
-		deploymentParam := r.URL.Query().Get("deployment")
-		deployment := s.ResolveDeployment(database, deploymentParam)
-		if endpoints, ok := s.config.TernDeployments[deployment]; ok {
-			for env := range endpoints {
-				environments = append(environments, env)
-			}
-		}
-	}
-
 	if len(environments) == 0 {
-		available := make([]string, 0, len(s.config.TernDeployments))
-		for name := range s.config.TernDeployments {
+		available := make([]string, 0, len(s.config.Databases))
+		for name := range s.config.Databases {
 			available = append(available, name)
 		}
 		sort.Strings(available)
 		s.logger.Warn("no environments found for database",
 			"database", database,
-			"available_deployments", available)
+			"available_databases", available)
 		if len(available) > 0 {
 			s.writeError(w, http.StatusNotFound,
-				fmt.Sprintf("no environments found for database %q — no matching deployment (available: %v). "+
-					"Add a 'deployment' field to schemabot.yaml or configure a 'default' deployment on the server.", database, available))
+				fmt.Sprintf("no environments found for database %q - configure this database in the SchemaBot server config (available: %v)", database, available))
 		} else {
 			s.writeError(w, http.StatusNotFound,
-				fmt.Sprintf("no environments found for database %q — no databases or deployments configured on this server", database))
+				fmt.Sprintf("no environments found for database %q - no databases configured on this server", database))
 		}
 		return
 	}
@@ -644,7 +655,10 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 // per-table state into local task records. Called once for gRPC-mode applies
 // with stale task state; subsequent reads are served from local storage.
 func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
-	deployment := s.ResolveDeployment(apply.Database, apply.Deployment)
+	deployment, err := storedDeploymentForApply(apply)
+	if err != nil {
+		return err
+	}
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
 		return fmt.Errorf("get tern client: %w", err)

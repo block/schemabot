@@ -52,16 +52,13 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Build PlanRequest in the format expected by the API service
 	prNumber := int32(pr)
-	deployment := h.service.TernDeployment(repo)
 	planReq := api.PlanRequest{
 		Database:    schemaResult.Database,
-		Deployment:  deployment,
 		Environment: environment,
 		Type:        schemaResult.Type,
 		SchemaFiles: schemaResult.SchemaFiles,
 		Repository:  repo,
 		PullRequest: &prNumber,
-		Target:      schemaResult.Target,
 	}
 
 	// Execute plan via the service
@@ -214,16 +211,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 		}
 
 		prNumber := int32(pr)
-		deployment := h.service.TernDeployment(repo)
 		planReq := api.PlanRequest{
 			Database:    schemaResult.Database,
-			Deployment:  deployment,
 			Environment: env,
 			Type:        schemaResult.Type,
 			SchemaFiles: schemaResult.SchemaFiles,
 			Repository:  repo,
 			PullRequest: &prNumber,
-			Target:      schemaResult.Target,
 		}
 
 		planResp, err := h.service.ExecutePlan(ctx, planReq)

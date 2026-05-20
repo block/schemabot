@@ -304,7 +304,7 @@ func buildWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logge
 		return webhookRuntime{}, fmt.Errorf("resolve GitHub webhook secret: %w", err)
 	}
 	if ghWebhookSecret == "" {
-		return webhookRuntime{}, fmt.Errorf("GitHub App is configured but webhook secret is empty — set github.webhook_secret to secure the /webhook endpoint")
+		return webhookRuntime{}, fmt.Errorf("GitHub App is configured but webhook secret is empty — set github.webhook-secret to secure the /webhook endpoint")
 	}
 
 	appID := serverConfig.GitHub.ResolveAppID()

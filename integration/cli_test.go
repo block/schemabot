@@ -846,11 +846,10 @@ func startSchemaBotLocal(t *testing.T) string {
 	require.NoError(t, err, "create local tern client")
 	t.Cleanup(func() { utils.CloseAndLog(localClient) })
 
-	// Create SchemaBot config with database registration (LocalClient mode)
-	// Use "default" as the key since CLI defaults deployment to "default"
+	// Create SchemaBot config with database registration (LocalClient mode).
 	config := &schemabotapi.ServerConfig{
 		Databases: map[string]schemabotapi.DatabaseConfig{
-			"default": {
+			"testdb": {
 				Type: "mysql",
 				Environments: map[string]schemabotapi.EnvironmentConfig{
 					"staging": {DSN: testdbDSN},
@@ -859,9 +858,9 @@ func startSchemaBotLocal(t *testing.T) string {
 		},
 	}
 
-	// Pre-register the LocalClient with "default/staging" key
+	// Pre-register the LocalClient with the server-side local deployment key.
 	ternClients := map[string]tern.Client{
-		"default/staging": localClient,
+		"testdb/staging": localClient,
 	}
 
 	svc := schemabotapi.New(storage, config, ternClients, logger)
@@ -989,8 +988,16 @@ func startSchemaBotWithGRPC(t *testing.T) string {
 	require.NoError(t, err, "create tern client")
 	t.Cleanup(func() { utils.CloseAndLog(ternClient) })
 
-	// Create SchemaBot config with TernDeployments to route requests to gRPC backend
+	// Create SchemaBot config with a server-side target routed to the gRPC backend.
 	config := &schemabotapi.ServerConfig{
+		Databases: map[string]schemabotapi.DatabaseConfig{
+			"testdb": {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {Target: "testdb-target", Deployment: "default"},
+				},
+			},
+		},
 		TernDeployments: schemabotapi.TernConfig{
 			"default": schemabotapi.TernEndpoints{
 				"staging": grpcAddr,

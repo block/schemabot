@@ -1534,7 +1534,7 @@ func TestVitess_Apply_DeferDeploy(t *testing.T) {
 	require.NotEmpty(t, planResp.Changes, "expected plan to have changes")
 
 	// Apply via API with defer_deploy option
-	applyResp, err := client.CallApplyAPI(endpoint, planResp.PlanID, vitessDB, "staging", "e2e-test",
+	applyResp, err := client.CallApplyAPI(endpoint, planResp.PlanID, "staging", "e2e-test",
 		map[string]string{"defer_deploy": "true", "skip_revert": "true"})
 	require.NoError(t, err)
 	require.NotEmpty(t, applyResp.ApplyID)
@@ -1586,7 +1586,7 @@ func TestVitess_Apply_DeferDeploy_StartTooEarly(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, planResp.PlanID)
 
-	applyResp, err := client.CallApplyAPI(endpoint, planResp.PlanID, vitessDB, "staging", "e2e-test",
+	applyResp, err := client.CallApplyAPI(endpoint, planResp.PlanID, "staging", "e2e-test",
 		map[string]string{"defer_deploy": "true", "skip_revert": "true"})
 	require.NoError(t, err)
 	require.NotEmpty(t, applyResp.ApplyID)

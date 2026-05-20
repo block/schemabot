@@ -25,31 +25,28 @@ import (
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
 	Database    string                         `json:"database"`
-	Deployment  string                         `json:"deployment,omitempty"`
 	Environment string                         `json:"environment"`
 	Type        string                         `json:"type"` // "mysql" or "vitess"
 	SchemaFiles map[string]*ternv1.SchemaFiles `json:"schema_files"`
 	Repository  string                         `json:"repository,omitempty"`
 	PullRequest *int32                         `json:"pull_request,omitempty"`
-	Target      string                         `json:"target,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
 type ApplyRequest struct {
 	PlanID         string            `json:"plan_id"`
-	Database       string            `json:"database,omitempty"` // Used for local mode detection
-	Deployment     string            `json:"deployment,omitempty"`
 	Environment    string            `json:"environment"`
 	Options        map[string]string `json:"options,omitempty"`
-	Caller         string            `json:"caller,omitempty"` // Identity of the caller (e.g., "cli:user@host")
-	Target         string            `json:"target,omitempty"`
+	Caller         string            `json:"caller,omitempty"`          // Identity of the caller (e.g., "cli:user@host")
 	InstallationID int64             `json:"installation_id,omitempty"` // GitHub App installation ID (for PR comment tracking)
 }
 
 // handlePlan handles POST /api/plan requests.
 func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	var req PlanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -106,7 +103,23 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 
 	planStart := time.Now()
 
-	deployment := s.ResolveDeployment(req.Database, req.Deployment)
+	resolvedTarget, err := s.config.ResolveDatabaseTarget(req.Database, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "resolve target")
+		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
+		return nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if req.Type != resolvedTarget.DatabaseType {
+		typeErr := fmt.Errorf("database %q type %q does not match server config type %q", req.Database, req.Type, resolvedTarget.DatabaseType)
+		span.RecordError(typeErr)
+		span.SetStatus(codes.Error, "type mismatch")
+		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
+		return nil, typeErr
+	}
+	deployment := resolvedTarget.Deployment
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
@@ -117,18 +130,13 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
-	// Call Tern Plan
-	target := req.Target
-	if target == "" {
-		target = req.Database
-	}
 	ternReq := &ternv1.PlanRequest{
 		Database:    req.Database,
-		Type:        req.Type,
+		Type:        resolvedTarget.DatabaseType,
 		SchemaFiles: req.SchemaFiles,
 		Repository:  req.Repository,
 		Environment: req.Environment,
-		Target:      target,
+		Target:      resolvedTarget.Target,
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest
@@ -136,7 +144,9 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 
 	s.logger.Info("ExecutePlan: calling client.Plan",
 		"database", req.Database,
-		"type", req.Type,
+		"type", resolvedTarget.DatabaseType,
+		"deployment", deployment,
+		"target", resolvedTarget.Target,
 		"is_remote", client.IsRemote(),
 		"schema_file_count", len(req.SchemaFiles),
 	)
@@ -175,7 +185,9 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	storedPlan := &storage.Plan{
 		PlanIdentifier: resp.PlanId,
 		Database:       req.Database,
-		DatabaseType:   req.Type,
+		DatabaseType:   resolvedTarget.DatabaseType,
+		Deployment:     deployment,
+		Target:         resolvedTarget.Target,
 		Repository:     req.Repository,
 		PullRequest:    prInt,
 		Environment:    req.Environment,
@@ -193,7 +205,9 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 // handleApply handles POST /api/apply requests.
 func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	var req ApplyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
@@ -275,8 +289,29 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		return nil, 0, planErr
 	}
 	span.SetAttributes(attribute.String("database", plan.Database))
+	if plan.Environment != req.Environment {
+		applyErr := fmt.Errorf("plan %s was created for environment %q, not %q", req.PlanID, plan.Environment, req.Environment)
+		span.RecordError(applyErr)
+		span.SetStatus(codes.Error, "environment mismatch")
+		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
+		return nil, 0, applyErr
+	}
+	if plan.Deployment == "" {
+		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "deployment")
+		span.RecordError(applyErr)
+		span.SetStatus(codes.Error, "missing stored deployment")
+		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
+		return nil, 0, applyErr
+	}
+	if plan.Target == "" {
+		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "target")
+		span.RecordError(applyErr)
+		span.SetStatus(codes.Error, "missing stored target")
+		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
+		return nil, 0, applyErr
+	}
 
-	deployment := s.ResolveDeployment(plan.Database, req.Deployment)
+	deployment := plan.Deployment
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
@@ -291,10 +326,6 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	if options == nil {
 		options = make(map[string]string)
 	}
-	applyTarget := req.Target
-	if applyTarget == "" {
-		applyTarget = plan.Database
-	}
 	ternReq := &ternv1.ApplyRequest{
 		PlanId:      req.PlanID,
 		Options:     options,
@@ -302,7 +333,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		Type:        plan.DatabaseType,
 		DdlChanges:  storageToProtoTableChanges(plan.FlatDDLChanges()),
 		Environment: req.Environment,
-		Target:      applyTarget,
+		Target:      plan.Target,
 		Caller:      req.Caller,
 	}
 
@@ -494,7 +525,10 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 // (which calls Plan internally). This is the shared implementation used by
 // both the HTTP handler and the webhook handler.
 func (s *Service) ExecuteRollbackPlan(ctx context.Context, database, environment, deployment string) (*apitypes.PlanResponse, error) {
-	deployment = s.ResolveDeployment(database, deployment)
+	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
+	if err != nil {
+		return nil, fmt.Errorf("resolve deployment for rollback plan: %w", err)
+	}
 
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {

@@ -20,28 +20,19 @@ const (
 	DatabaseTypeMySQL  DatabaseType = "mysql"
 )
 
-// EnvironmentEntry represents a configured environment with optional target.
+// EnvironmentEntry represents an environment a repository has opted into.
 type EnvironmentEntry struct {
-	Name   string
-	Target string
+	Name string
 }
 
-// EnvironmentList supports both list-of-strings and map forms in YAML:
+// EnvironmentList supports a list of environment names in YAML:
 //
-//	# Simple form — target defaults to database field
 //	environments:
 //	  - staging
 //	  - production
-//
-//	# Map form — explicit target per environment
-//	environments:
-//	  staging:
-//	    target: cluster-staging-001
-//	  production:
-//	    target: cluster-production-001
 type EnvironmentList []EnvironmentEntry
 
-// UnmarshalYAML handles both list-of-strings and map-of-objects forms.
+// UnmarshalYAML handles list-of-strings form.
 func (e *EnvironmentList) UnmarshalYAML(value *yaml.Node) error {
 	*e = nil // Reset to avoid accumulating entries on re-unmarshal
 	switch value.Kind {
@@ -56,23 +47,9 @@ func (e *EnvironmentList) UnmarshalYAML(value *yaml.Node) error {
 		}
 		return nil
 	case yaml.MappingNode:
-		// Map form: staging: {target: "..."}
-		// Iterate yaml.Node children to preserve YAML declaration order.
-		for i := 0; i < len(value.Content)-1; i += 2 {
-			keyNode := value.Content[i]
-			valNode := value.Content[i+1]
-			name := keyNode.Value
-			var entry struct {
-				Target string `yaml:"target"`
-			}
-			if err := valNode.Decode(&entry); err != nil {
-				return fmt.Errorf("environment %q: %w", name, err)
-			}
-			*e = append(*e, EnvironmentEntry{Name: name, Target: entry.Target})
-		}
-		return nil
+		return fmt.Errorf("environments must be a list of names; configure database targets in the SchemaBot server config")
 	default:
-		return fmt.Errorf("environments must be a list or map, got %v", value.Kind)
+		return fmt.Errorf("environments must be a list, got %v", value.Kind)
 	}
 }
 
@@ -90,7 +67,7 @@ func (c *SchemabotConfig) GetType() DatabaseType {
 	return c.Type
 }
 
-// GetEnvironments returns the configured environment names, defaulting to ["staging"].
+// GetEnvironments returns the enabled environment names, defaulting to ["staging"].
 func (c *SchemabotConfig) GetEnvironments() []string {
 	if len(c.Environments) == 0 {
 		return []string{"staging"}
@@ -107,23 +84,12 @@ func (c *SchemabotConfig) HasEnvironment(env string) bool {
 	return slices.Contains(c.GetEnvironments(), env)
 }
 
-// GetTarget returns the target for the given environment.
-// If the environment has no explicit target, falls back to the Database field.
-func (c *SchemabotConfig) GetTarget(env string) string {
-	for _, e := range c.Environments {
-		if e.Name == env && e.Target != "" {
-			return e.Target
-		}
-	}
-	return c.Database
-}
-
 // DiscoveredConfig represents a schemabot.yaml config found via Tree API search.
 type DiscoveredConfig struct {
 	Config       *SchemabotConfig
 	Path         string   // Full path to schemabot.yaml file
 	SchemaDir    string   // Directory containing schemabot.yaml
-	Environments []string // From config.GetEnvironments()
+	Environments []string // Enabled environments from config.GetEnvironments()
 }
 
 // ConfigFileName is the name of the schemabot config file.
@@ -164,7 +130,9 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 	}
 
 	var config SchemabotConfig
-	if err := yaml.Unmarshal([]byte(content), &config); err != nil {
+	decoder := yaml.NewDecoder(strings.NewReader(content))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
 	}
 

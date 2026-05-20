@@ -551,7 +551,7 @@ func TestWebhookRepoAllowlistRejectsUnregisteredRepo(t *testing.T) {
 
 	service := api.New(nil, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{
-			"org/allowed-repo": {DefaultTernDeployment: "default"},
+			"org/allowed-repo": {},
 		},
 	}, nil, testLogger())
 
@@ -597,7 +597,7 @@ func TestWebhookRepoAllowlistAllowsRegisteredRepo(t *testing.T) {
 
 	service := api.New(nil, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{
-			"octocat/hello-world": {DefaultTernDeployment: "default"},
+			"octocat/hello-world": {},
 		},
 	}, nil, testLogger())
 
@@ -658,7 +658,7 @@ func TestWebhookRepoAllowlistEmptyAllowsAll(t *testing.T) {
 func TestWebhookRepoAllowlistPullRequestRejectsUnregistered(t *testing.T) {
 	service := api.New(nil, &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{
-			"org/allowed-repo": {DefaultTernDeployment: "default"},
+			"org/allowed-repo": {},
 		},
 	}, nil, testLogger())
 

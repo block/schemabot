@@ -1792,10 +1792,10 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	}
 }
 
-// TestE2EPlanUsesRepoDeployment verifies that the webhook plan handler routes
-// to the correct Tern deployment based on the repo's default_tern_deployment config.
-func TestE2EPlanUsesRepoDeployment(t *testing.T) {
-	dbName := "webhook_repo_deployment"
+// TestE2EPlanUsesServerSideTarget verifies that the webhook plan handler routes
+// using the database target policy from server config.
+func TestE2EPlanUsesServerSideTarget(t *testing.T) {
+	dbName := "webhook_server_target"
 	ctx := t.Context()
 
 	// Create the app database on the target
@@ -1835,20 +1835,24 @@ func TestE2EPlanUsesRepoDeployment(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = localClient.Close() })
 
-	// Configure service in gRPC mode: no Databases, only TernDeployments + Repos.
-	// The tern client is registered under "team-a/staging" — NOT "default/staging".
-	// If the webhook handler doesn't set Deployment from the Repos config,
-	// resolveDeployment falls back to "default" and TernClient lookup fails.
+	// The tern client is registered under "team-a/staging", so plan must use
+	// the deployment stored in databases.<db>.environments.staging.
 	serverConfig := &api.ServerConfig{
+		Databases: map[string]api.DatabaseConfig{
+			dbName: {
+				Type: "mysql",
+				Environments: map[string]api.EnvironmentConfig{
+					"staging": {Target: "team-a-target", Deployment: "team-a"},
+				},
+			},
+		},
 		TernDeployments: api.TernConfig{
 			"team-a": api.TernEndpoints{
 				"staging": "localhost:9999", // address not dialed; pre-injected client is used instead
 			},
 		},
 		Repos: map[string]api.RepoConfig{
-			"octocat/hello-world": {
-				DefaultTernDeployment: "team-a",
-			},
+			"octocat/hello-world": {},
 		},
 	}
 

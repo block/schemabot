@@ -200,6 +200,12 @@ type Plan struct {
 	// DatabaseType is "vitess" or "mysql".
 	DatabaseType string
 
+	// Deployment is the Tern deployment selected by server config at plan time.
+	Deployment string
+
+	// Target is the Tern-facing target selected by server config at plan time.
+	Target string
+
 	// Repository is the GitHub repository (owner/repo format).
 	Repository string
 
@@ -295,7 +301,8 @@ type Apply struct {
 	Environment string
 
 	// Deployment is the Tern deployment name used for this apply.
-	// Empty for local mode (no Tern routing needed).
+	// Local mode stores the database name so recovery and controls can route
+	// using the same plan-time decision as gRPC mode.
 	Deployment string
 
 	// Caller identifies who initiated this apply.

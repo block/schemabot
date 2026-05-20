@@ -3,6 +3,8 @@ CREATE TABLE `plans` (
   `plan_identifier` varchar(255) NOT NULL,
   `database_name` varchar(255) NOT NULL,
   `database_type` varchar(50) NOT NULL,
+  `deployment` varchar(255) NOT NULL DEFAULT '',
+  `target` varchar(255) NOT NULL DEFAULT '',
   `repository` varchar(255) NOT NULL,
   `pull_request` int unsigned NOT NULL,
   `environment` varchar(50) NOT NULL DEFAULT '',

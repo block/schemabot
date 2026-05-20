@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"os"
@@ -40,7 +41,7 @@ type ServerConfig struct {
 	// AllowedEnvironments restricts which environments this SchemaBot instance handles.
 	// When set, the instance only processes commands for listed environments and uses
 	// the GitHub Checks API to verify prior environments owned by other instances.
-	// When empty or nil, all environments are allowed (backwards compatible).
+	// When empty or nil, all environments are allowed.
 	AllowedEnvironments []string `yaml:"allowed_environments"`
 
 	// SchedulerWorkers is the number of concurrent scheduler workers that claim
@@ -104,11 +105,11 @@ func (g *GitHubConfig) Configured() bool {
 		return false
 	}
 	if appID == 0 {
-		slog.Warn("GitHub App private_key is set but app_id is missing — skipping GitHub setup")
+		slog.Warn("GitHub App private-key is set but app-id is missing — skipping GitHub setup")
 		return false
 	}
 	if g.PrivateKey == "" {
-		slog.Warn("GitHub App app_id is set but private_key is missing — skipping GitHub setup")
+		slog.Warn("GitHub App app-id is set but private-key is missing — skipping GitHub setup")
 		return false
 	}
 	// Actually resolve the private key — if the file/secret doesn't exist yet,
@@ -164,9 +165,15 @@ type DatabaseConfig struct {
 
 // EnvironmentConfig holds per-environment database configuration.
 type EnvironmentConfig struct {
-	// DSN is the database connection string.
+	// DSN is the database connection string for local mode.
 	// Can be a direct DSN or a reference to a secret (e.g., "env:MYSQL_DSN").
 	DSN string `yaml:"dsn"`
+
+	// Target is the opaque Tern-facing target identifier for gRPC mode.
+	Target string `yaml:"target,omitempty"`
+
+	// Deployment is the Tern deployment key for gRPC mode.
+	Deployment string `yaml:"deployment,omitempty"`
 
 	// For PlanetScale/Vitess:
 	// Organization is the PlanetScale organization name.
@@ -202,10 +209,13 @@ type TLSConfig struct {
 }
 
 // RepoConfig holds configuration for a specific repository.
-type RepoConfig struct {
-	// DefaultTernDeployment is the Tern deployment to use for this repo
-	// when not overridden by schemabot.yaml in the repo.
-	DefaultTernDeployment string `yaml:"default_tern_deployment"`
+type RepoConfig struct{}
+
+// ResolvedDatabaseTarget is the server-owned routing decision for plan/apply.
+type ResolvedDatabaseTarget struct {
+	DatabaseType string
+	Deployment   string
+	Target       string
 }
 
 // LoadServerConfig loads the server configuration from the file specified
@@ -227,7 +237,9 @@ func LoadServerConfigFromFile(path string) (*ServerConfig, error) {
 	}
 
 	var config ServerConfig
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&config); err != nil {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
@@ -240,12 +252,15 @@ func LoadServerConfigFromFile(path string) (*ServerConfig, error) {
 
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
-	// Either Databases (local mode) or TernDeployments (gRPC mode) must be configured
-	if len(c.Databases) == 0 && len(c.TernDeployments) == 0 {
-		return fmt.Errorf("either databases or tern_deployments is required")
+	// The database registry is required in both local mode and gRPC mode:
+	// local environments provide DSNs, while remote environments provide the
+	// server-owned target/deployment route.
+	if len(c.Databases) == 0 {
+		return fmt.Errorf("databases is required")
 	}
 
-	// Validate Databases if present (local mode)
+	// Validate Databases if present. An environment is either local mode
+	// (direct DSN) or gRPC mode (server-side target + deployment).
 	for name, dbConfig := range c.Databases {
 		if dbConfig.Type == "" {
 			return fmt.Errorf("database %q missing type", name)
@@ -257,8 +272,26 @@ func (c *ServerConfig) Validate() error {
 			return fmt.Errorf("database %q has no environments configured", name)
 		}
 		for env, envConfig := range dbConfig.Environments {
-			if envConfig.DSN == "" {
-				return fmt.Errorf("database %q environment %q missing DSN", name, env)
+			hasDSN := envConfig.DSN != ""
+			hasRemoteRouting := envConfig.Target != "" || envConfig.Deployment != ""
+			switch {
+			case hasDSN && hasRemoteRouting:
+				return fmt.Errorf("database %q environment %q cannot configure both dsn and target/deployment", name, env)
+			case hasDSN:
+				continue
+			case !hasRemoteRouting:
+				return fmt.Errorf("database %q environment %q missing dsn or target/deployment", name, env)
+			case envConfig.Target == "":
+				return fmt.Errorf("database %q environment %q missing target", name, env)
+			case envConfig.Deployment == "":
+				return fmt.Errorf("database %q environment %q missing deployment", name, env)
+			}
+			endpoints, ok := c.TernDeployments[envConfig.Deployment]
+			if !ok {
+				return fmt.Errorf("database %q environment %q references unknown deployment %q", name, env, envConfig.Deployment)
+			}
+			if endpoints[env] == "" {
+				return fmt.Errorf("database %q environment %q deployment %q has no endpoint", name, env, envConfig.Deployment)
 			}
 		}
 	}
@@ -271,15 +304,6 @@ func (c *ServerConfig) Validate() error {
 		for env, addr := range endpoints {
 			if addr == "" {
 				return fmt.Errorf("deployment %q environment %q has empty address", name, env)
-			}
-		}
-	}
-
-	// Validate repo configs reference valid deployments
-	for repo, repoConfig := range c.Repos {
-		if repoConfig.DefaultTernDeployment != "" {
-			if _, ok := c.TernDeployments[repoConfig.DefaultTernDeployment]; !ok {
-				return fmt.Errorf("repo %q references unknown deployment %q", repo, repoConfig.DefaultTernDeployment)
 			}
 		}
 	}
@@ -309,19 +333,45 @@ func (c *ServerConfig) DatabaseEnvironment(database, environment string) *Enviro
 	return nil
 }
 
-// TernDeployment returns the Tern deployment name for the given repository.
-// It checks repo-specific config first, then falls back to "default".
-func (c *ServerConfig) TernDeployment(repo string) string {
-	if repoConfig, ok := c.Repos[repo]; ok && repoConfig.DefaultTernDeployment != "" {
-		return repoConfig.DefaultTernDeployment
+// ResolveDatabaseTarget returns the complete routing metadata for a configured
+// database/environment. Local targets use the database name for deployment and
+// target; remote targets use the configured Tern deployment and opaque target.
+func (c *ServerConfig) ResolveDatabaseTarget(database, environment string) (ResolvedDatabaseTarget, error) {
+	if c == nil {
+		return ResolvedDatabaseTarget{}, fmt.Errorf("server config is nil")
 	}
-	return DefaultDeployment
+	dbConfig := c.Database(database)
+	if dbConfig == nil {
+		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q is not configured on this server", database)
+	}
+	envConfig, ok := dbConfig.Environments[environment]
+	if !ok {
+		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q environment %q is not configured on this server", database, environment)
+	}
+
+	if envConfig.DSN != "" {
+		return ResolvedDatabaseTarget{
+			DatabaseType: dbConfig.Type,
+			Deployment:   database,
+			Target:       database,
+		}, nil
+	}
+	if envConfig.Target == "" {
+		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q environment %q missing server-side target", database, environment)
+	}
+	if envConfig.Deployment == "" {
+		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q environment %q missing server-side deployment", database, environment)
+	}
+	return ResolvedDatabaseTarget{
+		DatabaseType: dbConfig.Type,
+		Deployment:   envConfig.Deployment,
+		Target:       envConfig.Target,
+	}, nil
 }
 
 // IsRepoAllowed returns whether the given repository is permitted to use SchemaBot.
 // If the receiver is nil, Repos is empty, or Repos is nil, all repositories are
-// allowed (backwards compatible). If Repos is populated, only listed repositories
-// are allowed.
+// allowed. If Repos is populated, only listed repositories are allowed.
 func (c *ServerConfig) IsRepoAllowed(repo string) bool {
 	if c == nil || len(c.Repos) == 0 {
 		return true
@@ -332,7 +382,7 @@ func (c *ServerConfig) IsRepoAllowed(repo string) bool {
 
 // IsEnvironmentAllowed returns whether the given environment is handled by this
 // SchemaBot instance. If the receiver is nil, AllowedEnvironments is empty, or
-// AllowedEnvironments is nil, all environments are allowed (backwards compatible).
+// AllowedEnvironments is nil, all environments are allowed.
 func (c *ServerConfig) IsEnvironmentAllowed(env string) bool {
 	if c == nil || len(c.AllowedEnvironments) == 0 {
 		return true

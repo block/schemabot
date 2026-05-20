@@ -28,38 +28,55 @@ SchemaBot delegates to remote services that implement the Tern proto. This is us
 storage:
   dsn: "env:SCHEMABOT_DSN"
 
+databases:
+  payments:
+    type: mysql
+    environments:
+      staging:
+        target: "payments-staging"
+        deployment: tenant1
+      production:
+        target: "payments-production"
+        deployment: tenant1
+
 tern_deployments:
   tenant1:
     staging: "tern-staging:9090"
     production: "tern-production:9090"
-  tenant2:
-    production: "tern1-production:9090"
 ```
+
+In gRPC mode, `target` is an opaque identifier understood by the remote Tern service. SchemaBot stores the resolved `target` and `deployment` on each plan, then reuses that stored route during apply. Callers do not send target or deployment in plan/apply requests.
+
+The example above is a single SchemaBot deployment that owns both environments. In environment-isolated deployments, each SchemaBot config should contain only the targets for the environments that instance owns. Use `allowed_environments` to scope each instance.
 
 ## Hybrid Mode
 
-Both modes can be used simultaneously. Databases configured in the `databases` section use local (direct) connections, while everything else routes through `tern_deployments`. This is useful when some databases are co-located with SchemaBot and others are in remote environments.
+Both modes can be used simultaneously. Each database environment in the `databases` section chooses one route: local mode with `dsn`, or gRPC mode with `target` and `deployment`. This is useful when some databases are co-located with SchemaBot and others are in remote environments.
 
 ```yaml
 storage:
   dsn: "env:SCHEMABOT_DSN"
 
-# Direct connections for co-located databases
 databases:
   local-db:
     type: mysql
     environments:
       staging:
         dsn: "env:LOCAL_DB_DSN"
+  remote-db:
+    type: mysql
+    environments:
+      staging:
+        target: "remote-db-staging"
+        deployment: default
 
-# Remote Tern services for databases in other environments
 tern_deployments:
   default:
     staging: "tern-staging:9090"
     production: "tern-production:9090"
 ```
 
-Routing is automatic — when a plan or apply request arrives, SchemaBot checks the `databases` config first. If the database name matches, it uses a direct connection. Otherwise, it routes to the selected Tern deployment via gRPC (defaulting to the `default` deployment key, or the repo-specific deployment configured via `repos.*.default_tern_deployment`).
+Routing is always server-side. A database environment with `dsn` uses local mode. A database environment with `target` and `deployment` uses gRPC mode through the matching `tern_deployments` endpoint. A database that is not listed in `databases` is not routable.
 
 ## Scheduler Workers
 
@@ -92,12 +109,24 @@ databases:
 ```
 
 ```yaml
-# gRPC mode — repos as allowlist + routing
+# gRPC mode — repos as allowlist, database targets as routing
 repos:
-  myorg/payments-service:
-    default_tern_deployment: tenant1
-  myorg/user-service:
-    default_tern_deployment: tenant2
+  myorg/payments-service: {}
+  myorg/user-service: {}
+
+databases:
+  payments:
+    type: mysql
+    environments:
+      staging:
+        target: "payments-staging"
+        deployment: tenant1
+  users:
+    type: mysql
+    environments:
+      staging:
+        target: "users-staging"
+        deployment: tenant2
 
 tern_deployments:
   tenant1:
@@ -109,7 +138,7 @@ tern_deployments:
 When a webhook arrives from an unlisted repository:
 - If the user invoked a SchemaBot command (e.g., `schemabot plan`), a PR comment explains the repo is not registered.
 - Auto-plan events (PR open/sync) are ignored without a PR comment because the
-  repository is outside this SchemaBot deployment's ownership.
+  repository is outside this SchemaBot instance's ownership.
 
 If `repos` is not configured or empty, all repositories are allowed.
 
@@ -179,13 +208,61 @@ github:
   webhook-secret: "env:PROD_WEBHOOK_SECRET"
 ```
 
+### Environment-local gRPC targets
+
+For remote Tern deployments, keep the target registry environment-local too. The staging instance only needs staging target identifiers:
+
+```yaml
+storage:
+  dsn: "env:STAGING_SCHEMABOT_DSN"
+
+allowed_environments:
+  - staging
+
+databases:
+  payments:
+    type: mysql
+    environments:
+      staging:
+        target: "payments-staging"
+        deployment: primary
+
+tern_deployments:
+  primary:
+    staging: "tern-staging:9090"
+```
+
+The production instance only needs production target identifiers:
+
+```yaml
+storage:
+  dsn: "env:PROD_SCHEMABOT_DSN"
+
+allowed_environments:
+  - production
+
+databases:
+  payments:
+    type: mysql
+    environments:
+      production:
+        target: "payments-production"
+        deployment: primary
+
+tern_deployments:
+  primary:
+    production: "tern-production:9090"
+```
+
+Do not require the staging ConfigMap to contain production targets, or the production ConfigMap to contain staging targets. Each instance resolves only the environments it owns.
+
 ### How it works
 
 - **Environment scoping:** When `allowed_environments` is set, the instance only processes commands targeting those environments. Commands for other environments (e.g., `schemabot apply -e production` sent to the staging instance) are accepted without a PR response by this deployment. A deployment that allows the requested environment must process its own webhook delivery.
 
 - **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates.
 
-- **Cross-instance environment verification:** Environment ordering (e.g., staging must succeed before production) works across instances. The production instance queries the GitHub Checks API for the staging instance's `SchemaBot (staging)` aggregate check to verify the prior environment completed successfully.
+- **Cross-instance environment verification:** Environment ordering (e.g., staging must succeed before production) works across instances. The production instance queries the GitHub Checks API for the staging instance's `SchemaBot (staging)` aggregate check to verify the prior environment completed successfully. GitHub check runs are the shared authority for cross-environment state; the production instance does not need staging target configuration to enforce the staging gate.
 
 - **Separate GitHub Apps:** Each instance needs its own GitHub App installation. Both Apps must be installed on the same repositories and configured to receive the same webhook events. GitHub delivers webhooks to all installed Apps independently.
 

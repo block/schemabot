@@ -117,7 +117,17 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 
 	previousState := apply.State
 
-	deployment := s.ResolveDeployment(apply.Database, apply.Deployment)
+	deployment, err := storedDeploymentForApply(apply)
+	if err != nil {
+		s.logger.Error("scheduler: claimed apply is missing stored deployment metadata",
+			"worker", workerID,
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"error", err)
+		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, "missing_deployment")
+		return
+	}
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
 		s.logger.Error("scheduler: failed to get client",

@@ -17,6 +17,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -91,6 +92,15 @@ type staticApplyStore struct {
 
 func (s *staticApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
 	return s.apply, s.err
+}
+func (s *staticApplyStore) GetByDatabase(context.Context, string, string, string) ([]*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.apply == nil {
+		return nil, nil
+	}
+	return []*storage.Apply{s.apply}, nil
 }
 
 // mockTernClient implements tern.Client for testing.
@@ -206,6 +216,8 @@ func executeApplyTestPlan() *storage.Plan {
 		PlanIdentifier: "plan-1",
 		Database:       "testdb",
 		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     DefaultDeployment,
+		Target:         "testdb",
 		Environment:    "staging",
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"testdb": {
@@ -222,11 +234,32 @@ func executeApplyTestPlan() *storage.Plan {
 	}
 }
 
+func activeTestApply(applyID string) *storage.Apply {
+	return &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: applyID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      DefaultDeployment,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+}
+
 func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) *Service {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	return New(&mockStorageWithApplyStores{
 		plans:   &staticPlanStore{plan: executeApplyTestPlan()},
 		applies: applies,
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": client,
+	}, logger)
+}
+
+func newControlTestService(client tern.Client, apply *storage.Apply) *Service {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(&mockStorageWithApplyStores{
+		applies: &staticApplyStore{apply: apply},
 	}, testServerConfig(), map[string]tern.Client{
 		"default/staging": client,
 	}, logger)
@@ -324,6 +357,8 @@ func TestApplyHandler(t *testing.T) {
 			PlanIdentifier: "plan-active",
 			Database:       "testdb",
 			DatabaseType:   storage.DatabaseTypeMySQL,
+			Deployment:     DefaultDeployment,
+			Target:         "testdb",
 			Environment:    "staging",
 		}
 		stor := &mockStorageWithPlanLookup{
@@ -441,17 +476,14 @@ func TestTernHealth(t *testing.T) {
 
 func TestVolumeHandler(t *testing.T) {
 	t.Run("success returns volume values", func(t *testing.T) {
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{
-			"default/staging": &mockTernClient{
-				volumeResp: &ternv1.VolumeResponse{
-					Accepted:       true,
-					PreviousVolume: 3,
-					NewVolume:      11,
-				},
+		mock := &mockTernClient{
+			volumeResp: &ternv1.VolumeResponse{
+				Accepted:       true,
+				PreviousVolume: 3,
+				NewVolume:      11,
 			},
 		}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-vol123"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -476,7 +508,7 @@ func TestVolumeHandler(t *testing.T) {
 	})
 
 	t.Run("invalid volume range", func(t *testing.T) {
-		svc := newTestService()
+		svc := newControlTestService(&mockTernClient{}, activeTestApply("apply-vol123"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -509,6 +541,83 @@ func TestVolumeHandler(t *testing.T) {
 	})
 }
 
+func TestControlHandlersRejectClientDeployment(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "stop",
+			path: "/api/stop",
+			body: `{"database": "testdb", "environment": "staging", "deployment": "default"}`,
+		},
+		{
+			name: "start",
+			path: "/api/start",
+			body: `{"database": "testdb", "environment": "staging", "deployment": "default"}`,
+		},
+		{
+			name: "cutover",
+			path: "/api/cutover",
+			body: `{"database": "testdb", "environment": "staging", "deployment": "default"}`,
+		},
+		{
+			name: "volume",
+			path: "/api/volume",
+			body: `{"database": "testdb", "environment": "staging", "deployment": "default", "volume": 5}`,
+		},
+		{
+			name: "revert",
+			path: "/api/revert",
+			body: `{"database": "testdb", "environment": "staging", "deployment": "default"}`,
+		},
+		{
+			name: "skip-revert",
+			path: "/api/skip-revert",
+			body: `{"database": "testdb", "environment": "staging", "deployment": "default"}`,
+		},
+		{
+			name: "rollback plan",
+			path: "/api/rollback/plan",
+			body: `{"apply_id": "apply-123", "deployment": "default"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newTestService()
+			mux := http.NewServeMux()
+			svc.ConfigureRoutes(mux)
+
+			req := httptest.NewRequestWithContext(t.Context(), "POST", tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), "unknown field")
+			assert.Contains(t, w.Body.String(), "deployment")
+		})
+	}
+}
+
+func TestControlHandlerRejectsApplyDatabaseMismatch(t *testing.T) {
+	svc := newControlTestService(&mockTernClient{}, activeTestApply("apply-abc123"))
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	body := `{"database": "otherdb", "environment": "staging", "apply_id": "apply-abc123"}`
+	req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "belongs to testdb/staging")
+	assert.Contains(t, w.Body.String(), "not otherdb/staging")
+}
+
 func TestStopHandler(t *testing.T) {
 	t.Run("passes apply_id to tern client", func(t *testing.T) {
 		mock := &mockTernClient{
@@ -517,11 +626,7 @@ func TestStopHandler(t *testing.T) {
 				StoppedCount: 2,
 			},
 		}
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{
-			"default/staging": mock,
-		}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-abc123"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -546,11 +651,7 @@ func TestStopHandler(t *testing.T) {
 				StoppedCount: 1,
 			},
 		}
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{
-			"default/staging": mock,
-		}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-active-stop"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -561,7 +662,8 @@ func TestStopHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		assert.Empty(t, mock.stopReq.ApplyId)
+		require.NotNil(t, mock.stopReq, "expected stop request to be captured")
+		assert.Equal(t, "apply-active-stop", mock.stopReq.ApplyId)
 
 		var resp apitypes.StopResponse
 		err := json.NewDecoder(w.Body).Decode(&resp)
@@ -593,11 +695,7 @@ func TestStartHandler(t *testing.T) {
 				StartedCount: 3,
 			},
 		}
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{
-			"default/staging": mock,
-		}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-xyz789"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -622,11 +720,7 @@ func TestStartHandler(t *testing.T) {
 				StartedCount: 1,
 			},
 		}
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{
-			"default/staging": mock,
-		}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-active-start"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -637,7 +731,8 @@ func TestStartHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		assert.Empty(t, mock.startReq.ApplyId)
+		require.NotNil(t, mock.startReq, "expected start request to be captured")
+		assert.Equal(t, "apply-active-start", mock.startReq.ApplyId)
 
 		var resp apitypes.StartResponse
 		err := json.NewDecoder(w.Body).Decode(&resp)
@@ -668,11 +763,7 @@ func TestCutoverHandler(t *testing.T) {
 				Accepted: true,
 			},
 		}
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{
-			"default/staging": mock,
-		}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-cut123"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -694,11 +785,7 @@ func TestCutoverHandler(t *testing.T) {
 				Accepted: true,
 			},
 		}
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{
-			"default/staging": mock,
-		}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-active-cutover"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -709,7 +796,8 @@ func TestCutoverHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		assert.Empty(t, mock.cutoverReq.ApplyId)
+		require.NotNil(t, mock.cutoverReq, "expected cutover request to be captured")
+		assert.Equal(t, "apply-active-cutover", mock.cutoverReq.ApplyId)
 	})
 
 	t.Run("missing database", func(t *testing.T) {
@@ -732,9 +820,7 @@ func TestRevertHandler(t *testing.T) {
 		mock := &mockTernClient{
 			revertResp: &ternv1.RevertResponse{Accepted: true},
 		}
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{"default/staging": mock}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-rev123"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -754,9 +840,7 @@ func TestRevertHandler(t *testing.T) {
 		mock := &mockTernClient{
 			revertResp: &ternv1.RevertResponse{Accepted: true},
 		}
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{"default/staging": mock}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-active-revert"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -767,7 +851,8 @@ func TestRevertHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		assert.Empty(t, mock.revertReq.ApplyId)
+		require.NotNil(t, mock.revertReq, "expected revert request to be captured")
+		assert.Equal(t, "apply-active-revert", mock.revertReq.ApplyId)
 	})
 }
 
@@ -776,9 +861,7 @@ func TestSkipRevertHandler(t *testing.T) {
 		mock := &mockTernClient{
 			skipRevertResp: &ternv1.SkipRevertResponse{Accepted: true},
 		}
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{"default/staging": mock}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-skip456"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -798,9 +881,7 @@ func TestSkipRevertHandler(t *testing.T) {
 		mock := &mockTernClient{
 			skipRevertResp: &ternv1.SkipRevertResponse{Accepted: true},
 		}
-		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-		ternClients := map[string]tern.Client{"default/staging": mock}
-		svc := New(&mockStorage{}, testServerConfig(), ternClients, logger)
+		svc := newControlTestService(mock, activeTestApply("apply-active-skip"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -811,7 +892,8 @@ func TestSkipRevertHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		assert.Empty(t, mock.skipRevertReq.ApplyId)
+		require.NotNil(t, mock.skipRevertReq, "expected skip-revert request to be captured")
+		assert.Equal(t, "apply-active-skip", mock.skipRevertReq.ApplyId)
 	})
 }
 

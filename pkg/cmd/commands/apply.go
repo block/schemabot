@@ -102,8 +102,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	}
 
 	// Step 1: Generate plan
-	opts := client.PlanOptions{Target: cfg.GetTarget(cmd.Environment), Deployment: cfg.Deployment}
-	planResult, err := client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, opts)
+	planResult, err := client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest)
 	if err != nil {
 		return err
 	}
@@ -239,7 +238,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying changes...")
 
-	if _, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat, opts); err != nil {
+	if _, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat); err != nil {
 		return err
 	}
 

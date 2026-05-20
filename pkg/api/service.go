@@ -119,10 +119,16 @@ type Service struct {
 // SetApplyObserver sets a progress observer on the tern client for an apply.
 // The observer receives progress and terminal notifications from the poller.
 func (s *Service) SetApplyObserver(database, deployment, environment string, applyID int64, observer tern.ProgressObserver) {
-	deployment = s.ResolveDeployment(database, deployment)
+	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
+	if err != nil {
+		s.logger.Error("failed to resolve tern deployment for observer",
+			"database", database, "deployment", deployment, "environment", environment, "apply_id", applyID, "error", err)
+		return
+	}
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {
-		s.logger.Error("failed to get tern client for observer", "error", err)
+		s.logger.Error("failed to get tern client for observer",
+			"database", database, "deployment", deployment, "environment", environment, "apply_id", applyID, "error", err)
 		return
 	}
 	client.SetObserver(applyID, observer)
@@ -132,10 +138,16 @@ func (s *Service) SetApplyObserver(database, deployment, environment string, app
 // call. The observer is registered before the engine starts, preventing the
 // race where the apply completes before the observer is set.
 func (s *Service) SetPendingObserver(database, deployment, environment string, observer tern.ProgressObserver) {
-	deployment = s.ResolveDeployment(database, deployment)
+	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
+	if err != nil {
+		s.logger.Error("failed to resolve tern deployment for pending observer",
+			"database", database, "deployment", deployment, "environment", environment, "error", err)
+		return
+	}
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {
-		s.logger.Error("failed to get tern client for pending observer", "error", err)
+		s.logger.Error("failed to get tern client for pending observer",
+			"database", database, "deployment", deployment, "environment", environment, "error", err)
 		return
 	}
 	client.SetPendingObserver(observer)
@@ -177,18 +189,6 @@ func (s *Service) SetSchedulerPollInterval(interval time.Duration) error {
 	return nil
 }
 
-// TernDeployment returns the Tern deployment name for the given repository.
-// In gRPC mode (TernDeployments configured), this reads the repo-specific
-// mapping from server config, falling back to DefaultDeployment.
-// In local mode (no TernDeployments), returns empty string so that
-// resolveDeployment can derive the deployment from the database name.
-func (s *Service) TernDeployment(repo string) string {
-	if len(s.config.TernDeployments) == 0 {
-		return ""
-	}
-	return s.config.TernDeployment(repo)
-}
-
 // TernClient returns the Tern client for the given deployment and environment.
 // Clients are created lazily on first use, so Tern connection failures only
 // affect requests to that specific deployment/environment rather than blocking
@@ -196,20 +196,7 @@ func (s *Service) TernDeployment(repo string) string {
 // For single-deployment setups, use DefaultDeployment ("default") as the deployment.
 //
 // The method first checks for config-based database registration (local mode),
-// then falls back to TernDeployments (gRPC mode).
-// RegisterTernClient registers a tern client for the given deployment and
-// environment. This allows embedders to add clients dynamically as they
-// are created (e.g., lazily per-cluster).
-func (s *Service) RegisterTernClient(deployment, environment string, client tern.Client) {
-	if deployment == "" {
-		deployment = DefaultDeployment
-	}
-	key := deployment + "/" + environment
-	s.ternMu.Lock()
-	defer s.ternMu.Unlock()
-	s.ternClients[key] = client
-}
-
+// then uses TernDeployments for gRPC mode.
 func (s *Service) TernClient(deployment, environment string) (tern.Client, error) {
 	if deployment == "" {
 		deployment = DefaultDeployment
@@ -226,64 +213,18 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 
 	// Try local mode first (config-based database registration)
 	if dbConfig := s.config.Database(deployment); dbConfig != nil {
-		if envConfig, ok := dbConfig.Environments[environment]; ok {
-			// Resolve target DSN (handles env:, file: prefixes)
-			targetDSN, err := secrets.Resolve(envConfig.DSN, "")
+		envConfig, ok := dbConfig.Environments[environment]
+		switch {
+		case !ok:
+			s.logger.Debug("database config does not contain this environment, using remote tern deployment",
+				"database", deployment, "environment", environment)
+		case envConfig.DSN == "":
+			s.logger.Debug("database config does not contain a local DSN, using remote tern deployment",
+				"database", deployment, "environment", environment)
+		default:
+			client, err := s.newLocalTernClient(key, deployment, dbConfig.Type, envConfig)
 			if err != nil {
-				return nil, fmt.Errorf("resolve DSN for %s: %w", key, err)
-			}
-
-			// Resolve PlanetScale token if configured
-			var tokenName, tokenValue string
-			if envConfig.TokenSecretRef != "" {
-				token, err := secrets.Resolve(envConfig.TokenSecretRef, "")
-				if err != nil {
-					return nil, fmt.Errorf("resolve token for %s: %w", key, err)
-				}
-				parts := strings.SplitN(token, ":", 2)
-				if len(parts) == 2 {
-					tokenName, tokenValue = parts[0], parts[1]
-				}
-			}
-
-			// Register TLS config for PlanetScale MySQL connections if configured
-			var tlsName string
-			if envConfig.TLS != nil {
-				tlsName, err = registerTLSConfig(key, envConfig.TLS)
-				if err != nil {
-					return nil, fmt.Errorf("register TLS for %s: %w", key, err)
-				}
-			}
-
-			// LocalClient uses SchemaBot's storage directly
-			var revertWindow time.Duration
-			if envConfig.RevertWindowDuration != "" {
-				if d, err := time.ParseDuration(envConfig.RevertWindowDuration); err == nil {
-					revertWindow = d
-				}
-			}
-			metadata := map[string]string{
-				"organization": envConfig.Organization,
-				"token_name":   tokenName,
-				"token_value":  tokenValue,
-			}
-			if tlsName != "" {
-				metadata["tls_name"] = tlsName
-			}
-			if revertWindow > 0 {
-				metadata["revert_window_duration"] = revertWindow.String()
-			}
-			if envConfig.APIURL != "" {
-				metadata["api_url"] = envConfig.APIURL
-			}
-			client, err := tern.NewLocalClient(tern.LocalConfig{
-				Database:  deployment,
-				Type:      dbConfig.Type,
-				TargetDSN: targetDSN,
-				Metadata:  metadata,
-			}, s.storage, s.logger)
-			if err != nil {
-				return nil, fmt.Errorf("create local tern client for %s: %w", key, err)
+				return nil, err
 			}
 			s.ternClients[key] = client
 			s.logger.Info("created local tern client", "key", key, "type", dbConfig.Type, "deployment", deployment)
@@ -311,6 +252,81 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	}
 
 	s.ternClients[key] = client
+	return client, nil
+}
+
+// RegisterTernClient registers a tern client for the given deployment and
+// environment. This allows embedders to add clients dynamically as they
+// are created (e.g., lazily per-cluster).
+func (s *Service) RegisterTernClient(deployment, environment string, client tern.Client) {
+	if deployment == "" {
+		deployment = DefaultDeployment
+	}
+	key := deployment + "/" + environment
+	s.ternMu.Lock()
+	defer s.ternMu.Unlock()
+	s.ternClients[key] = client
+}
+
+func (s *Service) newLocalTernClient(key, database, dbType string, envConfig EnvironmentConfig) (tern.Client, error) {
+	// Resolve target DSN (handles env:, file: prefixes)
+	targetDSN, err := secrets.Resolve(envConfig.DSN, "")
+	if err != nil {
+		return nil, fmt.Errorf("resolve DSN for %s: %w", key, err)
+	}
+
+	// Resolve PlanetScale token if configured
+	var tokenName, tokenValue string
+	if envConfig.TokenSecretRef != "" {
+		token, err := secrets.Resolve(envConfig.TokenSecretRef, "")
+		if err != nil {
+			return nil, fmt.Errorf("resolve token for %s: %w", key, err)
+		}
+		parts := strings.SplitN(token, ":", 2)
+		if len(parts) == 2 {
+			tokenName, tokenValue = parts[0], parts[1]
+		}
+	}
+
+	// Register TLS config for PlanetScale MySQL connections if configured
+	var tlsName string
+	if envConfig.TLS != nil {
+		tlsName, err = registerTLSConfig(key, envConfig.TLS)
+		if err != nil {
+			return nil, fmt.Errorf("register TLS for %s: %w", key, err)
+		}
+	}
+
+	// LocalClient uses SchemaBot's storage directly
+	var revertWindow time.Duration
+	if envConfig.RevertWindowDuration != "" {
+		if d, err := time.ParseDuration(envConfig.RevertWindowDuration); err == nil {
+			revertWindow = d
+		}
+	}
+	metadata := map[string]string{
+		"organization": envConfig.Organization,
+		"token_name":   tokenName,
+		"token_value":  tokenValue,
+	}
+	if tlsName != "" {
+		metadata["tls_name"] = tlsName
+	}
+	if revertWindow > 0 {
+		metadata["revert_window_duration"] = revertWindow.String()
+	}
+	if envConfig.APIURL != "" {
+		metadata["api_url"] = envConfig.APIURL
+	}
+	client, err := tern.NewLocalClient(tern.LocalConfig{
+		Database:  database,
+		Type:      dbType,
+		TargetDSN: targetDSN,
+		Metadata:  metadata,
+	}, s.storage, s.logger)
+	if err != nil {
+		return nil, fmt.Errorf("create local tern client for %s: %w", key, err)
+	}
 	return client, nil
 }
 

@@ -28,15 +28,13 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// TestHybridMode_LocalAndGRPC verifies that a single SchemaBot Service instance
-// can route requests to both a LocalClient (for databases registered in the
-// "databases" config section) and a GRPCClient (for databases routed via
-// "tern_deployments") simultaneously.
+// TestHybridMode_LocalAndNamedRemoteTargets verifies that one SchemaBot Service
+// can route local databases and named remote Tern deployments simultaneously.
 //
 // Setup:
 //   - "local-db" is registered in config.Databases with a real MySQL testcontainer
-//   - "grpc-db" is routed via config.TernDeployments to an in-process gRPC server
-//     backed by a separate LocalClient (simulating a remote Tern service)
+//   - "grpc-db" is routed through a named Tern deployment to an in-process gRPC
+//     server backed by a separate LocalClient
 //   - Both use the same SchemaBot storage instance
 //
 // The test verifies:
@@ -45,7 +43,7 @@ import (
 //  3. An apply for "local-db" creates local apply records (no external_id)
 //  4. An apply for "grpc-db" creates apply records with external_id set
 //  5. Both complete successfully from the same Service
-func TestHybridMode_LocalAndGRPC(t *testing.T) {
+func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	ctx := t.Context()
 
 	// =========================================================================
@@ -108,6 +106,7 @@ func TestHybridMode_LocalAndGRPC(t *testing.T) {
 	t.Cleanup(func() { utils.CloseAndLog(grpcClient) })
 
 	// Hybrid config: local database + gRPC deployment
+	const remoteDeployment = "remote-tenant"
 	serverConfig := &schemabotapi.ServerConfig{
 		Databases: map[string]schemabotapi.DatabaseConfig{
 			localDBName: {
@@ -116,19 +115,25 @@ func TestHybridMode_LocalAndGRPC(t *testing.T) {
 					"staging": {DSN: localDSN},
 				},
 			},
+			grpcDBName: {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {Target: "grpc-target", Deployment: remoteDeployment},
+				},
+			},
 		},
 		TernDeployments: schemabotapi.TernConfig{
-			"default": {"staging": ternGRPCAddr},
+			remoteDeployment: {"staging": ternGRPCAddr},
 		},
 	}
 
 	// Validate that hybrid config passes validation
 	require.NoError(t, serverConfig.Validate(), "hybrid config should be valid")
 
-	// Pre-register the gRPC client for the default deployment.
+	// Pre-register the gRPC client for the named remote deployment.
 	// The LocalClient for localDBName will be created lazily by TernClient().
 	svc := schemabotapi.New(schemabotStorage, serverConfig, map[string]tern.Client{
-		"default/staging": grpcClient,
+		remoteDeployment + "/staging": grpcClient,
 	}, logger)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
@@ -198,6 +203,13 @@ func TestHybridMode_LocalAndGRPC(t *testing.T) {
 	grpcPlanID, ok := grpcPlanResp["plan_id"].(string)
 	require.True(t, ok && grpcPlanID != "", "grpc plan should return plan_id: %v", grpcPlanResp)
 	t.Logf("gRPC plan ID: %s", grpcPlanID)
+	storedGRPCPlan, err := schemabotStorage.Plans().Get(ctx, grpcPlanID)
+	require.NoError(t, err, "get grpc plan")
+	require.NotNil(t, storedGRPCPlan, "grpc plan should be stored")
+	assert.Equal(t, remoteDeployment, storedGRPCPlan.Deployment,
+		"grpc plan should store the named deployment from server-side routing")
+	assert.Equal(t, "grpc-target", storedGRPCPlan.Target,
+		"grpc plan should store the target from server-side routing")
 
 	// Both plans should have changes (CREATE TABLE)
 	localChanges, _ := localPlanResp["changes"].([]any)
@@ -212,7 +224,6 @@ func TestHybridMode_LocalAndGRPC(t *testing.T) {
 	localApplyResp := postJSON(t, "http://"+addr+"/api/apply", map[string]any{
 		"plan_id":     localPlanID,
 		"environment": "staging",
-		"database":    localDBName,
 	})
 	require.Equal(t, true, localApplyResp["accepted"], "local apply not accepted: %v", localApplyResp)
 	localApplyID, ok := localApplyResp["apply_id"].(string)
@@ -265,6 +276,8 @@ func TestHybridMode_LocalAndGRPC(t *testing.T) {
 		"apply_identifier and external_id should differ in gRPC mode")
 	assert.Equal(t, grpcDBName, grpcApply.Database,
 		"grpc apply should be for the grpc database")
+	assert.Equal(t, remoteDeployment, grpcApply.Deployment,
+		"grpc apply should use the named deployment from server-side routing")
 	t.Logf("gRPC apply: external_id=%q (non-empty = gRPC mode confirmed)", grpcApply.ExternalID)
 
 	// Wait for pollForCompletion to sync gRPC apply state to storage
@@ -323,33 +336,44 @@ func TestHybridMode_LocalAndGRPC(t *testing.T) {
 	assert.Equal(t, "grpc_items", grpcTableName)
 }
 
-// TestHybridMode_TernDeployment verifies that TernDeployment returns the
-// correct deployment key for webhook routing in hybrid mode. TernDeployment
-// is repo-based (for webhooks); the database-based routing happens in
-// resolveDeployment (tested indirectly in TestHybridMode_LocalAndGRPC).
+// TestHybridMode_TernDeployment verifies that hybrid mode selects the Tern
+// deployment from server-side database/environment routing.
 func TestHybridMode_TernDeployment(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-
 	serverConfig := &schemabotapi.ServerConfig{
 		Databases: map[string]schemabotapi.DatabaseConfig{
 			"local-db": {
-				Type:         "mysql",
-				Environments: map[string]schemabotapi.EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/localdb"}},
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost:3306)/localdb"},
+				},
+			},
+			"remote-db": {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {Target: "remote-target-001", Deployment: "tenant-a"},
+				},
 			},
 		},
 		TernDeployments: schemabotapi.TernConfig{
-			"default": {"staging": "localhost:9090"},
+			"tenant-a": {"staging": "localhost:9090"},
 		},
 	}
 
-	svc := schemabotapi.New(nil, serverConfig, nil, logger)
+	require.NoError(t, serverConfig.Validate(), "hybrid config should be valid")
 
-	// TernDeployment returns the default deployment when TernDeployments is
-	// configured, regardless of which repo is requesting. Repos can override
-	// this via repos.*.default_tern_deployment in config.
-	dep := svc.TernDeployment("some-repo")
-	assert.Equal(t, "default", dep,
-		"TernDeployment should return 'default' when TernDeployments is configured")
+	localTarget, err := serverConfig.ResolveDatabaseTarget("local-db", "staging")
+	require.NoError(t, err)
+	assert.Equal(t, "local-db", localTarget.Deployment)
+	assert.Equal(t, "local-db", localTarget.Target)
+
+	remoteTarget, err := serverConfig.ResolveDatabaseTarget("remote-db", "staging")
+	require.NoError(t, err)
+	assert.Equal(t, "tenant-a", remoteTarget.Deployment)
+	assert.Equal(t, "remote-target-001", remoteTarget.Target)
+
+	endpoint, err := serverConfig.TernDeployments.Endpoint(remoteTarget.Deployment, "staging")
+	require.NoError(t, err)
+	assert.Equal(t, "localhost:9090", endpoint)
 }
 
 // startTernGRPCForDB starts a gRPC Tern server backed by a LocalClient for

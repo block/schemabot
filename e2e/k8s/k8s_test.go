@@ -39,8 +39,9 @@
 //	                      +-------------------------------+     (tern db + testapp db)
 //
 // Both tiers are deployed via the same Helm chart with different values.
-// The control plane uses tern_deployments (GRPCClient), the data plane uses
-// databases (LocalClient) with grpc.enabled=true.
+// The control plane uses databases for server-side target/deployment routing
+// plus tern_deployments for gRPC endpoints. The data plane uses databases
+// with DSNs (LocalClient) and grpc.enabled=true.
 package k8s
 
 import (
@@ -62,8 +63,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-var deployOpts = client.PlanOptions{Deployment: "data-plane"}
 
 func storageDSNs(t *testing.T) []string {
 	t.Helper()
@@ -144,7 +143,7 @@ func TestK8s_PlanApply_AddColumn(t *testing.T) {
 	}
 
 	planResp, err := client.CallPlanAPIWithFiles(ep, "testapp", "mysql", "staging",
-		map[string]*apitypes.SchemaFiles{"testapp": {Files: schemaFiles}}, "", 0, deployOpts)
+		map[string]*apitypes.SchemaFiles{"testapp": {Files: schemaFiles}}, "", 0)
 	require.NoError(t, err)
 	require.NotEmpty(t, planResp.PlanID)
 
@@ -158,7 +157,7 @@ func TestK8s_PlanApply_AddColumn(t *testing.T) {
 	}
 	require.True(t, found, "expected table change for %s in plan", tableName)
 
-	applyResp, err := client.CallApplyAPI(ep, planResp.PlanID, "testapp", "staging", "", nil, deployOpts)
+	applyResp, err := client.CallApplyAPI(ep, planResp.PlanID, "staging", "", nil)
 	require.NoError(t, err)
 	require.True(t, applyResp.Accepted, "apply not accepted: %s", applyResp.ErrorMessage)
 
@@ -202,7 +201,7 @@ func TestK8s_PlanApply_CreateTable(t *testing.T) {
 			`CREATE TABLE %s (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, value VARCHAR(100) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, tableName),
 	}
 
-	applyID := testutil.ApplySchemaAndWait(t, ep, "testapp", "mysql", "staging", schemaFiles, testutil.PollDeadline, deployOpts)
+	applyID := testutil.ApplySchemaAndWait(t, ep, "testapp", "mysql", "staging", schemaFiles, testutil.PollDeadline)
 	require.NotEmpty(t, applyID)
 
 	// Verify the table was created on the target database with the correct columns
@@ -243,7 +242,7 @@ func TestK8s_Progress(t *testing.T) {
 			`CREATE TABLE %s (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) DEFAULT NULL, KEY idx_email (email)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, tableName),
 	}
 
-	_, applyID := testutil.PlanAndApply(t, ep, "testapp", "mysql", "staging", schemaFiles, nil, deployOpts)
+	_, applyID := testutil.PlanAndApply(t, ep, "testapp", "mysql", "staging", schemaFiles, nil)
 
 	// Wait for Running — 500k rows ensures Spirit's copy phase is always observable
 	testutil.WaitForState(t, ep, applyID, state.Apply.Running, testutil.PollDeadline)

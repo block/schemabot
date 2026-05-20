@@ -1,9 +1,12 @@
 package api
 
 import (
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTernConfig_Endpoint_SingleDeployment(t *testing.T) {
@@ -122,7 +125,7 @@ func TestTernConfig_Endpoint_MultiDeployment(t *testing.T) {
 			wantErr:     true,
 		},
 		{
-			name:        "empty deployment falls back to default (not found)",
+			name:        "empty deployment resolves to missing default key",
 			deployment:  "",
 			environment: "staging",
 			wantErr:     true,
@@ -152,4 +155,42 @@ func TestTernConfig_Endpoint_EmptyEndpoint(t *testing.T) {
 
 	_, err := config.Endpoint("", "production")
 	assert.Error(t, err)
+}
+
+func TestServiceDeploymentForDatabaseEnvironment(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"localdb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost:3306)/localdb"},
+				},
+			},
+			"remotedb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {Target: "remote-target-001", Deployment: "tenant-a"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"tenant-a": {"staging": "localhost:9090"},
+		},
+	}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	localDeployment, err := service.deploymentForDatabaseEnvironment("localdb", "", "staging")
+	require.NoError(t, err)
+	assert.Equal(t, "localdb", localDeployment)
+
+	remoteDeployment, err := service.deploymentForDatabaseEnvironment("remotedb", "", "staging")
+	require.NoError(t, err)
+	assert.Equal(t, "tenant-a", remoteDeployment)
+
+	storedDeployment, err := service.deploymentForDatabaseEnvironment("remotedb", "stored-route", "staging")
+	require.NoError(t, err)
+	assert.Equal(t, "stored-route", storedDeployment)
+
+	_, err = service.deploymentForDatabaseEnvironment("missing", "", "staging")
+	require.Error(t, err)
 }

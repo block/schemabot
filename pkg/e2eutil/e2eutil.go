@@ -119,18 +119,16 @@ func RunCLIWithError(binPath, dir string, args ...string) (string, error) {
 }
 
 type schemaDirConfig struct {
-	environments map[string]string // env name → target
+	environments []string
 }
 
 // SchemaDirOption configures optional fields for WriteSchemaDir.
 type SchemaDirOption func(*schemaDirConfig)
 
-// WithEnvironments adds per-environment targets to the generated schemabot.yaml.
-// The map keys are environment names (e.g., "staging", "production") and values
-// are target identifiers (e.g., DSIDs).
-func WithEnvironments(envs map[string]string) SchemaDirOption {
+// WithEnvironmentNames adds environment names to the generated schemabot.yaml.
+func WithEnvironmentNames(envs ...string) SchemaDirOption {
 	return func(c *schemaDirConfig) {
-		c.environments = envs
+		c.environments = append([]string(nil), envs...)
 	}
 }
 
@@ -148,14 +146,11 @@ func WriteSchemaDir(t *testing.T, database, dbType string, sqlFiles map[string]s
 	var b strings.Builder
 	fmt.Fprintf(&b, "database: %s\ntype: %s\n", database, dbType)
 	if len(cfg.environments) > 0 {
-		envNames := make([]string, 0, len(cfg.environments))
-		for env := range cfg.environments {
-			envNames = append(envNames, env)
-		}
+		envNames := append([]string(nil), cfg.environments...)
 		sort.Strings(envNames)
 		b.WriteString("environments:\n")
 		for _, env := range envNames {
-			fmt.Fprintf(&b, "  %s:\n    target: %s\n", env, cfg.environments[env])
+			fmt.Fprintf(&b, "  - %s\n", env)
 		}
 	}
 	if err := os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(b.String()), 0644); err != nil {

@@ -196,11 +196,10 @@ func grpcPlan(t *testing.T, database, env string, schemaFiles map[string]string)
 	return result
 }
 
-func grpcApply(t *testing.T, planID, database, env string, opts map[string]string) grpcApplyResponse {
+func grpcApply(t *testing.T, planID, env string, opts map[string]string) grpcApplyResponse {
 	t.Helper()
 	body := map[string]any{
 		"plan_id":     planID,
-		"database":    database,
 		"environment": env,
 	}
 	if opts != nil {

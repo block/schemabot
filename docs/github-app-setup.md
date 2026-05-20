@@ -80,9 +80,9 @@ storage:
   dsn: "env:SCHEMABOT_DSN"
 
 github:
-  app_id: "123456"                                 # From step 1
-  private_key: "file:/path/to/private-key.pem"    # PEM file
-  webhook_secret: "env:GITHUB_WEBHOOK_SECRET"      # From step 1
+  app-id: "123456"                                 # From step 1
+  private-key: "file:/path/to/private-key.pem"     # PEM file
+  webhook-secret: "env:GITHUB_WEBHOOK_SECRET"      # From step 1
 
 databases:
   mydb:
@@ -94,14 +94,14 @@ databases:
         dsn: "env:PRODUCTION_DSN"
 ```
 
-The `private_key` and `webhook_secret` fields support secret references — the same format used for DSNs:
+The `private-key` and `webhook-secret` fields support secret references — the same format used for DSNs:
 
 | Format | Example |
 |--------|---------|
 | Direct value | `"my-secret"` |
 | Environment variable | `"env:GITHUB_WEBHOOK_SECRET"` |
 | File | `"file:/run/secrets/github-key.pem"` |
-| AWS Secrets Manager | `"secretsmanager:my-app/github#private_key"` |
+| AWS Secrets Manager | `"secretsmanager:my-app/github#private-key"` |
 
 For AWS deployments, see [deploy/aws/](../deploy/aws/) which stores credentials in Secrets Manager.
 
@@ -210,11 +210,11 @@ schemabot plan -d mydb          # Plan for a specific database (multi-db repos)
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `SCHEMABOT_CONFIG_FILE` | Yes | — | Path to server config YAML |
-| `GITHUB_APP_ID` | No | — | Fallback if `github.app_id` is not set in config |
+| `GITHUB_APP_ID` | No | — | Fallback if `github.app-id` is not set in config |
 | `PORT` | No | `8080` | HTTP server port |
 | `LOG_LEVEL` | No | `info` | `debug`, `info`, `warn`, `error` |
 
-GitHub credentials (`private_key`, `webhook_secret`) are configured in the YAML config file using secret references, not environment variables. This keeps all configuration in one place and supports any secret backend.
+GitHub credentials (`private-key`, `webhook-secret`) are configured in the YAML config file using secret references, not environment variables. This keeps all configuration in one place and supports any secret backend.
 
 ## Webhook Ingress
 
@@ -240,11 +240,11 @@ For local development and PR testing, [smee.io](https://smee.io) can proxy GitHu
 
 ### IP Allowlisting
 
-GitHub publishes its webhook source IPs at https://api.github.com/meta (the `hooks` field). Restricting your webhook endpoint to these CIDRs is recommended as defense-in-depth. SchemaBot always validates webhook signatures via HMAC-SHA256 when `webhook_secret` is configured (see below), so IP allowlisting provides an additional layer of protection.
+GitHub publishes its webhook source IPs at https://api.github.com/meta (the `hooks` field). Restricting your webhook endpoint to these CIDRs is recommended as defense-in-depth. SchemaBot always validates webhook signatures via HMAC-SHA256 when `webhook-secret` is configured (see below), so IP allowlisting provides an additional layer of protection.
 
 ## Webhook Signature Validation
 
-If `webhook_secret` is set in the config, SchemaBot validates the `X-Hub-Signature-256` header on every webhook request using HMAC-SHA256. Requests with invalid or missing signatures are rejected with HTTP 401.
+If `webhook-secret` is set in the config, SchemaBot validates the `X-Hub-Signature-256` header on every webhook request using HMAC-SHA256. Requests with invalid or missing signatures are rejected with HTTP 401.
 
 If the secret is not set, signature validation is skipped (useful for local development).
 

@@ -199,6 +199,13 @@ func (c *LocalClient) protoEngine() ternv1.Engine {
 	return ternv1.Engine_ENGINE_SPIRIT
 }
 
+func localPlanTarget(req *ternv1.PlanRequest, database string) string {
+	if req.Target != "" {
+		return req.Target
+	}
+	return database
+}
+
 // engineNameToProto converts a storage engine name to the proto enum.
 func engineNameToProto(name string) (ternv1.Engine, error) {
 	switch name {
@@ -356,6 +363,8 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		PlanIdentifier: result.PlanID,
 		Database:       c.config.Database,
 		DatabaseType:   c.config.Type,
+		Deployment:     c.config.Database,
+		Target:         localPlanTarget(req, c.config.Database),
 		Repository:     req.Repository,
 		PullRequest:    int(req.PullRequest),
 		Environment:    req.Environment,

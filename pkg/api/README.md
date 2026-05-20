@@ -4,25 +4,27 @@ Package `api` provides the SchemaBot HTTP API service. It routes requests to Ter
 
 ## Service
 
-The `Service` type is the core of the API layer. It holds the storage connection, server config, and a pool of Tern clients keyed by `database/environment`.
+The `Service` type is the core of the API layer. It holds the storage connection, server config, and a pool of Tern clients keyed by `deployment/environment`.
 
 ```go
 type Service struct {
     storage     storage.Storage
     config      *ServerConfig
-    ternClients map[string]tern.Client  // lazy, created on first request
+    ternClients map[string]tern.Client  // keyed by "deployment/environment"
     // ...
 }
 ```
 
 ### Tern Client Pool
 
-Clients are created lazily on first request via `TernClient(database, environment)`:
+Clients are created lazily on first request via `TernClient(deployment, environment)`:
 
-1. **Local mode**: If the database is in the `databases:` config section, creates a `LocalClient` with an embedded Spirit engine. DSN is resolved via `pkg/secrets`.
-2. **gRPC mode**: If the database maps to a `tern_deployments:` entry, creates a `GRPCClient` pointing to remote services that implement the Tern proto.
+1. **Local mode**: If the resolved deployment matches a `databases:` entry with a `dsn`, creates a `LocalClient` with an embedded Spirit engine. DSN is resolved via `pkg/secrets`.
+2. **gRPC mode**: If the database environment resolved to a server-side `target` and `deployment`, creates a `GRPCClient` pointing to the matching `tern_deployments:` endpoint.
 
 Lazy creation means a connection failure to one database doesn't block startup or affect other databases.
+
+Plan requests resolve `database + environment` through server config, then store the resolved `target` and `deployment` on the plan. Apply requests load the stored plan and reuse that route; callers do not send target or deployment.
 
 ## HTTP Routes
 
@@ -90,9 +92,9 @@ Stopped applies (user called `schemabot stop`) are **not** auto-resumed. The use
 Config is loaded from `SCHEMABOT_CONFIG_FILE` (YAML). Key sections:
 
 - `storage.dsn` — SchemaBot's internal database connection
-- `databases` — Local mode: database name → type + per-environment DSNs
+- `databases` — database name → type + per-environment local DSNs or remote targets
 - `tern_deployments` — gRPC mode: deployment name → per-environment Tern addresses
-- `repos` — Repository → deployment mapping
+- `repos` — repository allowlist
 
 See the top-level [README](../../README.md) for configuration examples.
 

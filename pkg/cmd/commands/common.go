@@ -65,19 +65,8 @@ var ErrSilent = errors.New("silent error")
 type CLIConfig struct {
 	Database     string                   `yaml:"database"`
 	Type         string                   `yaml:"type"`
-	Deployment   string                   `yaml:"deployment,omitempty"`
 	Environments ghclient.EnvironmentList `yaml:"environments,omitempty"`
 	SchemaDir    string                   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
-}
-
-// GetTarget returns the target for the given environment, falling back to the database name.
-func (c *CLIConfig) GetTarget(env string) string {
-	for _, e := range c.Environments {
-		if e.Name == env && e.Target != "" {
-			return e.Target
-		}
-	}
-	return c.Database
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.
@@ -98,7 +87,9 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	}
 
 	var cfg CLIConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
@@ -287,7 +278,7 @@ func resolveControlFlags(endpoint, profile string, applyID, database, environmen
 // optionally watches progress. Returns the apply ID (for yield logic, etc.).
 // Used by both RunApply and RunRollback.
 func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, environment, caller, operation string,
-	deferCutover, deferDeploy, skipRevert bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration, opts ...client.PlanOptions) (string, error) {
+	deferCutover, deferDeploy, skipRevert bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
 		return "", fmt.Errorf("no plan_id in response")
@@ -309,7 +300,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 		options["branch"] = branch
 	}
 
-	applyResult, err := client.CallApplyAPI(ep, planResult.PlanID, database, environment, caller, options, opts...)
+	applyResult, err := client.CallApplyAPI(ep, planResult.PlanID, environment, caller, options)
 	if err != nil {
 		return "", err
 	}

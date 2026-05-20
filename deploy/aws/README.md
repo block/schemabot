@@ -310,9 +310,9 @@ storage:
   dsn: "secretsmanager:schemabot-example/storage-dsn#dsn"
 
 github:
-  app_id: "secretsmanager:schemabot-example/github-app#app_id"
-  private_key: "secretsmanager:schemabot-example/github-app#private_key"
-  webhook_secret: "secretsmanager:schemabot-example/github-app#webhook_secret"
+  app-id: "secretsmanager:schemabot-example/github-app#app-id"
+  private-key: "secretsmanager:schemabot-example/github-app#private-key"
+  webhook-secret: "secretsmanager:schemabot-example/github-app#webhook-secret"
 
 databases:
   testapp:

@@ -57,6 +57,14 @@ func TestResolveApplyID_ControlOperations(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	serverConfig := &schemabotapi.ServerConfig{
+		Databases: map[string]schemabotapi.DatabaseConfig{
+			appDBName: {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {Target: appDBName + "-target", Deployment: "default"},
+				},
+			},
+		},
 		TernDeployments: schemabotapi.TernConfig{
 			"default": {"staging": ternGRPCAddr},
 		},
