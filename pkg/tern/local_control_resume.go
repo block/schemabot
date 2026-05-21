@@ -411,13 +411,35 @@ func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *s
 func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.Apply,
 	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string, block bool) error {
 
+	creds := c.credentials()
+	eng := c.getEngine()
+	if eng == nil {
+		return fmt.Errorf("no engine available")
+	}
+
+	if drainer, ok := eng.(engine.Drainer); ok {
+		drainer.Drain()
+	}
+
+	tasks = c.filterResumeTasksStillNeeded(ctx, apply, plan, tasks)
+	if len(tasks) == 0 {
+		oldApplyState := apply.State
+		now := time.Now()
+		apply.State = state.Apply.Completed
+		apply.CompletedAt = &now
+		apply.UpdatedAt = now
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			"All tasks already completed on resume (schema check shows no remaining changes)", oldApplyState, state.Apply.Completed)
+		return nil
+	}
+
 	var ddls []string
 	for _, t := range tasks {
 		ddls = append(ddls, t.DDL)
 	}
-
-	creds := c.credentials()
-	eng := c.getEngine()
 
 	// Build table changes from the DDL list
 	var tableChanges []engine.TableChange
@@ -473,6 +495,29 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		c.pollForCompletionAtomic(context.Background(), apply, tasks, creds, nil)
 	}()
 	return nil
+}
+
+func (c *LocalClient) filterResumeTasksStillNeeded(ctx context.Context, apply *storage.Apply, plan *storage.Plan, tasks []*storage.Task) []*storage.Task {
+	var remaining []*storage.Task
+	for _, task := range tasks {
+		needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task.TableName)
+		if err != nil {
+			c.logger.Warn("could not verify table schema state, keeping task in resume set",
+				"task_id", task.TaskIdentifier, "table", task.TableName, "error", err)
+			remaining = append(remaining, task)
+			continue
+		}
+		if needsChange {
+			remaining = append(remaining, task)
+			continue
+		}
+		now := time.Now()
+		task.ProgressPercent = 100
+		task.CompletedAt = &now
+		c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
+			fmt.Sprintf("Task %s already completed (schema check shows no remaining changes)", task.TaskIdentifier))
+	}
+	return remaining
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
