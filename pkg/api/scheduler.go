@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -48,14 +49,16 @@ func (s *Service) StartScheduler(ctx context.Context) {
 
 	stop := make(chan struct{})
 	wake := make(chan struct{}, workers)
+	workerCtx, cancel := context.WithCancel(ctx)
 	s.stopRecovery = stop
+	s.cancelRecovery = cancel
 	s.schedulerWake = wake
 	s.schedulerMu.Unlock()
 
 	for i := 0; i < workers; i++ {
 		workerID := i
 		s.recoveryWg.Go(func() {
-			s.schedulerWorker(ctx, workerID, stop, wake)
+			s.schedulerWorker(workerCtx, workerID, stop, wake)
 		})
 	}
 
@@ -71,11 +74,16 @@ func (s *Service) StopScheduler() {
 		return
 	}
 	stop := s.stopRecovery
+	cancel := s.cancelRecovery
 	s.stopRecovery = nil
+	s.cancelRecovery = nil
 	s.schedulerWake = nil
 	s.schedulerMu.Unlock()
 
 	close(stop)
+	if cancel != nil {
+		cancel()
+	}
 	s.recoveryWg.Wait()
 }
 
@@ -209,6 +217,18 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Environment)
 	}
 	if err := client.ResumeApply(ctx, apply); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			s.logger.Debug("scheduler: stopped while running claimed apply",
+				"worker", workerID,
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"error", err)
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+			}
+			return
+		}
 		s.logger.Error("scheduler: failed to resume apply",
 			"worker", workerID,
 			"apply_id", apply.ApplyIdentifier,

@@ -249,15 +249,34 @@ func (c *LocalClient) usesGroupedApply(apply *storage.Apply) bool {
 	return apply.DatabaseType == storage.DatabaseTypeMySQL && apply.GetOptions().DeferCutover
 }
 
+func (c *LocalClient) setApplyCancel(cancel context.CancelFunc) {
+	c.cancelMu.Lock()
+	c.cancelApply = cancel
+	c.cancelMu.Unlock()
+}
+
+func (c *LocalClient) clearApplyCancel() {
+	c.cancelMu.Lock()
+	c.cancelApply = nil
+	c.cancelMu.Unlock()
+}
+
 func (c *LocalClient) startApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+	go func() {
+		defer c.clearApplyCancel()
+		c.runApplyExecution(ctx, apply, tasks, plan, options)
+	}()
+}
+
+func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
 	if c.usesGroupedApply(apply) {
-		go c.runWithRecovery(ctx, apply, tasks, func() {
+		c.runWithRecovery(ctx, apply, tasks, func() {
 			c.executeGroupedApply(ctx, apply, tasks, plan, options)
 		})
 		return
 	}
 
-	go c.runWithRecovery(ctx, apply, tasks, func() {
+	c.runWithRecovery(ctx, apply, tasks, func() {
 		c.executeApplySequential(ctx, apply, tasks, plan, options)
 	})
 }

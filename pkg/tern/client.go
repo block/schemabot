@@ -51,9 +51,10 @@ type Client interface {
 	// Health checks the service health.
 	Health(ctx context.Context) error
 
-	// ResumeApply starts or resumes work claimed by a scheduler worker.
-	// Fresh pending applies are dispatched for the first time; stale applies
-	// use checkpoint/resume capabilities of the underlying engine.
+	// ResumeApply runs work claimed by a scheduler worker until it reaches a
+	// durable terminal or retry-waiting state. Fresh pending applies are
+	// dispatched for the first time; stale applies use checkpoint/resume
+	// capabilities of the underlying engine.
 	ResumeApply(ctx context.Context, apply *storage.Apply) error
 
 	// Endpoint returns the address this client connects to.

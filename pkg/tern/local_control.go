@@ -124,6 +124,8 @@ func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv
 			// apply record reflects the true outcome. failApplyWithTasks skips
 			// tasks already in terminal state, so the cancelled tasks are preserved.
 			c.markApplyCancelled(ctx, applyID)
+		} else {
+			c.markApplyStopped(ctx, applyID)
 		}
 		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			eventMsg, "", "")
@@ -252,6 +254,27 @@ func (c *LocalClient) handleStopAllCompleted(ctx context.Context, applyID int64,
 		StoppedCount: 0,
 		SkippedCount: skippedCount,
 	}, nil
+}
+
+// markApplyStopped sets the apply to stopped. Stop() marks this synchronously
+// so callers do not depend on the background apply goroutine to observe
+// cancellation before progress shows the user-requested stop.
+func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) {
+	apply, err := c.storage.Applies().Get(ctx, applyID)
+	if err != nil || apply == nil {
+		c.logger.Error("failed to load apply for stop", "apply_id", applyID, "error", err)
+		return
+	}
+	if state.IsTerminalApplyState(apply.State) {
+		c.logger.Debug("apply already terminal, not marking stopped", "apply_id", apply.ApplyIdentifier, "state", apply.State)
+		return
+	}
+	apply.State = state.Apply.Stopped
+	apply.CompletedAt = nil
+	apply.UpdatedAt = time.Now()
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		c.logger.Error("failed to mark apply as stopped", "apply_id", apply.ApplyIdentifier, "error", err)
+	}
 }
 
 // markApplyCancelled sets the apply to cancelled. Called by Stop() for Vitess

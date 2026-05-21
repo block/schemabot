@@ -114,6 +114,7 @@ type Service struct {
 	// Scheduler loop management.
 	schedulerMu           sync.Mutex
 	stopRecovery          chan struct{}
+	cancelRecovery        context.CancelFunc
 	schedulerWake         chan struct{}
 	recoveryWg            sync.WaitGroup
 	schedulerPollInterval time.Duration

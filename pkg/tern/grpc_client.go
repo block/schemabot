@@ -350,11 +350,10 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 	return err
 }
 
-// ResumeApply starts or resumes background tracking for work claimed by the
-// scheduler. Fresh queued applies have no external_id yet, so this method first
-// dispatches them to remote Tern and stores the returned ID. Stale remote
-// applies already have external_id and only need progress tracking or control
-// RPCs restored.
+// ResumeApply runs work claimed by the scheduler. Fresh queued applies have no
+// external_id yet, so this method first dispatches them to remote Tern and
+// stores the returned ID. The call then polls until the apply reaches a durable
+// terminal state or the scheduler context is canceled.
 func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
 	if c.storage == nil {
 		return fmt.Errorf("storage not configured for GRPCClient")
@@ -400,9 +399,24 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 		}
 	}
 
-	// Spawn background poller to track progress and maintain heartbeat
-	go c.pollForCompletion(context.Background(), apply)
+	return c.pollForCompletion(ctx, apply)
+}
 
+// TrackApply starts background progress tracking for an apply that was already
+// started by an explicit user control operation. Scheduler workers use
+// ResumeApply instead, which blocks and owns the claimed apply.
+func (c *GRPCClient) TrackApply(ctx context.Context, apply *storage.Apply) error {
+	if c.storage == nil {
+		return fmt.Errorf("storage not configured for GRPCClient")
+	}
+	trackCtx := context.WithoutCancel(ctx)
+	go func() {
+		if err := c.pollForCompletion(trackCtx, apply); err != nil {
+			slog.Warn("gRPC apply tracking stopped before terminal state",
+				"apply_id", apply.ApplyIdentifier,
+				"error", err)
+		}
+	}()
 	return nil
 }
 
@@ -484,12 +498,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("store remote apply id for %s: %w", apply.ApplyIdentifier, err)
 	}
 
-	pollCtx, cancelPoll := context.WithCancel(context.WithoutCancel(ctx))
-	go func() {
-		defer cancelPoll()
-		c.pollForCompletion(pollCtx, apply)
-	}()
-	return nil
+	return c.pollForCompletion(ctx, apply)
 }
 
 func (c *GRPCClient) prepareDispatchTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
@@ -562,7 +571,7 @@ func (c *GRPCClient) markDispatchFailed(ctx context.Context, apply *storage.Appl
 
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
 // Also maintains heartbeat to keep the lease on the apply.
-func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply) {
+func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -572,7 +581,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-heartbeatTicker.C:
 			// Heartbeat: bump updated_at to maintain lease
 			_ = c.storage.Applies().Heartbeat(ctx, apply.ID)
@@ -624,7 +633,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			_ = c.storage.Applies().Update(ctx, apply)
 			if terminal {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
-				return
+				return nil
 			}
 		}
 	}

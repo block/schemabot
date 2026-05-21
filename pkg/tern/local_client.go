@@ -601,9 +601,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	// Start apply in background with cancellable context (Stop() cancels this)
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	c.cancelMu.Lock()
-	c.cancelApply = cancelApply
-	c.cancelMu.Unlock()
+	c.setApplyCancel(cancelApply)
 	c.startApplyExecution(applyCtx, apply, tasks, plan, options)
 
 	return &ternv1.ApplyResponse{

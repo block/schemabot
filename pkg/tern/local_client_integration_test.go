@@ -669,6 +669,86 @@ func TestLocalClient_Stop_NoMigration(t *testing.T) {
 	assert.Contains(t, err.Error(), "no active schema change")
 }
 
+func TestLocalClient_Stop_QueuedApplyMarksApplyStopped(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err, "failed to create client")
+	defer utils.CloseAndLog(client)
+
+	ctx := t.Context()
+	now := time.Now()
+	applyID, err := stor.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-stop-queued",
+		PlanID:          1,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+	_, err = stor.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task-stop-queued",
+		ApplyID:        applyID,
+		PlanID:         1,
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		Environment:    localClientTestEnvironment,
+		State:          state.Task.Pending,
+		TableName:      "items",
+		Namespace:      "testdb",
+		DDL:            "ALTER TABLE items ADD COLUMN queued_stop_note VARCHAR(255)",
+		DDLAction:      "alter",
+		Options:        []byte("{}"),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	// Queued applies can be stopped before the scheduler dispatch goroutine has
+	// written a running state. Stop must persist the apply-level stopped state
+	// itself so progress and start commands do not keep seeing pending.
+	resp, err := client.Stop(ctx, &ternv1.StopRequest{
+		ApplyId:     "apply-stop-queued",
+		Type:        storage.DatabaseTypeMySQL,
+		Database:    "testdb",
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.StoppedCount)
+
+	apply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+
+	tasks, err := stor.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, state.Task.Stopped, tasks[0].State)
+}
+
 func TestLocalClient_Start_NoStoppedMigration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")

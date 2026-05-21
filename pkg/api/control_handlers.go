@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +14,10 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
+
+type applyTracker interface {
+	TrackApply(context.Context, *storage.Apply) error
+}
 
 // controlStatus returns "success" if accepted, "rejected" otherwise.
 func controlStatus(accepted bool) string {
@@ -270,9 +275,14 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	// terminal state.
 	var syncErr string
 	if resp.Accepted && client.IsRemote() {
-		// Mark running before ResumeApply so it doesn't re-issue a Start RPC.
+		// Mark running before starting local progress tracking so it does
+		// not re-issue a Start RPC.
 		apply.State = state.Apply.Running
-		if resumeErr := client.ResumeApply(r.Context(), apply); resumeErr != nil {
+		tracker, ok := client.(applyTracker)
+		if !ok {
+			s.logger.Error("remote client does not support apply tracking after start", "apply_id", apply.ApplyIdentifier)
+			syncErr = "schema change was started successfully, but the status and progress endpoints may show stale state until the next recovery cycle"
+		} else if resumeErr := tracker.TrackApply(r.Context(), apply); resumeErr != nil {
 			s.logger.Error("failed to resume apply tracking after start", "apply_id", apply.ApplyIdentifier, "error", resumeErr)
 			syncErr = "schema change was started successfully, but the status and progress endpoints may show stale state until the next recovery cycle"
 		}
