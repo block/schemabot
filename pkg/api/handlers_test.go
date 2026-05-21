@@ -111,6 +111,7 @@ type mockTernClient struct {
 	applyReq       *ternv1.ApplyRequest
 	volumeResp     *ternv1.VolumeResponse
 	volumeErr      error
+	volumeReq      *ternv1.VolumeRequest // captured request
 	stopResp       *ternv1.StopResponse
 	stopErr        error
 	stopReq        *ternv1.StopRequest // captured request
@@ -165,6 +166,7 @@ func (m *mockTernClient) Start(ctx context.Context, req *ternv1.StartRequest) (*
 	return nil, m.startErr
 }
 func (m *mockTernClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
+	m.volumeReq = req
 	if m.volumeResp != nil {
 		return m.volumeResp, m.volumeErr
 	}
@@ -487,7 +489,7 @@ func TestVolumeHandler(t *testing.T) {
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"database": "testdb", "environment": "staging", "volume": 11}`
+		body := `{"environment": "staging", "apply_id": "apply-vol123", "volume": 11}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/volume", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -505,6 +507,11 @@ func TestVolumeHandler(t *testing.T) {
 		newVol, _ := resp["new_volume"].(float64)
 		assert.Equal(t, float64(3), prevVol)
 		assert.Equal(t, float64(11), newVol)
+
+		require.NotNil(t, mock.volumeReq, "expected volume request to be captured")
+		assert.Equal(t, "apply-vol123", mock.volumeReq.ApplyId)
+		assert.Equal(t, "testdb", mock.volumeReq.Database)
+		assert.Equal(t, "staging", mock.volumeReq.Environment)
 	})
 
 	t.Run("invalid volume range", func(t *testing.T) {
@@ -512,7 +519,7 @@ func TestVolumeHandler(t *testing.T) {
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"database": "testdb", "environment": "staging", "volume": 0}`
+		body := `{"environment": "staging", "apply_id": "apply-vol123", "volume": 0}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/volume", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -526,7 +533,7 @@ func TestVolumeHandler(t *testing.T) {
 		assert.NotEmpty(t, resp["error"], "expected error message for invalid volume")
 	})
 
-	t.Run("missing database", func(t *testing.T) {
+	t.Run("missing apply_id", func(t *testing.T) {
 		svc := newTestService()
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
@@ -538,6 +545,7 @@ func TestVolumeHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "apply_id is required")
 	})
 }
 
@@ -550,32 +558,32 @@ func TestControlHandlersRejectClientDeployment(t *testing.T) {
 		{
 			name: "stop",
 			path: "/api/stop",
-			body: `{"database": "testdb", "environment": "staging", "deployment": "default"}`,
+			body: `{"environment": "staging", "apply_id": "apply-123", "deployment": "default"}`,
 		},
 		{
 			name: "start",
 			path: "/api/start",
-			body: `{"database": "testdb", "environment": "staging", "deployment": "default"}`,
+			body: `{"environment": "staging", "apply_id": "apply-123", "deployment": "default"}`,
 		},
 		{
 			name: "cutover",
 			path: "/api/cutover",
-			body: `{"database": "testdb", "environment": "staging", "deployment": "default"}`,
+			body: `{"environment": "staging", "apply_id": "apply-123", "deployment": "default"}`,
 		},
 		{
 			name: "volume",
 			path: "/api/volume",
-			body: `{"database": "testdb", "environment": "staging", "deployment": "default", "volume": 5}`,
+			body: `{"environment": "staging", "apply_id": "apply-123", "deployment": "default", "volume": 5}`,
 		},
 		{
 			name: "revert",
 			path: "/api/revert",
-			body: `{"database": "testdb", "environment": "staging", "deployment": "default"}`,
+			body: `{"environment": "staging", "apply_id": "apply-123", "deployment": "default"}`,
 		},
 		{
 			name: "skip-revert",
 			path: "/api/skip-revert",
-			body: `{"database": "testdb", "environment": "staging", "deployment": "default"}`,
+			body: `{"environment": "staging", "apply_id": "apply-123", "deployment": "default"}`,
 		},
 		{
 			name: "rollback plan",
@@ -602,20 +610,79 @@ func TestControlHandlersRejectClientDeployment(t *testing.T) {
 	}
 }
 
-func TestControlHandlerRejectsApplyDatabaseMismatch(t *testing.T) {
+func TestControlHandlersRejectClientDatabase(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "stop",
+			path: "/api/stop",
+			body: `{"database": "testdb", "environment": "staging", "apply_id": "apply-123"}`,
+		},
+		{
+			name: "start",
+			path: "/api/start",
+			body: `{"database": "testdb", "environment": "staging", "apply_id": "apply-123"}`,
+		},
+		{
+			name: "cutover",
+			path: "/api/cutover",
+			body: `{"database": "testdb", "environment": "staging", "apply_id": "apply-123"}`,
+		},
+		{
+			name: "volume",
+			path: "/api/volume",
+			body: `{"database": "testdb", "environment": "staging", "apply_id": "apply-123", "volume": 5}`,
+		},
+		{
+			name: "revert",
+			path: "/api/revert",
+			body: `{"database": "testdb", "environment": "staging", "apply_id": "apply-123"}`,
+		},
+		{
+			name: "skip-revert",
+			path: "/api/skip-revert",
+			body: `{"database": "testdb", "environment": "staging", "apply_id": "apply-123"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newTestService()
+			mux := http.NewServeMux()
+			svc.ConfigureRoutes(mux)
+
+			req := httptest.NewRequestWithContext(t.Context(), "POST", tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), "unknown field")
+			assert.Contains(t, w.Body.String(), "database")
+		})
+	}
+}
+
+func TestControlHandlerRejectsApplyEnvironmentMismatch(t *testing.T) {
 	svc := newControlTestService(&mockTernClient{}, activeTestApply("apply-abc123"))
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 
-	body := `{"database": "otherdb", "environment": "staging", "apply_id": "apply-abc123"}`
+	body := `{"environment": "production", "apply_id": "apply-abc123"}`
 	req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-	assert.Contains(t, w.Body.String(), "belongs to testdb/staging")
-	assert.Contains(t, w.Body.String(), "not otherdb/staging")
+	var resp apitypes.ErrorResponse
+	err := json.NewDecoder(w.Body).Decode(&resp)
+	require.NoError(t, err, "failed to decode response")
+	assert.Contains(t, resp.Error, `belongs to environment "staging"`)
+	assert.Contains(t, resp.Error, `not "production"`)
 }
 
 func TestStopHandler(t *testing.T) {
@@ -630,7 +697,7 @@ func TestStopHandler(t *testing.T) {
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"database": "testdb", "environment": "staging", "apply_id": "apply-abc123"}`
+		body := `{"environment": "staging", "apply_id": "apply-abc123"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -638,42 +705,15 @@ func TestStopHandler(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-		// Verify apply_id was passed through to the tern client
 		require.NotNil(t, mock.stopReq, "expected stop request to be captured")
 		assert.Equal(t, "apply-abc123", mock.stopReq.ApplyId)
 		assert.Equal(t, "testdb", mock.stopReq.Database)
+		assert.Equal(t, "staging", mock.stopReq.Environment)
 	})
 
-	t.Run("works without apply_id", func(t *testing.T) {
-		mock := &mockTernClient{
-			stopResp: &ternv1.StopResponse{
-				Accepted:     true,
-				StoppedCount: 1,
-			},
-		}
+	t.Run("requires apply_id", func(t *testing.T) {
+		mock := &mockTernClient{}
 		svc := newControlTestService(mock, activeTestApply("apply-active-stop"))
-		mux := http.NewServeMux()
-		svc.ConfigureRoutes(mux)
-
-		body := `{"database": "testdb", "environment": "staging"}`
-		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
-
-		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		require.NotNil(t, mock.stopReq, "expected stop request to be captured")
-		assert.Equal(t, "apply-active-stop", mock.stopReq.ApplyId)
-
-		var resp apitypes.StopResponse
-		err := json.NewDecoder(w.Body).Decode(&resp)
-		require.NoError(t, err, "failed to decode response")
-		assert.True(t, resp.Accepted, "expected accepted=true")
-		assert.Equal(t, int64(1), resp.StoppedCount)
-	})
-
-	t.Run("missing database", func(t *testing.T) {
-		svc := newTestService()
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -683,7 +723,24 @@ func TestStopHandler(t *testing.T) {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, req)
 
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "apply_id is required")
+		assert.Nil(t, mock.stopReq)
+	})
+
+	t.Run("missing environment", func(t *testing.T) {
+		svc := newTestService()
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"apply_id": "apply-abc123"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
 		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "environment is required")
 	})
 }
 
@@ -699,7 +756,7 @@ func TestStartHandler(t *testing.T) {
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"database": "testdb", "environment": "staging", "apply_id": "apply-xyz789"}`
+		body := `{"environment": "staging", "apply_id": "apply-xyz789"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -707,42 +764,15 @@ func TestStartHandler(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-		// Verify apply_id was passed through to the tern client
 		require.NotNil(t, mock.startReq, "expected start request to be captured")
 		assert.Equal(t, "apply-xyz789", mock.startReq.ApplyId)
 		assert.Equal(t, "testdb", mock.startReq.Database)
+		assert.Equal(t, "staging", mock.startReq.Environment)
 	})
 
-	t.Run("works without apply_id", func(t *testing.T) {
-		mock := &mockTernClient{
-			startResp: &ternv1.StartResponse{
-				Accepted:     true,
-				StartedCount: 1,
-			},
-		}
+	t.Run("requires apply_id", func(t *testing.T) {
+		mock := &mockTernClient{}
 		svc := newControlTestService(mock, activeTestApply("apply-active-start"))
-		mux := http.NewServeMux()
-		svc.ConfigureRoutes(mux)
-
-		body := `{"database": "testdb", "environment": "staging"}`
-		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
-
-		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		require.NotNil(t, mock.startReq, "expected start request to be captured")
-		assert.Equal(t, "apply-active-start", mock.startReq.ApplyId)
-
-		var resp apitypes.StartResponse
-		err := json.NewDecoder(w.Body).Decode(&resp)
-		require.NoError(t, err, "failed to decode response")
-		assert.True(t, resp.Accepted, "expected accepted=true")
-		assert.Equal(t, int64(1), resp.StartedCount)
-	})
-
-	t.Run("missing database", func(t *testing.T) {
-		svc := newTestService()
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -752,7 +782,24 @@ func TestStartHandler(t *testing.T) {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, req)
 
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "apply_id is required")
+		assert.Nil(t, mock.startReq)
+	})
+
+	t.Run("missing environment", func(t *testing.T) {
+		svc := newTestService()
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"apply_id": "apply-xyz789"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
 		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "environment is required")
 	})
 }
 
@@ -767,7 +814,7 @@ func TestCutoverHandler(t *testing.T) {
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"database": "testdb", "environment": "staging", "apply_id": "apply-cut123"}`
+		body := `{"environment": "staging", "apply_id": "apply-cut123"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -777,31 +824,13 @@ func TestCutoverHandler(t *testing.T) {
 
 		require.NotNil(t, mock.cutoverReq, "expected cutover request to be captured")
 		assert.Equal(t, "apply-cut123", mock.cutoverReq.ApplyId)
+		assert.Equal(t, "testdb", mock.cutoverReq.Database)
+		assert.Equal(t, "staging", mock.cutoverReq.Environment)
 	})
 
-	t.Run("works without apply_id", func(t *testing.T) {
-		mock := &mockTernClient{
-			cutoverResp: &ternv1.CutoverResponse{
-				Accepted: true,
-			},
-		}
+	t.Run("requires apply_id", func(t *testing.T) {
+		mock := &mockTernClient{}
 		svc := newControlTestService(mock, activeTestApply("apply-active-cutover"))
-		mux := http.NewServeMux()
-		svc.ConfigureRoutes(mux)
-
-		body := `{"database": "testdb", "environment": "staging"}`
-		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
-
-		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		require.NotNil(t, mock.cutoverReq, "expected cutover request to be captured")
-		assert.Equal(t, "apply-active-cutover", mock.cutoverReq.ApplyId)
-	})
-
-	t.Run("missing database", func(t *testing.T) {
-		svc := newTestService()
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -811,7 +840,24 @@ func TestCutoverHandler(t *testing.T) {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, req)
 
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "apply_id is required")
+		assert.Nil(t, mock.cutoverReq)
+	})
+
+	t.Run("missing environment", func(t *testing.T) {
+		svc := newTestService()
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"apply_id": "apply-cut123"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
 		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "environment is required")
 	})
 }
 
@@ -824,7 +870,7 @@ func TestRevertHandler(t *testing.T) {
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"database": "testdb", "environment": "staging", "apply_id": "apply-rev123"}`
+		body := `{"environment": "staging", "apply_id": "apply-rev123"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/revert", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -836,23 +882,21 @@ func TestRevertHandler(t *testing.T) {
 		assert.Equal(t, "testdb", mock.revertReq.Database)
 	})
 
-	t.Run("works without apply_id", func(t *testing.T) {
-		mock := &mockTernClient{
-			revertResp: &ternv1.RevertResponse{Accepted: true},
-		}
+	t.Run("requires apply_id", func(t *testing.T) {
+		mock := &mockTernClient{}
 		svc := newControlTestService(mock, activeTestApply("apply-active-revert"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"database": "testdb", "environment": "staging"}`
+		body := `{"environment": "staging"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/revert", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		require.NotNil(t, mock.revertReq, "expected revert request to be captured")
-		assert.Equal(t, "apply-active-revert", mock.revertReq.ApplyId)
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "apply_id is required")
+		assert.Nil(t, mock.revertReq)
 	})
 }
 
@@ -865,7 +909,7 @@ func TestSkipRevertHandler(t *testing.T) {
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"database": "testdb", "environment": "staging", "apply_id": "apply-skip456"}`
+		body := `{"environment": "staging", "apply_id": "apply-skip456"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/skip-revert", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -877,23 +921,21 @@ func TestSkipRevertHandler(t *testing.T) {
 		assert.Equal(t, "testdb", mock.skipRevertReq.Database)
 	})
 
-	t.Run("works without apply_id", func(t *testing.T) {
-		mock := &mockTernClient{
-			skipRevertResp: &ternv1.SkipRevertResponse{Accepted: true},
-		}
+	t.Run("requires apply_id", func(t *testing.T) {
+		mock := &mockTernClient{}
 		svc := newControlTestService(mock, activeTestApply("apply-active-skip"))
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"database": "testdb", "environment": "staging"}`
+		body := `{"environment": "staging"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/skip-revert", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		require.NotNil(t, mock.skipRevertReq, "expected skip-revert request to be captured")
-		assert.Equal(t, "apply-active-skip", mock.skipRevertReq.ApplyId)
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "apply_id is required")
+		assert.Nil(t, mock.skipRevertReq)
 	})
 }
 

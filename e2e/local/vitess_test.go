@@ -1417,7 +1417,7 @@ func TestVitess_Apply_RevertWindow(t *testing.T) {
 	require.True(t, sawRevertWindow, "expected revert_window state (revert enabled by default), but apply jumped to completed")
 
 	// Clean up: skip-revert to finalize
-	_, _ = client.CallSkipRevertAPI(endpoint, vitessDB, "staging")
+	_, _ = client.CallSkipRevertAPI(endpoint, "staging", applyID)
 	waitForApplyState(t, endpoint, applyID, state.Apply.Completed, testutil.PollDeadline)
 }
 
@@ -1452,8 +1452,8 @@ func TestVitess_Apply_Cancel(t *testing.T) {
 	waitForApplyState(t, endpoint, applyID, state.Apply.WaitingForDeploy, testutil.PollDeadline)
 
 	// Cancel from the stable waiting_for_deploy state
-	t.Logf("calling stop API: endpoint=%s database=%s applyID=%s", endpoint, vitessDB, applyID)
-	stopResult, err := client.CallStopAPI(endpoint, vitessDB, "staging", applyID)
+	t.Logf("calling stop API: endpoint=%s applyID=%s", endpoint, applyID)
+	stopResult, err := client.CallStopAPI(endpoint, "staging", applyID)
 	require.NoError(t, err, "stop/cancel API call")
 	t.Logf("stop API returned: accepted=%v stopped=%d skipped=%d error=%q",
 		stopResult.Accepted, stopResult.StoppedCount, stopResult.SkippedCount, stopResult.ErrorMessage)
@@ -1553,7 +1553,7 @@ func TestVitess_Apply_DeferDeploy(t *testing.T) {
 	// return WaitingForDeploy before the apply record in storage catches up.
 	var startResp *apitypes.StartResponse
 	for range 10 {
-		startResp, err = client.CallStartAPI(endpoint, vitessDB, "staging", applyResp.ApplyID)
+		startResp, err = client.CallStartAPI(endpoint, "staging", applyResp.ApplyID)
 		if err == nil && startResp.Accepted {
 			break
 		}
@@ -1591,7 +1591,7 @@ func TestVitess_Apply_DeferDeploy_StartTooEarly(t *testing.T) {
 	require.NotEmpty(t, applyResp.ApplyID)
 
 	// Call Start immediately — apply hasn't reached WaitingForDeploy yet
-	_, startErr := client.CallStartAPI(endpoint, vitessDB, "staging", applyResp.ApplyID)
+	_, startErr := client.CallStartAPI(endpoint, "staging", applyResp.ApplyID)
 	require.Error(t, startErr)
 	assert.Contains(t, startErr.Error(), "not ready for deploy")
 
@@ -1599,7 +1599,7 @@ func TestVitess_Apply_DeferDeploy_StartTooEarly(t *testing.T) {
 	waitForApplyState(t, endpoint, applyResp.ApplyID, state.Apply.WaitingForDeploy, testutil.PollDeadline)
 	var startResp *apitypes.StartResponse
 	for range 10 {
-		startResp, err = client.CallStartAPI(endpoint, vitessDB, "staging", applyResp.ApplyID)
+		startResp, err = client.CallStartAPI(endpoint, "staging", applyResp.ApplyID)
 		if err == nil && startResp.Accepted {
 			break
 		}

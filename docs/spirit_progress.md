@@ -249,9 +249,9 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
 | Running | `ESC detach · s stop · v volume` |
 | Running (volume mode) | `Volume: ████████░░░ 8/11` / `↑↓ adjust · 1-9 direct · ESC done` |
 | Waiting for cutover (with `--cutover`) | `Press Enter to proceed with cutover (or ESC to detach)` |
-| Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover --apply-id <id>` |
+| Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover -e <env> <id>` |
 | Cutting over | `Cutover in progress - please wait...` |
-| Stopped | `Use 'schemabot start --apply-id <id>' to resume.` |
+| Stopped | `Use 'schemabot start -e <env> <id>' to resume.` |
 
 ## Key behaviors
 

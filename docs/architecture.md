@@ -61,13 +61,13 @@ Users interact with SchemaBot through three interfaces:
 ```
 schemabot plan -s ./schema -e staging       # Preview changes
 schemabot apply -s ./schema -e staging -y   # Apply changes
-schemabot progress -d mydb -e staging       # Watch progress
-schemabot cutover -d mydb -e staging        # Trigger cutover
-schemabot stop -d mydb -e staging           # Pause execution
-schemabot start -d mydb -e staging          # Resume execution
-schemabot volume -d mydb -e staging -v 8    # Adjust speed
-schemabot revert -d mydb -e staging         # Roll back (Vitess)
-schemabot skip-revert -d mydb -e staging    # Finalize (Vitess)
+schemabot progress <apply_id>               # Watch progress
+schemabot cutover -e staging <apply_id>     # Trigger cutover
+schemabot stop -e staging <apply_id>        # Pause execution
+schemabot start -e staging <apply_id>       # Resume execution
+schemabot volume -e staging <apply_id> -v 8 # Adjust speed
+schemabot revert -e staging <apply_id>      # Revert during the revert window (Vitess)
+schemabot skip-revert -e staging <apply_id> # Finalize (Vitess)
 ```
 
 **PR Comments** — SchemaBot is a GitHub app installed on repos. The PR workflow:

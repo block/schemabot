@@ -26,17 +26,13 @@ func (cmd *StopCmd) Run(g *Globals) error {
 	// Check current state first
 	result, err := client.GetProgress(ep, cmd.ApplyID)
 	if err != nil {
-		// Check if this is a "not found" error - likely means no active schema change
-		if client.IsNotFound(err) {
-			fmt.Printf("No active schema change found for database '%s' environment '%s'\n", cmd.Database, cmd.Environment)
-			return nil
-		}
-		return fmt.Errorf("get progress: %w", err)
+		return fmt.Errorf("get progress for apply %s: %w", cmd.ApplyID, err)
 	}
+	populateControlDisplayFields(&cmd.Database, result)
 
 	curState := result.State
 	if state.IsState(curState, state.NoActiveChange) || curState == "" {
-		fmt.Printf("No active schema change for database '%s' environment '%s'\n", cmd.Database, cmd.Environment)
+		fmt.Printf("No active schema change for %s\n", formatControlTarget(cmd.ApplyID, cmd.Database, cmd.Environment))
 		return nil
 	}
 	if state.IsState(curState, state.Apply.Completed) {
@@ -51,11 +47,8 @@ func (cmd *StopCmd) Run(g *Globals) error {
 		return fmt.Errorf("cannot stop schema change in state: %s", curState)
 	}
 
-	// Always scope stop to the specific apply to avoid cross-apply contamination.
-	autoResolveApplyID(&cmd.ApplyID, result)
-
 	// Call stop API
-	stopResult, err := client.CallStopAPI(ep, cmd.Database, cmd.Environment, cmd.ApplyID)
+	stopResult, err := client.CallStopAPI(ep, cmd.Environment, cmd.ApplyID)
 	if err != nil {
 		return err
 	}

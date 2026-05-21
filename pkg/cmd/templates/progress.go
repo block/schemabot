@@ -648,7 +648,7 @@ func WriteStopSuccess(data StopData) {
 	}
 	fmt.Println()
 	if data.ApplyID != "" {
-		fmt.Printf("%sCheckpoint saved. Use 'schemabot start --apply-id %s' to resume.%s\n", ANSIDim, data.ApplyID, ANSIReset)
+		fmt.Printf("%sCheckpoint saved. Use 'schemabot start -e %s %s' to resume.%s\n", ANSIDim, data.Environment, data.ApplyID, ANSIReset)
 	} else {
 		fmt.Printf("%sCheckpoint saved. Use 'schemabot start' to resume from where you left off.%s\n", ANSIDim, ANSIReset)
 	}
@@ -684,9 +684,9 @@ func WriteStartNoWatch(applyID, database, environment string) {
 	fmt.Printf("%s%s▶️  Schema change resumed%s\n", ANSIBold, ANSIGreen, ANSIReset)
 	fmt.Println()
 	if applyID != "" {
-		fmt.Printf("To watch and manage: schemabot progress --apply-id %s\n", applyID)
+		fmt.Printf("To watch and manage: schemabot progress %s\n", applyID)
 	} else {
-		fmt.Printf("To watch and manage: schemabot progress -d %s -e %s\n", database, environment)
+		fmt.Printf("To watch and manage: schemabot status -d %s -e %s\n", database, environment)
 	}
 }
 

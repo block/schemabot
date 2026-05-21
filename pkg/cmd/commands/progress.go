@@ -17,7 +17,7 @@ type ProgressCmd struct {
 // Run executes the progress command.
 func (cmd *ProgressCmd) Run(g *Globals) error {
 	if cmd.ApplyID == "" {
-		return fmt.Errorf("--apply-id is required (use 'schemabot status -d <database>' to find active applies)")
+		return fmt.Errorf("apply_id is required (use 'schemabot status -d <database>' to find active applies)")
 	}
 
 	ep, err := g.Resolve()

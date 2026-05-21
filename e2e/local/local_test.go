@@ -826,7 +826,7 @@ CREATE TABLE %s (
 	})
 
 	t.Run("trigger_cutover", func(t *testing.T) {
-		out, err := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "cutover", applyID, "--endpoint", endpoint, "--watch=false")
+		out, err := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "cutover", applyID, "-e", "staging", "--endpoint", endpoint, "--watch=false")
 		if err != nil {
 			stripped := e2eutil.StripANSI(out)
 			if !strings.Contains(strings.ToLower(stripped), "complete") && !strings.Contains(strings.ToLower(stripped), "nothing to cutover") {
@@ -867,7 +867,7 @@ func TestLocal_Stop_NoActiveChange(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	out, _ := runCLIWithError(t, binPath, "stop", "apply-nonexistent", "--endpoint", endpoint)
+	out, _ := runCLIWithError(t, binPath, "stop", "apply-nonexistent", "-e", "staging", "--endpoint", endpoint)
 	if !strings.Contains(out, "No") && !strings.Contains(out, "not found") && !strings.Contains(out, "error") {
 		t.Logf("Stop output: %s", out)
 	}
@@ -877,7 +877,7 @@ func TestLocal_Start_NoStoppedChange(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	out, _ := runCLIWithError(t, binPath, "start", "apply-nonexistent", "--endpoint", endpoint, "--watch=false")
+	out, _ := runCLIWithError(t, binPath, "start", "apply-nonexistent", "-e", "staging", "--endpoint", endpoint, "--watch=false")
 	if !strings.Contains(out, "No") && !strings.Contains(out, "not found") && !strings.Contains(out, "error") {
 		t.Logf("Start output: %s", out)
 	}
@@ -931,17 +931,17 @@ CREATE TABLE %s (
 	applyState, _ := fetchApplyState(endpoint, applyID)
 
 	if applyState != state.Apply.Completed {
-		stopOut, stopErr := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "stop", applyID, "--endpoint", endpoint)
+		stopOut, stopErr := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "stop", applyID, "-e", "staging", "--endpoint", endpoint)
 		if stopErr == nil && strings.Contains(e2eutil.StripANSI(stopOut), "stopped") {
 			waitForApplyState(t, endpoint, applyID, state.Apply.Stopped, 30*time.Second)
-			startOut := e2eutil.RunCLIInDir(t, binPath, schemaDir, "start", applyID, "--endpoint", endpoint, "--watch=false")
+			startOut := e2eutil.RunCLIInDir(t, binPath, schemaDir, "start", applyID, "-e", "staging", "--endpoint", endpoint, "--watch=false")
 			e2eutil.AssertContains(t, startOut, "resumed")
 		}
 	}
 
 	waitForApplyAnyState(t, endpoint, applyID, []string{state.Apply.WaitingForCutover, state.Apply.Completed}, 30*time.Second)
 
-	cutoverOut, cutoverErr := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "cutover", applyID, "--endpoint", endpoint, "--watch=false")
+	cutoverOut, cutoverErr := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "cutover", applyID, "-e", "staging", "--endpoint", endpoint, "--watch=false")
 	if cutoverErr != nil {
 		stripped := e2eutil.StripANSI(cutoverOut)
 		if !strings.Contains(strings.ToLower(stripped), "complete") && !strings.Contains(strings.ToLower(stripped), "nothing to cutover") {
@@ -1089,7 +1089,7 @@ CREATE TABLE %s (
 	t.Run("stop_mid_flight", func(t *testing.T) {
 		waitForApplyState(t, endpoint, applyID, state.Apply.Running, 3*time.Second)
 
-		stopOut, stopErr := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "stop", applyID, "--endpoint", endpoint)
+		stopOut, stopErr := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "stop", applyID, "-e", "staging", "--endpoint", endpoint)
 		stripped := e2eutil.StripANSI(stopOut)
 		if stopErr != nil && !strings.Contains(strings.ToLower(stripped), "stopped") {
 			// If the apply already completed (tables too small), skip the stop/start test
@@ -1106,7 +1106,7 @@ CREATE TABLE %s (
 
 	// Resume — this should re-plan, find remaining tables, and process them sequentially
 	t.Run("start_resumes", func(t *testing.T) {
-		startOut := e2eutil.RunCLIInDir(t, binPath, schemaDir, "start", applyID, "--endpoint", endpoint, "--watch=false")
+		startOut := e2eutil.RunCLIInDir(t, binPath, schemaDir, "start", applyID, "-e", "staging", "--endpoint", endpoint, "--watch=false")
 		e2eutil.AssertContains(t, startOut, "resumed")
 	})
 
@@ -1141,12 +1141,11 @@ func TestLocal_Volume_Help(t *testing.T) {
 func TestLocal_Volume_InvalidLevel(t *testing.T) {
 	binPath := buildCLI(t)
 
-	// Volume validation happens after apply_id resolution, so these will fail
-	// at the resolution step (no such apply), which is still an error.
-	_, err := runCLIWithError(t, binPath, "volume", "apply-fake", "-v", "0", "--endpoint", "http://localhost:9999")
+	// Volume is rejected before the CLI contacts the API.
+	_, err := runCLIWithError(t, binPath, "volume", "apply-fake", "-e", "staging", "-v", "0", "--endpoint", "http://localhost:9999")
 	require.Error(t, err, "expected error for volume=0")
 
-	_, err = runCLIWithError(t, binPath, "volume", "apply-fake", "-v", "12", "--endpoint", "http://localhost:9999")
+	_, err = runCLIWithError(t, binPath, "volume", "apply-fake", "-e", "staging", "-v", "12", "--endpoint", "http://localhost:9999")
 	require.Error(t, err, "expected error for volume=12")
 }
 
@@ -1154,7 +1153,7 @@ func TestLocal_Volume_NoActiveChange(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	_, err := runCLIWithError(t, binPath, "volume", "apply-nonexistent", "-v", "5", "--endpoint", endpoint)
+	_, err := runCLIWithError(t, binPath, "volume", "apply-nonexistent", "-e", "staging", "-v", "5", "--endpoint", endpoint)
 	if err == nil {
 		t.Log("volume with no active change didn't error - may be acceptable if there's a leftover state")
 	}
@@ -1209,7 +1208,7 @@ CREATE TABLE %s (
 	// Volume adjustment during "Waiting for cutover" stops but can't restart properly
 	prog, _ := testutil.FetchProgress(endpoint, applyID)
 	if prog != nil && prog.State == state.Apply.Running {
-		volumeOut, volumeErr := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "volume", applyID, "-v", "8", "--endpoint", endpoint, "--watch=false")
+		volumeOut, volumeErr := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "volume", applyID, "-e", "staging", "-v", "8", "--endpoint", endpoint, "--watch=false")
 		if volumeErr == nil {
 			t.Logf("Volume adjustment succeeded: %s", volumeOut)
 		} else {
@@ -1302,7 +1301,7 @@ CREATE TABLE %s (
 
 		prog, _ = testutil.FetchProgress(endpoint, applyID)
 		if prog != nil && prog.State == state.Apply.WaitingForCutover {
-			e2eutil.RunCLIInDir(t, binPath, schemaDir, "cutover", applyID, "--endpoint", endpoint, "--watch=false")
+			e2eutil.RunCLIInDir(t, binPath, schemaDir, "cutover", applyID, "-e", "staging", "--endpoint", endpoint, "--watch=false")
 			testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, 10*time.Second)
 		}
 	}

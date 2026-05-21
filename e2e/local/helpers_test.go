@@ -243,7 +243,7 @@ func ensureNoActiveChange(t *testing.T, endpoint string) {
 
 		if s == state.Apply.Stopped {
 			log.Printf("Found stopped schema change (%s), restarting...", applyID)
-			resp, err := client.CallStartAPI(endpoint, "testapp", "staging", applyID)
+			resp, err := client.CallStartAPI(endpoint, "staging", applyID)
 			if err != nil {
 				log.Printf("Start failed for %s: %v", applyID, err)
 			} else if !resp.Accepted {
@@ -257,7 +257,7 @@ func ensureNoActiveChange(t *testing.T, endpoint string) {
 			// Cutover is async — triggers sentinel drop, Spirit completes in background.
 			// Poll loop will pick up completion on next iteration.
 			log.Printf("Found schema change waiting for cutover (%s), cutting over...", applyID)
-			resp, err := client.CallCutoverAPI(endpoint, "testapp", "staging", applyID)
+			resp, err := client.CallCutoverAPI(endpoint, "staging", applyID)
 			if err != nil {
 				log.Printf("Cutover failed for %s: %v", applyID, err)
 			} else if !resp.Accepted {

@@ -50,7 +50,7 @@ func (m WatchModel) fetchProgress() tea.Cmd {
 
 func (m WatchModel) triggerDeploy() tea.Cmd {
 	return func() tea.Msg {
-		result, err := client.CallStartAPI(m.endpoint, m.database, m.environment, m.applyID)
+		result, err := client.CallStartAPI(m.endpoint, m.environment, m.applyID)
 		if err != nil {
 			return deployResultMsg{success: false, err: err}
 		}
@@ -69,7 +69,7 @@ func (m WatchModel) triggerDeploy() tea.Cmd {
 
 func (m WatchModel) triggerCutover() tea.Cmd {
 	return func() tea.Msg {
-		result, err := client.CallCutoverAPI(m.endpoint, m.database, m.environment, m.applyID)
+		result, err := client.CallCutoverAPI(m.endpoint, m.environment, m.applyID)
 		if err != nil {
 			return cutoverResultMsg{success: false, err: err}
 		}
@@ -88,7 +88,7 @@ func (m WatchModel) triggerCutover() tea.Cmd {
 
 func (m WatchModel) triggerStop() tea.Cmd {
 	return func() tea.Msg {
-		result, err := client.CallStopAPI(m.endpoint, m.database, m.environment, m.applyID)
+		result, err := client.CallStopAPI(m.endpoint, m.environment, m.applyID)
 		if err != nil {
 			return stopResultMsg{success: false, err: err}
 		}
@@ -108,7 +108,7 @@ func (m WatchModel) triggerStop() tea.Cmd {
 
 func (m WatchModel) triggerSkipRevert() tea.Cmd {
 	return func() tea.Msg {
-		result, err := client.CallSkipRevertAPI(m.endpoint, m.database, m.environment)
+		result, err := client.CallSkipRevertAPI(m.endpoint, m.environment, m.applyID)
 		if err != nil {
 			return stopResultMsg{success: false, err: err}
 		}
@@ -199,7 +199,7 @@ func (m WatchModel) handleVolumeKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m WatchModel) triggerVolumeChange(volume int) tea.Cmd {
 	return func() tea.Msg {
-		result, err := client.CallVolumeAPI(m.endpoint, m.database, m.environment, m.applyID, volume)
+		result, err := client.CallVolumeAPI(m.endpoint, m.environment, m.applyID, volume)
 		if err != nil {
 			return volumeResultMsg{success: false, err: err}
 		}

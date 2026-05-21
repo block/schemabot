@@ -67,7 +67,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	} else if active != nil && active.State != "" && !state.IsState(active.State, state.NoActiveChange) {
 		progressCmd := fmt.Sprintf("schemabot status %s", active.ApplyID)
 		if active.ApplyID == "" {
-			progressCmd = fmt.Sprintf("schemabot progress -d %s -e %s", cfg.Database, cmd.Environment)
+			progressCmd = fmt.Sprintf("schemabot status -d %s -e %s", cfg.Database, cmd.Environment)
 		}
 		var stateMsg string
 		switch {
@@ -91,9 +91,9 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 			fmt.Println()
 			if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
 				if active.ApplyID != "" {
-					fmt.Printf("To trigger cutover:  schemabot cutover --apply-id %s\n", active.ApplyID)
+					fmt.Printf("To trigger cutover:  schemabot cutover -e %s %s\n", cmd.Environment, active.ApplyID)
 				} else {
-					fmt.Printf("To trigger cutover:  schemabot cutover -d %s -e %s\n", cfg.Database, cmd.Environment)
+					fmt.Printf("To find the apply ID: schemabot status -d %s -e %s\n", cfg.Database, cmd.Environment)
 				}
 			}
 			fmt.Printf("To watch and manage: %s\n", progressCmd)

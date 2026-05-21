@@ -2445,7 +2445,7 @@ The new apply will only process tables that haven't completed.
        ALTER TABLE `orders` ADD INDEX `idx_total_cents`(`total_cents`);
 
 
-Stopped. Use 'schemabot start --apply-id <apply_id>' to resume from checkpoint.
+Stopped. Use 'schemabot start -e staging <apply_id>' to resume from checkpoint.
 
 ```
 </details>
@@ -2487,7 +2487,7 @@ Press Enter to proceed with cutover (or Ctrl+C to detach): _
 Row copy complete. All data has been copied and new writes
 continue to be replicated to keep the shadow table in sync.
 
-To proceed: schemabot cutover --apply-id <apply_id>
+To proceed: schemabot cutover -e staging <apply_id>
 Watching for cutover... (Ctrl+C to detach)
 
 ```
@@ -3639,7 +3639,7 @@ ESC detach • s stop • v volume
 
 ```
 
-Stop command: User runs 'schemabot stop --apply-id <apply_id>'
+Stop command: User runs 'schemabot stop -e staging <apply_id>'
 
 ⏸️  Schema change stopped
 
@@ -3648,7 +3648,7 @@ Environment: staging
 Stopped:     2 table(s)
 Skipped:     1 table(s) (already complete)
 
-Checkpoint saved. Use 'schemabot start --apply-id apply-a1b2c3d4e5f67890' to resume.
+Checkpoint saved. Use 'schemabot start -e staging apply-a1b2c3d4e5f67890' to resume.
 
 ```
 </details>
@@ -3687,7 +3687,7 @@ Checkpoint saved. Use 'schemabot start --apply-id apply-a1b2c3d4e5f67890' to res
 
 ```
 
-Start command: User runs 'schemabot start --apply-id <apply_id>'
+Start command: User runs 'schemabot start -e staging <apply_id>'
 
 ▶️  Schema change resumed
 
@@ -4557,7 +4557,7 @@ Defer cutover: Stopped by user (s)
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 6,400,000 / 7,200,000
 
-Use 'schemabot start --apply-id <apply_id>' to resume.
+Use 'schemabot start -e staging <apply_id>' to resume.
 
 ```
 </details>
@@ -4578,10 +4578,10 @@ To check status:
   schemabot status <apply_id>
 
 To proceed with cutover:
-  schemabot cutover --apply-id <apply_id>
+  schemabot cutover -e staging <apply_id>
 
 To abort the schema change:
-  schemabot stop --apply-id <apply_id>
+  schemabot stop -e staging <apply_id>
 
 ```
 </details>

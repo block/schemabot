@@ -29,6 +29,7 @@ func (cmd *StartCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("get progress: %w", err)
 	}
+	populateControlDisplayFields(&cmd.Database, result)
 
 	curState := result.State
 	if state.IsState(curState, state.Apply.Completed) {
@@ -46,11 +47,8 @@ func (cmd *StartCmd) Run(g *Globals) error {
 		return fmt.Errorf("cannot start schema change in state: %s", curState)
 	}
 
-	// Always scope start to the specific apply to avoid cross-apply contamination.
-	autoResolveApplyID(&cmd.ApplyID, result)
-
 	// Call start API
-	startResult, err := client.CallStartAPI(ep, cmd.Database, cmd.Environment, cmd.ApplyID)
+	startResult, err := client.CallStartAPI(ep, cmd.Environment, cmd.ApplyID)
 	if err != nil {
 		return err
 	}

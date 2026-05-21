@@ -26,20 +26,22 @@ func (cmd *RevertCmd) Run(g *Globals) error {
 	// Check current state
 	result, err := client.GetProgress(ep, cmd.ApplyID)
 	if err == nil {
+		populateControlDisplayFields(&cmd.Database, result)
 		if !state.IsState(result.State, state.Apply.RevertWindow) {
 			return fmt.Errorf("cannot revert: apply is in state %q (expected revert_window)", result.State)
 		}
 	} else {
-		slog.Warn("could not verify apply state before revert, proceeding anyway", "error", err)
+		slog.Warn("could not verify apply state before revert, proceeding anyway",
+			"apply_id", cmd.ApplyID, "environment", cmd.Environment, "error", err)
 	}
 
-	resp, err := client.CallRevertAPI(ep, cmd.Database, cmd.Environment)
+	resp, err := client.CallRevertAPI(ep, cmd.Environment, cmd.ApplyID)
 	if err != nil {
 		return fmt.Errorf("revert failed: %w", err)
 	}
 
 	if resp.Accepted {
-		fmt.Printf("Revert initiated for %s/%s\n", cmd.Database, cmd.Environment)
+		fmt.Printf("Revert initiated for %s\n", formatControlTarget(cmd.ApplyID, cmd.Database, cmd.Environment))
 	} else {
 		fmt.Printf("Revert not accepted: %s\n", resp.ErrorMessage)
 	}

@@ -39,14 +39,13 @@ func (g *Globals) Resolve() (string, error) {
 // ControlFlags holds flags for commands that target a specific schema change.
 type ControlFlags struct {
 	ApplyID     string `arg:"" optional:"" help:"Apply ID to target"`
-	Database    string `short:"d" help:"Database name"`
+	Database    string `kong:"-"`
 	Environment string `short:"e" help:"Target environment"`
 }
 
-// Resolve resolves the control flags using the standard resolution chain:
-// endpoint → apply-id → require database+environment.
+// Resolve resolves the endpoint and verifies the explicit control-operation scope.
 func (cf *ControlFlags) Resolve(g *Globals) (string, error) {
-	return resolveControlFlags(g.Endpoint, g.Profile, &cf.ApplyID, &cf.Database, &cf.Environment)
+	return resolveControlFlags(g.Endpoint, g.Profile, cf.ApplyID, cf.Environment)
 }
 
 // RequireApplyID returns an error if ApplyID is not set.
@@ -117,22 +116,6 @@ func resolveEndpoint(endpoint, profile string) (string, error) {
 	return ep, nil
 }
 
-// resolveApplyID resolves an apply ID to database and environment by calling the progress API.
-// Returns (database, environment, error).
-func resolveApplyID(endpoint, applyID string) (string, string, error) {
-	result, err := client.GetProgress(endpoint, applyID)
-	if err != nil {
-		if client.IsNotFound(err) {
-			return "", "", fmt.Errorf("no schema change found for apply ID '%s'", applyID)
-		}
-		return "", "", err
-	}
-	if result.Database == "" || result.Environment == "" {
-		return "", "", fmt.Errorf("could not resolve database/environment for apply ID '%s'", applyID)
-	}
-	return result.Database, result.Environment, nil
-}
-
 // confirmAction prompts the user for "yes" confirmation. Returns true if confirmed.
 func confirmAction(prompt, cancelMsg string) (bool, error) {
 	fmt.Print(prompt)
@@ -181,29 +164,13 @@ func writeJSON(v any) error {
 	return enc.Encode(v)
 }
 
-// resolveDBEnvFromApplyID resolves an apply-id flag to database/environment.
-// If applyID is empty, this is a no-op. Otherwise it calls the progress API
-// and overwrites the database and environment pointers.
-func resolveDBEnvFromApplyID(ep string, applyID *string, database, environment *string) error {
-	if *applyID == "" {
-		return nil
-	}
-	db, env, err := resolveApplyID(ep, *applyID)
-	if err != nil {
-		return err
-	}
-	*database = db
-	*environment = env
-	return nil
-}
-
-// requireDatabaseEnvironment validates that database and environment are set.
-func requireDatabaseEnvironment(database, environment string) error {
-	if database == "" {
-		return fmt.Errorf("--database is required (or use --apply-id)")
+// requireControlScope validates the explicit fields that scope a control operation.
+func requireControlScope(applyID, environment string) error {
+	if applyID == "" {
+		return fmt.Errorf("apply_id is required")
 	}
 	if environment == "" {
-		return fmt.Errorf("--environment is required (or use --apply-id)")
+		return fmt.Errorf("--environment is required")
 	}
 	return nil
 }
@@ -249,26 +216,34 @@ func checkAccepted(result acceptedResponse, operation string) error {
 	return nil
 }
 
-// autoResolveApplyID sets applyID from the progress response if not already set.
-// This ensures control operations are scoped to a specific apply.
-func autoResolveApplyID(applyID *string, progressResult *apitypes.ProgressResponse) {
-	if *applyID == "" && progressResult.ApplyID != "" {
-		*applyID = progressResult.ApplyID
+// populateControlDisplayFields fills fields used for CLI output from progress.
+// The control API still derives database from apply_id; this is only display data.
+func populateControlDisplayFields(database *string, progressResult *apitypes.ProgressResponse) {
+	if progressResult == nil {
+		return
+	}
+	if *database == "" {
+		*database = progressResult.Database
 	}
 }
 
-// resolveControlFlags resolves endpoint, database, and environment from the
-// common control command flags (endpoint, profile, applyID, database, environment).
-// Returns the resolved endpoint.
-func resolveControlFlags(endpoint, profile string, applyID, database, environment *string) (string, error) {
+func formatControlTarget(applyID, database, environment string) string {
+	if database != "" {
+		return fmt.Sprintf("%s/%s (apply %s)", database, environment, applyID)
+	}
+	if environment != "" {
+		return fmt.Sprintf("apply %s in %s", applyID, environment)
+	}
+	return fmt.Sprintf("apply %s", applyID)
+}
+
+// resolveControlFlags resolves the endpoint and validates apply_id + environment.
+func resolveControlFlags(endpoint, profile, applyID, environment string) (string, error) {
 	ep, err := resolveEndpoint(endpoint, profile)
 	if err != nil {
 		return "", err
 	}
-	if err := resolveDBEnvFromApplyID(ep, applyID, database, environment); err != nil {
-		return "", err
-	}
-	if err := requireDatabaseEnvironment(*database, *environment); err != nil {
+	if err := requireControlScope(applyID, environment); err != nil {
 		return "", err
 	}
 	return ep, nil
@@ -345,8 +320,8 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 // printWatchInstructions prints the "To watch and manage" hint.
 func printWatchInstructions(applyID, database, environment string) {
 	if applyID != "" {
-		fmt.Printf("To watch and manage: schemabot progress --apply-id %s\n", applyID)
+		fmt.Printf("To watch and manage: schemabot progress %s\n", applyID)
 	} else {
-		fmt.Printf("To watch and manage: schemabot progress -d %s -e %s\n", database, environment)
+		fmt.Printf("To watch and manage: schemabot status -d %s -e %s\n", database, environment)
 	}
 }

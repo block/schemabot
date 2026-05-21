@@ -33,6 +33,7 @@ func (cmd *VolumeCmd) Run(g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("get progress: %w", err)
 	}
+	populateControlDisplayFields(&cmd.Database, result)
 
 	curState := result.State
 	if state.IsState(curState, state.Apply.Completed) {
@@ -46,11 +47,8 @@ func (cmd *VolumeCmd) Run(g *Globals) error {
 		return fmt.Errorf("cannot adjust volume in state: %s", curState)
 	}
 
-	// Auto-resolve apply_id from progress response
-	autoResolveApplyID(&cmd.ApplyID, result)
-
 	// Call volume API
-	volumeResult, err := client.CallVolumeAPI(ep, cmd.Database, cmd.Environment, cmd.ApplyID, cmd.Volume)
+	volumeResult, err := client.CallVolumeAPI(ep, cmd.Environment, cmd.ApplyID, cmd.Volume)
 	if err != nil {
 		return err
 	}

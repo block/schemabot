@@ -27,6 +27,7 @@ func (cmd *CutoverCmd) Run(g *Globals) error {
 	// Check current state first
 	result, err := client.GetProgress(ep, cmd.ApplyID)
 	if err == nil {
+		populateControlDisplayFields(&cmd.Database, result)
 		if state.IsState(result.State, state.Apply.Completed) {
 			fmt.Println("✓ Schema change already complete")
 			tables := ddl.FilterInternalTablesTyped(result.Tables)
@@ -42,13 +43,8 @@ func (cmd *CutoverCmd) Run(g *Globals) error {
 		}
 	}
 
-	// Always scope cutover to the specific apply to avoid cross-apply contamination.
-	if result != nil {
-		autoResolveApplyID(&cmd.ApplyID, result)
-	}
-
 	// Trigger cutover
-	cutoverResult, err := client.CallCutoverAPI(ep, cmd.Database, cmd.Environment, cmd.ApplyID)
+	cutoverResult, err := client.CallCutoverAPI(ep, cmd.Environment, cmd.ApplyID)
 	if err != nil {
 		return err
 	}

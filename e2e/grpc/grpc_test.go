@@ -207,7 +207,7 @@ func TestGRPC_PlanApply_AddColumn(t *testing.T) {
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
 	// Wait for completion
-	grpcWaitForState(t, "testapp", "staging", "COMPLETED", 3*time.Minute)
+	grpcWaitForState(t, "testapp", "staging", state.Apply.Completed, 3*time.Minute)
 
 	// Verify column exists
 	assert.True(t, grpcColumnExists(t, "staging", tableName, "email"),
@@ -240,15 +240,15 @@ func TestGRPC_StopStart(t *testing.T) {
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
 	// Wait for it to be running (not just planned)
-	grpcWaitForAnyState(t, "testapp", "staging", []string{"APPLYING", "COPY", "COMPLETED"}, 60*time.Second)
+	grpcWaitForAnyState(t, "testapp", "staging", []string{state.Apply.Running, state.Apply.Completed}, 60*time.Second)
 
 	// If already completed, Spirit was too fast -- skip stop/start verification
 	prog := grpcProgress(t, "testapp", "staging")
-	if !strings.Contains(strings.ToUpper(prog.State), "COMPLETED") {
+	if !state.IsState(prog.State, state.Apply.Completed) {
 		// Stop
 		stopResp := grpcPost(t, "/api/stop", map[string]string{ //nolint:bodyclose // closed via utils.CloseAndLog
-			"database":    "testapp",
 			"environment": "staging",
+			"apply_id":    apply.ApplyID,
 		})
 		defer utils.CloseAndLog(stopResp.Body)
 		var stopResult grpcSimpleResponse
@@ -256,12 +256,12 @@ func TestGRPC_StopStart(t *testing.T) {
 		require.True(t, stopResult.Accepted, "stop not accepted: %s", stopResult.ErrorMessage)
 
 		// Verify stopped
-		grpcWaitForState(t, "testapp", "staging", "STOPPED", 30*time.Second)
+		grpcWaitForState(t, "testapp", "staging", state.Apply.Stopped, 30*time.Second)
 
 		// Start
 		startResp := grpcPost(t, "/api/start", map[string]string{ //nolint:bodyclose // closed via utils.CloseAndLog
-			"database":    "testapp",
 			"environment": "staging",
+			"apply_id":    apply.ApplyID,
 		})
 		defer utils.CloseAndLog(startResp.Body)
 		var startResult grpcSimpleResponse
@@ -270,7 +270,7 @@ func TestGRPC_StopStart(t *testing.T) {
 	}
 
 	// Wait for completion
-	grpcWaitForState(t, "testapp", "staging", "COMPLETED", 5*time.Minute)
+	grpcWaitForState(t, "testapp", "staging", state.Apply.Completed, 5*time.Minute)
 
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
 }
@@ -301,7 +301,7 @@ func TestGRPC_StopStart_LocalStateSync(t *testing.T) {
 	require.NotEmpty(t, apply.ApplyID, "expected non-empty apply_id")
 
 	// Wait for it to be running (not just planned)
-	grpcWaitForAnyState(t, "testapp", "staging", []string{"APPLYING", "COPY", "RUNNING", "COMPLETED"}, 60*time.Second)
+	grpcWaitForAnyState(t, "testapp", "staging", []string{state.Apply.Running, state.Apply.Completed}, 60*time.Second)
 
 	// If already completed, Spirit was too fast -- skip stop/start verification
 	prog := grpcProgress(t, "testapp", "staging")
@@ -311,7 +311,6 @@ func TestGRPC_StopStart_LocalStateSync(t *testing.T) {
 
 	// Stop
 	stopResp := grpcPost(t, "/api/stop", map[string]string{
-		"database":    "testapp",
 		"environment": "staging",
 		"apply_id":    apply.ApplyID,
 	})
@@ -321,13 +320,12 @@ func TestGRPC_StopStart_LocalStateSync(t *testing.T) {
 	require.True(t, stopResult.Accepted, "stop not accepted: %s", stopResult.ErrorMessage)
 
 	// Verify stopped via database-based progress (calls Tern directly)
-	grpcWaitForState(t, "testapp", "staging", "STOPPED", 30*time.Second)
+	grpcWaitForState(t, "testapp", "staging", state.Apply.Stopped, 30*time.Second)
 
 	// Wait for the background poller to sync the stopped state to local storage.
 	grpcWaitForStatusState(t, apply.ApplyID, state.Apply.Stopped, false, 30*time.Second)
 
 	startResp := grpcPost(t, "/api/start", map[string]string{
-		"database":    "testapp",
 		"environment": "staging",
 		"apply_id":    apply.ApplyID,
 	})
@@ -349,7 +347,7 @@ func TestGRPC_StopStart_LocalStateSync(t *testing.T) {
 		"progress by apply_id must not show stopped after start")
 
 	// Wait for completion
-	grpcWaitForState(t, "testapp", "staging", "COMPLETED", 5*time.Minute)
+	grpcWaitForState(t, "testapp", "staging", state.Apply.Completed, 5*time.Minute)
 
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
 }
@@ -375,14 +373,14 @@ func TestGRPC_Volume(t *testing.T) {
 	apply := grpcApply(t, plan.PlanID, "staging", nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
-	grpcWaitForAnyState(t, "testapp", "staging", []string{"APPLYING", "COPY", "COMPLETED"}, 60*time.Second)
+	grpcWaitForAnyState(t, "testapp", "staging", []string{state.Apply.Running, state.Apply.Completed}, 60*time.Second)
 
 	// Try to adjust volume (may fail if Spirit completed too fast -- that's OK)
 	prog := grpcProgress(t, "testapp", "staging")
-	if !strings.Contains(strings.ToUpper(prog.State), "COMPLETED") {
+	if !state.IsState(prog.State, state.Apply.Completed) {
 		resp := grpcPost(t, "/api/volume", map[string]any{ //nolint:bodyclose // closed via utils.CloseAndLog
-			"database":    "testapp",
 			"environment": "staging",
+			"apply_id":    apply.ApplyID,
 			"volume":      5,
 		})
 		defer utils.CloseAndLog(resp.Body)
@@ -398,7 +396,7 @@ func TestGRPC_Volume(t *testing.T) {
 	}
 
 	// Wait for completion
-	grpcWaitForState(t, "testapp", "staging", "COMPLETED", 5*time.Minute)
+	grpcWaitForState(t, "testapp", "staging", state.Apply.Completed, 5*time.Minute)
 
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
 }
@@ -432,13 +430,13 @@ func TestGRPC_DeferCutover(t *testing.T) {
 
 	// Wait for waiting_for_cutover or completed (Spirit may be too fast even with copy-swap)
 	finalState := grpcWaitForAnyState(t, "testapp", "staging",
-		[]string{"WAITING_FOR_CUTOVER", "COMPLETED"}, 3*time.Minute)
+		[]string{state.Apply.WaitingForCutover, state.Apply.Completed}, 3*time.Minute)
 
-	if strings.Contains(strings.ToUpper(finalState), "WAITING_FOR_CUTOVER") {
+	if state.IsState(finalState, state.Apply.WaitingForCutover) {
 		// Trigger cutover
 		resp := grpcPost(t, "/api/cutover", map[string]string{ //nolint:bodyclose // closed via utils.CloseAndLog
-			"database":    "testapp",
 			"environment": "staging",
+			"apply_id":    apply.ApplyID,
 		})
 		defer utils.CloseAndLog(resp.Body)
 		var cutoverResp grpcSimpleResponse
@@ -446,7 +444,7 @@ func TestGRPC_DeferCutover(t *testing.T) {
 		require.True(t, cutoverResp.Accepted, "cutover not accepted: %s", cutoverResp.ErrorMessage)
 
 		// Wait for completion
-		grpcWaitForState(t, "testapp", "staging", "COMPLETED", 2*time.Minute)
+		grpcWaitForState(t, "testapp", "staging", state.Apply.Completed, 2*time.Minute)
 	}
 
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
@@ -482,7 +480,7 @@ func TestGRPC_Status_StaleState(t *testing.T) {
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
 	// Wait for completion via progress (this calls Tern's Progress RPC)
-	grpcWaitForState(t, "testapp", "staging", "COMPLETED", 3*time.Minute)
+	grpcWaitForState(t, "testapp", "staging", state.Apply.Completed, 3*time.Minute)
 
 	// Status reads from local storage, which is updated asynchronously by the
 	// background poller. Poll until the poller has synced the completed state.
@@ -496,15 +494,15 @@ func TestGRPC_Status_StaleState(t *testing.T) {
 			}
 		}
 		return found != nil &&
-			strings.Contains(strings.ToUpper(found.State), "COMPLETED") &&
+			state.IsState(found.State, state.Apply.Completed) &&
 			status.ActiveCount == 0
 	}, 30*time.Second, 500*time.Millisecond,
 		"status did not reflect completed state before timeout")
 
 	// Regression guard: status must not remain pending after Tern completes.
-	assert.NotEqual(t, "pending", found.State,
+	assert.False(t, state.IsState(found.State, state.Apply.Pending),
 		"status must reflect Tern's completed state, not stale pending")
-	assert.Contains(t, strings.ToUpper(found.State), "COMPLETED",
+	assert.True(t, state.IsState(found.State, state.Apply.Completed),
 		"status should show completed state after Tern finishes the apply")
 
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
@@ -534,7 +532,7 @@ func TestGRPC_CrossService_PlanApply_Production(t *testing.T) {
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
 	// Wait for completion
-	grpcWaitForState(t, "testapp", "production", "COMPLETED", 3*time.Minute)
+	grpcWaitForState(t, "testapp", "production", state.Apply.Completed, 3*time.Minute)
 
 	// Verify column exists
 	assert.True(t, grpcColumnExists(t, "production", tableName, colName),

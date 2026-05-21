@@ -114,8 +114,8 @@ func CallApplyAPI(endpoint, planID, environment, caller string, options map[stri
 }
 
 // CallCutoverAPI calls the cutover API and returns the typed result.
-func CallCutoverAPI(endpoint, database, environment, applyID string) (*apitypes.ControlResponse, error) {
-	req := apitypes.ControlRequest{Database: database, Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
+func CallCutoverAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
+	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
 	var result apitypes.ControlResponse
 	if err := doPostInto(endpoint, "/api/cutover", req, &result); err != nil {
 		return nil, err
@@ -253,8 +253,8 @@ func isSchemaFile(name string) bool {
 }
 
 // CallStopAPI calls the stop API and returns the typed result.
-func CallStopAPI(endpoint, database, environment, applyID string) (*apitypes.StopResponse, error) {
-	req := apitypes.ControlRequest{Database: database, Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
+func CallStopAPI(endpoint, environment, applyID string) (*apitypes.StopResponse, error) {
+	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
 	var result apitypes.StopResponse
 	if err := doPostInto(endpoint, "/api/stop", req, &result); err != nil {
 		return nil, err
@@ -263,8 +263,8 @@ func CallStopAPI(endpoint, database, environment, applyID string) (*apitypes.Sto
 }
 
 // CallStartAPI calls the start API and returns the typed result.
-func CallStartAPI(endpoint, database, environment, applyID string) (*apitypes.StartResponse, error) {
-	req := apitypes.ControlRequest{Database: database, Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
+func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartResponse, error) {
+	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
 	var result apitypes.StartResponse
 	if err := doPostInto(endpoint, "/api/start", req, &result); err != nil {
 		return nil, err
@@ -273,8 +273,8 @@ func CallStartAPI(endpoint, database, environment, applyID string) (*apitypes.St
 }
 
 // CallVolumeAPI calls the volume API and returns the typed result.
-func CallVolumeAPI(endpoint, database, environment, applyID string, volume int) (*apitypes.VolumeResponse, error) {
-	req := apitypes.VolumeRequest{Database: database, Environment: environment, Volume: int32(volume), ApplyID: applyID}
+func CallVolumeAPI(endpoint, environment, applyID string, volume int) (*apitypes.VolumeResponse, error) {
+	req := apitypes.VolumeRequest{Environment: environment, Volume: int32(volume), ApplyID: applyID}
 	var result apitypes.VolumeResponse
 	if err := doPostInto(endpoint, "/api/volume", req, &result); err != nil {
 		return nil, err
@@ -283,8 +283,8 @@ func CallVolumeAPI(endpoint, database, environment, applyID string, volume int) 
 }
 
 // CallRevertAPI calls the revert API and returns the typed result.
-func CallRevertAPI(endpoint, database, environment string) (*apitypes.ControlResponse, error) {
-	req := apitypes.ControlRequest{Database: database, Environment: environment, Caller: GenerateCLIOwner()}
+func CallRevertAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
+	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
 	var result apitypes.ControlResponse
 	if err := doPostInto(endpoint, "/api/revert", req, &result); err != nil {
 		return nil, err
@@ -293,8 +293,8 @@ func CallRevertAPI(endpoint, database, environment string) (*apitypes.ControlRes
 }
 
 // CallSkipRevertAPI calls the skip-revert API and returns the typed result.
-func CallSkipRevertAPI(endpoint, database, environment string) (*apitypes.ControlResponse, error) {
-	req := apitypes.ControlRequest{Database: database, Environment: environment, Caller: GenerateCLIOwner()}
+func CallSkipRevertAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
+	req := apitypes.ControlRequest{Environment: environment, ApplyID: applyID, Caller: GenerateCLIOwner()}
 	var result apitypes.ControlResponse
 	if err := doPostInto(endpoint, "/api/skip-revert", req, &result); err != nil {
 		return nil, err

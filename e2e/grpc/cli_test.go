@@ -165,6 +165,7 @@ func TestGRPCCLI_DeferCutover(t *testing.T) {
 		// Trigger cutover via CLI
 		out = e2eutil.RunCLIInDir(t, bin, schemaDir, "cutover",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -223,6 +224,7 @@ func TestGRPCCLI_StopStart(t *testing.T) {
 		// Stop via CLI
 		e2eutil.RunCLIInDir(t, bin, schemaDir, "stop",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 		)
 
@@ -240,6 +242,7 @@ func TestGRPCCLI_StopStart(t *testing.T) {
 		// Start via CLI
 		e2eutil.RunCLIInDir(t, bin, schemaDir, "start",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -296,6 +299,7 @@ func TestGRPCCLI_Volume(t *testing.T) {
 	if !strings.Contains(e2eutil.StripANSI(progOut), "Completed") {
 		volOut, err := e2eutil.RunCLIWithErrorInDir(t, bin, schemaDir, "volume",
 			applyID,
+			"-e", "staging",
 			"-v", "5",
 			"--endpoint", endpoint,
 		)

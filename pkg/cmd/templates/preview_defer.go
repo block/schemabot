@@ -186,7 +186,7 @@ func previewDeferStoppedOutput() {
 	}
 	WriteProgress(data)
 
-	fmt.Println("Use 'schemabot start --apply-id <apply_id>' to resume.")
+	fmt.Println("Use 'schemabot start -e staging <apply_id>' to resume.")
 }
 
 func previewDeferDetachedOutput() {
@@ -201,10 +201,10 @@ func previewDeferDetachedOutput() {
 	fmt.Println("  schemabot status <apply_id>")
 	fmt.Println()
 	fmt.Println("To proceed with cutover:")
-	fmt.Println("  schemabot cutover --apply-id <apply_id>")
+	fmt.Println("  schemabot cutover -e staging <apply_id>")
 	fmt.Println()
 	fmt.Println("To abort the schema change:")
-	fmt.Println("  schemabot stop --apply-id <apply_id>")
+	fmt.Println("  schemabot stop -e staging <apply_id>")
 }
 
 func previewDeferCuttingOutput() {

@@ -39,6 +39,10 @@ Plan requests resolve `database + environment` through server config, then store
 
 ### Control Operations
 
+Control requests are scoped by `apply_id` and `environment`. The API loads the
+stored apply row, derives database and routing metadata from storage, and rejects
+request bodies that try to send database or deployment fields.
+
 | Method | Path | Handler | Description |
 |--------|------|---------|-------------|
 | POST | `/api/cutover` | `handleCutover` | Trigger cutover |

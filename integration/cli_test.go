@@ -234,6 +234,7 @@ CREATE TABLE orders (
 	t.Run("cutover_completes_change", func(t *testing.T) {
 		out := runCLIInDir(t, binPath, schemaDir, "cutover",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -463,6 +464,7 @@ func TestCLI_Stop_NoActiveSchemaChange(t *testing.T) {
 		// Stop with a non-existent apply ID should fail
 		_, err := runCLIWithError(t, binPath, "stop",
 			"apply-nonexistent",
+			"-e", "staging",
 			"--endpoint", endpoint,
 		)
 		require.Error(t, err, "expected error for stop with non-existent apply ID")
@@ -481,6 +483,7 @@ func TestCLI_Start_NoStoppedSchemaChange(t *testing.T) {
 		// Start with a non-existent apply ID should fail
 		_, err := runCLIWithError(t, binPath, "start",
 			"apply-nonexistent",
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -595,6 +598,7 @@ CREATE TABLE items (
 	t.Run("stop_schema_change", func(t *testing.T) {
 		out := runCLIInDir(t, binPath, schemaDir, "stop",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 		)
 		assertContains(t, out, "Schema change stopped")
@@ -617,6 +621,7 @@ CREATE TABLE items (
 	t.Run("start_schema_change", func(t *testing.T) {
 		out := runCLIInDir(t, binPath, schemaDir, "start",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -632,6 +637,7 @@ CREATE TABLE items (
 	t.Run("cutover", func(t *testing.T) {
 		out := runCLIInDir(t, binPath, schemaDir, "cutover",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -660,7 +666,7 @@ CREATE TABLE items (
 	t.Log("Stop/start flow completed successfully")
 }
 
-// TestCLI_StopStartByApplyID tests stop and start using --apply-id instead of --database/--environment.
+// TestCLI_StopStartByApplyID tests stop and start with explicit apply ID and environment scope.
 func TestCLI_StopStartByApplyID(t *testing.T) {
 	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
 
@@ -752,6 +758,7 @@ CREATE TABLE items (
 	t.Run("stop_by_apply_id", func(t *testing.T) {
 		out := runCLIInDir(t, binPath, schemaDir, "stop",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 		)
 		assertContains(t, out, "Schema change stopped")
@@ -762,6 +769,7 @@ CREATE TABLE items (
 	t.Run("start_by_apply_id", func(t *testing.T) {
 		out := runCLIInDir(t, binPath, schemaDir, "start",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -775,6 +783,7 @@ CREATE TABLE items (
 	t.Run("cutover", func(t *testing.T) {
 		out := runCLIInDir(t, binPath, schemaDir, "cutover",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
@@ -1158,6 +1167,7 @@ func TestCLI_Volume_NoActiveSchemaChange(t *testing.T) {
 		// Volume with a non-existent apply ID should fail
 		_, err := runCLIWithError(t, binPath, "volume",
 			"apply-nonexistent",
+			"-e", "staging",
 			"-v", "5",
 			"--endpoint", endpoint,
 		)

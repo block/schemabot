@@ -242,7 +242,7 @@ func TestFetchProgress_ErrorCodeClassification(t *testing.T) {
 		{
 			name:      "invalid_request is permanent",
 			status:    http.StatusBadRequest,
-			body:      `{"error":"database is required","error_code":"invalid_request"}`,
+			body:      `{"error":"apply_id is required","error_code":"invalid_request"}`,
 			retryable: false,
 		},
 		{

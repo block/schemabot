@@ -749,7 +749,13 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// Query engine for live progress. For Vitess, also query during pending state
 	// to surface PlanetScale states (preparing branch, deploy request, etc.).
 	queryDuringPending := c.config.Type == storage.DatabaseTypeVitess
-	if eng != nil && (activeTask.State != state.Task.Pending || queryDuringPending) {
+	// A stopped task is SchemaBot-owned state. Do not let a stale engine poll
+	// report an older active state such as waiting_for_cutover and overwrite it.
+	queryLiveProgress := activeTask.State != state.Task.Pending && activeTask.State != state.Task.Stopped
+	if queryDuringPending && activeTask.State == state.Task.Pending {
+		queryLiveProgress = true
+	}
+	if eng != nil && queryLiveProgress {
 		progressReq := &engine.ProgressRequest{
 			Database:    c.config.Database,
 			Credentials: creds,

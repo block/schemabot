@@ -659,10 +659,10 @@ CREATE TABLE users (
 	})
 
 	t.Run("cutover_works_while_locked", func(t *testing.T) {
-		// Cutover should work while locked (it's for the lock owner's schema change)
-		// It may fail because there's no active schema change, but NOT because of locking
+		// Control operations are scoped by apply_id and should not be rejected by repo locks.
+		// This may fail because the apply does not exist, but not because of locking.
 		out, _ := runCLIWithErrorInDir(t, binPath, schemaDir, "cutover",
-			"-d", dbName,
+			"apply-lock-test",
 			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
@@ -672,9 +672,9 @@ CREATE TABLE users (
 	})
 
 	t.Run("stop_works_while_locked", func(t *testing.T) {
-		// Stop should work while locked (it's for controlling the owner's schema change)
+		// Stop should not be blocked by repo locks.
 		out, _ := runCLIWithErrorInDir(t, binPath, schemaDir, "stop",
-			"-d", dbName,
+			"apply-lock-test",
 			"-e", "staging",
 			"--endpoint", endpoint,
 		)
@@ -683,9 +683,9 @@ CREATE TABLE users (
 	})
 
 	t.Run("start_works_while_locked", func(t *testing.T) {
-		// Start should work while locked
+		// Start should not be blocked by repo locks.
 		out, _ := runCLIWithErrorInDir(t, binPath, schemaDir, "start",
-			"-d", dbName,
+			"apply-lock-test",
 			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
@@ -695,9 +695,9 @@ CREATE TABLE users (
 	})
 
 	t.Run("volume_works_while_locked", func(t *testing.T) {
-		// Volume should work while locked
+		// Volume should not be blocked by repo locks.
 		out, _ := runCLIWithErrorInDir(t, binPath, schemaDir, "volume",
-			"-d", dbName,
+			"apply-lock-test",
 			"-e", "staging",
 			"-v", "5",
 			"--endpoint", endpoint,
@@ -862,6 +862,7 @@ CREATE TABLE orders (
 	t.Run("cleanup", func(t *testing.T) {
 		runCLIInDir(t, binPath, schemaDir, "cutover",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"--watch=false",
 		)

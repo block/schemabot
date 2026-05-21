@@ -776,7 +776,7 @@ func previewWaitingForCutoverOutput() {
 	fmt.Println("Row copy complete. All data has been copied and new writes")
 	fmt.Println("continue to be replicated to keep the shadow table in sync.")
 	fmt.Println()
-	fmt.Println("To proceed: schemabot cutover --apply-id <apply_id>")
+	fmt.Println("To proceed: schemabot cutover -e staging <apply_id>")
 	fmt.Println("Watching for cutover... (Ctrl+C to detach)")
 }
 
@@ -874,7 +874,7 @@ func previewStoppedOutput() {
 		},
 	}
 	WriteProgress(data)
-	fmt.Println("\nStopped. Use 'schemabot start --apply-id <apply_id>' to resume from checkpoint.")
+	fmt.Println("\nStopped. Use 'schemabot start -e staging <apply_id>' to resume from checkpoint.")
 }
 
 func previewApplyWatchOutput() {
@@ -952,7 +952,7 @@ func previewApplyStoppedOutput() {
 	WriteProgress(data)
 
 	fmt.Printf("%s\n", FormatApplyStopped())
-	fmt.Println("Use 'schemabot start --apply-id <apply_id>' to resume.")
+	fmt.Println("Use 'schemabot start -e staging <apply_id>' to resume.")
 }
 
 // =============================================================================
@@ -960,7 +960,7 @@ func previewApplyStoppedOutput() {
 // =============================================================================
 
 func previewStopCommandOutput() {
-	fmt.Println("Stop command: User runs 'schemabot stop --apply-id <apply_id>'")
+	fmt.Println("Stop command: User runs 'schemabot stop -e staging <apply_id>'")
 	fmt.Println()
 
 	WriteStopSuccess(StopData{
@@ -997,7 +997,7 @@ func previewStopCommandOutput() {
 }
 
 func previewStartCommandOutput() {
-	fmt.Println("Start command: User runs 'schemabot start --apply-id <apply_id>'")
+	fmt.Println("Start command: User runs 'schemabot start -e staging <apply_id>'")
 	fmt.Println()
 
 	WriteStartSuccess(StartData{

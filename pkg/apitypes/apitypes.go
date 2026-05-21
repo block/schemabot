@@ -74,16 +74,14 @@ type ApplyRequest struct {
 // ControlRequest is the HTTP request body for control operations
 // (stop, start, cutover, revert, skip-revert).
 type ControlRequest struct {
-	Database    string `json:"database"`
 	Environment string `json:"environment"`
-	ApplyID     string `json:"apply_id,omitempty"`
+	ApplyID     string `json:"apply_id"`
 	Caller      string `json:"caller,omitempty"`
 }
 
 // VolumeRequest is the HTTP request body for POST /api/volume.
 type VolumeRequest struct {
-	ApplyID     string `json:"apply_id,omitempty"`
-	Database    string `json:"database"`
+	ApplyID     string `json:"apply_id"`
 	Environment string `json:"environment"`
 	Volume      int32  `json:"volume"`
 }
