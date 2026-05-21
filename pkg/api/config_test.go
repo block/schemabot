@@ -379,6 +379,33 @@ func TestServerConfig_Validate(t *testing.T) {
 	}
 }
 
+func TestServerConfig_ValidateRejectsLocalRemoteRouteCollision(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"primary": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/primary"},
+				},
+			},
+			"payments": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {Target: "payments-staging", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"staging": "localhost:9090"},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "primary" environment "staging" uses a local dsn`)
+	assert.Contains(t, err.Error(), `tern_deployments also defines deployment "primary"`)
+}
+
 func TestServerConfig_ResolveDatabaseTarget(t *testing.T) {
 	cfg := ServerConfig{
 		Databases: map[string]DatabaseConfig{

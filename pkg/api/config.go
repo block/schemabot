@@ -296,6 +296,10 @@ func (c *ServerConfig) Validate() error {
 		}
 	}
 
+	if err := c.validateNoLocalRemoteRouteCollision(); err != nil {
+		return err
+	}
+
 	// Validate TernDeployments if present (gRPC mode)
 	for name, endpoints := range c.TernDeployments {
 		if len(endpoints) == 0 {
@@ -308,6 +312,28 @@ func (c *ServerConfig) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+// TernClient uses the same deployment/environment key for remote deployments
+// and local database clients. Reject ambiguous config before runtime routing can
+// choose the wrong backend.
+func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
+	for database, dbConfig := range c.Databases {
+		remoteEnvironments, ok := c.TernDeployments[database]
+		if !ok {
+			continue
+		}
+		for environment, envConfig := range dbConfig.Environments {
+			if envConfig.DSN == "" {
+				continue
+			}
+			if remoteEnvironments[environment] == "" {
+				continue
+			}
+			return fmt.Errorf("database %q environment %q uses a local dsn but tern_deployments also defines deployment %q for that environment; rename the database or deployment to avoid ambiguous routing", database, environment, database)
+		}
+	}
 	return nil
 }
 

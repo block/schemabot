@@ -134,10 +134,10 @@ The webhook handler calls `service.ExecutePlan()` — the same code path as the 
 
 ```
 ExecutePlan(ctx, PlanRequest)
-  ├─ Resolve Tern deployment from database name
+  ├─ Resolve database + environment through server config
   ├─ Get or create Tern client (local or gRPC)
   ├─ Call client.Plan() → DDL diff against live database
-  ├─ Store plan in storage.Plans (idempotent)
+  ├─ Store plan and route metadata in storage.Plans (idempotent)
   └─ Return PlanResponse with tables, lint warnings, errors
 ```
 
