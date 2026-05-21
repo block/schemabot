@@ -327,14 +327,17 @@ func TestGRPCClient_Close(t *testing.T) {
 }
 
 // capturingTernServer records the apply_id from Start and Progress requests.
-// progressState controls what Progress returns (defaults to STATE_COMPLETED).
+// progressState is returned only when progressStateSet is true; otherwise the
+// server defaults to STATE_COMPLETED.
 type capturingTernServer struct {
 	ternv1.UnimplementedTernServer
-	mu              sync.Mutex
-	startApplyID    string
-	progressApplyID string
-	progressState   ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
-	startCalled     bool         // tracks whether Start was actually invoked
+	mu               sync.Mutex
+	startApplyID     string
+	progressApplyID  string
+	progressState    ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
+	progressStateSet bool
+	progressErr      error
+	startCalled      bool // tracks whether Start was actually invoked
 }
 
 func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
@@ -351,8 +354,13 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	s.mu.Lock()
 	s.progressApplyID = req.ApplyId
 	ps := s.progressState
+	psSet := s.progressStateSet
+	err := s.progressErr
 	s.mu.Unlock()
-	if ps == 0 {
+	if err != nil {
+		return nil, err
+	}
+	if !psSet {
 		ps = ternv1.State_STATE_COMPLETED
 	}
 	return &ternv1.ProgressResponse{State: ps}, nil
@@ -371,30 +379,84 @@ func (s *capturingTernServer) getProgressApplyID() string {
 }
 
 // mockApplyStore is a minimal ApplyStore for testing ResumeApply.
-type mockApplyStore struct{ storage.ApplyStore }
-
-func (m *mockApplyStore) Update(context.Context, *storage.Apply) error { return nil }
-func (m *mockApplyStore) Heartbeat(context.Context, int64) error       { return nil }
-
-// mockTaskStore is a minimal TaskStore for testing pollForCompletion.
-type mockTaskStore struct{ storage.TaskStore }
-
-func (m *mockTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
-	return nil, nil
+type mockApplyStore struct {
+	storage.ApplyStore
+	apply *storage.Apply
 }
 
-// mockStorage wires together the mock stores.
-type mockStorage struct{ storage.Storage }
+func (m *mockApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	return m.apply, nil
+}
+func (m *mockApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	m.apply = apply
+	return nil
+}
+func (m *mockApplyStore) Heartbeat(context.Context, int64) error { return nil }
 
-func (m *mockStorage) Applies() storage.ApplyStore { return &mockApplyStore{} }
-func (m *mockStorage) Tasks() storage.TaskStore    { return &mockTaskStore{} }
+// mockTaskStore is a minimal TaskStore for testing pollForCompletion.
+type mockTaskStore struct {
+	storage.TaskStore
+	tasks []*storage.Task
+}
+
+func (m *mockTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
+	return m.tasks, nil
+}
+func (m *mockTaskStore) Update(context.Context, *storage.Task) error { return nil }
+
+// mockStorage wires together the mock stores.
+type mockStorage struct {
+	storage.Storage
+	applies *mockApplyStore
+	tasks   *mockTaskStore
+}
+
+func (m *mockStorage) Applies() storage.ApplyStore {
+	if m.applies != nil {
+		return m.applies
+	}
+	return &mockApplyStore{}
+}
+func (m *mockStorage) Tasks() storage.TaskStore {
+	if m.tasks != nil {
+		return m.tasks
+	}
+	return &mockTaskStore{}
+}
+
+func testCapturingGRPCClient(t *testing.T, server *capturingTernServer) (*GRPCClient, func()) {
+	t.Helper()
+
+	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "localhost:0")
+	require.NoError(t, err, "failed to listen")
+
+	grpcServer := grpc.NewServer()
+	ternv1.RegisterTernServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err, "failed to dial")
+
+	client := &GRPCClient{
+		conn:    conn,
+		client:  ternv1.NewTernClient(conn),
+		storage: &mockStorage{},
+	}
+	cleanup := func() {
+		utils.CloseAndLog(client)
+		grpcServer.Stop()
+		utils.CloseAndLog(lis)
+	}
+	return client, cleanup
+}
 
 func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 	// Progress returns STOPPED initially so ResumeApply checks remote state,
 	// confirms the apply is stopped, and calls Start. After Start, the mock
 	// transitions to COMPLETED so the poller exits.
 	server := &capturingTernServer{
-		progressState: ternv1.State_STATE_STOPPED,
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
 	}
 
 	// Start a test gRPC server
@@ -452,7 +514,8 @@ func TestGRPCClient_ResumeApply_SkipsStartWhenNotStopped(t *testing.T) {
 	// Progress returns COMPLETED — Tern already finished the apply even though
 	// local state says "stopped". Start should NOT be called.
 	server := &capturingTernServer{
-		progressState: ternv1.State_STATE_COMPLETED,
+		progressState:    ternv1.State_STATE_COMPLETED,
+		progressStateSet: true,
 	}
 
 	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "localhost:0")
@@ -493,6 +556,128 @@ func TestGRPCClient_ResumeApply_SkipsStartWhenNotStopped(t *testing.T) {
 	// State should have been updated from Tern's response.
 	assert.Equal(t, state.Apply.Completed, apply.State,
 		"apply state should reflect Tern's real state")
+}
+
+func TestGRPCClient_PollFailsWhenRemoteApplyIsNotFound(t *testing.T) {
+	// A known remote apply ID returning NotFound means the data plane can no
+	// longer report progress for work the control plane believes exists. The
+	// local apply fails so workers do not keep polling a stale remote ID.
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
+		progressErr: status.Error(codes.NotFound, "apply not found"),
+	})
+	defer cleanup()
+
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-missing-remote",
+		State:          state.Task.Running,
+	}
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-control-plane",
+		Database:        "testdb",
+		Environment:     "development",
+		ExternalID:      "remote-not-found",
+		State:           state.Apply.Running,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	client.pollForCompletion(ctx, apply)
+
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remote-not-found")
+	assert.NotNil(t, apply.CompletedAt)
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, task.ErrorMessage, "remote-not-found")
+	assert.NotNil(t, task.CompletedAt)
+}
+
+func TestGRPCClient_PollFailsWhenExactRemoteApplyHasNoActiveProgress(t *testing.T) {
+	// STATE_NO_ACTIVE_CHANGE is only valid for database-scoped discovery. An
+	// exact apply-id progress request returning no active work is inconsistent
+	// cross-plane state and should fail the local apply.
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
+		progressState:    ternv1.State_STATE_NO_ACTIVE_CHANGE,
+		progressStateSet: true,
+	})
+	defer cleanup()
+
+	task := &storage.Task{
+		ID:             12,
+		TaskIdentifier: "task-no-active",
+		State:          state.Task.Running,
+	}
+	apply := &storage.Apply{
+		ID:              2,
+		ApplyIdentifier: "apply-no-active",
+		Database:        "testdb",
+		Environment:     "development",
+		ExternalID:      "remote-no-active",
+		State:           state.Apply.Running,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	client.pollForCompletion(ctx, apply)
+
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "no active schema change")
+	assert.NotNil(t, apply.CompletedAt)
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, task.ErrorMessage, "no active schema change")
+	assert.NotNil(t, task.CompletedAt)
+}
+
+func TestGRPCClient_RemoteProgressLossDoesNotOverwriteTerminalApply(t *testing.T) {
+	// Remote progress loss can fail the local apply only while the durable
+	// control-plane row is still non-terminal. If storage already has a terminal
+	// state, preserve it instead of overwriting it with a stale remote lookup
+	// failure.
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
+		progressErr: status.Error(codes.NotFound, "apply not found"),
+	})
+	defer cleanup()
+
+	storedApply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-already-complete",
+		Database:        "testdb",
+		Environment:     "development",
+		ExternalID:      "remote-already-complete",
+		State:           state.Apply.Completed,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: storedApply},
+		tasks: &mockTaskStore{tasks: []*storage.Task{{
+			ID:             13,
+			TaskIdentifier: "task-already-complete",
+			State:          state.Task.Completed,
+		}}},
+	}
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-already-complete",
+		Database:        "testdb",
+		Environment:     "development",
+		ExternalID:      "remote-already-complete",
+		State:           state.Apply.Running,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	client.pollForCompletion(ctx, apply)
+
+	assert.Equal(t, state.Apply.Completed, apply.State)
+	assert.Empty(t, apply.ErrorMessage)
 }
 
 func TestNewGRPCClient(t *testing.T) {

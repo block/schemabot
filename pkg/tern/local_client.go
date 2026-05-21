@@ -651,11 +651,15 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		if lookupErr != nil {
 			return nil, fmt.Errorf("get apply %s: %w", req.ApplyId, lookupErr)
 		}
-		if apply != nil {
-			tasks, err = c.storage.Tasks().GetByApplyID(ctx, apply.ID)
-			if err != nil {
-				return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, err)
-			}
+		if apply == nil {
+			return nil, fmt.Errorf("get apply %s: %w", req.ApplyId, storage.ErrApplyNotFound)
+		}
+		tasks, err = c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+		if err != nil {
+			return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, err)
+		}
+		if len(tasks) == 0 {
+			return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, storage.ErrTaskNotFound)
 		}
 	} else {
 		// Fall back to database lookup — this means the caller didn't provide

@@ -107,8 +107,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -408,6 +411,125 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 	return nil
 }
 
+type remoteApplyTransitionSkipReason string
+
+const (
+	remoteApplyTransitionReady        remoteApplyTransitionSkipReason = ""
+	remoteApplyTransitionReloadFailed remoteApplyTransitionSkipReason = "reload_failed"
+	remoteApplyTransitionMissing      remoteApplyTransitionSkipReason = "apply_missing"
+	remoteApplyTransitionTerminal     remoteApplyTransitionSkipReason = "already_terminal"
+)
+
+func (c *GRPCClient) reloadRemoteApplyForTransition(ctx context.Context, apply *storage.Apply) (*storage.Apply, remoteApplyTransitionSkipReason, error) {
+	currentApply, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return nil, remoteApplyTransitionReloadFailed, fmt.Errorf("reload remote gRPC apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if currentApply == nil {
+		return nil, remoteApplyTransitionMissing, nil
+	}
+	if state.IsTerminalApplyState(currentApply.State) {
+		*apply = *currentApply
+		return currentApply, remoteApplyTransitionTerminal, nil
+	}
+	return currentApply, remoteApplyTransitionReady, nil
+}
+
+func logSkippedRemoteApplyTransition(operation string, apply, currentApply *storage.Apply, reason remoteApplyTransitionSkipReason, err error) {
+	fields := []any{
+		"operation", operation,
+		"apply_id", apply.ApplyIdentifier,
+		"external_id", apply.ExternalID,
+		"reason", reason,
+	}
+	if currentApply != nil {
+		fields = append(fields, "state", currentApply.State)
+	}
+
+	switch reason {
+	case remoteApplyTransitionReloadFailed:
+		fields = append(fields, "error", err)
+		slog.Error("skipping remote gRPC apply state transition", fields...)
+	case remoteApplyTransitionMissing:
+		slog.Warn("skipping remote gRPC apply state transition", fields...)
+	case remoteApplyTransitionTerminal:
+		slog.Debug("skipping remote gRPC apply state transition", fields...)
+	default:
+		slog.Warn("skipping remote gRPC apply state transition", fields...)
+	}
+}
+
+func (c *GRPCClient) failApplyAfterRemoteProgressLoss(ctx context.Context, apply *storage.Apply, message string) {
+	currentApply, skipReason, err := c.reloadRemoteApplyForTransition(ctx, apply)
+	if skipReason != remoteApplyTransitionReady {
+		logSkippedRemoteApplyTransition("fail apply after remote progress loss", apply, currentApply, skipReason, err)
+		return
+	}
+
+	now := time.Now()
+	tasks, taskErr := c.storage.Tasks().GetByApplyID(ctx, currentApply.ID)
+	if taskErr != nil {
+		slog.Error("failed to load tasks after remote gRPC apply failed",
+			"apply_id", currentApply.ApplyIdentifier,
+			"external_id", currentApply.ExternalID,
+			"error", taskErr)
+	}
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			continue
+		}
+		task.State = state.Task.Failed
+		task.ErrorMessage = message
+		task.CompletedAt = &now
+		task.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			slog.Error("failed to update task after remote gRPC apply failure",
+				"apply_id", currentApply.ApplyIdentifier,
+				"task_id", task.TaskIdentifier,
+				"error", err)
+		}
+	}
+
+	currentApply.State = state.Apply.Failed
+	currentApply.ErrorMessage = message
+	currentApply.CompletedAt = &now
+	currentApply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, currentApply); err != nil {
+		slog.Error("failed to update apply after remote gRPC apply failure",
+			"apply_id", currentApply.ApplyIdentifier,
+			"external_id", currentApply.ExternalID,
+			"error", err)
+		return
+	}
+	*apply = *currentApply
+	metrics.AdjustActiveApplies(ctx, -1, currentApply.Database, currentApply.Environment)
+}
+
+func (c *GRPCClient) persistRemoteTerminalApply(ctx context.Context, apply *storage.Apply, now time.Time) bool {
+	currentApply, skipReason, err := c.reloadRemoteApplyForTransition(ctx, apply)
+	if skipReason != remoteApplyTransitionReady {
+		logSkippedRemoteApplyTransition("persist remote terminal apply", apply, currentApply, skipReason, err)
+		return skipReason == remoteApplyTransitionMissing || skipReason == remoteApplyTransitionTerminal
+	}
+
+	currentApply.State = apply.State
+	currentApply.ErrorMessage = apply.ErrorMessage
+	currentApply.StartedAt = apply.StartedAt
+	currentApply.CompletedAt = &now
+	currentApply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, currentApply); err != nil {
+		slog.Error("failed to update terminal remote gRPC apply",
+			"apply_id", currentApply.ApplyIdentifier,
+			"external_id", currentApply.ExternalID,
+			"state", currentApply.State,
+			"error", err)
+		return false
+	}
+	*apply = *currentApply
+	metrics.AdjustActiveApplies(ctx, -1, currentApply.Database, currentApply.Environment)
+	return true
+}
+
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
 // Also maintains heartbeat to keep the lease on the apply.
 func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply) {
@@ -432,7 +554,23 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				ApplyId:     apply.ExternalID,
 			})
 			if err != nil {
+				if status.Code(err) == codes.NotFound {
+					message := fmt.Sprintf("remote apply %s was not found by data plane", apply.ExternalID)
+					c.failApplyAfterRemoteProgressLoss(ctx, apply, message)
+					return
+				}
+				slog.Warn("remote gRPC progress poll failed",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"error", err)
 				continue
+			}
+			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
+				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id", apply.ExternalID)
+				c.failApplyAfterRemoteProgressLoss(ctx, apply, message)
+				return
 			}
 
 			// Update apply state based on response (skip if proto state is unspecified)
@@ -467,11 +605,17 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 
 			terminal := isTerminalProtoState(resp.State)
 			if terminal {
-				apply.CompletedAt = &now
+				if c.persistRemoteTerminalApply(ctx, apply, now) {
+					return
+				}
+				continue
 			}
-			_ = c.storage.Applies().Update(ctx, apply)
-			if terminal {
-				return
+			if err := c.storage.Applies().Update(ctx, apply); err != nil {
+				slog.Error("failed to update remote gRPC apply progress",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"state", apply.State,
+					"error", err)
 			}
 		}
 	}
