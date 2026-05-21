@@ -573,6 +573,87 @@ func TestLocalClient_Progress(t *testing.T) {
 	assert.Equal(t, ternv1.State_STATE_NO_ACTIVE_CHANGE, resp.State, "expected STATE_NO_ACTIVE_CHANGE when no active schema change, got: %v", resp.State)
 }
 
+func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err, "failed to create client")
+	defer utils.CloseAndLog(client)
+
+	// Apply-ID scoped progress is an exact lookup. Missing apply rows should
+	// fail visibly instead of returning the database-scoped no-active sentinel.
+	_, err = client.Progress(t.Context(), &ternv1.ProgressRequest{
+		ApplyId:     "missing-apply",
+		Type:        storage.DatabaseTypeMySQL,
+		Database:    "testdb",
+		Environment: localClientTestEnvironment,
+	})
+	require.ErrorIs(t, err, storage.ErrApplyNotFound)
+}
+
+func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingTasks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err, "failed to create client")
+	defer utils.CloseAndLog(client)
+
+	applyID := "apply-missing-tasks"
+	now := time.Now()
+	_, err = stor.Applies().Create(t.Context(), &storage.Apply{
+		ApplyIdentifier: applyID,
+		PlanID:          1,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+		Options:         []byte("{}"),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	// An apply row without tasks is inconsistent storage for progress. Return an
+	// error so gRPC callers can fail the remote apply visibly.
+	_, err = client.Progress(t.Context(), &ternv1.ProgressRequest{
+		ApplyId:     applyID,
+		Type:        storage.DatabaseTypeMySQL,
+		Database:    "testdb",
+		Environment: localClientTestEnvironment,
+	})
+	require.ErrorIs(t, err, storage.ErrTaskNotFound)
+}
+
 func TestLocalClient_Progress_UsesConfigDatabase(t *testing.T) {
 	// In local mode, LocalClient always uses the database from config,
 	// not from the request. This test verifies that behavior.

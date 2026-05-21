@@ -338,6 +338,7 @@ type capturingTernServer struct {
 	progressApplyID  string
 	progressState    ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
 	progressStateSet bool
+	progressErr      error
 	startCalled      bool // tracks whether Start was actually invoked
 }
 
@@ -354,9 +355,13 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
 	s.progressApplyID = req.ApplyId
+	progressErr := s.progressErr
 	ps := s.progressState
 	progressStateSet := s.progressStateSet
 	s.mu.Unlock()
+	if progressErr != nil {
+		return nil, progressErr
+	}
 	if ps == 0 && !progressStateSet {
 		ps = ternv1.State_STATE_COMPLETED
 	}
@@ -596,6 +601,52 @@ func TestGRPCClient_ResumeApplyFailsWhenRemoteApplyDisappears(t *testing.T) {
 	assert.Contains(t, apply.ErrorMessage, "remote-missing")
 	assert.NotNil(t, apply.CompletedAt)
 	assert.Equal(t, "remote-missing", server.getProgressApplyID())
+}
+
+func TestGRPCClient_ResumeApplyFailsWhenRemoteApplyIsNotFound(t *testing.T) {
+	// A missing remote apply is inconsistent cross-plane state. The scheduler
+	// worker should fail the local apply and release the worker instead of
+	// retrying a lookup that the data plane has definitively rejected.
+	server := &capturingTernServer{
+		progressErr: status.Error(codes.NotFound, "apply not found"),
+	}
+
+	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "localhost:0")
+	require.NoError(t, err, "failed to listen")
+
+	grpcServer := grpc.NewServer()
+	ternv1.RegisterTernServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err, "failed to dial")
+
+	client := &GRPCClient{
+		conn:    conn,
+		client:  ternv1.NewTernClient(conn),
+		storage: &mockStorage{},
+	}
+	defer utils.CloseAndLog(client)
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-local",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-not-found",
+		State:           state.Apply.Running,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = client.ResumeApply(ctx, apply)
+	require.Error(t, err)
+	assert.Equal(t, codes.NotFound, status.Code(err))
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remote-not-found")
+	assert.NotNil(t, apply.CompletedAt)
+	assert.Equal(t, "remote-not-found", server.getProgressApplyID())
 }
 
 func TestNewGRPCClient(t *testing.T) {

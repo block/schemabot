@@ -105,7 +105,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
@@ -579,6 +581,21 @@ func (c *GRPCClient) markRemoteApplyFailed(ctx context.Context, apply *storage.A
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 }
 
+func (c *GRPCClient) failMissingRemoteApply(ctx context.Context, apply *storage.Apply, message string, cause error) error {
+	tasks, taskErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if taskErr != nil {
+		slog.Error("failed to load tasks after remote gRPC apply was not found",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"error", taskErr)
+	}
+	c.markRemoteApplyFailed(ctx, apply, tasks, message, false)
+	if cause != nil {
+		return fmt.Errorf("poll remote apply %s for %s: %w", apply.ExternalID, apply.ApplyIdentifier, cause)
+	}
+	return fmt.Errorf("poll remote apply %s for %s: %s", apply.ExternalID, apply.ApplyIdentifier, message)
+}
+
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
 // Also maintains heartbeat to keep the lease on the apply.
 func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply) error {
@@ -606,6 +623,10 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				ApplyId:     apply.ExternalID,
 			})
 			if err != nil {
+				if status.Code(err) == codes.NotFound {
+					message := fmt.Sprintf("remote apply %s was not found by data plane", apply.ExternalID)
+					return c.failMissingRemoteApply(ctx, apply, message, err)
+				}
 				slog.Warn("remote gRPC progress poll failed",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
@@ -624,15 +645,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					"consecutive_no_active", consecutiveNoActive)
 				if consecutiveNoActive >= grpcNoActiveProgressLimit {
 					message := fmt.Sprintf("remote apply %s returned no active schema change", apply.ExternalID)
-					tasks, taskErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
-					if taskErr != nil {
-						slog.Error("failed to load tasks after remote gRPC apply disappeared",
-							"apply_id", apply.ApplyIdentifier,
-							"external_id", apply.ExternalID,
-							"error", taskErr)
-					}
-					c.markRemoteApplyFailed(ctx, apply, tasks, message, false)
-					return fmt.Errorf("poll remote apply %s for %s: %s", apply.ExternalID, apply.ApplyIdentifier, message)
+					return c.failMissingRemoteApply(ctx, apply, message, nil)
 				}
 				continue
 			}

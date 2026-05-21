@@ -20,6 +20,10 @@ type Client interface {
 	Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error)
 
 	// Progress returns detailed progress for an active schema change.
+	// When ApplyId is set, progress is an exact apply lookup and missing
+	// apply/task data is returned as an error. Without ApplyId, callers get
+	// database-scoped progress and no active work is reported as
+	// STATE_NO_ACTIVE_CHANGE.
 	Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error)
 
 	// Cutover triggers the cutover phase when defer_cutover was used.

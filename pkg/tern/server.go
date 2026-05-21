@@ -2,12 +2,14 @@ package tern
 
 import (
 	"context"
+	"errors"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Server wraps a Client as a gRPC TernServer.
@@ -54,6 +56,9 @@ func (s *Server) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.A
 func (s *Server) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	resp, err := s.client.Progress(ctx, req)
 	if err != nil {
+		if errors.Is(err, storage.ErrApplyNotFound) || errors.Is(err, storage.ErrTaskNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return resp, nil
