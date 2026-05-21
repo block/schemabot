@@ -30,6 +30,7 @@ if ! minikube status > /dev/null 2>&1; then
     echo "Starting minikube..."
     minikube start --driver=docker --cpus=2 --memory=2048
 fi
+kubectl config use-context minikube > /dev/null
 
 # --- Build image ---
 
@@ -44,11 +45,26 @@ rm -f "$REPO_ROOT/deploy/local/schemabot-dev"
 PIDS=()
 cleanup() {
     echo "Cleaning up port-forwards..."
-    for pid in "${PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
+    for pid in "${PIDS[@]:-}"; do
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
     done
 }
 trap cleanup EXIT
+
+collect_pod_logs() {
+    echo "=== Control Plane ==="
+    kubectl logs -n "$NAMESPACE" -l app.kubernetes.io/instance=control-plane --tail=200 2>/dev/null || true
+    echo "=== Data Plane ==="
+    kubectl logs -n "$NAMESPACE" -l app.kubernetes.io/instance=data-plane --tail=200 2>/dev/null || true
+    echo "=== MySQL Control Plane ==="
+    kubectl logs -n "$NAMESPACE" -l app=mysql-control-plane --tail=50 2>/dev/null || true
+    echo "=== MySQL Data Plane ==="
+    kubectl logs -n "$NAMESPACE" -l app=mysql-data-plane --tail=50 2>/dev/null || true
+    echo "=== All pods ==="
+    kubectl get pods -n "$NAMESPACE" -o wide 2>/dev/null || true
+}
 
 # --- Deploy ---
 
@@ -100,9 +116,14 @@ TEST_EXIT_CODE=0
 E2E_SCHEMABOT_URL=http://localhost:8080 \
 E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:3307)/schemabot?parseTime=true&multiStatements=true" \
 E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:3308)/testapp?parseTime=true&multiStatements=true" \
-go test -count=1 -v -tags=e2e -timeout=10m ./e2e/k8s/... || TEST_EXIT_CODE=$?
+go test -count=1 -v -tags=e2e -timeout=8m ./e2e/k8s/... || TEST_EXIT_CODE=$?
 
 # --- Teardown ---
+
+if [ "$TEST_EXIT_CODE" -ne 0 ]; then
+    echo "k8s e2e tests failed; collecting pod logs before teardown..."
+    collect_pod_logs
+fi
 
 echo "Tearing down..."
 kubectl delete namespace "$NAMESPACE" --ignore-not-found

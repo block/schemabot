@@ -91,6 +91,7 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 	svc := schemabotapi.New(storage, serverConfig, map[string]tern.Client{
 		appDBName + "/staging": localClient,
 	}, logger)
+	startTestScheduler(t, svc)
 
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
@@ -127,6 +128,13 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 	})
 
 	return testServer{Addr: addr, Storage: storage, Service: svc}
+}
+
+func startTestScheduler(t *testing.T, svc *schemabotapi.Service) {
+	t.Helper()
+
+	require.NoError(t, svc.SetSchedulerPollInterval(200*time.Millisecond))
+	svc.StartScheduler(t.Context())
 }
 
 // postJSON marshals body as JSON, POSTs to url, asserts HTTP 200,

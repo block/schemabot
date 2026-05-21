@@ -98,6 +98,12 @@ func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
 // The webhook handler uses this to start watching progress and posting PR comments.
 type RecoveryCallback func(apply *storage.Apply)
 
+type pendingObserverKey struct {
+	database    string
+	deployment  string
+	environment string
+}
+
 type Service struct {
 	storage     storage.Storage
 	config      *ServerConfig
@@ -106,7 +112,9 @@ type Service struct {
 	logger      *slog.Logger
 
 	// Scheduler loop management.
+	schedulerMu           sync.Mutex
 	stopRecovery          chan struct{}
+	schedulerWake         chan struct{}
 	recoveryWg            sync.WaitGroup
 	schedulerPollInterval time.Duration
 
@@ -114,6 +122,9 @@ type Service struct {
 	// ResumeApply starts the engine/poller. Set by the webhook handler to attach
 	// an observer for PR comments.
 	OnApplyRecovered RecoveryCallback
+
+	pendingObserverMu sync.Mutex
+	pendingObservers  map[pendingObserverKey]tern.ProgressObserver
 }
 
 // SetApplyObserver sets a progress observer on the tern client for an apply.
@@ -134,9 +145,9 @@ func (s *Service) SetApplyObserver(database, deployment, environment string, app
 	client.SetObserver(applyID, observer)
 }
 
-// SetPendingObserver sets an observer that will be consumed by the next Apply()
-// call. The observer is registered before the engine starts, preventing the
-// race where the apply completes before the observer is set.
+// SetPendingObserver stores an observer for the next queued apply for this
+// target. ExecuteApply consumes it after creating the durable apply row and
+// registers it before a scheduler worker can start engine work.
 func (s *Service) SetPendingObserver(database, deployment, environment string, observer tern.ProgressObserver) {
 	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
 	if err != nil {
@@ -144,13 +155,28 @@ func (s *Service) SetPendingObserver(database, deployment, environment string, o
 			"database", database, "deployment", deployment, "environment", environment, "error", err)
 		return
 	}
-	client, err := s.TernClient(deployment, environment)
-	if err != nil {
-		s.logger.Error("failed to get tern client for pending observer",
-			"database", database, "deployment", deployment, "environment", environment, "error", err)
+
+	key := pendingObserverKey{database: database, deployment: deployment, environment: environment}
+	s.pendingObserverMu.Lock()
+	defer s.pendingObserverMu.Unlock()
+	if s.pendingObservers == nil {
+		s.pendingObservers = make(map[pendingObserverKey]tern.ProgressObserver)
+	}
+	if observer == nil {
+		delete(s.pendingObservers, key)
 		return
 	}
-	client.SetPendingObserver(observer)
+	s.pendingObservers[key] = observer
+}
+
+func (s *Service) consumePendingObserver(database, deployment, environment string) tern.ProgressObserver {
+	key := pendingObserverKey{database: database, deployment: deployment, environment: environment}
+
+	s.pendingObserverMu.Lock()
+	defer s.pendingObserverMu.Unlock()
+	observer := s.pendingObservers[key]
+	delete(s.pendingObservers, key)
+	return observer
 }
 
 // New creates a new SchemaBot service.
@@ -170,6 +196,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		ternClients:           ternClients,
 		logger:                logger,
 		schedulerPollInterval: SchedulerPollInterval,
+		pendingObservers:      make(map[pendingObserverKey]tern.ProgressObserver),
 	}
 }
 
@@ -182,6 +209,8 @@ func (s *Service) SetSchedulerPollInterval(interval time.Duration) error {
 	if interval <= 0 {
 		return fmt.Errorf("scheduler poll interval must be positive")
 	}
+	s.schedulerMu.Lock()
+	defer s.schedulerMu.Unlock()
 	if s.stopRecovery != nil {
 		return fmt.Errorf("scheduler already running")
 	}
@@ -463,7 +492,7 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 // resolveApplyID translates a SchemaBot apply_identifier into the ID that the
 // Tern backend expects.
 //
-// gRPC mode (external_id is set by ExecuteApply when Tern is remote):
+// gRPC mode (external_id is set after scheduler dispatch):
 //
 //	caller sends "apply-abc123"
 //	  → storage lookup: apply_identifier="apply-abc123", external_id="tern-42"
@@ -472,10 +501,9 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 //
 // Local mode (external_id is empty):
 //
-// LocalClient.Apply() creates the apply record in the same database as
+// LocalClient dispatches the apply from the same storage database as
 // the API layer. It never sets external_id because there is no remote
-// Tern — LocalClient IS the engine. ExecuteApply checks
-// client.IsRemote() == false and skips generating a new identifier.
+// Tern.
 //
 //	caller sends "apply-def456"
 //	  → storage lookup: apply_identifier="apply-def456", external_id=""

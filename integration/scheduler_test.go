@@ -127,6 +127,7 @@ func TestScheduler_BasicClaimAndResume(t *testing.T) {
 	require.True(t, applyResp["accepted"] == true)
 	applyID, _ := applyResp["apply_id"].(string)
 	waitForState(t, "http://"+ts.Addr, applyID, "completed", 15*time.Second)
+	ts.Service.StopScheduler()
 
 	// Remove the table so the second plan contains DDL that recovery can resume.
 	targetConn, err := sql.Open("mysql", appDSN)

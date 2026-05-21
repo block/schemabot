@@ -51,10 +51,9 @@ type Client interface {
 	// Health checks the service health.
 	Health(ctx context.Context) error
 
-	// ResumeApply resumes an in-progress apply whose heartbeat has expired.
-	// Uses checkpoint/resume capabilities of the underlying engine.
-	// This is called by Service.RecoverInProgress on startup for applies
-	// with stale heartbeats (crashed workers).
+	// ResumeApply starts or resumes work claimed by a scheduler worker.
+	// Fresh pending applies are dispatched for the first time; stale applies
+	// use checkpoint/resume capabilities of the underlying engine.
 	ResumeApply(ctx context.Context, apply *storage.Apply) error
 
 	// Endpoint returns the address this client connects to.
@@ -64,12 +63,6 @@ type Client interface {
 
 	// IsRemote reports whether this client delegates to a separate Tern
 	// service with its own storage.
-	//
-	// When true (GRPCClient): ExecuteApply creates apply/task records in
-	// SchemaBot's storage and stores Tern's apply_id as external_id.
-	//
-	// When false (LocalClient): Apply() already created the records in the
-	// same database — ExecuteApply reuses them.
 	IsRemote() bool
 
 	// SetPendingObserver sets an observer that will be consumed by the next

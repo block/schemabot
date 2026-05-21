@@ -72,6 +72,7 @@ func TestResolveApplyID_ControlOperations(t *testing.T) {
 	svc := schemabotapi.New(st, serverConfig, map[string]tern.Client{
 		"default/staging": ternClient,
 	}, logger)
+	startTestScheduler(t, svc)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	mux := http.NewServeMux()
@@ -138,10 +139,8 @@ func TestResolveApplyID_ControlOperations(t *testing.T) {
 	applyIdentifier, ok := applyResult["apply_id"].(string)
 	require.True(t, ok && applyIdentifier != "", "apply response missing apply_id")
 
-	// 5. Verify apply_identifier != external_id.
-	storedApply, err := st.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
-	require.NoError(t, err)
-	require.NotNil(t, storedApply, "apply not found in storage")
+	// 5. Scheduler dispatches the queued apply and stores remote Tern's id.
+	storedApply := waitForStoredExternalID(t, st.Applies(), applyIdentifier, 10*time.Second)
 	require.NotEmpty(t, storedApply.ExternalID, "external_id should be set by remote Tern")
 	require.NotEqual(t, applyIdentifier, storedApply.ExternalID,
 		"apply_identifier and external_id must differ — resolveApplyID translates between them")

@@ -362,15 +362,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 
 // buildApplyOptions converts apply options to the string map used by the engine.
 func buildApplyOptions(apply *storage.Apply) map[string]string {
-	opts := apply.GetOptions()
-	options := make(map[string]string)
-	if opts.DeferCutover {
-		options["defer_cutover"] = "true"
-	}
-	if opts.AllowUnsafe {
-		options["allow_unsafe"] = "true"
-	}
-	return options
+	return apply.GetOptions().Map()
 }
 
 // prepareRetryableTasksForResume queues only the task work that previously
@@ -501,6 +493,11 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		return nil
 	}
 
+	if state.IsState(apply.State, state.Apply.Pending) {
+		c.dispatchQueuedApply(ctx, apply, tasks, plan)
+		return nil
+	}
+
 	c.logger.Info("resuming apply (heartbeat expired)",
 		"apply_id", apply.ApplyIdentifier,
 		"database", apply.Database,
@@ -570,4 +567,21 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	}
 
 	return nil
+}
+
+func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) {
+	options := buildApplyOptions(apply)
+	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
+	c.cancelMu.Lock()
+	c.cancelApply = cancelApply
+	c.cancelMu.Unlock()
+
+	c.logger.Info("dispatching queued apply",
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"state", apply.State,
+		"task_count", len(tasks),
+	)
+
+	c.startApplyExecution(applyCtx, apply, tasks, plan, options)
 }

@@ -12,6 +12,9 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -383,11 +386,63 @@ func (m *mockTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, e
 	return nil, nil
 }
 
+func (m *mockTaskStore) Update(context.Context, *storage.Task) error {
+	return nil
+}
+
 // mockStorage wires together the mock stores.
 type mockStorage struct{ storage.Storage }
 
 func (m *mockStorage) Applies() storage.ApplyStore { return &mockApplyStore{} }
 func (m *mockStorage) Tasks() storage.TaskStore    { return &mockTaskStore{} }
+
+func TestGRPCClientMarkDispatchFailedDecrementsActiveAppliesForRetryableFailure(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	client := &GRPCClient{storage: &mockStorage{}}
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-123",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	task := &storage.Task{
+		TaskIdentifier: "task-123",
+		State:          state.Task.Pending,
+	}
+
+	client.markDispatchFailed(t.Context(), apply, []*storage.Task{task}, "connection reset", true)
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State)
+	assert.Equal(t, state.Task.FailedRetryable, task.State)
+	assert.Nil(t, apply.CompletedAt)
+	assert.Nil(t, task.CompletedAt)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	var found bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, metric := range sm.Metrics {
+			if metric.Name != "schemabot.active_applies" {
+				continue
+			}
+			found = true
+			sum, ok := metric.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			require.Len(t, sum.DataPoints, 1)
+			assert.Equal(t, int64(-1), sum.DataPoints[0].Value)
+		}
+	}
+	assert.True(t, found, "schemabot.active_applies metric not found")
+}
 
 func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 	// Progress returns STOPPED initially so ResumeApply checks remote state,

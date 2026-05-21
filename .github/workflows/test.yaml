@@ -246,13 +246,6 @@ jobs:
           driver: docker
           cpus: 2
           memory: 2048
-      - name: "Build and load image"
-        run: |
-          CGO_ENABLED=0 GOOS=linux go build -o bin/schemabot-linux ./pkg/cmd
-          cp bin/schemabot-linux deploy/local/schemabot-dev
-          eval $(minikube docker-env)
-          docker build -t schemabot:test -f deploy/local/Dockerfile.dev deploy/local/
-          rm -f deploy/local/schemabot-dev
       - name: "Deploy and test"
         run: e2e/k8s/e2e-test.sh
       - name: "Pod logs on failure"

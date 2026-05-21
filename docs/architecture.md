@@ -327,13 +327,13 @@ In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each sche
 | Scheduler                |      | Scheduler                |
 | +----------------------+ |      | +----------------------+ |
 | | worker 0             | |      | | worker 0             | |
-| | claim stale apply    | |      | | claim stale apply    | |
+| | claim apply work     | |      | | claim apply work     | |
 | | attach Observer      | |      | | attach Observer      | |
 | | ResumeApply          | |      | | ResumeApply          | |
 | +----------------------+ |      | +----------------------+ |
 | +----------------------+ |      | +----------------------+ |
 | | worker 1             | |      | | worker 1             | |
-| | claim stale apply    | |      | | claim stale apply    | |
+| | claim apply work     | |      | | claim apply work     | |
 | | attach Observer      | |      | | attach Observer      | |
 | | ResumeApply          | |      | | ResumeApply          | |
 | +----------------------+ |      | +----------------------+ |
@@ -358,9 +358,70 @@ In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each sche
 
 The storage arrows represent scheduler coordination. The GitHub arrows represent optional observer notifications; CLI applies simply run without an observer.
 
-A **claim** is an atomic storage operation: it selects one stale apply and refreshes its `updated_at` heartbeat in the same transaction. That heartbeat refresh is the scheduler's lease while it reloads state and calls `ResumeApply()`. Claims use `FOR UPDATE SKIP LOCKED` so multiple scheduler workers can run concurrently without taking the same apply.
+A **claim** is an atomic storage operation: it selects one apply that needs work and refreshes its `updated_at` heartbeat in the same transaction. That heartbeat refresh is the scheduler's lease while it reloads state and calls `ResumeApply()`. Claims use `FOR UPDATE SKIP LOCKED` so multiple scheduler workers can run concurrently without taking the same apply.
 
-An apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
+A running apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
+
+Freshly queued applies are also claimable once their task rows exist. After `ExecuteApply` commits the pending apply and tasks, it sends a best-effort wake signal to the scheduler. The wake path is only a latency optimization: it nudges one worker to call the same claim path immediately instead of waiting for the next poll tick. It never bypasses storage claims or creates a second queue. If the scheduler is stopped or a wake is already pending, the signal is skipped and the normal poll loop still finds the apply.
+
+```
+HTTP apply request
+      |
+      v
+store pending apply + tasks
+      |
+      v
+best-effort scheduler wake
+      |
+      v
+worker calls FindNextApply()
+      |
+      v
+claim row + refresh heartbeat
+      |
+      v
+TernClient.ResumeApply()
+```
+
+In gRPC mode there are two scheduler layers. The control plane scheduler owns the user-facing apply in control-plane storage. It claims queued or stale control-plane rows, calls `GRPCClient.ResumeApply()`, and stores the remote Tern apply ID in `external_id` once the data plane accepts the work. The data plane scheduler owns engine execution in data-plane storage. It only sees the apply rows created by the data plane's `LocalClient` and recovers local engine work if that process crashes.
+
+```
+Control plane                                  Data plane
+-------------                                  ----------
+HTTP API
+  |
+  v
+control storage
+  |  pending apply/tasks
+  v
+control scheduler worker
+  |  claim + heartbeat
+  v
+GRPCClient.ResumeApply()
+  |  Apply(...)
+  +-------------------------------------------> LocalClient.Apply()
+                                                |
+                                                v
+                                           data storage
+                                                |  local apply/tasks
+                                                +----> engine worker
+                                                |          |
+                                                |          v
+                                                |     target database
+                                                |
+                                                v
+                                           data scheduler worker
+                                                |
+                                                v
+                                           LocalClient.ResumeApply()
+
+control scheduler poller <----- Progress(...) --+
+  |
+  v
+control storage external_id="tern-42"
+```
+
+If the control plane crashes after dispatching work, the data plane can continue running the engine. When the control plane restarts, its scheduler claims the stale control-plane row, sees `external_id` is already set, and resumes only progress polling against the remote apply. If the data plane crashes, its own scheduler claims the data-plane row and resumes the engine from local storage.
 
 SchemaBot has two different kinds of locking:
 
