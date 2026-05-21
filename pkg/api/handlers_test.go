@@ -103,6 +103,10 @@ func (s *staticApplyStore) GetByDatabase(context.Context, string, string, string
 	}
 	return []*storage.Apply{s.apply}, nil
 }
+func (s *staticApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	s.apply = apply
+	return s.err
+}
 
 type capturingApplyStore struct {
 	storage.ApplyStore
@@ -186,6 +190,17 @@ func (s *capturingTaskStore) Update(_ context.Context, task *storage.Task) error
 		}
 	}
 	return storage.ErrTaskNotFound
+}
+func (s *capturingTaskStore) GetByApplyID(_ context.Context, applyID int64) ([]*storage.Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var tasks []*storage.Task
+	for _, task := range s.tasks {
+		if task.ApplyID == applyID {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks, s.err
 }
 
 type emptyLockStore struct {
@@ -365,6 +380,14 @@ func activeTestApply(applyID string) *storage.Apply {
 	}
 }
 
+func stoppedTestApply(applyID string) *storage.Apply {
+	apply := activeTestApply(applyID)
+	startedAt := time.Now().Add(-time.Minute)
+	apply.State = state.Apply.Stopped
+	apply.StartedAt = &startedAt
+	return apply
+}
+
 func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) (*Service, *capturingTaskStore) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	tasks := &capturingTaskStore{}
@@ -380,9 +403,14 @@ func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) 
 }
 
 func newControlTestService(client tern.Client, apply *storage.Apply) *Service {
+	return newControlTestServiceWithTasks(client, apply, nil)
+}
+
+func newControlTestServiceWithTasks(client tern.Client, apply *storage.Apply, tasks []*storage.Task) *Service {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	return New(&mockStorageWithApplyStores{
 		applies: &staticApplyStore{apply: apply},
+		tasks:   &capturingTaskStore{tasks: tasks},
 	}, testServerConfig(), map[string]tern.Client{
 		"default/staging": client,
 	}, logger)
@@ -928,14 +956,16 @@ func TestStopHandler(t *testing.T) {
 }
 
 func TestStartHandler(t *testing.T) {
-	t.Run("passes apply_id to tern client", func(t *testing.T) {
-		mock := &mockTernClient{
-			startResp: &ternv1.StartResponse{
-				Accepted:     true,
-				StartedCount: 3,
-			},
+	t.Run("queues stopped apply for scheduler by apply_id", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := stoppedTestApply("apply-xyz789")
+		task := &storage.Task{
+			ID:             10,
+			TaskIdentifier: "task-start-xyz789",
+			ApplyID:        apply.ID,
+			State:          state.Task.Stopped,
 		}
-		svc := newControlTestService(mock, activeTestApply("apply-xyz789"))
+		svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -947,10 +977,15 @@ func TestStartHandler(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-		require.NotNil(t, mock.startReq, "expected start request to be captured")
-		assert.Equal(t, "apply-xyz789", mock.startReq.ApplyId)
-		assert.Equal(t, "testdb", mock.startReq.Database)
-		assert.Equal(t, "staging", mock.startReq.Environment)
+		assert.Nil(t, mock.startReq, "request path should queue scheduler work without calling Tern start")
+		assert.Equal(t, state.Apply.Pending, apply.State)
+		assert.Equal(t, state.Task.Stopped, task.State)
+
+		var resp apitypes.StartResponse
+		err := json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.True(t, resp.Accepted, "expected accepted=true")
+		assert.Equal(t, int64(1), resp.StartedCount)
 	})
 
 	t.Run("requires apply_id", func(t *testing.T) {

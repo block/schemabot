@@ -148,6 +148,10 @@ func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan
 func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 	expired, err := s.storage.Applies().ExpireRetryable(ctx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			s.logger.Debug("scheduler: stopped while expiring retryable applies", "worker", workerID, "error", err)
+			return
+		}
 		s.logger.Error("scheduler: failed to expire retryable applies", "worker", workerID, "error", err)
 		metrics.RecordSchedulerClaimFailure(ctx, "expire_retryable_error")
 		return
@@ -164,6 +168,10 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 
 	apply, err := s.storage.Applies().FindNextApply(ctx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			s.logger.Debug("scheduler: stopped while claiming apply", "worker", workerID, "error", err)
+			return
+		}
 		s.logger.Error("scheduler: failed to claim apply", "worker", workerID, "error", err)
 		metrics.RecordSchedulerClaimFailure(ctx, "storage_error")
 		return

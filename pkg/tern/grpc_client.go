@@ -363,6 +363,25 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 		return c.dispatchPendingApply(ctx, apply)
 	}
 
+	if apply.ExternalID != "" && state.IsState(apply.State, state.Apply.Pending) {
+		_, err := c.client.Start(ctx, &ternv1.StartRequest{
+			Database:    apply.Database,
+			Environment: apply.Environment,
+			ApplyId:     apply.ExternalID,
+		})
+		if err != nil {
+			return fmt.Errorf("start queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		now := time.Now()
+		apply.State = state.Apply.Running
+		if apply.StartedAt == nil {
+			apply.StartedAt = &now
+		}
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			return fmt.Errorf("update started gRPC apply %s: %w", apply.ApplyIdentifier, err)
+		}
+	}
+
 	// Check the real state from Tern before deciding what to do. Local state
 	// may be stale (e.g. local says "stopped" but Tern already resumed).
 	if apply.State == state.Apply.Stopped {
@@ -400,24 +419,6 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 	}
 
 	return c.pollForCompletion(ctx, apply)
-}
-
-// TrackApply starts background progress tracking for an apply that was already
-// started by an explicit user control operation. Scheduler workers use
-// ResumeApply instead, which blocks and owns the claimed apply.
-func (c *GRPCClient) TrackApply(ctx context.Context, apply *storage.Apply) error {
-	if c.storage == nil {
-		return fmt.Errorf("storage not configured for GRPCClient")
-	}
-	trackCtx := context.WithoutCancel(ctx)
-	go func() {
-		if err := c.pollForCompletion(trackCtx, apply); err != nil {
-			slog.Warn("gRPC apply tracking stopped before terminal state",
-				"apply_id", apply.ApplyIdentifier,
-				"error", err)
-		}
-	}()
-	return nil
 }
 
 func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Apply) error {

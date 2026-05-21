@@ -757,6 +757,7 @@ func TestLocalClient_Start_NoStoppedMigration(t *testing.T) {
 	container, dsn := setupMySQLContainer(t)
 	_ = container              // container is managed by TestMain
 	setupStorageSchema(t, dsn) // need storage tables
+	cleanupTasks(t, dsn)       // ensure no leftover applies from other tests
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	stor := createStorage(t, dsn)

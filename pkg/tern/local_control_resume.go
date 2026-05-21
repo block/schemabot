@@ -389,6 +389,20 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 	}
 }
 
+func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
+	if !state.IsState(apply.State, state.Apply.Pending) {
+		return
+	}
+	for _, task := range tasks {
+		if !state.IsState(task.State, state.Task.Stopped) {
+			continue
+		}
+		task.CompletedAt = nil
+		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier))
+	}
+}
+
 // launchAtomicResume sends all DDLs to the engine in one call, marks tasks and
 // apply as RUNNING, logs the provided message, and then polls for completion.
 // Scheduler-owned calls block so the worker owns the apply until terminal or
@@ -505,7 +519,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		return nil
 	}
 
-	if state.IsState(apply.State, state.Apply.Pending) {
+	if state.IsState(apply.State, state.Apply.Pending) && apply.StartedAt == nil {
 		c.dispatchQueuedApply(ctx, apply, tasks, plan)
 		return ctx.Err()
 	}
@@ -544,6 +558,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	}
 
 	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
+	c.prepareStoppedTasksForResume(ctx, apply, activeTasks)
 
 	options := buildApplyOptions(apply)
 

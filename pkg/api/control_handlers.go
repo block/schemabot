@@ -15,10 +15,6 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-type applyTracker interface {
-	TrackApply(context.Context, *storage.Apply) error
-}
-
 // controlStatus returns "success" if accepted, "rejected" otherwise.
 func controlStatus(accepted bool) string {
 	if accepted {
@@ -254,37 +250,35 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := client.Start(r.Context(), &ternv1.StartRequest{
-		ApplyId:     applyID,
-		Database:    apply.Database,
-		Environment: apply.Environment,
-	})
+	var resp *ternv1.StartResponse
+	var err error
+	queuedForScheduler := false
+	switch {
+	case state.IsState(apply.State, state.Apply.WaitingForDeploy):
+		resp, err = client.Start(r.Context(), &ternv1.StartRequest{
+			ApplyId:     applyID,
+			Database:    apply.Database,
+			Environment: apply.Environment,
+		})
+	case state.IsState(apply.State, state.Apply.Stopped):
+		resp, err = s.queueStoppedApplyForScheduler(r.Context(), apply)
+		queuedForScheduler = err == nil && resp.Accepted
+	case apply.GetOptions().DeferDeploy:
+		err = fmt.Errorf("schema change is not ready for deploy (current state: %s)", apply.State)
+	default:
+		err = fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
+	}
 	if err != nil {
 		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, "error")
 		s.writeControlError(w, "start", apply, err)
 		return
 	}
+
 	metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventStartRequested, "Start requested by user")
-	}
-
-	// For remote (gRPC) clients, update local apply state and restart the
-	// background progress poller. Without this, the local applies.state stays
-	// "stopped" permanently because the old poller exited when it saw the
-	// terminal state.
-	var syncErr string
-	if resp.Accepted && client.IsRemote() {
-		// Mark running before starting local progress tracking so it does
-		// not re-issue a Start RPC.
-		apply.State = state.Apply.Running
-		tracker, ok := client.(applyTracker)
-		if !ok {
-			s.logger.Error("remote client does not support apply tracking after start", "apply_id", apply.ApplyIdentifier)
-			syncErr = "schema change was started successfully, but the status and progress endpoints may show stale state until the next recovery cycle"
-		} else if resumeErr := tracker.TrackApply(r.Context(), apply); resumeErr != nil {
-			s.logger.Error("failed to resume apply tracking after start", "apply_id", apply.ApplyIdentifier, "error", resumeErr)
-			syncErr = "schema change was started successfully, but the status and progress endpoints may show stale state until the next recovery cycle"
+		if queuedForScheduler {
+			s.wakeScheduler(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		}
 	}
 
@@ -294,12 +288,46 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		StartedCount: resp.StartedCount,
 		SkippedCount: resp.SkippedCount,
 	}
-	if syncErr != "" {
-		httpResp.ErrorCode = apitypes.ErrCodeStateSyncFailed
-		httpResp.ErrorMessage = syncErr
-	}
 
 	s.writeJSON(w, http.StatusOK, httpResp)
+}
+
+func (s *Service) queueStoppedApplyForScheduler(ctx context.Context, apply *storage.Apply) (*ternv1.StartResponse, error) {
+	if !state.IsState(apply.State, state.Apply.Stopped) {
+		return nil, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
+	}
+	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	var startedCount int64
+	var skippedCount int64
+	for _, task := range tasks {
+		switch {
+		case state.IsState(task.State, state.Task.Stopped):
+			startedCount++
+		case state.IsTerminalTaskState(task.State):
+			skippedCount++
+		}
+	}
+	if startedCount == 0 {
+		return nil, fmt.Errorf("no stopped tasks for apply %s", apply.ApplyIdentifier)
+	}
+	apply.State = state.Apply.Pending
+	apply.CompletedAt = nil
+	now := time.Now()
+	if apply.StartedAt == nil {
+		apply.StartedAt = &now
+	}
+	apply.UpdatedAt = now
+	if err := s.storage.Applies().Update(ctx, apply); err != nil {
+		return nil, fmt.Errorf("queue apply %s for scheduler start: %w", apply.ApplyIdentifier, err)
+	}
+	return &ternv1.StartResponse{
+		Accepted:     true,
+		StartedCount: startedCount,
+		SkippedCount: skippedCount,
+	}, nil
 }
 
 // VolumeRequest is the HTTP request body for POST /api/volume.
