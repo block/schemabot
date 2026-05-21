@@ -423,6 +423,25 @@ control storage external_id="tern-42"
 
 If the control plane crashes after dispatching work, the data plane can continue running the engine. When the control plane restarts, its scheduler claims the stale control-plane row, sees `external_id` is already set, and resumes only progress polling against the remote apply. If the data plane crashes, its own scheduler claims the data-plane row and resumes the engine from local storage.
 
+The control-plane `external_id` must resolve to data-plane apply state. In normal operation, the data plane keeps historical apply and task rows, so a known remote ID should report either active progress or a terminal state. If the data plane repeatedly reports `STATE_NO_ACTIVE_CHANGE` for a known `external_id`, SchemaBot treats that as inconsistent remote state: the control-plane apply is marked failed and the scheduler worker is released. This protects scheduler capacity if storage is corrupted, cleared, restored from different snapshots, or otherwise split between tiers.
+
+```
+control storage
+apply_identifier="apply-123"
+external_id="tern-42"
+       |
+       | Progress(apply_id="tern-42")
+       v
+data-plane storage
+no active or historical rows for "tern-42"
+       |
+       v
+STATE_NO_ACTIVE_CHANGE
+       |
+       v
+fail local apply + free scheduler worker
+```
+
 SchemaBot has two different kinds of locking:
 
 - **Database locks** are coordination state for users and automation. They make ownership visible in CLI/webhook flows and let a human intentionally hold, release, or force-release work for a database.
