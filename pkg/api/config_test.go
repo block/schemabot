@@ -1,12 +1,15 @@
 package api
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 func TestLoadServerConfig(t *testing.T) {
@@ -404,6 +407,262 @@ func TestServerConfig_ValidateRejectsLocalRemoteRouteCollision(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database "primary" environment "staging" uses a local dsn`)
 	assert.Contains(t, err.Error(), `tern_deployments also defines deployment "primary"`)
+}
+
+func TestServerConfig_ValidateSourcePolicy(t *testing.T) {
+	baseConfig := func(allowedDirs []string) ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root@tcp(localhost)/payments"},
+					},
+					AllowedRepos: []string{"octocat/hello-world"},
+					AllowedDirs:  allowedDirs,
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		config     ServerConfig
+		wantErr    bool
+		wantErrMsg string
+	}{
+		{
+			name:    "valid source policy",
+			config:  baseConfig([]string{"schema/payments", "db/payments/"}),
+			wantErr: false,
+		},
+		{
+			name:       "empty schema dir",
+			config:     baseConfig([]string{""}),
+			wantErr:    true,
+			wantErrMsg: "path is empty",
+		},
+		{
+			name:       "absolute schema dir",
+			config:     baseConfig([]string{"/schema/payments"}),
+			wantErr:    true,
+			wantErrMsg: "repo-relative",
+		},
+		{
+			name:       "escaping schema dir",
+			config:     baseConfig([]string{"../payments"}),
+			wantErr:    true,
+			wantErrMsg: "must not escape",
+		},
+		{
+			name:       "duplicate normalized schema dir",
+			config:     baseConfig([]string{"schema/payments", "schema/payments/"}),
+			wantErr:    true,
+			wantErrMsg: "duplicate",
+		},
+		{
+			name: "duplicate repo",
+			config: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"payments": {
+						Type: storage.DatabaseTypeMySQL,
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/payments"},
+						},
+						AllowedRepos: []string{"octocat/hello-world", "octocat/hello-world"},
+					},
+				},
+			},
+			wantErr:    true,
+			wantErrMsg: "duplicate",
+		},
+		{
+			name: "empty repo after trimming whitespace",
+			config: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"payments": {
+						Type: storage.DatabaseTypeMySQL,
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/payments"},
+						},
+						AllowedRepos: []string{" "},
+					},
+				},
+			},
+			wantErr:    true,
+			wantErrMsg: "empty value",
+		},
+		{
+			name: "repo with surrounding whitespace",
+			config: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"payments": {
+						Type: storage.DatabaseTypeMySQL,
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/payments"},
+						},
+						AllowedRepos: []string{"octocat/hello-world "},
+					},
+				},
+			},
+			wantErr:    true,
+			wantErrMsg: "leading or trailing whitespace",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrMsg)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+func TestServerConfig_AuthorizePlanSource(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/payments"},
+				},
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"schema/payments"},
+			},
+			"open": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/open"},
+				},
+			},
+		},
+	}
+
+	t.Run("missing server config blocks trusted source", func(t *testing.T) {
+		var nilConfig *ServerConfig
+		err := nilConfig.AuthorizePlanSource(PlanSourcePolicyRequest{
+			Database:    "payments",
+			Repository:  "octocat/hello-world",
+			PullRequest: 1,
+			SchemaPath:  "schema/payments",
+		})
+
+		require.Error(t, err)
+		var policyErr *SourcePolicyError
+		require.True(t, errors.As(err, &policyErr), "expected SourcePolicyError")
+		assert.Equal(t, SourcePolicyReasonMissingServerConfig, policyErr.Reason)
+	})
+
+	tests := []struct {
+		name       string
+		req        PlanSourcePolicyRequest
+		wantReason string
+	}{
+		{
+			name: "database without source policy allows trusted source",
+			req: PlanSourcePolicyRequest{
+				Database:    "open",
+				Repository:  "octocat/hello-world",
+				PullRequest: 1,
+				SchemaPath:  "schema/open",
+			},
+		},
+		{
+			name: "missing database config blocks trusted source",
+			req: PlanSourcePolicyRequest{
+				Database:    "missing",
+				Repository:  "octocat/hello-world",
+				PullRequest: 1,
+				SchemaPath:  "schema/payments",
+			},
+			wantReason: SourcePolicyReasonMissingDatabaseConfig,
+		},
+		{
+			name: "trusted source is allowed",
+			req: PlanSourcePolicyRequest{
+				Database:    "payments",
+				Repository:  "octocat/hello-world",
+				PullRequest: 1,
+				SchemaPath:  "schema/payments",
+			},
+		},
+		{
+			name: "trusted descendant dir is allowed",
+			req: PlanSourcePolicyRequest{
+				Database:    "payments",
+				Repository:  "octocat/hello-world",
+				PullRequest: 1,
+				SchemaPath:  "schema/payments/archive",
+			},
+		},
+		{
+			name: "missing repository is blocked",
+			req: PlanSourcePolicyRequest{
+				Database:    "payments",
+				PullRequest: 1,
+				SchemaPath:  "schema/payments",
+			},
+			wantReason: SourcePolicyReasonMissingRepository,
+		},
+		{
+			name: "missing pull request is blocked",
+			req: PlanSourcePolicyRequest{
+				Database:   "payments",
+				Repository: "octocat/hello-world",
+				SchemaPath: "schema/payments",
+			},
+			wantReason: SourcePolicyReasonMissingPullRequest,
+		},
+		{
+			name: "missing schema path is blocked",
+			req: PlanSourcePolicyRequest{
+				Database:    "payments",
+				Repository:  "octocat/hello-world",
+				PullRequest: 1,
+			},
+			wantReason: SourcePolicyReasonMissingSchemaPath,
+		},
+		{
+			name: "unauthorized repo is blocked",
+			req: PlanSourcePolicyRequest{
+				Database:    "payments",
+				Repository:  "octocat/orders",
+				PullRequest: 1,
+				SchemaPath:  "schema/payments",
+			},
+			wantReason: SourcePolicyReasonUnauthorizedRepo,
+		},
+		{
+			name: "sibling directory is blocked",
+			req: PlanSourcePolicyRequest{
+				Database:    "payments",
+				Repository:  "octocat/hello-world",
+				PullRequest: 1,
+				SchemaPath:  "schema/payments-archive",
+			},
+			wantReason: SourcePolicyReasonUnauthorizedSchemaDir,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := cfg.AuthorizePlanSource(tt.req)
+			if tt.wantReason == "" {
+				assert.NoError(t, err)
+				return
+			}
+
+			require.Error(t, err)
+			var policyErr *SourcePolicyError
+			require.True(t, errors.As(err, &policyErr), "expected SourcePolicyError")
+			assert.Equal(t, tt.wantReason, policyErr.Reason)
+		})
+	}
 }
 
 func TestServerConfig_ResolveDatabaseTarget(t *testing.T) {

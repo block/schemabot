@@ -21,8 +21,9 @@ import (
 )
 
 var (
-	testDB  *sql.DB
-	testDSN string
+	testDB             *sql.DB
+	testDSN            string
+	testDSNChangedRows string
 )
 
 func TestMain(m *testing.M) {
@@ -51,6 +52,7 @@ func TestMain(m *testing.M) {
 	// the value if called within the same second, but we still want to know
 	// if the row was found.
 	testDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot_test?parseTime=true&clientFoundRows=true&multiStatements=true", host, port)
+	testDSNChangedRows = fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot_test?parseTime=true&multiStatements=true", host, port)
 
 	testDB, err = sql.Open("mysql", testDSN)
 	if err != nil {

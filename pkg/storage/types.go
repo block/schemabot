@@ -213,6 +213,9 @@ type Plan struct {
 	// PullRequest is the PR number that generated this plan.
 	PullRequest int
 
+	// SchemaPath is the repo-relative directory that generated this plan.
+	SchemaPath string
+
 	// Environment is "staging" or "production".
 	Environment string
 

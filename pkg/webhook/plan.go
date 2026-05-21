@@ -76,18 +76,23 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Build PlanRequest in the format expected by the API service
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
-		Database:    schemaResult.Database,
-		Environment: environment,
-		Type:        schemaResult.Type,
-		SchemaFiles: schemaResult.SchemaFiles,
-		Repository:  repo,
-		PullRequest: &prNumber,
+		Database:      schemaResult.Database,
+		Environment:   environment,
+		Type:          schemaResult.Type,
+		SchemaFiles:   schemaResult.SchemaFiles,
+		Repository:    repo,
+		PullRequest:   &prNumber,
+		SchemaPath:    schemaResult.SchemaPath,
+		SourceTrusted: true,
 	}
 
 	// Execute plan via the service
 	planResp, err := h.service.ExecutePlan(ctx, planReq)
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
+		h.postFailingAggregates(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{
+			environment: userFacingError(err),
+		})
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
 			RequestedBy: requestedBy,
 			Timestamp:   time.Now().UTC().Format("2006-01-02 15:04:05"),
@@ -260,12 +265,14 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 
 		prNumber := int32(pr)
 		planReq := api.PlanRequest{
-			Database:    schemaResult.Database,
-			Environment: env,
-			Type:        schemaResult.Type,
-			SchemaFiles: schemaResult.SchemaFiles,
-			Repository:  repo,
-			PullRequest: &prNumber,
+			Database:      schemaResult.Database,
+			Environment:   env,
+			Type:          schemaResult.Type,
+			SchemaFiles:   schemaResult.SchemaFiles,
+			Repository:    repo,
+			PullRequest:   &prNumber,
+			SchemaPath:    schemaResult.SchemaPath,
+			SourceTrusted: true,
 		}
 
 		planResp, err := h.service.ExecutePlan(ctx, planReq)

@@ -60,6 +60,27 @@ func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.
 func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
 func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
 
+type capturingPlanStore struct {
+	mockPlanLookupStore
+	created   *storage.Plan
+	createErr error
+}
+
+func (s *capturingPlanStore) Create(_ context.Context, plan *storage.Plan) (int64, error) {
+	s.created = plan
+	if s.createErr != nil {
+		return 0, s.createErr
+	}
+	return 1, nil
+}
+
+type mockStorageWithPlanLookup struct {
+	mockStorage
+	plans storage.PlanStore
+}
+
+func (m *mockStorageWithPlanLookup) Plans() storage.PlanStore { return m.plans }
+
 type mockStorageWithApplyStores struct {
 	mockStorage
 	plans     storage.PlanStore
@@ -242,6 +263,9 @@ func (s *noopApplyLogStore) Append(context.Context, *storage.ApplyLog) error {
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
 	healthErr      error
+	planResp       *ternv1.PlanResponse
+	planErr        error
+	planReq        *ternv1.PlanRequest
 	applyResp      *ternv1.ApplyResponse
 	applyErr       error
 	applyReq       *ternv1.ApplyRequest
@@ -272,7 +296,11 @@ type mockTernClient struct {
 
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
 func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
-	return nil, nil
+	m.planReq = req
+	if m.planResp != nil {
+		return m.planResp, m.planErr
+	}
+	return nil, m.planErr
 }
 func (m *mockTernClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	m.applyReq = req
@@ -429,6 +457,322 @@ func newControlTestService(client tern.Client, apply *storage.Apply) *Service {
 func newTestService() *Service {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	return New(&mockStorage{}, testServerConfig(), nil, logger)
+}
+
+func TestExecutePlanSourcePolicy(t *testing.T) {
+	newPolicyService := func() (*Service, *mockTernClient, *capturingPlanStore) {
+		t.Helper()
+		plans := &capturingPlanStore{}
+		mockClient := &mockTernClient{
+			planResp: &ternv1.PlanResponse{PlanId: "plan-source-policy"},
+		}
+		cfg := &ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment},
+					},
+					AllowedRepos: []string{"octocat/hello-world"},
+					AllowedDirs:  []string{"schema/payments"},
+				},
+			},
+			TernDeployments: TernConfig{
+				DefaultDeployment: {"staging": "localhost:9090"},
+			},
+		}
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+			DefaultDeployment + "/staging": mockClient,
+		}, logger)
+		return svc, mockClient, plans
+	}
+
+	schemaFiles := map[string]*ternv1.SchemaFiles{
+		"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+	}
+
+	t.Run("trusted GitHub source is authorized and persisted", func(t *testing.T) {
+		svc, mockClient, plans := newPolicyService()
+		pr := int32(1)
+
+		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:      "payments",
+			Environment:   "staging",
+			Type:          storage.DatabaseTypeMySQL,
+			SchemaFiles:   schemaFiles,
+			Repository:    "octocat/hello-world",
+			PullRequest:   &pr,
+			SchemaPath:    "schema/payments",
+			SourceTrusted: true,
+		})
+
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.Equal(t, "plan-source-policy", resp.PlanID)
+		require.NotNil(t, mockClient.planReq, "expected source-authorized plan to call Tern")
+		assert.Equal(t, "payments-staging-target", mockClient.planReq.Target)
+		assert.Equal(t, "schema/payments", mockClient.planReq.SchemaPath)
+		require.NotNil(t, plans.created, "expected source-authorized plan to be stored")
+		assert.Equal(t, "schema/payments", plans.created.SchemaPath)
+		assert.Equal(t, "octocat/hello-world", plans.created.Repository)
+	})
+
+	t.Run("direct API source keeps operator path working", func(t *testing.T) {
+		svc, mockClient, plans := newPolicyService()
+		pr := int32(1)
+
+		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.Equal(t, "plan-source-policy", resp.PlanID)
+		require.NotNil(t, mockClient.planReq, "direct API planning should still call Tern")
+		assert.Empty(t, mockClient.planReq.SchemaPath)
+		require.NotNil(t, plans.created, "direct API planning should still store the plan")
+		assert.Empty(t, plans.created.SchemaPath)
+	})
+
+	t.Run("duplicate plan identifier is tolerated", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		pr := int32(1)
+
+		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:      "payments",
+			Environment:   "staging",
+			Type:          storage.DatabaseTypeMySQL,
+			SchemaFiles:   schemaFiles,
+			Repository:    "octocat/hello-world",
+			PullRequest:   &pr,
+			SchemaPath:    "schema/payments",
+			SourceTrusted: true,
+		})
+
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.NotNil(t, plans.created)
+		assert.Equal(t, "schema/payments", plans.created.SchemaPath)
+	})
+}
+
+func TestExecuteApplySourcePolicyAllowsDirectPlan(t *testing.T) {
+	plan := &storage.Plan{
+		ID:             42,
+		PlanIdentifier: "plan-old-direct",
+		Database:       "payments",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     DefaultDeployment,
+		Target:         "payments-staging-target",
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		Environment:    "staging",
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment},
+				},
+				AllowedRepos: []string{"octocat/hello-world"},
+			},
+		},
+		TernDeployments: TernConfig{
+			DefaultDeployment: {"staging": "localhost:9090"},
+		},
+	}
+	mockClient := &mockTernClient{
+		applyResp: &ternv1.ApplyResponse{Accepted: false, ErrorMessage: "engine rejected"},
+		isRemote:  true,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithPlanLookup{
+		plans: &mockPlanLookupStore{plan: plan},
+	}, cfg, map[string]tern.Client{
+		DefaultDeployment + "/staging": mockClient,
+	}, logger)
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-old-direct",
+		Environment: "staging",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Zero(t, applyID)
+	assert.False(t, resp.Accepted)
+	require.NotNil(t, mockClient.applyReq, "direct API apply should still call Tern")
+	assert.Equal(t, "payments-staging-target", mockClient.applyReq.Target)
+}
+
+func TestExecuteApplySourcePolicyBlocksStoredTrustedPlan(t *testing.T) {
+	plan := &storage.Plan{
+		ID:             42,
+		PlanIdentifier: "plan-untrusted-repo",
+		Database:       "payments",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     DefaultDeployment,
+		Target:         "payments-staging-target",
+		Repository:     "octocat/orders",
+		PullRequest:    1,
+		SchemaPath:     "schema/payments",
+		Environment:    "staging",
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment},
+				},
+				AllowedRepos: []string{"octocat/hello-world"},
+			},
+		},
+		TernDeployments: TernConfig{
+			DefaultDeployment: {"staging": "localhost:9090"},
+		},
+	}
+	mockClient := &mockTernClient{
+		applyResp: &ternv1.ApplyResponse{Accepted: false, ErrorMessage: "engine rejected"},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithPlanLookup{
+		plans: &mockPlanLookupStore{plan: plan},
+	}, cfg, map[string]tern.Client{
+		DefaultDeployment + "/staging": mockClient,
+	}, logger)
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-untrusted-repo",
+		Environment: "staging",
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Nil(t, mockClient.applyReq, "stored trusted plan with unauthorized source should not call Tern")
+	var policyErr *SourcePolicyError
+	require.True(t, errors.As(err, &policyErr), "expected SourcePolicyError")
+	assert.Equal(t, SourcePolicyReasonUnauthorizedRepo, policyErr.Reason)
+}
+
+func TestExecuteApplySourcePolicyBlocksMissingDatabaseConfig(t *testing.T) {
+	plan := &storage.Plan{
+		ID:             42,
+		PlanIdentifier: "plan-missing-database-config",
+		Database:       "payments",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     DefaultDeployment,
+		Target:         "payments-staging-target",
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		SchemaPath:     "schema/payments",
+		Environment:    "staging",
+	}
+	cfg := &ServerConfig{
+		TernDeployments: TernConfig{
+			DefaultDeployment: {"staging": "localhost:9090"},
+		},
+	}
+	mockClient := &mockTernClient{
+		applyResp: &ternv1.ApplyResponse{Accepted: false, ErrorMessage: "engine rejected"},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithPlanLookup{
+		plans: &mockPlanLookupStore{plan: plan},
+	}, cfg, map[string]tern.Client{
+		DefaultDeployment + "/staging": mockClient,
+	}, logger)
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-missing-database-config",
+		Environment: "staging",
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Nil(t, mockClient.applyReq, "stored trusted plan without database config should not call Tern")
+	var policyErr *SourcePolicyError
+	require.True(t, errors.As(err, &policyErr), "expected SourcePolicyError")
+	assert.Equal(t, SourcePolicyReasonMissingDatabaseConfig, policyErr.Reason)
+}
+
+func TestPlanHandlerRejectsClientSuppliedSchemaPath(t *testing.T) {
+	svc := newTestService()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	body := `{
+		"database": "payments",
+		"environment": "staging",
+		"type": "mysql",
+		"schema_path": "schema/payments",
+		"schema_files": {"payments": {"files": {"users.sql": "CREATE TABLE users (id bigint primary key)"}}}
+	}`
+	req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/plan", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "unknown field")
+	assert.Contains(t, w.Body.String(), "schema_path")
+}
+
+func TestPlanHandlerSourcePolicyAllowsDirectSource(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment},
+				},
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"schema/payments"},
+			},
+		},
+		TernDeployments: TernConfig{
+			DefaultDeployment: {"staging": "localhost:9090"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-source-policy"}}
+	svc := New(&mockStorageWithPlanLookup{plans: &capturingPlanStore{}}, cfg, map[string]tern.Client{
+		DefaultDeployment + "/staging": mockClient,
+	}, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	body := `{
+		"database": "payments",
+		"environment": "staging",
+		"type": "mysql",
+		"repository": "octocat/hello-world",
+		"pull_request": 1,
+		"schema_files": {"payments": {"files": {"users.sql": "CREATE TABLE users (id bigint primary key)"}}}
+	}`
+	req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/plan", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, mockClient.planReq, "direct HTTP planning should still call Tern")
+	assert.Empty(t, mockClient.planReq.SchemaPath)
+	var resp apitypes.PlanResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, "plan-source-policy", resp.PlanID)
 }
 
 func TestExecuteApplyRequiresRemoteApplyID(t *testing.T) {
@@ -641,6 +985,60 @@ func TestApplyHandler(t *testing.T) {
 		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 		assert.Equal(t, apitypes.ErrCodeActiveApplyExists, resp.ErrorCode)
 		assert.Contains(t, resp.Error, storage.ErrActiveApplyExists.Error())
+	})
+
+	t.Run("allows direct stored plans without source metadata", func(t *testing.T) {
+		plan := &storage.Plan{
+			ID:             42,
+			PlanIdentifier: "plan-old-direct",
+			Database:       "payments",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Deployment:     DefaultDeployment,
+			Target:         "payments-staging-target",
+			Repository:     "octocat/hello-world",
+			PullRequest:    1,
+			Environment:    "staging",
+		}
+		cfg := &ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment},
+					},
+					AllowedRepos: []string{"octocat/hello-world"},
+				},
+			},
+			TernDeployments: TernConfig{
+				DefaultDeployment: {"staging": "localhost:9090"},
+			},
+		}
+		stor := &mockStorageWithPlanLookup{
+			plans: &mockPlanLookupStore{plan: plan},
+		}
+		mock := &mockTernClient{
+			applyResp: &ternv1.ApplyResponse{Accepted: false, ErrorMessage: "engine rejected"},
+			isRemote:  true,
+		}
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		ternClients := map[string]tern.Client{DefaultDeployment + "/staging": mock}
+		svc := New(stor, cfg, ternClients, logger)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"plan_id": "plan-old-direct", "environment": "staging"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/apply", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.NotNil(t, mock.applyReq, "direct HTTP apply should still call Tern")
+
+		var resp apitypes.ApplyResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.False(t, resp.Accepted)
+		assert.Equal(t, apitypes.ErrCodeEngineError, resp.ErrorCode)
 	})
 }
 

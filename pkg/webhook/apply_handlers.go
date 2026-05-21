@@ -141,12 +141,14 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	// Generate plan
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
-		Database:    schemaResult.Database,
-		Environment: environment,
-		Type:        schemaResult.Type,
-		SchemaFiles: schemaResult.SchemaFiles,
-		Repository:  repo,
-		PullRequest: &prNumber,
+		Database:      schemaResult.Database,
+		Environment:   environment,
+		Type:          schemaResult.Type,
+		SchemaFiles:   schemaResult.SchemaFiles,
+		Repository:    repo,
+		PullRequest:   &prNumber,
+		SchemaPath:    schemaResult.SchemaPath,
+		SourceTrusted: true,
 	}
 
 	planResp, err := h.service.ExecutePlan(ctx, planReq)
@@ -444,12 +446,14 @@ func (h *Handler) executeApply(
 	// Re-plan for drift detection
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
-		Database:    schemaResult.Database,
-		Environment: environment,
-		Type:        schemaResult.Type,
-		SchemaFiles: schemaResult.SchemaFiles,
-		Repository:  repo,
-		PullRequest: &prNumber,
+		Database:      schemaResult.Database,
+		Environment:   environment,
+		Type:          schemaResult.Type,
+		SchemaFiles:   schemaResult.SchemaFiles,
+		Repository:    repo,
+		PullRequest:   &prNumber,
+		SchemaPath:    schemaResult.SchemaPath,
+		SourceTrusted: true,
 	}
 
 	planResp, err := h.service.ExecutePlan(ctx, planReq)

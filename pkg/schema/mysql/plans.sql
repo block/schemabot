@@ -7,6 +7,7 @@ CREATE TABLE `plans` (
   `target` varchar(255) NOT NULL DEFAULT '',
   `repository` varchar(255) NOT NULL,
   `pull_request` int unsigned NOT NULL,
+  `schema_path` varchar(1024) NOT NULL DEFAULT '',
   `environment` varchar(50) NOT NULL DEFAULT '',
   `schema_files` json NOT NULL,
   `plan_data` json NOT NULL,

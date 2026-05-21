@@ -31,6 +31,12 @@ type PlanRequest struct {
 	SchemaFiles map[string]*ternv1.SchemaFiles `json:"schema_files"`
 	Repository  string                         `json:"repository,omitempty"`
 	PullRequest *int32                         `json:"pull_request,omitempty"`
+	SchemaPath  string                         `json:"-"`
+
+	// SourceTrusted is set by the GitHub webhook path after SchemaBot has
+	// discovered the PR source itself. It is deliberately not JSON-decodable:
+	// direct API clients cannot attest repo/path ownership.
+	SourceTrusted bool `json:"-"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
@@ -73,6 +79,11 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.ExecutePlan(r.Context(), req)
 	if err != nil {
+		var policyErr *SourcePolicyError
+		if errors.As(err, &policyErr) {
+			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "plan failed: "+err.Error())
+			return
+		}
 		s.logger.Error("plan failed", "database", req.Database, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
@@ -122,6 +133,48 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	}
 	deployment := resolvedTarget.Deployment
 
+	prInt := 0
+	if req.PullRequest != nil {
+		prInt = int(*req.PullRequest)
+	}
+	trustedSchemaPath := ""
+	if req.SourceTrusted {
+		trustedSchemaPath = req.SchemaPath
+	}
+	// Source policy checks only apply to SchemaBot-discovered PR sources. Direct
+	// operator/API plans remain available through the existing endpoint access
+	// model until the dedicated auth layer is added.
+	if !req.SourceTrusted {
+		s.logger.Debug("skipping source policy for direct plan request",
+			"database", req.Database,
+			"environment", req.Environment,
+			"repository", req.Repository,
+			"pull_request", prInt)
+	} else {
+		if err := s.config.AuthorizePlanSource(PlanSourcePolicyRequest{
+			Database:    req.Database,
+			Repository:  req.Repository,
+			PullRequest: prInt,
+			SchemaPath:  trustedSchemaPath,
+		}); err != nil {
+			reason := sourcePolicyReason(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "source policy")
+			metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
+			metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
+			metrics.RecordSourcePolicyBlock(ctx, "plan", req.Database, req.Environment, reason)
+			s.logger.Warn("plan blocked by source policy",
+				"database", req.Database,
+				"environment", req.Environment,
+				"repository", req.Repository,
+				"pull_request", prInt,
+				"schema_path", req.SchemaPath,
+				"reason", reason,
+				"error", err)
+			return nil, fmt.Errorf("source policy: %w", err)
+		}
+	}
+
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
 		span.RecordError(err)
@@ -138,6 +191,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		Repository:  req.Repository,
 		Environment: req.Environment,
 		Target:      resolvedTarget.Target,
+		SchemaPath:  trustedSchemaPath,
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest
@@ -179,10 +233,6 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	}
 
 	// Store plan in SchemaBot's storage (idempotent — duplicate is ignored)
-	prInt := 0
-	if req.PullRequest != nil {
-		prInt = int(*req.PullRequest)
-	}
 	storedPlan := &storage.Plan{
 		PlanIdentifier: resp.PlanId,
 		Database:       req.Database,
@@ -191,6 +241,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		Target:         resolvedTarget.Target,
 		Repository:     req.Repository,
 		PullRequest:    prInt,
+		SchemaPath:     trustedSchemaPath,
 		Environment:    req.Environment,
 		SchemaFiles:    protoToSchemaFiles(req.SchemaFiles),
 		Namespaces:     protoChangesToNamespaces(resp.Changes),
@@ -227,6 +278,11 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, storage.ErrActiveApplyExists) {
 			s.logger.Warn("apply blocked by active apply", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply blocked by active apply: "+err.Error())
+			return
+		}
+		var policyErr *SourcePolicyError
+		if errors.As(err, &policyErr) {
+			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "apply failed: "+err.Error())
 			return
 		}
 		s.logger.Error("apply failed", "plan_id", req.PlanID, "error", err)
@@ -303,6 +359,41 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		span.SetStatus(codes.Error, "missing stored target")
 		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
 		return nil, 0, applyErr
+	}
+	// Source policy is evaluated for plans created from SchemaBot's trusted
+	// GitHub PR discovery path. Direct operator/API plans do not have a
+	// server-discovered schema path today; those remain governed by endpoint
+	// access until the dedicated auth layer is added.
+	if plan.SchemaPath == "" {
+		s.logger.Debug("skipping source policy for apply because stored plan has no trusted schema path",
+			"plan_id", req.PlanID,
+			"database", plan.Database,
+			"environment", req.Environment,
+			"repository", plan.Repository,
+			"pull_request", plan.PullRequest)
+	} else {
+		if err := s.config.AuthorizePlanSource(PlanSourcePolicyRequest{
+			Database:    plan.Database,
+			Repository:  plan.Repository,
+			PullRequest: plan.PullRequest,
+			SchemaPath:  plan.SchemaPath,
+		}); err != nil {
+			reason := sourcePolicyReason(err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "source policy")
+			metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
+			metrics.RecordSourcePolicyBlock(ctx, "apply", plan.Database, req.Environment, reason)
+			s.logger.Warn("apply blocked by source policy",
+				"plan_id", req.PlanID,
+				"database", plan.Database,
+				"environment", req.Environment,
+				"repository", plan.Repository,
+				"pull_request", plan.PullRequest,
+				"schema_path", plan.SchemaPath,
+				"reason", reason,
+				"error", err)
+			return nil, 0, fmt.Errorf("source policy for plan %s: %w", req.PlanID, err)
+		}
 	}
 
 	deployment := plan.Deployment

@@ -134,6 +134,50 @@ func RecordSchemaFreshnessRejected(ctx context.Context, action string) {
 	)
 }
 
+var knownSourcePolicyOperations = map[string]bool{
+	"plan":  true,
+	"apply": true,
+}
+
+var knownSourcePolicyBlockReasons = map[string]bool{
+	"missing_server_config":   true,
+	"missing_database_config": true,
+	"missing_repository":      true,
+	"missing_pull_request":    true,
+	"missing_schema_path":     true,
+	"unauthorized_repo":       true,
+	"unauthorized_schema_dir": true,
+	"unknown":                 true,
+}
+
+// RecordSourcePolicyBlock increments the counter for source-policy decisions
+// that block a trusted GitHub source before planning or applying.
+func RecordSourcePolicyBlock(ctx context.Context, operation, database, environment, reason string) {
+	if !knownSourcePolicyOperations[operation] {
+		operation = "unknown"
+	}
+	if !knownSourcePolicyBlockReasons[reason] {
+		reason = "unknown"
+	}
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.source_policy.blocks_total",
+		otelmetric.WithDescription("Total trusted-source plan/apply requests blocked by source policy"),
+		otelmetric.WithUnit("{block}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create source policy block counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("operation", operation),
+			attribute.String("database", database),
+			attribute.String("environment", environment),
+			attribute.String("reason", reason),
+		),
+	)
+}
+
 // knownCheckOwnershipOperations limits metric cardinality to expected check
 // ownership miss paths.
 var knownCheckOwnershipOperations = map[string]bool{

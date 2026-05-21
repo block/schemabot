@@ -367,6 +367,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		Target:         localPlanTarget(req, c.config.Database),
 		Repository:     req.Repository,
 		PullRequest:    int(req.PullRequest),
+		SchemaPath:     req.SchemaPath,
 		Environment:    req.Environment,
 		SchemaFiles:    schemaFiles,
 		Namespaces:     namespaces,

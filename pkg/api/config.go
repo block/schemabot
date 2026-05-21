@@ -166,6 +166,16 @@ type DatabaseConfig struct {
 
 	// Environments contains per-environment configuration.
 	Environments map[string]EnvironmentConfig `yaml:"environments"`
+
+	// AllowedRepos restricts which trusted GitHub PR repositories may manage
+	// this database. Values are exact owner/repo names. A literal "*" allows
+	// any trusted repo.
+	AllowedRepos []string `yaml:"allowed_repos,omitempty"`
+
+	// AllowedDirs restricts which trusted GitHub PR repo-relative schema
+	// directories may manage this database. Values match the directory itself
+	// and descendants. A literal "*" allows any trusted schema directory.
+	AllowedDirs []string `yaml:"allowed_dirs,omitempty"`
 }
 
 // EnvironmentConfig holds per-environment database configuration.
@@ -275,6 +285,9 @@ func (c *ServerConfig) Validate() error {
 	for name, dbConfig := range c.Databases {
 		if dbConfig.Type == "" {
 			return fmt.Errorf("database %q missing type", name)
+		}
+		if err := validateDatabaseSourcePolicy(name, dbConfig); err != nil {
+			return err
 		}
 		if dbConfig.Type != storage.DatabaseTypeMySQL && dbConfig.Type != storage.DatabaseTypeVitess {
 			return fmt.Errorf("database %q has invalid type %q (must be %s or %s)", name, dbConfig.Type, storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess)

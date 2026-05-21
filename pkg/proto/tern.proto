@@ -252,6 +252,8 @@ message PlanRequest {
   // Opaque identifier for endpoint discovery (e.g., database identifier).
   // Forwarded to Tern for provider-based resolution. Defaults to database if empty.
   string target = 8;
+  // Repo-relative schema directory discovered by SchemaBot from the PR.
+  string schema_path = 9;
 }
 
 // TableChange represents a DDL change to a table.
@@ -502,4 +504,3 @@ message VolumeResponse {
   // New volume level.
   int32 new_volume = 4;
 }
-

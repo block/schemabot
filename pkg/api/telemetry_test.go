@@ -276,6 +276,49 @@ func TestRecordCheckOwnershipMissMetric(t *testing.T) {
 	assert.True(t, found, "schemabot.check_ownership_misses_total metric not found")
 }
 
+func TestRecordSourcePolicyBlockMetric(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordSourcePolicyBlock(t.Context(), "plan", "mydb", "staging", "unauthorized_repo")
+	metrics.RecordSourcePolicyBlock(t.Context(), "apply", "mydb", "production", "missing_database_config")
+	metrics.RecordSourcePolicyBlock(t.Context(), "not_real", "mydb", "staging", "not_real")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	var found bool
+	var sawUnknown bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.source_policy.blocks_total" {
+				continue
+			}
+			found = true
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			assert.Len(t, sum.DataPoints, 3, "expected one data point per operation/reason attribute set")
+			for _, dp := range sum.DataPoints {
+				operation, hasOperation := dp.Attributes.Value(attribute.Key("operation"))
+				reason, hasReason := dp.Attributes.Value(attribute.Key("reason"))
+				require.True(t, hasOperation)
+				require.True(t, hasReason)
+				if operation.AsString() == "unknown" && reason.AsString() == "unknown" {
+					sawUnknown = true
+				}
+			}
+		}
+	}
+	assert.True(t, found, "schemabot.source_policy.blocks_total metric not found")
+	assert.True(t, sawUnknown, "expected unknown operation and reason to be normalized")
+}
+
 func TestRecordStatusCheckOperationMetric(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))

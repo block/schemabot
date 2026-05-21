@@ -460,6 +460,10 @@ func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[stri
 func TestE2EPlanWithChanges(t *testing.T) {
 	dbName := "webhook_plan_changes"
 	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -532,6 +536,7 @@ func TestE2EPlanWithChanges(t *testing.T) {
 	assert.Equal(t, "staging", plan.Environment)
 	assert.Equal(t, "octocat/hello-world", plan.Repository)
 	assert.Equal(t, 1, plan.PullRequest)
+	assert.Equal(t, "schema", plan.SchemaPath)
 	assert.NotEmpty(t, plan.PlanIdentifier, "plan should have an identifier")
 	assert.NotNil(t, plan.Namespaces, "plan should have namespace data")
 	assert.NotEmpty(t, plan.Namespaces[dbName].Tables, "plan should have DDL changes")
@@ -549,6 +554,84 @@ func TestE2EPlanWithChanges(t *testing.T) {
 	assert.True(t, check.HasChanges, "check should indicate changes detected")
 	assert.Equal(t, "completed", check.Status)
 	assert.Equal(t, "action_required", check.Conclusion)
+}
+
+// TestE2EPlanSourcePolicyBlocksUnauthorizedRepo verifies the trusted GitHub
+// discovery path enforces server-side source policy before a plan is stored.
+// The manual command path should also write a failing aggregate check so the
+// Checks UI matches the failure comment.
+func TestE2EPlanSourcePolicyBlocksUnauthorizedRepo(t *testing.T) {
+	dbName := "webhook_source_policy_block"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/orders"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan failed")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## ❌ Plan Failed")
+		assert.Contains(t, body, "source policy")
+		assert.Contains(t, body, "repo \"octocat/hello-world\" is not authorized")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for source policy failure comment")
+	}
+
+	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, plan := range plans {
+		assert.NotEqual(t, dbName, plan.Database, "source-policy-blocked plan should not be stored")
+	}
+
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	assert.Nil(t, check, "source-policy-blocked plan should not store a per-database check")
+
+	var aggregateCheck checkRunCapture
+	select {
+	case aggregateCheck = <-result.checkRuns:
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for source policy aggregate check run")
+	}
+	assert.Equal(t, aggregateCheckName, aggregateCheck.Name)
+	assert.Equal(t, checkStatusCompleted, aggregateCheck.Status)
+	assert.Equal(t, checkConclusionFailure, aggregateCheck.Conclusion)
+	require.NotNil(t, aggregateCheck.Output)
+	assert.Contains(t, aggregateCheck.Output.Summary, "source policy")
+
+	aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, aggregate, "source-policy-blocked plan should store a failing aggregate check")
+	assert.Equal(t, "abc123", aggregate.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, aggregate.Status)
+	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion)
 }
 
 func TestE2EPlanNoChanges(t *testing.T) {
@@ -862,6 +945,80 @@ func TestE2EAutoPlan(t *testing.T) {
 		assert.Equal(t, "action_required", cr.Conclusion)
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for check run")
+	}
+}
+
+// TestE2EAutoPlanSourcePolicyBlocksWithFailingAggregate verifies auto-plan
+// source-policy failures create a failing aggregate Check Run for branch
+// protection instead of only posting a PR comment.
+func TestE2EAutoPlanSourcePolicyBlocksWithFailingAggregate(t *testing.T) {
+	dbName := "webhook_autoplan_source_policy_block"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/orders"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "failed to plan")
+		assert.Contains(t, body, "source policy")
+		assert.Contains(t, body, "repo \"octocat/hello-world\" is not authorized")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for source policy auto-plan comment")
+	}
+
+	var aggregateCheck checkRunCapture
+	select {
+	case aggregateCheck = <-result.checkRuns:
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for source policy aggregate check run")
+	}
+	assert.Equal(t, aggregateCheckName, aggregateCheck.Name)
+	assert.Equal(t, "completed", aggregateCheck.Status)
+	assert.Equal(t, "failure", aggregateCheck.Conclusion)
+	require.NotNil(t, aggregateCheck.Output)
+	assert.Contains(t, aggregateCheck.Output.Summary, "source policy")
+
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, check, "source-policy-blocked auto-plan should store a failing aggregate check")
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.Equal(t, "completed", check.Status)
+	assert.Equal(t, "failure", check.Conclusion)
+
+	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, plan := range plans {
+		assert.NotEqual(t, dbName, plan.Database, "source-policy-blocked auto-plan should not store a plan")
 	}
 }
 
