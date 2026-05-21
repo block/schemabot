@@ -595,7 +595,9 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			return ctx.Err()
 		case <-heartbeatTicker.C:
 			// Heartbeat: bump updated_at to maintain lease
-			_ = c.storage.Applies().Heartbeat(ctx, apply.ID)
+			if err := c.storage.Applies().Heartbeat(ctx, apply.ID); err != nil {
+				return fmt.Errorf("heartbeat gRPC apply %s: %w", apply.ApplyIdentifier, err)
+			}
 		case <-ticker.C:
 			// Poll progress from remote Tern
 			resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
@@ -604,6 +606,12 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				ApplyId:     apply.ExternalID,
 			})
 			if err != nil {
+				slog.Warn("remote gRPC progress poll failed",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"error", err)
 				continue
 			}
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
@@ -644,7 +652,10 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			// terminal check so task records get their final state synced
 			// before we return.
 			if c.storage != nil {
-				tasks, _ := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+				tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+				if err != nil {
+					return fmt.Errorf("load tasks to sync gRPC progress for %s: %w", apply.ApplyIdentifier, err)
+				}
 				for _, task := range tasks {
 					for _, tp := range resp.Tables {
 						if tp.TableName == task.TableName {
@@ -653,7 +664,9 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 							task.RowsTotal = tp.RowsTotal
 							task.ProgressPercent = int(tp.PercentComplete)
 							task.UpdatedAt = now
-							_ = c.storage.Tasks().Update(ctx, task)
+							if err := c.storage.Tasks().Update(ctx, task); err != nil {
+								return fmt.Errorf("sync task %s from gRPC progress for %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+							}
 							break
 						}
 					}
@@ -664,7 +677,9 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			if terminal {
 				apply.CompletedAt = &now
 			}
-			_ = c.storage.Applies().Update(ctx, apply)
+			if err := c.storage.Applies().Update(ctx, apply); err != nil {
+				return fmt.Errorf("sync apply %s from gRPC progress: %w", apply.ApplyIdentifier, err)
+			}
 			if terminal {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 				return nil
