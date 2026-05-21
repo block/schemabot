@@ -2,6 +2,8 @@ package commands
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -372,15 +374,27 @@ func WatchApplyProgressByApplyID(endpoint, applyID string, allowCutover bool) er
 // from a prior prompt (e.g., confirmation "yes" + key repeat) doesn't
 // leak into the Bubbletea event loop.
 // runWatchModel runs a WatchModel and returns the result.
-func runWatchModel(model WatchModel) error {
+func runWatchModel(model WatchModel) (err error) {
+	// Print apply context even on panic so operators never lose the apply ID.
+	defer func() {
+		if r := recover(); r != nil {
+			printExitContext(model.applyID, "", model.database, model.environment)
+			err = fmt.Errorf("unexpected error: %v", r)
+		}
+	}()
+
 	// Don't use alt-screen - render inline for seamless experience
 	p := tea.NewProgram(model)
 	finalModel, err := p.Run()
 	if err != nil {
+		printExitContext(model.applyID, "", model.database, model.environment)
 		return err
 	}
 
 	m := finalModel.(WatchModel)
+
+	// Always print apply context on exit so operators can resume monitoring.
+	printExitContext(m.applyID, m.deployRequestURL, m.database, m.environment)
 
 	// The TUI view already displays errors inline, so return ErrSilent
 	// to exit with code 1 without printing the error again.
@@ -392,4 +406,34 @@ func runWatchModel(model WatchModel) error {
 	}
 
 	return nil
+}
+
+// printExitContext prints apply context on any TUI exit so operators
+// can resume monitoring or find the apply in PlanetScale.
+func printExitContext(applyID, deployRequestURL, database, environment string) {
+	msg := formatExitContext(applyID, deployRequestURL, database, environment)
+	if msg != "" {
+		fmt.Print(msg)
+	}
+}
+
+// formatExitContext builds the exit context message with apply ID, deploy
+// request URL, and resume command. Returns empty string if no apply ID.
+func formatExitContext(applyID, deployRequestURL, database, environment string) string {
+	if applyID == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "  Apply ID:  %s\n", applyID)
+	if deployRequestURL != "" {
+		fmt.Fprintf(&b, "  Deploy Request:  %s\n", deployRequestURL)
+	}
+	cmd := fmt.Sprintf("schemabot progress --apply-id %s", applyID)
+	if environment != "" {
+		cmd += " -e " + environment
+	}
+	fmt.Fprintf(&b, "  Resume:    %s\n", cmd)
+	b.WriteString("\n")
+	return b.String()
 }

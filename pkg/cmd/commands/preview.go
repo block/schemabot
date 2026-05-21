@@ -103,6 +103,11 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewLogStopped, templates.PreviewLogMulti, templates.PreviewLogAll,
 		templates.PreviewLogCutover, templates.PreviewLogDetailed:
 		previewLogOutput(previewType)
+	// Exit context previews (printed on TUI exit)
+	case templates.PreviewExitDetachMySQL, templates.PreviewExitDetachVitess,
+		templates.PreviewExitErrorMySQL, templates.PreviewExitErrorVitess,
+		templates.PreviewExitAll:
+		previewExitContext(previewType)
 	// Meta
 	case templates.PreviewAll:
 		templates.PreviewCLIOutput(previewType)
@@ -111,6 +116,11 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		fmt.Println("LOG OUTPUT MODE PREVIEWS (-o log)")
 		fmt.Println("=" + strings.Repeat("=", 70))
 		previewLogAll()
+		fmt.Println()
+		fmt.Println("=" + strings.Repeat("=", 70))
+		fmt.Println("EXIT CONTEXT PREVIEWS")
+		fmt.Println("=" + strings.Repeat("=", 70))
+		previewExitAll()
 	default:
 		return fmt.Errorf("unknown preview type: %s (run 'schemabot preview' for valid types)", cmd.Type)
 	}

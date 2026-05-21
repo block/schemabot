@@ -314,6 +314,37 @@ func TestWatchModel_ConsecutiveErrors_IncrementCounter(t *testing.T) {
 	assert.Empty(t, m.errorMsg, "error should be cleared on success")
 }
 
+func TestFormatExitContext(t *testing.T) {
+	t.Run("includes apply ID and resume command", func(t *testing.T) {
+		result := formatExitContext("apply-abc123", "", "mydb", "production")
+		assert.Contains(t, result, "apply-abc123")
+		assert.Contains(t, result, "schemabot progress --apply-id apply-abc123 -e production")
+	})
+
+	t.Run("includes deploy request URL when present", func(t *testing.T) {
+		result := formatExitContext("apply-abc123", "https://app.planetscale.com/org/db/deploy-requests/42", "mydb", "production")
+		assert.Contains(t, result, "apply-abc123")
+		assert.Contains(t, result, "https://app.planetscale.com/org/db/deploy-requests/42")
+		assert.Contains(t, result, "schemabot progress --apply-id apply-abc123 -e production")
+	})
+
+	t.Run("omits deploy URL when empty", func(t *testing.T) {
+		result := formatExitContext("apply-abc123", "", "mydb", "staging")
+		assert.NotContains(t, result, "Deploy Request:")
+	})
+
+	t.Run("empty apply ID returns empty string", func(t *testing.T) {
+		result := formatExitContext("", "https://example.com", "mydb", "staging")
+		assert.Empty(t, result)
+	})
+
+	t.Run("omits environment flag when empty", func(t *testing.T) {
+		result := formatExitContext("apply-abc123", "", "mydb", "")
+		assert.Contains(t, result, "schemabot progress --apply-id apply-abc123")
+		assert.NotContains(t, result, "-e ")
+	})
+}
+
 func TestFetchProgress_ConnectionRefused_RetryableConnectionError(t *testing.T) {
 	// Server is not listening — connection refused.
 	m := NewWatchModel("http://127.0.0.1:1", "testdb", "staging", false)

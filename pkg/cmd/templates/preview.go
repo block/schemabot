@@ -105,6 +105,13 @@ const (
 	PreviewLogCutover  PreviewType = "log_cutover"  // Waiting for cutover + cutover
 	PreviewLogDetailed PreviewType = "log_detailed" // Detailed with task_id and all fields
 
+	// Exit context previews (printed on TUI exit)
+	PreviewExitDetachMySQL  PreviewType = "exit_detach_mysql"  // MySQL apply: user detaches mid-progress
+	PreviewExitDetachVitess PreviewType = "exit_detach_vitess" // Vitess apply: user detaches mid-progress
+	PreviewExitErrorMySQL   PreviewType = "exit_error_mysql"   // MySQL apply: connection lost during progress
+	PreviewExitErrorVitess  PreviewType = "exit_error_vitess"  // Vitess apply: connection lost during progress
+	PreviewExitAll          PreviewType = "exit_all"           // Show all exit context previews
+
 	// Comment template previews (GitHub PR comments)
 	PreviewCommentPlan                PreviewType = "comment_plan"                  // Plan comment with DDL changes + lint violations
 	PreviewCommentPlanEmpty           PreviewType = "comment_plan_empty"            // Plan comment with no changes

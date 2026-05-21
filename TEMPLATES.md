@@ -4673,3 +4673,34 @@ The following changes will permanently delete data:
 ```
 </details>
 
+
+## Exit Context (CLI)
+
+=== Exit Context: MySQL Detach ===
+
+  Apply ID:  apply-8487c4ad
+  Resume:    schemabot progress --apply-id apply-8487c4ad -e staging
+
+
+=== Exit Context: Vitess Detach ===
+
+  Apply ID:  apply-9849818a9cec4ba7
+  Deploy Request:  https://app.planetscale.com/square-production/inventory2/deploy-requests/109
+  Resume:    schemabot progress --apply-id apply-9849818a9cec4ba7 -e production
+
+
+=== Exit Context: MySQL Connection Lost ===
+Error: unexpected error: connection refused
+
+  Apply ID:  apply-8487c4ad
+  Resume:    schemabot progress --apply-id apply-8487c4ad -e staging
+
+
+=== Exit Context: Vitess Connection Lost ===
+Error: unexpected error: connection refused
+
+  Apply ID:  apply-9849818a9cec4ba7
+  Deploy Request:  https://app.planetscale.com/square-production/inventory2/deploy-requests/109
+  Resume:    schemabot progress --apply-id apply-9849818a9cec4ba7 -e production
+
+
