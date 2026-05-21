@@ -66,6 +66,15 @@ collect_pod_logs() {
     kubectl get pods -n "$NAMESPACE" -o wide 2>/dev/null || true
 }
 
+wait_for_schemabot_rollout() {
+    local release_name="$1"
+
+    # Wait on the Deployment created by Helm. Selecting pods directly can race
+    # the controller before it creates the first matching pod.
+    kubectl rollout status "deployment/${release_name}-schemabot" \
+        -n "$NAMESPACE" --timeout=120s
+}
+
 # --- Deploy ---
 
 echo "Creating namespace..."
@@ -79,12 +88,12 @@ kubectl wait --for=condition=ready pod -l app=mysql-data-plane -n "$NAMESPACE" -
 echo "Installing data plane..."
 helm upgrade --install data-plane "$REPO_ROOT/charts/schemabot" \
     -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/data-plane-values.yaml"
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=data-plane -n "$NAMESPACE" --timeout=120s
+wait_for_schemabot_rollout data-plane
 
 echo "Installing control plane..."
 helm upgrade --install control-plane "$REPO_ROOT/charts/schemabot" \
     -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/control-plane-values.yaml"
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=control-plane -n "$NAMESPACE" --timeout=120s
+wait_for_schemabot_rollout control-plane
 
 # --- Port-forwards ---
 
