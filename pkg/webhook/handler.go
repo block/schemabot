@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -29,19 +30,23 @@ import (
 
 // Handler processes GitHub webhook events.
 type Handler struct {
-	service       *api.Service
-	ghClient      github.GitHubClientFactory
-	webhookSecret []byte
-	logger        *slog.Logger
+	service                    *api.Service
+	ghClient                   github.GitHubClientFactory
+	webhookSecret              []byte
+	logger                     *slog.Logger
+	priorEnvCheckMaxAttempts   int
+	priorEnvCheckRetryInterval time.Duration
 }
 
 // NewHandler creates a new webhook handler.
 func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webhookSecret []byte, logger *slog.Logger) *Handler {
 	h := &Handler{
-		service:       service,
-		ghClient:      ghClient,
-		webhookSecret: webhookSecret,
-		logger:        logger,
+		service:                    service,
+		ghClient:                   ghClient,
+		webhookSecret:              webhookSecret,
+		logger:                     logger,
+		priorEnvCheckMaxAttempts:   defaultPriorEnvCheckMaxAttempts,
+		priorEnvCheckRetryInterval: defaultPriorEnvCheckRetryInterval,
 	}
 
 	// Register recovery callback so the scheduler can attach comment observers

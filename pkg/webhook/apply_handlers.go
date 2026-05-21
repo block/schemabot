@@ -76,8 +76,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 
 	// Environment ordering enforcement: prior environments must be clean before applying.
-	// e.g., for [sandbox, staging, production], applying to production requires both
-	// sandbox and staging checks to be success.
+	// The repo config only opts into environments; server config owns their order.
 	if blocked := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID, requestedBy); blocked {
 		h.logger.Info("apply blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		return

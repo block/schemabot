@@ -14,7 +14,7 @@ import (
 // SchemaRequestResult contains everything needed to execute a plan from a PR.
 type SchemaRequestResult struct {
 	Database     string
-	Environments []string // All configured environments in order (e.g., ["staging", "production"])
+	Environments []string // Enabled environments from schemabot.yaml; server config owns promotion order.
 	Type         string   // "mysql" or "vitess"
 	SchemaFiles  map[string]*ternv1.SchemaFiles
 	Repository   string

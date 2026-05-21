@@ -44,6 +44,11 @@ type ServerConfig struct {
 	// When empty or nil, all environments are allowed.
 	AllowedEnvironments []string `yaml:"allowed_environments"`
 
+	// EnvironmentOrder defines the server-owned promotion order. Client-side
+	// schemabot.yaml environments only opt into environments; their YAML order is
+	// not authoritative for apply gating. Defaults to staging before production.
+	EnvironmentOrder []string `yaml:"environment_order"`
+
 	// SchedulerWorkers is the number of concurrent scheduler workers that claim
 	// and resume applies. Each worker independently polls FindNextApply with
 	// FOR UPDATE SKIP LOCKED to prevent races. Defaults to 1.
@@ -218,6 +223,8 @@ type ResolvedDatabaseTarget struct {
 	Target       string
 }
 
+var defaultEnvironmentOrder = []string{"staging", "production"}
+
 // LoadServerConfig loads the server configuration from the file specified
 // by the SCHEMABOT_CONFIG_FILE environment variable.
 func LoadServerConfig() (*ServerConfig, error) {
@@ -257,6 +264,10 @@ func (c *ServerConfig) Validate() error {
 	// server-owned target/deployment route.
 	if len(c.Databases) == 0 {
 		return fmt.Errorf("databases is required")
+	}
+
+	if err := validateUniqueNames("environment_order", c.EnvironmentOrder); err != nil {
+		return err
 	}
 
 	// Validate Databases if present. An environment is either local mode
@@ -333,6 +344,20 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 			}
 			return fmt.Errorf("database %q environment %q uses a local dsn but tern_deployments also defines deployment %q for that environment; rename the database or deployment to avoid ambiguous routing", database, environment, database)
 		}
+	}
+	return nil
+}
+
+func validateUniqueNames(field string, names []string) error {
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name == "" {
+			return fmt.Errorf("%s contains an empty value", field)
+		}
+		if _, ok := seen[name]; ok {
+			return fmt.Errorf("%s contains duplicate value %q", field, name)
+		}
+		seen[name] = struct{}{}
 	}
 	return nil
 }
@@ -414,6 +439,47 @@ func (c *ServerConfig) IsEnvironmentAllowed(env string) bool {
 		return true
 	}
 	return slices.Contains(c.AllowedEnvironments, env)
+}
+
+// PromotionEnvironmentOrder returns the server-owned environment promotion
+// order used by PR apply gating.
+func (c *ServerConfig) PromotionEnvironmentOrder() []string {
+	if c == nil || len(c.EnvironmentOrder) == 0 {
+		return slices.Clone(defaultEnvironmentOrder)
+	}
+	return slices.Clone(c.EnvironmentOrder)
+}
+
+// OrderedEnvironments returns the enabled environments sorted by the server-owned
+// promotion order. Unknown environments are appended alphabetically so callers
+// get deterministic behavior even before a custom environment_order is added.
+func (c *ServerConfig) OrderedEnvironments(enabled []string) []string {
+	enabledSet := make(map[string]struct{}, len(enabled))
+	for _, env := range enabled {
+		if env == "" {
+			continue
+		}
+		enabledSet[env] = struct{}{}
+	}
+
+	ordered := make([]string, 0, len(enabledSet))
+	for _, env := range c.PromotionEnvironmentOrder() {
+		if _, ok := enabledSet[env]; ok {
+			ordered = append(ordered, env)
+			delete(enabledSet, env)
+		}
+	}
+
+	if len(enabledSet) == 0 {
+		return ordered
+	}
+
+	remaining := make([]string, 0, len(enabledSet))
+	for env := range enabledSet {
+		remaining = append(remaining, env)
+	}
+	slices.Sort(remaining)
+	return append(ordered, remaining...)
 }
 
 // ShouldRespondToUnscoped returns whether this instance should respond to

@@ -346,6 +346,22 @@ func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason string, err error) 
 	return sb.String()
 }
 
+// RenderApplyBlockedByMissingPriorEnvCheck renders a comment when apply is
+// blocked because SchemaBot cannot find a completed check for a required prior
+// environment. This is distinct from a read/API error: retrying the later apply
+// does not create the missing prior-environment check.
+func RenderApplyBlockedByMissingPriorEnvCheck(priorEnv string) string {
+	var sb strings.Builder
+
+	sb.WriteString("## ❌ Apply Blocked\n\n")
+	fmt.Fprintf(&sb, "SchemaBot could not find a completed `%s` check for this PR.\n\n", priorEnv)
+	fmt.Fprintf(&sb, "SchemaBot must verify `%s` before applying a later environment. Create the missing `%s` status with:\n", priorEnv, priorEnv)
+	fmt.Fprintf(&sb, "```\nschemabot plan -e %s\n```\n\n", priorEnv)
+	fmt.Fprintf(&sb, "If the plan finds changes, apply `%s` and wait for the SchemaBot check to succeed. Then retry this apply.\n", priorEnv)
+
+	return sb.String()
+}
+
 // RenderApplyBlockedByPriorEnvInProgress renders a comment when an apply is blocked
 // because a prior environment's apply is currently running.
 func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv string) string {

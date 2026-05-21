@@ -24,6 +24,10 @@ type emptyStorage struct {
 	storage.Storage
 }
 
+func (s *emptyStorage) Close() error {
+	return nil
+}
+
 func (s *emptyStorage) Checks() storage.CheckStore {
 	return &emptyCheckStore{}
 }
@@ -34,6 +38,10 @@ func (s *emptyStorage) Applies() storage.ApplyStore {
 
 type emptyCheckStore struct {
 	storage.CheckStore
+}
+
+func (s *emptyCheckStore) Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*storage.Check, error) {
+	return nil, nil
 }
 
 func (s *emptyCheckStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Check, error) {
@@ -52,10 +60,6 @@ type failingStorage struct {
 	emptyStorage
 }
 
-func (s *failingStorage) Close() error {
-	return nil
-}
-
 func (s *failingStorage) Checks() storage.CheckStore {
 	return &failingCheckStore{}
 }
@@ -66,6 +70,31 @@ type failingCheckStore struct {
 
 func (s *failingCheckStore) Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*storage.Check, error) {
 	return nil, errors.New("storage read failed")
+}
+
+type sequenceStorage struct {
+	emptyStorage
+	checks *sequenceCheckStore
+}
+
+func (s *sequenceStorage) Checks() storage.CheckStore {
+	return s.checks
+}
+
+type sequenceCheckStore struct {
+	storage.CheckStore
+	results []*storage.Check
+	calls   int
+}
+
+func (s *sequenceCheckStore) Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*storage.Check, error) {
+	s.calls++
+	if len(s.results) == 0 {
+		return nil, nil
+	}
+	check := s.results[0]
+	s.results = s.results[1:]
+	return check, nil
 }
 
 func TestComputeAggregate(t *testing.T) {
@@ -163,9 +192,11 @@ func TestCheckPriorEnvViaLocalFailsClosedOnStorageError(t *testing.T) {
 	t.Cleanup(func() { utils.CloseAndLog(service) })
 
 	h := &Handler{
-		service:  service,
-		ghClient: &fakeClientFactory{client: installClient},
-		logger:   testLogger(),
+		service:                    service,
+		ghClient:                   &fakeClientFactory{client: installClient},
+		logger:                     testLogger(),
+		priorEnvCheckMaxAttempts:   1,
+		priorEnvCheckRetryInterval: time.Nanosecond,
 	}
 
 	blocked := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345)
@@ -178,6 +209,106 @@ func TestCheckPriorEnvViaLocalFailsClosedOnStorageError(t *testing.T) {
 		assert.Contains(t, body, "storage read failed")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for fail-closed comment")
+	}
+}
+
+// TestCheckPriorEnvViaLocalMissingCheckBlocksWithActionableGuidance covers an
+// apply to a later environment when this SchemaBot instance owns the required
+// prior environment, but no stored check state exists for it. The apply must
+// fail closed and tell the operator how to create the missing prior-environment
+// status instead of suggesting a blind retry of the later apply.
+func TestCheckPriorEnvViaLocalMissingCheckBlocksWithActionableGuidance(t *testing.T) {
+	const (
+		repo = "octocat/hello-world"
+		pr   = 1
+	)
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	service := api.New(&emptyStorage{}, &api.ServerConfig{}, nil, testLogger())
+	t.Cleanup(func() { utils.CloseAndLog(service) })
+
+	h := &Handler{
+		service:                    service,
+		ghClient:                   &fakeClientFactory{client: installClient},
+		logger:                     testLogger(),
+		priorEnvCheckMaxAttempts:   1,
+		priorEnvCheckRetryInterval: time.Nanosecond,
+	}
+
+	blocked := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345)
+	assert.True(t, blocked, "missing prior check should block apply")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Apply Blocked")
+		assert.Contains(t, body, "could not find a completed `staging` check")
+		assert.Contains(t, body, "schemabot plan -e staging")
+		assert.NotContains(t, body, "Retry the apply command")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for missing-check comment")
+	}
+}
+
+// TestCheckPriorEnvViaLocalRetriesBeforeFailClosed covers the race where a
+// later-environment apply starts just before the prior environment's local check
+// state is visible in storage. SchemaBot should retry, accept the later success,
+// and only use the missing-check fail-closed path if the state stays missing.
+func TestCheckPriorEnvViaLocalRetriesBeforeFailClosed(t *testing.T) {
+	const (
+		repo = "octocat/hello-world"
+		pr   = 1
+	)
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	checks := &sequenceCheckStore{
+		results: []*storage.Check{
+			nil,
+			{Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+		},
+	}
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	service := api.New(&sequenceStorage{checks: checks}, &api.ServerConfig{}, nil, testLogger())
+	t.Cleanup(func() { utils.CloseAndLog(service) })
+
+	h := &Handler{
+		service:                    service,
+		ghClient:                   &fakeClientFactory{client: installClient},
+		logger:                     testLogger(),
+		priorEnvCheckMaxAttempts:   2,
+		priorEnvCheckRetryInterval: time.Nanosecond,
+	}
+
+	blocked := h.checkPriorEnvViaLocal(t.Context(), repo, pr, "orders", "mysql", "production", "staging", 12345)
+	assert.False(t, blocked, "retry should observe the prior environment success and allow apply")
+	assert.Equal(t, 2, checks.calls)
+
+	select {
+	case body := <-comments:
+		t.Fatalf("unexpected comment posted: %s", body)
+	default:
 	}
 }
 
@@ -384,8 +515,10 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		factory := &fakeClientFactory{client: installClient}
 
 		h := &Handler{
-			ghClient: factory,
-			logger:   testLogger(),
+			ghClient:                   factory,
+			logger:                     testLogger(),
+			priorEnvCheckMaxAttempts:   1,
+			priorEnvCheckRetryInterval: time.Nanosecond,
 		}
 
 		return h, comments
@@ -415,11 +548,21 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		assert.True(t, blocked)
 	})
 
-	t.Run("no staging check allows proceed", func(t *testing.T) {
-		h, _ := setupCheckRunServer(t, []map[string]any{})
+	t.Run("no staging check blocks apply", func(t *testing.T) {
+		h, comments := setupCheckRunServer(t, []map[string]any{})
 
 		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
-		assert.False(t, blocked)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Apply Blocked")
+			assert.Contains(t, body, "could not find a completed `staging` check")
+			assert.Contains(t, body, "schemabot plan -e staging")
+			assert.NotContains(t, body, "Retry the apply command")
+		default:
+			t.Fatal("expected a comment explaining the missing prior environment check")
+		}
 	})
 
 	t.Run("staging check in progress blocks apply", func(t *testing.T) {
@@ -429,6 +572,66 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
 		assert.True(t, blocked)
+	})
+
+	// This covers the cross-instance race where the production SchemaBot instance
+	// checks GitHub before the staging instance's aggregate Check Run has become
+	// visible. SchemaBot should retry briefly, accept the staging success, and
+	// still fail closed if the check never appears.
+	t.Run("missing staging check retries before allowing success", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 10)
+		checkCalls := 0
+
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"head": map[string]any{"sha": headSHA, "ref": "feature"},
+				"base": map[string]any{"sha": "base123", "ref": "main"},
+				"user": map[string]any{"login": "testuser"},
+			})
+		})
+
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+
+		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			checkCalls++
+			checkRuns := []map[string]any{}
+			if checkCalls > 1 {
+				checkRuns = []map[string]any{
+					{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success"},
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"total_count": len(checkRuns),
+				"check_runs":  checkRuns,
+			})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		h := &Handler{
+			ghClient:                   &fakeClientFactory{client: installClient},
+			logger:                     testLogger(),
+			priorEnvCheckMaxAttempts:   2,
+			priorEnvCheckRetryInterval: time.Nanosecond,
+		}
+
+		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		assert.False(t, blocked, "retry should observe the prior environment success and allow apply")
+		assert.Equal(t, 2, checkCalls)
+
+		select {
+		case body := <-comments:
+			t.Fatalf("unexpected comment posted: %s", body)
+		default:
+		}
 	})
 
 	t.Run("GitHub API failure blocks apply (fail-closed)", func(t *testing.T) {
@@ -463,8 +666,10 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		factory := &fakeClientFactory{client: installClient}
 
 		h := &Handler{
-			ghClient: factory,
-			logger:   testLogger(),
+			ghClient:                   factory,
+			logger:                     testLogger(),
+			priorEnvCheckMaxAttempts:   1,
+			priorEnvCheckRetryInterval: time.Nanosecond,
 		}
 
 		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)

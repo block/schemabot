@@ -722,18 +722,33 @@ watcher from overwriting a newer plan or newer apply result.
 
 ## Environment Ordering
 
-Environment ordering is enforced for PR comment commands. The order comes from
-the `environments` list in `schemabot.yaml`:
+Environment ordering is enforced for PR comment commands. The set of enabled
+environments comes from `schemabot.yaml`, but the order comes from server config:
 
 ```yaml
-environments:
-  - sandbox
+environment_order:
   - staging
   - production
 ```
 
+If `environment_order` is omitted, SchemaBot defaults to staging before
+production.
+
+For clients, `schemabot.yaml` environments are strictly an opt-in mechanism:
+
+```yaml
+environments:
+  - production
+  - staging
+```
+
+The order in that file is ignored for apply gating. In the example above, the
+repository has opted into both environments. SchemaBot still treats staging as
+the prior environment for production because the server-owned order says staging
+comes first.
+
 Before applying to an environment, SchemaBot checks all prior environments for
-the same database:
+the same database that are also enabled in `schemabot.yaml`:
 
 | Prior environment state | Apply allowed? | Reason |
 | --- | --- | --- |
@@ -741,16 +756,50 @@ the same database:
 | `action_required` | No | Apply the prior environment first. |
 | `in_progress` | No | Wait for the prior environment to finish. |
 | `failure` | No | Fix and re-apply the prior environment. |
-| No record | Yes | No managed changes were found for that prior environment. |
+| No record | No | SchemaBot cannot prove the prior environment is clean. |
 
-Prior environments owned by the same SchemaBot deployment are checked from local
-storage. If ownership is split with `allowed_environments`, prior environments
-owned by another deployment are checked through their published aggregate check,
-such as `SchemaBot (staging)`.
+The lookup path depends on which SchemaBot deployment owns the prior
+environment:
 
-If SchemaBot cannot read the prior environment state from local storage or
-GitHub, the apply is blocked. Unknown prior-environment state is not treated as
-safe.
+- If the same deployment owns the prior environment, SchemaBot reads its local
+  check storage for the same PR, database type, database, and prior
+  environment.
+- If another deployment owns the prior environment, SchemaBot reads the
+  environment aggregate check run from GitHub, such as `SchemaBot (staging)`.
+
+Remote prior-environment checks use the aggregate because the current deployment
+does not have access to the other deployment's per-database storage. That makes
+the remote check stricter than the local check: a production apply can be
+blocked by any pending or failed staging SchemaBot aggregate, not only by the
+same database's staging row.
+
+In split deployments, GitHub check runs are the central authority for
+cross-environment gating. A production SchemaBot instance does not need staging
+target identifiers in its server config. Its apply flow is:
+
+```text
+schemabot apply -e production
+        |
+        v
+Read enabled environments from schemabot.yaml
+and promotion order from server config
+        |
+        v
+For each prior environment:
+  - if this instance owns it, read SchemaBot storage
+  - if another instance owns it, read that environment's GitHub aggregate check
+        |
+        v
+Only resolve the production target from this instance's ConfigMap
+```
+
+This means environment-scoped ConfigMaps can stay environment-local: the staging
+ConfigMap contains staging targets, the production ConfigMap contains production
+targets, and GitHub check runs connect the promotion gate between them.
+
+A missing prior-environment record or aggregate blocks the apply because
+SchemaBot cannot prove the prior environment is clean. Unknown prior-environment
+state is not treated as safe.
 
 Rollback commands, such as `schemabot rollback <apply-id> -e <environment>`,
 are not gated by prior environment checks. They are operator-facing controls for

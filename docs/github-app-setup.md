@@ -143,7 +143,7 @@ environments:
 |-------|----------|-------------|
 | `database` | Yes | Must match a database name in your SchemaBot server config |
 | `type` | Yes | `"mysql"` or `"vitess"` |
-| `environments` | No | Defaults to `["staging"]`. Valid values: `"staging"`, `"production"` |
+| `environments` | No | Defaults to `["staging"]`. Valid values: `"staging"`, `"production"`. This is an opt-in list; server config controls promotion order. |
 
 ### Schema File Layout
 

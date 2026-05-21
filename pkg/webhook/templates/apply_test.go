@@ -451,6 +451,16 @@ func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
 	})
 }
 
+func TestRenderApplyBlockedByMissingPriorEnvCheck(t *testing.T) {
+	result := RenderApplyBlockedByMissingPriorEnvCheck("staging")
+
+	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "could not find a completed `staging` check")
+	assert.Contains(t, result, "schemabot plan -e staging")
+	assert.Contains(t, result, "apply `staging`")
+	assert.NotContains(t, result, "Retry the apply command")
+}
+
 func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {
 	inProgress := []BlockingCheck{
 		{Name: "CI / unit-tests", State: "in_progress"},

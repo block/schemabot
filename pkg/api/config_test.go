@@ -492,6 +492,51 @@ func TestServerConfig_EnvironmentIsolatedConfigMaps(t *testing.T) {
 	assert.Equal(t, "payments-production-target", production.Target)
 }
 
+func TestServerConfig_OrderedEnvironments(t *testing.T) {
+	t.Run("default order ignores client order", func(t *testing.T) {
+		cfg := ServerConfig{}
+
+		got := cfg.OrderedEnvironments([]string{"production", "staging"})
+
+		assert.Equal(t, []string{"staging", "production"}, got)
+	})
+
+	t.Run("custom order", func(t *testing.T) {
+		cfg := ServerConfig{EnvironmentOrder: []string{"sandbox", "staging", "production"}}
+
+		got := cfg.OrderedEnvironments([]string{"production", "sandbox", "staging"})
+
+		assert.Equal(t, []string{"sandbox", "staging", "production"}, got)
+	})
+
+	t.Run("unknown environments are deterministic", func(t *testing.T) {
+		cfg := ServerConfig{}
+
+		got := cfg.OrderedEnvironments([]string{"qa", "production", "dev", "staging"})
+
+		assert.Equal(t, []string{"staging", "production", "dev", "qa"}, got)
+	})
+
+	t.Run("invalid order rejects duplicates", func(t *testing.T) {
+		cfg := ServerConfig{
+			EnvironmentOrder: []string{"staging", "staging"},
+			Databases: map[string]DatabaseConfig{
+				"testdb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root@tcp(localhost)/testdb"},
+					},
+				},
+			},
+		}
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate")
+	})
+}
+
 func TestLoadServerConfigFromFile_InvalidConfig(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")

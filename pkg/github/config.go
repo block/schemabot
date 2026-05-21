@@ -68,6 +68,7 @@ func (c *SchemabotConfig) GetType() DatabaseType {
 }
 
 // GetEnvironments returns the enabled environment names, defaulting to ["staging"].
+// The returned order is not authoritative; SchemaBot servers own promotion order.
 func (c *SchemabotConfig) GetEnvironments() []string {
 	if len(c.Environments) == 0 {
 		return []string{"staging"}

@@ -49,6 +49,32 @@ In gRPC mode, `target` is an opaque identifier understood by the remote Tern ser
 
 The example above is a single SchemaBot deployment that owns both environments. In environment-isolated deployments, each SchemaBot config should contain only the targets for the environments that instance owns. Use `allowed_environments` to scope each instance.
 
+## Environment Order
+
+For clients, `schemabot.yaml` environments are strictly an opt-in mechanism. They control which environments a repository opts into; they do not control promotion order. SchemaBot enforces promotion order from server config:
+
+```yaml
+environment_order:
+  - staging
+  - production
+```
+
+If omitted, SchemaBot defaults to `staging` before `production`. The order of values in `schemabot.yaml` is ignored for apply gating, so these two repo configs are equivalent:
+
+```yaml
+environments:
+  - staging
+  - production
+```
+
+```yaml
+environments:
+  - production
+  - staging
+```
+
+Both enable staging and production. When applying production, SchemaBot checks staging first because the server-owned `environment_order` says staging precedes production.
+
 ## Hybrid Mode
 
 Both modes can be used simultaneously. Each database environment in the `databases` section chooses one route: local mode with `dsn`, or gRPC mode with `target` and `deployment`. This is useful when some databases are co-located with SchemaBot and others are in remote environments.

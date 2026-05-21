@@ -3,7 +3,6 @@ package webhook
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -22,6 +21,7 @@ const maxCheckRunTextLength = 65530
 const (
 	checkStatusCompleted  = "completed"
 	checkStatusInProgress = "in_progress"
+	checkStatusQueued     = "queued"
 )
 
 // GitHub Check Run conclusion values.
@@ -37,6 +37,14 @@ const (
 // environment and database; the aggregate rolls it into one visible conclusion so
 // branch protection only needs one stable name.
 const aggregateCheckName = "SchemaBot"
+
+const (
+	// defaultPriorEnvCheckMaxAttempts bounds the apply gate wait for prior
+	// environment check state. It includes the first read plus retries, so the
+	// default waits up to roughly three seconds before failing closed.
+	defaultPriorEnvCheckMaxAttempts   = 4
+	defaultPriorEnvCheckRetryInterval = time.Second
+)
 
 // aggregateSentinel is used for database type and database name when storing
 // aggregate check state in the checks table. For the environment field,
@@ -599,8 +607,9 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 	}
 }
 
-// checkPriorEnvironments enforces environment ordering: all environments before
-// the current one in the configured list must have their check run at "success".
+// checkPriorEnvironments enforces server-owned environment ordering: all enabled
+// environments before the current one in the server promotion order must have a
+// successful SchemaBot check.
 // Returns true if the apply is blocked (caller should return).
 //
 // For environments: [sandbox, staging, production]
@@ -608,9 +617,10 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 //   - applying to staging: sandbox must be success
 //   - applying to production: both sandbox and staging must be success
 //
+// schemabot.yaml only opts into environments; its YAML order is ignored.
 // When allowed_environments is configured, this instance only owns a subset of
-// environments. For prior environments owned by this instance, the local database
-// is checked. For prior environments owned by another instance, the GitHub Checks
+// environments. For prior environments owned by this instance, local storage is
+// checked. For prior environments owned by another instance, the GitHub Checks
 // API is queried for the per-environment aggregate check run.
 func (h *Handler) checkPriorEnvironments(
 	ctx context.Context, repo string, pr int,
@@ -618,6 +628,9 @@ func (h *Handler) checkPriorEnvironments(
 	environments []string,
 	installationID int64, requestedBy string,
 ) bool {
+	config := h.service.Config()
+	environments = config.OrderedEnvironments(environments)
+
 	// Find the index of the current environment
 	currentIdx := -1
 	for i, env := range environments {
@@ -631,8 +644,6 @@ func (h *Handler) checkPriorEnvironments(
 	if currentIdx <= 0 {
 		return false
 	}
-
-	config := h.service.Config()
 
 	// Check all prior environments
 	for i := 0; i < currentIdx; i++ {
@@ -660,7 +671,7 @@ func (h *Handler) checkPriorEnvViaLocal(
 	database, dbType, environment, priorEnv string,
 	installationID int64,
 ) bool {
-	check, err := h.service.Storage().Checks().Get(ctx, repo, pr, priorEnv, dbType, database)
+	check, err := h.waitForLocalPriorEnvCheck(ctx, repo, pr, database, dbType, environment, priorEnv)
 	if err != nil {
 		h.logger.Error("failed to look up prior environment check",
 			"repo", repo, "pr", pr,
@@ -673,13 +684,14 @@ func (h *Handler) checkPriorEnvViaLocal(
 	}
 
 	if check == nil {
-		// No check exists for this prior environment — it may not have changes.
-		// This is OK (e.g., staging has no changes but production does).
-		h.logger.Debug("no prior environment check found, allowing apply",
+		h.logger.Warn("prior environment check is missing, blocking apply",
 			"repo", repo, "pr", pr,
 			"database", database, "database_type", dbType,
-			"environment", environment, "prior_environment", priorEnv)
-		return false
+			"environment", environment, "prior_environment", priorEnv,
+			"attempts", h.priorEnvCheckMaxAttemptCount())
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByMissingPriorEnvCheck(priorEnv))
+		return true
 	}
 
 	switch {
@@ -691,6 +703,12 @@ func (h *Handler) checkPriorEnvViaLocal(
 			"check_status", check.Status, "check_conclusion", check.Conclusion)
 		return false
 	case check.Status == checkStatusInProgress:
+		h.logger.Warn("prior environment check is still in progress after retries, blocking apply",
+			"repo", repo, "pr", pr,
+			"database", database, "database_type", dbType,
+			"environment", environment, "prior_environment", priorEnv,
+			"check_status", check.Status, "check_conclusion", check.Conclusion,
+			"attempts", h.priorEnvCheckMaxAttemptCount())
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
 		return true
@@ -705,6 +723,49 @@ func (h *Handler) checkPriorEnvViaLocal(
 			templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action))
 		return true
 	}
+}
+
+func (h *Handler) waitForLocalPriorEnvCheck(
+	ctx context.Context, repo string, pr int,
+	database, dbType, environment, priorEnv string,
+) (*storage.Check, error) {
+	// A later-environment apply can race a prior-environment plan/apply webhook
+	// that has not persisted its check state yet. Retry briefly, then preserve
+	// the fail-closed behavior if the prior environment still cannot be proven
+	// safe.
+	attempts := h.priorEnvCheckMaxAttemptCount()
+	for attempt := 1; attempt <= attempts; attempt++ {
+		check, err := h.service.Storage().Checks().Get(ctx, repo, pr, priorEnv, dbType, database)
+		if err != nil {
+			return nil, err
+		}
+		if !shouldRetryStoredPriorEnvCheck(check) || attempt == attempts {
+			return check, nil
+		}
+
+		h.logger.Debug("prior environment check state not ready, retrying",
+			"repo", repo, "pr", pr,
+			"database", database, "database_type", dbType,
+			"environment", environment, "prior_environment", priorEnv,
+			"check_status", storedPriorEnvCheckStatus(check),
+			"attempt", attempt, "max_attempts", attempts)
+		if err := h.waitBeforePriorEnvCheckRetry(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	return nil, nil
+}
+
+func shouldRetryStoredPriorEnvCheck(check *storage.Check) bool {
+	return check == nil || check.Status == checkStatusInProgress
+}
+
+func storedPriorEnvCheckStatus(check *storage.Check) string {
+	if check == nil {
+		return "missing"
+	}
+	return check.Status
 }
 
 // checkPriorEnvViaGitHub checks the prior environment status by querying the
@@ -741,7 +802,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 	}
 
 	checkName := aggregateCheckNameForEnv(priorEnv)
-	checkResult, err := client.FindCheckRunByName(ctx, repo, prInfo.HeadSHA, checkName)
+	checkResult, err := h.waitForGitHubPriorEnvCheck(ctx, client, repo, pr, database, environment, priorEnv, prInfo.HeadSHA, checkName)
 	if err != nil {
 		h.logger.Error("failed to query GitHub check for prior environment, blocking apply",
 			"prior_env", priorEnv, "check_name", checkName, "error", err)
@@ -751,24 +812,33 @@ func (h *Handler) checkPriorEnvViaGitHub(
 	}
 
 	if checkResult == nil {
-		// No check run from the other instance. This could mean:
-		// (a) The prior environment has no schema changes for this PR (legit — allow proceed)
-		// (b) The other instance hasn't processed the webhook yet (race — should block)
-		// We cannot distinguish these cases without additional coordination. For now,
-		// allow proceed since blocking on missing checks would break PRs that only
-		// touch a subset of environments. A future improvement could add a brief retry
-		// with backoff to handle case (b).
-		slog.Info("no GitHub check found for prior environment, allowing proceed",
-			"prior_env", priorEnv, "check_name", checkName, "repo", repo, "pr", pr)
-		return false
+		h.logger.Warn("no GitHub check found for prior environment, blocking apply",
+			"repo", repo, "pr", pr,
+			"database", database,
+			"environment", environment, "prior_environment", priorEnv,
+			"check_name", checkName,
+			"attempts", h.priorEnvCheckMaxAttemptCount())
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByMissingPriorEnvCheck(priorEnv))
+		return true
 	}
 
 	switch {
 	case checkResult.Status == checkStatusCompleted && checkResult.Conclusion == checkConclusionSuccess:
-		slog.Debug("prior environment verified via GitHub check",
-			"prior_env", priorEnv, "conclusion", checkResult.Conclusion)
+		h.logger.Debug("prior environment verified via GitHub check",
+			"repo", repo, "pr", pr,
+			"database", database,
+			"environment", environment, "prior_environment", priorEnv,
+			"check_name", checkName, "conclusion", checkResult.Conclusion)
 		return false
-	case checkResult.Status == checkStatusInProgress:
+	case checkResult.Status == checkStatusInProgress || checkResult.Status == checkStatusQueued:
+		h.logger.Warn("prior environment GitHub check is still non-terminal after retries, blocking apply",
+			"repo", repo, "pr", pr,
+			"database", database,
+			"environment", environment, "prior_environment", priorEnv,
+			"check_name", checkName,
+			"check_status", checkResult.Status, "check_conclusion", checkResult.Conclusion,
+			"attempts", h.priorEnvCheckMaxAttemptCount())
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv))
 		return true
@@ -782,6 +852,77 @@ func (h *Handler) checkPriorEnvViaGitHub(
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action))
 		return true
+	}
+}
+
+func (h *Handler) waitForGitHubPriorEnvCheck(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int,
+	database, environment, priorEnv, headSHA, checkName string,
+) (*ghclient.CheckRunResult, error) {
+	// Cross-instance prior environment checks depend on GitHub Check Run
+	// visibility. Retry briefly so ordering jitter does not cause an avoidable
+	// block, then fail closed if the required check is still missing or running.
+	attempts := h.priorEnvCheckMaxAttemptCount()
+	for attempt := 1; attempt <= attempts; attempt++ {
+		checkResult, err := client.FindCheckRunByName(ctx, repo, headSHA, checkName)
+		if err != nil {
+			return nil, err
+		}
+		if !shouldRetryGitHubPriorEnvCheck(checkResult) || attempt == attempts {
+			return checkResult, nil
+		}
+
+		h.logger.Debug("prior environment GitHub check not ready, retrying",
+			"repo", repo, "pr", pr,
+			"database", database,
+			"environment", environment, "prior_environment", priorEnv,
+			"head_sha", headSHA,
+			"check_name", checkName,
+			"check_status", githubPriorEnvCheckStatus(checkResult),
+			"attempt", attempt, "max_attempts", attempts)
+		if err := h.waitBeforePriorEnvCheckRetry(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	return nil, nil
+}
+
+func shouldRetryGitHubPriorEnvCheck(check *ghclient.CheckRunResult) bool {
+	return check == nil || check.Status == checkStatusQueued || check.Status == checkStatusInProgress
+}
+
+func githubPriorEnvCheckStatus(check *ghclient.CheckRunResult) string {
+	if check == nil {
+		return "missing"
+	}
+	return check.Status
+}
+
+func (h *Handler) priorEnvCheckMaxAttemptCount() int {
+	if h == nil || h.priorEnvCheckMaxAttempts <= 0 {
+		return defaultPriorEnvCheckMaxAttempts
+	}
+	return h.priorEnvCheckMaxAttempts
+}
+
+func (h *Handler) priorEnvCheckRetryDelay() time.Duration {
+	if h == nil || h.priorEnvCheckRetryInterval <= 0 {
+		return defaultPriorEnvCheckRetryInterval
+	}
+	return h.priorEnvCheckRetryInterval
+}
+
+func (h *Handler) waitBeforePriorEnvCheckRetry(ctx context.Context) error {
+	timer := time.NewTimer(h.priorEnvCheckRetryDelay())
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

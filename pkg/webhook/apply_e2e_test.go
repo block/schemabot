@@ -1039,7 +1039,9 @@ func TestE2EApplyProductionBlockedByStagingFirst(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n  - production\n", dbName)
+	// Client config can enable environments, but cannot control promotion order.
+	// Production listed before staging must still be gated by staging.
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - production\n  - staging\n", dbName)
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
@@ -1066,6 +1068,51 @@ func TestE2EApplyProductionBlockedByStagingFirst(t *testing.T) {
 		assert.Contains(t, body, "schemabot apply -e staging")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for blocked comment")
+	}
+}
+
+// TestE2EApplyUsesCustomServerEnvironmentOrder verifies that environment_order
+// in server config controls promotion order. The repo lists staging before
+// production, but this server config makes production the prior environment.
+func TestE2EApplyUsesCustomServerEnvironmentOrder(t *testing.T) {
+	dbName := "webhook_custom_env_order"
+	svc := setupE2EService(t, dbName)
+	svc.Config().EnvironmentOrder = []string{"production", "staging"}
+
+	seedCheck(t, svc, dbName, "production", "action_required")
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n  - production\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply Blocked")
+		assert.Contains(t, body, "Production")
+		assert.Contains(t, body, "Apply production first")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for custom-order blocked comment")
 	}
 }
 
@@ -1242,6 +1289,7 @@ func TestE2EApplyAutoConfirmDowngradesOnSHAMismatch(t *testing.T) {
 func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	dbName := "webhook_three_env"
 	svc := setupE2EService(t, dbName)
+	svc.Config().EnvironmentOrder = []string{"sandbox", "staging", "production"}
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)

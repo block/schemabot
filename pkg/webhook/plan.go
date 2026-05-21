@@ -146,6 +146,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 	// Filter environments to those this service is allowed to handle.
 	if h.service != nil {
 		config := h.service.Config()
+		environments = config.OrderedEnvironments(environments)
 		allowedEnvironments = append([]string(nil), config.AllowedEnvironments...)
 		if len(config.AllowedEnvironments) > 0 {
 			var allowed []string
