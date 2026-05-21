@@ -333,11 +333,12 @@ func TestGRPCClient_Close(t *testing.T) {
 // progressState controls what Progress returns (defaults to STATE_COMPLETED).
 type capturingTernServer struct {
 	ternv1.UnimplementedTernServer
-	mu              sync.Mutex
-	startApplyID    string
-	progressApplyID string
-	progressState   ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
-	startCalled     bool         // tracks whether Start was actually invoked
+	mu               sync.Mutex
+	startApplyID     string
+	progressApplyID  string
+	progressState    ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
+	progressStateSet bool
+	startCalled      bool // tracks whether Start was actually invoked
 }
 
 func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
@@ -354,8 +355,9 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	s.mu.Lock()
 	s.progressApplyID = req.ApplyId
 	ps := s.progressState
+	progressStateSet := s.progressStateSet
 	s.mu.Unlock()
-	if ps == 0 {
+	if ps == 0 && !progressStateSet {
 		ps = ternv1.State_STATE_COMPLETED
 	}
 	return &ternv1.ProgressResponse{State: ps}, nil
@@ -396,7 +398,7 @@ type mockStorage struct{ storage.Storage }
 func (m *mockStorage) Applies() storage.ApplyStore { return &mockApplyStore{} }
 func (m *mockStorage) Tasks() storage.TaskStore    { return &mockTaskStore{} }
 
-func TestGRPCClientMarkDispatchFailedDecrementsActiveAppliesForRetryableFailure(t *testing.T) {
+func TestGRPCClientMarkRemoteApplyFailedDecrementsActiveAppliesForRetryableFailure(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	prevMP := otel.GetMeterProvider()
@@ -418,7 +420,7 @@ func TestGRPCClientMarkDispatchFailedDecrementsActiveAppliesForRetryableFailure(
 		State:          state.Task.Pending,
 	}
 
-	client.markDispatchFailed(t.Context(), apply, []*storage.Task{task}, "connection reset", true)
+	client.markRemoteApplyFailed(t.Context(), apply, []*storage.Task{task}, "connection reset", true)
 
 	assert.Equal(t, state.Apply.FailedRetryable, apply.State)
 	assert.Equal(t, state.Task.FailedRetryable, task.State)
@@ -548,6 +550,52 @@ func TestGRPCClient_ResumeApply_SkipsStartWhenNotStopped(t *testing.T) {
 	// State should have been updated from Tern's response.
 	assert.Equal(t, state.Apply.Completed, apply.State,
 		"apply state should reflect Tern's real state")
+}
+
+func TestGRPCClient_ResumeApplyFailsWhenRemoteApplyDisappears(t *testing.T) {
+	// A scheduler worker polling a known remote apply ID should not run forever
+	// if the data plane repeatedly reports that no active apply exists.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_NO_ACTIVE_CHANGE,
+		progressStateSet: true,
+	}
+
+	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "localhost:0")
+	require.NoError(t, err, "failed to listen")
+
+	grpcServer := grpc.NewServer()
+	ternv1.RegisterTernServer(grpcServer, server)
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err, "failed to dial")
+
+	client := &GRPCClient{
+		conn:    conn,
+		client:  ternv1.NewTernClient(conn),
+		storage: &mockStorage{},
+	}
+	defer utils.CloseAndLog(client)
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-local",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-missing",
+		State:           state.Apply.Running,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = client.ResumeApply(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "returned no active schema change")
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remote-missing")
+	assert.NotNil(t, apply.CompletedAt)
+	assert.Equal(t, "remote-missing", server.getProgressApplyID())
 }
 
 func TestNewGRPCClient(t *testing.T) {

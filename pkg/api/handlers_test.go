@@ -1005,6 +1005,27 @@ func TestStartHandler(t *testing.T) {
 		assert.Nil(t, mock.startReq)
 	})
 
+	t.Run("deferred deploy rejects start before waiting_for_deploy", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := activeTestApply("apply-defer-pending")
+		apply.State = state.Apply.Pending
+		apply.SetOptions(storage.ApplyOptions{DeferDeploy: true})
+		svc := newControlTestServiceWithTasks(mock, apply, nil)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-defer-pending"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusInternalServerError, w.Code)
+		assert.Contains(t, w.Body.String(), "not ready for deploy")
+		assert.Nil(t, mock.startReq, "start should only reach Tern after the apply is waiting for deploy")
+		assert.Equal(t, state.Apply.Pending, apply.State)
+	})
+
 	t.Run("missing environment", func(t *testing.T) {
 		svc := newTestService()
 		mux := http.NewServeMux()

@@ -114,6 +114,15 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+const (
+	grpcProgressPollInterval = 500 * time.Millisecond
+
+	// A known remote apply ID returning no active work means the data plane no
+	// longer has the apply rows needed to report progress. Do not let a scheduler
+	// worker poll that state forever.
+	grpcNoActiveProgressLimit = 3
+)
+
 // GRPCClient implements Client using gRPC.
 // It delegates execution to a remote Tern service but SchemaBot still manages
 // the apply lifecycle (storage, heartbeats, progress tracking).
@@ -424,23 +433,23 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Apply) error {
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
-		c.markDispatchFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load plan %d: %v", apply.PlanID, err), false)
+		c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load plan %d: %v", apply.PlanID, err), false)
 		return fmt.Errorf("load plan %d for queued gRPC apply %s: %w", apply.PlanID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
 		errMsg := fmt.Sprintf("queued gRPC apply failed: plan %d not found", apply.PlanID)
-		c.markDispatchFailed(ctx, apply, nil, errMsg, false)
+		c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false)
 		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
-		c.markDispatchFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load tasks: %v", err), false)
+		c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load tasks: %v", err), false)
 		return fmt.Errorf("load tasks for queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if len(tasks) == 0 {
 		errMsg := "queued gRPC apply failed: no tasks found"
-		c.markDispatchFailed(ctx, apply, nil, errMsg, false)
+		c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false)
 		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 	if err := c.prepareDispatchTasks(ctx, apply, tasks); err != nil {
@@ -464,12 +473,12 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		Caller:      apply.Caller,
 	})
 	if err != nil {
-		c.markDispatchFailed(ctx, apply, tasks, err.Error(), engine.IsRetryable(err))
+		c.markRemoteApplyFailed(ctx, apply, tasks, err.Error(), engine.IsRetryable(err))
 		return fmt.Errorf("apply queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil {
 		errMsg := "remote apply returned nil response"
-		c.markDispatchFailed(ctx, apply, tasks, errMsg, false)
+		c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false)
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 	if !resp.Accepted {
@@ -477,12 +486,12 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		if errMsg == "" {
 			errMsg = "remote apply was not accepted"
 		}
-		c.markDispatchFailed(ctx, apply, tasks, errMsg, false)
+		c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false)
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 	if resp.ApplyId == "" {
 		errMsg := "remote apply accepted without apply_id"
-		c.markDispatchFailed(ctx, apply, tasks, errMsg, false)
+		c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false)
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 
@@ -531,7 +540,7 @@ func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
 	return changes
 }
 
-func (c *GRPCClient) markDispatchFailed(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, message string, retryable bool) {
+func (c *GRPCClient) markRemoteApplyFailed(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, message string, retryable bool) {
 	now := time.Now()
 	taskState := state.Task.Failed
 	applyState := state.Apply.Failed
@@ -550,7 +559,7 @@ func (c *GRPCClient) markDispatchFailed(ctx context.Context, apply *storage.Appl
 		}
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			slog.Error("failed to update task after gRPC dispatch failure",
+			slog.Error("failed to update task after remote gRPC apply failure",
 				"apply_id", apply.ApplyIdentifier,
 				"task_id", task.TaskIdentifier,
 				"error", err)
@@ -563,7 +572,7 @@ func (c *GRPCClient) markDispatchFailed(ctx context.Context, apply *storage.Appl
 	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		slog.Error("failed to update apply after gRPC dispatch failure",
+		slog.Error("failed to update apply after remote gRPC apply failure",
 			"apply_id", apply.ApplyIdentifier,
 			"error", err)
 	}
@@ -573,12 +582,13 @@ func (c *GRPCClient) markDispatchFailed(ctx context.Context, apply *storage.Appl
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
 // Also maintains heartbeat to keep the lease on the apply.
 func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(grpcProgressPollInterval)
 	defer ticker.Stop()
 
 	heartbeatTicker := time.NewTicker(10 * time.Second)
 	defer heartbeatTicker.Stop()
 
+	consecutiveNoActive := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -596,6 +606,29 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			if err != nil {
 				continue
 			}
+			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
+				consecutiveNoActive++
+				slog.Warn("remote gRPC apply has no active progress",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"consecutive_no_active", consecutiveNoActive)
+				if consecutiveNoActive >= grpcNoActiveProgressLimit {
+					message := fmt.Sprintf("remote apply %s returned no active schema change", apply.ExternalID)
+					tasks, taskErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+					if taskErr != nil {
+						slog.Error("failed to load tasks after remote gRPC apply disappeared",
+							"apply_id", apply.ApplyIdentifier,
+							"external_id", apply.ExternalID,
+							"error", taskErr)
+					}
+					c.markRemoteApplyFailed(ctx, apply, tasks, message, false)
+					return fmt.Errorf("poll remote apply %s for %s: %s", apply.ExternalID, apply.ApplyIdentifier, message)
+				}
+				continue
+			}
+			consecutiveNoActive = 0
 
 			// Update apply state based on response (skip if proto state is unspecified)
 			now := time.Now()
