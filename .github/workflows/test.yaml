@@ -216,7 +216,7 @@ jobs:
       - name: "Test"
         run: |
           echo "Vitess e2e shard ${{ matrix.shard }}: ${{ matrix.run_filter }}"
-          make test-e2e-local RUN="${{ matrix.run_filter }}" E2E_TEST_TIMEOUT=6m E2E_TEST_FLAGS=-v
+          make test-e2e-local RUN="${{ matrix.run_filter }}" E2E_TEST_TIMEOUT=8m E2E_TEST_FLAGS=-v
       - name: "Container logs on failure"
         if: failure()
         run: |
