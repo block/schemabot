@@ -223,6 +223,13 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metrics.RecordControlOperation(r.Context(), "stop", apply.Database, apply.Environment, controlStatus(resp.Accepted))
+	if resp.Accepted && resp.StoppedCount > 0 && client.IsRemote() {
+		if syncErr := s.syncRemoteStopState(r.Context(), apply); syncErr != nil {
+			metrics.RecordControlOperation(r.Context(), "stop", apply.Database, apply.Environment, "error")
+			s.writeControlError(w, "stop", apply, syncErr)
+			return
+		}
+	}
 	if resp.Accepted {
 		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventStopRequested, "Stop requested by user")
 	}
@@ -233,6 +240,46 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 		StoppedCount: resp.StoppedCount,
 		SkippedCount: resp.SkippedCount,
 	})
+}
+
+func (s *Service) syncRemoteStopState(ctx context.Context, apply *storage.Apply) error {
+	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("get tasks for stopped apply %s: %w", apply.ApplyIdentifier, err)
+	}
+
+	// The remote data plane has already accepted the stop. Mirror that state
+	// into control-plane storage so a follow-up start can be queued immediately
+	// without waiting for the scheduler progress poller to observe it.
+	now := time.Now()
+	taskState := state.Task.Stopped
+	applyState := state.Apply.Stopped
+	completedAt := (*time.Time)(nil)
+	if apply.DatabaseType == storage.DatabaseTypeVitess {
+		taskState = state.Task.Cancelled
+		applyState = state.Apply.Cancelled
+		completedAt = &now
+	}
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			continue
+		}
+		task.State = taskState
+		task.ErrorMessage = ""
+		task.CompletedAt = completedAt
+		task.UpdatedAt = now
+		if err := s.storage.Tasks().Update(ctx, task); err != nil {
+			return fmt.Errorf("mark task %s %s after remote stop: %w", task.TaskIdentifier, taskState, err)
+		}
+	}
+	apply.State = applyState
+	apply.ErrorMessage = ""
+	apply.CompletedAt = completedAt
+	apply.UpdatedAt = now
+	if err := s.storage.Applies().Update(ctx, apply); err != nil {
+		return fmt.Errorf("mark apply %s %s after remote stop: %w", apply.ApplyIdentifier, applyState, err)
+	}
+	return nil
 }
 
 // StartRequest is the HTTP request body for POST /api/start.

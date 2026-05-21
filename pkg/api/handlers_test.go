@@ -953,6 +953,55 @@ func TestStopHandler(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, w.Code)
 		assert.Contains(t, w.Body.String(), "environment is required")
 	})
+
+	t.Run("accepted remote stop is immediately startable", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			stopResp: &ternv1.StopResponse{
+				Accepted:     true,
+				StoppedCount: 1,
+			},
+		}
+		apply := activeTestApply("apply-remote-stopstart")
+		apply.ExternalID = "remote-apply-stopstart"
+		task := &storage.Task{
+			ID:             12,
+			TaskIdentifier: "task-remote-stopstart",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}
+		svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		stopBody := `{"environment": "staging", "apply_id": "apply-remote-stopstart"}`
+		stopReq := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(stopBody))
+		stopReq.Header.Set("Content-Type", "application/json")
+		stopRecorder := httptest.NewRecorder()
+		mux.ServeHTTP(stopRecorder, stopReq)
+
+		require.Equal(t, http.StatusOK, stopRecorder.Code, stopRecorder.Body.String())
+		require.NotNil(t, mock.stopReq, "expected remote stop request to be captured")
+		assert.Equal(t, "remote-apply-stopstart", mock.stopReq.ApplyId)
+		assert.Equal(t, state.Apply.Stopped, apply.State)
+		assert.Equal(t, state.Task.Stopped, task.State)
+
+		startBody := `{"environment": "staging", "apply_id": "apply-remote-stopstart"}`
+		startReq := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(startBody))
+		startReq.Header.Set("Content-Type", "application/json")
+		startRecorder := httptest.NewRecorder()
+		mux.ServeHTTP(startRecorder, startReq)
+
+		require.Equal(t, http.StatusOK, startRecorder.Code, startRecorder.Body.String())
+		assert.Nil(t, mock.startReq, "stopped remote applies should be queued for scheduler start")
+		assert.Equal(t, state.Apply.Pending, apply.State)
+
+		var startResp apitypes.StartResponse
+		err := json.NewDecoder(startRecorder.Body).Decode(&startResp)
+		require.NoError(t, err, "failed to decode start response")
+		assert.True(t, startResp.Accepted, "expected accepted=true")
+		assert.Equal(t, int64(1), startResp.StartedCount)
+	})
 }
 
 func TestStartHandler(t *testing.T) {
