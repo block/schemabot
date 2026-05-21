@@ -225,6 +225,9 @@ type mockTernClient struct {
 	applyResp      *ternv1.ApplyResponse
 	applyErr       error
 	applyReq       *ternv1.ApplyRequest
+	progressResp   *ternv1.ProgressResponse
+	progressErr    error
+	progressReq    *ternv1.ProgressRequest
 	volumeResp     *ternv1.VolumeResponse
 	volumeErr      error
 	volumeReq      *ternv1.VolumeRequest // captured request
@@ -262,7 +265,11 @@ func (m *mockTernClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*
 	return nil, m.applyErr
 }
 func (m *mockTernClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
-	return nil, nil
+	m.progressReq = req
+	if m.progressResp != nil {
+		return m.progressResp, m.progressErr
+	}
+	return nil, m.progressErr
 }
 func (m *mockTernClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	m.cutoverReq = req
@@ -419,6 +426,90 @@ func newControlTestServiceWithTasks(client tern.Client, apply *storage.Apply, ta
 func newTestService() *Service {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	return New(&mockStorage{}, testServerConfig(), nil, logger)
+}
+
+func TestProgressByApplyIDServesQueuedRemoteApplyFromStorage(t *testing.T) {
+	// The scheduler marks the control-plane row running before gRPC dispatch
+	// stores external_id. During that short handoff, apply-id progress should
+	// be served locally as pending instead of asking the data plane about an ID
+	// it does not know yet.
+	mock := &mockTernClient{
+		isRemote:    true,
+		progressErr: errors.New("remote progress should not be called before external_id is set"),
+	}
+	apply := activeTestApply("apply-queued-remote")
+	apply.ExternalID = ""
+	apply.State = state.Apply.Running
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-queued-remote",
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Environment:    apply.Environment,
+		TableName:      "users",
+		State:          state.Task.Pending,
+		Engine:         storage.EngineSpirit,
+	}
+	svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-queued-remote", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Nil(t, mock.progressReq, "remote progress should wait until scheduler stores external_id")
+
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "apply-queued-remote", resp.ApplyID)
+	assert.Equal(t, state.Apply.Pending, resp.State)
+	require.Len(t, resp.Tables, 1)
+	assert.Equal(t, "users", resp.Tables[0].TableName)
+}
+
+func TestProgressByDatabaseServesQueuedRemoteApplyFromStorage(t *testing.T) {
+	// Database-scoped progress uses the same handoff behavior as apply-id
+	// progress: before external_id is persisted, the data plane cannot resolve
+	// the control-plane apply identifier, so the API reports the queued state
+	// from storage.
+	mock := &mockTernClient{
+		isRemote:    true,
+		progressErr: errors.New("remote progress should not be called before external_id is set"),
+	}
+	apply := activeTestApply("apply-queued-db")
+	apply.ExternalID = ""
+	apply.State = state.Apply.Running
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-queued-db",
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Environment:    apply.Environment,
+		TableName:      "users",
+		State:          state.Task.Pending,
+		Engine:         storage.EngineSpirit,
+	}
+	svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/testdb?environment=staging", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Nil(t, mock.progressReq, "remote progress should wait until scheduler stores external_id")
+
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "apply-queued-db", resp.ApplyID)
+	assert.Equal(t, state.Apply.Pending, resp.State)
+	require.Len(t, resp.Tables, 1)
+	assert.Equal(t, "users", resp.Tables[0].TableName)
 }
 
 func TestExecuteApplyQueuesApplyForScheduler(t *testing.T) {
@@ -996,6 +1087,78 @@ func TestStopHandler(t *testing.T) {
 		assert.Nil(t, mock.startReq, "stopped remote applies should be queued for scheduler start")
 		assert.Equal(t, state.Apply.Pending, apply.State)
 
+		var startResp apitypes.StartResponse
+		err := json.NewDecoder(startRecorder.Body).Decode(&startResp)
+		require.NoError(t, err, "failed to decode start response")
+		assert.True(t, startResp.Accepted, "expected accepted=true")
+		assert.Equal(t, int64(1), startResp.StartedCount)
+	})
+
+	t.Run("accepted remote stop uses data-plane task state for startability", func(t *testing.T) {
+		// The scheduler progress poller can race with a user stop and leave the
+		// control-plane task row ahead of the data plane. The stop path treats
+		// the data-plane task state as authoritative so a follow-up start can be
+		// queued immediately.
+		mock := &mockTernClient{
+			isRemote: true,
+			stopResp: &ternv1.StopResponse{
+				Accepted:     true,
+				StoppedCount: 1,
+			},
+			progressResp: &ternv1.ProgressResponse{
+				State: ternv1.State_STATE_STOPPED,
+				Tables: []*ternv1.TableProgress{
+					{
+						TableName:       "users",
+						Status:          state.Task.Stopped,
+						RowsCopied:      10,
+						RowsTotal:       100,
+						PercentComplete: 10,
+					},
+				},
+			},
+		}
+		apply := activeTestApply("apply-remote-stop-race")
+		apply.ExternalID = "remote-apply-stop-race"
+		task := &storage.Task{
+			ID:              13,
+			TaskIdentifier:  "task-remote-stop-race",
+			ApplyID:         apply.ID,
+			Database:        apply.Database,
+			DatabaseType:    apply.DatabaseType,
+			Environment:     apply.Environment,
+			TableName:       "users",
+			State:           state.Task.Completed,
+			RowsCopied:      100,
+			RowsTotal:       100,
+			ProgressPercent: 100,
+		}
+		svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		stopBody := `{"environment": "staging", "apply_id": "apply-remote-stop-race"}`
+		stopReq := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(stopBody))
+		stopReq.Header.Set("Content-Type", "application/json")
+		stopRecorder := httptest.NewRecorder()
+		mux.ServeHTTP(stopRecorder, stopReq)
+
+		require.Equal(t, http.StatusOK, stopRecorder.Code, stopRecorder.Body.String())
+		require.NotNil(t, mock.progressReq, "expected stop sync to refresh remote progress")
+		assert.Equal(t, "remote-apply-stop-race", mock.progressReq.ApplyId)
+		assert.Equal(t, state.Apply.Stopped, apply.State)
+		assert.Equal(t, state.Task.Stopped, task.State)
+		assert.Equal(t, int64(10), task.RowsCopied)
+		assert.Equal(t, int64(100), task.RowsTotal)
+		assert.Equal(t, 10, task.ProgressPercent)
+
+		startBody := `{"environment": "staging", "apply_id": "apply-remote-stop-race"}`
+		startReq := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(startBody))
+		startReq.Header.Set("Content-Type", "application/json")
+		startRecorder := httptest.NewRecorder()
+		mux.ServeHTTP(startRecorder, startReq)
+
+		require.Equal(t, http.StatusOK, startRecorder.Code, startRecorder.Body.String())
 		var startResp apitypes.StartResponse
 		err := json.NewDecoder(startRecorder.Body).Decode(&startResp)
 		require.NoError(t, err, "failed to decode start response")

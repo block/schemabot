@@ -224,7 +224,7 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 	metrics.RecordControlOperation(r.Context(), "stop", apply.Database, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted && resp.StoppedCount > 0 && client.IsRemote() {
-		if syncErr := s.syncRemoteStopState(r.Context(), apply); syncErr != nil {
+		if syncErr := s.syncRemoteStopState(r.Context(), client, apply); syncErr != nil {
 			metrics.RecordControlOperation(r.Context(), "stop", apply.Database, apply.Environment, "error")
 			s.writeControlError(w, "stop", apply, syncErr)
 			return
@@ -242,11 +242,12 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Service) syncRemoteStopState(ctx context.Context, apply *storage.Apply) error {
+func (s *Service) syncRemoteStopState(ctx context.Context, client tern.Client, apply *storage.Apply) error {
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return fmt.Errorf("get tasks for stopped apply %s: %w", apply.ApplyIdentifier, err)
 	}
+	remoteProgressByTask := s.remoteStopProgressByTask(ctx, client, apply)
 
 	// The remote data plane has already accepted the stop. Mirror that state
 	// into control-plane storage so a follow-up start can be queued immediately
@@ -261,15 +262,33 @@ func (s *Service) syncRemoteStopState(ctx context.Context, apply *storage.Apply)
 		completedAt = &now
 	}
 	for _, task := range tasks {
-		if state.IsTerminalTaskState(task.State) {
+		nextTaskState := taskState
+		nextCompletedAt := completedAt
+		remoteProgress, hasRemoteProgress := remoteProgressByTask[progressTableKey(task.Namespace, task.TableName)]
+		if hasRemoteProgress {
+			remoteTaskState := state.NormalizeTaskStatus(remoteProgress.Status)
+			if remoteTaskState != "" {
+				nextTaskState = remoteTaskState
+				if state.IsTerminalTaskState(remoteTaskState) {
+					nextCompletedAt = &now
+				} else {
+					nextCompletedAt = nil
+				}
+			}
+			task.RowsCopied = remoteProgress.RowsCopied
+			task.RowsTotal = remoteProgress.RowsTotal
+			task.ProgressPercent = int(remoteProgress.PercentComplete)
+			task.ETASeconds = int(remoteProgress.EtaSeconds)
+		}
+		if state.IsTerminalTaskState(task.State) && (!hasRemoteProgress || !state.IsState(nextTaskState, state.Task.Stopped)) {
 			continue
 		}
-		task.State = taskState
+		task.State = nextTaskState
 		task.ErrorMessage = ""
-		task.CompletedAt = completedAt
+		task.CompletedAt = nextCompletedAt
 		task.UpdatedAt = now
 		if err := s.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("mark task %s %s after remote stop: %w", task.TaskIdentifier, taskState, err)
+			return fmt.Errorf("mark task %s %s after remote stop: %w", task.TaskIdentifier, nextTaskState, err)
 		}
 	}
 	apply.State = applyState
@@ -280,6 +299,39 @@ func (s *Service) syncRemoteStopState(ctx context.Context, apply *storage.Apply)
 		return fmt.Errorf("mark apply %s %s after remote stop: %w", apply.ApplyIdentifier, applyState, err)
 	}
 	return nil
+}
+
+func (s *Service) remoteStopProgressByTask(ctx context.Context, client tern.Client, apply *storage.Apply) map[string]*ternv1.TableProgress {
+	if client == nil || !client.IsRemote() || apply == nil || apply.ExternalID == "" || apply.DatabaseType != storage.DatabaseTypeMySQL {
+		return nil
+	}
+	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ExternalID,
+		Database:    apply.Database,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		s.logger.Warn("remote stop progress refresh failed, using local task snapshot",
+			"apply_id", apply.ApplyIdentifier,
+			"external_apply_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"error", err)
+		return nil
+	}
+	if resp == nil {
+		s.logger.Warn("remote stop progress refresh returned empty response, using local task snapshot",
+			"apply_id", apply.ApplyIdentifier,
+			"external_apply_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment)
+		return nil
+	}
+	progressByTask := make(map[string]*ternv1.TableProgress, len(resp.Tables))
+	for _, tableProgress := range resp.Tables {
+		progressByTask[progressTableKey(tableProgress.Namespace, tableProgress.TableName)] = tableProgress
+	}
+	return progressByTask
 }
 
 // StartRequest is the HTTP request body for POST /api/start.
