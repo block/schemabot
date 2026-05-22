@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -48,9 +49,21 @@ func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.Pla
 func (s *Server) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	resp, err := s.client.Apply(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(applyErrorCode(err), err.Error())
 	}
 	return resp, nil
+}
+
+// applyErrorCode preserves engine retryability across the gRPC boundary for
+// scheduler-driven dispatch.
+func applyErrorCode(err error) codes.Code {
+	if err == nil {
+		return codes.OK
+	}
+	if !engine.IsRetryable(err) {
+		return codes.FailedPrecondition
+	}
+	return codes.Internal
 }
 
 func (s *Server) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {

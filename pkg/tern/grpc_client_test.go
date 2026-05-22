@@ -652,6 +652,93 @@ func TestGRPCClient_ResumeApplyDoesNotFailStateWhenRemoteDispatchOutcomeIsAmbigu
 	assert.Empty(t, task.ErrorMessage)
 }
 
+func TestGRPCClient_ResumeApplyClassifiesRemoteDispatchErrors(t *testing.T) {
+	// When remote dispatch is rejected before the data plane accepts work, the
+	// control plane records the failure using the gRPC status code. Retryable
+	// status codes stay claimable for the scheduler; known-permanent status
+	// codes become terminal failures.
+	testCases := []struct {
+		name            string
+		code            codes.Code
+		message         string
+		wantApplyState  string
+		wantTaskState   string
+		wantCompletedAt bool
+	}{
+		{
+			name:           "retryable remote error",
+			code:           codes.Internal,
+			message:        "remote apply rejected",
+			wantApplyState: state.Apply.FailedRetryable,
+			wantTaskState:  state.Task.FailedRetryable,
+		},
+		{
+			name:            "permanent remote error",
+			code:            codes.FailedPrecondition,
+			message:         "remote apply rejected",
+			wantApplyState:  state.Apply.Failed,
+			wantTaskState:   state.Task.Failed,
+			wantCompletedAt: true,
+		},
+		{
+			name:            "permanent status with transient-looking message",
+			code:            codes.FailedPrecondition,
+			message:         "Too many requests for this deploy request",
+			wantApplyState:  state.Apply.Failed,
+			wantTaskState:   state.Task.Failed,
+			wantCompletedAt: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &capturingTernServer{
+				applyErr: status.Error(tc.code, tc.message),
+			}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+
+			apply := &storage.Apply{
+				ID:              10,
+				ApplyIdentifier: "apply-classify-remote-error",
+				PlanID:          102,
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				State:           state.Apply.Pending,
+			}
+			task := &storage.Task{
+				ID:             14,
+				TaskIdentifier: "task-classify-remote-error",
+				ApplyID:        apply.ID,
+				TableName:      "users",
+				State:          state.Task.Pending,
+			}
+			client.storage = &mockStorage{
+				applies: &mockApplyStore{apply: apply},
+				tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+				plans: &mockPlanStore{plan: &storage.Plan{
+					ID:             apply.PlanID,
+					PlanIdentifier: "plan-classify-remote-error",
+				}},
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			err := client.ResumeApply(ctx, apply)
+			require.Error(t, err)
+
+			require.NotNil(t, server.getApplyRequest(), "expected Apply RPC to be attempted")
+			assert.Equal(t, tc.wantApplyState, apply.State)
+			assert.Contains(t, apply.ErrorMessage, tc.message)
+			assert.Equal(t, tc.wantCompletedAt, apply.CompletedAt != nil)
+			assert.Equal(t, tc.wantTaskState, task.State)
+			assert.Contains(t, task.ErrorMessage, tc.message)
+			assert.Equal(t, tc.wantCompletedAt, task.CompletedAt != nil)
+		})
+	}
+}
+
 func TestGRPCClient_QueuedRemoteDispatchPredicate(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -496,7 +496,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		if isAmbiguousRemoteApplyDispatchError(err) {
 			return fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err)
 		}
-		c.markRemoteApplyFailed(ctx, apply, tasks, err.Error(), engine.IsRetryable(err))
+		c.markRemoteApplyFailed(ctx, apply, tasks, err.Error(), isRetryableRemoteApplyError(err))
 		return fmt.Errorf("apply queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil {
@@ -539,6 +539,38 @@ func isAmbiguousRemoteApplyDispatchError(err error) bool {
 		errors.Is(err, context.DeadlineExceeded) ||
 		status.Code(err) == codes.Canceled ||
 		status.Code(err) == codes.DeadlineExceeded
+}
+
+// isRetryableRemoteApplyError classifies a definite remote Apply rejection.
+// Ambiguous cancellation/deadline errors are handled before this path because
+// the control plane cannot know whether the data plane accepted the request.
+func isRetryableRemoteApplyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isAmbiguousRemoteApplyDispatchError(err) {
+		return false
+	}
+
+	st, ok := status.FromError(err)
+	if !ok {
+		if engine.IsTransientTransportError(err) {
+			return true
+		}
+		return engine.IsRetryable(err)
+	}
+
+	switch st.Code() {
+	case codes.Internal, codes.Unknown, codes.Unavailable, codes.ResourceExhausted, codes.Aborted:
+		return true
+	case codes.Canceled, codes.DeadlineExceeded:
+		return false
+	case codes.OK, codes.InvalidArgument, codes.NotFound, codes.AlreadyExists, codes.PermissionDenied,
+		codes.Unauthenticated, codes.FailedPrecondition, codes.OutOfRange, codes.Unimplemented, codes.DataLoss:
+		return false
+	default:
+		return false
+	}
 }
 
 func (c *GRPCClient) prepareDispatchTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
