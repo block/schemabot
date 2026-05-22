@@ -1,6 +1,10 @@
 package github
 
 import (
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
 	"testing"
 	"time"
 
@@ -155,6 +159,60 @@ func TestGetApprovedReviewers(t *testing.T) {
 					assert.Contains(t, result, expected)
 				}
 			}
+		})
+	}
+}
+
+func TestIsTeamMember(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       map[string]string
+		wantMember bool
+		wantErr    bool
+	}{
+		{
+			name:       "active membership allows",
+			statusCode: http.StatusOK,
+			body:       map[string]string{"state": "active"},
+			wantMember: true,
+		},
+		{
+			name:       "pending membership does not allow",
+			statusCode: http.StatusOK,
+			body:       map[string]string{"state": "pending"},
+			wantMember: false,
+		},
+		{
+			name:       "not found is not a member",
+			statusCode: http.StatusNotFound,
+			wantMember: false,
+		},
+		{
+			name:       "server error is returned",
+			statusCode: http.StatusInternalServerError,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupConfigTestGitHubServer(t)
+			mux.HandleFunc("GET /orgs/octocat/teams/db-operators/memberships/mona", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.statusCode)
+				if tt.body != nil {
+					require.NoError(t, json.NewEncoder(w).Encode(tt.body))
+				}
+			})
+
+			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			member, err := ic.IsTeamMember(t.Context(), "octocat", "db-operators", "mona")
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantMember, member)
 		})
 	}
 }

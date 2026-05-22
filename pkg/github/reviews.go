@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -213,6 +214,24 @@ func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug str
 	}
 
 	return members, nil
+}
+
+// IsTeamMember returns true when login is an active member of org/slug.
+// GitHub returns 404 when the user is not a team member; that is an ordinary
+// negative authorization result. Other errors are returned so callers can fail
+// closed when GitHub membership cannot be verified.
+func (ic *InstallationClient) IsTeamMember(ctx context.Context, org, slug, login string) (bool, error) {
+	membership, resp, err := ic.client.Teams.GetTeamMembershipBySlug(ctx, org, slug, login)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("get team membership %s/%s for %s: %w", org, slug, login, err)
+	}
+	if membership == nil {
+		return false, nil
+	}
+	return membership.GetState() == "active", nil
 }
 
 // RequestReviewers requests reviews from users and/or teams on a PR.

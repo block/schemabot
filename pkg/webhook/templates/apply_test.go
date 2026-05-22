@@ -197,6 +197,38 @@ func TestRenderApplyStatusComment_NoRequestedBy(t *testing.T) {
 	assert.NotContains(t, result, "@")
 }
 
+func TestRenderPRCommandNotAuthorized(t *testing.T) {
+	result := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
+		RequestedBy: "mona",
+		CommandName: "apply",
+		Database:    "orders",
+		Environment: "staging",
+	})
+
+	assert.Contains(t, result, "SchemaBot Command Not Authorized")
+	assert.Contains(t, result, "`orders`")
+	assert.Contains(t, result, "`staging`")
+	assert.Contains(t, result, "@mona is not authorized")
+	assert.Contains(t, result, "`schemabot apply`")
+	assert.Contains(t, result, "SchemaBot admin/database operator")
+}
+
+func TestRenderPRCommandAuthorizationUnavailable(t *testing.T) {
+	result := RenderPRCommandAuthorizationUnavailable(ActorAuthorizationCommentData{
+		RequestedBy: "mona",
+		CommandName: "apply-confirm",
+		Database:    "orders",
+		Environment: "production",
+	})
+
+	assert.Contains(t, result, "SchemaBot Authorization Check Failed")
+	assert.Contains(t, result, "`orders`")
+	assert.Contains(t, result, "`production`")
+	assert.Contains(t, result, "could not verify GitHub team membership")
+	assert.Contains(t, result, "No schema change was started")
+	assert.Contains(t, result, "membership checks are available")
+}
+
 func TestApplyStatusFromProgress(t *testing.T) {
 	resp := &apitypes.ProgressResponse{
 		State:       "running",

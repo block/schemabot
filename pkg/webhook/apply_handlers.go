@@ -30,7 +30,19 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
-	// Fix checks stuck at "in_progress" from crashed applies
+	// Discover config and fetch schema files from PR
+	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
+	if err != nil {
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
+		return
+	}
+
+	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); blocked {
+		return
+	}
+
+	// Fix checks stuck at "in_progress" from crashed applies after the actor
+	// is authorized to run apply for this database.
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
 		h.postComment(repo, pr, installationID, templates.RenderGenericError(templates.SchemaErrorData{
@@ -40,13 +52,6 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 			CommandName: action.Apply,
 			ErrorDetail: "Failed to reconcile stale status checks: " + err.Error(),
 		}))
-		return
-	}
-
-	// Discover config and fetch schema files from PR
-	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
-	if err != nil {
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
 		return
 	}
 
@@ -338,6 +343,10 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
 	if err != nil {
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
+		return
+	}
+
+	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.ApplyConfirm); blocked {
 		return
 	}
 

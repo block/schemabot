@@ -319,6 +319,51 @@ func TestRecordSourcePolicyBlockMetric(t *testing.T) {
 	assert.True(t, sawUnknown, "expected unknown operation and reason to be normalized")
 }
 
+func TestRecordPRCommandActorAuthorizationMetric(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordPRCommandActorAuthorization(t.Context(), "apply", "mydb", "staging", "org/repo", "allowed", "allowed_admin_user")
+	metrics.RecordPRCommandActorAuthorization(t.Context(), "apply_confirm", "mydb", "production", "org/repo", "denied", "not_authorized")
+	metrics.RecordPRCommandActorAuthorization(t.Context(), "not_real", "mydb", "staging", "org/repo", "not_real", "not_real")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	var found bool
+	var sawUnknown bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.pr_command_actor_authorization.total" {
+				continue
+			}
+			found = true
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			assert.Len(t, sum.DataPoints, 3, "expected one data point per command/status/reason attribute set")
+			for _, dp := range sum.DataPoints {
+				command, hasCommand := dp.Attributes.Value(attribute.Key("command"))
+				status, hasStatus := dp.Attributes.Value(attribute.Key("status"))
+				reason, hasReason := dp.Attributes.Value(attribute.Key("reason"))
+				require.True(t, hasCommand)
+				require.True(t, hasStatus)
+				require.True(t, hasReason)
+				if command.AsString() == "unknown" && status.AsString() == "unknown" && reason.AsString() == "unknown" {
+					sawUnknown = true
+				}
+			}
+		}
+	}
+	assert.True(t, found, "schemabot.pr_command_actor_authorization.total metric not found")
+	assert.True(t, sawUnknown, "expected unknown command, status, and reason to be normalized")
+}
+
 func TestRecordStatusCheckOperationMetric(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))

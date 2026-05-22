@@ -178,6 +178,77 @@ func RecordSourcePolicyBlock(ctx context.Context, operation, database, environme
 	)
 }
 
+var knownPRCommandActorAuthCommands = map[string]bool{
+	"apply":            true,
+	"apply_confirm":    true,
+	"rollback":         true,
+	"rollback_confirm": true,
+	"unlock":           true,
+	"cutover":          true,
+	"stop":             true,
+	"start":            true,
+	"volume":           true,
+	"revert":           true,
+	"skip_revert":      true,
+}
+
+var knownPRCommandActorAuthStatuses = map[string]bool{
+	"allowed": true,
+	"denied":  true,
+	"error":   true,
+	"skipped": true,
+}
+
+var knownPRCommandActorAuthReasons = map[string]bool{
+	"disabled":                true,
+	"allowed_admin_team":      true,
+	"allowed_admin_user":      true,
+	"allowed_operator_team":   true,
+	"allowed_operator_user":   true,
+	"missing_actor":           true,
+	"missing_server_config":   true,
+	"missing_database_config": true,
+	"no_configured_principal": true,
+	"not_authorized":          true,
+	"github_error":            true,
+	"unknown":                 true,
+}
+
+// RecordPRCommandActorAuthorization increments the counter for GitHub PR
+// comment actor authorization decisions. Command, status, and reason are
+// allowlisted to keep metric cardinality bounded.
+func RecordPRCommandActorAuthorization(ctx context.Context, command, database, environment, repository, status, reason string) {
+	if !knownPRCommandActorAuthCommands[command] {
+		command = "unknown"
+	}
+	if !knownPRCommandActorAuthStatuses[status] {
+		status = "unknown"
+	}
+	if !knownPRCommandActorAuthReasons[reason] {
+		reason = "unknown"
+	}
+
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.pr_command_actor_authorization.total",
+		otelmetric.WithDescription("Total GitHub PR command actor authorization decisions"),
+		otelmetric.WithUnit("{decision}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create PR command actor authorization counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("command", command),
+			attribute.String("database", database),
+			attribute.String("environment", environment),
+			attribute.String("repository", repository),
+			attribute.String("status", status),
+			attribute.String("reason", reason),
+		),
+	)
+}
+
 // knownCheckOwnershipOperations limits metric cardinality to expected check
 // ownership miss paths.
 var knownCheckOwnershipOperations = map[string]bool{

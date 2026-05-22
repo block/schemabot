@@ -26,6 +26,53 @@ type ApplyLockConflictData struct {
 	ApplyState string
 }
 
+// ActorAuthorizationCommentData contains data for PR command actor
+// authorization comments.
+type ActorAuthorizationCommentData struct {
+	RequestedBy string
+	CommandName string
+	Database    string
+	Environment string
+}
+
+// RenderPRCommandNotAuthorized renders a comment when a GitHub PR command
+// actor is not allowed to run SchemaBot apply/apply-confirm for the database.
+func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
+	var sb strings.Builder
+
+	sb.WriteString("## SchemaBot Command Not Authorized\n\n")
+	writeDBEnvLine(&sb, data.Database, data.Environment)
+	if data.RequestedBy != "" {
+		fmt.Fprintf(&sb, "**Requested by**: @%s\n", data.RequestedBy)
+	}
+	sb.WriteString("\n")
+	if data.RequestedBy != "" {
+		fmt.Fprintf(&sb, "@%s is not authorized to run `schemabot %s` for this database.\n\n", data.RequestedBy, data.CommandName)
+	} else {
+		fmt.Fprintf(&sb, "The requester is not authorized to run `schemabot %s` for this database.\n\n", data.CommandName)
+	}
+	sb.WriteString("A configured SchemaBot admin/database operator must run this command.\n")
+
+	return sb.String()
+}
+
+// RenderPRCommandAuthorizationUnavailable renders a comment when SchemaBot
+// cannot verify actor authorization for apply/apply-confirm.
+func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData) string {
+	var sb strings.Builder
+
+	sb.WriteString("## SchemaBot Authorization Check Failed\n\n")
+	writeDBEnvLine(&sb, data.Database, data.Environment)
+	if data.RequestedBy != "" {
+		fmt.Fprintf(&sb, "**Requested by**: @%s\n", data.RequestedBy)
+	}
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "SchemaBot could not verify GitHub team membership for `schemabot %s`. No schema change was started.\n\n", data.CommandName)
+	sb.WriteString("A configured SchemaBot admin/database operator should retry after membership checks are available.\n")
+
+	return sb.String()
+}
+
 // RenderUnsafeChangesBlocked renders a comment when unsafe changes are detected
 // and --allow-unsafe was not specified. Shows the plan DDL plus a blocking message
 // instructing the user to re-run with --allow-unsafe.
