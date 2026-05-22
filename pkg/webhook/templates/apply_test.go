@@ -224,9 +224,9 @@ func TestRenderPRCommandAuthorizationUnavailable(t *testing.T) {
 	assert.Contains(t, result, "SchemaBot Authorization Check Failed")
 	assert.Contains(t, result, "`orders`")
 	assert.Contains(t, result, "`production`")
-	assert.Contains(t, result, "could not verify GitHub team membership")
+	assert.Contains(t, result, "could not verify authorization")
 	assert.Contains(t, result, "No schema change was started")
-	assert.Contains(t, result, "membership checks are available")
+	assert.Contains(t, result, "inspect SchemaBot authorization logs")
 }
 
 func TestApplyStatusFromProgress(t *testing.T) {

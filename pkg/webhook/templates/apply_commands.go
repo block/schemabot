@@ -67,8 +67,8 @@ func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData)
 		fmt.Fprintf(&sb, "**Requested by**: @%s\n", data.RequestedBy)
 	}
 	sb.WriteString("\n")
-	fmt.Fprintf(&sb, "SchemaBot could not verify GitHub team membership for `schemabot %s`. No schema change was started.\n\n", data.CommandName)
-	sb.WriteString("A configured SchemaBot admin/database operator should retry after membership checks are available.\n")
+	fmt.Fprintf(&sb, "SchemaBot could not verify authorization for `schemabot %s`. No schema change was started.\n\n", data.CommandName)
+	sb.WriteString("A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.\n")
 
 	return sb.String()
 }
