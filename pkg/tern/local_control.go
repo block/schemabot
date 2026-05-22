@@ -2,11 +2,11 @@ package tern
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/planetscale"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -49,11 +49,15 @@ func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 
-	// Log cutover triggered
+	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build cutover request for apply %d: %w", task.ApplyID, err)
+	}
+
 	c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 		"Cutover triggered", "", "")
 
-	_, err = eng.Cutover(ctx, c.buildControlRequest(ctx, task, creds))
+	_, err = eng.Cutover(ctx, controlReq)
 	if err != nil {
 		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cutover failed: %v", err), "", "")
@@ -101,14 +105,15 @@ func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv
 	}
 	c.cancelMu.Unlock()
 
-	// Snapshot progress AFTER Spirit has fully stopped to preserve row copy progress.
-	engineTableProgress := c.snapshotEngineProgress(ctx, eng, creds)
-
 	// For Vitess/PlanetScale, stopping means cancelling the deploy request —
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".
 	terminalState := state.Task.Stopped
+	var engineTableProgress map[string]*engine.TableProgress
 	if c.config.Type == storage.DatabaseTypeVitess {
 		terminalState = state.Task.Cancelled
+	} else {
+		// Snapshot progress AFTER Spirit has fully stopped to preserve row copy progress.
+		engineTableProgress = c.snapshotEngineProgress(ctx, eng, creds)
 	}
 
 	stoppedCount, skippedCount, applyID := c.markTasksWithState(ctx, tasks, targetApplyID, engineTableProgress, terminalState)
@@ -166,8 +171,14 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 		if task.State == state.Task.Running ||
 			task.State == state.Task.WaitingForCutover ||
 			task.State == state.Task.CuttingOver {
-			req := c.buildControlRequest(ctx, task, creds)
+			req, err := c.buildControlRequest(ctx, task, creds)
+			if err != nil {
+				return fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
+			}
 			if _, err := eng.Stop(ctx, req); err != nil {
+				if c.config.Type == storage.DatabaseTypeVitess {
+					return fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, err)
+				}
 				c.logger.Warn("engine stop returned error (runner may have already exited)",
 					"task_id", task.TaskIdentifier, "error", err)
 			}
@@ -183,10 +194,15 @@ func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Eng
 		c.logger.Error("snapshotEngineProgress: engine is nil")
 		return nil
 	}
-	progress, _ := eng.Progress(ctx, &engine.ProgressRequest{
+	progress, err := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
 	})
+	if err != nil {
+		c.logger.Warn("failed to snapshot engine progress after stop",
+			"database", c.config.Database, "type", c.config.Type, "error", err)
+		return nil
+	}
 	if progress != nil {
 		return indexEngineTableProgress(progress.Tables)
 	}
@@ -290,30 +306,47 @@ func (c *LocalClient) controlSetup(ctx context.Context) (*storage.Task, *engine.
 	return task, c.credentials(), eng, nil
 }
 
-// buildControlRequest creates a ControlRequest with ResumeState from VitessApplyData.
-// For PlanetScale, the engine needs the deploy request ID (in ResumeState.Metadata)
-// to execute control operations (cutover, revert, skip-revert).
-func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Task, creds *engine.Credentials) *engine.ControlRequest {
+// buildControlRequest creates a ControlRequest with persisted Vitess deploy data.
+// PlanetScale control operations identify the server-side deploy request from
+// ResumeState.Metadata, so missing stored data must fail before calling the engine.
+func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Task, creds *engine.Credentials) (*engine.ControlRequest, error) {
 	req := &engine.ControlRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
 	}
 	if c.config.Type == storage.DatabaseTypeVitess {
-		if vad, err := c.storage.VitessApplyData().GetByApplyID(ctx, task.ApplyID); err == nil {
-			meta, _ := json.Marshal(map[string]any{
-				"branch_name":        vad.BranchName,
-				"deploy_request_id":  vad.DeployRequestID,
-				"deploy_request_url": vad.DeployRequestURL,
-				"is_instant":         vad.IsInstant,
-				"deferred_deploy":    vad.DeferredDeploy,
-			})
-			req.ResumeState = &engine.ResumeState{
-				MigrationContext: vad.MigrationContext,
-				Metadata:         string(meta),
-			}
+		store := c.storage.VitessApplyData()
+		if store == nil {
+			return nil, fmt.Errorf("vitess apply data store is not configured")
 		}
+		vad, err := store.GetByApplyID(ctx, task.ApplyID)
+		if err != nil {
+			return nil, fmt.Errorf("load Vitess apply data for apply %d: %w", task.ApplyID, err)
+		}
+		if vad == nil {
+			return nil, fmt.Errorf("load Vitess apply data for apply %d: %w", task.ApplyID, storage.ErrVitessApplyDataNotFound)
+		}
+		resumeState, err := planetscale.BuildControlResumeState(planetscaleResumeData(vad))
+		if err != nil {
+			return nil, fmt.Errorf("build Vitess control resume state for apply %d: %w", task.ApplyID, err)
+		}
+		req.ResumeState = resumeState
 	}
-	return req
+	return req, nil
+}
+
+func planetscaleResumeData(vad *storage.VitessApplyData) planetscale.ResumeData {
+	if vad == nil {
+		return planetscale.ResumeData{}
+	}
+	return planetscale.ResumeData{
+		BranchName:       vad.BranchName,
+		DeployRequestID:  vad.DeployRequestID,
+		DeployRequestURL: vad.DeployRequestURL,
+		MigrationContext: vad.MigrationContext,
+		IsInstant:        vad.IsInstant,
+		DeferredDeploy:   vad.DeferredDeploy,
+	}
 }
 
 // Volume modifies the schema change speed/concurrency in-flight.
@@ -322,15 +355,20 @@ func (c *LocalClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*t
 		return nil, fmt.Errorf("volume must be between 1 and 11")
 	}
 
-	_, creds, eng, err := c.controlSetup(ctx)
+	task, creds, eng, err := c.controlSetup(ctx)
 	if err != nil {
 		return nil, err
+	}
+	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build volume request for task %s: %w", task.TaskIdentifier, err)
 	}
 
 	result, err := eng.Volume(ctx, &engine.VolumeRequest{
 		Database:    c.config.Database,
 		Volume:      req.Volume,
-		Credentials: creds,
+		ResumeState: controlReq.ResumeState,
+		Credentials: controlReq.Credentials,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("volume failed: %w", err)
@@ -350,7 +388,11 @@ func (c *LocalClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*t
 		return nil, err
 	}
 
-	if _, err = eng.Revert(ctx, c.buildControlRequest(ctx, task, creds)); err != nil {
+	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build revert request for task %s: %w", task.TaskIdentifier, err)
+	}
+	if _, err = eng.Revert(ctx, controlReq); err != nil {
 		return nil, fmt.Errorf("revert failed: %w", err)
 	}
 	return &ternv1.RevertResponse{Accepted: true}, nil
@@ -363,7 +405,11 @@ func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequ
 		return nil, err
 	}
 
-	if _, err = eng.SkipRevert(ctx, c.buildControlRequest(ctx, task, creds)); err != nil {
+	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	if err != nil {
+		return nil, fmt.Errorf("build skip-revert request for task %s: %w", task.TaskIdentifier, err)
+	}
+	if _, err = eng.SkipRevert(ctx, controlReq); err != nil {
 		return nil, fmt.Errorf("skip revert failed: %w", err)
 	}
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil

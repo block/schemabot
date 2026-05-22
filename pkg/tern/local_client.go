@@ -759,16 +759,11 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				c.logger.Warn("VitessApplyData not found for progress — apply may still be initializing", "apply_id", activeTask.ApplyID)
 			default:
 				vitessApplyIsInstant = vad.IsInstant
-				meta, _ := json.Marshal(map[string]any{
-					"branch_name":        vad.BranchName,
-					"deploy_request_id":  vad.DeployRequestID,
-					"deploy_request_url": vad.DeployRequestURL,
-					"is_instant":         vad.IsInstant,
-					"deferred_deploy":    vad.DeferredDeploy,
-				})
-				progressReq.ResumeState = &engine.ResumeState{
-					MigrationContext: vad.MigrationContext,
-					Metadata:         string(meta),
+				resumeState, resumeErr := planetscale.BuildResumeState(planetscaleResumeData(vad))
+				if resumeErr != nil {
+					c.logger.Error("failed to build Vitess resume state for progress", "apply_id", activeTask.ApplyID, "error", resumeErr)
+				} else {
+					progressReq.ResumeState = resumeState
 				}
 			}
 		}

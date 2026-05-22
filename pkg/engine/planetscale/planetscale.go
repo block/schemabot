@@ -458,6 +458,62 @@ type psMetadata struct {
 	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
 }
 
+// ResumeData is PlanetScale deploy metadata persisted by the tern layer and
+// encoded into engine.ResumeState.Metadata for engine control and progress calls.
+type ResumeData struct {
+	BranchName       string
+	DeployRequestID  uint64
+	DeployRequestURL string
+	MigrationContext string
+	DeployedAt       *time.Time
+	IsInstant        bool
+	DeferredDeploy   bool
+}
+
+// BuildResumeState encodes PlanetScale resume metadata into the opaque
+// engine.ResumeState contract. Partial metadata is allowed because setup states
+// can persist branch information before the deploy request exists.
+func BuildResumeState(data ResumeData) (*engine.ResumeState, error) {
+	metadata, err := encodePSMetadata(&psMetadata{
+		BranchName:       data.BranchName,
+		DeployRequestID:  data.DeployRequestID,
+		DeployRequestURL: data.DeployRequestURL,
+		DeployedAt:       data.DeployedAt,
+		IsInstant:        data.IsInstant,
+		DeferredDeploy:   data.DeferredDeploy,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &engine.ResumeState{
+		MigrationContext: data.MigrationContext,
+		Metadata:         metadata,
+	}, nil
+}
+
+// BuildControlResumeState encodes PlanetScale resume metadata for control
+// operations that act on an existing deploy request.
+func BuildControlResumeState(data ResumeData) (*engine.ResumeState, error) {
+	if missing := missingControlResumeData(data); len(missing) > 0 {
+		return nil, fmt.Errorf("deploy request metadata is incomplete (missing %s)", strings.Join(missing, ", "))
+	}
+	return BuildResumeState(data)
+}
+
+func missingControlResumeData(data ResumeData) []string {
+	var missing []string
+	if data.BranchName == "" {
+		missing = append(missing, "branch_name")
+	}
+	if data.DeployRequestID == 0 {
+		missing = append(missing, "deploy_request_id")
+	}
+	if data.DeployRequestURL == "" {
+		missing = append(missing, "deploy_request_url")
+	}
+	return missing
+}
+
 func encodePSMetadata(m *psMetadata) (string, error) {
 	data, err := json.Marshal(m)
 	if err != nil {
