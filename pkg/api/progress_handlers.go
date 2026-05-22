@@ -55,6 +55,35 @@ func shouldServeProgressFromStorage(applyState string) bool {
 	return state.IsTerminalApplyState(applyState) || state.IsState(applyState, state.Apply.FailedRetryable)
 }
 
+// A remote apply may be accepted into control-plane storage before a scheduler
+// worker dispatches it and stores the data-plane ID. During that handoff window,
+// progress must use local storage instead of asking the data plane about a
+// control-plane apply identifier it cannot know.
+func shouldServeRemoteProgressFromStorage(apply *storage.Apply, client tern.Client) bool {
+	if apply == nil {
+		return false
+	}
+	if client == nil || !client.IsRemote() {
+		return false
+	}
+	return apply.ExternalID == ""
+}
+
+// queuedRemoteProgressApply returns the user-visible apply state while a gRPC
+// apply is claimed by a scheduler worker but has not been accepted by the
+// remote data plane yet. The storage row is already running for recovery
+// purposes, but operators should still see pending until external_id exists.
+func queuedRemoteProgressApply(apply *storage.Apply) *storage.Apply {
+	if apply == nil {
+		return nil
+	}
+	queued := *apply
+	if state.IsState(queued.State, state.Apply.Running) {
+		queued.State = state.Apply.Pending
+	}
+	return &queued
+}
+
 // engineName converts a protobuf Engine enum to a display-friendly name.
 func engineName(e ternv1.Engine) string {
 	switch e {
@@ -174,6 +203,9 @@ func (s *Service) GetProgress(ctx context.Context, database, environment string)
 	if err != nil {
 		return nil, fmt.Errorf("get tern client for %s/%s: %w", database, environment, err)
 	}
+	if shouldServeRemoteProgressFromStorage(activeApply, client) {
+		return s.progressFromLocalStorage(ctx, queuedRemoteProgressApply(activeApply))
+	}
 
 	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
 		ApplyId:  ternApplyID,
@@ -260,6 +292,17 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound, err.Error())
 		return
 	}
+	if shouldServeRemoteProgressFromStorage(activeApply, client) {
+		httpResp, err := s.progressFromLocalStorage(r.Context(), queuedRemoteProgressApply(activeApply))
+		if err != nil {
+			s.logger.Error("failed to read queued remote apply progress from storage",
+				"apply_id", activeApply.ApplyIdentifier, "state", activeApply.State, "error", err)
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read apply: "+err.Error())
+			return
+		}
+		s.writeJSON(w, http.StatusOK, httpResp)
+		return
+	}
 
 	resp, err := client.Progress(r.Context(), &ternv1.ProgressRequest{
 		ApplyId:  ternApplyID,
@@ -336,6 +379,17 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		return
 	}
 	s.logger.Debug("progress by apply-id: got client", "apply_id", applyID, "is_remote", client.IsRemote())
+
+	if shouldServeRemoteProgressFromStorage(apply, client) {
+		httpResp, err := s.progressFromLocalStorage(r.Context(), queuedRemoteProgressApply(apply))
+		if err != nil {
+			s.logger.Error("failed to read queued remote apply progress from storage", "apply_id", applyID, "state", apply.State, "error", err)
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
+			return
+		}
+		s.writeJSON(w, http.StatusOK, httpResp)
+		return
+	}
 
 	// Resolve to the Tern-facing ID: external_id (remote engine's apply identifier) or apply_identifier (local mode).
 	ternApplyID := apply.ApplyIdentifier

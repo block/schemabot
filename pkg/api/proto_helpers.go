@@ -80,19 +80,6 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange) map[string]*storag
 	return result
 }
 
-// storageToProtoTableChanges converts storage TableChange slice to proto TableChange slice.
-func storageToProtoTableChanges(changes []storage.TableChange) []*ternv1.TableChange {
-	tables := make([]*ternv1.TableChange, len(changes))
-	for i, c := range changes {
-		tables[i] = &ternv1.TableChange{
-			TableName:  c.Table,
-			Ddl:        c.DDL,
-			ChangeType: changeTypeToProto(c.Operation),
-		}
-	}
-	return tables
-}
-
 // protoChangeTypeToOperation converts a proto ChangeType enum to a storage operation string.
 func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 	switch ct {

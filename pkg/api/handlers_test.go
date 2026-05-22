@@ -124,6 +124,10 @@ func (s *staticApplyStore) GetByDatabase(context.Context, string, string, string
 	}
 	return []*storage.Apply{s.apply}, nil
 }
+func (s *staticApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	s.apply = apply
+	return s.err
+}
 
 type capturingApplyStore struct {
 	storage.ApplyStore
@@ -243,6 +247,17 @@ func (s *capturingTaskStore) Update(_ context.Context, task *storage.Task) error
 	}
 	return storage.ErrTaskNotFound
 }
+func (s *capturingTaskStore) GetByApplyID(_ context.Context, applyID int64) ([]*storage.Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var tasks []*storage.Task
+	for _, task := range s.tasks {
+		if task.ApplyID == applyID {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks, s.err
+}
 
 type emptyLockStore struct {
 	storage.LockStore
@@ -269,6 +284,9 @@ type mockTernClient struct {
 	applyResp      *ternv1.ApplyResponse
 	applyErr       error
 	applyReq       *ternv1.ApplyRequest
+	progressResp   *ternv1.ProgressResponse
+	progressErr    error
+	progressReq    *ternv1.ProgressRequest
 	volumeResp     *ternv1.VolumeResponse
 	volumeErr      error
 	volumeReq      *ternv1.VolumeRequest // captured request
@@ -310,7 +328,11 @@ func (m *mockTernClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*
 	return nil, m.applyErr
 }
 func (m *mockTernClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
-	return nil, nil
+	m.progressReq = req
+	if m.progressResp != nil {
+		return m.progressResp, m.progressErr
+	}
+	return nil, m.progressErr
 }
 func (m *mockTernClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	m.cutoverReq = req
@@ -446,9 +468,14 @@ func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) 
 }
 
 func newControlTestService(client tern.Client, apply *storage.Apply) *Service {
+	return newControlTestServiceWithTasks(client, apply, nil)
+}
+
+func newControlTestServiceWithTasks(client tern.Client, apply *storage.Apply, tasks []*storage.Task) *Service {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	return New(&mockStorageWithApplyStores{
 		applies: &staticApplyStore{apply: apply},
+		tasks:   &capturingTaskStore{tasks: tasks},
 	}, testServerConfig(), map[string]tern.Client{
 		"default/staging": client,
 	}, logger)
@@ -574,6 +601,18 @@ func TestExecuteApplySourcePolicyAllowsDirectPlan(t *testing.T) {
 		Repository:     "octocat/hello-world",
 		PullRequest:    1,
 		Environment:    "staging",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				Tables: []storage.TableChange{
+					{
+						Namespace: "payments",
+						Table:     "users",
+						DDL:       "ALTER TABLE users ADD COLUMN email varchar(255)",
+						Operation: "alter",
+					},
+				},
+			},
+		},
 	}
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
@@ -589,14 +628,19 @@ func TestExecuteApplySourcePolicyAllowsDirectPlan(t *testing.T) {
 			DefaultDeployment: {"staging": "localhost:9090"},
 		},
 	}
-	mockClient := &mockTernClient{
-		applyResp: &ternv1.ApplyResponse{Accepted: false, ErrorMessage: "engine rejected"},
-		isRemote:  true,
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	stor := &mockStorageWithApplyStores{
+		plans:     &mockPlanLookupStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
 	}
+	mockClient := &mockTernClient{isRemote: true}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := New(&mockStorageWithPlanLookup{
-		plans: &mockPlanLookupStore{plan: plan},
-	}, cfg, map[string]tern.Client{
+	svc := New(stor, cfg, map[string]tern.Client{
 		DefaultDeployment + "/staging": mockClient,
 	}, logger)
 
@@ -607,10 +651,14 @@ func TestExecuteApplySourcePolicyAllowsDirectPlan(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, resp)
-	assert.Zero(t, applyID)
-	assert.False(t, resp.Accepted)
-	require.NotNil(t, mockClient.applyReq, "direct API apply should still call Tern")
-	assert.Equal(t, "payments-staging-target", mockClient.applyReq.Target)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(123), applyID)
+	assert.Nil(t, mockClient.applyReq, "direct API apply should queue work without dispatching remote Tern")
+	require.NotNil(t, applies.apply)
+	assert.Equal(t, state.Apply.Pending, applies.apply.State)
+	assert.Equal(t, "payments-staging-target", applies.apply.GetOptions().Target)
+	require.Len(t, tasks.tasks, 1)
+	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
 }
 
 func TestExecuteApplySourcePolicyBlocksStoredTrustedPlan(t *testing.T) {
@@ -775,21 +823,116 @@ func TestPlanHandlerSourcePolicyAllowsDirectSource(t *testing.T) {
 	assert.Equal(t, "plan-source-policy", resp.PlanID)
 }
 
-func TestExecuteApplyRequiresRemoteApplyID(t *testing.T) {
-	svc, _ := newExecuteApplyTestService(&mockTernClient{
-		applyResp: &ternv1.ApplyResponse{Accepted: true},
-		isRemote:  true,
-	}, &capturingApplyStore{})
+func TestExecuteApplyQueuesRemoteApplyForScheduler(t *testing.T) {
+	// Remote applies follow the same durable queue path as local applies. The
+	// request returns the control-plane apply ID before the scheduler dispatches
+	// work to remote Tern and stores external_id.
+	applies := &capturingApplyStore{}
+	mock := &mockTernClient{isRemote: true}
+	svc, tasks := newExecuteApplyTestService(mock, applies)
 
 	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
 		PlanID:      "plan-1",
 		Environment: "staging",
 	})
 
-	require.Error(t, err)
-	assert.Nil(t, resp)
-	assert.Zero(t, applyID)
-	assert.Contains(t, err.Error(), "accepted apply missing apply_id")
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(123), applyID)
+	assert.NotEmpty(t, resp.ApplyID)
+	require.NotNil(t, applies.apply)
+	assert.Equal(t, state.Apply.Pending, applies.apply.State)
+	assert.Empty(t, applies.apply.ExternalID)
+	assert.Equal(t, storage.EngineSpirit, applies.apply.Engine)
+	assert.Equal(t, "testdb", applies.apply.GetOptions().Target)
+	assert.Nil(t, mock.applyReq, "request path should not call remote Tern before scheduler claim")
+	require.Len(t, tasks.tasks, 1)
+	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
+}
+
+func TestProgressByApplyIDServesQueuedRemoteApplyFromStorage(t *testing.T) {
+	// The scheduler marks the control-plane row running before gRPC dispatch
+	// stores external_id. During that handoff, apply-id progress should be
+	// served locally as pending instead of asking the data plane about an ID it
+	// does not know yet.
+	mock := &mockTernClient{
+		isRemote:    true,
+		progressErr: errors.New("remote progress should not be called before external_id is set"),
+	}
+	apply := activeTestApply("apply-queued-remote")
+	apply.ExternalID = ""
+	apply.State = state.Apply.Running
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-queued-remote",
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Environment:    apply.Environment,
+		TableName:      "users",
+		State:          state.Task.Pending,
+		Engine:         storage.EngineSpirit,
+	}
+	svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-queued-remote", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Nil(t, mock.progressReq, "remote progress should wait until scheduler stores external_id")
+
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "apply-queued-remote", resp.ApplyID)
+	assert.Equal(t, state.Apply.Pending, resp.State)
+	require.Len(t, resp.Tables, 1)
+	assert.Equal(t, "users", resp.Tables[0].TableName)
+}
+
+func TestProgressByDatabaseServesQueuedRemoteApplyFromStorage(t *testing.T) {
+	// Database-scoped progress uses the same handoff behavior as apply-id
+	// progress: before external_id is persisted, the data plane cannot resolve
+	// the control-plane apply identifier, so the API reports the queued state
+	// from storage.
+	mock := &mockTernClient{
+		isRemote:    true,
+		progressErr: errors.New("remote progress should not be called before external_id is set"),
+	}
+	apply := activeTestApply("apply-queued-db")
+	apply.ExternalID = ""
+	apply.State = state.Apply.Running
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-queued-db",
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Environment:    apply.Environment,
+		TableName:      "users",
+		State:          state.Task.Pending,
+		Engine:         storage.EngineSpirit,
+	}
+	svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/testdb?environment=staging", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Nil(t, mock.progressReq, "remote progress should wait until scheduler stores external_id")
+
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "apply-queued-db", resp.ApplyID)
+	assert.Equal(t, state.Apply.Pending, resp.State)
+	require.Len(t, resp.Tables, 1)
+	assert.Equal(t, "users", resp.Tables[0].TableName)
 }
 
 func TestExecuteApplyQueuesLocalApplyForScheduler(t *testing.T) {
@@ -998,6 +1141,18 @@ func TestApplyHandler(t *testing.T) {
 			Repository:     "octocat/hello-world",
 			PullRequest:    1,
 			Environment:    "staging",
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"payments": {
+					Tables: []storage.TableChange{
+						{
+							Namespace: "payments",
+							Table:     "users",
+							DDL:       "ALTER TABLE users ADD COLUMN email varchar(255)",
+							Operation: "alter",
+						},
+					},
+				},
+			},
 		}
 		cfg := &ServerConfig{
 			Databases: map[string]DatabaseConfig{
@@ -1013,13 +1168,17 @@ func TestApplyHandler(t *testing.T) {
 				DefaultDeployment: {"staging": "localhost:9090"},
 			},
 		}
-		stor := &mockStorageWithPlanLookup{
-			plans: &mockPlanLookupStore{plan: plan},
+		applies := &capturingApplyStore{}
+		tasks := &capturingTaskStore{}
+		applies.taskStore = tasks
+		stor := &mockStorageWithApplyStores{
+			plans:     &mockPlanLookupStore{plan: plan},
+			applies:   applies,
+			tasks:     tasks,
+			locks:     &emptyLockStore{},
+			applyLogs: &noopApplyLogStore{},
 		}
-		mock := &mockTernClient{
-			applyResp: &ternv1.ApplyResponse{Accepted: false, ErrorMessage: "engine rejected"},
-			isRemote:  true,
-		}
+		mock := &mockTernClient{isRemote: true}
 		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 		ternClients := map[string]tern.Client{DefaultDeployment + "/staging": mock}
 		svc := New(stor, cfg, ternClients, logger)
@@ -1033,12 +1192,17 @@ func TestApplyHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		require.NotNil(t, mock.applyReq, "direct HTTP apply should still call Tern")
+		assert.Nil(t, mock.applyReq, "direct HTTP apply should queue work without dispatching remote Tern")
 
 		var resp apitypes.ApplyResponse
 		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
-		assert.False(t, resp.Accepted)
-		assert.Equal(t, apitypes.ErrCodeEngineError, resp.ErrorCode)
+		assert.True(t, resp.Accepted)
+		assert.NotEmpty(t, resp.ApplyID)
+		require.NotNil(t, applies.apply)
+		assert.Equal(t, state.Apply.Pending, applies.apply.State)
+		assert.Equal(t, "payments-staging-target", applies.apply.GetOptions().Target)
+		require.Len(t, tasks.tasks, 1)
+		assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
 	})
 }
 

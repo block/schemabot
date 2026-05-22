@@ -320,7 +320,7 @@ stored GitHub context, and errors never fail server startup.
 
 The scheduler is part of Tern orchestration. The API service starts it on server startup because the server owns process lifecycle, configuration, and the Tern client pool, but the scheduler's work is to coordinate applies: claim storage records, refresh their heartbeat lease, and call `ResumeApply()` on the right Tern client.
 
-Each scheduler worker runs immediately on startup, then polls every 10 seconds. The worker claims at most one apply per tick and resumes it through the Tern client for that apply's deployment and environment. Fresh local applies also send a best-effort wake signal after their apply and task rows are committed, so a worker can claim them immediately instead of waiting for the next poll tick.
+Each scheduler worker runs immediately on startup, then polls every 10 seconds. The worker claims at most one apply per tick and resumes it through the Tern client for that apply's deployment and environment. Fresh applies also send a best-effort wake signal after their apply and task rows are committed, so a worker can claim them immediately instead of waiting for the next poll tick.
 
 `scheduler_workers` controls scheduler concurrency. The default is four workers, so an untuned server can still make progress across independent databases and environments concurrently. More workers help larger installations with many independent schema changes because each worker can claim and resume a different target during the same scheduler tick.
 
@@ -367,7 +367,7 @@ A **claim** is an atomic storage operation: it selects one apply that needs work
 
 A running apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
 
-Freshly queued local applies are also claimable once their task rows exist. `ExecuteApply` stores the pending apply and its initial tasks in one transaction, then sends a best-effort wake signal to the scheduler. The wake path is only a latency optimization: it nudges one worker to call the same claim path immediately instead of waiting for the next poll tick. It never bypasses storage claims or creates a second queue. If the scheduler is stopped or a wake is already pending, the signal is skipped and the normal poll loop still finds the apply.
+Freshly queued applies are also claimable once their task rows exist. `ExecuteApply` stores the pending apply and its initial tasks in one transaction, then sends a best-effort wake signal to the scheduler. The wake path is only a latency optimization: it nudges one worker to call the same claim path immediately instead of waiting for the next poll tick. It never bypasses storage claims or creates a second queue. If the scheduler is stopped or a wake is already pending, the signal is skipped and the normal poll loop still finds the apply.
 
 ```
 HTTP apply request
@@ -386,6 +386,9 @@ claim row + refresh heartbeat
       |
       v
 TernClient.ResumeApply()
+      |
+      v
+dispatch through LocalClient or GRPCClient
 ```
 
 SchemaBot has two different kinds of locking:
@@ -482,7 +485,7 @@ There are two ways to deploy the tern layer:
 
 Used for: local development, self-hosted deployments, single-binary setups.
 
-**gRPC Mode** (`GRPCClient`) — SchemaBot delegates execution to an external Tern service over gRPC. SchemaBot still maintains its own storage for locks, plans, applies, and tasks — but the engine runs remotely.
+**gRPC Mode** (`GRPCClient`) — SchemaBot delegates execution to an external Tern service over gRPC. SchemaBot still maintains its own storage for locks, plans, applies, and tasks. HTTP apply requests queue durable control-plane rows first; scheduler workers dispatch the queued apply to the remote Tern service and then poll it until terminal.
 
 ```
 ┌──────────────────────────────┐        ┌──────────────────────────────┐
@@ -492,10 +495,13 @@ Used for: local development, self-hosted deployments, single-binary setups.
 │      │                       │        │      │                       │
 │      ▼                       │        │      ▼                       │
 │ SchemaBot Storage            │        │ Internal state               │
-│ (locks, plans, applies)      │        │ (opaque to SchemaBot)        │
+│ (locks, plans, applies)      │        │ (remote apply rows)          │
 │      │                       │        │      │                       │
 │      ▼                       │        │      ▼                       │
-│ GRPCClient ──────────────────┼────────▶ Tern Proto Interface ───────▶│ Target DB
+│ Scheduler worker             │        │ Tern Proto Interface         │
+│      │                       │        │      │                       │
+│      ▼                       │        │      ▼                       │
+│ GRPCClient ──────────────────┼────────▶ Engine ─────────────────────▶│ Target DB
 └──────────────────────────────┘        └──────────────────────────────┘
 ```
 
@@ -503,7 +509,7 @@ Used for: distributed deployments where SchemaBot and the database engine run on
 
 **Identity resolution (`apply_identifier` vs `external_id`):**
 
-In gRPC mode, SchemaBot and Tern maintain separate storage with separate IDs. When Apply succeeds, Tern returns its own ID (the remote engine's apply identifier). SchemaBot generates a separate `apply_identifier` for its HTTP callers and stores Tern's ID as `external_id`:
+In gRPC mode, SchemaBot and Tern maintain separate storage with separate IDs. SchemaBot generates an `apply_identifier` for HTTP callers when it queues the apply. The scheduler later calls remote Tern, receives Tern's own apply ID, and stores that remote ID as `external_id`:
 
 An accepted apply must return an apply ID and must be represented in SchemaBot
 storage before webhook progress tracking or Check Run ownership can proceed.
@@ -512,10 +518,16 @@ to the PR check that started the work.
 
 ```
 Apply flow:
-  ExecuteApply → client.Apply() → Tern returns ApplyId:"tern-42"
-    → SchemaBot generates apply_identifier="apply-abc123"
-    → stores external_id="tern-42"
+  ExecuteApply
+    → stores apply_identifier="apply-abc123", external_id=""
+    → wakes scheduler
     → returns apply_id="apply-abc123" to HTTP caller
+
+  Scheduler worker claims apply "apply-abc123"
+    → GRPCClient.ResumeApply() calls remote Apply()
+    → Tern returns ApplyId:"tern-42"
+    → SchemaBot stores external_id="tern-42"
+    → worker polls remote progress until terminal
 
 Subsequent RPCs (Progress, Stop, Start, Cutover, Volume):
   HTTP caller sends apply_id="apply-abc123"
@@ -528,15 +540,14 @@ In local mode (`client.IsRemote() == false`), `LocalClient` runs in the same pro
 
 ```
 Apply flow (local):
-  ExecuteApply checks client.IsRemote() → false
-  ExecuteApply → client.Apply()
-    → LocalClient creates apply in DB:
-        apply_identifier="apply-def456", external_id="" (not set — no remote Tern)
-    → returns ApplyId:"apply-def456"
-  ExecuteApply gets resp.ApplyId="apply-def456"
-    → IsRemote()==false, so looks up existing record directly
-    → reuses LocalClient's apply record
+  ExecuteApply
+    → stores apply_identifier="apply-def456", external_id=""
+    → wakes scheduler
     → returns apply_id="apply-def456" to HTTP caller
+
+  Scheduler worker claims apply "apply-def456"
+    → LocalClient.ResumeApply() runs the engine locally
+    → external_id remains empty
 
 Subsequent RPCs (local):
   HTTP caller sends apply_id="apply-def456"

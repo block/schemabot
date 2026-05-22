@@ -302,18 +302,17 @@ func applyMetricStatusForError(err error) string {
 	return "error"
 }
 
-// ExecuteApply stores an apply request durably and returns the apply response.
-// Local clients are queued for scheduler dispatch so request cancellation cannot
-// orphan in-memory execution. Remote clients dispatch through the gRPC request
-// path.
+// ExecuteApply queues an apply request in storage and returns once the work is
+// durable. Scheduler workers own dispatching queued work through the Tern
+// client so request cancellation cannot orphan in-memory execution.
 //
 // Flow:
 //  1. Load the plan from SchemaBot storage (source of truth for database, DDL changes).
-//  2. Resolve the Tern client to validate deployment/environment routing.
-//  3. Local mode: create a pending Apply row and pending Task rows, attach any
-//     pending observer, wake the scheduler, and return the SchemaBot apply ID.
-//  4. gRPC mode: call remote Apply, store the remote apply ID in external_id,
-//     start progress polling, and return the SchemaBot apply ID.
+//  2. Resolve the Tern client to validate the deployment/environment.
+//  3. Create a pending Apply record and pending Task records from the plan.
+//  4. Attach any pending observer to the stored apply before dispatch can start.
+//  5. Wake a scheduler worker so fresh applies usually start immediately.
+//  6. Return the SchemaBot apply_identifier to the HTTP caller.
 //
 // Returns the API response, the stored apply ID (0 if not stored), and any error.
 func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes.ApplyResponse, int64, error) {
@@ -412,10 +411,10 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	}
 	options["target"] = plan.Target
 
-	applyStart := time.Now()
+	enqueueStart := time.Now()
 	recordApplyResult := func(status string) {
 		metrics.RecordApply(ctx, plan.Database, req.Environment, status)
-		metrics.RecordApplyDuration(ctx, time.Since(applyStart), plan.Database, req.Environment, status)
+		metrics.RecordApplyDuration(ctx, time.Since(enqueueStart), plan.Database, req.Environment, status)
 	}
 	recordApplyError := func(status string, err error) {
 		span.RecordError(err)
@@ -423,112 +422,38 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		recordApplyResult(applyMetricStatusForError(err))
 	}
 
-	if !client.IsRemote() {
-		attachObserver := func(storedApplyID int64) {
-			observer := s.consumePendingObserver(plan.Database, deployment, req.Environment)
-			if observer != nil {
-				type applyIDSetter interface{ SetApplyID(int64) }
-				if setter, ok := observer.(applyIDSetter); ok {
-					setter.SetApplyID(storedApplyID)
-				}
-				client.SetObserver(storedApplyID, observer)
-			}
+	attachObserver := func(storedApplyID int64) {
+		observer := s.consumePendingObserver(plan.Database, deployment, req.Environment)
+		if observer == nil {
+			return
 		}
-
-		applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, deployment, options, attachObserver)
-		if err != nil {
-			recordApplyError("enqueue apply", err)
-			return nil, 0, err
+		type applyIDSetter interface{ SetApplyID(int64) }
+		if setter, ok := observer.(applyIDSetter); ok {
+			setter.SetApplyID(storedApplyID)
 		}
-		if storedApplyID <= 0 {
-			applyErr := fmt.Errorf("accepted apply missing stored apply id")
-			recordApplyError("apply missing stored id", applyErr)
-			return nil, 0, applyErr
-		}
-
-		span.SetAttributes(attribute.String("apply_id", applyIdentifier), attribute.Bool("accepted", true))
-		recordApplyResult("success")
-		metrics.AdjustActiveApplies(ctx, 1, plan.Database, req.Environment)
-		s.wakeScheduler(applyIdentifier, plan.Database, req.Environment)
-
-		return &apitypes.ApplyResponse{
-			Accepted: true,
-			ApplyID:  applyIdentifier,
-		}, storedApplyID, nil
+		client.SetObserver(storedApplyID, observer)
 	}
 
-	if observer := s.consumePendingObserver(plan.Database, deployment, req.Environment); observer != nil {
-		client.SetPendingObserver(observer)
-	}
-	ternReq := &ternv1.ApplyRequest{
-		PlanId:      req.PlanID,
-		Options:     options,
-		Database:    plan.Database,
-		Type:        plan.DatabaseType,
-		DdlChanges:  storageToProtoTableChanges(plan.FlatDDLChanges()),
-		Environment: req.Environment,
-		Target:      plan.Target,
-		Caller:      req.Caller,
-	}
-
-	resp, err := client.Apply(ctx, ternReq)
+	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, deployment, options, attachObserver)
 	if err != nil {
-		recordApplyError("apply failed", err)
+		recordApplyError("enqueue apply", err)
 		return nil, 0, err
 	}
-	if resp == nil {
-		applyErr := fmt.Errorf("apply returned nil response")
-		recordApplyError("apply missing response", applyErr)
-		return nil, 0, applyErr
-	}
-	if resp.Accepted && resp.ApplyId == "" {
-		applyErr := fmt.Errorf("accepted apply missing apply_id")
-		recordApplyError("apply missing id", applyErr)
-		return nil, 0, applyErr
-	}
-	span.SetAttributes(attribute.String("apply_id", resp.ApplyId), attribute.Bool("accepted", resp.Accepted))
-
-	var storedApplyID int64
-	applyIdentifier := resp.ApplyId
-	if resp.Accepted {
-		applyIdentifier = "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-		apply, id, err := s.createStoredApply(ctx, plan, req, deployment, options, applyIdentifier, resp.ApplyId)
-		if err != nil {
-			recordApplyError("store apply", err)
-			return nil, 0, err
-		}
-		storedApplyID = id
-
-		// Start background polling to sync Tern's real state into SchemaBot's
-		// storage.
-		if err := client.ResumeApply(ctx, apply); err != nil {
-			s.logger.Warn("failed to start progress tracking", "apply_id", applyIdentifier, "error", err)
-		}
-	}
-	if resp.Accepted && storedApplyID <= 0 {
+	if storedApplyID <= 0 {
 		applyErr := fmt.Errorf("accepted apply missing stored apply id")
 		recordApplyError("apply missing stored id", applyErr)
 		return nil, 0, applyErr
 	}
 
-	applyStatus := "success"
-	if !resp.Accepted {
-		applyStatus = "rejected"
-	}
-	recordApplyResult(applyStatus)
-	if resp.Accepted {
-		metrics.AdjustActiveApplies(ctx, 1, plan.Database, req.Environment)
-	}
+	span.SetAttributes(attribute.String("apply_id", applyIdentifier), attribute.Bool("accepted", true))
+	recordApplyResult("success")
+	metrics.AdjustActiveApplies(ctx, 1, plan.Database, req.Environment)
+	s.wakeScheduler(applyIdentifier, plan.Database, req.Environment)
 
-	applyResp := &apitypes.ApplyResponse{
-		Accepted:     resp.Accepted,
-		ApplyID:      applyIdentifier,
-		ErrorMessage: resp.ErrorMessage,
-	}
-	if !resp.Accepted && resp.ErrorMessage != "" {
-		applyResp.ErrorCode = apitypes.ErrCodeEngineError
-	}
-	return applyResp, storedApplyID, nil
+	return &apitypes.ApplyResponse{
+		Accepted: true,
+		ApplyID:  applyIdentifier,
+	}, storedApplyID, nil
 }
 
 func (s *Service) enqueueApply(

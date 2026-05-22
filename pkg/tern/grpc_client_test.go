@@ -332,12 +332,30 @@ func TestGRPCClient_Close(t *testing.T) {
 type capturingTernServer struct {
 	ternv1.UnimplementedTernServer
 	mu               sync.Mutex
+	applyReq         *ternv1.ApplyRequest
+	applyErr         error
+	remoteApplyID    string
 	startApplyID     string
 	progressApplyID  string
 	progressState    ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
 	progressStateSet bool
 	progressErr      error
 	startCalled      bool // tracks whether Start was actually invoked
+}
+
+func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
+	s.mu.Lock()
+	s.applyReq = req
+	applyID := s.remoteApplyID
+	if applyID == "" {
+		applyID = "remote-apply-123"
+	}
+	err := s.applyErr
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return &ternv1.ApplyResponse{Accepted: true, ApplyId: applyID}, nil
 }
 
 func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
@@ -378,6 +396,12 @@ func (s *capturingTernServer) getProgressApplyID() string {
 	return s.progressApplyID
 }
 
+func (s *capturingTernServer) getApplyRequest() *ternv1.ApplyRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applyReq
+}
+
 // mockApplyStore is a minimal ApplyStore for testing ResumeApply.
 type mockApplyStore struct {
 	storage.ApplyStore
@@ -385,10 +409,15 @@ type mockApplyStore struct {
 }
 
 func (m *mockApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
-	return m.apply, nil
+	if m.apply == nil {
+		return nil, nil
+	}
+	apply := *m.apply
+	return &apply, nil
 }
 func (m *mockApplyStore) Update(_ context.Context, apply *storage.Apply) error {
-	m.apply = apply
+	stored := *apply
+	m.apply = &stored
 	return nil
 }
 func (m *mockApplyStore) Heartbeat(context.Context, int64) error { return nil }
@@ -404,11 +433,21 @@ func (m *mockTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, e
 }
 func (m *mockTaskStore) Update(context.Context, *storage.Task) error { return nil }
 
+type mockPlanStore struct {
+	storage.PlanStore
+	plan *storage.Plan
+}
+
+func (m *mockPlanStore) GetByID(context.Context, int64) (*storage.Plan, error) {
+	return m.plan, nil
+}
+
 // mockStorage wires together the mock stores.
 type mockStorage struct {
 	storage.Storage
 	applies *mockApplyStore
 	tasks   *mockTaskStore
+	plans   *mockPlanStore
 }
 
 func (m *mockStorage) Applies() storage.ApplyStore {
@@ -422,6 +461,12 @@ func (m *mockStorage) Tasks() storage.TaskStore {
 		return m.tasks
 	}
 	return &mockTaskStore{}
+}
+func (m *mockStorage) Plans() storage.PlanStore {
+	if m.plans != nil {
+		return m.plans
+	}
+	return &mockPlanStore{}
 }
 
 func testCapturingGRPCClient(t *testing.T, server *capturingTernServer) (*GRPCClient, func()) {
@@ -448,6 +493,188 @@ func testCapturingGRPCClient(t *testing.T, server *capturingTernServer) (*GRPCCl
 		utils.CloseAndLog(lis)
 	}
 	return client, cleanup
+}
+
+func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
+	// Scheduler claims start with a durable control-plane apply and pending
+	// tasks but no external_id. ResumeApply dispatches the queued work to
+	// remote Tern, stores the returned data-plane ID, then polls it to terminal.
+	server := &capturingTernServer{remoteApplyID: "remote-dispatched-123"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-control-queued",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{
+		Target:       "testdb-target",
+		DeferCutover: true,
+	})
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		DDL:            "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:      "alter",
+		Namespace:      "default",
+		State:          state.Task.Pending,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-remote-queued",
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.NoError(t, err)
+
+	assert.Equal(t, "remote-dispatched-123", apply.ExternalID)
+	assert.Equal(t, state.Apply.Completed, apply.State)
+	require.NotNil(t, apply.StartedAt)
+	require.NotNil(t, apply.CompletedAt)
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected queued apply to be dispatched to remote Tern")
+	assert.Equal(t, "plan-remote-queued", req.PlanId)
+	assert.Equal(t, "testdb", req.Database)
+	assert.Equal(t, "testdb-target", req.Target)
+	assert.Equal(t, "true", req.Options["defer_cutover"])
+	require.Len(t, req.DdlChanges, 1)
+	assert.Equal(t, "users", req.DdlChanges[0].TableName)
+	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, req.DdlChanges[0].ChangeType)
+	assert.Equal(t, "remote-dispatched-123", server.getProgressApplyID())
+}
+
+func TestGRPCClient_ResumeApplyRejectsAmbiguousRemoteDispatchState(t *testing.T) {
+	// A stale active gRPC apply without an external_id is ambiguous: the prior
+	// worker may have sent the remote Apply RPC and crashed before persisting the
+	// returned data-plane ID. Fail closed instead of dispatching a duplicate
+	// remote schema change.
+	server := &capturingTernServer{remoteApplyID: "remote-duplicate"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              8,
+		ApplyIdentifier: "apply-ambiguous-dispatch",
+		PlanID:          100,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             12,
+		TaskIdentifier: "task-ambiguous-dispatch",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-ambiguous-dispatch",
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote dispatch state is ambiguous")
+
+	assert.Nil(t, server.getApplyRequest(), "ambiguous apply should not be dispatched to remote Tern")
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remote dispatch state is ambiguous")
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, task.ErrorMessage, "remote dispatch state is ambiguous")
+}
+
+func TestGRPCClient_ResumeApplyDoesNotFailStateWhenRemoteDispatchOutcomeIsAmbiguous(t *testing.T) {
+	// Cancellation or deadline from the remote Apply RPC does not prove whether
+	// the data plane accepted the schema change. Leave durable state unchanged
+	// so the scheduler does not record a false terminal failure.
+	server := &capturingTernServer{
+		applyErr: status.Error(codes.DeadlineExceeded, "deadline waiting for response"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              9,
+		ApplyIdentifier: "apply-ambiguous-rpc",
+		PlanID:          101,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	task := &storage.Task{
+		ID:             13,
+		TaskIdentifier: "task-ambiguous-rpc",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Pending,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-ambiguous-rpc",
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ambiguous remote dispatch outcome")
+
+	require.NotNil(t, server.getApplyRequest(), "expected Apply RPC to be attempted")
+	assert.Equal(t, state.Apply.Pending, apply.State)
+	assert.Empty(t, apply.ErrorMessage)
+	assert.Equal(t, state.Task.Pending, task.State)
+	assert.Empty(t, task.ErrorMessage)
+}
+
+func TestGRPCClient_QueuedRemoteDispatchPredicate(t *testing.T) {
+	tests := []struct {
+		name       string
+		state      string
+		externalID string
+		want       bool
+	}{
+		{name: "pending without remote id", state: state.Apply.Pending, want: true},
+		{name: "retryable without remote id", state: state.Apply.FailedRetryable, want: true},
+		{name: "running without remote id", state: state.Apply.Running, want: false},
+		{name: "pending with remote id", state: state.Apply.Pending, externalID: "remote-apply-123", want: false},
+		{name: "terminal without remote id", state: state.Apply.Completed, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				State:      tt.state,
+				ExternalID: tt.externalID,
+			}
+			assert.Equal(t, tt.want, shouldDispatchQueuedRemoteApply(apply))
+		})
+	}
 }
 
 func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
@@ -492,18 +719,8 @@ func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 	// Verify Start received the external_id as apply_id
 	assert.Equal(t, "remote_tern_xyz", server.getStartApplyID())
 
-	// The poller runs in a goroutine; give it a moment to fire the first Progress call.
-	// Progress returns STATE_COMPLETED so the poller exits after one iteration.
-	deadline := time.After(2 * time.Second)
-	for server.getProgressApplyID() == "" {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for Progress call")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-
+	// Progress returns STATE_COMPLETED after Start, so ResumeApply exits after
+	// syncing one terminal progress response.
 	assert.Equal(t, "remote_tern_xyz", server.getProgressApplyID())
 }
 
@@ -587,7 +804,9 @@ func TestGRPCClient_PollFailsWhenRemoteApplyIsNotFound(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote-not-found")
 
 	assert.Equal(t, state.Apply.Failed, apply.State)
 	assert.Contains(t, apply.ErrorMessage, "remote-not-found")
@@ -627,7 +846,9 @@ func TestGRPCClient_PollFailsWhenExactRemoteApplyHasNoActiveProgress(t *testing.
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no active schema change")
 
 	assert.Equal(t, state.Apply.Failed, apply.State)
 	assert.Contains(t, apply.ErrorMessage, "no active schema change")
@@ -674,7 +895,8 @@ func TestGRPCClient_RemoteProgressLossDoesNotOverwriteTerminalApply(t *testing.T
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply)
+	require.Error(t, err)
 
 	assert.Equal(t, state.Apply.Completed, apply.State)
 	assert.Empty(t, apply.ErrorMessage)
