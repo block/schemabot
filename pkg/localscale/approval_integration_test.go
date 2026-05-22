@@ -3,6 +3,7 @@
 package localscale_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -24,7 +25,7 @@ func TestApply_RequireApproval_RejectsDeployment(t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS users (id bigint NOT NULL PRIMARY KEY, name varchar(255)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"))
 
 	// Create branch
-	branchName := "approval-test-" + time.Now().Format("150405")
+	branchName := fmt.Sprintf("approval-test-%d", time.Now().UnixNano())
 	_, err := testClient.CreateBranch(ctx, &ps.CreateDatabaseBranchRequest{
 		Organization: testOrg,
 		Database:     "approvaldb",
@@ -45,8 +46,9 @@ func TestApply_RequireApproval_RejectsDeployment(t *testing.T) {
 	)
 
 	// Apply DDL on branch
+	approvalCol := uniqueIdentifier("approval_col")
 	require.NoError(t, testContainer.SeedDDL(ctx, testOrg, "approvaldb", "testkeyspace",
-		"ALTER TABLE users ADD COLUMN approval_col varchar(255)"))
+		fmt.Sprintf("ALTER TABLE `users` ADD COLUMN `%s` varchar(255)", approvalCol)))
 
 	// Create deploy request
 	dr, err := testClient.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{

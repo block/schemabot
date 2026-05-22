@@ -360,7 +360,7 @@ Fast mode: `DEBUG=1 go test -tags=integration ./mypackage/...`
 | `POST /admin/vtgate-exec` | Execute SQL against vtgate |
 | `POST /admin/metadata-query` | Execute SQL against metadata DB |
 | `POST /admin/branch-db-query` | Execute SQL against a branch database |
-| `POST /admin/reset-state` | Truncate metadata, close proxies |
+| `POST /admin/reset-state` | Cancel active deploy work, clean Vitess online DDL state, close branch proxies, drop branch databases, and reset metadata |
 
 Deploy request endpoints (create, deploy, cancel, cutover, revert, throttle) and the background state machine processor are coming in a follow-up PR.
 
@@ -368,7 +368,9 @@ Deploy request endpoints (create, deploy, cancel, cutover, revert, throttle) and
 
 LocalScale submits online DDL with the `vitess` strategy and `--singleton-context` flag. This means Vitess rejects new DDL submissions if there is a pending migration from a **different** migration context (each deploy request gets a unique context like `localscale:7`).
 
-This is important for test cleanup: if a test's online DDL migration is still running when the next test starts, the new deploy request will fail with `singleton-context migration rejected`. To avoid this, call `POST /admin/reset-state` between tests — it cancels all pending migrations and waits for them to reach terminal state before returning.
+This is important for test cleanup: if a test's online DDL migration or deploy worker is still running when the next test starts, the new deploy request can fail closed because another deploy is active, or Vitess can reject the DDL with `singleton-context migration rejected`.
+
+`POST /admin/reset-state` is the test isolation boundary. It must cancel active deploy execution, unthrottle and cancel Vitess migrations on every shard, wait for migrations to become terminal, clean terminal migration artifacts, close branch proxies, drop branch databases, and only then clear metadata. Tests should fail when reset fails; logging the error and continuing can leave stale state that makes a later test fail for the wrong reason.
 
 See `buildDDLStrategy()` in `helpers.go` for the full strategy string, and the [Vitess online DDL documentation](https://vitess.io/docs/user-guides/schema-changes/managed-online-schema-changes/) for details on singleton strategies.
 

@@ -3,6 +3,7 @@
 package local
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -161,6 +162,83 @@ func localscaleAdminPost(t *testing.T, endpoint string, body string) ([]byte, er
 	return e2eutil.LocalScaleAdminPost(t, os.Getenv("LOCALSCALE_URL"), endpoint, body)
 }
 
+type localScaleQueryResult struct {
+	Columns      []string `json:"columns,omitempty"`
+	Rows         [][]any  `json:"rows,omitempty"`
+	RowsAffected int64    `json:"rows_affected,omitempty"`
+}
+
+func localscaleMetadataQueryResult(t *testing.T, query string) (*localScaleQueryResult, error) {
+	t.Helper()
+	localscaleURL := os.Getenv("LOCALSCALE_URL")
+	if localscaleURL == "" {
+		return &localScaleQueryResult{}, nil
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	body := strings.NewReader(fmt.Sprintf(`{"query":%q}`, query))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, localscaleURL+"/admin/metadata-query", body)
+	if err != nil {
+		return nil, fmt.Errorf("create metadata query request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("execute metadata query: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("metadata query status %d", resp.StatusCode)
+	}
+	var result localScaleQueryResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode metadata query response: %w", err)
+	}
+	return &result, nil
+}
+
+func formatLocalScaleRows(result *localScaleQueryResult) string {
+	if result == nil || len(result.Rows) == 0 {
+		return "<none>"
+	}
+	var rows []string
+	for _, row := range result.Rows {
+		parts := make([]string, 0, len(row))
+		for i, value := range row {
+			column := fmt.Sprintf("col%d", i)
+			if i < len(result.Columns) {
+				column = result.Columns[i]
+			}
+			parts = append(parts, fmt.Sprintf("%s=%v", column, value))
+		}
+		rows = append(rows, strings.Join(parts, " "))
+	}
+	return strings.Join(rows, "; ")
+}
+
+func logLocalScaleDeployRequests(t *testing.T) {
+	t.Helper()
+	result, err := localscaleMetadataQueryResult(t,
+		`SELECT number, org, database_name, branch, deployment_state, deployed, cancelled, migration_context
+		 FROM localscale_deploy_requests
+		 ORDER BY org, database_name, number`)
+	if err != nil {
+		t.Logf("LocalScale deploy request diagnostics unavailable: %v", err)
+		return
+	}
+	t.Logf("LocalScale deploy requests: %s", formatLocalScaleRows(result))
+}
+
+func requireNoLocalScaleDeployRequests(t *testing.T) {
+	t.Helper()
+	result, err := localscaleMetadataQueryResult(t,
+		`SELECT number, org, database_name, branch, deployment_state, deployed, cancelled, migration_context
+		 FROM localscale_deploy_requests
+		 ORDER BY org, database_name, number`)
+	require.NoError(t, err, "query LocalScale deploy requests after reset")
+	require.Empty(t, result.Rows, "LocalScale reset left deploy requests behind: %s", formatLocalScaleRows(result))
+}
+
 // vitessResetVSchema seeds the base VSchema directly via LocalScale admin endpoint.
 // This ensures vtgate's VSchema matches the examples/vitess/schema files regardless
 // of what previous tests may have applied.
@@ -194,10 +272,12 @@ func vitessRestoreBaseSchema(t *testing.T, _ string) {
 	// singleton-context rejection when the next test submits DDL.
 	_, err := localscaleAdminPost(t, "/admin/reset-state", "{}")
 	if err != nil {
-		t.Logf("vitessRestoreBaseSchema: reset-state failed (non-fatal): %v", err)
+		logLocalScaleDeployRequests(t)
+		require.NoError(t, err, "reset LocalScale state before restoring Vitess schema")
 	}
 	t.Logf("vitessRestoreBaseSchema: resetState done (elapsed=%s)", time.Since(start))
-	clearSchemaBotState(t)
+	requireNoLocalScaleDeployRequests(t)
+	clearSchemaBotStorage(t)
 	t.Logf("vitessRestoreBaseSchema: clearState done (elapsed=%s)", time.Since(start))
 	vitessCleanupSchema(t)
 	t.Logf("vitessRestoreBaseSchema: cleanup done (elapsed=%s)", time.Since(start))
@@ -603,21 +683,25 @@ func TestVitess_Apply_ShardProgress(t *testing.T) {
   COLLATE utf8mb4_0900_ai_ci;`, indexName),
 	}))
 
-	// Seed 100k rows so VReplication has real data to copy during online DDL.
+	// Seed enough rows so VReplication has real data to copy during online DDL.
 	// Without data, the copy phase completes instantly and SHOW VITESS_MIGRATIONS
 	// won't return per-shard progress.
 	localscaleURL := os.Getenv("LOCALSCALE_URL")
-	for batch := range 100 {
+	const (
+		shardProgressRows      = 500_000
+		shardProgressBatchSize = 10_000
+	)
+	for batchStart := 0; batchStart < shardProgressRows; batchStart += shardProgressBatchSize {
 		var b strings.Builder
-		for i := range 1000 {
-			id := batch*1000 + i + 1
+		for i := range shardProgressBatchSize {
+			id := batchStart + i + 1
 			if i > 0 {
 				b.WriteByte(',')
 			}
 			fmt.Fprintf(&b, "(%d, %d, %d)", id, id%10+1, id*100)
 		}
 		vitessAdminQuery(t, localscaleURL, "localscale-staging", "testapp_sharded",
-			"INSERT INTO orders (id, user_id, total_cents) VALUES "+b.String())
+			"INSERT IGNORE INTO orders (id, user_id, total_cents) VALUES "+b.String())
 	}
 
 	binPath := buildCLI(t)
@@ -631,10 +715,14 @@ func TestVitess_Apply_ShardProgress(t *testing.T) {
 
 	// Poll for shard progress during execution with a tight loop.
 	var foundShards bool
+	var lastProgress *apitypes.ProgressResponse
+	var lastProgressErr error
 	deadline := time.Now().Add(testutil.PollDeadline)
 	for time.Now().Before(deadline) {
 		resp, err := client.GetProgress(endpoint, applyID)
 		if err == nil {
+			lastProgress = resp
+			lastProgressErr = nil
 			for _, tbl := range resp.Tables {
 				if len(tbl.Shards) > 0 {
 					foundShards = true
@@ -643,8 +731,24 @@ func TestVitess_Apply_ShardProgress(t *testing.T) {
 			if foundShards || state.IsTerminalApplyState(resp.State) {
 				break
 			}
+		} else {
+			lastProgressErr = err
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if !foundShards {
+		logLocalScaleDeployRequests(t)
+		if lastProgressErr != nil {
+			t.Logf("last progress error: %v", lastProgressErr)
+		}
+		if lastProgress != nil {
+			encoded, err := json.MarshalIndent(lastProgress, "", "  ")
+			if err != nil {
+				t.Logf("last progress response could not be encoded: %v", err)
+			} else {
+				t.Logf("last progress response: %s", encoded)
+			}
+		}
 	}
 	require.True(t, foundShards, "expected per-shard progress for 2-shard keyspace")
 
@@ -1113,7 +1217,7 @@ func TestVitess_Apply_VSchemaTaskTracking(t *testing.T) {
 				finalState = resp.State
 				// Verify all tables (including VSchema) reached terminal state
 				for _, tbl := range resp.Tables {
-					assert.True(t, state.IsTerminalApplyState(state.NormalizeTaskStatus(tbl.Status)),
+					assert.True(t, state.IsTerminalTaskState(state.NormalizeTaskStatus(tbl.Status)),
 						"table %s should be terminal, got %s", tbl.TableName, tbl.Status)
 				}
 				break
@@ -1654,7 +1758,7 @@ func TestVitess_Apply_BranchReuse(t *testing.T) {
 	assert.True(t, foundRefresh, "expected 'Refreshing schema for branch' in apply logs")
 
 	// Second apply on the same branch: add another column
-	clearSchemaBotState(t)
+	clearSchemaBotStorage(t)
 	col2 := fmt.Sprintf("reuse_col2_%d", time.Now().UnixMilli()%100000)
 	schemaDir2 := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (

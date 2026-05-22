@@ -344,23 +344,6 @@ func verifyColumnExists(t *testing.T, table, column string, keyspace ...string) 
 	require.Greater(t, len(result.Rows), 0, "column '%s' not found in table '%s' (keyspace %s)", column, table, ks)
 }
 
-// verifyColumnNotExists checks that a column does NOT exist in a table via vtgate.
-// Retries for up to 5s to account for vtgate schema cache refresh delay.
-func verifyColumnNotExists(t *testing.T, table, column string) {
-	t.Helper()
-	testutil.Poll(t, 5*time.Second, 500*time.Millisecond,
-		func() bool {
-			result, err := testContainer.VtgateExec(t.Context(), testOrg, testDB, "testapp_sharded",
-				fmt.Sprintf("SHOW COLUMNS FROM %s LIKE '%s'", table, column))
-			require.NoError(t, err, "verify column not exists %s.%s", table, column)
-			return len(result.Rows) == 0
-		},
-		func() string {
-			return fmt.Sprintf("column '%s' still exists in table '%s' after waiting for schema cache refresh", column, table)
-		},
-	)
-}
-
 // --- Branch database test helpers ---
 
 // branchDatabaseExists checks if a branch database exists in localscale-mysql.
@@ -450,50 +433,74 @@ func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantSt
 			}
 			// Fail fast on terminal error states (unless we're specifically waiting for them)
 			if lastState == drState.CompleteError && !wantSet[drState.CompleteError] {
+				logDeployDiagnostics(t, ctx, number)
 				require.Failf(t, "deploy failed", "deploy %d reached complete_error", number)
 			}
 			if lastState == drState.Error && !wantSet[drState.Error] {
+				logDeployDiagnostics(t, ctx, number)
 				require.Failf(t, "deploy failed", "deploy %d reached error", number)
 			}
 			return false
 		},
 		func() string {
+			logDeployDiagnostics(t, ctx, number)
 			return fmt.Sprintf("deploy %d: expected one of %v, last state was %q", number, wantStates, lastState)
 		},
 	)
 	return result
 }
 
-// cleanupActiveDeployRequests skips-revert or cancels any active deploy requests
-// so the next test isn't blocked by the gated deployment check.
+func logDeployDiagnostics(t *testing.T, ctx context.Context, number uint64) {
+	t.Helper()
+	diagCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	deployRows, err := testContainer.MetadataQuery(diagCtx,
+		`SELECT number, branch, deployment_state, deployed, cutover_requested, cancelled, migration_context
+		 FROM localscale_deploy_requests
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		testOrg, testDB, number)
+	if err != nil {
+		t.Logf("deploy diagnostics: deploy request query failed: %v", err)
+	} else {
+		t.Logf("deploy diagnostics: deploy_request columns=%v rows=%v", deployRows.Columns, deployRows.Rows)
+	}
+
+	for _, keyspace := range []string{"testapp", "testapp_sharded"} {
+		migrationRows, err := testContainer.VtgateExec(diagCtx, testOrg, testDB, keyspace, "SHOW VITESS_MIGRATIONS")
+		if err != nil {
+			t.Logf("deploy diagnostics: SHOW VITESS_MIGRATIONS failed for %s: %v", keyspace, err)
+			continue
+		}
+		t.Logf("deploy diagnostics: %s migrations columns=%v rows=%v", keyspace, migrationRows.Columns, migrationRows.Rows)
+	}
+}
+
+// cleanupActiveDeployRequests resets LocalScale control-plane state so the next
+// test starts without active deploy requests, branch databases, or in-flight
+// Vitess migrations.
 func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 	t.Helper()
+	resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+
 	start := time.Now()
-	cleaned := 0
-	// Scan all deploy requests and skip-revert or cancel any that are active
-	for i := uint64(1); i <= 100; i++ {
-		dr, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
-			Organization: testOrg, Database: testDB, Number: i,
-		})
-		if err != nil {
-			break // no more deploy requests
-		}
-		switch dr.DeploymentState {
-		case "complete_pending_revert":
-			_, _ = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
-				Organization: testOrg, Database: testDB, Number: i,
-			})
-			cleaned++
-		case "queued", "in_progress", "pending_cutover", "in_progress_cutover", "submitting":
-			_, _ = testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
-				Organization: testOrg, Database: testDB, Number: i,
-			})
-			cleaned++
-		}
-	}
-	if cleaned > 0 {
-		t.Logf("cleanupActiveDeployRequests: cleaned %d DRs in %s", cleaned, time.Since(start).Round(time.Millisecond))
-	}
+	require.NoError(t, testContainer.ResetState(resetCtx), "reset LocalScale state")
+	t.Logf("cleanupActiveDeployRequests: reset LocalScale state in %s", time.Since(start).Round(time.Millisecond))
+}
+
+func requireNoDeployRequests(t *testing.T, ctx context.Context) {
+	t.Helper()
+	result, err := testContainer.MetadataQuery(ctx,
+		`SELECT number, org, database_name, branch, deployment_state
+		 FROM localscale_deploy_requests
+		 ORDER BY org, database_name, number`)
+	require.NoError(t, err, "query deploy requests")
+	require.Empty(t, result.Rows, "expected reset state to clear deploy requests")
+}
+
+func uniqueIdentifier(prefix string) string {
+	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 }
 
 // cancelAllVitessMigrations cancels all pending Vitess migrations across keyspaces.

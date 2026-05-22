@@ -387,6 +387,7 @@ package planetscale
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1334,7 +1335,11 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 // isRetryableEngineError returns true if the error is a transient condition
 // that may succeed on a future attempt.
 func isRetryableEngineError(err error) bool {
-	return isRetryablePSError(err) || engine.IsTransientTransportError(err)
+	return isRetryablePSError(err) || isRetryableMySQLConnectionError(err) || engine.IsTransientTransportError(err)
+}
+
+func isRetryableMySQLConnectionError(err error) bool {
+	return errors.Is(err, mysql.ErrInvalidConn) || errors.Is(err, driver.ErrBadConn)
 }
 
 // isSnapshotInProgress returns true if the error indicates PlanetScale is
@@ -1398,6 +1403,7 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 	mysqlCfg.Passwd = password.PlainText
 	mysqlCfg.Net = "tcp"
 	mysqlCfg.Addr = password.Hostname
+	mysqlCfg.DBName = sc.Namespace
 	mysqlCfg.InterpolateParams = true
 	if mtlsRegistered.Load() {
 		mysqlCfg.TLSConfig = mtlsConfigName
@@ -1412,11 +1418,6 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 
 	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping branch for %s: %w", sc.Namespace, err)
-	}
-
-	// USE the keyspace — vtgate branch proxy routes based on the database name.
-	if _, err := db.ExecContext(ctx, "USE `"+sc.Namespace+"`"); err != nil {
-		return fmt.Errorf("use keyspace %s: %w", sc.Namespace, err)
 	}
 
 	for _, tc := range sc.TableChanges {

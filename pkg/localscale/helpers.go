@@ -239,6 +239,17 @@ func (s *Server) vtgateShardConn(ctx context.Context, backend *databaseBackend, 
 		return nil, nil, fmt.Errorf("no shards found for keyspace %s", keyspace)
 	}
 
+	return s.vtgateTargetConn(ctx, backend, keyspace, firstShard)
+}
+
+func (s *Server) vtgateTargetConn(ctx context.Context, backend *databaseBackend, keyspace, shard string) (_ *sql.Conn, cleanup func(), _ error) {
+	if err := validateIdentifier(keyspace); err != nil {
+		return nil, nil, fmt.Errorf("invalid keyspace %s: %w", keyspace, err)
+	}
+	if err := validateIdentifier(shard); err != nil {
+		return nil, nil, fmt.Errorf("invalid shard %s: %w", shard, err)
+	}
+
 	conn, err := backend.unscopedVtgateDB.Conn(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get vtgate connection: %w", err)
@@ -246,7 +257,7 @@ func (s *Server) vtgateShardConn(ctx context.Context, backend *databaseBackend, 
 
 	// Target the shard. After USE keyspace:shard, all queries on this connection
 	// bypass vtgate's planner and go directly to the tablet.
-	target := fmt.Sprintf("%s:%s", keyspace, firstShard)
+	target := fmt.Sprintf("%s:%s", keyspace, shard)
 	if err := validateIdentifier(target); err != nil {
 		utils.CloseAndLog(conn)
 		return nil, nil, fmt.Errorf("invalid shard target %s: %w", target, err)
@@ -270,19 +281,14 @@ func (s *Server) forEachShard(ctx context.Context, backend *databaseBackend, key
 		return fmt.Errorf("find shards for %s: %w", keyspace, err)
 	}
 	for shard := range resp.Shards {
-		conn, err := backend.unscopedVtgateDB.Conn(ctx)
+		conn, cleanup, err := s.vtgateTargetConn(ctx, backend, keyspace, shard)
 		if err != nil {
-			return fmt.Errorf("get connection: %w", err)
-		}
-		target := fmt.Sprintf("%s:%s", keyspace, shard)
-		if _, err := conn.ExecContext(ctx, "USE "+quoteIdentifier(target)); err != nil {
-			utils.CloseAndLog(conn)
-			return fmt.Errorf("target %s: %w", target, err)
+			return fmt.Errorf("connect shard %s: %w", shard, err)
 		}
 		fnErr := fn(conn)
-		utils.CloseAndLog(conn)
+		cleanup()
 		if fnErr != nil {
-			return fnErr
+			return fmt.Errorf("run on shard %s: %w", shard, fnErr)
 		}
 	}
 	return nil
@@ -810,26 +816,48 @@ func validateBranchName(name string) error {
 // hasn't been created yet.
 func (s *Server) waitForOnlineDDLReady(ctx context.Context) error {
 	for key, backend := range s.backends {
-		for keyspace, db := range backend.vtgateDBs {
-			deadline := time.Now().Add(60 * time.Second)
-			ready := false
-			for time.Now().Before(deadline) {
-				rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS")
-				if err == nil {
-					utils.CloseAndLog(rows)
-					s.logger.Info("online DDL ready", "database", key.database, "keyspace", keyspace)
-					ready = true
-					break
-				}
-				s.logger.Debug("waiting for online DDL readiness", "database", key.database, "keyspace", keyspace, "error", err)
-				time.Sleep(time.Second)
-			}
-			if !ready {
-				return fmt.Errorf("online DDL not ready after 60s for %s/%s", key.database, keyspace)
+		for keyspace := range backend.vtgateDBs {
+			if err := s.waitForKeyspaceOnlineDDLReady(ctx, key, backend, keyspace); err != nil {
+				s.logger.Warn("online DDL readiness failed", "database", key.database, "keyspace", keyspace, "error", err)
+				return err
 			}
 		}
 	}
 	return nil
+}
+
+func (s *Server) waitForKeyspaceOnlineDDLReady(ctx context.Context, key backendKey, backend *databaseBackend, keyspace string) error {
+	deadline := time.Now().Add(60 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		err := s.forEachShard(ctx, backend, keyspace, func(conn *sql.Conn) error {
+			rows, queryErr := conn.QueryContext(ctx, "SHOW VITESS_MIGRATIONS")
+			if queryErr != nil {
+				return queryErr
+			}
+			utils.CloseAndLog(rows)
+			return nil
+		})
+		if err == nil {
+			s.logger.Info("online DDL ready", "database", key.database, "keyspace", keyspace)
+			return nil
+		}
+		lastErr = err
+		s.logger.Debug("waiting for online DDL readiness", "database", key.database, "keyspace", keyspace, "error", err)
+
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			s.logger.Warn("online DDL readiness context canceled", "database", key.database, "keyspace", keyspace, "error", ctx.Err())
+			return fmt.Errorf("wait for online DDL readiness for %s/%s: %w", key.database, keyspace, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("online DDL not ready after 60s for %s/%s: %w", key.database, keyspace, lastErr)
+	}
+	return fmt.Errorf("online DDL not ready after 60s for %s/%s", key.database, keyspace)
 }
 
 // execLog executes a SQL statement and logs any error. Use this instead of

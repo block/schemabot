@@ -392,31 +392,51 @@ func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBac
 	if err != nil {
 		return err
 	}
-	var firstErr error
+	type migrationTarget struct {
+		keyspace string
+		shard    string
+	}
+	targets := make(map[migrationTarget]struct{})
 	for _, m := range migrations {
 		uuid := m["migration_uuid"]
 		keyspace := m["_keyspace"]
-		if uuid == "" || keyspace == "" {
-			s.logger.Warn("skipping migration with missing uuid or keyspace", "uuid", uuid, "keyspace", keyspace)
+		shard := m["shard"]
+		if uuid == "" || keyspace == "" || shard == "" {
+			s.logger.Warn("skipping migration with missing uuid, keyspace, or shard", "uuid", uuid, "keyspace", keyspace, "shard", shard)
 			continue
 		}
 		if err := validateSessionString(uuid); err != nil {
 			s.logger.Warn("skipping migration with invalid UUID", "uuid", uuid, "error", err)
 			continue
 		}
-		db, ok := backend.vtgateDBs[keyspace]
-		if !ok {
+		if _, ok := backend.vtgateDBs[keyspace]; !ok {
 			s.logger.Warn("unknown keyspace for migration", "uuid", uuid, "keyspace", keyspace)
 			continue
 		}
-		stmt := fmt.Sprintf("ALTER VITESS_MIGRATION '%s' %s", uuid, action)
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			s.logger.Warn("alter vitess_migration failed", "keyspace", keyspace, "action", action, "uuid", uuid, "error", err)
+		targets[migrationTarget{keyspace: keyspace, shard: shard}] = struct{}{}
+	}
+
+	var firstErr error
+	for target := range targets {
+		stmt := fmt.Sprintf("ALTER VITESS_MIGRATION %s ALL", action)
+		err := func() error {
+			conn, cleanup, err := s.vtgateTargetConn(ctx, backend, target.keyspace, target.shard)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
+			if _, err := conn.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
+			return nil
+		}()
+		if err != nil {
+			s.logger.Warn("alter vitess_migration failed", "keyspace", target.keyspace, "shard", target.shard, "action", action, "error", err)
 			if firstErr == nil {
-				firstErr = fmt.Errorf("alter vitess_migration %s %s on %s: %w", uuid, action, keyspace, err)
+				firstErr = fmt.Errorf("alter vitess_migration %s all on %s:%s: %w", action, target.keyspace, target.shard, err)
 			}
 		} else {
-			s.logger.Info("alter vitess_migration", "keyspace", keyspace, "action", action, "uuid", uuid)
+			s.logger.Info("alter vitess_migration", "keyspace", target.keyspace, "shard", target.shard, "action", action)
 		}
 	}
 	return firstErr

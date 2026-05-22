@@ -235,14 +235,19 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	resp := deployResponse(number, branch, dr.Submitting)
 	resp["approved"] = true
 	resp["html_url"] = fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number)
+
+	ref := deployRequest{org: org, database: database, number: number}
+	execCtx, unregisterDeploy := s.registerActiveDeployExecution(ref)
+
 	s.writeJSON(w, resp)
 
 	// Background goroutine: apply VSchema, snapshot schema, submit DDL, advance state.
 	instantDDL := body.InstantDDL
 	s.wg.Go(func() {
+		defer unregisterDeploy()
 		params := deployExecParams{
 			backend:          backend,
-			ref:              deployRequest{org: org, database: database, number: number},
+			ref:              ref,
 			hasVSchema:       hasVSchema,
 			vschemaData:      vschemaDataSQL.String,
 			totalDDL:         totalDDL,
@@ -251,7 +256,11 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 			migrationContext: migrationContext,
 			autoCutover:      autoCutover,
 		}
-		if err := s.executeDeployRequest(s.shutdownCtx, params); err != nil {
+		if err := s.executeDeployRequest(execCtx, params); err != nil {
+			if execCtx.Err() != nil {
+				s.logger.Info("deploy execution cancelled", "number", number, "error", err)
+				return
+			}
 			s.logger.Error("deploy execution failed", "number", number, "error", err)
 			if stateErr := s.updateDeployState(s.shutdownCtx, params.ref, dr.Error); stateErr != nil {
 				s.logger.Error("failed to set error state", "number", number, "error", stateErr)

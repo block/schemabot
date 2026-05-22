@@ -91,6 +91,9 @@ type branchProxy struct {
 	logger      *slog.Logger
 	done        chan struct{}
 	connWg      sync.WaitGroup // tracks in-flight connections
+	connMu      sync.Mutex
+	conns       map[net.Conn]struct{}
+	closing     bool
 }
 
 func newBranchProxy(ctx context.Context, listenAddr, upstreamDSN string, branchName string, keyspaces []string, logger *slog.Logger, tlsCfg *tls.Config) (*branchProxy, error) {
@@ -135,6 +138,7 @@ func newBranchProxy(ctx context.Context, listenAddr, upstreamDSN string, branchN
 		mysqlServer: mysqlSrv,
 		logger:      logger,
 		done:        make(chan struct{}),
+		conns:       make(map[net.Conn]struct{}),
 	}
 	go p.serve()
 	return p, nil
@@ -148,7 +152,9 @@ func (p *branchProxy) Addr() string {
 // Close shuts down the proxy listener, waits for serve to exit, and drains
 // in-flight connections.
 func (p *branchProxy) Close() error {
+	p.beginClose()
 	err := p.listener.Close()
+	p.closeClientConns()
 	<-p.done
 	p.connWg.Wait()
 	return err
@@ -161,9 +167,51 @@ func (p *branchProxy) serve() {
 		if err != nil {
 			return
 		}
+		untrack, ok := p.trackClientConn(client)
+		if !ok {
+			p.logger.Debug("proxy: closing accepted connection during shutdown")
+			utils.CloseAndLog(client)
+			continue
+		}
 		p.connWg.Go(func() {
+			defer untrack()
 			p.handleConn(client)
 		})
+	}
+}
+
+func (p *branchProxy) beginClose() {
+	p.connMu.Lock()
+	p.closing = true
+	p.connMu.Unlock()
+}
+
+func (p *branchProxy) trackClientConn(conn net.Conn) (func(), bool) {
+	p.connMu.Lock()
+	if p.closing {
+		p.connMu.Unlock()
+		return func() {}, false
+	}
+	p.conns[conn] = struct{}{}
+	p.connMu.Unlock()
+
+	return func() {
+		p.connMu.Lock()
+		delete(p.conns, conn)
+		p.connMu.Unlock()
+	}, true
+}
+
+func (p *branchProxy) closeClientConns() {
+	p.connMu.Lock()
+	conns := make([]net.Conn, 0, len(p.conns))
+	for conn := range p.conns {
+		conns = append(conns, conn)
+	}
+	p.connMu.Unlock()
+
+	for _, conn := range conns {
+		utils.CloseAndLog(conn)
 	}
 }
 

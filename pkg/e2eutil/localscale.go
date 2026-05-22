@@ -105,13 +105,6 @@ func LocalScaleMetadataQuery(localscaleURL, query string) error {
 	return nil
 }
 
-// LocalScaleResetDeployRequests marks all pending deploy requests as closed.
-// Preserves auto-increment counters so new DRs get unique numbers.
-func LocalScaleResetDeployRequests(localscaleURL string) error {
-	return LocalScaleMetadataQuery(localscaleURL,
-		"UPDATE localscale_deploy_requests SET deployment_state = 'complete', deployed = FALSE, cancelled = TRUE WHERE deployment_state != 'complete'")
-}
-
 // LocalScaleCleanupSchema drops extra tables, indexes, and columns from a
 // Vitess keyspace, restoring it to the expected base state. Uses direct DDL
 // via admin endpoints for speed (~1s vs ~10s for a full apply).

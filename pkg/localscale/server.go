@@ -86,8 +86,11 @@ type Server struct {
 	processorCancel      context.CancelFunc
 	processorDone        chan struct{}
 	wg                   sync.WaitGroup // tracks background goroutines
-	revertWindowDuration time.Duration  // how long the revert window stays open after deploy completes
-	defaultThrottleRatio float64        // default throttle ratio applied to new deploys (0.0 = no throttle, max 0.95)
+	activeDeployMu       sync.Mutex
+	activeDeploySeq      uint64
+	activeDeployCancels  map[deployRequest]activeDeployExecution
+	revertWindowDuration time.Duration // how long the revert window stays open after deploy completes
+	defaultThrottleRatio float64       // default throttle ratio applied to new deploys (0.0 = no throttle, max 0.95)
 
 	// proxies maps branch name → TCP proxy. Each proxy gives a branch its own
 	// network endpoint by rewriting MySQL database names in the handshake.
@@ -330,6 +333,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		deployRequestDelay:    cfg.DeployRequestDelay,
 		processorTickInterval: cfg.ProcessorTickInterval,
 		proxies:               make(map[string]*branchProxy),
+		activeDeployCancels:   make(map[deployRequest]activeDeployExecution),
 		proxyHost:             proxyHost,
 		proxyAdvertiseHost:    proxyAdvertiseHost,
 		portAlloc:             pa,
@@ -513,6 +517,22 @@ func (s *Server) applyVSchemaInternal(ctx context.Context, backend *databaseBack
 // terminal state, and truncates metadata tables. This is used by tests to clean
 // up stale state from previous test runs (since vtcombo persists data).
 func (s *Server) ResetState(ctx context.Context) error {
+	s.logger.Info("resetting LocalScale state")
+	s.cancelActiveDeployExecutions()
+
+	for _, backend := range s.backends {
+		for keyspace := range backend.vtgateDBs {
+			if err := s.forEachShard(ctx, backend, keyspace, func(conn *sql.Conn) error {
+				if _, err := conn.ExecContext(ctx, "ALTER VITESS_MIGRATION UNTHROTTLE ALL"); err != nil {
+					return fmt.Errorf("unthrottle vitess migrations: %w", err)
+				}
+				return nil
+			}); err != nil {
+				return fmt.Errorf("unthrottle migrations for %s: %w", keyspace, err)
+			}
+		}
+	}
+
 	// Cancel all running Vitess migrations across all backends.
 	// Uses shard-targeted connections because ALTER VITESS_MIGRATION CANCEL ALL
 	// fails on keyspace-scoped connections for multi-shard keyspaces.
@@ -535,20 +555,25 @@ func (s *Server) ResetState(ctx context.Context) error {
 	defer ticker.Stop()
 	timer := time.NewTimer(10 * time.Second)
 	defer timer.Stop()
+	var lastCheckErr error
 	for {
 		allTerminal := true
 		for _, backend := range s.backends {
 			for keyspace := range backend.vtgateDBs {
-				_ = s.forEachShard(ctx, backend, keyspace, func(conn *sql.Conn) error {
+				if err := s.forEachShard(ctx, backend, keyspace, func(conn *sql.Conn) error {
 					rows, err := conn.QueryContext(ctx, "SHOW VITESS_MIGRATIONS")
 					if err != nil {
 						s.logger.Warn("show migrations failed", "keyspace", keyspace, "error", err)
+						allTerminal = false
+						lastCheckErr = fmt.Errorf("show migrations for %s: %w", keyspace, err)
 						return nil // non-fatal, continue checking other shards
 					}
 					rowMaps, err := scanDynamicRows(rows)
 					utils.CloseAndLog(rows)
 					if err != nil {
 						s.logger.Warn("scan migrations failed", "keyspace", keyspace, "error", err)
+						allTerminal = false
+						lastCheckErr = fmt.Errorf("scan migrations for %s: %w", keyspace, err)
 						return nil
 					}
 					for _, colMap := range rowMaps {
@@ -561,7 +586,11 @@ func (s *Server) ResetState(ctx context.Context) error {
 						}
 					}
 					return nil
-				})
+				}); err != nil {
+					s.logger.Warn("check migrations failed", "keyspace", keyspace, "error", err)
+					allTerminal = false
+					lastCheckErr = fmt.Errorf("check migrations for %s: %w", keyspace, err)
+				}
 			}
 		}
 		if allTerminal {
@@ -569,14 +598,26 @@ func (s *Server) ResetState(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("waiting for migrations to cancel: %w", ctx.Err())
+			return fmt.Errorf("waiting for migrations to cancel: %w; %s", ctx.Err(), s.resetStateDiagnosticsWithLastError(ctx, lastCheckErr))
 		case <-timer.C:
-			return fmt.Errorf("timed out waiting for migrations to reach terminal state")
+			return fmt.Errorf("timed out waiting for migrations to reach terminal state; %s", s.resetStateDiagnosticsWithLastError(ctx, lastCheckErr))
 		case <-ticker.C:
 		}
 	}
+	for _, backend := range s.backends {
+		for keyspace := range backend.vtgateDBs {
+			if err := s.forEachShard(ctx, backend, keyspace, func(conn *sql.Conn) error {
+				if _, err := conn.ExecContext(ctx, "ALTER VITESS_MIGRATION CLEANUP ALL"); err != nil {
+					return fmt.Errorf("cleanup terminal vitess migrations: %w", err)
+				}
+				return nil
+			}); err != nil {
+				return fmt.Errorf("cleanup terminal migrations for %s: %w", keyspace, err)
+			}
+		}
+	}
 	// Shut down all branch proxies.
-	s.closeAllProxies()
+	s.closeBranchProxies()
 
 	// Drop all branch databases (branch_*) from the metadata MySQL.
 	// Branch databases persist across container reuse and contain stale schema
@@ -610,7 +651,138 @@ func (s *Server) ResetState(ctx context.Context) error {
 		"INSERT IGNORE INTO localscale_branches (org, database_name, name, parent_branch, ready) VALUES ('', '', 'main', '', TRUE)"); err != nil {
 		return fmt.Errorf("insert default branch: %w", err)
 	}
+	s.logger.Info("reset LocalScale state complete")
 	return nil
+}
+
+func (s *Server) registerActiveDeployExecution(ref deployRequest) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(s.shutdownCtx)
+
+	s.activeDeployMu.Lock()
+	s.activeDeploySeq++
+	id := s.activeDeploySeq
+	s.activeDeployCancels[ref] = activeDeployExecution{id: id, cancel: cancel}
+	s.activeDeployMu.Unlock()
+
+	return ctx, func() {
+		s.activeDeployMu.Lock()
+		if current, ok := s.activeDeployCancels[ref]; ok && current.id == id {
+			delete(s.activeDeployCancels, ref)
+		} else {
+			s.logger.Info("deploy execution already replaced before unregister", "number", ref.number, "org", ref.org, "database", ref.database)
+		}
+		s.activeDeployMu.Unlock()
+		cancel()
+	}
+}
+
+func (s *Server) cancelActiveDeployExecutions() {
+	s.activeDeployMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.activeDeployCancels))
+	for _, execution := range s.activeDeployCancels {
+		cancels = append(cancels, execution.cancel)
+	}
+	s.activeDeployMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	if len(cancels) > 0 {
+		s.logger.Info("cancelled active deploy executions for reset", "count", len(cancels))
+	}
+}
+
+type activeDeployExecution struct {
+	id     uint64
+	cancel context.CancelFunc
+}
+
+func (s *Server) resetStateDiagnosticsWithLastError(ctx context.Context, lastCheckErr error) string {
+	diagCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+
+	var parts []string
+	if lastCheckErr != nil {
+		parts = append(parts, "last migration check error: "+lastCheckErr.Error())
+	}
+	deployRows, err := s.activeDeployRequestDiagnostics(diagCtx)
+	if err != nil {
+		parts = append(parts, "active deploy requests unavailable: "+err.Error())
+	} else if len(deployRows) > 0 {
+		parts = append(parts, "active deploy requests: "+strings.Join(deployRows, "; "))
+	}
+
+	migrationRows, err := s.vitessMigrationDiagnostics(diagCtx)
+	if err != nil {
+		parts = append(parts, "vitess migrations unavailable: "+err.Error())
+	} else if len(migrationRows) > 0 {
+		parts = append(parts, "vitess migrations: "+strings.Join(migrationRows, "; "))
+	}
+
+	if len(parts) == 0 {
+		return "no active deploy requests or non-terminal Vitess migrations found"
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (s *Server) activeDeployRequestDiagnostics(ctx context.Context) ([]string, error) {
+	rows, err := s.metadataDB.QueryContext(ctx,
+		`SELECT number, org, database_name, branch, deployment_state, deployed, migration_context
+		 FROM localscale_deploy_requests
+		 WHERE deployment_state IN ('submitting','queued','in_progress','pending_cutover','in_progress_cutover','in_progress_vschema','in_progress_cancel','in_progress_revert','in_progress_revert_vschema','complete_pending_revert')
+		 ORDER BY org, database_name, number`)
+	if err != nil {
+		return nil, fmt.Errorf("query active deploy requests: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var result []string
+	for rows.Next() {
+		var number uint64
+		var org, database, branch, deployState, migrationContext string
+		var deployed bool
+		if err := rows.Scan(&number, &org, &database, &branch, &deployState, &deployed, &migrationContext); err != nil {
+			return nil, fmt.Errorf("scan active deploy request: %w", err)
+		}
+		result = append(result, fmt.Sprintf("number=%d org=%s database=%s branch=%s state=%s deployed=%t migration_context=%s",
+			number, org, database, branch, deployState, deployed, migrationContext))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active deploy requests: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Server) vitessMigrationDiagnostics(ctx context.Context) ([]string, error) {
+	var result []string
+	for _, backend := range s.backends {
+		for keyspace := range backend.vtgateDBs {
+			if err := s.forEachShard(ctx, backend, keyspace, func(conn *sql.Conn) error {
+				rows, err := conn.QueryContext(ctx, "SHOW VITESS_MIGRATIONS")
+				if err != nil {
+					return fmt.Errorf("show migrations for %s: %w", keyspace, err)
+				}
+				rowMaps, err := scanDynamicRows(rows)
+				utils.CloseAndLog(rows)
+				if err != nil {
+					return fmt.Errorf("scan migrations for %s: %w", keyspace, err)
+				}
+				for _, colMap := range rowMaps {
+					status := colMap["migration_status"]
+					switch status {
+					case state.Vitess.Complete, state.Vitess.Failed, state.Vitess.Cancelled:
+						continue
+					}
+					result = append(result, fmt.Sprintf("keyspace=%s uuid=%s status=%s context=%s message=%s",
+						keyspace, colMap["uuid"], status, colMap["migration_context"], colMap["message"]))
+				}
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return result, nil
 }
 
 // proxyListenAddr returns the next bind address for a branch proxy.
@@ -695,29 +867,56 @@ func (s *Server) releaseProxyPort(proxy *branchProxy) {
 func (s *Server) trackProxy(branch string, proxy *branchProxy) {
 	s.proxyMu.Lock()
 	old := s.proxies[branch]
-	if old != nil {
-		s.releaseProxyPort(old)
-	}
 	s.proxies[branch] = proxy
 	s.proxyMu.Unlock()
 
 	if old != nil {
-		s.wg.Go(func() { utils.CloseAndLog(old) })
+		s.wg.Go(func() {
+			utils.CloseAndLog(old)
+			s.releaseProxyPort(old)
+		})
 	}
 }
 
 // closeProxy shuts down and removes the TCP proxy for a branch.
 func (s *Server) closeProxy(branch string) {
 	s.proxyMu.Lock()
-	defer s.proxyMu.Unlock()
-	if p, ok := s.proxies[branch]; ok {
-		s.releaseProxyPort(p)
-		utils.CloseAndLog(p)
+	p, ok := s.proxies[branch]
+	if ok {
 		delete(s.proxies, branch)
+	}
+	s.proxyMu.Unlock()
+
+	if ok {
+		utils.CloseAndLog(p)
+		s.releaseProxyPort(p)
 	}
 }
 
-// closeAllProxies shuts down all branch TCP proxies.
+// closeBranchProxies shuts down branch password proxies while preserving edge
+// proxies that SchemaBot uses as long-lived vtgate endpoints.
+func (s *Server) closeBranchProxies() {
+	s.proxyMu.Lock()
+	old := make(map[string]*branchProxy, len(s.proxies))
+	for name, p := range s.proxies {
+		if strings.HasPrefix(name, "edge:") {
+			continue
+		}
+		old[name] = p
+		delete(s.proxies, name)
+	}
+	s.proxyMu.Unlock()
+
+	for _, p := range old {
+		utils.CloseAndLog(p)
+		s.releaseProxyPort(p)
+	}
+	if len(old) > 0 {
+		s.logger.Info("closed branch proxies for reset", "count", len(old))
+	}
+}
+
+// closeAllProxies shuts down all TCP proxies.
 func (s *Server) closeAllProxies() {
 	// Snapshot and clear under lock, then close outside the lock.
 	// proxy.Close() blocks on <-p.done (waits for serve() to exit),
@@ -732,8 +931,8 @@ func (s *Server) closeAllProxies() {
 	s.proxyMu.Unlock()
 
 	for _, p := range old {
-		s.releaseProxyPort(p)
 		utils.CloseAndLog(p)
+		s.releaseProxyPort(p)
 	}
 }
 

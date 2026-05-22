@@ -52,10 +52,11 @@ func TestDeployRequestDiffCreateTable(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
 	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
+	tableName := uniqueIdentifier("diff_new_table")
 	branchName := createBranchWithDDL(t, ctx, "diff-ct",
 		map[string][]string{
 			"testapp_sharded": {
-				"CREATE TABLE diff_new_table (id bigint NOT NULL PRIMARY KEY, value varchar(255), created_at datetime DEFAULT CURRENT_TIMESTAMP)",
+				fmt.Sprintf("CREATE TABLE `%s` (id bigint NOT NULL PRIMARY KEY, value varchar(255), created_at datetime DEFAULT CURRENT_TIMESTAMP)", tableName),
 			},
 		},
 		nil,
@@ -69,9 +70,47 @@ func TestDeployRequestDiffCreateTable(t *testing.T) {
 
 	// Verify diff_new_table exists in vtgate
 	result, err := testContainer.VtgateExec(ctx, testOrg, testDB, "testapp_sharded",
-		"SHOW TABLES LIKE 'diff_new_table'")
+		fmt.Sprintf("SHOW TABLES LIKE '%s'", tableName))
 	require.NoError(t, err, "verify new table")
-	require.Greater(t, len(result.Rows), 0, "expected 'diff_new_table' in vtgate after deploy")
+	require.Greater(t, len(result.Rows), 0, "expected %q in vtgate after deploy", tableName)
+}
+
+func TestResetStateCanRunImmediatelyAfterDeploySubmit(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	ctx := t.Context()
+
+	indexName := fmt.Sprintf("idx_reset_%d", time.Now().UnixNano())
+	branchName := createBranchWithDDL(t, ctx, "reset-submit",
+		map[string][]string{
+			"testapp_sharded": {
+				fmt.Sprintf("ALTER TABLE users ADD INDEX `%s` (`full_name`)", indexName),
+			},
+		},
+		nil,
+	)
+
+	dr := createDeploy(t, ctx, branchName, false)
+	require.Equal(t, drState.Ready, dr.DeploymentState, "expected changes")
+
+	deploy(t, ctx, dr.Number, false)
+	require.NoError(t, testContainer.ResetState(ctx), "reset LocalScale state after deploy submit")
+	requireNoDeployRequests(t, ctx)
+
+	nextCol := fmt.Sprintf("reset_next_%d", time.Now().UnixNano())
+	nextBranch := createBranchWithDDL(t, ctx, "reset-next",
+		map[string][]string{
+			"testapp_sharded": {
+				fmt.Sprintf("ALTER TABLE users ADD COLUMN `%s` varchar(50)", nextCol),
+			},
+		},
+		nil,
+	)
+	nextDR := createDeploy(t, ctx, nextBranch, true)
+	require.Equal(t, drState.Ready, nextDR.DeploymentState, "expected changes after reset")
+
+	deploy(t, ctx, nextDR.Number, true)
+	waitForDeployState(t, ctx, nextDR.Number, drState.CompletePendingRevert, drState.Complete)
 }
 
 // TestBranchDatabaseCleanupOnSkipRevert verifies that branch databases are dropped
@@ -80,10 +119,11 @@ func TestBranchDatabaseCleanupOnSkipRevert(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
 	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
+	cleanupCol := uniqueIdentifier("cleanup_test_col")
 	branchName := createBranchWithDDL(t, ctx, "cleanup",
 		map[string][]string{
 			"testapp_sharded": {
-				"ALTER TABLE users ADD COLUMN cleanup_test_col varchar(50)",
+				fmt.Sprintf("ALTER TABLE `users` ADD COLUMN `%s` varchar(50)", cleanupCol),
 			},
 		},
 		nil,
@@ -222,9 +262,10 @@ func TestStateValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := t.Context()
+			ddlCol := fmt.Sprintf("%s_%d", tt.ddlCol, time.Now().UnixNano())
 			branchName := createBranchWithDDL(t, ctx, "state-"+tt.name,
 				map[string][]string{
-					"testapp_sharded": {fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s varchar(50)", tt.table, tt.ddlCol)},
+					"testapp_sharded": {fmt.Sprintf("ALTER TABLE `%s` ADD COLUMN `%s` varchar(50)", tt.table, ddlCol)},
 				},
 				nil,
 			)
@@ -269,10 +310,12 @@ func TestMultiKeyspaceDDLDeploy(t *testing.T) {
 	// --singleton-context rejecting our DDL submission.
 	cancelAllVitessMigrations(t, ctx)
 
+	shardedCol := fmt.Sprintf("multi_ks_col_%d", time.Now().UnixNano())
+	seqCol := fmt.Sprintf("multi_ks_seq_col_%d", time.Now().UnixNano())
 	branchName := createBranchWithDDL(t, ctx, "multi-ks",
 		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE orders ADD COLUMN multi_ks_col varchar(50)"},
-			"testapp":         {"ALTER TABLE users_seq ADD COLUMN multi_ks_seq_col int"},
+			"testapp_sharded": {fmt.Sprintf("ALTER TABLE `orders` ADD COLUMN `%s` varchar(50)", shardedCol)},
+			"testapp":         {fmt.Sprintf("ALTER TABLE `users_seq` ADD COLUMN `%s` int", seqCol)},
 		},
 		nil,
 	)
@@ -284,10 +327,10 @@ func TestMultiKeyspaceDDLDeploy(t *testing.T) {
 	waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert, drState.Complete)
 
 	// Verify column exists in testapp_sharded via vtgate
-	verifyColumnExists(t, "orders", "multi_ks_col")
+	verifyColumnExists(t, "orders", shardedCol)
 
 	// Verify column exists in testapp via vtgate
-	verifyColumnExists(t, "users_seq", "multi_ks_seq_col", "testapp")
+	verifyColumnExists(t, "users_seq", seqCol, "testapp")
 
 	t.Log("Multi-keyspace DDL deploy succeeded")
 }
@@ -317,15 +360,16 @@ func TestBranchDDLError(t *testing.T) {
 	utils.CloseAndLog(db)
 
 	// Verify the branch still works — apply valid DDL
+	recoveryCol := uniqueIdentifier("ddl_error_recovery_col")
 	applyBranchDDL(t, ctx, branchName, map[string][]string{
-		"testapp_sharded": {"ALTER TABLE users ADD COLUMN ddl_error_recovery_col varchar(50)"},
+		"testapp_sharded": {fmt.Sprintf("ALTER TABLE `users` ADD COLUMN `%s` varchar(50)", recoveryCol)},
 	})
 
 	// Verify the column exists in branch database
 	result, err := testContainer.BranchDBQuery(ctx, branchName, "testapp_sharded",
-		"SHOW COLUMNS FROM users LIKE 'ddl_error_recovery_col'")
+		fmt.Sprintf("SHOW COLUMNS FROM users LIKE '%s'", recoveryCol))
 	require.NoError(t, err, "SHOW COLUMNS")
-	require.Greater(t, len(result.Rows), 0, "expected 'ddl_error_recovery_col' in branch DB after recovery")
+	require.Greater(t, len(result.Rows), 0, "expected %q in branch DB after recovery", recoveryCol)
 }
 
 // TestThrottleRatioBoundary verifies throttle ratio boundary validation.
@@ -333,9 +377,10 @@ func TestThrottleRatioBoundary(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
 	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
 	ctx := t.Context()
+	throttleCol := uniqueIdentifier("throttle_bounds_col")
 	branchName := createBranchWithDDL(t, ctx, "throttle-bounds",
 		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE orders ADD COLUMN throttle_bounds_col varchar(50)"},
+			"testapp_sharded": {fmt.Sprintf("ALTER TABLE `orders` ADD COLUMN `%s` varchar(50)", throttleCol)},
 		},
 		nil,
 	)
@@ -398,10 +443,11 @@ func TestRevertWindowExpiration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
+	revertExpiryCol := uniqueIdentifier("revert_expiry_col")
 	branchName := createBranchWithDDL(t, ctx, "revert-expiry",
 		map[string][]string{
 			"testapp": {
-				"ALTER TABLE users_seq ADD COLUMN revert_expiry_col INT",
+				fmt.Sprintf("ALTER TABLE `users_seq` ADD COLUMN `%s` INT", revertExpiryCol),
 			},
 		},
 		nil,
@@ -409,32 +455,6 @@ func TestRevertWindowExpiration(t *testing.T) {
 
 	dr := createDeploy(t, ctx, branchName, true)
 	require.Equal(t, drState.Ready, dr.DeploymentState, "expected changes")
-
-	// Cancel any active deploy requests from previous tests that may block us.
-	if dr.Number > 1 {
-		for i := uint64(1); i < dr.Number; i++ {
-			prev, getErr := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
-				Organization: testOrg,
-				Database:     testDB,
-				Number:       i,
-			})
-			if getErr != nil {
-				continue
-			}
-			switch prev.DeploymentState {
-			case drState.Complete, drState.CompletePendingRevert, drState.CompleteError, drState.CompleteRevert, drState.CompleteCancel, drState.CompleteRevertError, drState.Error, drState.NoChanges:
-				continue
-			}
-			t.Logf("Cancelling stale deploy request %d (state=%s)", i, prev.DeploymentState)
-			_, _ = testClient.CancelDeployRequest(ctx, &ps.CancelDeployRequestRequest{
-				Organization: testOrg,
-				Database:     testDB,
-				Number:       i,
-			})
-		}
-		// Wait for cancellations to take effect
-		time.Sleep(2 * time.Second)
-	}
 
 	// Deploy
 	deploy(t, ctx, dr.Number, false)
@@ -455,9 +475,10 @@ func TestDeployRequestPendingToReady(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
+	pendingReadyCol := uniqueIdentifier("pending_ready_col")
 	branchName := createBranchWithDDL(t, ctx, "pending-ready",
 		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE users ADD COLUMN pending_ready_col VARCHAR(50) NULL"},
+			"testapp_sharded": {fmt.Sprintf("ALTER TABLE `users` ADD COLUMN `%s` VARCHAR(50) NULL", pendingReadyCol)},
 		},
 		nil,
 	)
@@ -526,9 +547,10 @@ func TestDeploySubmittingToQueued(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
+	submittingCol := uniqueIdentifier("submitting_test_col")
 	branchName := createBranchWithDDL(t, ctx, "submitting-queued",
 		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE users ADD COLUMN submitting_test_col VARCHAR(50) NULL"},
+			"testapp_sharded": {fmt.Sprintf("ALTER TABLE `users` ADD COLUMN `%s` VARCHAR(50) NULL", submittingCol)},
 		},
 		nil,
 	)
@@ -563,9 +585,10 @@ func TestInstantDDLEligibility(t *testing.T) {
 
 	// ADD COLUMN NULL is instant in MySQL 8.4.
 	// Apply via /apply-schema endpoint which detects ALGORITHM=INSTANT.
+	instantCol := uniqueIdentifier("instant_test_col")
 	branchName := createBranch(t, ctx, "instant-check")
 	applyBranchSchemaHTTP(t, ctx, branchName, map[string][]string{
-		"testapp_sharded": {"ALTER TABLE users ADD COLUMN instant_test_col VARCHAR(50) NULL"},
+		"testapp_sharded": {fmt.Sprintf("ALTER TABLE `users` ADD COLUMN `%s` VARCHAR(50) NULL", instantCol)},
 	})
 
 	dr := createDeploy(t, ctx, branchName, true)
@@ -575,9 +598,10 @@ func TestInstantDDLEligibility(t *testing.T) {
 		"ADD COLUMN NULL should be instant-eligible")
 
 	// Non-instant ALTER (ADD INDEX) should NOT be eligible
+	instantIndex := uniqueIdentifier("idx_instant_test")
 	branchName2 := createBranch(t, ctx, "non-instant-check")
 	applyBranchSchemaHTTP(t, ctx, branchName2, map[string][]string{
-		"testapp_sharded": {"ALTER TABLE users ADD INDEX idx_instant_test (email, full_name)"},
+		"testapp_sharded": {fmt.Sprintf("ALTER TABLE `users` ADD INDEX `%s` (`email`, `full_name`)", instantIndex)},
 	})
 
 	dr2 := createDeploy(t, ctx, branchName2, true)
@@ -597,9 +621,10 @@ func TestCancelInProgressToCompleteCancel(t *testing.T) {
 	defer cancel()
 
 	// Use ADD INDEX (non-instant) so the deploy takes long enough to cancel
+	cancelIndex := uniqueIdentifier("idx_cancel_test")
 	branchName := createBranchWithDDL(t, ctx, "cancel-test",
 		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE products ADD INDEX idx_cancel_test (name, price_cents)"},
+			"testapp_sharded": {fmt.Sprintf("ALTER TABLE `products` ADD INDEX `%s` (`name`, `price_cents`)", cancelIndex)},
 		},
 		nil,
 	)
@@ -686,9 +711,14 @@ func TestCompleteRevertError(t *testing.T) {
 
 	cancelAllVitessMigrations(t, ctx)
 
+	revertTable := uniqueIdentifier("revert_error_table")
+	require.NoError(t, testContainer.SeedDDL(ctx, testOrg, testDB, "testapp",
+		fmt.Sprintf("CREATE TABLE `%s` (id bigint NOT NULL PRIMARY KEY, value varchar(50))", revertTable)),
+		"seed table for revert test")
+
 	branchName := createBranchWithDDL(t, ctx, "revert-error",
 		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE users ADD COLUMN revert_error_col VARCHAR(50) NULL"},
+			"testapp": {fmt.Sprintf("DROP TABLE `%s`", revertTable)},
 		},
 		nil,
 	)
@@ -711,7 +741,10 @@ func TestCompleteRevertError(t *testing.T) {
 	require.Equal(t, drState.CompleteRevert, dr.DeploymentState,
 		"successful revert should produce complete_revert, not complete_revert_error")
 
-	verifyColumnNotExists(t, "users", "revert_error_col")
+	result, err := testContainer.VtgateExec(ctx, testOrg, testDB, "testapp",
+		fmt.Sprintf("SHOW TABLES LIKE '%s'", revertTable))
+	require.NoError(t, err, "SHOW TABLES after revert")
+	require.NotEmpty(t, result.Rows, "expected %q to exist after revert", revertTable)
 	t.Logf("Verified revert flow with correct state differentiation for deploy request %d", dr.Number)
 }
 
@@ -722,9 +755,10 @@ func TestRefreshSchema(t *testing.T) {
 	ctx := t.Context()
 
 	// Create a branch and apply DDL to it
+	refreshCol := uniqueIdentifier("refresh_test_col")
 	branchName := createBranchWithDDL(t, ctx, "refresh-test",
 		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE users ADD COLUMN refresh_test_col VARCHAR(50) NULL"},
+			"testapp_sharded": {fmt.Sprintf("ALTER TABLE `users` ADD COLUMN `%s` VARCHAR(50) NULL", refreshCol)},
 		},
 		nil,
 	)
@@ -747,8 +781,8 @@ func TestRefreshSchema(t *testing.T) {
 	})
 	require.NoError(t, err)
 	for _, d := range branchSchema {
-		assert.NotContains(t, d.Raw, "refresh_test_col",
-			"branch should not have refresh_test_col after schema refresh (table %s)", d.Name)
+		assert.NotContains(t, d.Raw, refreshCol,
+			"branch should not have %s after schema refresh (table %s)", refreshCol, d.Name)
 	}
 }
 
@@ -765,8 +799,9 @@ func TestRefreshSchemaAndApply(t *testing.T) {
 	branchName := createBranch(t, ctx, "reuse-test")
 
 	// First apply: add a column
+	reuseCol1 := uniqueIdentifier("reuse_col_1")
 	applyBranchDDL(t, ctx, branchName, map[string][]string{
-		"testapp_sharded": {"ALTER TABLE users ADD COLUMN reuse_col_1 VARCHAR(50) NULL"},
+		"testapp_sharded": {fmt.Sprintf("ALTER TABLE `users` ADD COLUMN `%s` VARCHAR(50) NULL", reuseCol1)},
 	})
 	dr := createDeploy(t, ctx, branchName, true)
 	require.Equal(t, drState.Ready, dr.DeploymentState)
@@ -787,8 +822,9 @@ func TestRefreshSchemaAndApply(t *testing.T) {
 	waitForBranchReady(t, ctx, branchName)
 
 	// Second apply on same branch: add another column
+	reuseCol2 := uniqueIdentifier("reuse_col_2")
 	applyBranchDDL(t, ctx, branchName, map[string][]string{
-		"testapp_sharded": {"ALTER TABLE users ADD COLUMN reuse_col_2 VARCHAR(50) NULL"},
+		"testapp_sharded": {fmt.Sprintf("ALTER TABLE `users` ADD COLUMN `%s` VARCHAR(50) NULL", reuseCol2)},
 	})
 	dr2 := createDeploy(t, ctx, branchName, true)
 	require.Equal(t, drState.Ready, dr2.DeploymentState)
@@ -804,6 +840,6 @@ func TestRefreshSchemaAndApply(t *testing.T) {
 	}
 
 	// Verify both columns exist on main
-	verifyColumnExists(t, "users", "reuse_col_1")
-	verifyColumnExists(t, "users", "reuse_col_2")
+	verifyColumnExists(t, "users", reuseCol1)
+	verifyColumnExists(t, "users", reuseCol2)
 }
