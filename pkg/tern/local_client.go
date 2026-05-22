@@ -140,7 +140,7 @@ type LocalClient struct {
 	heartbeatInterval time.Duration
 
 	// cancelApply cancels the background goroutine running executeApplySequential
-	// or executeApplyAtomic. Set when an apply starts, called by Stop().
+	// or executeGroupedApply. Set when an apply starts, called by Stop().
 	// Protected by cancelMu since Apply and Stop run on different goroutines.
 	cancelMu    sync.Mutex
 	cancelApply context.CancelFunc
@@ -151,8 +151,8 @@ type LocalClient struct {
 	observerMu sync.RWMutex
 	observers  map[int64]ProgressObserver // keyed by apply ID
 
-	// pendingObserver is consumed by the next Apply() call and registered
-	// before Spirit starts. Set by the webhook handler via SetPendingObserver.
+	// pendingObserver is consumed by the next direct Apply() call and registered
+	// before Spirit starts.
 	// Protected by observerMu.
 	pendingObserver ProgressObserver
 }
@@ -487,8 +487,6 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		caller = options["caller"]
 	}
 
-	// Detect deferred cutover. Spirit uses this for atomic cutover; Vitess
-	// always uses the grouped engine apply path for deploy requests.
 	deferCutover := options["defer_cutover"] == "true"
 	allowUnsafe := options["allow_unsafe"] == "true"
 
@@ -588,9 +586,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		tasks[i].ID = taskID
 	}
 
-	// Register pending observer before starting the engine — prevents race where
-	// the apply completes before the observer is set. The webhook handler calls
-	// SetPendingObserver before triggering the apply API call.
+	// Direct client calls can still register a pending observer before starting
+	// the engine. API-created applies use the service-level observer registry
+	// because scheduler workers dispatch them asynchronously.
 	if obs := c.consumePendingObserver(); obs != nil {
 		// Set the apply ID on the observer if it supports it (e.g., CommentObserver
 		// needs the ID to look up tracked comments for editing).
@@ -603,22 +601,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	// Start apply in background with cancellable context (Stop() cancels this)
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	c.cancelMu.Lock()
-	c.cancelApply = cancelApply
-	c.cancelMu.Unlock()
-	if deferCutover || c.config.Type == storage.DatabaseTypeVitess {
-		// Grouped mode: all DDLs are sent in one engine call. For Spirit this
-		// is atomic cutover when defer_cutover is enabled; for Vitess this
-		// creates one deploy request per apply.
-		go c.runWithRecovery(applyCtx, apply, tasks, func() {
-			c.executeApplyAtomic(applyCtx, apply, tasks, plan, options)
-		})
-	} else {
-		// Independent mode: each DDL runs separately, cuts over independently
-		go c.runWithRecovery(applyCtx, apply, tasks, func() {
-			c.executeApplySequential(applyCtx, apply, tasks, plan, options)
-		})
-	}
+	c.setApplyCancel(cancelApply)
+	c.startApplyExecution(applyCtx, cancelApply, apply, tasks, plan, options)
 
 	return &ternv1.ApplyResponse{
 		Accepted: true,

@@ -147,8 +147,9 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	webhookRuntime.StartMissingSummaryReconciliation(ctx, logger)
 
 	// Start the scheduler worker pool after webhook callbacks are registered.
-	// This polls for stale applies every 10 seconds:
+	// This polls for apply work every 10 seconds:
 	// - Runs immediately on startup
+	// - Dispatches queued local applies
 	// - Recovers applies with stale heartbeats (> 1 minute) using FOR UPDATE SKIP LOCKED
 	// - STOPPED applies are NOT auto-resumed (user must call `schemabot start`)
 	svc.StartScheduler(ctx)

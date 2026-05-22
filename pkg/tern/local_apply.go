@@ -242,9 +242,49 @@ func groupedApplyModeDescription(apply *storage.Apply) string {
 	}
 }
 
-// executeApplyAtomic runs all DDLs in one engine operation. For Spirit with
+func (c *LocalClient) usesGroupedApply(apply *storage.Apply) bool {
+	if apply.DatabaseType == storage.DatabaseTypeVitess {
+		return true
+	}
+	return apply.DatabaseType == storage.DatabaseTypeMySQL && apply.GetOptions().DeferCutover
+}
+
+func (c *LocalClient) setApplyCancel(cancel context.CancelFunc) {
+	c.cancelMu.Lock()
+	c.cancelApply = cancel
+	c.cancelMu.Unlock()
+}
+
+func (c *LocalClient) clearApplyCancel() {
+	c.cancelMu.Lock()
+	c.cancelApply = nil
+	c.cancelMu.Unlock()
+}
+
+func (c *LocalClient) startApplyExecution(ctx context.Context, cancel context.CancelFunc, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+	go func() {
+		defer c.clearApplyCancel()
+		defer cancel()
+		c.runApplyExecution(ctx, apply, tasks, plan, options)
+	}()
+}
+
+func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+	if c.usesGroupedApply(apply) {
+		c.runWithRecovery(ctx, apply, tasks, func() {
+			c.executeGroupedApply(ctx, apply, tasks, plan, options)
+		})
+		return
+	}
+
+	c.runWithRecovery(ctx, apply, tasks, func() {
+		c.executeApplySequential(ctx, apply, tasks, plan, options)
+	})
+}
+
+// executeGroupedApply runs all DDLs in one engine operation. For Spirit with
 // defer_cutover, this is atomic cutover; for Vitess, this is one deploy request.
-func (c *LocalClient) executeApplyAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
 	defer c.startApplyHeartbeat(ctx, apply)()
 	creds := c.credentials()
 	mode := groupedApplyMode(apply)

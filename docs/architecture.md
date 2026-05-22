@@ -268,14 +268,19 @@ type ProgressObserver interface {
 Webhook handler: "someone commented schemabot apply"
     |
     +-- Creates CommentObserver (posts PR comments)
-    +-- Calls SetPendingObserver on the client
+    +-- Calls SetPendingObserver on the API service
     +-- Calls ExecuteApply
             |
             v
-        Client.Apply()
-            +-- Consumes pending observer
-            +-- Registers Observer on the apply before engine starts
-            +-- Starts engine goroutine
+        store pending apply + tasks
+            +-- Registers Observer on the apply before scheduler dispatch
+            +-- Wakes scheduler
+                    |
+                    v
+                Scheduler worker claims apply
+                    |
+                    v
+                Client.ResumeApply()
                     |
                     +-- Progress tick: poll engine, derive task/apply state
                     |   +-- Observer.OnProgress()
@@ -315,7 +320,7 @@ stored GitHub context, and errors never fail server startup.
 
 The scheduler is part of Tern orchestration. The API service starts it on server startup because the server owns process lifecycle, configuration, and the Tern client pool, but the scheduler's work is to coordinate applies: claim storage records, refresh their heartbeat lease, and call `ResumeApply()` on the right Tern client.
 
-Each scheduler worker runs immediately on startup, then polls every 10 seconds. The worker claims at most one apply per tick and resumes it through the Tern client for that apply's deployment and environment.
+Each scheduler worker runs immediately on startup, then polls every 10 seconds. The worker claims at most one apply per tick and resumes it through the Tern client for that apply's deployment and environment. Fresh local applies also send a best-effort wake signal after their apply and task rows are committed, so a worker can claim them immediately instead of waiting for the next poll tick.
 
 `scheduler_workers` controls scheduler concurrency. The default is four workers, so an untuned server can still make progress across independent databases and environments concurrently. More workers help larger installations with many independent schema changes because each worker can claim and resume a different target during the same scheduler tick.
 
@@ -327,13 +332,13 @@ In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each sche
 | Scheduler                |      | Scheduler                |
 | +----------------------+ |      | +----------------------+ |
 | | worker 0             | |      | | worker 0             | |
-| | claim stale apply    | |      | | claim stale apply    | |
+| | claim apply work     | |      | | claim apply work     | |
 | | attach Observer      | |      | | attach Observer      | |
 | | ResumeApply          | |      | | ResumeApply          | |
 | +----------------------+ |      | +----------------------+ |
 | +----------------------+ |      | +----------------------+ |
 | | worker 1             | |      | | worker 1             | |
-| | claim stale apply    | |      | | claim stale apply    | |
+| | claim apply work     | |      | | claim apply work     | |
 | | attach Observer      | |      | | attach Observer      | |
 | | ResumeApply          | |      | | ResumeApply          | |
 | +----------------------+ |      | +----------------------+ |
@@ -358,9 +363,30 @@ In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each sche
 
 The storage arrows represent scheduler coordination. The GitHub arrows represent optional observer notifications; CLI applies simply run without an observer.
 
-A **claim** is an atomic storage operation: it selects one stale apply and refreshes its `updated_at` heartbeat in the same transaction. That heartbeat refresh is the scheduler's lease while it reloads state and calls `ResumeApply()`. Claims use `FOR UPDATE SKIP LOCKED` so multiple scheduler workers can run concurrently without taking the same apply.
+A **claim** is an atomic storage operation: it selects one apply that needs work and refreshes its `updated_at` heartbeat in the same transaction. That heartbeat refresh is the scheduler's lease while it reloads state and calls `ResumeApply()`. Claims use `FOR UPDATE SKIP LOCKED` so multiple scheduler workers can run concurrently without taking the same apply.
 
-An apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
+A running apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
+
+Freshly queued local applies are also claimable once their task rows exist. `ExecuteApply` stores the pending apply and its initial tasks in one transaction, then sends a best-effort wake signal to the scheduler. The wake path is only a latency optimization: it nudges one worker to call the same claim path immediately instead of waiting for the next poll tick. It never bypasses storage claims or creates a second queue. If the scheduler is stopped or a wake is already pending, the signal is skipped and the normal poll loop still finds the apply.
+
+```
+HTTP apply request
+      |
+      v
+store pending apply + tasks
+      |
+      v
+best-effort scheduler wake
+      |
+      v
+worker calls FindNextApply()
+      |
+      v
+claim row + refresh heartbeat
+      |
+      v
+TernClient.ResumeApply()
+```
 
 SchemaBot has two different kinds of locking:
 

@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -58,21 +60,20 @@ func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.
 func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
 func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
 
-type mockStorageWithPlanLookup struct {
-	mockStorage
-	plans storage.PlanStore
-}
-
-func (m *mockStorageWithPlanLookup) Plans() storage.PlanStore { return m.plans }
-
 type mockStorageWithApplyStores struct {
 	mockStorage
-	plans   storage.PlanStore
-	applies storage.ApplyStore
+	plans     storage.PlanStore
+	applies   storage.ApplyStore
+	tasks     storage.TaskStore
+	locks     storage.LockStore
+	applyLogs storage.ApplyLogStore
 }
 
-func (m *mockStorageWithApplyStores) Plans() storage.PlanStore    { return m.plans }
-func (m *mockStorageWithApplyStores) Applies() storage.ApplyStore { return m.applies }
+func (m *mockStorageWithApplyStores) Plans() storage.PlanStore         { return m.plans }
+func (m *mockStorageWithApplyStores) Applies() storage.ApplyStore      { return m.applies }
+func (m *mockStorageWithApplyStores) Tasks() storage.TaskStore         { return m.tasks }
+func (m *mockStorageWithApplyStores) Locks() storage.LockStore         { return m.locks }
+func (m *mockStorageWithApplyStores) ApplyLogs() storage.ApplyLogStore { return m.applyLogs }
 
 type staticPlanStore struct {
 	storage.PlanStore
@@ -103,6 +104,141 @@ func (s *staticApplyStore) GetByDatabase(context.Context, string, string, string
 	return []*storage.Apply{s.apply}, nil
 }
 
+type capturingApplyStore struct {
+	storage.ApplyStore
+	mu        sync.Mutex
+	apply     *storage.Apply
+	taskStore *capturingTaskStore
+	claimed   bool
+	findCh    chan struct{}
+	err       error
+}
+
+func (s *capturingApplyStore) Create(_ context.Context, apply *storage.Apply) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.apply = apply
+	if s.err != nil {
+		return 0, s.err
+	}
+	return 123, nil
+}
+
+func (s *capturingApplyStore) CreateWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (int64, error) {
+	s.mu.Lock()
+	if s.err != nil {
+		err := s.err
+		s.mu.Unlock()
+		return 0, err
+	}
+	s.mu.Unlock()
+
+	applyID := int64(123)
+	previousTaskCount := 0
+	if s.taskStore != nil {
+		s.taskStore.mu.Lock()
+		previousTaskCount = len(s.taskStore.tasks)
+		s.taskStore.mu.Unlock()
+	}
+	for _, task := range tasks {
+		task.ApplyID = applyID
+		if s.taskStore != nil {
+			if _, err := s.taskStore.Create(ctx, task); err != nil {
+				s.taskStore.mu.Lock()
+				s.taskStore.tasks = s.taskStore.tasks[:previousTaskCount]
+				s.taskStore.mu.Unlock()
+				return 0, err
+			}
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.apply = apply
+	return applyID, nil
+}
+
+func (s *capturingApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.apply = apply
+	return nil
+}
+
+func (s *capturingApplyStore) FindNextApply(context.Context) (*storage.Apply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.findCh != nil {
+		select {
+		case s.findCh <- struct{}{}:
+		default:
+		}
+	}
+	if s.apply == nil || s.claimed {
+		return nil, nil
+	}
+	s.claimed = true
+	apply := *s.apply
+	apply.ID = 123
+	return &apply, nil
+}
+
+func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.Apply, error) {
+	return nil, nil
+}
+
+type capturingTaskStore struct {
+	storage.TaskStore
+	mu           sync.Mutex
+	tasks        []*storage.Task
+	createCalls  int
+	failOnCreate int
+	err          error
+}
+
+func (s *capturingTaskStore) Create(_ context.Context, task *storage.Task) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.createCalls++
+	if s.failOnCreate == s.createCalls {
+		if s.err != nil {
+			return 0, s.err
+		}
+		return 0, errors.New("create task failed")
+	}
+	task.ID = int64(len(s.tasks) + 1)
+	s.tasks = append(s.tasks, task)
+	return int64(len(s.tasks)), nil
+}
+
+func (s *capturingTaskStore) Update(_ context.Context, task *storage.Task) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, storedTask := range s.tasks {
+		if storedTask.ID == task.ID || storedTask.TaskIdentifier == task.TaskIdentifier {
+			s.tasks[i] = task
+			return nil
+		}
+	}
+	return storage.ErrTaskNotFound
+}
+
+type emptyLockStore struct {
+	storage.LockStore
+}
+
+func (s *emptyLockStore) Get(context.Context, string, string) (*storage.Lock, error) {
+	return nil, nil
+}
+
+type noopApplyLogStore struct {
+	storage.ApplyLogStore
+}
+
+func (s *noopApplyLogStore) Append(context.Context, *storage.ApplyLog) error {
+	return nil
+}
+
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
 	healthErr      error
@@ -127,6 +263,10 @@ type mockTernClient struct {
 	skipRevertResp *ternv1.SkipRevertResponse
 	skipRevertErr  error
 	skipRevertReq  *ternv1.SkipRevertRequest // captured request
+	resumeMu       sync.Mutex
+	resumeErr      error
+	resumeApply    *storage.Apply
+	resumeCh       chan *storage.Apply
 	isRemote       bool
 }
 
@@ -190,7 +330,19 @@ func (m *mockTernClient) RollbackPlan(ctx context.Context, database string) (*te
 	return nil, nil
 }
 func (m *mockTernClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
-	return nil
+	m.resumeMu.Lock()
+	m.resumeApply = apply
+	resumeCh := m.resumeCh
+	resumeErr := m.resumeErr
+	m.resumeMu.Unlock()
+
+	if resumeCh != nil {
+		select {
+		case resumeCh <- apply:
+		default:
+		}
+	}
+	return resumeErr
 }
 func (m *mockTernClient) Endpoint() string                                  { return "mock" }
 func (m *mockTernClient) IsRemote() bool                                    { return m.isRemote }
@@ -248,14 +400,21 @@ func activeTestApply(applyID string) *storage.Apply {
 	}
 }
 
-func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) *Service {
+func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) (*Service, *capturingTaskStore) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	if capturingApplies, ok := applies.(*capturingApplyStore); ok {
+		capturingApplies.taskStore = tasks
+	}
 	return New(&mockStorageWithApplyStores{
-		plans:   &staticPlanStore{plan: executeApplyTestPlan()},
-		applies: applies,
+		plans:     &staticPlanStore{plan: executeApplyTestPlan()},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
 	}, testServerConfig(), map[string]tern.Client{
 		"default/staging": client,
-	}, logger)
+	}, logger), tasks
 }
 
 func newControlTestService(client tern.Client, apply *storage.Apply) *Service {
@@ -272,42 +431,134 @@ func newTestService() *Service {
 	return New(&mockStorage{}, testServerConfig(), nil, logger)
 }
 
-func TestExecuteApplyRequiresApplyIDs(t *testing.T) {
-	t.Run("accepted response requires engine apply id", func(t *testing.T) {
-		svc := newExecuteApplyTestService(&mockTernClient{
-			applyResp: &ternv1.ApplyResponse{Accepted: true},
-		}, nil)
+func TestExecuteApplyRequiresRemoteApplyID(t *testing.T) {
+	svc, _ := newExecuteApplyTestService(&mockTernClient{
+		applyResp: &ternv1.ApplyResponse{Accepted: true},
+		isRemote:  true,
+	}, &capturingApplyStore{})
 
-		resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
-			PlanID:      "plan-1",
-			Environment: "staging",
-		})
-
-		require.Error(t, err)
-		assert.Nil(t, resp)
-		assert.Zero(t, applyID)
-		assert.Contains(t, err.Error(), "accepted apply missing apply_id")
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
 	})
 
-	t.Run("accepted response requires stored apply id", func(t *testing.T) {
-		svc := newExecuteApplyTestService(&mockTernClient{
-			applyResp: &ternv1.ApplyResponse{Accepted: true, ApplyId: "apply-123"},
-		}, &staticApplyStore{
-			apply: &storage.Apply{
-				ApplyIdentifier: "apply-123",
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Contains(t, err.Error(), "accepted apply missing apply_id")
+}
+
+func TestExecuteApplyQueuesLocalApplyForScheduler(t *testing.T) {
+	applies := &capturingApplyStore{}
+	mock := &mockTernClient{}
+	svc, tasks := newExecuteApplyTestService(mock, applies)
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(123), applyID)
+	assert.NotEmpty(t, resp.ApplyID)
+	require.NotNil(t, applies.apply)
+	assert.Equal(t, state.Apply.Pending, applies.apply.State)
+	assert.Equal(t, storage.EngineSpirit, applies.apply.Engine)
+	assert.Equal(t, "testdb", applies.apply.GetOptions().Target)
+	assert.Nil(t, mock.applyReq, "request path should enqueue work without dispatching the engine")
+	require.Len(t, tasks.tasks, 1)
+	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
+}
+
+func TestExecuteApplyDoesNotStorePartialQueueWhenTaskCreateFails(t *testing.T) {
+	plan := executeApplyTestPlan()
+	plan.Namespaces["testdb"].Tables = append(plan.Namespaces["testdb"].Tables, storage.TableChange{
+		Namespace: "testdb",
+		Table:     "orders",
+		DDL:       "ALTER TABLE orders ADD COLUMN status varchar(255)",
+		Operation: "alter",
+	})
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{
+		failOnCreate: 2,
+		err:          errors.New("task insert failed"),
+	}
+	applies.taskStore = tasks
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": &mockTernClient{},
+	}, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Contains(t, err.Error(), "task insert failed")
+	assert.Nil(t, applies.apply)
+	assert.Empty(t, tasks.tasks)
+}
+
+func TestExecuteApplyWakesSchedulerForQueuedLocalApply(t *testing.T) {
+	applies := &capturingApplyStore{findCh: make(chan struct{}, 1)}
+	mock := &mockTernClient{resumeCh: make(chan *storage.Apply, 1)}
+	svc, _ := newExecuteApplyTestService(mock, applies)
+	svc.config.SchedulerWorkers = 1
+	require.NoError(t, svc.SetSchedulerPollInterval(time.Hour))
+	svc.StartScheduler(t.Context())
+	t.Cleanup(svc.StopScheduler)
+
+	select {
+	case <-applies.findCh:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "scheduler did not perform startup claim")
+	}
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.NoError(t, err)
+	require.True(t, resp.Accepted)
+	assert.Equal(t, int64(123), applyID)
+
+	select {
+	case resumedApply := <-mock.resumeCh:
+		assert.Equal(t, int64(123), resumedApply.ID)
+		assert.Equal(t, state.Apply.Pending, resumedApply.State)
+		assert.Equal(t, "testdb", resumedApply.Database)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "scheduler did not resume queued apply after wake")
+	}
+}
+
+func TestProgressResponseFromProtoPreservesVSchemaChangeType(t *testing.T) {
+	resp := progressResponseFromProto(&ternv1.ProgressResponse{
+		State: ternv1.State_STATE_RUNNING,
+		Tables: []*ternv1.TableProgress{
+			{
+				TableName:  "VSchema: testapp",
+				Namespace:  "testapp",
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+				Status:     state.Task.Running,
 			},
-		})
-
-		resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
-			PlanID:      "plan-1",
-			Environment: "staging",
-		})
-
-		require.Error(t, err)
-		assert.Nil(t, resp)
-		assert.Zero(t, applyID)
-		assert.Contains(t, err.Error(), "accepted apply missing stored apply id")
+		},
 	})
+
+	require.Len(t, resp.Tables, 1)
+	assert.Equal(t, "vschema_update", resp.Tables[0].ChangeType)
 }
 
 func TestHealth(t *testing.T) {
@@ -363,12 +614,14 @@ func TestApplyHandler(t *testing.T) {
 			Target:         "testdb",
 			Environment:    "staging",
 		}
-		stor := &mockStorageWithPlanLookup{
-			plans: &mockPlanLookupStore{plan: plan},
+		stor := &mockStorageWithApplyStores{
+			plans:     &mockPlanLookupStore{plan: plan},
+			applies:   &capturingApplyStore{err: fmt.Errorf("create apply: %w", storage.ErrActiveApplyExists)},
+			tasks:     &capturingTaskStore{},
+			locks:     &emptyLockStore{},
+			applyLogs: &noopApplyLogStore{},
 		}
-		mock := &mockTernClient{
-			applyErr: fmt.Errorf("create apply: %w", storage.ErrActiveApplyExists),
-		}
+		mock := &mockTernClient{}
 		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 		ternClients := map[string]tern.Client{"default/staging": mock}
 		svc := New(stor, testServerConfig(), ternClients, logger)
@@ -382,9 +635,7 @@ func TestApplyHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
-		require.NotNil(t, mock.applyReq)
-		assert.Equal(t, "testdb", mock.applyReq.Database)
-		assert.Equal(t, storage.DatabaseTypeMySQL, mock.applyReq.Type)
+		assert.Nil(t, mock.applyReq, "request path should not dispatch local apply work")
 
 		var resp apitypes.ErrorResponse
 		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))

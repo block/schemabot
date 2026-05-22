@@ -29,16 +29,30 @@ type ProgressObserver interface {
 func (c *LocalClient) SetObserver(applyID int64, observer ProgressObserver) {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()
+
+	if observer == nil {
+		delete(c.observers, applyID)
+		if c.logger != nil {
+			c.logger.Debug("cleared progress observer for apply", "apply_id", applyID)
+		}
+		return
+	}
+
 	if c.observers == nil {
 		c.observers = make(map[int64]ProgressObserver)
+	}
+	if _, exists := c.observers[applyID]; exists {
+		if c.logger != nil {
+			c.logger.Debug("progress observer already registered for apply", "apply_id", applyID)
+		}
+		return
 	}
 	c.observers[applyID] = observer
 }
 
-// SetPendingObserver sets an observer that will be consumed by the next Apply()
-// call. The observer is registered on the apply record before the engine starts,
-// preventing the race where the apply completes before the observer is set.
-// Called by the webhook handler before triggering the apply API call.
+// SetPendingObserver sets an observer that will be consumed by the next direct
+// client Apply() call. The API service uses its own pending-observer registry
+// because scheduler workers dispatch API-created applies asynchronously.
 func (c *LocalClient) SetPendingObserver(observer ProgressObserver) {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()

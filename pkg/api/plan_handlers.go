@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -245,25 +246,18 @@ func applyMetricStatusForError(err error) string {
 	return "error"
 }
 
-// ExecuteApply executes an apply request via the Tern client, stores the result,
-// and returns the apply response. This is the shared implementation used by both
-// the HTTP handler and the webhook handler.
+// ExecuteApply stores an apply request durably and returns the apply response.
+// Local clients are queued for scheduler dispatch so request cancellation cannot
+// orphan in-memory execution. Remote clients dispatch through the gRPC request
+// path.
 //
 // Flow:
 //  1. Load the plan from SchemaBot storage (source of truth for database, DDL changes).
-//  2. Build a ternv1.ApplyRequest with PlanId, DdlChanges, and options.
-//  3. Call client.Apply(ctx, ternReq):
-//     - LocalClient: looks up plan in same DB, creates apply + task records,
-//     starts Spirit in a background goroutine, returns ApplyId (its own UUID).
-//     - GRPCClient: passes the request to the remote Tern over gRPC. The remote
-//     Tern creates its own records and starts execution. Returns ApplyId
-//     (the remote engine's apply identifier).
-//  4. Store the result in SchemaBot's storage:
-//     - Local (IsRemote=false): the apply record already exists (LocalClient
-//     created it in step 3). Look it up and reuse it.
-//     - Remote (IsRemote=true): generate a SchemaBot-owned apply_identifier,
-//     store Tern's ApplyId as external_id, create apply + task records.
-//  5. Return the apply_identifier to the HTTP caller.
+//  2. Resolve the Tern client to validate deployment/environment routing.
+//  3. Local mode: create a pending Apply row and pending Task rows, attach any
+//     pending observer, wake the scheduler, and return the SchemaBot apply ID.
+//  4. gRPC mode: call remote Apply, store the remote apply ID in external_id,
+//     start progress polling, and return the SchemaBot apply ID.
 //
 // Returns the API response, the stored apply ID (0 if not stored), and any error.
 func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes.ApplyResponse, int64, error) {
@@ -275,7 +269,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	)
 	defer span.End()
 
-	// Load plan first — it's the source of truth for database and type.
+	// Load plan first; it is the source of truth for database, type, and routing.
 	plan, err := s.storage.Plans().Get(ctx, req.PlanID)
 	if err != nil {
 		span.RecordError(err)
@@ -321,10 +315,59 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		return nil, 0, fmt.Errorf("database %q (%s): %w", plan.Database, req.Environment, err)
 	}
 
-	// Ensure options map exists and includes environment
-	options := req.Options
+	options := maps.Clone(req.Options)
 	if options == nil {
 		options = make(map[string]string)
+	}
+	options["target"] = plan.Target
+
+	applyStart := time.Now()
+	recordApplyResult := func(status string) {
+		metrics.RecordApply(ctx, plan.Database, req.Environment, status)
+		metrics.RecordApplyDuration(ctx, time.Since(applyStart), plan.Database, req.Environment, status)
+	}
+	recordApplyError := func(status string, err error) {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, status)
+		recordApplyResult(applyMetricStatusForError(err))
+	}
+
+	if !client.IsRemote() {
+		attachObserver := func(storedApplyID int64) {
+			observer := s.consumePendingObserver(plan.Database, deployment, req.Environment)
+			if observer != nil {
+				type applyIDSetter interface{ SetApplyID(int64) }
+				if setter, ok := observer.(applyIDSetter); ok {
+					setter.SetApplyID(storedApplyID)
+				}
+				client.SetObserver(storedApplyID, observer)
+			}
+		}
+
+		applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, deployment, options, attachObserver)
+		if err != nil {
+			recordApplyError("enqueue apply", err)
+			return nil, 0, err
+		}
+		if storedApplyID <= 0 {
+			applyErr := fmt.Errorf("accepted apply missing stored apply id")
+			recordApplyError("apply missing stored id", applyErr)
+			return nil, 0, applyErr
+		}
+
+		span.SetAttributes(attribute.String("apply_id", applyIdentifier), attribute.Bool("accepted", true))
+		recordApplyResult("success")
+		metrics.AdjustActiveApplies(ctx, 1, plan.Database, req.Environment)
+		s.wakeScheduler(applyIdentifier, plan.Database, req.Environment)
+
+		return &apitypes.ApplyResponse{
+			Accepted: true,
+			ApplyID:  applyIdentifier,
+		}, storedApplyID, nil
+	}
+
+	if observer := s.consumePendingObserver(plan.Database, deployment, req.Environment); observer != nil {
+		client.SetPendingObserver(observer)
 	}
 	ternReq := &ternv1.ApplyRequest{
 		PlanId:      req.PlanID,
@@ -337,18 +380,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		Caller:      req.Caller,
 	}
 
-	// Time only the client.Apply call, not plan lookup or client creation.
-	applyStart := time.Now()
 	resp, err := client.Apply(ctx, ternReq)
-	recordApplyResult := func(status string) {
-		metrics.RecordApply(ctx, plan.Database, req.Environment, status)
-		metrics.RecordApplyDuration(ctx, time.Since(applyStart), plan.Database, req.Environment, status)
-	}
-	recordApplyError := func(status string, err error) {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, status)
-		recordApplyResult(applyMetricStatusForError(err))
-	}
 	if err != nil {
 		recordApplyError("apply failed", err)
 		return nil, 0, err
@@ -365,133 +397,21 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	}
 	span.SetAttributes(attribute.String("apply_id", resp.ApplyId), attribute.Bool("accepted", resp.Accepted))
 
-	// Store apply and task records in SchemaBot's storage.
-	//
-	// Local mode (client.IsRemote() == false):
-	//   LocalClient.Apply() already created the apply/task records in the same
-	//   database and started its own background poller. Look up the existing
-	//   record directly.
-	//
-	// gRPC mode (client.IsRemote() == true):
-	//   Remote Tern has separate storage. Create new apply/task records with a
-	//   SchemaBot-owned apply_identifier. Store Tern's apply_id as external_id
-	//   for resolveApplyID to translate in subsequent RPCs.
-	//
-	//   After creating the record, we call ResumeApply to start a background
-	//   poller (pollForCompletion) that syncs Tern's real state into local
-	//   storage. This must happen here — not in GRPCClient.Apply() — because
-	//   the poller needs the storage.Apply record which doesn't exist until
-	//   after the record is created above.
 	var storedApplyID int64
 	applyIdentifier := resp.ApplyId
 	if resp.Accepted {
-		if !client.IsRemote() {
-			// Local mode: LocalClient.Apply() already created the apply + task
-			// records in the same database. Just look up the existing record.
-			existing, lookupErr := s.storage.Applies().GetByApplyIdentifier(ctx, resp.ApplyId)
-			if lookupErr != nil {
-				applyErr := fmt.Errorf("lookup local apply %s: %w", resp.ApplyId, lookupErr)
-				recordApplyError("lookup local apply", applyErr)
-				return nil, 0, applyErr
-			}
-			if existing == nil {
-				applyErr := fmt.Errorf("local apply %s not found: LocalClient should have created it", resp.ApplyId)
-				s.logger.Error("local apply not found after LocalClient.Apply()",
-					"apply_id", resp.ApplyId,
-					"accepted", resp.Accepted,
-				)
-				recordApplyError("local apply missing", applyErr)
-				return nil, 0, applyErr
-			}
-			storedApplyID = existing.ID
-			applyIdentifier = existing.ApplyIdentifier
-		} else {
-			// gRPC mode: remote Tern has separate storage. Create apply + task
-			// records in SchemaBot's storage with a SchemaBot-owned identifier.
-			// resp.ApplyId is Tern's own ID (the remote engine's apply identifier) — stored as
-			// external_id for resolveApplyID to translate in subsequent RPCs.
-			applyIdentifier = "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-			now := time.Now()
+		applyIdentifier = "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+		apply, id, err := s.createStoredApply(ctx, plan, req, deployment, options, applyIdentifier, resp.ApplyId)
+		if err != nil {
+			recordApplyError("store apply", err)
+			return nil, 0, err
+		}
+		storedApplyID = id
 
-			deferCutover := options["defer_cutover"] == "true"
-			allowUnsafe := options["allow_unsafe"] == "true"
-			applyOpts := storage.ApplyOptions{
-				DeferCutover: deferCutover,
-				AllowUnsafe:  allowUnsafe,
-			}
-
-			var lockID int64
-			lock, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
-			if err != nil {
-				applyErr := fmt.Errorf("lookup lock for %s/%s: %w", plan.Database, plan.DatabaseType, err)
-				recordApplyError("lookup lock", applyErr)
-				return nil, 0, applyErr
-			}
-			if lock != nil {
-				lockID = lock.ID
-			}
-
-			apply := &storage.Apply{
-				ApplyIdentifier: applyIdentifier,
-				LockID:          lockID,
-				PlanID:          plan.ID,
-				Database:        plan.Database,
-				DatabaseType:    plan.DatabaseType,
-				Repository:      plan.Repository,
-				PullRequest:     plan.PullRequest,
-				Environment:     req.Environment,
-				Deployment:      deployment,
-				Caller:          req.Caller,
-				InstallationID:  req.InstallationID,
-				ExternalID:      resp.ApplyId,
-				Engine:          storage.EngineSpirit,
-				State:           state.Apply.Pending,
-				Options:         storage.MarshalApplyOptions(applyOpts),
-				CreatedAt:       now,
-				UpdatedAt:       now,
-			}
-			storedApplyID, err = s.storage.Applies().Create(ctx, apply)
-			if err != nil {
-				applyErr := fmt.Errorf("store apply: %w", err)
-				recordApplyError("store apply", applyErr)
-				return nil, 0, applyErr
-			}
-
-			for _, ddlChange := range plan.FlatDDLChanges() {
-				task := &storage.Task{
-					TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
-					ApplyID:        storedApplyID,
-					PlanID:         plan.ID,
-					Database:       plan.Database,
-					DatabaseType:   plan.DatabaseType,
-					Engine:         storage.EngineSpirit,
-					Repository:     plan.Repository,
-					PullRequest:    plan.PullRequest,
-					Environment:    req.Environment,
-					State:          state.Task.Pending,
-					Options:        storage.MarshalApplyOptions(applyOpts),
-					Namespace:      ddlChange.Namespace,
-					TableName:      ddlChange.Table,
-					DDL:            ddlChange.DDL,
-					DDLAction:      ddlChange.Operation,
-					CreatedAt:      now,
-					UpdatedAt:      now,
-				}
-				if _, err := s.storage.Tasks().Create(ctx, task); err != nil {
-					applyErr := fmt.Errorf("store task: %w", err)
-					recordApplyError("store task", applyErr)
-					return nil, 0, applyErr
-				}
-			}
-
-			// Start background poller to keep local storage in sync with Tern.
-			// ResumeApply spawns pollForCompletion which syncs Tern's real state
-			// into SchemaBot's storage — without this, status stays "pending".
-			// Must happen after task creation so the poller can sync task state.
-			apply.ID = storedApplyID
-			if err := client.ResumeApply(ctx, apply); err != nil {
-				s.logger.Warn("failed to start progress tracking", "apply_id", applyIdentifier, "error", err)
-			}
+		// Start background polling to sync Tern's real state into SchemaBot's
+		// storage.
+		if err := client.ResumeApply(ctx, apply); err != nil {
+			s.logger.Warn("failed to start progress tracking", "apply_id", applyIdentifier, "error", err)
 		}
 	}
 	if resp.Accepted && storedApplyID <= 0 {
@@ -518,6 +438,127 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		applyResp.ErrorCode = apitypes.ErrCodeEngineError
 	}
 	return applyResp, storedApplyID, nil
+}
+
+func (s *Service) enqueueApply(
+	ctx context.Context,
+	plan *storage.Plan,
+	req ApplyRequest,
+	deployment string,
+	options map[string]string,
+	onApplyCreated func(int64),
+) (string, int64, error) {
+	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, deployment, options, applyIdentifier, "")
+	if err != nil {
+		return "", 0, err
+	}
+	if onApplyCreated != nil {
+		onApplyCreated(storedApplyID)
+	}
+	return apply.ApplyIdentifier, storedApplyID, nil
+}
+
+func (s *Service) createStoredApply(
+	ctx context.Context,
+	plan *storage.Plan,
+	req ApplyRequest,
+	deployment string,
+	options map[string]string,
+	applyIdentifier string,
+	externalID string,
+) (*storage.Apply, int64, error) {
+	now := time.Now()
+	applyOpts := storage.ApplyOptionsFromMap(options)
+
+	var lockID int64
+	lock, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
+	if err != nil {
+		return nil, 0, fmt.Errorf("lookup lock for %s/%s: %w", plan.Database, plan.DatabaseType, err)
+	}
+	if lock != nil {
+		lockID = lock.ID
+	}
+
+	apply := &storage.Apply{
+		ApplyIdentifier: applyIdentifier,
+		LockID:          lockID,
+		PlanID:          plan.ID,
+		Database:        plan.Database,
+		DatabaseType:    plan.DatabaseType,
+		Repository:      plan.Repository,
+		PullRequest:     plan.PullRequest,
+		Environment:     req.Environment,
+		Deployment:      deployment,
+		Caller:          req.Caller,
+		InstallationID:  req.InstallationID,
+		ExternalID:      externalID,
+		Engine:          storage.EngineForType(plan.DatabaseType),
+		State:           state.Apply.Pending,
+		Options:         storage.MarshalApplyOptions(applyOpts),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	taskChanges := applyTaskChanges(plan)
+	tasks := make([]*storage.Task, 0, len(taskChanges))
+	for _, ddlChange := range taskChanges {
+		task := &storage.Task{
+			TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
+			PlanID:         plan.ID,
+			Database:       plan.Database,
+			DatabaseType:   plan.DatabaseType,
+			Engine:         storage.EngineForType(plan.DatabaseType),
+			Repository:     plan.Repository,
+			PullRequest:    plan.PullRequest,
+			Environment:    req.Environment,
+			State:          state.Task.Pending,
+			Options:        storage.MarshalApplyOptions(applyOpts),
+			Namespace:      ddlChange.Namespace,
+			TableName:      ddlChange.Table,
+			DDL:            ddlChange.DDL,
+			DDLAction:      ddlChange.Operation,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		tasks = append(tasks, task)
+	}
+
+	storedApplyID, err := s.storage.Applies().CreateWithTasks(ctx, apply, tasks)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
+	}
+	apply.ID = storedApplyID
+
+	if logStore := s.storage.ApplyLogs(); logStore != nil {
+		if err := logStore.Append(ctx, &storage.ApplyLog{
+			ApplyID:   storedApplyID,
+			Level:     storage.LogLevelInfo,
+			EventType: storage.LogEventInfo,
+			Source:    storage.LogSourceSchemaBot,
+			Message:   fmt.Sprintf("Apply queued: %s", applyIdentifier),
+			NewState:  state.Apply.Pending,
+			CreatedAt: now,
+		}); err != nil {
+			s.logger.Warn("failed to log queued apply", "apply_id", applyIdentifier, "error", err)
+		}
+	}
+
+	return apply, storedApplyID, nil
+}
+
+func applyTaskChanges(plan *storage.Plan) []storage.TableChange {
+	changes := append([]storage.TableChange{}, plan.FlatDDLChanges()...)
+	for namespace, nsData := range plan.Namespaces {
+		if len(nsData.VSchema) > 0 {
+			changes = append(changes, storage.TableChange{
+				Table:     "VSchema: " + namespace,
+				Namespace: namespace,
+				Operation: "vschema_update",
+			})
+		}
+	}
+	return changes
 }
 
 // ExecuteRollbackPlan generates a rollback plan via the Tern client.

@@ -195,6 +195,7 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	t.Cleanup(func() { _ = localClient.Close() })
 
 	serverConfig := &api.ServerConfig{
+		SchedulerWorkers: 1,
 		Databases: map[string]api.DatabaseConfig{
 			appDBName: {
 				Type: "mysql",
@@ -208,6 +209,10 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	svc := api.New(st, serverConfig, map[string]tern.Client{
 		appDBName + "/staging": localClient,
 	}, logger)
+	require.NoError(t, svc.SetSchedulerPollInterval(100*time.Millisecond))
+	// Webhook E2E helpers use the real service lifecycle. Local applies are
+	// durably queued by ExecuteApply, then dispatched by scheduler workers.
+	svc.StartScheduler(ctx)
 	t.Cleanup(func() { _ = svc.Close() })
 
 	return svc

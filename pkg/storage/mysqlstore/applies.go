@@ -345,6 +345,75 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	return id, nil
 }
 
+// CreateWithTasks stores an apply and its initial tasks in one transaction.
+func (s *applyStore) CreateWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (int64, error) {
+	// Ensure options has valid JSON (empty object if nil)
+	options := apply.Options
+	if len(options) == 0 {
+		options = []byte("{}")
+	}
+
+	lockTarget := isActiveApplyState(apply.State)
+	var writeTx *applyWriteTx
+	var err error
+	if lockTarget {
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, "create apply with tasks", apply.Database, apply.DatabaseType, apply.Environment)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		writeTx, err = beginApplyWriteTx(ctx, s.db, "create apply with tasks")
+		if err != nil {
+			return 0, err
+		}
+	}
+	defer writeTx.close(ctx, "create apply with tasks")
+
+	if lockTarget {
+		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, 0); err != nil {
+			return 0, err
+		}
+	}
+
+	result, err := writeTx.tx.ExecContext(ctx, `
+		INSERT INTO applies (
+			apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
+			state, error_message, options, attempt
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		apply.ApplyIdentifier, apply.LockID, apply.PlanID, apply.Database, apply.DatabaseType,
+		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, apply.Engine,
+		apply.State, apply.ErrorMessage, string(options), apply.Attempt,
+	)
+	if err != nil {
+		if isDuplicateKeyError(err) {
+			return 0, fmt.Errorf("create apply %s: %w", apply.ApplyIdentifier, storage.ErrApplyIDExists)
+		}
+		return 0, fmt.Errorf("insert apply %s: %w", apply.ApplyIdentifier, err)
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("read inserted apply id for %s: %w", apply.ApplyIdentifier, err)
+	}
+
+	for _, task := range tasks {
+		task.ApplyID = id
+		taskID, err := insertTask(ctx, writeTx.tx, task)
+		if err != nil {
+			return 0, fmt.Errorf("insert task %s for apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
+		task.ID = taskID
+	}
+
+	if err := writeTx.commit(); err != nil {
+		return 0, fmt.Errorf("commit create apply with tasks: %w", err)
+	}
+
+	return id, nil
+}
+
 // Get returns an apply by ID, or nil if not found.
 func (s *applyStore) Get(ctx context.Context, id int64) (*storage.Apply, error) {
 	row := s.db.QueryRowContext(ctx, `

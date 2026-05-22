@@ -127,6 +127,7 @@ func TestScheduler_BasicClaimAndResume(t *testing.T) {
 	require.True(t, applyResp["accepted"] == true)
 	applyID, _ := applyResp["apply_id"].(string)
 	waitForState(t, "http://"+ts.Addr, applyID, "completed", 15*time.Second)
+	ts.Service.StopScheduler()
 
 	// Remove the table so the second plan contains DDL that recovery can resume.
 	targetConn, err := sql.Open("mysql", appDSN)
@@ -336,7 +337,7 @@ func TestScheduler_ClaimableStates(t *testing.T) {
 				applyIdentifier)
 			require.NoError(t, err)
 
-			// The scheduler should only claim stale applies in states that recovery can resume safely.
+			// The scheduler should claim only queued or stale applies in states it can resume safely.
 			claimed, err := stor.Applies().FindNextApply(ctx)
 			require.NoError(t, err)
 			if tc.wantClaim {

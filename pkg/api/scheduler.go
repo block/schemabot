@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -27,13 +28,16 @@ const (
 //
 // Scheduler workers claim apply work from storage so one server can make
 // progress across independent databases and environments concurrently. This
-// currently includes crash recovery for applies with stale heartbeats.
+// includes queued applies, crash recovery for applies with stale heartbeats,
+// and retry recovery for transient engine failures.
 //
 // Launches N concurrent workers (configured via scheduler_workers in config).
 // Each worker independently claims applies using FOR UPDATE SKIP LOCKED.
 // Call StopScheduler to gracefully stop.
 func (s *Service) StartScheduler(ctx context.Context) {
+	s.schedulerMu.Lock()
 	if s.stopRecovery != nil {
+		s.schedulerMu.Unlock()
 		s.logger.Info("scheduler already running")
 		return
 	}
@@ -43,13 +47,18 @@ func (s *Service) StartScheduler(ctx context.Context) {
 		workers = DefaultSchedulerWorkers
 	}
 
-	s.stopRecovery = make(chan struct{})
+	stop := make(chan struct{})
+	wake := make(chan struct{}, workers)
+	workerCtx, cancel := context.WithCancel(ctx)
+	s.stopRecovery = stop
+	s.cancelRecovery = cancel
+	s.schedulerWake = wake
+	s.schedulerMu.Unlock()
 
 	for i := range workers {
 		workerID := i
-		stop := s.stopRecovery
 		s.recoveryWg.Go(func() {
-			s.schedulerWorker(ctx, workerID, stop)
+			s.schedulerWorker(workerCtx, workerID, stop, wake)
 		})
 	}
 
@@ -59,18 +68,57 @@ func (s *Service) StartScheduler(ctx context.Context) {
 // StopScheduler stops the background scheduler and waits for all workers to finish.
 // Safe to call multiple times.
 func (s *Service) StopScheduler() {
+	s.schedulerMu.Lock()
 	if s.stopRecovery == nil {
+		s.schedulerMu.Unlock()
 		return
 	}
 	stop := s.stopRecovery
-	close(stop)
-	s.recoveryWg.Wait()
+	cancel := s.cancelRecovery
 	s.stopRecovery = nil
+	s.cancelRecovery = nil
+	s.schedulerWake = nil
+	s.schedulerMu.Unlock()
+
+	close(stop)
+	if cancel != nil {
+		cancel()
+	}
+	s.recoveryWg.Wait()
+}
+
+func (s *Service) wakeScheduler(applyIdentifier, database, environment string) {
+	s.schedulerMu.Lock()
+	wake := s.schedulerWake
+	running := s.stopRecovery != nil
+	s.schedulerMu.Unlock()
+
+	if !running || wake == nil {
+		s.logger.Debug("scheduler wake skipped because scheduler is not running",
+			"apply_id", applyIdentifier,
+			"database", database,
+			"environment", environment)
+		return
+	}
+
+	select {
+	case wake <- struct{}{}:
+		s.logger.Debug("scheduler wake queued",
+			"apply_id", applyIdentifier,
+			"database", database,
+			"environment", environment)
+	default:
+		s.logger.Debug("scheduler wake already pending",
+			"apply_id", applyIdentifier,
+			"database", database,
+			"environment", environment)
+	}
 }
 
 // schedulerWorker is a single worker that claims at most one apply on startup
-// and on each scheduler poll tick.
-func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan struct{}) {
+// and on each scheduler poll tick. Wake signals share the same claim path as
+// polling; storage locking decides whether a worker actually owns work.
+func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan struct{}, wake <-chan struct{}) {
 	ticker := time.NewTicker(s.schedulerPollInterval)
 	defer ticker.Stop()
 
@@ -86,6 +134,9 @@ func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan
 		case <-ctx.Done():
 			s.logger.Debug("scheduler worker context cancelled", "worker", workerID)
 			return
+		case <-wake:
+			s.logger.Debug("scheduler worker woke for queued apply", "worker", workerID)
+			s.recoverApplies(ctx, workerID)
 		case <-ticker.C:
 			s.recoverApplies(ctx, workerID)
 		}
@@ -166,6 +217,18 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Environment)
 	}
 	if err := client.ResumeApply(ctx, apply); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			s.logger.Debug("scheduler: stopped while running claimed apply",
+				"worker", workerID,
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"error", err)
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+			}
+			return
+		}
 		s.logger.Error("scheduler: failed to resume apply",
 			"worker", workerID,
 			"apply_id", apply.ApplyIdentifier,

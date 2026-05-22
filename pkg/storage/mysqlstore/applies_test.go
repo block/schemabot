@@ -66,6 +66,79 @@ func TestApplyStore_CreateDuplicate(t *testing.T) {
 	require.ErrorIs(t, err, storage.ErrApplyIDExists)
 }
 
+func TestApplyStore_CreateWithTasksCommitsQueueAtomically(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_create_with_tasks",
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	tasks := []*storage.Task{
+		{
+			TaskIdentifier: "task_create_with_tasks_users",
+			PlanID:         1,
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Engine:         storage.EngineSpirit,
+			Environment:    "staging",
+			State:          state.Task.Pending,
+			TableName:      "users",
+			DDL:            "ALTER TABLE users ADD COLUMN email VARCHAR(255)",
+			DDLAction:      "alter",
+			Options:        []byte("{}"),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+		{
+			TaskIdentifier: "task_create_with_tasks_orders",
+			PlanID:         1,
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Engine:         storage.EngineSpirit,
+			Environment:    "staging",
+			State:          state.Task.Pending,
+			TableName:      "orders",
+			DDL:            "ALTER TABLE orders ADD COLUMN status VARCHAR(255)",
+			DDLAction:      "alter",
+			Options:        []byte("{}"),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+	}
+
+	applyID, err := store.Applies().CreateWithTasks(ctx, apply, tasks)
+	require.NoError(t, err)
+	require.NotZero(t, applyID)
+
+	storedTasks, err := store.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, storedTasks, 2)
+	assert.Equal(t, applyID, tasks[0].ApplyID)
+	assert.Equal(t, applyID, tasks[1].ApplyID)
+
+	// A pending apply created with its full task set is immediately ready for
+	// scheduler dispatch; workers never see a partially populated task list.
+	claimed, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+}
+
 func TestApplyStore_CreateBlocksActiveApplyForSameTarget(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

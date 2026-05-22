@@ -162,7 +162,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 
 	if apply.GetOptions().DeferCutover {
 		logMsg := fmt.Sprintf("Resume requested: %d tasks resumed, %d already completed", len(resumeTasks), completedCount)
-		if err := c.launchAtomicResume(ctx, apply, resumeTasks, plan, options, logMsg); err != nil {
+		if err := c.launchAtomicResume(ctx, apply, resumeTasks, plan, options, logMsg, false); err != nil {
 			return nil, err
 		}
 	} else {
@@ -183,8 +183,12 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 			fmt.Sprintf("Resume requested (sequential): %d tasks to resume, %d already completed", len(resumeTasks), completedCount), oldApplyState, state.Apply.Running)
 
 		resumeCtx, cancelResume := context.WithCancel(context.Background())
-		c.cancelApply = cancelResume
-		go c.resumeApplySequential(resumeCtx, apply, resumeTasks, plan, options)
+		c.setApplyCancel(cancelResume)
+		go func() {
+			defer c.clearApplyCancel()
+			defer cancelResume()
+			c.resumeApplySequential(resumeCtx, apply, resumeTasks, plan, options)
+		}()
 	}
 
 	return &ternv1.StartResponse{
@@ -362,15 +366,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 
 // buildApplyOptions converts apply options to the string map used by the engine.
 func buildApplyOptions(apply *storage.Apply) map[string]string {
-	opts := apply.GetOptions()
-	options := make(map[string]string)
-	if opts.DeferCutover {
-		options["defer_cutover"] = "true"
-	}
-	if opts.AllowUnsafe {
-		options["allow_unsafe"] = "true"
-	}
-	return options
+	return apply.GetOptions().Map()
 }
 
 // prepareRetryableTasksForResume queues only the task work that previously
@@ -394,10 +390,12 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 }
 
 // launchAtomicResume sends all DDLs to the engine in one call, marks tasks and
-// apply as RUNNING, logs the provided message, and starts pollForCompletionAtomic
-// in a background goroutine. Used by both Start() and ResumeApply().
+// apply as RUNNING, logs the provided message, and then polls for completion.
+// Scheduler-owned calls block so the worker owns the apply until terminal or
+// retry-waiting state; user start calls poll in the background and returns
+// after the engine accepts the resume.
 func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.Apply,
-	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string) error {
+	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string, block bool) error {
 
 	var ddls []string
 	for _, t := range tasks {
@@ -449,6 +447,13 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 		logMessage, oldApplyState, state.Apply.Running)
 
+	if block {
+		stopHeartbeat := c.startApplyHeartbeat(ctx, apply)
+		defer stopHeartbeat()
+		c.pollForCompletionAtomic(ctx, apply, tasks, creds, nil)
+		return nil
+	}
+
 	stopHeartbeat := c.startApplyHeartbeat(context.Background(), apply)
 	go func() {
 		defer stopHeartbeat()
@@ -464,9 +469,9 @@ func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*stor
 	}
 }
 
-// ResumeApply resumes an in-progress apply whose heartbeat has expired.
-// This can happen after a server restart or if the worker goroutine crashed.
-// Spirit's checkpoint table allows resuming from where the schema change left off.
+// ResumeApply starts or resumes an apply claimed by a scheduler worker.
+// Pending applies are dispatched for the first time; stale applies use the
+// engine's resume metadata to continue after a missed heartbeat.
 func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
 	// Get tasks for this apply
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
@@ -499,6 +504,11 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		}
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
+	}
+
+	if state.IsState(apply.State, state.Apply.Pending) {
+		c.dispatchQueuedApply(ctx, apply, tasks, plan)
+		return ctx.Err()
 	}
 
 	c.logger.Info("resuming apply (heartbeat expired)",
@@ -539,7 +549,11 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	options := buildApplyOptions(apply)
 
 	if apply.GetOptions().DeferCutover {
-		if err := c.launchAtomicResume(ctx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply))); err != nil {
+		resumeCtx, cancelResume := context.WithCancel(ctx)
+		c.setApplyCancel(cancelResume)
+		defer c.clearApplyCancel()
+		defer cancelResume()
+		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply)), true); err != nil {
 			if c.shouldRetryEngineError(err) {
 				c.logger.Warn("engine apply failed during recovery, pausing apply for scheduler retry",
 					"apply_id", apply.ApplyIdentifier,
@@ -566,8 +580,29 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"Apply resumed from checkpoint (sequential)", "", state.Apply.Running)
 
-		go c.resumeApplySequential(context.Background(), apply, activeTasks, plan, options)
+		resumeCtx, cancelResume := context.WithCancel(ctx)
+		c.setApplyCancel(cancelResume)
+		defer c.clearApplyCancel()
+		defer cancelResume()
+		c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options)
 	}
 
-	return nil
+	return ctx.Err()
+}
+
+func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) {
+	options := buildApplyOptions(apply)
+	applyCtx, cancelApply := context.WithCancel(ctx)
+	c.setApplyCancel(cancelApply)
+	defer c.clearApplyCancel()
+	defer cancelApply()
+
+	c.logger.Info("dispatching queued apply",
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"state", apply.State,
+		"task_count", len(tasks),
+	)
+
+	c.runApplyExecution(applyCtx, apply, tasks, plan, options)
 }

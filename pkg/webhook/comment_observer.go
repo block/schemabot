@@ -70,7 +70,7 @@ type CommentObserverConfig struct {
 }
 
 // SetApplyID sets the apply ID after the apply record is created.
-// Called by LocalClient.Apply() when consuming a pending observer.
+// Called before the observer is registered for progress notifications.
 func (o *CommentObserver) SetApplyID(id int64) {
 	o.applyID = id
 }
@@ -116,7 +116,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 
 	// Post cutover comment when entering cutting_over with defer_cutover,
 	// but only if one hasn't been posted already.
-	if currentState == state.Apply.CuttingOver && o.deferCutover && !o.hasCutoverComment {
+	if currentState == state.Apply.CuttingOver && o.shouldDeferCutover(apply) && !o.hasCutoverComment {
 		body := formatCutoverComment(apply, tasks)
 		o.postAndTrackComment(state.Comment.Cutover, body)
 		o.hasCutoverComment = true
@@ -208,6 +208,10 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 	if o.OnTerminalHook != nil {
 		o.OnTerminalHook(apply)
 	}
+}
+
+func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
+	return o.deferCutover || apply.GetOptions().DeferCutover
 }
 
 // editTrackedComment looks up a stored comment ID and edits it.

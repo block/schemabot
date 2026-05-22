@@ -92,11 +92,9 @@ package tern
 // helper translates apply_identifier → external_id before calling Tern.
 //
 // In local mode (client.IsRemote() == false), the LocalClient runs in the
-// same process and writes to the same database as the API layer. It creates
-// the apply record (with no external_id) before ExecuteApply runs.
-// ExecuteApply sees IsRemote() == false and keeps applyIdentifier =
-// resp.ApplyId, leaving external_id empty. LocalClient uses apply_id
-// when provided, falling back to database lookup.
+// same process and writes to the same database as the API layer. API-created
+// applies are queued in SchemaBot storage with no external_id, then scheduler
+// workers dispatch them through LocalClient.ResumeApply().
 
 import (
 	"context"
@@ -355,12 +353,9 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 
 // ResumeApply starts background progress tracking for an apply.
 //
-// Called from two places:
-//   - ExecuteApply (fresh apply): the apply was just created in SchemaBot's
-//     storage but the background poller hasn't started yet. State is "pending".
-//   - RecoverInProgress (crash recovery): the apply's heartbeat expired,
-//     indicating the previous poller died. State may be "stopped" (needs
-//     Start RPC) or still "running"/"pending" (just needs a new poller).
+// Called when a fresh remote apply needs progress tracking or when the apply's
+// heartbeat expired, indicating the previous poller died. State may be stopped
+// (needs a Start RPC) or already active (just needs a new poller).
 //
 // In contrast, LocalClient doesn't need this — it starts its own poller
 // inside LocalClient.Apply() because it shares the same storage.

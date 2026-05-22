@@ -78,6 +78,15 @@ func TestFormatProgressComment_WithError(t *testing.T) {
 	assert.Contains(t, body, "Failed")
 }
 
+func TestCommentObserverShouldDeferCutoverUsesPersistedApplyOption(t *testing.T) {
+	apply := &storage.Apply{
+		Options: storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+	}
+	observer := &CommentObserver{}
+
+	assert.True(t, observer.shouldDeferCutover(apply))
+}
+
 func TestFormatCutoverComment(t *testing.T) {
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-abc123",

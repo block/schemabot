@@ -36,15 +36,23 @@ type taskStore struct {
 	db *sql.DB
 }
 
+type taskInserter interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // Create stores a new task.
 func (s *taskStore) Create(ctx context.Context, task *storage.Task) (int64, error) {
+	return insertTask(ctx, s.db, task)
+}
+
+func insertTask(ctx context.Context, execer taskInserter, task *storage.Task) (int64, error) {
 	// Ensure options has valid JSON (empty object if nil)
 	options := task.Options
 	if len(options) == 0 {
 		options = []byte("{}")
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	result, err := execer.ExecContext(ctx, `
 		INSERT INTO tasks (
 			task_identifier, apply_id, plan_id, database_name, database_type,
 			namespace, table_name, ddl, ddl_action,

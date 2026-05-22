@@ -81,13 +81,13 @@ request bodies that try to send database or deployment fields.
 
 ## Scheduler
 
-On startup, the service launches a background scheduler (`StartScheduler`) that claims apply work from storage. A claim means selecting one stale apply and refreshing its heartbeat in the same transaction so the worker has a lease while it resumes the apply.
+On startup, the service launches a background scheduler (`StartScheduler`) that claims apply work from storage. A claim means selecting one apply that needs work and refreshing its heartbeat in the same transaction so the worker has a lease while it starts or resumes the apply.
 
 1. Runs immediately, then polls every 10 seconds per configured worker
-2. Finds applies with stale heartbeats (no update for 1+ minute)
+2. Finds fresh queued applies or applies with stale heartbeats (no update for 1+ minute)
 3. Claims one apply atomically by selecting it and refreshing its heartbeat in the same transaction
 4. Gets the appropriate Tern client for the database/environment
-5. Calls `ResumeApply()` so execution continues from persisted engine state
+5. Calls `ResumeApply()` so execution starts from the queue or continues from persisted engine state
 
 Stopped applies (user called `schemabot stop`) are **not** auto-resumed. The user must explicitly call `schemabot start`.
 

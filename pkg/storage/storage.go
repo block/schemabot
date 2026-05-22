@@ -168,6 +168,11 @@ type ApplyStore interface {
 	// the same database, database type, and environment.
 	Create(ctx context.Context, apply *Apply) (int64, error)
 
+	// CreateWithTasks stores a new apply and its initial tasks in one
+	// transaction. Pending applies become scheduler-claimable only after the
+	// task rows are committed.
+	CreateWithTasks(ctx context.Context, apply *Apply, tasks []*Task) (int64, error)
+
 	// Get returns an apply by ID, or nil if not found.
 	Get(ctx context.Context, id int64) (*Apply, error)
 
@@ -200,9 +205,9 @@ type ApplyStore interface {
 	GetInProgress(ctx context.Context) ([]*Apply, error)
 
 	// FindNextApply atomically claims the next apply that needs attention.
-	// A claim selects one stale apply and refreshes its heartbeat in the same
-	// transaction. That heartbeat is the scheduler's lease while it reloads
-	// state and resumes the apply.
+	// A claim selects one apply that needs work and refreshes its heartbeat in
+	// the same transaction. That heartbeat is the scheduler's lease while it
+	// reloads state and starts or resumes the apply.
 	// Returns the claimed apply, or nil if nothing needs work.
 	FindNextApply(ctx context.Context) (*Apply, error)
 

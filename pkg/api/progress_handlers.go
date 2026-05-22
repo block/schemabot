@@ -27,6 +27,8 @@ func changeTypeToString(ct ternv1.ChangeType) string {
 		return ddl.StatementTypeToOp(statement.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
 		return ddl.StatementTypeToOp(statement.StatementDropTable)
+	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
+		return "vschema_update"
 	default:
 		return ""
 	}

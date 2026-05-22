@@ -100,7 +100,7 @@ Task fields updated during polling (`storage.Task` in `pkg/storage/types.go`):
 | `pollTaskToCompletion` (sequential mode) | Poller goroutine | Every 500ms | Same as above, plus `IsInstant` |
 | `LocalClient.Stop()` | Stop handler | Once, after `eng.Stop()` blocks | `State` → STOPPED (or COMPLETED if table finished), `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `CompletedAt` |
 | `LocalClient.Progress()` | Progress handler | On each API call (if engine state changed and task is non-terminal) | `State`, `UpdatedAt`, `CompletedAt` |
-| `executeApplyAtomic` / `executeApplySequential` | Apply launcher | Once at start | `State` → RUNNING, `StartedAt` |
+| `executeGroupedApply` / `executeApplySequential` | Apply launcher | Once at start | `State` → RUNNING, `StartedAt` |
 
 The pollers are the primary write path during normal operation. The Stop handler is special:
 it calls `eng.Stop()` first (which blocks until Spirit's goroutine exits), THEN reads

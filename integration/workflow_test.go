@@ -63,6 +63,11 @@ func createTestDB(t *testing.T, prefix string) (appDBName, appDSN string) {
 // registered via t.Cleanup.
 func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 	t.Helper()
+	return startTestServerWithSchedulerInterval(t, appDBName, appDSN, 200*time.Millisecond)
+}
+
+func startTestServerWithSchedulerInterval(t *testing.T, appDBName, appDSN string, schedulerInterval time.Duration) testServer {
+	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -91,6 +96,7 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 	svc := schemabotapi.New(storage, serverConfig, map[string]tern.Client{
 		appDBName + "/staging": localClient,
 	}, logger)
+	startTestSchedulerWithInterval(t, svc, schedulerInterval)
 
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
@@ -127,6 +133,18 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 	})
 
 	return testServer{Addr: addr, Storage: storage, Service: svc}
+}
+
+func startTestScheduler(t *testing.T, svc *schemabotapi.Service) {
+	t.Helper()
+	startTestSchedulerWithInterval(t, svc, 200*time.Millisecond)
+}
+
+func startTestSchedulerWithInterval(t *testing.T, svc *schemabotapi.Service, interval time.Duration) {
+	t.Helper()
+
+	require.NoError(t, svc.SetSchedulerPollInterval(interval))
+	svc.StartScheduler(t.Context())
 }
 
 // postJSON marshals body as JSON, POSTs to url, asserts HTTP 200,
@@ -1318,7 +1336,10 @@ func TestFullWorkflow_Spirit_PartialFailure(t *testing.T) {
 	ctx := t.Context()
 
 	appDBName, _ := createTestDB(t, "partialfail_")
-	ts := startTestServer(t, appDBName, strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1))
+	// The first queued apply starts through a scheduler wake, so this test can
+	// use a slower poll interval to observe the retryable pause before the next
+	// scheduler retry consumes it.
+	ts := startTestServerWithSchedulerInterval(t, appDBName, strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1), 5*time.Second)
 
 	endpoint := "http://" + ts.Addr
 
