@@ -49,6 +49,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +59,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -174,20 +176,106 @@ func TestK8s_PlanApply_AddColumn(t *testing.T) {
 	require.NotEmpty(t, prog.Tables, "tables should be present in progress")
 	assert.Equal(t, tableName, prog.Tables[0].TableName, "progress should report the correct table")
 
-	// Verify external_id on the control plane's storage — this is set from the
-	// data plane's apply ID returned over gRPC. Its presence proves the gRPC
-	// Apply() call succeeded and the response was persisted.
+	// Verify lifecycle fields on the control plane's storage. external_id is
+	// the data-plane apply ID returned over gRPC, while started_at/completed_at
+	// prove the control-plane poller persisted the remote lifecycle to storage.
 	sbDB, err := sql.Open("mysql", testutil.SchemabotDSN(t))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(sbDB)
 
-	var externalID string
-	err = sbDB.QueryRowContext(t.Context(),
-		"SELECT external_id FROM applies WHERE apply_identifier = ?",
-		applyResp.ApplyID,
-	).Scan(&externalID)
-	require.NoError(t, err, "query apply record on control plane")
+	externalID, startedAt, completedAt := waitForControlPlaneApplyLifecycle(t, sbDB, applyResp.ApplyID)
 	assert.NotEmpty(t, externalID, "external_id should be set — proves data plane returned its apply ID over gRPC")
+	assert.False(t, completedAt.Before(startedAt), "completed_at should not be before started_at")
+
+	// The control plane owns the operator-facing apply history even though the
+	// data plane executes the schema change. Logs should show dispatch to the
+	// data plane and the terminal state observed by the control-plane poller.
+	waitForControlPlaneApplyLogs(t, ep, applyResp.ApplyID, tableName)
+}
+
+func waitForControlPlaneApplyLifecycle(t *testing.T, db *sql.DB, applyID string) (string, time.Time, time.Time) {
+	t.Helper()
+
+	var externalID string
+	var startedAt, completedAt sql.NullTime
+	var lastErr error
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			lastErr = db.QueryRowContext(t.Context(),
+				"SELECT external_id, started_at, completed_at FROM applies WHERE apply_identifier = ?",
+				applyID,
+			).Scan(&externalID, &startedAt, &completedAt)
+			if lastErr != nil {
+				return false
+			}
+			return externalID != "" && startedAt.Valid && completedAt.Valid && !completedAt.Time.Before(startedAt.Time)
+		},
+		func() string {
+			return fmt.Sprintf("control-plane apply lifecycle was not persisted for %s: external_id=%q started_at=%v completed_at=%v last_err=%v",
+				applyID, externalID, startedAt, completedAt, lastErr)
+		})
+
+	return externalID, startedAt.Time, completedAt.Time
+}
+
+func waitForControlPlaneApplyLogs(t *testing.T, endpoint string, applyID, tableName string) {
+	t.Helper()
+
+	var logs []*client.LogEntry
+	var lastErr error
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			logs, lastErr = client.GetLogs(endpoint, "", "", applyID, 50)
+			return lastErr == nil &&
+				hasLogNewState(logs, "Apply queued", state.Apply.Pending) &&
+				hasLogTransition(logs, "Apply dispatched to remote Tern", state.Apply.Pending, state.Apply.Running) &&
+				hasLogTransition(logs, "Remote apply reached terminal state: completed", state.Apply.Running, state.Apply.Completed) &&
+				hasLogTransitionTo(logs, "Remote task "+tableName+" changed state", state.Task.Completed)
+		},
+		func() string {
+			return fmt.Sprintf("control-plane apply logs did not contain the full remote lifecycle for %s: api_logs=%s last_err=%v",
+				applyID, formatLogEntries(logs), lastErr)
+		})
+}
+
+func hasLogNewState(logs []*client.LogEntry, messageContains, newState string) bool {
+	for _, log := range logs {
+		if strings.Contains(log.Message, messageContains) && log.NewState == newState {
+			return true
+		}
+	}
+	return false
+}
+
+func hasLogTransition(logs []*client.LogEntry, messageContains, oldState, newState string) bool {
+	for _, log := range logs {
+		if strings.Contains(log.Message, messageContains) &&
+			log.EventType == storage.LogEventStateTransition &&
+			log.OldState == oldState &&
+			log.NewState == newState {
+			return true
+		}
+	}
+	return false
+}
+
+func hasLogTransitionTo(logs []*client.LogEntry, messageContains, newState string) bool {
+	for _, log := range logs {
+		if strings.Contains(log.Message, messageContains) &&
+			log.EventType == storage.LogEventStateTransition &&
+			log.NewState == newState {
+			return true
+		}
+	}
+	return false
+}
+
+func formatLogEntries(logs []*client.LogEntry) string {
+	parts := make([]string, 0, len(logs))
+	for _, log := range logs {
+		parts = append(parts, fmt.Sprintf("%s:%s:%s->%s", log.EventType, log.Message, log.OldState, log.NewState))
+	}
+	return strings.Join(parts, " | ")
 }
 
 // TestK8s_PlanApply_CreateTable tests creating a new table through the two-tier path.
@@ -265,7 +353,7 @@ func TestK8s_Scheduler_DataPlanePodRestartRecoversIndexAdd(t *testing.T) {
 
 	crashedPod := crashPod(t, "data-plane")
 
-	// The restarted data-plane scheduler claims stale local apply rows. Aging
+	// The restarted data-plane scheduler claims stale data-plane apply rows. Aging
 	// the heartbeat avoids waiting for the production staleness threshold.
 	markDataPlaneHeartbeatStale(t, fixture.DataPlaneApplyID)
 	waitForReplacementPodReady(t, "data-plane", crashedPod, 2*time.Minute)
