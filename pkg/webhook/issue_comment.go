@@ -247,12 +247,14 @@ func (h *Handler) postComment(repo string, pr int, installationID int64, body st
 
 	client, err := h.ghClient.ForInstallation(installationID)
 	if err != nil {
-		h.logger.Error("failed to create GitHub client", "error", err)
+		h.logger.Error("failed to create GitHub client for comment",
+			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
 		return
 	}
 
 	if _, err := client.CreateIssueComment(ctx, repo, pr, body); err != nil {
-		h.logger.Error("failed to post comment", "repo", repo, "pr", pr, "error", err)
+		h.logger.Error("failed to post comment",
+			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
 	}
 }
 

@@ -6,10 +6,11 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
-| `schemabot.plans.total` | Counter | database, environment, status | Total plan operations |
-| `schemabot.plan.duration_seconds` | Histogram | database, environment, status | Plan execution time |
-| `schemabot.applies.total` | Counter | database, environment, status | Total apply operations |
-| `schemabot.apply.duration_seconds` | Histogram | database, environment, status | Apply API call time |
+| `schemabot.plans.total` | Counter | repository, database, environment, status | Total plan operations |
+| `schemabot.plan.duration_seconds` | Histogram | repository, database, environment, status | Plan execution time |
+| `schemabot.applies.total` | Counter | repository, database, environment, status | Total apply operations |
+| `schemabot.apply.duration_seconds` | Histogram | repository, database, environment, status | Apply API call time |
+| `schemabot.schema_request.errors_total` | Counter | repository, command, database, environment, reason | Schema request errors by reason |
 | `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies |
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |

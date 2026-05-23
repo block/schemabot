@@ -119,16 +119,16 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "resolve target")
-		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "error")
 		return nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
 	}
 	if req.Type != resolvedTarget.DatabaseType {
 		typeErr := fmt.Errorf("database %q type %q does not match server config type %q", req.Database, req.Type, resolvedTarget.DatabaseType)
 		span.RecordError(typeErr)
 		span.SetStatus(codes.Error, "type mismatch")
-		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "error")
 		return nil, typeErr
 	}
 	deployment := resolvedTarget.Deployment
@@ -160,8 +160,8 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 			reason := sourcePolicyReason(err)
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "source policy")
-			metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
-			metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
+			metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "error")
+			metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "error")
 			metrics.RecordSourcePolicyBlock(ctx, "plan", req.Database, req.Environment, reason)
 			s.logger.Warn("plan blocked by source policy",
 				"database", req.Database,
@@ -179,8 +179,8 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "tern client")
-		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "error")
 		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
@@ -210,13 +210,13 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "plan failed")
-		metrics.RecordPlan(ctx, req.Database, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "error")
+		metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "error")
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "error")
 		return nil, err
 	}
 	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
-	metrics.RecordPlan(ctx, req.Database, req.Environment, "success")
-	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Database, req.Environment, "success")
+	metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "success")
+	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "success")
 
 	s.logger.Info("ExecutePlan: plan response",
 		"plan_id", resp.PlanId,
@@ -342,21 +342,21 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		applyErr := fmt.Errorf("plan %s was created for environment %q, not %q", req.PlanID, plan.Environment, req.Environment)
 		span.RecordError(applyErr)
 		span.SetStatus(codes.Error, "environment mismatch")
-		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
+		metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, "error")
 		return nil, 0, applyErr
 	}
 	if plan.Deployment == "" {
 		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "deployment")
 		span.RecordError(applyErr)
 		span.SetStatus(codes.Error, "missing stored deployment")
-		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
+		metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, "error")
 		return nil, 0, applyErr
 	}
 	if plan.Target == "" {
 		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "target")
 		span.RecordError(applyErr)
 		span.SetStatus(codes.Error, "missing stored target")
-		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
+		metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, "error")
 		return nil, 0, applyErr
 	}
 	// Source policy is evaluated for plans created from SchemaBot's trusted
@@ -380,7 +380,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 			reason := sourcePolicyReason(err)
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "source policy")
-			metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
+			metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, "error")
 			metrics.RecordSourcePolicyBlock(ctx, "apply", plan.Database, req.Environment, reason)
 			s.logger.Warn("apply blocked by source policy",
 				"plan_id", req.PlanID,
@@ -401,7 +401,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "tern client")
-		metrics.RecordApply(ctx, plan.Database, req.Environment, "error")
+		metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, "error")
 		return nil, 0, fmt.Errorf("database %q (%s): %w", plan.Database, req.Environment, err)
 	}
 
@@ -413,8 +413,8 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 
 	enqueueStart := time.Now()
 	recordApplyResult := func(status string) {
-		metrics.RecordApply(ctx, plan.Database, req.Environment, status)
-		metrics.RecordApplyDuration(ctx, time.Since(enqueueStart), plan.Database, req.Environment, status)
+		metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, status)
+		metrics.RecordApplyDuration(ctx, time.Since(enqueueStart), plan.Repository, plan.Database, req.Environment, status)
 	}
 	recordApplyError := func(status string, err error) {
 		span.RecordError(err)

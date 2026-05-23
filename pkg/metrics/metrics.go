@@ -19,7 +19,7 @@ const meterName = "schemabot"
 //
 // The OTel SDK deduplicates instruments with the same name, so repeated calls
 // to Int64Counter are cheap after the first registration.
-func RecordPlan(ctx context.Context, database, environment, status string) {
+func RecordPlan(ctx context.Context, repo, database, environment, status string) {
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64Counter("schemabot.plans.total",
 		otelmetric.WithDescription("Total number of plan operations"),
@@ -31,6 +31,7 @@ func RecordPlan(ctx context.Context, database, environment, status string) {
 	}
 	counter.Add(ctx, 1,
 		otelmetric.WithAttributes(
+			attribute.String("repository", repo),
 			attribute.String("database", database),
 			attribute.String("environment", environment),
 			attribute.String("status", status),
@@ -39,7 +40,7 @@ func RecordPlan(ctx context.Context, database, environment, status string) {
 }
 
 // RecordPlanDuration records the duration of a plan operation.
-func RecordPlanDuration(ctx context.Context, duration time.Duration, database, environment, status string) {
+func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, database, environment, status string) {
 	meter := otel.Meter(meterName)
 	hist, err := meter.Float64Histogram("schemabot.plan.duration_seconds",
 		otelmetric.WithDescription("Duration of plan operations"),
@@ -51,6 +52,7 @@ func RecordPlanDuration(ctx context.Context, duration time.Duration, database, e
 	}
 	hist.Record(ctx, duration.Seconds(),
 		otelmetric.WithAttributes(
+			attribute.String("repository", repo),
 			attribute.String("database", database),
 			attribute.String("environment", environment),
 			attribute.String("status", status),
@@ -60,7 +62,7 @@ func RecordPlanDuration(ctx context.Context, duration time.Duration, database, e
 
 // RecordApply increments the applies counter with database, environment, and status attributes.
 // Status should be "success", "error", "rejected", or "conflict".
-func RecordApply(ctx context.Context, database, environment, status string) {
+func RecordApply(ctx context.Context, repo, database, environment, status string) {
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64Counter("schemabot.applies.total",
 		otelmetric.WithDescription("Total number of apply operations"),
@@ -72,6 +74,7 @@ func RecordApply(ctx context.Context, database, environment, status string) {
 	}
 	counter.Add(ctx, 1,
 		otelmetric.WithAttributes(
+			attribute.String("repository", repo),
 			attribute.String("database", database),
 			attribute.String("environment", environment),
 			attribute.String("status", status),
@@ -81,7 +84,7 @@ func RecordApply(ctx context.Context, database, environment, status string) {
 
 // RecordApplyDuration records the duration of an apply operation (API call time,
 // not the full Spirit run which can take hours).
-func RecordApplyDuration(ctx context.Context, duration time.Duration, database, environment, status string) {
+func RecordApplyDuration(ctx context.Context, duration time.Duration, repo, database, environment, status string) {
 	meter := otel.Meter(meterName)
 	hist, err := meter.Float64Histogram("schemabot.apply.duration_seconds",
 		otelmetric.WithDescription("Duration of apply operations (API call time)"),
@@ -93,6 +96,7 @@ func RecordApplyDuration(ctx context.Context, duration time.Duration, database, 
 	}
 	hist.Record(ctx, duration.Seconds(),
 		otelmetric.WithAttributes(
+			attribute.String("repository", repo),
 			attribute.String("database", database),
 			attribute.String("environment", environment),
 			attribute.String("status", status),
@@ -395,6 +399,30 @@ var knownWebhookActions = map[string]bool{
 	"requested":   true, // check_run
 	"completed":   true, // check_run
 	"":            true, // events without actions (e.g., ping)
+}
+
+// RecordSchemaRequestError increments the schema request error counter.
+// Reason should be a stable string: "database_not_found", "invalid_config",
+// "no_config", "multiple_configs", or "unexpected".
+func RecordSchemaRequestError(ctx context.Context, repo, command, database, environment, reason string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.schema_request.errors_total",
+		otelmetric.WithDescription("Schema request errors by reason"),
+		otelmetric.WithUnit("{error}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create schema request error counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("repository", repo),
+			attribute.String("command", command),
+			attribute.String("database", database),
+			attribute.String("environment", environment),
+			attribute.String("reason", reason),
+		),
+	)
 }
 
 // RecordWebhookEvent increments the webhook events counter.

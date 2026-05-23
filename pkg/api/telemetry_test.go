@@ -57,7 +57,7 @@ func TestSetupTelemetryWithOTLP(t *testing.T) {
 	assert.NotNil(t, tel.tracerProvider, "tracerProvider should be set with OTLP endpoint")
 
 	// Record a metric so there's data to push.
-	metrics.RecordPlan(t.Context(), "testdb", "staging", "success")
+	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "staging", "success")
 
 	// Create a trace span so there's trace data to push.
 	tracer := otel.Tracer("test")
@@ -109,10 +109,10 @@ func TestRecordPlanMetric(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordPlan(t.Context(), "testdb", "staging", "success")
-	metrics.RecordPlan(t.Context(), "testdb", "staging", "success")
-	metrics.RecordPlan(t.Context(), "testdb", "staging", "error")
-	metrics.RecordPlan(t.Context(), "other", "production", "success")
+	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "staging", "success")
+	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "staging", "success")
+	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "staging", "error")
+	metrics.RecordPlan(t.Context(), "testrepo", "other", "production", "success")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
@@ -140,15 +140,15 @@ func TestRecordPlanMetric(t *testing.T) {
 			DataPoints: []metricdata.DataPoint[int64]{
 				{
 					Value:      2,
-					Attributes: attribute.NewSet(attribute.String("database", "testdb"), attribute.String("environment", "staging"), attribute.String("status", "success")),
+					Attributes: attribute.NewSet(attribute.String("repository", "testrepo"), attribute.String("database", "testdb"), attribute.String("environment", "staging"), attribute.String("status", "success")),
 				},
 				{
 					Value:      1,
-					Attributes: attribute.NewSet(attribute.String("database", "testdb"), attribute.String("environment", "staging"), attribute.String("status", "error")),
+					Attributes: attribute.NewSet(attribute.String("repository", "testrepo"), attribute.String("database", "testdb"), attribute.String("environment", "staging"), attribute.String("status", "error")),
 				},
 				{
 					Value:      1,
-					Attributes: attribute.NewSet(attribute.String("database", "other"), attribute.String("environment", "production"), attribute.String("status", "success")),
+					Attributes: attribute.NewSet(attribute.String("repository", "testrepo"), attribute.String("database", "other"), attribute.String("environment", "production"), attribute.String("status", "success")),
 				},
 			},
 		},
@@ -236,10 +236,10 @@ func TestRecordApplyMetrics(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordApply(t.Context(), "mydb", "staging", "success")
-	metrics.RecordApply(t.Context(), "mydb", "staging", "error")
-	metrics.RecordApply(t.Context(), "mydb", "staging", "conflict")
-	metrics.RecordApplyDuration(t.Context(), 2*time.Second, "mydb", "staging", "success")
+	metrics.RecordApply(t.Context(), "testrepo", "mydb", "staging", "success")
+	metrics.RecordApply(t.Context(), "testrepo", "mydb", "staging", "error")
+	metrics.RecordApply(t.Context(), "testrepo", "mydb", "staging", "conflict")
+	metrics.RecordApplyDuration(t.Context(), 2*time.Second, "testrepo", "mydb", "staging", "success")
 
 	names := collectMetricNames(t, reader)
 	assert.True(t, names["schemabot.applies.total"], "expected schemabot.applies.total")
@@ -397,7 +397,7 @@ func TestRecordPlanDurationMetric(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordPlanDuration(t.Context(), 500*time.Millisecond, "mydb", "staging", "success")
+	metrics.RecordPlanDuration(t.Context(), 500*time.Millisecond, "testrepo", "mydb", "staging", "success")
 
 	names := collectMetricNames(t, reader)
 	assert.True(t, names["schemabot.plan.duration_seconds"], "expected schemabot.plan.duration_seconds")

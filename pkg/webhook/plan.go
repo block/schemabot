@@ -90,6 +90,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	planResp, err := h.service.ExecutePlan(ctx, planReq)
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
+		metrics.RecordPlan(ctx, repo, schemaResult.Database, environment, "error")
 		h.postFailingAggregates(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{
 			environment: userFacingError(err),
 		})
@@ -106,6 +107,8 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, requestedBy)
+
+	metrics.RecordPlan(ctx, repo, schemaResult.Database, environment, "success")
 
 	// Post plan comment
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
@@ -341,28 +344,45 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		CommandName:  commandName,
 	}
 
+	logFields := []any{
+		"repo", repo, "pr", pr, "environment", environment,
+		"database", databaseName, "action", commandName, "error", err,
+	}
+
+	ctx := context.Background()
+
 	var dbNotFoundErr *ghclient.DatabaseNotFoundError
 	if errors.As(err, &dbNotFoundErr) {
+		h.logger.Warn("schema request: database not found", logFields...)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_not_found")
 		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotFound(data))
 		return
 	}
 
 	if errors.Is(err, ghclient.ErrInvalidConfig) {
+		h.logger.Warn("schema request: invalid config", logFields...)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "invalid_config")
 		h.postComment(repo, pr, installationID, templates.RenderInvalidConfig(data))
 		return
 	}
 
 	if errors.Is(err, ghclient.ErrNoConfig) {
+		h.logger.Warn("schema request: no config found", logFields...)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "no_config")
 		h.postComment(repo, pr, installationID, templates.RenderNoConfig(data))
 		return
 	}
 
 	if errors.Is(err, ghclient.ErrMultipleConfigs) {
+		h.logger.Warn("schema request: multiple configs found", logFields...)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "multiple_configs")
 		data.AvailableDatabases = templates.FormatAvailableDatabases(err.Error())
 		h.postComment(repo, pr, installationID, templates.RenderMultipleConfigs(data))
 		return
 	}
 
+	h.logger.Error("schema request failed", logFields...)
+	metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "unexpected")
 	data.ErrorDetail = err.Error()
 	h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
 }
