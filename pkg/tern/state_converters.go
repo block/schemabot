@@ -48,6 +48,23 @@ func taskStateToApplyState(ts string) string {
 	}
 }
 
+func taskStateForTerminalApplyState(applyState string) string {
+	switch applyState {
+	case state.Apply.Completed:
+		return state.Task.Completed
+	case state.Apply.Failed:
+		return state.Task.Failed
+	case state.Apply.Stopped:
+		return state.Task.Stopped
+	case state.Apply.Cancelled:
+		return state.Task.Cancelled
+	case state.Apply.Reverted:
+		return state.Task.Reverted
+	default:
+		return ""
+	}
+}
+
 // engineStateToStorage converts engine State to a canonical task state string.
 func engineStateToStorage(es engine.State) string {
 	switch es {
