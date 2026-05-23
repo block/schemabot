@@ -310,7 +310,13 @@ func (ic *InstallationClient) FindConfigForPR(ctx context.Context, repo string, 
 
 		config, err := ic.FetchConfig(ctx, repo, configPath, prInfo.HeadSHA)
 		if err != nil {
-			continue
+			if errors.Is(err, ErrNoConfig) {
+				continue
+			}
+			// Config not found at this path is expected — the search
+			// walks up parent directories. Other errors (auth failures,
+			// rate limits, server errors) must propagate.
+			return nil, "", err
 		}
 
 		depth := strings.Count(dir, "/")

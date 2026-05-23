@@ -129,6 +129,36 @@ func TestFindAllConfigsForPRDoesNotClassifyMissingConfigAsGitHubUnavailable(t *t
 	assert.Empty(t, configs)
 }
 
+// TestFindConfigForPR_AuthFailureDoesNotFallThroughToNoConfig verifies that
+// auth errors propagate instead of being swallowed as ErrNoConfig.
+func TestFindConfigForPR_AuthFailureDoesNotFallThroughToNoConfig(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{SHA: new("abc123")},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.CommitFile{{
+			Filename: new("schema/mydb/orders.sql"),
+			Status:   new("modified"),
+		}}))
+	})
+	// Config fetch returns 401 (simulates stale installation token)
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"Bad credentials"}`))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, _, err := ic.FindConfigForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, ErrNoConfig))
+	assert.Contains(t, err.Error(), "401")
+}
+
 func setupConfigTestGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {
 	t.Helper()
 
