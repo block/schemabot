@@ -786,10 +786,14 @@ func ddlMatchesStoredPlan(planResp *apitypes.PlanResponse, storedPlan *storage.P
 // SchemaBot's own checks and checks with conclusion "neutral", "skipped", or "success".
 // Only checks with completed status and conclusion "failure", "error", or "timed_out"
 // are considered failing.
-func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus) []templates.BlockingCheck {
+func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var failing []templates.BlockingCheck
+	filterRequiredChecks := statusRollupContainsRequiredCheck(statuses, config)
 	for _, s := range statuses {
 		if s.IsSchemaBot {
+			continue
+		}
+		if filterRequiredChecks && !config.IsCheckRequired(s.Name) {
 			continue
 		}
 		if s.Status != "completed" {
@@ -810,7 +814,8 @@ func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus) []templa
 // Returns true if apply was blocked (caller should return), false if it may proceed.
 // Blocks on both failing checks and in-progress checks with distinct messages.
 func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, headSHA, environment string) bool {
-	if !h.service.Config().ShouldRequirePassingChecks() {
+	config := h.service.Config()
+	if !config.ShouldRequirePassingChecks() {
 		h.logger.Debug("passing checks gate disabled", "repo", repo, "pr", pr)
 		return false
 	}
@@ -824,8 +829,8 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 		return true
 	}
 
-	failing := filterFailingNonSchemaBotChecks(statuses)
-	inProgress := filterInProgressNonSchemaBotChecks(statuses)
+	failing := filterFailingNonSchemaBotChecks(statuses, config)
+	inProgress := filterInProgressNonSchemaBotChecks(statuses, config)
 
 	if len(failing) > 0 {
 		h.logger.Info("apply blocked by failing PR checks",
@@ -850,10 +855,14 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 
 // filterInProgressNonSchemaBotChecks returns checks that are still running,
 // excluding SchemaBot's own checks.
-func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus) []templates.BlockingCheck {
+func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var inProgress []templates.BlockingCheck
+	filterRequiredChecks := statusRollupContainsRequiredCheck(statuses, config)
 	for _, s := range statuses {
 		if s.IsSchemaBot {
+			continue
+		}
+		if filterRequiredChecks && !config.IsCheckRequired(s.Name) {
 			continue
 		}
 		switch s.Status {
@@ -865,6 +874,21 @@ func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus) []tem
 		}
 	}
 	return inProgress
+}
+
+func statusRollupContainsRequiredCheck(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) bool {
+	if config == nil || len(config.RequiredChecks) == 0 {
+		return false
+	}
+	for _, s := range statuses {
+		if s.IsSchemaBot {
+			continue
+		}
+		if config.IsCheckRequired(s.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command.

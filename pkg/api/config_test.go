@@ -246,6 +246,45 @@ func TestServerConfig_Validate(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "valid required checks",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{"Owner Owl", "CI / lint"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "required checks reject empty values",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{"Owner Owl", ""},
+			},
+			wantErr: true,
+		},
+		{
+			name: "required checks reject duplicate values",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{"Owner Owl", "Owner Owl"},
+			},
+			wantErr: true,
+		},
+		{
 			name: "remote database target",
 			cfg: ServerConfig{
 				Databases: map[string]DatabaseConfig{
@@ -1073,6 +1112,51 @@ require_passing_checks: false
 		require.NoError(t, err)
 
 		assert.False(t, cfg.ShouldRequirePassingChecks())
+	})
+}
+
+func TestServerConfig_IsCheckRequired(t *testing.T) {
+	t.Run("nil receiver requires all checks", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.True(t, cfg.IsCheckRequired("CI / lint"))
+	})
+
+	t.Run("empty list requires all checks", func(t *testing.T) {
+		cfg := &ServerConfig{}
+		assert.True(t, cfg.IsCheckRequired("CI / lint"))
+	})
+
+	t.Run("configured list matches exact names only", func(t *testing.T) {
+		cfg := &ServerConfig{RequiredChecks: []string{"Owner Owl", "CI / lint"}}
+		assert.True(t, cfg.IsCheckRequired("Owner Owl"))
+		assert.True(t, cfg.IsCheckRequired("CI / lint"))
+		assert.False(t, cfg.IsCheckRequired("owner owl"))
+		assert.False(t, cfg.IsCheckRequired("CI / tests"))
+	})
+
+	t.Run("YAML deserialization", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "config.yaml")
+		content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/testapp"
+required_checks:
+  - "Owner Owl"
+  - "CI / lint"
+`
+		err := os.WriteFile(configPath, []byte(content), 0644)
+		require.NoError(t, err)
+
+		cfg, err := LoadServerConfigFromFile(configPath)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"Owner Owl", "CI / lint"}, cfg.RequiredChecks)
+		assert.True(t, cfg.IsCheckRequired("Owner Owl"))
+		assert.False(t, cfg.IsCheckRequired("CI / tests"))
 	})
 }
 

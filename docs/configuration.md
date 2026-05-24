@@ -179,6 +179,17 @@ require_passing_checks: true
 
 Apply is blocked in two cases: checks that have **failed** (`failure`, `error`, `timed_out`) and checks that are **still running** (`in_progress`, `queued`, `pending`). Each case shows a distinct message — failing checks prompt the user to fix them, while in-progress checks prompt the user to wait. Checks with conclusion `neutral` or `skipped` are ignored. SchemaBot's own checks (names starting with "SchemaBot") are always excluded.
 
+For repositories with many optional checks, `required_checks` can narrow the gate to specific check names:
+
+```yaml
+require_passing_checks: true
+required_checks:
+  - "Owner Owl"
+  - "CI / required-tests"
+```
+
+When any configured check appears in the PR status rollup, only configured checks are evaluated. A configured check that is absent does not block apply. If none of the configured checks appear, SchemaBot falls back to the default behavior and evaluates all non-SchemaBot checks.
+
 When checks are failing, SchemaBot posts a comment listing the failing checks and instructs the user to fix them before retrying.
 
 If the GitHub API is unreachable when checking statuses, the apply is blocked (fail-closed). SchemaBot posts a comment explaining the error and suggests retrying.
