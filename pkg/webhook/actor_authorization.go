@@ -76,24 +76,31 @@ func (h *Handler) authorizePRCommandActor(
 	actor string,
 	database string,
 ) (api.ActorAuthorizationResult, error) {
+	// Without server config, SchemaBot cannot know the trusted actor policy.
 	if h.service == nil {
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonMissingServerConfig}, fmt.Errorf("server config is unavailable")
 	}
 	config := h.service.Config()
+	// The feature is opt-in; disabled auth preserves existing PR command behavior.
 	if !config.PRCommandAuthorizationEnabled() {
 		return api.ActorAuthorizationResult{Allowed: true, Reason: api.ActorAuthReasonDisabled}, nil
 	}
 
+	// GitHub should provide a comment actor. Missing actor identity is unsafe for
+	// a mutating PR command, so deny instead of guessing.
 	if strings.TrimSpace(actor) == "" {
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonMissingActor}, nil
 	}
 
+	// Authorization is scoped to the resolved server-side database config.
 	dbConfig := config.Database(database)
 	if dbConfig == nil {
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonMissingDatabaseConfig}, nil
 	}
 
 	authConfig := config.PRCommandAuthorization
+	// User allowlists are local config checks, so evaluate them before making
+	// GitHub API calls for team membership.
 	if matched, principal := matchedUserPrincipal(authConfig.AdminUsers, actor); matched {
 		return api.ActorAuthorizationResult{
 			Allowed:          true,
@@ -101,6 +108,7 @@ func (h *Handler) authorizePRCommandActor(
 			MatchedPrincipal: principal,
 		}, nil
 	}
+	// Database operator users are allowed only for this database.
 	if matched, principal := matchedUserPrincipal(dbConfig.OperatorUsers, actor); matched {
 		return api.ActorAuthorizationResult{
 			Allowed:          true,
@@ -109,18 +117,27 @@ func (h *Handler) authorizePRCommandActor(
 		}, nil
 	}
 
+	// At this point no user principal matched. Decide whether there are any team
+	// principals left to check, or whether the policy can be denied locally.
 	teamCount := len(authConfig.AdminTeams) + len(dbConfig.OperatorTeams)
 	principalCount := teamCount + len(authConfig.AdminUsers) + len(dbConfig.OperatorUsers)
+	// Actor auth is enabled but no admin/operator principals exist for this
+	// database. Fail closed instead of treating an empty policy as "allow all".
 	if principalCount == 0 {
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonNoConfiguredPrincipal}, nil
 	}
+	// With user-only policy, reaching this point means the actor was not in any
+	// configured user allowlist. No GitHub client is needed to deny.
 	if teamCount == 0 {
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonNotAuthorized}, nil
 	}
+	// Team policy requires GitHub membership lookups. If the client is missing,
+	// the command cannot be authorized safely.
 	if client == nil {
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, fmt.Errorf("github client is nil")
 	}
 
+	// Global admin teams can approve any configured database.
 	matched, principal, err := actorInAnyTeam(ctx, client, authConfig.AdminTeams, actor)
 	if err != nil {
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, err
@@ -133,6 +150,8 @@ func (h *Handler) authorizePRCommandActor(
 		}, nil
 	}
 
+	// Database operator teams only authorize the database currently being
+	// mutated by this PR command.
 	matched, principal, err = actorInAnyTeam(ctx, client, dbConfig.OperatorTeams, actor)
 	if err != nil {
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, err
@@ -145,6 +164,7 @@ func (h *Handler) authorizePRCommandActor(
 		}, nil
 	}
 
+	// No configured user or team authorized this actor.
 	return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonNotAuthorized}, nil
 }
 

@@ -4128,6 +4128,38 @@ Schema changes require approval from a code owner before applying.
 </details>
 
 <details>
+<summary><a name="actor-authorization-not-authorized"></a><strong>Actor Authorization: Not Authorized</strong></summary>
+
+
+## SchemaBot Command Not Authorized
+
+**Database**: `orders` | **Environment**: `staging`
+**Requested by**: @mona
+
+@mona is not authorized to run `schemabot apply` for this database.
+
+A configured SchemaBot admin/database operator must run this command.
+
+
+</details>
+
+<details>
+<summary><a name="actor-authorization-unavailable"></a><strong>Actor Authorization: Unavailable</strong></summary>
+
+
+## SchemaBot Authorization Check Failed
+
+**Database**: `orders` | **Environment**: `production`
+**Requested by**: @mona
+
+SchemaBot could not verify authorization for `schemabot apply-confirm`. No schema change was started.
+
+A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.
+
+
+</details>
+
+<details>
 <summary><a name="checks-gate-failing"></a><strong>Checks Gate: Failing</strong></summary>
 
 

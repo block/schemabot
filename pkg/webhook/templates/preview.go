@@ -209,6 +209,28 @@ func PreviewCommentReviewGateError() string {
 	})
 }
 
+// PreviewCommentPRCommandNotAuthorized renders a sample actor authorization
+// denial for apply/apply-confirm PR comments.
+func PreviewCommentPRCommandNotAuthorized() string {
+	return RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
+		RequestedBy: "mona",
+		CommandName: action.Apply,
+		Database:    "orders",
+		Environment: "staging",
+	})
+}
+
+// PreviewCommentPRCommandAuthorizationUnavailable renders a sample fail-closed
+// actor authorization error for apply/apply-confirm PR comments.
+func PreviewCommentPRCommandAuthorizationUnavailable() string {
+	return RenderPRCommandAuthorizationUnavailable(ActorAuthorizationCommentData{
+		RequestedBy: "mona",
+		CommandName: action.ApplyConfirm,
+		Database:    "orders",
+		Environment: "production",
+	})
+}
+
 // PreviewCommentApplyBlockedByPriorEnv renders a sample "production blocked by staging" comment.
 func PreviewCommentApplyBlockedByPriorEnv() string {
 	return RenderApplyBlockedByPriorEnv("testapp", "production", "staging", "has pending changes", "Apply staging first")

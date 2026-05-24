@@ -163,6 +163,8 @@ const (
 	PreviewCommentReviewGateError      PreviewType = "comment_review_gate_error"            // Review gate: fail-closed error
 	PreviewCommentChecksGateFailing    PreviewType = "comment_checks_gate_failing"          // Checks gate: failing CI/lint
 	PreviewCommentChecksGateInProgress PreviewType = "comment_checks_gate_in_progress"      // Checks gate: CI still running
+	PreviewCommentActorNotAuthorized   PreviewType = "comment_actor_not_authorized"         // Actor authorization: user is not allowed
+	PreviewCommentActorAuthUnavailable PreviewType = "comment_actor_auth_unavailable"       // Actor authorization: fail-closed error
 	PreviewCommentApplyAllType         PreviewType = "comment_apply_all"                    // Show all apply comment previews
 )
 
@@ -367,6 +369,10 @@ func PreviewCLIOutput(previewType PreviewType) {
 			{Name: "CI / unit-tests", State: "in_progress"},
 			{Name: "CI / integration-tests", State: "queued"},
 		}))
+	case PreviewCommentActorNotAuthorized:
+		fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized())
+	case PreviewCommentActorAuthUnavailable:
+		fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable())
 	case PreviewCommentApplyAllType:
 		previewApplyCommandAllOutput()
 	// Paired aggregate previews (PR + CLI subsections)
@@ -963,6 +969,8 @@ func previewApplyCommandAllOutput() {
 		{"BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
 		{"REVIEW REQUIRED (CODEOWNERS)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
 		{"REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
+		{"ACTOR AUTHORIZATION: NOT AUTHORIZED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized()) }},
+		{"ACTOR AUTHORIZATION: UNAVAILABLE", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable()) }},
 		{"CHECKS GATE: FAILING", func() {
 			fmt.Print(webhooktemplates.RenderApplyBlockedByFailingChecks("staging", []webhooktemplates.BlockingCheck{
 				{Name: "CI / unit-tests", State: "failure"},
