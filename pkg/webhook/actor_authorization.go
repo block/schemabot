@@ -99,26 +99,6 @@ func (h *Handler) authorizePRCommandActor(
 	}
 
 	authConfig := config.PRCommandAuthorization
-	// User allowlists are local config checks, so evaluate them before making
-	// GitHub API calls for team membership.
-	if matched, principal := matchedUserPrincipal(authConfig.AdminUsers, actor); matched {
-		return api.ActorAuthorizationResult{
-			Allowed:          true,
-			Reason:           api.ActorAuthReasonAllowedAdminUser,
-			MatchedPrincipal: principal,
-		}, nil
-	}
-	// Database operator users are allowed only for this database.
-	if matched, principal := matchedUserPrincipal(dbConfig.OperatorUsers, actor); matched {
-		return api.ActorAuthorizationResult{
-			Allowed:          true,
-			Reason:           api.ActorAuthReasonAllowedOperatorUser,
-			MatchedPrincipal: principal,
-		}, nil
-	}
-
-	// At this point no user principal matched. Decide whether there are any team
-	// principals left to check, or whether the policy can be denied locally.
 	teamCount := len(authConfig.AdminTeams) + len(dbConfig.OperatorTeams)
 	principalCount := teamCount + len(authConfig.AdminUsers) + len(dbConfig.OperatorUsers)
 	// Actor auth is enabled but no admin/operator principals exist for this
@@ -126,40 +106,61 @@ func (h *Handler) authorizePRCommandActor(
 	if principalCount == 0 {
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonNoConfiguredPrincipal}, nil
 	}
-	// With user-only policy, reaching this point means the actor was not in any
-	// configured user allowlist. No GitHub client is needed to deny.
-	if teamCount == 0 {
-		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonNotAuthorized}, nil
-	}
-	// Team policy requires GitHub membership lookups. If the client is missing,
-	// the command cannot be authorized safely.
-	if client == nil {
-		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, fmt.Errorf("github client is nil")
+
+	// Global admin teams have the highest precedence and can approve any
+	// configured database. A non-member result falls through to admin users.
+	if len(authConfig.AdminTeams) > 0 {
+		if client == nil {
+			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, fmt.Errorf("github client is nil")
+		}
+		matched, principal, err := actorInAnyTeam(ctx, client, authConfig.AdminTeams, actor)
+		if err != nil {
+			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, err
+		}
+		if matched {
+			return api.ActorAuthorizationResult{
+				Allowed:          true,
+				Reason:           api.ActorAuthReasonAllowedAdminTeam,
+				MatchedPrincipal: principal,
+			}, nil
+		}
 	}
 
-	// Global admin teams can approve any configured database.
-	matched, principal, err := actorInAnyTeam(ctx, client, authConfig.AdminTeams, actor)
-	if err != nil {
-		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, err
-	}
-	if matched {
+	// Global admin users are checked after admin teams and before any
+	// database-scoped operator policy.
+	if matched, principal := matchedUserPrincipal(authConfig.AdminUsers, actor); matched {
 		return api.ActorAuthorizationResult{
 			Allowed:          true,
-			Reason:           api.ActorAuthReasonAllowedAdminTeam,
+			Reason:           api.ActorAuthReasonAllowedAdminUser,
 			MatchedPrincipal: principal,
 		}, nil
 	}
 
-	// Database operator teams only authorize the database currently being
+	// Database operator teams authorize only the database currently being
 	// mutated by this PR command.
-	matched, principal, err = actorInAnyTeam(ctx, client, dbConfig.OperatorTeams, actor)
-	if err != nil {
-		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, err
+	if len(dbConfig.OperatorTeams) > 0 {
+		if client == nil {
+			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, fmt.Errorf("github client is nil")
+		}
+		matched, principal, err := actorInAnyTeam(ctx, client, dbConfig.OperatorTeams, actor)
+		if err != nil {
+			return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonGitHubError}, err
+		}
+		if matched {
+			return api.ActorAuthorizationResult{
+				Allowed:          true,
+				Reason:           api.ActorAuthReasonAllowedOperatorTeam,
+				MatchedPrincipal: principal,
+			}, nil
+		}
 	}
-	if matched {
+
+	// Database operator users are the final allowlist and are scoped to this
+	// database.
+	if matched, principal := matchedUserPrincipal(dbConfig.OperatorUsers, actor); matched {
 		return api.ActorAuthorizationResult{
 			Allowed:          true,
-			Reason:           api.ActorAuthReasonAllowedOperatorTeam,
+			Reason:           api.ActorAuthReasonAllowedOperatorUser,
 			MatchedPrincipal: principal,
 		}, nil
 	}

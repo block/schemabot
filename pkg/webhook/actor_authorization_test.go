@@ -130,6 +130,29 @@ func TestAuthorizePRCommandActorTeams(t *testing.T) {
 			wantMatch:  "octocat/schema-admins",
 		},
 		{
+			name: "admin team takes precedence over admin user",
+			configure: func(cfg *api.ServerConfig) {
+				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+				cfg.PRCommandAuthorization.AdminUsers = []string{"mona"}
+			},
+			statusCode: http.StatusOK,
+			state:      "active",
+			wantAllow:  true,
+			wantReason: api.ActorAuthReasonAllowedAdminTeam,
+			wantMatch:  "octocat/schema-admins",
+		},
+		{
+			name: "admin user allows after admin team non-member",
+			configure: func(cfg *api.ServerConfig) {
+				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+				cfg.PRCommandAuthorization.AdminUsers = []string{"mona"}
+			},
+			statusCode: http.StatusNotFound,
+			wantAllow:  true,
+			wantReason: api.ActorAuthReasonAllowedAdminUser,
+			wantMatch:  "mona",
+		},
+		{
 			name: "operator team allows",
 			configure: func(cfg *api.ServerConfig) {
 				db := cfg.Databases["orders"]
