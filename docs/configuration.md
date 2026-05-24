@@ -184,11 +184,13 @@ For repositories with many optional checks, `required_checks` can narrow the gat
 ```yaml
 require_passing_checks: true
 required_checks:
-  - "Owner Owl"
+  - "Required Review"
   - "CI / required-tests"
 ```
 
 When any configured check appears in the PR status rollup, only configured checks are evaluated. A configured check that is absent does not block apply. If none of the configured checks appear, SchemaBot falls back to the default behavior and evaluates all non-SchemaBot checks.
+
+`required_checks` names must exactly match GitHub check run names or commit status contexts. Matching is case-sensitive, and config validation rejects names with leading or trailing whitespace.
 
 When checks are failing, SchemaBot posts a comment listing the failing checks and instructs the user to fix them before retrying.
 

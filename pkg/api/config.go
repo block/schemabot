@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
@@ -409,6 +410,9 @@ func validateUniqueNames(field string, names []string) error {
 	for _, name := range names {
 		if name == "" {
 			return fmt.Errorf("%s contains an empty value", field)
+		}
+		if strings.TrimSpace(name) != name {
+			return fmt.Errorf("%s contains value %q with leading or trailing whitespace", field, name)
 		}
 		if _, ok := seen[name]; ok {
 			return fmt.Errorf("%s contains duplicate value %q", field, name)

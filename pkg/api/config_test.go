@@ -254,7 +254,7 @@ func TestServerConfig_Validate(t *testing.T) {
 						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
 					},
 				},
-				RequiredChecks: []string{"Owner Owl", "CI / lint"},
+				RequiredChecks: []string{"Required Review", "CI / lint"},
 			},
 			wantErr: false,
 		},
@@ -267,7 +267,7 @@ func TestServerConfig_Validate(t *testing.T) {
 						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
 					},
 				},
-				RequiredChecks: []string{"Owner Owl", ""},
+				RequiredChecks: []string{"Required Review", ""},
 			},
 			wantErr: true,
 		},
@@ -280,7 +280,20 @@ func TestServerConfig_Validate(t *testing.T) {
 						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
 					},
 				},
-				RequiredChecks: []string{"Owner Owl", "Owner Owl"},
+				RequiredChecks: []string{"Required Review", "Required Review"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "required checks reject leading and trailing whitespace",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{"Required Review "},
 			},
 			wantErr: true,
 		},
@@ -1127,10 +1140,10 @@ func TestServerConfig_IsCheckRequired(t *testing.T) {
 	})
 
 	t.Run("configured list matches exact names only", func(t *testing.T) {
-		cfg := &ServerConfig{RequiredChecks: []string{"Owner Owl", "CI / lint"}}
-		assert.True(t, cfg.IsCheckRequired("Owner Owl"))
+		cfg := &ServerConfig{RequiredChecks: []string{"Required Review", "CI / lint"}}
+		assert.True(t, cfg.IsCheckRequired("Required Review"))
 		assert.True(t, cfg.IsCheckRequired("CI / lint"))
-		assert.False(t, cfg.IsCheckRequired("owner owl"))
+		assert.False(t, cfg.IsCheckRequired("required review"))
 		assert.False(t, cfg.IsCheckRequired("CI / tests"))
 	})
 
@@ -1145,7 +1158,7 @@ databases:
       staging:
         dsn: "root@tcp(localhost:3306)/testapp"
 required_checks:
-  - "Owner Owl"
+  - "Required Review"
   - "CI / lint"
 `
 		err := os.WriteFile(configPath, []byte(content), 0644)
@@ -1154,8 +1167,8 @@ required_checks:
 		cfg, err := LoadServerConfigFromFile(configPath)
 		require.NoError(t, err)
 
-		assert.Equal(t, []string{"Owner Owl", "CI / lint"}, cfg.RequiredChecks)
-		assert.True(t, cfg.IsCheckRequired("Owner Owl"))
+		assert.Equal(t, []string{"Required Review", "CI / lint"}, cfg.RequiredChecks)
+		assert.True(t, cfg.IsCheckRequired("Required Review"))
 		assert.False(t, cfg.IsCheckRequired("CI / tests"))
 	})
 }

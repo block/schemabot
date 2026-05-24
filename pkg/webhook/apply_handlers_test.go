@@ -116,25 +116,25 @@ func TestFilterFailingNonSchemaBotChecks_RequiredChecks(t *testing.T) {
 	}{
 		{
 			name:   "configured failing check blocks when present",
-			config: &api.ServerConfig{RequiredChecks: []string{"Owner Owl"}},
+			config: &api.ServerConfig{RequiredChecks: []string{"Required Review"}},
 			statuses: []ghclient.PRCheckStatus{
-				{Name: "Owner Owl", Status: "completed", Conclusion: "failure"},
+				{Name: "Required Review", Status: "completed", Conclusion: "failure"},
 				{Name: "CI / lint", Status: "completed", Conclusion: "failure"},
 			},
-			wantNames: []string{"Owner Owl"},
+			wantNames: []string{"Required Review"},
 		},
 		{
 			name:   "unlisted failing check is ignored when configured check is present",
-			config: &api.ServerConfig{RequiredChecks: []string{"Owner Owl", "Security scan"}},
+			config: &api.ServerConfig{RequiredChecks: []string{"Required Review", "Security scan"}},
 			statuses: []ghclient.PRCheckStatus{
-				{Name: "Owner Owl", Status: "completed", Conclusion: "success"},
+				{Name: "Required Review", Status: "completed", Conclusion: "success"},
 				{Name: "CI / lint", Status: "completed", Conclusion: "failure"},
 			},
 			wantNames: nil,
 		},
 		{
 			name:   "all checks apply when no configured check is present",
-			config: &api.ServerConfig{RequiredChecks: []string{"Owner Owl"}},
+			config: &api.ServerConfig{RequiredChecks: []string{"Required Review"}},
 			statuses: []ghclient.PRCheckStatus{
 				{Name: "CI / lint", Status: "completed", Conclusion: "failure"},
 				{Name: "Security scan", Status: "completed", Conclusion: "error"},
@@ -199,25 +199,25 @@ func TestFilterInProgressNonSchemaBotChecks_RequiredChecks(t *testing.T) {
 	}{
 		{
 			name:   "configured in-progress check blocks when present",
-			config: &api.ServerConfig{RequiredChecks: []string{"Owner Owl"}},
+			config: &api.ServerConfig{RequiredChecks: []string{"Required Review"}},
 			statuses: []ghclient.PRCheckStatus{
-				{Name: "Owner Owl", Status: "queued", Conclusion: ""},
+				{Name: "Required Review", Status: "queued", Conclusion: ""},
 				{Name: "CI / tests", Status: "in_progress", Conclusion: ""},
 			},
-			wantNames: []string{"Owner Owl"},
+			wantNames: []string{"Required Review"},
 		},
 		{
 			name:   "unlisted in-progress check is ignored when configured check is present",
-			config: &api.ServerConfig{RequiredChecks: []string{"Owner Owl"}},
+			config: &api.ServerConfig{RequiredChecks: []string{"Required Review"}},
 			statuses: []ghclient.PRCheckStatus{
-				{Name: "Owner Owl", Status: "completed", Conclusion: "success"},
+				{Name: "Required Review", Status: "completed", Conclusion: "success"},
 				{Name: "CI / tests", Status: "in_progress", Conclusion: ""},
 			},
 			wantNames: nil,
 		},
 		{
 			name:   "all checks apply when no configured check is present",
-			config: &api.ServerConfig{RequiredChecks: []string{"Owner Owl"}},
+			config: &api.ServerConfig{RequiredChecks: []string{"Required Review"}},
 			statuses: []ghclient.PRCheckStatus{
 				{Name: "CI / tests", Status: "in_progress", Conclusion: ""},
 				{Name: "Deploy preview", Status: "pending", Conclusion: ""},
@@ -417,14 +417,14 @@ func TestEnforcePassingChecks(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 
 		mux.HandleFunc("POST /graphql", rollupGraphQLHandler([]rollupNode{
-			{Typename: "CheckRun", Name: "Owner Owl", Status: "COMPLETED", Conclusion: "SUCCESS", AppSlug: "owner-owl"},
+			{Typename: "CheckRun", Name: "Required Review", Status: "COMPLETED", Conclusion: "SUCCESS", AppSlug: "review-gate"},
 			{Typename: "CheckRun", Name: "CI / tests", Status: "COMPLETED", Conclusion: "FAILURE", AppSlug: "github-actions"},
 		}))
 
 		installClient := ghclient.NewInstallationClient(client, testLogger())
 		factory := &fakeClientFactory{client: installClient}
 
-		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Owner Owl"}}, nil, testLogger())
+		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Required Review"}}, nil, testLogger())
 		h := &Handler{
 			service:  service,
 			ghClient: factory,
@@ -457,7 +457,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 		installClient := ghclient.NewInstallationClient(client, testLogger())
 		factory := &fakeClientFactory{client: installClient}
 
-		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Owner Owl"}}, nil, testLogger())
+		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Required Review"}}, nil, testLogger())
 		h := &Handler{
 			service:  service,
 			ghClient: factory,
