@@ -776,16 +776,23 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		if err == nil {
 			engineResult = result
 			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
-			taskState := taskStateFromProgressResult(result)
+			engineTaskState := taskStateFromProgressResult(result)
+			taskState := taskStateWithNoBackwardProgress(activeTask.State, engineTaskState)
+			if !state.IsState(taskState, engineTaskState) {
+				c.logger.Warn("keeping stored task state because engine progress reported earlier state",
+					"task_id", activeTask.TaskIdentifier,
+					"stored_state", activeTask.State,
+					"engine_task_state", engineTaskState)
+			}
 
-			// Only update task state from engine if task is not already in a terminal state.
-			// Terminal states (CANCELLED, COMPLETED, FAILED, etc.) should be preserved -
-			// they represent the final state set by the apply execution.
+			// Engine state is translated to task state first. Stored task state
+			// can stay ahead of a stale engine poll; apply state is derived after
+			// task rows are coherent.
 			if !state.IsTerminalTaskState(activeTask.State) {
 				activeTask.State = taskState
 				now := time.Now()
 				activeTask.UpdatedAt = now
-				if result.State.IsTerminal() && !state.IsState(taskState, state.Task.FailedRetryable) && activeTask.CompletedAt == nil {
+				if state.IsTerminalTaskState(taskState) && activeTask.CompletedAt == nil {
 					activeTask.CompletedAt = &now
 				}
 				if result.State == engine.StateFailed && activeTask.ErrorMessage == "" {
@@ -860,8 +867,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 		// Look up engine progress for this table
 		if et, ok := engineProgressForTask(engineTableProgress, t); ok {
-			// Use live progress from engine (uppercase to match storage convention)
-			tp.Status = strings.ToUpper(et.State)
+			tp.Status = progressTableStatus(t.State, et.State)
 			tp.PercentComplete = int32(et.Progress)
 			tp.RowsCopied = et.RowsCopied
 			tp.RowsTotal = et.RowsTotal
@@ -891,7 +897,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			for j, sh := range et.Shards {
 				shards[j] = &ternv1.ShardProgress{
 					Shard:           sh.Shard,
-					Status:          sh.State,
+					Status:          state.NormalizeShardStatus(sh.State),
 					RowsCopied:      sh.RowsCopied,
 					RowsTotal:       sh.RowsTotal,
 					EtaSeconds:      sh.ETASeconds,
@@ -1001,6 +1007,81 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	}
 
 	return resp, nil
+}
+
+func progressTableStatus(storedTaskState, engineTableState string) string {
+	return taskStateWithNoBackwardProgress(storedTaskState, state.NormalizeTaskStatus(engineTableState))
+}
+
+// taskStateWithNoBackwardProgress applies the engine -> task -> apply ordering:
+// raw engine progress is first translated into a canonical task state, but a
+// stale engine poll cannot move a stored task back to an earlier phase. This
+// happens after restarts and terminal races where durable task storage is ahead
+// of a lagging per-table progress snapshot.
+func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) string {
+	storedTaskState = state.NormalizeTaskStatus(storedTaskState)
+	engineTaskState = state.NormalizeTaskStatus(engineTaskState)
+
+	// A terminal stored task is already the durable final answer.
+	if state.IsTerminalTaskState(storedTaskState) {
+		return storedTaskState
+	}
+
+	// Terminal engine results, stopped tasks, and retryable failures are real
+	// outcomes from the current engine poll and can advance active storage.
+	if state.IsTerminalTaskState(engineTaskState) ||
+		state.IsState(engineTaskState, state.Task.Stopped, state.Task.FailedRetryable) {
+		return engineTaskState
+	}
+
+	// Scheduler/control-owned states block stale active engine progress.
+	if blocksActiveEngineProgress(storedTaskState) {
+		return storedTaskState
+	}
+
+	engineProgressRank, engineProgressRanked := activeTaskProgressRank(engineTaskState)
+	storedProgressRank, storedProgressRanked := activeTaskProgressRank(storedTaskState)
+
+	// Unknown future canonical task states should not be ordered implicitly.
+	if !engineProgressRanked || !storedProgressRanked {
+		return storedTaskState
+	}
+
+	// For ordinary active phases, never let storage/display move backward.
+	if engineProgressRank < storedProgressRank {
+		return storedTaskState
+	}
+	return engineTaskState
+}
+
+// blocksActiveEngineProgress identifies durable scheduler/control states that
+// should not be overwritten by a stale active engine poll. For example, a user
+// can stop a task while the engine still reports running for a short window, or
+// the scheduler can mark a task failed_retryable before a retry claims it.
+func blocksActiveEngineProgress(taskState string) bool {
+	return state.IsState(taskState, state.Task.Stopped, state.Task.FailedRetryable)
+}
+
+// activeTaskProgressRank orders ordinary active task phases. Terminal states
+// and scheduler/control-owned states are handled before this helper, so new
+// task states must be consciously assigned to one of those policies.
+func activeTaskProgressRank(taskState string) (int, bool) {
+	switch state.NormalizeTaskStatus(taskState) {
+	case state.Task.Pending:
+		return 0, true
+	case state.Task.WaitingForDeploy:
+		return 1, true
+	case state.Task.Running:
+		return 2, true
+	case state.Task.WaitingForCutover:
+		return 3, true
+	case state.Task.CuttingOver:
+		return 4, true
+	case state.Task.RevertWindow:
+		return 5, true
+	default:
+		return 0, false
+	}
 }
 
 func ensureMetadata(m map[string]string) map[string]string {

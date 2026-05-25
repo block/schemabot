@@ -40,6 +40,7 @@ func TestNormalizeTaskStatus_VitessStates(t *testing.T) {
 		{"ready", Task.Pending},
 		{"running", Task.Running},
 		{"complete", Task.Completed},
+		{"COMPLETE", Task.Completed},
 		{"failed", Task.Failed},
 		{"cancelled", Task.Cancelled},
 		{"ready_to_complete", Task.WaitingForCutover},

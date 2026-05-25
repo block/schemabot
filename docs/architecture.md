@@ -234,12 +234,14 @@ Poller reads current engine state
       |
       v
 Derive task state
+  - normalize raw engine state
+  - preserve stored task state if it is already ahead
   - one task per DDL
   - rows copied, rows total, percent complete
       |
       v
 Derive apply state
-  - aggregate task states
+  - aggregate stored task states
   - active, terminal, and control states
       |
       v
@@ -252,6 +254,10 @@ Persist applies + tasks
           - progress comment
           - terminal summary comment
 ```
+
+State authority is intentionally one-way: engine progress is an input, not the durable source of truth. Raw engine states are first normalized into canonical task states. The poller then reconciles that normalized engine task state with the stored task row: terminal stored tasks stay terminal, scheduler/control-owned states such as `stopped` and `failed_retryable` are not overwritten by stale active engine polls, and ordinary active states can move forward but not backward. Apply state is derived after task rows are coherent, so PR comments, CLI progress, and scheduler checks never need to reason about raw engine states directly.
+
+Unknown raw engine states normalize to `running`. This keeps unfamiliar in-flight work visible and blocking without leaking engine-specific strings into SchemaBot state or UI. Once the engine state is understood, update `NormalizeTaskStatus()` and the state-policy tests so the new state has an explicit task-state mapping and ordering policy.
 
 The `ProgressObserver` interface (`pkg/tern/observer.go`) enables external notifications from the apply progress poller. Observers see SchemaBot's derived apply/task state, not raw engine state.
 

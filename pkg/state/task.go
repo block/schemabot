@@ -119,11 +119,15 @@ func NormalizeTaskStatus(raw string) string {
 	}
 
 	switch normalized := NormalizeState(s); normalized {
+	case NormalizeState(string(vitessstatus.OnlineDDLStatusComplete)):
+		return Task.Completed
 	case Task.Pending, Task.Running, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.CuttingOver, Task.Cancelled:
 		return normalized
 	default:
+		// Unknown engine states represent in-flight work until proven otherwise.
+		// Keep them visible and blocking, and add an explicit mapping once known.
 		return Task.Running
 	}
 }

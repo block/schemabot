@@ -111,6 +111,11 @@ func TestTaskStateFromProgressResult(t *testing.T) {
 		result := &engine.ProgressResult{State: engine.StateFailed}
 		assert.Equal(t, state.Task.Failed, taskStateFromProgressResult(result))
 	})
+
+	t.Run("unknown engine state stays visible as running", func(t *testing.T) {
+		result := &engine.ProgressResult{State: engine.State("something_new")}
+		assert.Equal(t, state.Task.Running, taskStateFromProgressResult(result))
+	})
 }
 
 func TestApplyEventStateTransition(t *testing.T) {

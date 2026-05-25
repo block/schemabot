@@ -11,7 +11,8 @@ state.Apply     state.Task       vitess schema / spirit status
 
 An apply includes one or more tasks, where a task tracks the execution of a single table. Both `Apply` and `Task` are
 SchemaBot's internal states (stored in DB) that operate in a state machine. Engine states are external — what
-Vitess OnlineDDL and Spirit report — and they are translated into Task and Apply states.
+Vitess OnlineDDL and Spirit report — and they are translated into Task state before Apply state is derived from
+the stored task rows.
 
 ## Apply states
 
@@ -28,6 +29,7 @@ Vitess OnlineDDL and Spirit report — and they are translated into Task and App
 | Failed | `failed` | At least one task failed |
 | FailedRetryable | `failed_retryable` | A retryable engine error occurred; scheduler recovery can retry it |
 | Stopped | `stopped` | User requested stop, resumable via start (engine-dependent) |
+| Cancelled | `cancelled` | Apply was cancelled and is not resumable |
 | RevertWindow | `revert_window` | Schema change applied, revert available. Only meaningful for PlanetScale; Spirit doesn't support revert so SchemaBot auto-advances to completed |
 | Reverted | `reverted` | Schema change was reverted |
 
@@ -67,12 +69,13 @@ stateDiagram-v2
 
 ## Task states
 
-Per-table execution state. Same state machine as Apply, plus `cancelled`:
+Per-table execution state. Mostly mirrors Apply state, with per-table scheduler/control states:
 
 | State | Value | Description |
 |-------|-------|-------------|
 | Pending | `pending` | Task created, not yet started |
 | Running | `running` | Engine is actively executing (row copy, checksum, etc.) |
+| WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only) |
 | WaitingForCutover | `waiting_for_cutover` | Row copy complete, waiting for cutover signal |
 | CuttingOver | `cutting_over` | Table cutover in progress |
 | Completed | `completed` | Schema change applied successfully |
@@ -133,17 +136,18 @@ Next dispatch:
 
 1. Any task **failed** → apply `failed`
 2. Any task **failed_retryable** → apply `failed_retryable`
-3. Any task **stopped** → apply `stopped`
-4. Any task **reverted** → apply `reverted`
-5. All tasks **completed** → apply `completed`
-6. Any task **cutting_over** → apply `cutting_over`
-7. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
-8. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
-9. Any task **revert_window** → apply `revert_window`
-10. Any task **running** → apply `running`
-11. Otherwise → apply `pending`
+3. Any task **cancelled** → apply `cancelled`
+4. Any task **stopped** → apply `stopped`
+5. Any task **reverted** → apply `reverted`
+6. All tasks **completed** → apply `completed`
+7. Any task **cutting_over** → apply `cutting_over`
+8. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
+9. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
+10. Any task **revert_window** → apply `revert_window`
+11. Any task **running** → apply `running`
+12. Otherwise → apply `pending`
 
-Terminal states (`completed`, `failed`, `reverted`, `cancelled`) are checked via `IsTerminalApplyState()`. Note: `failed_retryable` is not terminal because scheduler recovery can retry it, and `stopped` is not terminal at the task level because a stopped task can be resumed via Start.
+Apply terminal states (`completed`, `failed`, `stopped`, `cancelled`, `reverted`) are checked via `IsTerminalApplyState()`. Note: `failed_retryable` is not terminal because scheduler recovery can retry it, and `stopped` is not terminal at the task level because a stopped task can be resumed via Start.
 
 ## Spirit states
 
@@ -249,6 +253,8 @@ directly in the switch so it's clear where each status originates.
 
 What's common: Both engines produce completed, running, waiting_for_cutover, failed, pending equivalents.
 What's different: Spirit has granular sub-states → normalize to `running`. Vitess has queue lifecycle → normalize to `pending`.
+
+Unknown raw engine states normalize to `running`. This keeps unfamiliar in-flight work visible and blocking without leaking engine-specific strings into SchemaBot state or UI. After the state is understood, add an explicit mapping here and update the state-policy tests that guard task ordering.
 
 ## Progress rendering
 

@@ -72,7 +72,9 @@ func engineStateToStorage(es engine.State) string {
 	case engine.StateReverted:
 		return state.Task.Reverted
 	default:
-		return state.Task.Pending
+		// Unknown engine states represent in-flight work until proven otherwise.
+		// Keep them visible and blocking, and add an explicit mapping once known.
+		return state.Task.Running
 	}
 }
 
