@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	gh "github.com/google/go-github/v68/github"
+	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/require"
 
 	ghclient "github.com/block/schemabot/pkg/github"

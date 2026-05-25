@@ -17,8 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/bradleyfalzon/ghinstallation/v2"
-	gh "github.com/google/go-github/v68/github"
+	gh "github.com/google/go-github/v86/github"
 	"github.com/shurcooL/githubv4"
 )
 
@@ -126,13 +127,15 @@ func (c *Client) fetchAppSlug() {
 	c.lastSlugAttempt = time.Now()
 	c.slugFetchMu.Unlock()
 
-	transport, err := ghinstallation.NewAppsTransport(http.DefaultTransport, c.appID, c.privateKey)
+	appBaseTransport := newGitHubMetricsTransport(http.DefaultTransport, 0, c.loadAppSlug)
+	appTransport, err := ghinstallation.NewAppsTransport(appBaseTransport, c.appID, c.privateKey)
 	if err != nil {
 		c.logger.Error("failed to create app transport for slug fetch", "error", err)
 		return
 	}
-	appClient := gh.NewClient(&http.Client{Transport: transport, Timeout: 10 * time.Second})
-	app, _, err := appClient.Apps.Get(context.Background(), "")
+	appClient := gh.NewClient(&http.Client{Transport: appTransport, Timeout: 10 * time.Second})
+	ctx := context.Background()
+	app, _, err := appClient.Apps.Get(ctx, "")
 	if err != nil {
 		c.logger.Error("failed to fetch app slug from GitHub — check gate will not exclude own checks",
 			"app_id", c.appID, "error", err)
@@ -184,16 +187,18 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		return existing, nil
 	}
 
-	transport, err := ghinstallation.New(http.DefaultTransport, c.appID, installationID, c.privateKey)
+	baseTransport := newGitHubMetricsTransport(http.DefaultTransport, installationID, c.loadAppSlug)
+	installationTransport, err := ghinstallation.New(baseTransport, c.appID, installationID, c.privateKey)
 	if err != nil {
 		return nil, fmt.Errorf("create installation transport for installation %d: %w", installationID, err)
 	}
-	httpc := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+	httpc := &http.Client{Transport: installationTransport, Timeout: 30 * time.Second}
 	ghClient := gh.NewClient(httpc)
 	ic := &InstallationClient{
 		client:                  ghClient,
 		gql:                     githubv4.NewEnterpriseClient(graphQLURLFor(ghClient), httpc),
 		logger:                  c.logger,
+		installationID:          installationID,
 		checkStatusSingleflight: c.checkStatusSingleflight,
 	}
 	ic.storeAppSlug(slug)
@@ -215,10 +220,12 @@ func NewInstallationClient(client *gh.Client, logger *slog.Logger) *Installation
 func NewInstallationClientWithSlug(client *gh.Client, logger *slog.Logger, appSlug string) *InstallationClient {
 	ic := &InstallationClient{
 		client: client,
-		gql:    githubv4.NewEnterpriseClient(graphQLURLFor(client), client.Client()),
 		logger: logger,
 	}
 	ic.storeAppSlug(appSlug)
+	gqlHTTPClient := client.Client()
+	gqlHTTPClient.Transport = newGitHubMetricsTransport(gqlHTTPClient.Transport, 0, ic.loadAppSlug)
+	ic.gql = githubv4.NewEnterpriseClient(graphQLURLFor(client), gqlHTTPClient)
 	return ic
 }
 
@@ -234,6 +241,8 @@ type InstallationClient struct {
 	client *gh.Client
 	gql    *githubv4.Client
 	logger *slog.Logger
+
+	installationID int64
 
 	// appSlug is the GitHub App's slug used to identify own check runs.
 	// Stored as atomic.Pointer[string] because cached InstallationClients
@@ -732,6 +741,7 @@ func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo strin
 // caching across InstallationClients with different appSlug snapshots.
 func (ic *InstallationClient) fetchPRCheckStatuses(ctx context.Context, repo string, ref string) ([]CheckStatusRow, error) {
 	owner, repoName := splitRepo(repo)
+	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationGraphQLStatusCheckRollup, repo)
 
 	vars := map[string]any{
 		"owner": githubv4.String(owner),

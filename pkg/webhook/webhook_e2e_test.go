@@ -76,7 +76,7 @@ import (
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
-	gh "github.com/google/go-github/v68/github"
+	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"

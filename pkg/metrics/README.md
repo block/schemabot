@@ -15,6 +15,10 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
 | `schemabot.webhook.events_total` | Counter | event_type, action, repository, status | GitHub webhook events |
+| `schemabot.github.requests_total` | Counter | operation, category, resource, status, repository, github_app, installation_id | GitHub API responses observed by SchemaBot |
+| `schemabot.github.rate_limit.limit` | Gauge | operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
+| `schemabot.github.rate_limit.remaining` | Gauge | operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
+| `schemabot.github.rate_limit.used` | Gauge | operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.lock_operations_total` | Counter | operation, database, status | Lock acquire/release operations |
 | `schemabot.scheduler.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the scheduler |
@@ -47,6 +51,14 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 **action** (webhooks): `created`, `opened`, `synchronize`, `reopened`, `closed`, `requested`, `completed` (omitted for events without actions like `ping`)
 
 **status** (webhooks): `processed`, `invalid_signature`, `ignored`
+
+**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_team_membership`, `graphql_status_check_rollup`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+
+**category** (GitHub API): `auth`, `read`, `write`, `unknown`
+
+**resource** (GitHub API): `core`, `graphql`, `search`, `code_search`, `integration_manifest`, `source_import`, `code_scanning_upload`, `actions_runner_registration`, `scim`, `dependency_snapshots`, `dependency_sbom`, `audit_log`
+
+**status** (GitHub API): `success`, `error`, `unknown`
 
 **reason** (scheduler claim failures): `storage_error`, `expire_retryable_error`, `unknown`
 
@@ -120,6 +132,32 @@ blocks the aggregate Check Run for commit B until an operator decides whether
 the target environment needs another apply, a rollback, or manual reconciliation.
 A spike in `status="error"` usually points to storage or GitHub API failures and
 should be investigated before relying on branch-protection state.
+
+### GitHub API Usage
+
+`schemabot.github.rate_limit.remaining` is the most direct primary-rate-limit
+signal. Group it by `github_app`, `installation_id`, and `resource` to see which
+GitHub App deployment, installation, and rate-limit bucket is closest to
+exhaustion. The same labels on `schemabot.github.rate_limit.limit` and
+`schemabot.github.rate_limit.used` show the observed budget size and consumption
+for the latest response.
+
+`schemabot.github.requests_total` is the request-volume signal. Group it by
+`category` to separate ordinary reads from content-generating writes. The
+`write` category is the closest SchemaBot-side proxy for GitHub's secondary
+content-generation limits, because those limits are enforced separately from
+the primary hourly remaining count and are not exposed as a remaining-budget
+header.
+
+Useful dashboard views:
+
+1. Minimum `schemabot.github.rate_limit.remaining` by `github_app`,
+   `installation_id`, and `resource`.
+2. Request rate from `schemabot.github.requests_total` by `category`,
+   `operation`, and `status`.
+3. Write request rate by `github_app` and `installation_id` to spot
+   progress-comment or check-run update bursts before GitHub starts returning
+   secondary-limit errors.
 
 ### Control Operations
 

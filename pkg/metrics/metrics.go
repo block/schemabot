@@ -4,6 +4,8 @@ package metrics
 import (
 	"context"
 	"log/slog"
+	"strconv"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -522,6 +524,279 @@ func RecordSchemaRequestError(ctx context.Context, repo, command, database, envi
 			attribute.String("reason", reason),
 		),
 	)
+}
+
+const (
+	gitHubMetricValueUnknown = "unknown"
+
+	GitHubOperationAddCommentReaction            = "add_comment_reaction"
+	GitHubOperationCreateCheckRun                = "create_check_run"
+	GitHubOperationCreateIssueComment            = "create_issue_comment"
+	GitHubOperationCreateInstallationAccessToken = "create_installation_access_token"
+	GitHubOperationEditIssueComment              = "edit_issue_comment"
+	GitHubOperationFetchAppSlug                  = "fetch_app_slug"
+	GitHubOperationFetchBlob                     = "fetch_blob"
+	GitHubOperationFetchFileContent              = "fetch_file_content"
+	GitHubOperationFetchGitTree                  = "fetch_git_tree"
+	GitHubOperationFetchPullRequest              = "fetch_pull_request"
+	GitHubOperationGetTeamMembership             = "get_team_membership"
+	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
+	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
+	GitHubOperationListPRFiles                   = "list_pr_files"
+	GitHubOperationListReviews                   = "list_reviews"
+	GitHubOperationListTeamMembers               = "list_team_members"
+	GitHubOperationRequestReviewers              = "request_reviewers"
+	GitHubOperationUnknown                       = gitHubMetricValueUnknown
+	GitHubOperationUpdateCheckRun                = "update_check_run"
+)
+
+const (
+	GitHubRequestCategoryAuth    = "auth"
+	GitHubRequestCategoryRead    = "read"
+	GitHubRequestCategoryUnknown = gitHubMetricValueUnknown
+	GitHubRequestCategoryWrite   = "write"
+)
+
+const (
+	GitHubRequestStatusError   = "error"
+	GitHubRequestStatusSuccess = "success"
+	GitHubRequestStatusUnknown = gitHubMetricValueUnknown
+)
+
+const (
+	GitHubRateLimitResourceActionsRunnerRegistration = "actions_runner_registration"
+	GitHubRateLimitResourceAuditLog                  = "audit_log"
+	GitHubRateLimitResourceCodeScanningUpload        = "code_scanning_upload"
+	GitHubRateLimitResourceCodeSearch                = "code_search"
+	GitHubRateLimitResourceCore                      = "core"
+	GitHubRateLimitResourceDependencySBOM            = "dependency_sbom"
+	GitHubRateLimitResourceDependencySnapshots       = "dependency_snapshots"
+	GitHubRateLimitResourceGraphQL                   = "graphql"
+	GitHubRateLimitResourceIntegrationManifest       = "integration_manifest"
+	GitHubRateLimitResourceSCIM                      = "scim"
+	GitHubRateLimitResourceSearch                    = "search"
+	GitHubRateLimitResourceSourceImport              = "source_import"
+)
+
+var seenUnknownGitHubMetricLabels sync.Map
+
+// GitHubRequestSample describes a GitHub API response observed by SchemaBot.
+// Category distinguishes reads from content-generating writes so dashboards can
+// track pressure against GitHub's secondary write limits.
+type GitHubRequestSample struct {
+	Operation      string
+	Category       string
+	Resource       string
+	Status         string
+	Repository     string
+	GitHubApp      string
+	InstallationID int64
+}
+
+// RecordGitHubRequest increments the number of GitHub API responses observed.
+func RecordGitHubRequest(ctx context.Context, sample GitHubRequestSample) {
+	sample.Operation = normalizeGitHubOperation(sample.Operation)
+	sample.Category = normalizeGitHubRequestCategory(sample.Category)
+	sample.Resource = normalizeGitHubRateLimitResource(sample.Resource)
+	sample.Status = normalizeGitHubRequestStatus(sample.Status)
+
+	attrs := gitHubMetricAttributes(sample.Operation, sample.Resource, sample.Repository, sample.GitHubApp, sample.InstallationID)
+	attrs = append(attrs,
+		attribute.String("category", sample.Category),
+		attribute.String("status", sample.Status),
+	)
+
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.github.requests_total",
+		otelmetric.WithDescription("Total GitHub API responses observed by SchemaBot"),
+		otelmetric.WithUnit("{request}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create GitHub request counter", "error", err)
+		return
+	}
+
+	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+}
+
+// GitHubRateLimitSample describes rate-limit headers observed after a GitHub
+// API call. Operation and resource are allowlisted before recording to keep
+// metric cardinality bounded.
+type GitHubRateLimitSample struct {
+	Operation      string
+	Resource       string
+	Repository     string
+	GitHubApp      string
+	InstallationID int64
+	Limit          int64
+	Remaining      int64
+	Used           int64
+}
+
+// RecordGitHubRateLimit records the latest GitHub primary rate-limit header
+// values observed after an API call.
+func RecordGitHubRateLimit(ctx context.Context, sample GitHubRateLimitSample) {
+	sample.Operation = normalizeGitHubOperation(sample.Operation)
+	sample.Resource = normalizeGitHubRateLimitResource(sample.Resource)
+
+	attrs := gitHubMetricAttributes(sample.Operation, sample.Resource, sample.Repository, sample.GitHubApp, sample.InstallationID)
+
+	meter := otel.Meter(meterName)
+	limitGauge, err := meter.Int64Gauge("schemabot.github.rate_limit.limit",
+		otelmetric.WithDescription("GitHub primary rate limit for the observed API resource"),
+		otelmetric.WithUnit("{request}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create GitHub rate limit gauge", "error", err)
+		return
+	}
+	remainingGauge, err := meter.Int64Gauge("schemabot.github.rate_limit.remaining",
+		otelmetric.WithDescription("GitHub primary rate limit requests remaining for the observed API resource"),
+		otelmetric.WithUnit("{request}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create GitHub rate remaining gauge", "error", err)
+		return
+	}
+	usedGauge, err := meter.Int64Gauge("schemabot.github.rate_limit.used",
+		otelmetric.WithDescription("GitHub primary rate limit requests used for the observed API resource"),
+		otelmetric.WithUnit("{request}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create GitHub rate used gauge", "error", err)
+		return
+	}
+
+	limitGauge.Record(ctx, sample.Limit, otelmetric.WithAttributes(attrs...))
+	remainingGauge.Record(ctx, sample.Remaining, otelmetric.WithAttributes(attrs...))
+	usedGauge.Record(ctx, sample.Used, otelmetric.WithAttributes(attrs...))
+}
+
+func gitHubMetricAttributes(operation, resource, repository, githubApp string, installationID int64) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		attribute.String("operation", operation),
+		attribute.String("resource", resource),
+	}
+	if repository != "" {
+		attrs = append(attrs, attribute.String("repository", repository))
+	}
+	if githubApp != "" {
+		attrs = append(attrs, attribute.String("github_app", githubApp))
+	}
+	if installationID > 0 {
+		attrs = append(attrs, attribute.String("installation_id", strconv.FormatInt(installationID, 10)))
+	}
+	return attrs
+}
+
+func normalizeGitHubOperation(operation string) string {
+	if isKnownGitHubOperation(operation) {
+		return operation
+	}
+	logUnknownGitHubMetricLabel("operation", operation)
+	return gitHubMetricValueUnknown
+}
+
+func normalizeGitHubRequestCategory(category string) string {
+	if isKnownGitHubRequestCategory(category) {
+		return category
+	}
+	logUnknownGitHubMetricLabel("category", category)
+	return GitHubRequestCategoryUnknown
+}
+
+func normalizeGitHubRequestStatus(status string) string {
+	if isKnownGitHubRequestStatus(status) {
+		return status
+	}
+	logUnknownGitHubMetricLabel("status", status)
+	return GitHubRequestStatusUnknown
+}
+
+func normalizeGitHubRateLimitResource(resource string) string {
+	if isKnownGitHubRateLimitResource(resource) {
+		return resource
+	}
+	logUnknownGitHubMetricLabel("resource", resource)
+	return gitHubMetricValueUnknown
+}
+
+func logUnknownGitHubMetricLabel(label, value string) {
+	key := label + "\x00" + value
+	if _, loaded := seenUnknownGitHubMetricLabels.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	slog.Warn("GitHub metric label normalized to unknown", "label", label, "value", value)
+}
+
+func isKnownGitHubOperation(operation string) bool {
+	switch operation {
+	case GitHubOperationAddCommentReaction,
+		GitHubOperationCreateCheckRun,
+		GitHubOperationCreateIssueComment,
+		GitHubOperationCreateInstallationAccessToken,
+		GitHubOperationEditIssueComment,
+		GitHubOperationFetchAppSlug,
+		GitHubOperationFetchBlob,
+		GitHubOperationFetchFileContent,
+		GitHubOperationFetchGitTree,
+		GitHubOperationFetchPullRequest,
+		GitHubOperationGetTeamMembership,
+		GitHubOperationGraphQLStatusCheckRollup,
+		GitHubOperationListCheckRunsForRef,
+		GitHubOperationListPRFiles,
+		GitHubOperationListReviews,
+		GitHubOperationListTeamMembers,
+		GitHubOperationRequestReviewers,
+		GitHubOperationUnknown,
+		GitHubOperationUpdateCheckRun:
+		return true
+	default:
+		return false
+	}
+}
+
+func isKnownGitHubRequestCategory(category string) bool {
+	switch category {
+	case GitHubRequestCategoryAuth,
+		GitHubRequestCategoryRead,
+		GitHubRequestCategoryUnknown,
+		GitHubRequestCategoryWrite:
+		return true
+	default:
+		return false
+	}
+}
+
+func isKnownGitHubRequestStatus(status string) bool {
+	switch status {
+	case GitHubRequestStatusError,
+		GitHubRequestStatusSuccess,
+		GitHubRequestStatusUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func isKnownGitHubRateLimitResource(resource string) bool {
+	switch resource {
+	case GitHubRateLimitResourceActionsRunnerRegistration,
+		GitHubRateLimitResourceAuditLog,
+		GitHubRateLimitResourceCodeScanningUpload,
+		GitHubRateLimitResourceCodeSearch,
+		GitHubRateLimitResourceCore,
+		GitHubRateLimitResourceDependencySBOM,
+		GitHubRateLimitResourceDependencySnapshots,
+		GitHubRateLimitResourceGraphQL,
+		GitHubRateLimitResourceIntegrationManifest,
+		GitHubRateLimitResourceSCIM,
+		GitHubRateLimitResourceSearch,
+		GitHubRateLimitResourceSourceImport:
+		return true
+	default:
+		return false
+	}
 }
 
 // RecordWebhookEvent increments the webhook events counter.
