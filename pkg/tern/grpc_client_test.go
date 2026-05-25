@@ -417,6 +417,7 @@ type mockApplyStore struct {
 	storage.ApplyStore
 	apply     *storage.Apply
 	updateErr error
+	updates   []*storage.Apply
 }
 
 func (m *mockApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
@@ -432,6 +433,7 @@ func (m *mockApplyStore) Update(_ context.Context, apply *storage.Apply) error {
 	}
 	stored := *apply
 	m.apply = &stored
+	m.updates = append(m.updates, &stored)
 	return nil
 }
 func (m *mockApplyStore) Heartbeat(context.Context, int64) error { return nil }
@@ -678,6 +680,71 @@ func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
 	require.NotNil(t, dispatchLog, "dispatch log should be present")
 	assert.Equal(t, state.Apply.Pending, dispatchLog.OldState)
 	assert.Equal(t, state.Apply.Running, dispatchLog.NewState)
+}
+
+func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *testing.T) {
+	// A freshly dispatched remote apply can report pending before the remote
+	// engine starts copying rows. SchemaBot has already claimed the queued apply
+	// locally, so progress polling must not write pending back to the stored
+	// apply row and make it claimable by another scheduler worker.
+	server := &capturingTernServer{
+		remoteApplyID: "remote-pending-first",
+		progressStates: []ternv1.State{
+			ternv1.State_STATE_PENDING,
+			ternv1.State_STATE_COMPLETED,
+		},
+		progressTables: []*ternv1.TableProgress{{
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              23,
+		ApplyIdentifier: "apply-pending-progress",
+		PlanID:          123,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	task := &storage.Task{
+		ID:             29,
+		TaskIdentifier: "task-pending-progress",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		DDL:            "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:      "alter",
+		Namespace:      "default",
+		State:          state.Task.Pending,
+	}
+	applyStore := &mockApplyStore{apply: apply}
+	client.storage = &mockStorage{
+		applies: applyStore,
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-pending-progress",
+		}},
+		logs: &mockApplyLogStore{},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.NoError(t, err)
+
+	var storedStates []string
+	for _, updatedApply := range applyStore.updates {
+		storedStates = append(storedStates, updatedApply.State)
+	}
+	require.NotEmpty(t, storedStates)
+	assert.Equal(t, state.Apply.Running, storedStates[0])
+	assert.NotContains(t, storedStates[1:], state.Apply.Pending)
+	assert.Equal(t, state.Apply.Completed, storedStates[len(storedStates)-1])
 }
 
 func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing.T) {

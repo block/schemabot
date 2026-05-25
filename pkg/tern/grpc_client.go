@@ -930,7 +930,21 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 				continue
 			}
 			oldTaskState := storedTask.State
-			storedTask.State = state.NormalizeTaskStatus(remoteTask.Status)
+			remoteTaskState := state.NormalizeTaskStatus(remoteTask.Status)
+			if state.IsState(remoteTaskState, state.Task.Stopped) {
+				storedTask.State = remoteTaskState
+			} else {
+				storedTask.State = taskStateWithNoBackwardProgress(storedTask.State, remoteTaskState)
+			}
+			if !state.IsState(storedTask.State, remoteTaskState) {
+				slog.Debug("keeping stored gRPC task state because remote progress reported earlier state",
+					"apply_id", storedApply.ApplyIdentifier,
+					"external_id", storedApply.ExternalID,
+					"task_id", storedTask.TaskIdentifier,
+					"table", storedTask.TableName,
+					"stored_task_state", oldTaskState,
+					"remote_task_state", remoteTaskState)
+			}
 			storedTask.RowsCopied = remoteTask.RowsCopied
 			storedTask.RowsTotal = remoteTask.RowsTotal
 			storedTask.ProgressPercent = int(remoteTask.PercentComplete)
@@ -977,6 +991,59 @@ func storedTaskResolvedForTerminalRemoteApply(remoteApplyState, storedTaskState 
 	}
 	return state.IsState(remoteApplyState, state.Apply.Stopped) &&
 		state.IsState(storedTaskState, state.Task.Stopped)
+}
+
+// applyStateWithNoBackwardProgress keeps the control-plane apply row from
+// moving back to an earlier active phase when remote progress lags behind the
+// stored scheduler claim. A remote apply may briefly report pending after
+// SchemaBot has already claimed and dispatched it; writing pending locally would
+// make the same apply claimable by another scheduler worker.
+func applyStateWithNoBackwardProgress(storedApplyState, remoteApplyState string) string {
+	if remoteApplyState == "" {
+		return ""
+	}
+	if state.IsTerminalApplyState(remoteApplyState) {
+		return remoteApplyState
+	}
+	if state.IsTerminalApplyState(storedApplyState) {
+		return storedApplyState
+	}
+	if state.IsState(storedApplyState, state.Apply.FailedRetryable) {
+		return storedApplyState
+	}
+	if applyProgressRank(remoteApplyState) < applyProgressRank(storedApplyState) {
+		return storedApplyState
+	}
+	return remoteApplyState
+}
+
+func applyProgressRank(applyState string) int {
+	switch applyState {
+	case state.Apply.Pending:
+		return 0
+	case state.Apply.PreparingBranch:
+		return 1
+	case state.Apply.ApplyingBranchChanges:
+		return 2
+	case state.Apply.ValidatingBranch:
+		return 3
+	case state.Apply.CreatingDeployRequest:
+		return 4
+	case state.Apply.ValidatingDeployRequest:
+		return 5
+	case state.Apply.WaitingForDeploy:
+		return 6
+	case state.Apply.Running:
+		return 7
+	case state.Apply.WaitingForCutover:
+		return 8
+	case state.Apply.CuttingOver:
+		return 9
+	case state.Apply.RevertWindow:
+		return 10
+	default:
+		return 0
+	}
 }
 
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
@@ -1042,6 +1109,17 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 			if apply.StartedAt == nil && newState != state.Apply.Pending {
 				apply.StartedAt = &now
+			}
+			remoteApplyState := newState
+			newState = applyStateWithNoBackwardProgress(apply.State, remoteApplyState)
+			if !state.IsState(newState, remoteApplyState) {
+				slog.Debug("keeping stored gRPC apply state because remote progress reported earlier state",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"stored_state", apply.State,
+					"remote_state", remoteApplyState)
 			}
 			apply.State = newState
 			apply.UpdatedAt = now

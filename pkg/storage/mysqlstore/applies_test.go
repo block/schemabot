@@ -632,6 +632,100 @@ func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, persisted.State)
 }
 
+func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_concurrent_pending_claim",
+		LockID:          lock.ID,
+		PlanID:          503,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	tasks := []*storage.Task{
+		{
+			TaskIdentifier: "task_concurrent_pending_claim",
+			PlanID:         503,
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Engine:         storage.EngineSpirit,
+			Environment:    "staging",
+			State:          state.Task.Pending,
+			TableName:      "users",
+			DDL:            "ALTER TABLE users ADD COLUMN email VARCHAR(255)",
+			DDLAction:      "alter",
+			Options:        []byte("{}"),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+	}
+	applyID, err := store.Applies().CreateWithTasks(ctx, apply, tasks)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	const workers = 16
+	stores := make([]*Storage, workers)
+	for i := range workers {
+		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		require.NoError(t, openErr)
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		t.Cleanup(func() {
+			require.NoError(t, db.Close())
+		})
+		stores[i] = New(db)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var claimed []*storage.Apply
+	var claimErrors []error
+
+	for i := range workers {
+		workerStore := stores[i]
+		wg.Go(func() {
+			<-start
+			got, claimErr := workerStore.Applies().FindNextApply(ctx)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if claimErr != nil {
+				claimErrors = append(claimErrors, claimErr)
+				return
+			}
+			if got != nil {
+				claimed = append(claimed, got)
+			}
+		})
+	}
+
+	close(start)
+	wg.Wait()
+
+	require.Empty(t, claimErrors)
+	require.Len(t, claimed, 1, "only one scheduler worker should claim a pending apply")
+	assert.Equal(t, apply.ApplyIdentifier, claimed[0].ApplyIdentifier)
+	assert.Equal(t, state.Apply.Pending, claimed[0].State)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Running, persisted.State)
+}
+
 // TestApplyStore_ExpireRetryable verifies retry budget exhaustion at the
 // storage layer. A retryable apply that has used all attempts becomes failed,
 // and unfinished tasks are finalized as failed with completion timestamps.
