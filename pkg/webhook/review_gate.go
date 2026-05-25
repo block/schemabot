@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -28,7 +29,7 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 			RequestedBy: requestedBy,
 			Environment: environment,
 			CommandName: commandName,
-			ErrorDetail: "Review gate check failed: " + err.Error(),
+			ErrorDetail: reviewGateErrorDetail(err),
 		}))
 		return true
 	}
@@ -43,6 +44,14 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 		return true
 	}
 	return false
+}
+
+func reviewGateErrorDetail(err error) string {
+	detail := "Review gate check failed: " + err.Error()
+	if errors.Is(err, ghclient.ErrTeamMembershipUnreadable) {
+		detail += ". If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership."
+	}
+	return detail
 }
 
 // checkReviewGate checks if the PR has CODEOWNERS approval for the given schema path.

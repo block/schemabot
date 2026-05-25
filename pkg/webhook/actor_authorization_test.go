@@ -109,25 +109,24 @@ func TestAuthorizePRCommandActor(t *testing.T) {
 
 func TestAuthorizePRCommandActorTeams(t *testing.T) {
 	tests := []struct {
-		name       string
-		configure  func(*api.ServerConfig)
-		statusCode int
-		state      string
-		wantAllow  bool
-		wantReason string
-		wantMatch  string
-		wantErr    bool
+		name                  string
+		configure             func(*api.ServerConfig)
+		teamMembersStatusCode int
+		teamMembers           []string
+		wantAllow             bool
+		wantReason            string
+		wantMatch             string
+		wantErr               bool
 	}{
 		{
 			name: "admin team allows",
 			configure: func(cfg *api.ServerConfig) {
 				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
 			},
-			statusCode: http.StatusOK,
-			state:      "active",
-			wantAllow:  true,
-			wantReason: api.ActorAuthReasonAllowedAdminTeam,
-			wantMatch:  "octocat/schema-admins",
+			teamMembers: []string{"mona"},
+			wantAllow:   true,
+			wantReason:  api.ActorAuthReasonAllowedAdminTeam,
+			wantMatch:   "octocat/schema-admins",
 		},
 		{
 			name: "admin team takes precedence over admin user",
@@ -135,11 +134,10 @@ func TestAuthorizePRCommandActorTeams(t *testing.T) {
 				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
 				cfg.PRCommandAuthorization.AdminUsers = []string{"mona"}
 			},
-			statusCode: http.StatusOK,
-			state:      "active",
-			wantAllow:  true,
-			wantReason: api.ActorAuthReasonAllowedAdminTeam,
-			wantMatch:  "octocat/schema-admins",
+			teamMembers: []string{"mona"},
+			wantAllow:   true,
+			wantReason:  api.ActorAuthReasonAllowedAdminTeam,
+			wantMatch:   "octocat/schema-admins",
 		},
 		{
 			name: "admin user allows after admin team non-member",
@@ -147,10 +145,10 @@ func TestAuthorizePRCommandActorTeams(t *testing.T) {
 				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
 				cfg.PRCommandAuthorization.AdminUsers = []string{"mona"}
 			},
-			statusCode: http.StatusNotFound,
-			wantAllow:  true,
-			wantReason: api.ActorAuthReasonAllowedAdminUser,
-			wantMatch:  "mona",
+			teamMembers: []string{"hubot"},
+			wantAllow:   true,
+			wantReason:  api.ActorAuthReasonAllowedAdminUser,
+			wantMatch:   "mona",
 		},
 		{
 			name: "operator team allows",
@@ -159,36 +157,48 @@ func TestAuthorizePRCommandActorTeams(t *testing.T) {
 				db.OperatorTeams = []string{"octocat/orders-operators"}
 				cfg.Databases["orders"] = db
 			},
-			statusCode: http.StatusOK,
-			state:      "active",
-			wantAllow:  true,
-			wantReason: api.ActorAuthReasonAllowedOperatorTeam,
-			wantMatch:  "octocat/orders-operators",
+			teamMembers: []string{"mona"},
+			wantAllow:   true,
+			wantReason:  api.ActorAuthReasonAllowedOperatorTeam,
+			wantMatch:   "octocat/orders-operators",
 		},
 		{
 			name: "not a member denies",
 			configure: func(cfg *api.ServerConfig) {
 				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
 			},
-			statusCode: http.StatusNotFound,
-			wantReason: api.ActorAuthReasonNotAuthorized,
+			teamMembers: []string{"hubot"},
+			wantReason:  api.ActorAuthReasonNotAuthorized,
+		},
+		{
+			name: "admin team membership visibility error fails closed",
+			configure: func(cfg *api.ServerConfig) {
+				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+			},
+			teamMembersStatusCode: http.StatusForbidden,
+			wantReason:            api.ActorAuthReasonGitHubError,
+			wantErr:               true,
 		},
 		{
 			name: "GitHub error fails closed",
 			configure: func(cfg *api.ServerConfig) {
 				cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
 			},
-			statusCode: http.StatusInternalServerError,
-			wantReason: api.ActorAuthReasonGitHubError,
-			wantErr:    true,
+			teamMembersStatusCode: http.StatusInternalServerError,
+			wantReason:            api.ActorAuthReasonGitHubError,
+			wantErr:               true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client, mux := setupGitHubServer(t)
-			mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/memberships/mona", membershipHandler(t, tt.statusCode, tt.state))
-			mux.HandleFunc("GET /orgs/octocat/teams/orders-operators/memberships/mona", membershipHandler(t, tt.statusCode, tt.state))
+			teamMembersStatusCode := tt.teamMembersStatusCode
+			if teamMembersStatusCode == 0 {
+				teamMembersStatusCode = http.StatusOK
+			}
+			mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, teamMembersStatusCode, tt.teamMembers...))
+			mux.HandleFunc("GET /orgs/octocat/teams/orders-operators/members", teamMembersHandler(t, teamMembersStatusCode, tt.teamMembers...))
 			installClient := ghclient.NewInstallationClient(client, testLogger())
 
 			cfg := actorAuthTestConfig(true, tt.configure)
@@ -266,6 +276,40 @@ func TestEnforcePRCommandActorAuthorizationComments(t *testing.T) {
 	}
 }
 
+func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, http.StatusForbidden))
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 99}))
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	assert.True(t, blocked)
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "SchemaBot Authorization Check Failed")
+		assert.Contains(t, body, "could not verify authorization")
+		assert.Contains(t, body, "No schema change was started")
+		assert.Contains(t, body, "GitHub App can read organization members")
+		assert.NotContains(t, body, "is not authorized")
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for authorization failure comment")
+	}
+}
+
 // TestHandleApplyCommandBlocksUnauthorizedActorBeforePlanning exercises the
 // PR apply flow through schema discovery and actor authorization. An actor who
 // is not a configured admin/operator should receive a denial comment before
@@ -329,12 +373,16 @@ func actorAuthTestHandler(cfg *api.ServerConfig, installClient *ghclient.Install
 	}
 }
 
-func membershipHandler(t *testing.T, statusCode int, state string) http.HandlerFunc {
+func teamMembersHandler(t *testing.T, statusCode int, members ...string) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(statusCode)
 		if statusCode == http.StatusOK {
-			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"state": state}))
+			users := make([]map[string]string, 0, len(members))
+			for _, member := range members {
+				users = append(users, map[string]string{"login": member})
+			}
+			require.NoError(t, json.NewEncoder(w).Encode(users))
 		}
 		if statusCode >= http.StatusBadRequest {
 			_, err := fmt.Fprint(w, http.StatusText(statusCode))

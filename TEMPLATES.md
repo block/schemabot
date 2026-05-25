@@ -1111,7 +1111,7 @@ Schema changes require approval from a code owner before applying.
 
 ### Error
 
-> Review gate check failed: expand team @acme/schema-reviewers: API rate limit exceeded.
+> Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 </details>
 
 ### CLI Output
@@ -4123,7 +4123,7 @@ Schema changes require approval from a code owner before applying.
 
 ### Error
 
-> Review gate check failed: expand team @acme/schema-reviewers: API rate limit exceeded.
+> Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 
 </details>
 
@@ -4134,7 +4134,6 @@ Schema changes require approval from a code owner before applying.
 ## SchemaBot Command Not Authorized
 
 **Database**: `orders` | **Environment**: `staging`
-**Requested by**: @mona
 
 @mona is not authorized to run `schemabot apply` for this database.
 
@@ -4153,6 +4152,8 @@ A configured SchemaBot admin/database operator must run this command.
 **Requested by**: @mona
 
 SchemaBot could not verify authorization for `schemabot apply-confirm`. No schema change was started.
+
+If access is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 
 A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.
 

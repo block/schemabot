@@ -205,7 +205,7 @@ func PreviewCommentReviewGateError() string {
 		RequestedBy: "aparajon",
 		Environment: "staging",
 		CommandName: action.Apply,
-		ErrorDetail: "Review gate check failed: expand team @acme/schema-reviewers: API rate limit exceeded.",
+		ErrorDetail: "Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
 	})
 }
 

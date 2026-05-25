@@ -226,6 +226,7 @@ func TestRenderPRCommandAuthorizationUnavailable(t *testing.T) {
 	assert.Contains(t, result, "`production`")
 	assert.Contains(t, result, "could not verify authorization")
 	assert.Contains(t, result, "No schema change was started")
+	assert.Contains(t, result, "GitHub App can read organization members")
 	assert.Contains(t, result, "inspect SchemaBot authorization logs")
 }
 

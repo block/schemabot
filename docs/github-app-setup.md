@@ -41,7 +41,11 @@ Under **Repository permissions**, grant:
 | **Metadata** | Read | Required (granted automatically) |
 | **Pull requests** | Read & Write | Fetch PR info (head SHA, changed files) |
 
-No organization or account permissions are needed.
+Under **Organization permissions**, grant:
+
+| Permission | Access | Used For |
+|-----------|--------|----------|
+| **Members** | Read | Verify GitHub team membership for CODEOWNERS review gates and PR command authorization |
 
 ### Subscribe to Events
 

@@ -42,9 +42,6 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 
 	sb.WriteString("## SchemaBot Command Not Authorized\n\n")
 	writeDBEnvLine(&sb, data.Database, data.Environment)
-	if data.RequestedBy != "" {
-		fmt.Fprintf(&sb, "**Requested by**: @%s\n", data.RequestedBy)
-	}
 	sb.WriteString("\n")
 	if data.RequestedBy != "" {
 		fmt.Fprintf(&sb, "@%s is not authorized to run `schemabot %s` for this database.\n\n", data.RequestedBy, data.CommandName)
@@ -68,6 +65,7 @@ func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData)
 	}
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "SchemaBot could not verify authorization for `schemabot %s`. No schema change was started.\n\n", data.CommandName)
+	sb.WriteString("If access is granted through a GitHub team, verify the GitHub App can read organization members and team membership.\n\n")
 	sb.WriteString("A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.\n")
 
 	return sb.String()

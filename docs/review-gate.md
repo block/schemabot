@@ -23,7 +23,7 @@ Repo-specific settings take precedence over the global setting.
 
 When enabled, `schemabot apply` and `schemabot apply-confirm` check for PR approval before proceeding:
 
-1. **CODEOWNERS check**: If the repo has a CODEOWNERS file (checked from the base branch), SchemaBot requires approval from a listed code owner. Team slugs (`@org/team`) are expanded to individual members via the GitHub Teams API.
+1. **CODEOWNERS check**: If the repo has a CODEOWNERS file (checked from the base branch), SchemaBot requires approval from a listed code owner. Team slugs (`@org/team`) are expanded to individual members via the GitHub Teams API, which requires the GitHub App's **Members** organization permission with read access.
 
 2. **Fallback**: If no CODEOWNERS file exists, any non-self approval satisfies the gate.
 

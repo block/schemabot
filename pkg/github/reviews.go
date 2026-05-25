@@ -3,6 +3,7 @@ package github
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -19,6 +20,8 @@ const (
 	ReviewCommented        = "COMMENTED"
 	ReviewDismissed        = "DISMISSED"
 )
+
+var ErrTeamMembershipUnreadable = errors.New("team membership cannot be read")
 
 // ReviewInfo holds a single PR review.
 type ReviewInfo struct {
@@ -194,7 +197,7 @@ func OwnerNames(owners []codeowners.Owner) []string {
 
 // ListTeamMembers returns the login names of all members of a GitHub team.
 // The owner parameter is the org slug (e.g. "octocat"), and slug is the team
-// slug (e.g. "dba-team"). Returns an error if the team is not found.
+// slug (e.g. "dba-team"). Returns an error if team membership cannot be read.
 func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug string) ([]string, error) {
 	opts := &gh.TeamListTeamMembersOptions{ListOptions: gh.ListOptions{PerPage: 100}}
 	var members []string
@@ -202,7 +205,7 @@ func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug str
 	for {
 		users, resp, err := ic.client.Teams.ListTeamMembersBySlug(ctx, org, slug, opts)
 		if err != nil {
-			return nil, fmt.Errorf("list team members %s/%s: %w", org, slug, err)
+			return nil, teamMembershipReadError("list team members", org, slug, err)
 		}
 		for _, u := range users {
 			members = append(members, u.GetLogin())
@@ -216,22 +219,46 @@ func (ic *InstallationClient) ListTeamMembers(ctx context.Context, org, slug str
 	return members, nil
 }
 
-// IsTeamMember returns true when login is an active member of org/slug.
-// GitHub returns 404 when the user is not a team member; that is an ordinary
-// negative authorization result. Other errors are returned so callers can fail
-// closed when GitHub membership cannot be verified.
+// IsTeamMember returns true when login is a member of org/slug. It relies on
+// the same team-member listing used by CODEOWNERS review checks so the only
+// negative result is a readable team list that does not contain the actor.
 func (ic *InstallationClient) IsTeamMember(ctx context.Context, org, slug, login string) (bool, error) {
-	membership, resp, err := ic.client.Teams.GetTeamMembershipBySlug(ctx, org, slug, login)
+	members, err := ic.ListTeamMembers(ctx, org, slug)
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
-			return false, nil
+		return false, fmt.Errorf("check team membership %s/%s for %s: %w", org, slug, login, err)
+	}
+	for _, member := range members {
+		if strings.EqualFold(member, login) {
+			return true, nil
 		}
-		return false, fmt.Errorf("get team membership %s/%s for %s: %w", org, slug, login, err)
 	}
-	if membership == nil {
-		return false, nil
+	return false, nil
+}
+
+func teamMembershipReadError(operation, org, slug string, err error) error {
+	if isTeamMembershipVisibilityError(err) {
+		return fmt.Errorf("%w: %s %s/%s: %w", ErrTeamMembershipUnreadable, operation, org, slug, err)
 	}
-	return membership.GetState() == "active", nil
+	return fmt.Errorf("%s %s/%s: %w", operation, org, slug, err)
+}
+
+func isTeamMembershipVisibilityError(err error) bool {
+	var rateLimitErr *gh.RateLimitError
+	if errors.As(err, &rateLimitErr) {
+		return false
+	}
+	var abuseRateLimitErr *gh.AbuseRateLimitError
+	if errors.As(err, &abuseRateLimitErr) {
+		return false
+	}
+	var responseErr *gh.ErrorResponse
+	if !errors.As(err, &responseErr) || responseErr.Response == nil {
+		return false
+	}
+	statusCode := responseErr.Response.StatusCode
+	return statusCode >= http.StatusBadRequest &&
+		statusCode < http.StatusInternalServerError &&
+		statusCode != http.StatusTooManyRequests
 }
 
 // RequestReviewers requests reviews from users and/or teams on a PR.

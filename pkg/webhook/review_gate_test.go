@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,23 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+func TestReviewGateErrorDetailTeamMembership(t *testing.T) {
+	err := fmt.Errorf("expand team @octocat/schema-admins: %w", ghclient.ErrTeamMembershipUnreadable)
+
+	detail := reviewGateErrorDetail(err)
+
+	assert.Contains(t, detail, "Review gate check failed")
+	assert.Contains(t, detail, "team membership cannot be read")
+	assert.Contains(t, detail, "GitHub App can read organization members")
+}
+
+func TestReviewGateErrorDetailGeneric(t *testing.T) {
+	detail := reviewGateErrorDetail(assert.AnError)
+
+	assert.Contains(t, detail, "Review gate check failed")
+	assert.NotContains(t, detail, "GitHub App can read organization members")
+}
 
 // mockSettingsStore implements storage.SettingsStore for testing.
 type mockSettingsStore struct {

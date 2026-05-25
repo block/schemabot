@@ -165,43 +165,57 @@ func TestGetApprovedReviewers(t *testing.T) {
 
 func TestIsTeamMember(t *testing.T) {
 	tests := []struct {
-		name       string
-		statusCode int
-		body       map[string]string
-		wantMember bool
-		wantErr    bool
+		name            string
+		statusCode      int
+		members         []string
+		wantMember      bool
+		wantErr         bool
+		wantErrContains string
+		wantUnreadable  bool
 	}{
 		{
-			name:       "active membership allows",
+			name:       "listed member allows",
 			statusCode: http.StatusOK,
-			body:       map[string]string{"state": "active"},
+			members:    []string{"mona"},
 			wantMember: true,
 		},
 		{
-			name:       "pending membership does not allow",
+			name:       "listed member allows case-insensitively",
 			statusCode: http.StatusOK,
-			body:       map[string]string{"state": "pending"},
-			wantMember: false,
+			members:    []string{"Mona"},
+			wantMember: true,
 		},
 		{
-			name:       "not found is not a member",
-			statusCode: http.StatusNotFound,
-			wantMember: false,
+			name:       "readable team without actor is not a member",
+			statusCode: http.StatusOK,
+			members:    []string{"hubot"},
 		},
 		{
-			name:       "server error is returned",
-			statusCode: http.StatusInternalServerError,
-			wantErr:    true,
+			name:            "unreadable team returns sentinel error",
+			statusCode:      http.StatusNotFound,
+			wantErr:         true,
+			wantErrContains: "check team membership",
+			wantUnreadable:  true,
+		},
+		{
+			name:            "server error returns generic error",
+			statusCode:      http.StatusInternalServerError,
+			wantErr:         true,
+			wantErrContains: "check team membership",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client, mux := setupConfigTestGitHubServer(t)
-			mux.HandleFunc("GET /orgs/octocat/teams/db-operators/memberships/mona", func(w http.ResponseWriter, _ *http.Request) {
+			mux.HandleFunc("GET /orgs/octocat/teams/db-operators/members", func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tt.statusCode)
-				if tt.body != nil {
-					require.NoError(t, json.NewEncoder(w).Encode(tt.body))
+				if tt.statusCode == http.StatusOK {
+					users := make([]map[string]string, 0, len(tt.members))
+					for _, member := range tt.members {
+						users = append(users, map[string]string{"login": member})
+					}
+					require.NoError(t, json.NewEncoder(w).Encode(users))
 				}
 			})
 
@@ -209,10 +223,68 @@ func TestIsTeamMember(t *testing.T) {
 			member, err := ic.IsTeamMember(t.Context(), "octocat", "db-operators", "mona")
 			if tt.wantErr {
 				require.Error(t, err)
+				if tt.wantUnreadable {
+					assert.ErrorIs(t, err, ErrTeamMembershipUnreadable)
+				} else {
+					assert.NotErrorIs(t, err, ErrTeamMembershipUnreadable)
+				}
+				if tt.wantErrContains != "" {
+					assert.Contains(t, err.Error(), tt.wantErrContains)
+				}
 				return
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantMember, member)
+		})
+	}
+}
+
+func TestListTeamMembersErrorClassification(t *testing.T) {
+	tests := []struct {
+		name           string
+		statusCode     int
+		wantUnreadable bool
+	}{
+		{
+			name:           "not found is unreadable",
+			statusCode:     http.StatusNotFound,
+			wantUnreadable: true,
+		},
+		{
+			name:           "unauthorized is unreadable",
+			statusCode:     http.StatusUnauthorized,
+			wantUnreadable: true,
+		},
+		{
+			name:           "forbidden is unreadable",
+			statusCode:     http.StatusForbidden,
+			wantUnreadable: true,
+		},
+		{
+			name:       "too many requests is generic",
+			statusCode: http.StatusTooManyRequests,
+		},
+		{
+			name:       "server error is generic",
+			statusCode: http.StatusInternalServerError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupConfigTestGitHubServer(t)
+			mux.HandleFunc("GET /orgs/octocat/teams/db-operators/members", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.statusCode)
+			})
+
+			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			_, err := ic.ListTeamMembers(t.Context(), "octocat", "db-operators")
+			require.Error(t, err)
+			if tt.wantUnreadable {
+				assert.ErrorIs(t, err, ErrTeamMembershipUnreadable)
+			} else {
+				assert.NotErrorIs(t, err, ErrTeamMembershipUnreadable)
+			}
 		})
 	}
 }
