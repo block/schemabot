@@ -924,47 +924,77 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 	remoteTasks []*ternv1.TableProgress,
 	now time.Time,
 ) error {
+	remoteTaskIndex := indexProtoTableProgress(remoteTasks)
+	missingProgressTasks := 0
 	for _, storedTask := range storedTasks {
-		for _, remoteTask := range remoteTasks {
-			if remoteTask.TableName != storedTask.TableName {
-				continue
-			}
-			oldTaskState := storedTask.State
-			remoteTaskState := state.NormalizeTaskStatus(remoteTask.Status)
-			if state.IsState(remoteTaskState, state.Task.Stopped) {
-				storedTask.State = remoteTaskState
-			} else {
-				storedTask.State = taskStateWithNoBackwardProgress(storedTask.State, remoteTaskState)
-			}
-			if !state.IsState(storedTask.State, remoteTaskState) {
-				slog.Debug("keeping stored gRPC task state because remote progress reported earlier state",
-					"apply_id", storedApply.ApplyIdentifier,
-					"external_id", storedApply.ExternalID,
-					"task_id", storedTask.TaskIdentifier,
-					"table", storedTask.TableName,
-					"stored_task_state", oldTaskState,
-					"remote_task_state", remoteTaskState)
-			}
+		remoteTask, ok := protoProgressForTask(remoteTaskIndex, storedTask)
+		if !ok {
+			missingProgressTasks++
+			continue
+		}
+		oldTaskState := storedTask.State
+		remoteTaskState := state.NormalizeTaskStatus(remoteTask.Status)
+		if state.IsState(remoteTaskState, state.Task.Stopped) {
+			storedTask.State = remoteTaskState
+		} else {
+			storedTask.State = taskStateWithNoBackwardProgress(storedTask.State, remoteTaskState)
+		}
+		if !state.IsState(storedTask.State, remoteTaskState) {
+			slog.Debug("keeping stored gRPC task state because remote progress reported earlier state",
+				"apply_id", storedApply.ApplyIdentifier,
+				"external_id", storedApply.ExternalID,
+				"task_id", storedTask.TaskIdentifier,
+				"table", storedTask.TableName,
+				"stored_task_state", oldTaskState,
+				"remote_task_state", remoteTaskState)
+		}
+		if remoteTaskOmittedRowTotals(storedTask, remoteTask) {
+			slog.Debug("keeping stored gRPC task row-copy progress because remote progress omitted row totals",
+				"apply_id", storedApply.ApplyIdentifier,
+				"external_id", storedApply.ExternalID,
+				"task_id", storedTask.TaskIdentifier,
+				"namespace", storedTask.Namespace,
+				"table", storedTask.TableName,
+				"stored_rows_copied", storedTask.RowsCopied,
+				"stored_rows_total", storedTask.RowsTotal,
+				"stored_progress_percent", storedTask.ProgressPercent,
+				"remote_rows_copied", remoteTask.RowsCopied,
+				"remote_progress_percent", remoteTask.PercentComplete)
+		} else {
 			storedTask.RowsCopied = remoteTask.RowsCopied
 			storedTask.RowsTotal = remoteTask.RowsTotal
 			storedTask.ProgressPercent = int(remoteTask.PercentComplete)
-			if state.IsState(storedTask.State, state.Task.Completed) && storedTask.ProgressPercent != 100 {
-				storedTask.ProgressPercent = 100
-			}
-			if state.IsTerminalTaskState(storedTask.State) && storedTask.CompletedAt == nil {
-				storedTask.CompletedAt = &now
-			}
-			storedTask.UpdatedAt = now
-			if err := c.storage.Tasks().Update(ctx, storedTask); err != nil {
-				return fmt.Errorf("sync task %s from gRPC progress for %s: %w", storedTask.TaskIdentifier, storedApply.ApplyIdentifier, err)
-			}
-			if oldTaskState != storedTask.State {
-				c.logTaskStateTransition(ctx, storedApply.ID, storedTask, fmt.Sprintf("Remote task %s changed state: %s -> %s", storedTask.TableName, oldTaskState, storedTask.State), oldTaskState)
-			}
-			break
+		}
+		if state.IsState(storedTask.State, state.Task.Completed) && storedTask.ProgressPercent != 100 {
+			storedTask.ProgressPercent = 100
+		}
+		if state.IsTerminalTaskState(storedTask.State) && storedTask.CompletedAt == nil {
+			storedTask.CompletedAt = &now
+		}
+		storedTask.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, storedTask); err != nil {
+			return fmt.Errorf("sync task %s from gRPC progress for %s: %w", storedTask.TaskIdentifier, storedApply.ApplyIdentifier, err)
+		}
+		if oldTaskState != storedTask.State {
+			c.logTaskStateTransition(ctx, storedApply.ID, storedTask, fmt.Sprintf("Remote task %s changed state: %s -> %s", storedTask.TableName, oldTaskState, storedTask.State), oldTaskState)
 		}
 	}
+	if missingProgressTasks > 0 {
+		slog.Debug("remote gRPC progress omitted stored tasks",
+			"apply_id", storedApply.ApplyIdentifier,
+			"external_id", storedApply.ExternalID,
+			"database", storedApply.Database,
+			"environment", storedApply.Environment,
+			"missing_count", missingProgressTasks)
+	}
 	return nil
+}
+
+func remoteTaskOmittedRowTotals(storedTask *storage.Task, remoteTask *ternv1.TableProgress) bool {
+	if storedTask == nil || remoteTask == nil {
+		return false
+	}
+	return storedTask.RowsTotal > 0 && remoteTask.RowsTotal <= 0
 }
 
 func ensureStoredTasksResolvedForTerminalRemoteApply(remoteApply *storage.Apply, storedTasks []*storage.Task) error {
