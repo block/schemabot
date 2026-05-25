@@ -19,16 +19,12 @@ import (
 // handleApplyCommand handles the "schemabot apply -e <env>" PR comment command.
 // It generates a plan, acquires a lock, and posts a plan comment with a confirmation footer.
 func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	// Dedupe FetchPullRequest calls within this command invocation.
-	ctx = ghclient.WithPRInfoCache(ctx)
-
-	client, err := h.ghClient.ForInstallation(installationID)
+	ctx, cancel, client, err := h.commandBootstrap(installationID)
 	if err != nil {
-		h.logger.Error("failed to create GitHub client", "error", err)
+		h.logger.Error("apply: failed to bootstrap command", "error", err)
 		return
 	}
+	defer cancel()
 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
@@ -368,16 +364,12 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 // handleApplyConfirmCommand handles the "schemabot apply-confirm -e <env>" PR comment command.
 // It verifies lock ownership, re-plans for drift detection, executes the apply, and watches progress.
 func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	// Dedupe FetchPullRequest calls within this command invocation.
-	ctx = ghclient.WithPRInfoCache(ctx)
-
-	client, err := h.ghClient.ForInstallation(installationID)
+	ctx, cancel, client, err := h.commandBootstrap(installationID)
 	if err != nil {
-		h.logger.Error("failed to create GitHub client", "error", err)
+		h.logger.Error("apply-confirm: failed to bootstrap command", "error", err)
 		return
 	}
+	defer cancel()
 
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
@@ -894,10 +886,8 @@ func statusRollupContainsRequiredCheck(statuses []ghclient.PRCheckStatus, config
 // handleUnlockCommand handles the "schemabot unlock" PR comment command.
 // It finds all locks held by this PR and releases them.
 func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64, requestedBy string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := h.commandContext(30 * time.Second)
 	defer cancel()
-	// Dedupe FetchPullRequest calls within this command invocation.
-	ctx = ghclient.WithPRInfoCache(ctx)
 
 	// Find locks held by this PR
 	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)

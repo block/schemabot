@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
-	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -18,7 +17,7 @@ import (
 // It looks up the specified apply, generates a rollback plan from its original schema,
 // acquires a lock, and posts the plan for confirmation.
 func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
 
 	applyID := result.ApplyID
@@ -162,16 +161,12 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 // handleRollbackConfirmCommand handles the "schemabot rollback-confirm -e <env>" PR comment command.
 // It verifies the lock, re-generates the rollback plan for drift detection, and executes the apply.
 func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	// Dedupe FetchPullRequest calls within this command invocation.
-	ctx = ghclient.WithPRInfoCache(ctx)
-
-	client, err := h.ghClient.ForInstallation(installationID)
+	ctx, cancel, client, err := h.commandBootstrap(installationID)
 	if err != nil {
-		h.logger.Error("failed to create GitHub client", "error", err)
+		h.logger.Error("rollback-confirm: failed to bootstrap command", "error", err)
 		return
 	}
+	defer cancel()
 
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)

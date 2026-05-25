@@ -16,17 +16,13 @@ import (
 
 // handlePlanCommand handles the "schemabot plan -e <env>" command.
 func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	// Dedupe FetchPullRequest calls within this command invocation.
-	ctx = ghclient.WithPRInfoCache(ctx)
-
-	client, err := h.ghClient.ForInstallation(installationID)
+	ctx, cancel, client, err := h.commandBootstrap(installationID)
 	if err != nil {
-		h.logger.Error("failed to create GitHub client", "error", err)
+		h.logger.Error("plan: failed to bootstrap command", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "failed to initialize GitHub client")
 		return
 	}
+	defer cancel()
 
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
@@ -132,16 +128,12 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
 // When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
 func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, installationID int64, requestedBy string, isAutoPlan bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	// Dedupe FetchPullRequest calls within this plan invocation.
-	ctx = ghclient.WithPRInfoCache(ctx)
-
-	client, err := h.ghClient.ForInstallation(installationID)
+	ctx, cancel, client, err := h.commandBootstrap(installationID)
 	if err != nil {
-		h.logger.Error("failed to create GitHub client", "error", err)
+		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
 		return
 	}
+	defer cancel()
 
 	// Fix checks stuck at "in_progress" from crashed applies
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
