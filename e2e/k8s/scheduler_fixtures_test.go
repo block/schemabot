@@ -103,6 +103,11 @@ type runningIndexApply struct {
 
 func startRunningIndexAddApply(t *testing.T, tablePrefix string) runningIndexApply {
 	t.Helper()
+	return startIndexAddApply(t, tablePrefix, true)
+}
+
+func startIndexAddApply(t *testing.T, tablePrefix string, waitForRunning bool) runningIndexApply {
+	t.Helper()
 	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName(tablePrefix)
 
@@ -121,9 +126,11 @@ func startRunningIndexAddApply(t *testing.T, tablePrefix string) runningIndexApp
 	_, applyID := testutil.PlanAndApply(t, ep, "testapp", "mysql", "staging", schemaFiles, nil)
 	dataPlaneApplyID := waitForApplyExternalID(t, applyID, testutil.PollDeadline)
 
-	// The index add keeps Spirit observable long enough for the test to replace
-	// one tier while the other tier continues running.
-	testutil.WaitForState(t, ep, applyID, state.Apply.Running, testutil.PollDeadline)
+	if waitForRunning {
+		// The index add keeps Spirit observable long enough for the test to replace
+		// one tier while the other tier continues running.
+		testutil.WaitForState(t, ep, applyID, state.Apply.Running, testutil.PollDeadline)
+	}
 
 	return runningIndexApply{
 		Endpoint:         ep,

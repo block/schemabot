@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -32,19 +33,63 @@ func runKubectl(t *testing.T, args ...string) string {
 
 func crashPod(t *testing.T, instance string) string {
 	t.Helper()
-	selector := "app.kubernetes.io/instance=" + instance
-	pod := strings.TrimSpace(runKubectl(t, "get", "pod", "-n", k8sNamespace, "-l", selector, "-o", "jsonpath={.items[0].metadata.name}"))
-	require.NotEmpty(t, pod, "expected pod for %s", instance)
+	pods := podNamesForInstance(t, instance)
+	require.NotEmpty(t, pods, "expected pod for %s", instance)
+	pod := pods[0]
 
 	runKubectl(t, "delete", "pod", "-n", k8sNamespace, pod, "--grace-period=0", "--force", "--wait=false")
 	return pod
 }
 
-func waitForReplacementPodReady(t *testing.T, instance, previousPod string, timeout time.Duration) {
+func crashPods(t *testing.T, instance string) []string {
+	t.Helper()
+	pods := podNamesForInstance(t, instance)
+	require.NotEmpty(t, pods, "expected pods for %s", instance)
+
+	args := []string{"delete", "pod", "-n", k8sNamespace}
+	args = append(args, pods...)
+	args = append(args, "--grace-period=0", "--force", "--wait=false")
+	runKubectl(t, args...)
+	return pods
+}
+
+func podNamesForInstance(t *testing.T, instance string) []string {
 	t.Helper()
 	selector := "app.kubernetes.io/instance=" + instance
+	output := runKubectl(t, "get", "pod", "-n", k8sNamespace, "-l", selector, "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+	var pods []string
+	for line := range strings.SplitSeq(output, "\n") {
+		pod := strings.TrimSpace(line)
+		if pod != "" {
+			pods = append(pods, pod)
+		}
+	}
+	return pods
+}
+
+func desiredReplicasForInstance(t *testing.T, instance string) int {
+	t.Helper()
+	selector := "app.kubernetes.io/instance=" + instance
+	output := strings.TrimSpace(runKubectl(t, "get", "deployment", "-n", k8sNamespace, "-l", selector, "-o", "jsonpath={.items[0].spec.replicas}"))
+	replicas, err := strconv.Atoi(output)
+	require.NoError(t, err, "parse desired replicas for %s", instance)
+	require.Positive(t, replicas, "expected desired replicas for %s", instance)
+	return replicas
+}
+
+func waitForPodsReadyAfterDeletion(t *testing.T, instance string, previousPods []string, timeout time.Duration) {
+	t.Helper()
+	desiredReplicas := desiredReplicasForInstance(t, instance)
+	previous := make(map[string]bool, len(previousPods))
+	for _, pod := range previousPods {
+		previous[pod] = true
+	}
+
+	selector := "app.kubernetes.io/instance=" + instance
+	var readyPods []string
 	testutil.Poll(t, timeout, 500*time.Millisecond,
 		func() bool {
+			readyPods = readyPods[:0]
 			output := runKubectl(t, "get", "pod", "-n", k8sNamespace, "-l", selector, "-o", "json")
 
 			var podList struct {
@@ -63,20 +108,37 @@ func waitForReplacementPodReady(t *testing.T, instance, previousPod string, time
 			require.NoError(t, json.Unmarshal([]byte(output), &podList))
 
 			for _, pod := range podList.Items {
-				if pod.Metadata.Name != previousPod {
-					for _, condition := range pod.Status.Conditions {
-						if condition.Type == "Ready" && condition.Status == "True" {
-							return true
-						}
-					}
+				if previous[pod.Metadata.Name] {
+					continue
+				}
+				if podReady(pod.Status.Conditions) {
+					readyPods = append(readyPods, pod.Metadata.Name)
 				}
 			}
-			return false
+			return len(readyPods) >= desiredReplicas
 		},
 		func() string {
-			return fmt.Sprintf("timeout waiting for replacement %s pod after deleting %s", instance, previousPod)
+			return fmt.Sprintf("timeout waiting for %d ready replacement %s pods after deleting %s, ready replacements: %s",
+				desiredReplicas, instance, strings.Join(previousPods, ","), strings.Join(readyPods, ","))
 		},
 	)
+}
+
+func podReady(conditions []struct {
+	Type   string `json:"type"`
+	Status string `json:"status"`
+}) bool {
+	for _, condition := range conditions {
+		if condition.Type == "Ready" && condition.Status == "True" {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForReplacementPodReady(t *testing.T, instance, previousPod string, timeout time.Duration) {
+	t.Helper()
+	waitForPodsReadyAfterDeletion(t, instance, []string{previousPod}, timeout)
 }
 
 func waitForTernHealth(t *testing.T, endpoint, deployment, environment string, timeout time.Duration) {
@@ -140,4 +202,21 @@ func startControlPlanePortForward(t *testing.T) string {
 	endpoint := fmt.Sprintf("http://localhost:%d", port)
 	waitForHTTPStatus(t, endpoint+"/health", http.StatusOK, testutil.PollDeadline)
 	return endpoint
+}
+
+func startDataPlanePodGRPCPortForward(t *testing.T, pod string) string {
+	t.Helper()
+	port := freeLocalPort(t)
+	ctx, cancel := context.WithCancel(context.WithoutCancel(t.Context()))
+	cmd := exec.CommandContext(ctx, "kubectl", "port-forward", "-n", k8sNamespace, "pod/"+pod, fmt.Sprintf("%d:13370", port))
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		cancel()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+
+	return fmt.Sprintf("127.0.0.1:%d", port)
 }

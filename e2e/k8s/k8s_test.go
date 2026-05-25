@@ -45,6 +45,7 @@
 package k8s
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -58,12 +59,15 @@ import (
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func storageDSNs(t *testing.T) []string {
@@ -344,19 +348,127 @@ func TestK8s_Progress(t *testing.T) {
 	testutil.WaitForState(t, ep, applyID, state.Apply.Completed, testutil.PollDeadline)
 }
 
+// TestK8s_ProgressStableAcrossDataPlaneReplicas verifies that gRPC progress is
+// stable when a data-plane service has multiple pods. Only one pod owns the
+// in-memory Spirit runner, but every pod must be able to answer Progress from
+// shared storage without downgrading row-copy progress.
+func TestK8s_ProgressStableAcrossDataPlaneReplicas(t *testing.T) {
+	pods := podNamesForInstance(t, "data-plane")
+	require.GreaterOrEqual(t, len(pods), 2, "expected k8s e2e data plane to run at least two replicas")
+
+	endpoints := make([]dataPlanePodEndpoint, 0, len(pods))
+	for _, pod := range pods {
+		endpoints = append(endpoints, dataPlanePodEndpoint{
+			pod:     pod,
+			address: startDataPlanePodGRPCPortForward(t, pod),
+		})
+	}
+
+	fixture := startIndexAddApply(t, "k8s_dp_replicas", false)
+	tablesByPod := waitForDataPlanePodsRowCopyProgress(t, endpoints, fixture.DataPlaneApplyID, fixture.TableName)
+
+	for _, pod := range pods {
+		table := tablesByPod[pod]
+		require.NotNil(t, table, "data-plane pod %s should report row-copy progress", pod)
+		assert.Equal(t, fixture.TableName, table.TableName, "data-plane pod %s should report the target table", pod)
+		assert.Positive(t, table.RowsTotal, "data-plane pod %s should preserve row-copy totals", pod)
+		assert.True(t, hasRowCopyProgress(table.RowsTotal, table.RowsCopied, table.PercentComplete), "data-plane pod %s should preserve row-copy progress", pod)
+	}
+
+	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
+	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
+}
+
+type dataPlanePodEndpoint struct {
+	pod     string
+	address string
+}
+
+func waitForDataPlanePodsRowCopyProgress(t *testing.T, endpoints []dataPlanePodEndpoint, applyID, tableName string) map[string]*ternv1.TableProgress {
+	t.Helper()
+
+	clients := make(map[string]ternv1.TernClient, len(endpoints))
+	for _, endpoint := range endpoints {
+		conn, err := grpc.NewClient(endpoint.address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		require.NoError(t, err)
+		defer utils.CloseAndLog(conn)
+		clients[endpoint.pod] = ternv1.NewTernClient(conn)
+	}
+
+	matchedTables := make(map[string]*ternv1.TableProgress, len(endpoints))
+	lastResponses := make(map[string]*ternv1.ProgressResponse, len(endpoints))
+	lastErrors := make(map[string]error, len(endpoints))
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			for _, endpoint := range endpoints {
+				if matchedTables[endpoint.pod] != nil {
+					continue
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), testutil.ProgressTimeout)
+				resp, err := clients[endpoint.pod].Progress(ctx, &ternv1.ProgressRequest{
+					ApplyId:     applyID,
+					Database:    "testapp",
+					Environment: "staging",
+				})
+				cancel()
+				lastErrors[endpoint.pod] = err
+				if err != nil {
+					continue
+				}
+				lastResponses[endpoint.pod] = resp
+				for _, table := range resp.Tables {
+					if table.TableName == tableName && hasRowCopyProgress(table.RowsTotal, table.RowsCopied, table.PercentComplete) {
+						matchedTables[endpoint.pod] = table
+						break
+					}
+				}
+			}
+			return len(matchedTables) == len(endpoints)
+		},
+		func() string {
+			return fmt.Sprintf("timeout waiting for all data-plane pods to preserve row-copy progress for %s: matched=%s last_responses=%s last_errors=%v",
+				tableName, formatMatchedPods(matchedTables), formatPodProgressResponses(lastResponses), lastErrors)
+		})
+	return matchedTables
+}
+
+func formatMatchedPods(matchedTables map[string]*ternv1.TableProgress) string {
+	pods := make([]string, 0, len(matchedTables))
+	for pod := range matchedTables {
+		pods = append(pods, pod)
+	}
+	return strings.Join(pods, ",")
+}
+
+func formatPodProgressResponses(responses map[string]*ternv1.ProgressResponse) string {
+	parts := make([]string, 0, len(responses))
+	for pod, resp := range responses {
+		var tableParts []string
+		for _, table := range resp.Tables {
+			tableParts = append(tableParts, fmt.Sprintf("%s status=%s rows=%d/%d percent=%d",
+				table.TableName, table.Status, table.RowsCopied, table.RowsTotal, table.PercentComplete))
+		}
+		parts = append(parts, fmt.Sprintf("%s state=%s tables=[%s]", pod, resp.State, strings.Join(tableParts, "; ")))
+	}
+	return strings.Join(parts, " | ")
+}
+
+func hasRowCopyProgress(rowsTotal, rowsCopied int64, percentComplete int32) bool {
+	return rowsTotal > 0 && (rowsCopied > 0 || percentComplete > 0)
+}
+
 // TestK8s_Scheduler_DataPlanePodRestartRecoversIndexAdd verifies scheduler
 // recovery across the two-tier Kubernetes deployment. The control plane keeps
-// the user-facing apply alive while the data plane pod, which owns the Spirit
-// worker and target database access, is replaced mid-apply.
+// the user-facing apply alive while the data-plane pods are replaced mid-apply.
 func TestK8s_Scheduler_DataPlanePodRestartRecoversIndexAdd(t *testing.T) {
 	fixture := startRunningIndexAddApply(t, "k8s_sched_dp")
 
-	crashedPod := crashPod(t, "data-plane")
+	crashedPods := crashPods(t, "data-plane")
 
-	// The restarted data-plane scheduler claims stale data-plane apply rows. Aging
+	// The restarted data-plane scheduler claims stale local apply rows. Aging
 	// the heartbeat avoids waiting for the production staleness threshold.
 	markDataPlaneHeartbeatStale(t, fixture.DataPlaneApplyID)
-	waitForReplacementPodReady(t, "data-plane", crashedPod, 2*time.Minute)
+	waitForPodsReadyAfterDeletion(t, "data-plane", crashedPods, 2*time.Minute)
 	waitForTernHealth(t, fixture.Endpoint, "data-plane", "staging", testutil.PollDeadline)
 
 	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)

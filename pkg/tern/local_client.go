@@ -875,20 +875,15 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			tp.IsInstant = et.IsInstant
 			tp.ProgressDetail = et.ProgressDetail
 
-			// Update task timestamps from engine if not already set.
-			updated := false
-			if et.StartedAt != nil && t.StartedAt == nil {
-				t.StartedAt = et.StartedAt
-				updated = true
-			}
-			if et.CompletedAt != nil && t.CompletedAt == nil {
-				t.CompletedAt = et.CompletedAt
-				updated = true
-			}
-			if updated {
-				t.UpdatedAt = time.Now()
+			if syncStoredTaskProgressFromEngineTable(t, et, time.Now()) {
 				if err := c.storage.Tasks().Update(ctx, t); err != nil {
-					c.logger.Error("failed to update task timestamps", "task_id", t.TaskIdentifier, "error", err)
+					c.logger.Error("failed to update task progress from engine",
+						"task_id", t.TaskIdentifier,
+						"table", t.TableName,
+						"rows_copied", t.RowsCopied,
+						"rows_total", t.RowsTotal,
+						"progress_percent", t.ProgressPercent,
+						"error", err)
 				}
 			}
 
@@ -1007,6 +1002,55 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	}
 
 	return resp, nil
+}
+
+func syncStoredTaskProgressFromEngineTable(task *storage.Task, progress *engine.TableProgress, now time.Time) bool {
+	if task == nil || progress == nil {
+		return false
+	}
+
+	changed := false
+	if !engineTableProgressOmittedRowTotals(task, progress) {
+		if task.RowsCopied != progress.RowsCopied {
+			task.RowsCopied = progress.RowsCopied
+			changed = true
+		}
+		if task.RowsTotal != progress.RowsTotal {
+			task.RowsTotal = progress.RowsTotal
+			changed = true
+		}
+		if task.ProgressPercent != progress.Progress {
+			task.ProgressPercent = progress.Progress
+			changed = true
+		}
+		if task.ETASeconds != int(progress.ETASeconds) {
+			task.ETASeconds = int(progress.ETASeconds)
+			changed = true
+		}
+	}
+	if task.IsInstant != progress.IsInstant {
+		task.IsInstant = progress.IsInstant
+		changed = true
+	}
+	if progress.StartedAt != nil && task.StartedAt == nil {
+		task.StartedAt = progress.StartedAt
+		changed = true
+	}
+	if progress.CompletedAt != nil && task.CompletedAt == nil {
+		task.CompletedAt = progress.CompletedAt
+		changed = true
+	}
+	if changed {
+		task.UpdatedAt = now
+	}
+	return changed
+}
+
+func engineTableProgressOmittedRowTotals(task *storage.Task, progress *engine.TableProgress) bool {
+	if task == nil || progress == nil {
+		return false
+	}
+	return task.RowsTotal > 0 && progress.RowsTotal <= 0
 }
 
 func progressTableStatus(storedTaskState, engineTableState string) string {

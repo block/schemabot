@@ -5,10 +5,12 @@ import (
 	"log/slog"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -107,6 +109,58 @@ func TestTaskStateWithNoBackwardProgressPolicyCoversTaskStates(t *testing.T) {
 			"task state %s=%q must be terminal, scheduler/control-owned, or ranked as active progress",
 			taskName, taskState)
 	}
+}
+
+func TestSyncStoredTaskProgressFromEngineTablePersistsRows(t *testing.T) {
+	now := time.Date(2026, 5, 25, 17, 45, 0, 0, time.UTC)
+	startedAt := now.Add(-time.Minute)
+	task := &storage.Task{
+		TaskIdentifier: "task-progress",
+		State:          state.Task.Running,
+	}
+
+	changed := syncStoredTaskProgressFromEngineTable(task, &engine.TableProgress{
+		Table:      "users",
+		State:      state.Task.Running,
+		Progress:   42,
+		RowsCopied: 420,
+		RowsTotal:  1000,
+		ETASeconds: 12,
+		StartedAt:  &startedAt,
+	}, now)
+
+	require.True(t, changed)
+	assert.Equal(t, int64(420), task.RowsCopied)
+	assert.Equal(t, int64(1000), task.RowsTotal)
+	assert.Equal(t, 42, task.ProgressPercent)
+	assert.Equal(t, 12, task.ETASeconds)
+	assert.Equal(t, &startedAt, task.StartedAt)
+	assert.Equal(t, now, task.UpdatedAt)
+}
+
+func TestSyncStoredTaskProgressFromEngineTablePreservesRowsWhenEngineOmitsTotals(t *testing.T) {
+	now := time.Date(2026, 5, 25, 17, 45, 0, 0, time.UTC)
+	task := &storage.Task{
+		TaskIdentifier:  "task-progress",
+		State:           state.Task.Running,
+		RowsCopied:      950,
+		RowsTotal:       1000,
+		ProgressPercent: 95,
+		ETASeconds:      3,
+	}
+
+	changed := syncStoredTaskProgressFromEngineTable(task, &engine.TableProgress{
+		Table:    "users",
+		State:    state.Task.Running,
+		Progress: 0,
+	}, now)
+
+	require.False(t, changed)
+	assert.Equal(t, int64(950), task.RowsCopied)
+	assert.Equal(t, int64(1000), task.RowsTotal)
+	assert.Equal(t, 95, task.ProgressPercent)
+	assert.Equal(t, 3, task.ETASeconds)
+	assert.True(t, task.UpdatedAt.IsZero())
 }
 
 func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *testing.T) {
