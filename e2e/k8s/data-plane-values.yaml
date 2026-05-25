@@ -8,6 +8,8 @@ image:
   tag: test
   pullPolicy: Never
 
+replicaCount: 2
+
 grpc:
   enabled: true
   port: 13370

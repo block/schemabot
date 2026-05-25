@@ -106,6 +106,8 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+const noActiveSchemaChangeMessage = "No active schema change"
+
 // LocalConfig holds configuration for the local Tern client.
 type LocalConfig struct {
 	// Database is the name of this database.
@@ -774,59 +776,73 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		}
 		result, err := eng.Progress(ctx, progressReq)
 		if err == nil {
-			engineResult = result
-			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
-			taskState := taskStateFromProgressResult(result)
+			if isInactiveLocalEngineProgress(c.config.Type, result, activeTask.State) {
+				c.logger.Debug("Progress: ignoring inactive local engine response for active task",
+					"task_id", activeTask.TaskIdentifier,
+					"task_state", activeTask.State,
+					"engine_state", result.State,
+					"message", result.Message)
+			} else {
+				engineResult = result
+				c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
+				taskState := taskStateFromProgressResult(result)
 
-			// Only update task state from engine if task is not already in a terminal state.
-			// Terminal states (CANCELLED, COMPLETED, FAILED, etc.) should be preserved -
-			// they represent the final state set by the apply execution.
-			if !state.IsTerminalTaskState(activeTask.State) {
-				activeTask.State = taskState
-				now := time.Now()
-				activeTask.UpdatedAt = now
-				if result.State.IsTerminal() && !state.IsState(taskState, state.Task.FailedRetryable) && activeTask.CompletedAt == nil {
-					activeTask.CompletedAt = &now
-				}
-				if result.State == engine.StateFailed && activeTask.ErrorMessage == "" {
-					activeTask.ErrorMessage = progressFailureMessage(result)
-				}
-				if err := c.storage.Tasks().Update(ctx, activeTask); err != nil {
-					c.logger.Warn("failed to update task state from progress poll", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "error", err)
-				}
-			}
-
-			// Also update the apply record if the engine reports a terminal state
-			// but the apply hasn't been updated yet. Only do this when ALL tasks
-			// for this apply are terminal — in sequential mode, the engine reports
-			// "completed" per-task, but the apply isn't done until all tasks finish.
-			if result.State.IsTerminal() {
-				retryableFailure := state.IsState(taskState, state.Task.FailedRetryable)
-				allTerminal := !retryableFailure
-				for _, t := range currentApplyTasks {
-					if !state.IsTerminalTaskState(t.State) {
-						allTerminal = false
-						break
+				// Only update task state from engine if task is not already in a terminal state.
+				// Terminal states (CANCELLED, COMPLETED, FAILED, etc.) should be preserved -
+				// they represent the final state set by the apply execution.
+				if !state.IsTerminalTaskState(activeTask.State) {
+					activeTask.State = taskState
+					now := time.Now()
+					activeTask.UpdatedAt = now
+					if result.State.IsTerminal() && !state.IsState(taskState, state.Task.FailedRetryable) && activeTask.CompletedAt == nil {
+						activeTask.CompletedAt = &now
+					}
+					if result.State == engine.StateFailed && activeTask.ErrorMessage == "" {
+						activeTask.ErrorMessage = progressFailureMessage(result)
+					}
+					if err := c.storage.Tasks().Update(ctx, activeTask); err != nil {
+						c.logger.Warn("failed to update task state from progress poll", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "error", err)
 					}
 				}
-				if retryableFailure || allTerminal {
-					apply, _ := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-					if apply != nil && !state.IsTerminalApplyState(apply.State) {
-						now := time.Now()
-						apply.State = taskStateToApplyState(taskState)
-						if retryableFailure {
-							apply.CompletedAt = nil
-						} else {
-							apply.CompletedAt = &now
+
+				// Also update the apply record if the engine reports a terminal state
+				// but the apply hasn't been updated yet. Only do this when ALL tasks
+				// for this apply are terminal — in sequential mode, the engine reports
+				// "completed" per-task, but the apply isn't done until all tasks finish.
+				if result.State.IsTerminal() {
+					retryableFailure := state.IsState(taskState, state.Task.FailedRetryable)
+					allTerminal := !retryableFailure
+					for _, t := range currentApplyTasks {
+						if !state.IsTerminalTaskState(t.State) {
+							allTerminal = false
+							break
 						}
-						if result.State == engine.StateFailed {
-							apply.ErrorMessage = progressFailureMessage(result)
+					}
+					if retryableFailure || allTerminal {
+						apply, applyErr := c.storage.Applies().Get(ctx, activeTask.ApplyID)
+						if applyErr != nil {
+							return nil, fmt.Errorf("load apply %d after terminal progress: %w", activeTask.ApplyID, applyErr)
 						}
-						apply.UpdatedAt = now
-						if err := c.storage.Applies().Update(ctx, apply); err != nil {
-							c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
+						if apply == nil {
+							return nil, fmt.Errorf("load apply %d after terminal progress: %w", activeTask.ApplyID, storage.ErrApplyNotFound)
 						}
-						c.logger.Info("apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
+						if !state.IsTerminalApplyState(apply.State) {
+							now := time.Now()
+							apply.State = taskStateToApplyState(taskState)
+							if retryableFailure {
+								apply.CompletedAt = nil
+							} else {
+								apply.CompletedAt = &now
+							}
+							if result.State == engine.StateFailed {
+								apply.ErrorMessage = progressFailureMessage(result)
+							}
+							apply.UpdatedAt = now
+							if err := c.storage.Applies().Update(ctx, apply); err != nil {
+								c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
+							}
+							c.logger.Info("apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
+						}
 					}
 				}
 			}
@@ -1001,6 +1017,15 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	}
 
 	return resp, nil
+}
+
+func isInactiveLocalEngineProgress(dbType string, result *engine.ProgressResult, taskState string) bool {
+	if dbType != storage.DatabaseTypeMySQL || result == nil {
+		return false
+	}
+	return result.State == engine.StatePending &&
+		result.Message == noActiveSchemaChangeMessage &&
+		!state.IsState(taskState, state.Task.Pending)
 }
 
 func ensureMetadata(m map[string]string) map[string]string {

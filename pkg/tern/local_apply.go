@@ -101,7 +101,7 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 
 	// Spirit has no active schema change but task isn't terminal — task is stale.
 	// Crashed or failed without updating storage.
-	if result.Message == "No active schema change" {
+	if result.Message == noActiveSchemaChangeMessage {
 		c.logger.Info("conflict check: cleaning up stale task (no active schema change in engine)",
 			"task_id", t.TaskIdentifier, "storage_state", t.State, "started_at", t.StartedAt)
 		now := time.Now()

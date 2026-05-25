@@ -988,27 +988,85 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 	remoteTasks []*ternv1.TableProgress,
 	now time.Time,
 ) error {
+	remoteTaskIndex := indexProtoTableProgress(remoteTasks)
+	missingProgressTasks := 0
 	for _, storedTask := range storedTasks {
-		for _, remoteTask := range remoteTasks {
-			if remoteTask.TableName != storedTask.TableName {
-				continue
-			}
-			oldTaskState := storedTask.State
-			storedTask.State = state.NormalizeTaskStatus(remoteTask.Status)
+		remoteTask, ok := protoProgressForTask(remoteTaskIndex, storedTask)
+		if !ok {
+			missingProgressTasks++
+			continue
+		}
+		oldTaskState := storedTask.State
+		newTaskState := state.NormalizeTaskStatus(remoteTask.Status)
+		if isRemoteTaskStateRegression(storedTask.State, newTaskState) {
+			newTaskState = storedTask.State
+		}
+		storedTask.State = newTaskState
+		if !isWeakerRemoteTaskProgress(storedTask, remoteTask, newTaskState) {
 			storedTask.RowsCopied = remoteTask.RowsCopied
 			storedTask.RowsTotal = remoteTask.RowsTotal
 			storedTask.ProgressPercent = int(remoteTask.PercentComplete)
-			storedTask.UpdatedAt = now
-			if err := c.storage.Tasks().Update(ctx, storedTask); err != nil {
-				return fmt.Errorf("sync task %s from gRPC progress for %s: %w", storedTask.TaskIdentifier, storedApply.ApplyIdentifier, err)
-			}
-			if oldTaskState != storedTask.State {
-				c.logTaskStateTransition(ctx, storedApply.ID, storedTask, fmt.Sprintf("Remote task %s changed state: %s -> %s", storedTask.TableName, oldTaskState, storedTask.State), oldTaskState)
-			}
-			break
+		}
+		storedTask.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, storedTask); err != nil {
+			return fmt.Errorf("sync task %s from gRPC progress for %s: %w", storedTask.TaskIdentifier, storedApply.ApplyIdentifier, err)
+		}
+		if oldTaskState != storedTask.State {
+			c.logTaskStateTransition(ctx, storedApply.ID, storedTask, fmt.Sprintf("Remote task %s changed state: %s -> %s", storedTask.TableName, oldTaskState, storedTask.State), oldTaskState)
 		}
 	}
+	if missingProgressTasks > 0 {
+		slog.Debug("remote gRPC progress omitted stored tasks",
+			"apply_id", storedApply.ApplyIdentifier,
+			"external_id", storedApply.ExternalID,
+			"database", storedApply.Database,
+			"environment", storedApply.Environment,
+			"missing_count", missingProgressTasks)
+	}
 	return nil
+}
+
+func isRemoteTaskStateRegression(currentState, remoteState string) bool {
+	return isProgressedTaskState(currentState) && state.IsState(remoteState, state.Task.Pending)
+}
+
+func isRemoteApplyStateRegression(currentState, remoteState string) bool {
+	return isProgressedApplyState(currentState) && state.IsState(remoteState, state.Apply.Pending)
+}
+
+func isWeakerRemoteTaskProgress(storedTask *storage.Task, remoteTask *ternv1.TableProgress, effectiveRemoteState string) bool {
+	if storedTask == nil || remoteTask == nil {
+		return false
+	}
+	if storedTask.RowsTotal <= 0 || remoteTask.RowsTotal > 0 {
+		return false
+	}
+	return isProgressedTaskState(effectiveRemoteState)
+}
+
+func isProgressedApplyState(applyState string) bool {
+	return state.IsState(applyState,
+		state.Apply.Running,
+		state.Apply.WaitingForDeploy,
+		state.Apply.WaitingForCutover,
+		state.Apply.CuttingOver,
+		state.Apply.RevertWindow,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest,
+	)
+}
+
+func isProgressedTaskState(taskState string) bool {
+	return state.IsState(taskState,
+		state.Task.Running,
+		state.Task.WaitingForDeploy,
+		state.Task.WaitingForCutover,
+		state.Task.CuttingOver,
+		state.Task.RevertWindow,
+	)
 }
 
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
@@ -1071,6 +1129,9 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					"stored_state", apply.State)
 				c.logApplyWarning(ctx, apply, message)
 				return fmt.Errorf("poll remote gRPC apply %s: unmapped remote state %s", apply.ApplyIdentifier, remoteApplyStateDescription(resp.State))
+			}
+			if isRemoteApplyStateRegression(apply.State, newState) {
+				newState = apply.State
 			}
 			if apply.StartedAt == nil && newState != state.Apply.Pending {
 				apply.StartedAt = &now

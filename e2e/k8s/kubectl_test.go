@@ -40,6 +40,20 @@ func crashPod(t *testing.T, instance string) string {
 	return pod
 }
 
+func podNamesForInstance(t *testing.T, instance string) []string {
+	t.Helper()
+	selector := "app.kubernetes.io/instance=" + instance
+	output := runKubectl(t, "get", "pod", "-n", k8sNamespace, "-l", selector, "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+	var pods []string
+	for line := range strings.SplitSeq(output, "\n") {
+		pod := strings.TrimSpace(line)
+		if pod != "" {
+			pods = append(pods, pod)
+		}
+	}
+	return pods
+}
+
 func waitForReplacementPodReady(t *testing.T, instance, previousPod string, timeout time.Duration) {
 	t.Helper()
 	selector := "app.kubernetes.io/instance=" + instance
@@ -140,4 +154,21 @@ func startControlPlanePortForward(t *testing.T) string {
 	endpoint := fmt.Sprintf("http://localhost:%d", port)
 	waitForHTTPStatus(t, endpoint+"/health", http.StatusOK, testutil.PollDeadline)
 	return endpoint
+}
+
+func startDataPlanePodGRPCPortForward(t *testing.T, pod string) string {
+	t.Helper()
+	port := freeLocalPort(t)
+	ctx, cancel := context.WithCancel(context.WithoutCancel(t.Context()))
+	cmd := exec.CommandContext(ctx, "kubectl", "port-forward", "-n", k8sNamespace, "pod/"+pod, fmt.Sprintf("%d:13370", port))
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		cancel()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+
+	return fmt.Sprintf("127.0.0.1:%d", port)
 }

@@ -45,6 +45,7 @@
 package k8s
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -58,12 +59,15 @@ import (
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func storageDSNs(t *testing.T) []string {
@@ -342,6 +346,83 @@ func TestK8s_Progress(t *testing.T) {
 	assert.Contains(t, prog.Tables[0].DDL, "idx_email", "progress DDL should reference the index being added")
 
 	testutil.WaitForState(t, ep, applyID, state.Apply.Completed, testutil.PollDeadline)
+}
+
+// TestK8s_ProgressStableAcrossDataPlaneReplicas verifies that gRPC progress is
+// stable when a data-plane service has multiple pods. Only one pod owns the
+// in-memory Spirit runner, but every pod must be able to answer Progress from
+// shared storage without downgrading row-copy progress.
+func TestK8s_ProgressStableAcrossDataPlaneReplicas(t *testing.T) {
+	fixture := startRunningIndexAddApply(t, "k8s_dp_replicas")
+	waitForControlPlaneRowCopyProgress(t, fixture.Endpoint, fixture.ApplyID, fixture.TableName)
+
+	pods := podNamesForInstance(t, "data-plane")
+	require.GreaterOrEqual(t, len(pods), 2, "expected k8s e2e data plane to run at least two replicas")
+
+	for _, pod := range pods {
+		addr := startDataPlanePodGRPCPortForward(t, pod)
+		table := waitForDataPlanePodProgress(t, addr, fixture.DataPlaneApplyID, fixture.TableName)
+		assert.Equal(t, fixture.TableName, table.TableName, "data-plane pod %s should report the target table", pod)
+		assert.Positive(t, table.RowsTotal, "data-plane pod %s should preserve row-copy totals", pod)
+		assert.True(t, hasRowCopyProgress(table.RowsTotal, table.RowsCopied, table.PercentComplete), "data-plane pod %s should preserve row-copy progress", pod)
+	}
+
+	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
+	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
+}
+
+func waitForControlPlaneRowCopyProgress(t *testing.T, endpoint, applyID, tableName string) {
+	t.Helper()
+	deadline := time.Now().Add(testutil.PollDeadline)
+	var lastProgress *apitypes.ProgressResponse
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastProgress, lastErr = testutil.FetchProgress(endpoint, applyID)
+		if lastErr == nil {
+			for _, table := range lastProgress.Tables {
+				if table.TableName == tableName && hasRowCopyProgress(table.RowsTotal, table.RowsCopied, table.PercentComplete) {
+					return
+				}
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	require.Failf(t, "timeout", "timeout waiting for row-copy progress on %s: last_progress=%+v last_err=%v", tableName, lastProgress, lastErr)
+}
+
+func waitForDataPlanePodProgress(t *testing.T, address, applyID, tableName string) *ternv1.TableProgress {
+	t.Helper()
+	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(conn)
+	client := ternv1.NewTernClient(conn)
+
+	deadline := time.Now().Add(testutil.PollDeadline)
+	var lastResp *ternv1.ProgressResponse
+	var lastErr error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(t.Context(), testutil.ProgressTimeout)
+		lastResp, lastErr = client.Progress(ctx, &ternv1.ProgressRequest{
+			ApplyId:     applyID,
+			Database:    "testapp",
+			Environment: "staging",
+		})
+		cancel()
+		if lastErr == nil {
+			for _, table := range lastResp.Tables {
+				if table.TableName == tableName && hasRowCopyProgress(table.RowsTotal, table.RowsCopied, table.PercentComplete) {
+					return table
+				}
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	require.Failf(t, "timeout", "timeout waiting for data-plane pod %s to preserve row-copy progress for %s: last_resp=%+v last_err=%v", address, tableName, lastResp, lastErr)
+	return nil
+}
+
+func hasRowCopyProgress(rowsTotal, rowsCopied int64, percentComplete int32) bool {
+	return rowsTotal > 0 && (rowsCopied > 0 || percentComplete > 0)
 }
 
 // TestK8s_Scheduler_DataPlanePodRestartRecoversIndexAdd verifies scheduler

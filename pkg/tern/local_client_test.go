@@ -7,7 +7,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -86,4 +88,21 @@ func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *test
 			require.ErrorIs(t, err, tc.wantError)
 		})
 	}
+}
+
+func TestIsInactiveLocalEngineProgress(t *testing.T) {
+	require.True(t, isInactiveLocalEngineProgress(storage.DatabaseTypeMySQL, &engine.ProgressResult{
+		State:   engine.StatePending,
+		Message: noActiveSchemaChangeMessage,
+	}, state.Task.Running))
+
+	require.False(t, isInactiveLocalEngineProgress(storage.DatabaseTypeMySQL, &engine.ProgressResult{
+		State:   engine.StatePending,
+		Message: noActiveSchemaChangeMessage,
+	}, state.Task.Pending))
+
+	require.False(t, isInactiveLocalEngineProgress(storage.DatabaseTypeVitess, &engine.ProgressResult{
+		State:   engine.StatePending,
+		Message: noActiveSchemaChangeMessage,
+	}, state.Task.Running))
 }

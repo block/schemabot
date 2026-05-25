@@ -825,6 +825,172 @@ func TestGRPCClient_PollFinalizesTaskAlreadyTerminalFromRemoteProgress(t *testin
 	require.NotNil(t, task.CompletedAt)
 }
 
+func TestGRPCClient_SyncRemoteProgressByNamespace(t *testing.T) {
+	// Multi-keyspace Vitess applies can report the same table name from more
+	// than one namespace. The control plane must update each task from the
+	// matching namespace/table progress row so PR comments and logs do not show
+	// one keyspace's row-copy progress on another keyspace's task.
+	apply := &storage.Apply{
+		ID:              19,
+		ApplyIdentifier: "apply-namespace-progress",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-namespace-progress",
+		State:           state.Apply.Running,
+	}
+	firstTask := &storage.Task{
+		ID:             31,
+		TaskIdentifier: "task-commerce-orders",
+		ApplyID:        apply.ID,
+		Namespace:      "commerce_sharded",
+		TableName:      "orders",
+		State:          state.Task.Pending,
+	}
+	secondTask := &storage.Task{
+		ID:             32,
+		TaskIdentifier: "task-commerce-006-orders",
+		ApplyID:        apply.ID,
+		Namespace:      "commerce_sharded_006",
+		TableName:      "orders",
+		State:          state.Task.Pending,
+	}
+	client := &GRPCClient{
+		storage: &mockStorage{
+			applies: &mockApplyStore{apply: apply},
+			tasks:   &mockTaskStore{tasks: []*storage.Task{firstTask, secondTask}},
+			logs:    &mockApplyLogStore{},
+		},
+	}
+
+	err := client.syncStoredTasksFromRemoteTasks(t.Context(), apply, []*storage.Task{firstTask, secondTask}, []*ternv1.TableProgress{
+		{
+			Namespace:       "commerce_sharded",
+			TableName:       "orders",
+			Status:          state.Task.Running,
+			RowsCopied:      100,
+			RowsTotal:       1000,
+			PercentComplete: 10,
+		},
+		{
+			Namespace:       "commerce_sharded_006",
+			TableName:       "orders",
+			Status:          state.Task.Running,
+			RowsCopied:      800,
+			RowsTotal:       1000,
+			PercentComplete: 80,
+		},
+	}, time.Now())
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Task.Running, firstTask.State)
+	assert.Equal(t, int64(100), firstTask.RowsCopied)
+	assert.Equal(t, 10, firstTask.ProgressPercent)
+	assert.Equal(t, state.Task.Running, secondTask.State)
+	assert.Equal(t, int64(800), secondTask.RowsCopied)
+	assert.Equal(t, 80, secondTask.ProgressPercent)
+}
+
+func TestGRPCClient_SyncRemoteProgressKeepsLastUsefulRows(t *testing.T) {
+	// Remote gRPC progress is a lossy signal: a different data-plane pod, or a
+	// momentary engine response without table counters, can report the task as
+	// running without row-copy totals. The control plane keeps the last durable
+	// row-copy progress so PR comments do not regress from a progress bar to a
+	// generic running line.
+	apply := &storage.Apply{
+		ID:              20,
+		ApplyIdentifier: "apply-progress-regression",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-progress-regression",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:              33,
+		TaskIdentifier:  "task-progress-regression",
+		ApplyID:         apply.ID,
+		Namespace:       "default",
+		TableName:       "orders",
+		State:           state.Task.Running,
+		RowsCopied:      950,
+		RowsTotal:       1000,
+		ProgressPercent: 95,
+	}
+	client := &GRPCClient{
+		storage: &mockStorage{
+			tasks: &mockTaskStore{tasks: []*storage.Task{task}},
+			logs:  &mockApplyLogStore{},
+		},
+	}
+
+	err := client.syncStoredTasksFromRemoteTasks(t.Context(), apply, []*storage.Task{task}, []*ternv1.TableProgress{
+		{
+			Namespace:       "default",
+			TableName:       "orders",
+			Status:          state.Task.Running,
+			RowsCopied:      0,
+			RowsTotal:       0,
+			PercentComplete: 0,
+		},
+	}, time.Now())
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Task.Running, task.State)
+	assert.Equal(t, int64(950), task.RowsCopied)
+	assert.Equal(t, int64(1000), task.RowsTotal)
+	assert.Equal(t, 95, task.ProgressPercent)
+}
+
+func TestGRPCClient_SyncRemoteProgressDoesNotMoveActiveTaskBackToPending(t *testing.T) {
+	// Multi-pod data planes can answer progress from a pod that sees the
+	// stored task row but does not own the in-memory engine runner. A weaker
+	// pending response must not move an already-running control-plane task
+	// backward in the state machine.
+	apply := &storage.Apply{
+		ID:              21,
+		ApplyIdentifier: "apply-state-regression",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-state-regression",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             34,
+		TaskIdentifier: "task-state-regression",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "orders",
+		State:          state.Task.Running,
+		RowsCopied:     950,
+		RowsTotal:      1000,
+	}
+	client := &GRPCClient{
+		storage: &mockStorage{
+			tasks: &mockTaskStore{tasks: []*storage.Task{task}},
+			logs:  &mockApplyLogStore{},
+		},
+	}
+
+	err := client.syncStoredTasksFromRemoteTasks(t.Context(), apply, []*storage.Task{task}, []*ternv1.TableProgress{
+		{
+			Namespace: "default",
+			TableName: "orders",
+			Status:    state.Task.Pending,
+		},
+	}, time.Now())
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Task.Running, task.State)
+	assert.Equal(t, int64(950), task.RowsCopied)
+	assert.Equal(t, int64(1000), task.RowsTotal)
+}
+
+func TestGRPCClient_RemoteApplyStateRegression(t *testing.T) {
+	assert.True(t, isRemoteApplyStateRegression(state.Apply.Running, state.Apply.Pending))
+	assert.True(t, isRemoteApplyStateRegression(state.Apply.WaitingForCutover, state.Apply.Pending))
+	assert.False(t, isRemoteApplyStateRegression(state.Apply.Pending, state.Apply.Pending))
+	assert.False(t, isRemoteApplyStateRegression(state.Apply.Running, state.Apply.Completed))
+}
+
 func hasLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 	for _, log := range logs {
 		if strings.Contains(log.Message, want) {
