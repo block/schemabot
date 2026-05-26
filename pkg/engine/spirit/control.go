@@ -265,14 +265,14 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 	// Volume uses Stop to force a checkpoint before restarting with new settings.
 	// Keep the stored stopped state available for Start while reporting the
 	// adjustment as running to progress pollers.
-	e.setHideStoppedState(rm, true)
+	e.setVolumeRestartInProgress(rm, true)
 
 	_, err := e.Stop(ctx, &engine.ControlRequest{
 		Database:    req.Database,
 		Credentials: req.Credentials,
 	})
 	if err != nil {
-		e.setHideStoppedState(rm, false)
+		e.setVolumeRestartInProgress(rm, false)
 		return nil, fmt.Errorf("stop for volume change: %w", err)
 	}
 
@@ -290,10 +290,10 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 		Credentials: req.Credentials,
 	})
 	if err != nil {
-		e.setHideStoppedState(rm, false)
+		e.setVolumeRestartInProgress(rm, false)
 		return nil, fmt.Errorf("restart after volume change: %w", err)
 	}
-	e.setHideStoppedState(rm, false)
+	e.setVolumeRestartInProgress(rm, false)
 
 	// Log checkpoint state AFTER restart (should still be same - Spirit resumes from checkpoint)
 	e.mu.Lock()
@@ -311,11 +311,11 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 	}, nil
 }
 
-func (e *Engine) setHideStoppedState(rm *runningMigration, hide bool) {
+func (e *Engine) setVolumeRestartInProgress(rm *runningMigration, inProgress bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.runningMigration == rm {
-		rm.hideStoppedState = hide
+		rm.volumeRestartInProgress = inProgress
 	}
 }
 

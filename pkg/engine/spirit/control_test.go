@@ -258,7 +258,7 @@ func TestVolumeReportsRunningWhileStoredStoppedStateRestarts(t *testing.T) {
 	require.Eventually(t, func() bool {
 		eng.mu.Lock()
 		defer eng.mu.Unlock()
-		return rm.state == engine.StateStopped && rm.hideStoppedState
+		return rm.state == engine.StateStopped && rm.volumeRestartInProgress
 	}, time.Second, 10*time.Millisecond)
 
 	progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
