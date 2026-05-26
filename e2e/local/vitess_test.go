@@ -146,6 +146,15 @@ func usersSchemaWithColumn(colName string) string {
 		1)
 }
 
+func usersSchemaWithIndex(indexName string) string {
+	base := vitessBaseSchema()
+	original := base["testapp_sharded/users.sql"]
+	return strings.Replace(original,
+		"  KEY `idx_email` (`email`)",
+		fmt.Sprintf("  KEY `idx_email` (`email`),\n  KEY `%s` (`full_name`)", indexName),
+		1)
+}
+
 // localscaleAdminPost delegates to the shared e2eutil helper.
 func localscaleAdminPost(t *testing.T, endpoint string, body string) ([]byte, error) {
 	t.Helper()
@@ -1429,13 +1438,11 @@ func TestVitess_Apply_Cancel(t *testing.T) {
 	defer vitessRestoreBaseSchema(t, "staging")
 
 	endpoint := schemabotURL(t)
-	// Use a column addition (instant DDL) with --defer-deploy so the apply
-	// holds at waiting_for_deploy — a stable state we can reliably cancel
-	// from without racing against completion. --defer-cutover doesn't work
-	// for instant DDL since there's no cutover phase.
-	colName := fmt.Sprintf("cancel_col_%d", time.Now().UnixMilli()%100000)
+	// Use a non-instant DDL with deferred cutover so the deploy request reaches
+	// a stable actionable state before cancellation.
+	indexName := fmt.Sprintf("idx_cancel_%d", time.Now().UnixMilli()%100000)
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
-		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
+		"testapp_sharded/users.sql": usersSchemaWithIndex(indexName),
 	}))
 
 	binPath := buildCLI(t)
@@ -1443,15 +1450,13 @@ func TestVitess_Apply_Cancel(t *testing.T) {
 		"-s", ".",
 		"-e", "staging",
 		"--endpoint", endpoint,
-		"-y", "-o", "log", "--no-watch", "--allow-unsafe", "--defer-deploy",
+		"-y", "-o", "log", "--no-watch", "--allow-unsafe", "--defer-cutover",
 	)
 	applyID := extractApplyIDFromLog(applyOut)
 	require.NotEmpty(t, applyID, "expected apply ID in output")
 
-	// Wait for waiting_for_deploy — deterministic pause point
-	waitForApplyState(t, endpoint, applyID, state.Apply.WaitingForDeploy, testutil.PollDeadline)
+	waitForApplyState(t, endpoint, applyID, state.Apply.WaitingForCutover, testutil.PollDeadline)
 
-	// Cancel from the stable waiting_for_deploy state
 	t.Logf("calling stop API: endpoint=%s applyID=%s", endpoint, applyID)
 	stopResult, err := client.CallStopAPI(endpoint, "staging", applyID)
 	require.NoError(t, err, "stop/cancel API call")
