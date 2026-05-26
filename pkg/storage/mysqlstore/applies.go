@@ -30,9 +30,16 @@ const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_i
 	a.state, a.error_message, a.options, a.attempt,
 	a.created_at, a.started_at, a.completed_at, a.updated_at`
 
-// maxRecoveryAttempts is the retry budget for failed_retryable applies. The
-// original apply attempt is separate; this counts scheduler redispatches.
-const maxRecoveryAttempts = 10
+const (
+	// maxRecoveryAttempts is the retry budget for failed_retryable applies. The
+	// original apply attempt is separate; this counts scheduler redispatches.
+	maxRecoveryAttempts = 10
+
+	// retryableClaimDelaySeconds keeps failed_retryable visible before the next
+	// scheduler retry. It uses the same stale heartbeat window as crashed worker
+	// recovery so retryable failures do not become a hot loop.
+	retryableClaimDelaySeconds = 60
+)
 
 const (
 	applyTargetLockWait           = 10 * time.Second
@@ -553,8 +560,8 @@ func (s *applyStore) GetRecent(ctx context.Context, limit int) ([]*storage.Apply
 // Returns the claimed apply, or nil if nothing needs work.
 //
 // Matches queued pending applies with persisted tasks, stale active applies
-// where heartbeat expired > 1 minute, and failed_retryable applies that still
-// have retry budget. Apply creation/update enforces one active apply per
+// where heartbeat expired > 1 minute, and stale failed_retryable applies that
+// still have retry budget. Apply creation/update enforces one active apply per
 // database/type/environment, so claims only need to lease one row and avoid
 // worker races on that row.
 func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) {
@@ -570,7 +577,7 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 	activeStatePlaceholders := placeholders(len(activeStates))
 	queryArgs := []any{state.Apply.Pending}
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
-	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts)
+	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableClaimDelaySeconds)
 
 	// Apply creation/update enforces at most one active apply per
 	// database/type/environment. The claim query only needs to find stale work;
@@ -581,7 +588,7 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 		WHERE (
 			(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
 			OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
-			OR (a.state = ? AND a.attempt < ?)
+			OR (a.state = ? AND a.attempt < ? AND a.updated_at < NOW() - INTERVAL ? SECOND)
 		)
 		ORDER BY a.created_at
 		LIMIT 1

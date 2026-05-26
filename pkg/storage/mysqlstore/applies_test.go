@@ -553,8 +553,10 @@ func TestApplyStore_GetInProgress(t *testing.T) {
 }
 
 // TestApplyStore_FindNextApplyClaimsRetryable verifies the storage-level retry
-// claim behavior. The caller sees the retryable state that was claimed, while
-// the stored row is leased as running with an incremented apply attempt.
+// claim behavior. A fresh failed_retryable apply remains visible for operators
+// and progress callers. After the retry delay, the caller sees the retryable
+// state that was claimed while the stored row is leased as running with an
+// incremented apply attempt.
 func TestApplyStore_FindNextApplyClaimsRetryable(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -564,6 +566,17 @@ func TestApplyStore_FindNextApplyClaimsRetryable(t *testing.T) {
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_claim", 500, state.Apply.FailedRetryable, "staging")
 	apply.ErrorMessage = "transient engine failure"
 	require.NoError(t, store.Applies().Update(ctx, apply))
+
+	freshClaim, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, freshClaim)
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = DATE_SUB(NOW(), INTERVAL ? SECOND)
+		WHERE id = ?
+	`, retryableClaimDelaySeconds+1, apply.ID)
+	require.NoError(t, err)
 
 	claimed, err := store.Applies().FindNextApply(ctx)
 	require.NoError(t, err)
