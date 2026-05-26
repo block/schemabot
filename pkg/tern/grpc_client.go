@@ -980,7 +980,7 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 		}
 	}
 	if missingProgressTasks > 0 {
-		slog.Debug("remote gRPC progress omitted stored tasks",
+		slog.Warn("remote gRPC progress omitted stored tasks",
 			"apply_id", storedApply.ApplyIdentifier,
 			"external_id", storedApply.ExternalID,
 			"database", storedApply.Database,
@@ -1023,14 +1023,14 @@ func storedTaskResolvedForTerminalRemoteApply(remoteApplyState, storedTaskState 
 		state.IsState(storedTaskState, state.Task.Stopped)
 }
 
-// applyStateWithNoBackwardProgress keeps the control-plane apply row from
-// moving back to an earlier active phase when remote progress lags behind the
-// stored scheduler claim. A remote apply may briefly report pending after
-// SchemaBot has already claimed and dispatched it; writing pending locally would
-// make the same apply claimable by another scheduler worker.
-func applyStateWithNoBackwardProgress(storedApplyState, remoteApplyState string) string {
+// applyStateFromRemoteProgress is the apply-level counterpart to
+// taskStateWithNoBackwardProgress in LocalClient. Local mode translates engine
+// progress into task state first, then derives apply state from stored tasks.
+// gRPC mode receives an apply state directly from the remote data plane, so the
+// control plane needs the same no-backward policy at the apply row boundary.
+func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string) string {
 	if remoteApplyState == "" {
-		return ""
+		return storedApplyState
 	}
 	if state.IsTerminalApplyState(remoteApplyState) {
 		return remoteApplyState
@@ -1141,7 +1141,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				apply.StartedAt = &now
 			}
 			remoteApplyState := newState
-			newState = applyStateWithNoBackwardProgress(apply.State, remoteApplyState)
+			newState = applyStateFromRemoteProgress(apply.State, remoteApplyState)
 			if !state.IsState(newState, remoteApplyState) {
 				slog.Debug("keeping stored gRPC apply state because remote progress reported earlier state",
 					"apply_id", apply.ApplyIdentifier,

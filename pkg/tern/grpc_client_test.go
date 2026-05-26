@@ -750,6 +750,58 @@ func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *te
 	assert.Equal(t, state.Apply.Completed, storedStates[len(storedStates)-1])
 }
 
+func TestApplyStateFromRemoteProgress(t *testing.T) {
+	tests := []struct {
+		name        string
+		storedState string
+		remoteState string
+		expected    string
+	}{
+		{
+			name:        "empty remote state keeps stored state",
+			storedState: state.Apply.Running,
+			remoteState: "",
+			expected:    state.Apply.Running,
+		},
+		{
+			name:        "remote terminal state wins",
+			storedState: state.Apply.Running,
+			remoteState: state.Apply.Completed,
+			expected:    state.Apply.Completed,
+		},
+		{
+			name:        "stored terminal state is final",
+			storedState: state.Apply.Completed,
+			remoteState: state.Apply.Running,
+			expected:    state.Apply.Completed,
+		},
+		{
+			name:        "stored retryable failure blocks active progress",
+			storedState: state.Apply.FailedRetryable,
+			remoteState: state.Apply.Running,
+			expected:    state.Apply.FailedRetryable,
+		},
+		{
+			name:        "stale pending remote state does not reopen running apply",
+			storedState: state.Apply.Running,
+			remoteState: state.Apply.Pending,
+			expected:    state.Apply.Running,
+		},
+		{
+			name:        "newer active remote state advances stored state",
+			storedState: state.Apply.Running,
+			remoteState: state.Apply.WaitingForCutover,
+			expected:    state.Apply.WaitingForCutover,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, applyStateFromRemoteProgress(tc.storedState, tc.remoteState))
+		})
+	}
+}
+
 func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing.T) {
 	// Remote task state is the source of truth for stored task rows. Apply-level
 	// terminal state must not invent task results when the remote task snapshot
