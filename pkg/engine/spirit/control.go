@@ -262,26 +262,22 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 		"new_volume":      req.Volume,
 	})
 
-	// Stop the schema change
+	// Volume uses Stop to force a checkpoint before restarting with new settings.
+	// Keep the stored stopped state available for Start while reporting the
+	// adjustment as running to progress pollers.
+	e.setHideStoppedState(rm, true)
+
 	_, err := e.Stop(ctx, &engine.ControlRequest{
 		Database:    req.Database,
 		Credentials: req.Credentials,
 	})
 	if err != nil {
+		e.setHideStoppedState(rm, false)
 		return nil, fmt.Errorf("stop for volume change: %w", err)
 	}
 
 	// Log checkpoint state AFTER stopping (should be same as before)
 	e.logCheckpointState(rm, "after_stop", nil)
-
-	// Override the stopped state immediately. Stop() sets rm.state = StateStopped,
-	// but during a volume change this is a transient internal state. If the poller
-	// observes "stopped" it treats it as terminal and exits, leaving storage stuck.
-	// Setting it back to "running" before Start() ensures Progress() never exposes
-	// the intermediate stopped state.
-	e.mu.Lock()
-	rm.state = engine.StateRunning
-	e.mu.Unlock()
 
 	// Update engine configuration
 	e.threads = newThreads
@@ -294,8 +290,10 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 		Credentials: req.Credentials,
 	})
 	if err != nil {
+		e.setHideStoppedState(rm, false)
 		return nil, fmt.Errorf("restart after volume change: %w", err)
 	}
+	e.setHideStoppedState(rm, false)
 
 	// Log checkpoint state AFTER restart (should still be same - Spirit resumes from checkpoint)
 	e.mu.Lock()
@@ -311,6 +309,14 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 		NewVolume:      req.Volume,
 		Message:        fmt.Sprintf("Volume changed: %d -> %d (%d threads, %v chunks)", previousVolume, req.Volume, newThreads, newChunkTime),
 	}, nil
+}
+
+func (e *Engine) setHideStoppedState(rm *runningMigration, hide bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.runningMigration == rm {
+		rm.hideStoppedState = hide
+	}
 }
 
 // minThreads is the lower bound for CPU-scaled volumes (6-11).

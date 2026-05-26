@@ -78,6 +78,7 @@ type runningMigration struct {
 	errorMessage      string // Error details when state is StateFailed
 	started           time.Time
 	deferCutover      bool // Whether to defer cutover until manual trigger
+	hideStoppedState  bool // Set while stored stopped state should still be exposed as running progress.
 
 	// For resume support
 	cancelFunc context.CancelFunc
@@ -510,6 +511,9 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	// Determine overall state from Spirit's state
 	// Preserve terminal states (stopped, failed) - don't overwrite them
 	state := rm.state
+	if state == engine.StateStopped && rm.hideStoppedState {
+		state = engine.StateRunning
+	}
 	if state != engine.StateStopped && state != engine.StateFailed {
 		switch spiritState {
 		case status.WaitingOnSentinelTable:

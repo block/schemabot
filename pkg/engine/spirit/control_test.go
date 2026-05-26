@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/engine"
 )
 
 func TestVolumeToSpiritSettings(t *testing.T) {
@@ -222,4 +224,51 @@ func TestSettingsToVolume(t *testing.T) {
 	assert.Equal(t, int32(6), settingsToVolume(8, 5*time.Second))
 	assert.Equal(t, int32(8), settingsToVolume(12, 5*time.Second))
 	assert.Equal(t, int32(10), settingsToVolume(maxThreads, 5*time.Second))
+}
+
+// Volume adjustments store a stopped state so Spirit can resume from checkpoint
+// with new settings. Progress should still report running during that window so
+// the scheduler keeps polling the active schema change.
+func TestVolumeReportsRunningWhileStoredStoppedStateRestarts(t *testing.T) {
+	eng := New(Config{})
+	rm := &runningMigration{
+		database:       "testdb",
+		tableNamespace: map[string]string{},
+		state:          engine.StateRunning,
+		host:           "127.0.0.1",
+		username:       "root",
+	}
+	rm.wg.Add(1)
+	eng.runningMigration = rm
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := eng.Volume(t.Context(), &engine.VolumeRequest{
+			Database: "testdb",
+			Volume:   4,
+			Credentials: &engine.Credentials{
+				DSN: "root@tcp(127.0.0.1:1)/testdb",
+			},
+		})
+		errCh <- err
+	}()
+
+	require.Eventually(t, func() bool {
+		eng.mu.Lock()
+		defer eng.mu.Unlock()
+		return rm.state == engine.StateStopped && rm.hideStoppedState
+	}, time.Second, 10*time.Millisecond)
+
+	progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StateRunning, progress.State)
+
+	rm.wg.Done()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for volume change")
+	}
+	eng.Drain()
 }
