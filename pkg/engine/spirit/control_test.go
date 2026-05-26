@@ -235,11 +235,13 @@ func TestVolumeReportsRunningWhileStoredStoppedStateRestarts(t *testing.T) {
 		database:       "testdb",
 		tableNamespace: map[string]string{},
 		state:          engine.StateRunning,
-		host:           "127.0.0.1",
+		host:           "127.0.0.1:1",
 		username:       "root",
 	}
 	rm.wg.Add(1)
+	eng.mu.Lock()
 	eng.runningMigration = rm
+	eng.mu.Unlock()
 
 	errCh := make(chan error, 1)
 	go func() {
