@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -335,18 +336,114 @@ func TestWatchModel_ConsecutiveErrors_IncrementCounter(t *testing.T) {
 	assert.Empty(t, m.errorMsg, "error should be cleared on success")
 }
 
+func TestWatchModel_EnterTriggersDeferredDeploy(t *testing.T) {
+	tests := []struct {
+		name string
+		key  tea.KeyMsg
+	}{
+		{name: "carriage return", key: tea.KeyMsg{Type: tea.KeyEnter}},
+		{name: "line feed", key: tea.KeyMsg{Type: tea.KeyCtrlJ}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalCallStartAPI := callStartAPI
+			t.Cleanup(func() { callStartAPI = originalCallStartAPI })
+
+			var gotEndpoint string
+			var gotEnvironment string
+			var gotApplyID string
+			callStartAPI = func(endpoint, environment, applyID string) (*apitypes.StartResponse, error) {
+				gotEndpoint = endpoint
+				gotEnvironment = environment
+				gotApplyID = applyID
+				return &apitypes.StartResponse{Accepted: true, StartedCount: 1}, nil
+			}
+
+			m := NewWatchModel("https://schemabot.example", "inventory2", "staging", true)
+			m.applyID = "apply-abc123"
+			m.state = state.Apply.WaitingForDeploy
+			m.initialized = true
+
+			updated, cmd := m.Update(tt.key)
+			model := updated.(WatchModel)
+			require.NotNil(t, cmd)
+			assert.True(t, model.deployTriggered)
+
+			msg := cmd()
+			result, ok := msg.(deployResultMsg)
+			require.True(t, ok, "expected deployResultMsg, got %T", msg)
+			require.NoError(t, result.err)
+			assert.True(t, result.success)
+
+			assert.Equal(t, "https://schemabot.example", gotEndpoint)
+			assert.Equal(t, "apply-abc123", gotApplyID)
+			assert.Equal(t, "staging", gotEnvironment)
+		})
+	}
+}
+
+func TestWatchModel_EnterTriggersCutover(t *testing.T) {
+	tests := []struct {
+		name string
+		key  tea.KeyMsg
+	}{
+		{name: "carriage return", key: tea.KeyMsg{Type: tea.KeyEnter}},
+		{name: "line feed", key: tea.KeyMsg{Type: tea.KeyCtrlJ}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewWatchModel("https://schemabot.example", "inventory2", "staging", true)
+			m.applyID = "apply-abc123"
+			m.state = state.Apply.WaitingForCutover
+			m.initialized = true
+
+			updated, cmd := m.Update(tt.key)
+			model := updated.(WatchModel)
+			require.NotNil(t, cmd)
+			assert.True(t, model.cutoverTriggered)
+		})
+	}
+}
+
+func TestWatchModel_EnterTriggersSkipRevert(t *testing.T) {
+	tests := []struct {
+		name string
+		key  tea.KeyMsg
+	}{
+		{name: "carriage return", key: tea.KeyMsg{Type: tea.KeyEnter}},
+		{name: "line feed", key: tea.KeyMsg{Type: tea.KeyCtrlJ}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewWatchModel("https://schemabot.example", "inventory2", "staging", true)
+			m.applyID = "apply-abc123"
+			m.state = state.Apply.RevertWindow
+			m.initialized = true
+
+			updated, cmd := m.Update(tt.key)
+			model := updated.(WatchModel)
+			require.NotNil(t, cmd)
+			assert.True(t, model.skipRevertTriggered)
+			assert.False(t, model.skipRevertAt.IsZero())
+		})
+	}
+}
+
 func TestFormatExitContext(t *testing.T) {
 	t.Run("includes apply ID and resume command", func(t *testing.T) {
 		result := formatExitContext("apply-abc123", "", "mydb", "production")
 		assert.Contains(t, result, "apply-abc123")
-		assert.Contains(t, result, "schemabot progress --apply-id apply-abc123 -e production")
+		assert.Contains(t, result, "schemabot progress apply-abc123 -e production")
 	})
 
 	t.Run("includes deploy request URL when present", func(t *testing.T) {
 		result := formatExitContext("apply-abc123", "https://app.planetscale.com/org/db/deploy-requests/42", "mydb", "production")
 		assert.Contains(t, result, "apply-abc123")
 		assert.Contains(t, result, "https://app.planetscale.com/org/db/deploy-requests/42")
-		assert.Contains(t, result, "schemabot progress --apply-id apply-abc123 -e production")
+		assert.Contains(t, result, "schemabot progress apply-abc123 -e production")
 	})
 
 	t.Run("omits deploy URL when empty", func(t *testing.T) {
@@ -361,7 +458,7 @@ func TestFormatExitContext(t *testing.T) {
 
 	t.Run("omits environment flag when empty", func(t *testing.T) {
 		result := formatExitContext("apply-abc123", "", "mydb", "")
-		assert.Contains(t, result, "schemabot progress --apply-id apply-abc123")
+		assert.Contains(t, result, "schemabot progress apply-abc123")
 		assert.NotContains(t, result, "-e ")
 	})
 }

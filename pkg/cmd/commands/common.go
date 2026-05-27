@@ -310,7 +310,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	}
 
 	fmt.Println("Watching progress...")
-	if err := WatchApplyProgressWithFormat(ep, applyID, true, format, logHeartbeat); err != nil {
+	if err := WatchApplyProgressWithFormat(ep, applyID, environment, true, format, logHeartbeat); err != nil {
 		return applyID, err
 	}
 

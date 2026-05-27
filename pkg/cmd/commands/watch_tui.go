@@ -22,7 +22,7 @@ type WatchModel struct {
 	database            string
 	environment         string
 	applyID             string // When set, fetches progress by apply ID instead of database/environment
-	allowCutover        bool
+	allowControlActions bool
 	maxTableNameLen     int
 	deployTriggered     bool
 	cutoverTriggered    bool
@@ -137,19 +137,19 @@ type volumeResultMsg struct {
 }
 
 // NewWatchModel creates a new WatchModel.
-func NewWatchModel(endpoint, database, environment string, allowCutover bool) WatchModel {
+func NewWatchModel(endpoint, database, environment string, allowControlActions bool) WatchModel {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
 	return WatchModel{
-		endpoint:      endpoint,
-		database:      database,
-		environment:   environment,
-		allowCutover:  allowCutover,
-		spinner:       s,
-		startedAt:     time.Now(),
-		currentVolume: 4, // Default Spirit volume
+		endpoint:            endpoint,
+		database:            database,
+		environment:         environment,
+		allowControlActions: allowControlActions,
+		spinner:             s,
+		startedAt:           time.Now(),
+		currentVolume:       4, // Default Spirit volume
 	}
 }
 
@@ -172,6 +172,10 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Handle volume mode inputs
 		if m.volumeMode {
 			return m.handleVolumeKeys(msg)
+		}
+
+		if isEnterKey(msg) {
+			return m.handleEnterKey()
 		}
 
 		switch msg.String() {
@@ -200,23 +204,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if state.IsState(m.state, state.Apply.Running) && !isCuttingOver {
 				m.volumeMode = true
 				return m, nil
-			}
-		case "enter":
-			// Trigger deploy if waiting for deploy and not already triggered
-			if state.IsState(m.state, state.Apply.WaitingForDeploy) && m.allowCutover && !m.deployTriggered {
-				m.deployTriggered = true
-				return m, m.triggerDeploy()
-			}
-			// Trigger cutover if waiting and not already triggered
-			if state.IsState(m.state, state.Apply.WaitingForCutover) && m.allowCutover && !m.cutoverTriggered {
-				m.cutoverTriggered = true
-				return m, m.triggerCutover()
-			}
-			// Trigger skip-revert if in revert window
-			if state.IsState(m.state, state.Apply.RevertWindow) && !m.skipRevertTriggered {
-				m.skipRevertTriggered = true
-				m.skipRevertAt = time.Now()
-				return m, m.triggerSkipRevert()
 			}
 		}
 
@@ -357,15 +344,46 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func isEnterKey(msg tea.KeyMsg) bool {
+	return msg.Type == tea.KeyEnter || msg.Type == tea.KeyCtrlJ ||
+		msg.String() == "enter" || msg.String() == "ctrl+j"
+}
+
+func (m WatchModel) handleEnterKey() (tea.Model, tea.Cmd) {
+	// Trigger deploy if waiting for deploy and not already triggered
+	if state.IsState(m.state, state.Apply.WaitingForDeploy) && m.allowControlActions && !m.deployTriggered {
+		m.deployTriggered = true
+		return m, m.triggerDeploy()
+	}
+	// Trigger cutover if waiting and not already triggered
+	if state.IsState(m.state, state.Apply.WaitingForCutover) && m.allowControlActions && !m.cutoverTriggered {
+		m.cutoverTriggered = true
+		return m, m.triggerCutover()
+	}
+	// Trigger skip-revert if in revert window
+	if state.IsState(m.state, state.Apply.RevertWindow) && !m.skipRevertTriggered {
+		m.skipRevertTriggered = true
+		m.skipRevertAt = time.Now()
+		return m, m.triggerSkipRevert()
+	}
+	return m, nil
+}
+
 // WatchApplyProgressTUI uses Bubbletea to display progress.
-func WatchApplyProgressTUI(endpoint, database, environment string, allowCutover bool) error {
-	model := NewWatchModel(endpoint, database, environment, allowCutover)
+func WatchApplyProgressTUI(endpoint, database, environment string, allowControlActions bool) error {
+	model := NewWatchModel(endpoint, database, environment, allowControlActions)
 	return runWatchModel(model)
 }
 
 // WatchApplyProgressByApplyID watches progress using an apply ID instead of database/environment.
-func WatchApplyProgressByApplyID(endpoint, applyID string, allowCutover bool) error {
-	model := NewWatchModel(endpoint, "", "", allowCutover)
+func WatchApplyProgressByApplyID(endpoint, applyID string, allowControlActions bool) error {
+	return watchApplyProgressByApplyIDWithEnvironment(endpoint, applyID, "", allowControlActions)
+}
+
+// watchApplyProgressByApplyIDWithEnvironment watches progress and keeps the
+// known environment available for control operations before the first progress payload.
+func watchApplyProgressByApplyIDWithEnvironment(endpoint, applyID, environment string, allowControlActions bool) error {
+	model := NewWatchModel(endpoint, "", environment, allowControlActions)
 	model.applyID = applyID
 	return runWatchModel(model)
 }
@@ -429,7 +447,7 @@ func formatExitContext(applyID, deployRequestURL, database, environment string) 
 	if deployRequestURL != "" {
 		fmt.Fprintf(&b, "  Deploy Request:  %s\n", deployRequestURL)
 	}
-	cmd := fmt.Sprintf("schemabot progress --apply-id %s", applyID)
+	cmd := fmt.Sprintf("schemabot progress %s", applyID)
 	if environment != "" {
 		cmd += " -e " + environment
 	}

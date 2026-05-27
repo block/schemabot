@@ -284,7 +284,7 @@ const (
 // WatchApplyProgressWithFormat polls the progress API by apply ID with the
 // specified output format. logHeartbeat controls the interval between progress
 // heartbeats in log mode (0 = default 10s).
-func WatchApplyProgressWithFormat(endpoint, applyID string, allowCutoverPrompt bool, format OutputFormat, logHeartbeat time.Duration) error {
+func WatchApplyProgressWithFormat(endpoint, applyID, environment string, allowControlActions bool, format OutputFormat, logHeartbeat time.Duration) error {
 	// Use log format for CI/server environments
 	if format == OutputFormatLog {
 		if logHeartbeat <= 0 {
@@ -297,7 +297,7 @@ func WatchApplyProgressWithFormat(endpoint, applyID string, allowCutoverPrompt b
 	}
 
 	// Interactive format: use Bubbletea TUI
-	return WatchApplyProgressByApplyID(endpoint, applyID, allowCutoverPrompt)
+	return watchApplyProgressByApplyIDWithEnvironment(endpoint, applyID, environment, allowControlActions)
 }
 
 // WatchApplyProgressAfterCutover polls the progress API after cutover has been triggered.

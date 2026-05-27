@@ -23,6 +23,8 @@ const pollInterval = 2 * time.Second
 // maxPollInterval is the ceiling for exponential backoff on consecutive errors.
 const maxPollInterval = 30 * time.Second
 
+var callStartAPI = client.CallStartAPI
+
 func (m WatchModel) tick() tea.Cmd {
 	d := pollInterval
 	if m.consecutiveErrors > 0 {
@@ -50,7 +52,7 @@ func (m WatchModel) fetchProgress() tea.Cmd {
 
 func (m WatchModel) triggerDeploy() tea.Cmd {
 	return func() tea.Msg {
-		result, err := client.CallStartAPI(m.endpoint, m.environment, m.applyID)
+		result, err := callStartAPI(m.endpoint, m.environment, m.applyID)
 		if err != nil {
 			return deployResultMsg{success: false, err: err}
 		}

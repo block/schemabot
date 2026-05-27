@@ -190,7 +190,7 @@ func (m WatchModel) progressView() string {
 			b.WriteString("⚡ This change will be applied using instant mode.\n")
 		}
 		b.WriteString("\n")
-		if m.allowCutover {
+		if m.allowControlActions {
 			b.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
@@ -204,7 +204,7 @@ func (m WatchModel) progressView() string {
 		b.WriteString("\n\n")
 		b.WriteString("Row copy complete. All data has been copied and new writes\n")
 		b.WriteString("continue to be replicated to keep the shadow table in sync.\n\n")
-		if m.allowCutover {
+		if m.allowControlActions {
 			b.WriteString("Press Enter to proceed with cutover (or ESC to detach)\n")
 		} else {
 			if m.applyID != "" {

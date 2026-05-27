@@ -26,7 +26,7 @@ func (cmd *ProgressCmd) Run(g *Globals) error {
 	}
 
 	if cmd.Watch {
-		return WatchApplyProgressByApplyID(ep, cmd.ApplyID, true)
+		return watchApplyProgressByApplyIDWithEnvironment(ep, cmd.ApplyID, cmd.Environment, true)
 	}
 
 	result, err := client.GetProgress(ep, cmd.ApplyID)
