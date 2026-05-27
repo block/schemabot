@@ -538,14 +538,21 @@ func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error
 	return scanApplies(rows)
 }
 
-// GetRecent returns the most recent applies across all databases, ordered by start time desc.
-func (s *applyStore) GetRecent(ctx context.Context, limit int) ([]*storage.Apply, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT `+applyColumns+`
+// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
+func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
+	query := `
+		SELECT ` + applyColumns + `
 		FROM applies
-		ORDER BY COALESCE(started_at, created_at) DESC
-		LIMIT ?
-	`, limit)
+	`
+	var args []any
+	if filter.Environment != "" {
+		query += " WHERE environment = ?"
+		args = append(args, filter.Environment)
+	}
+	query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+	args = append(args, filter.Limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

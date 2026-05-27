@@ -350,5 +350,7 @@ type ActiveApplyResponse struct {
 // StatusResponse is the HTTP response for GET /api/status.
 type StatusResponse struct {
 	ActiveCount int                    `json:"active_count"`
+	Limit       int                    `json:"limit,omitempty"`
+	HasMore     bool                   `json:"has_more,omitempty"`
 	Applies     []*ActiveApplyResponse `json:"applies"`
 }

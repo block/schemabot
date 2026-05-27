@@ -12,7 +12,8 @@ import (
 type StatusCmd struct {
 	ApplyIDArg  string `arg:"" optional:"" help:"Apply ID to show details for" name:"apply_id"`
 	Database    string `short:"d" help:"Database name (show apply history)"`
-	Environment string `short:"e" help:"Environment filter (with -d)"`
+	Environment string `short:"e" help:"Environment filter"`
+	Limit       int    `short:"n" help:"Maximum recent applies to show (default 20, max 1000)"`
 	JSON        bool   `help:"Output as JSON"`
 }
 
@@ -33,8 +34,11 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		return showDatabaseHistory(ep, cmd.Database, cmd.Environment, cmd.JSON)
 	}
 
-	// Mode 3: List all active applies
-	result, err := client.GetStatus(ep)
+	// Mode 3: List recent applies
+	result, err := client.GetStatus(ep, client.StatusOptions{
+		Limit:       cmd.Limit,
+		Environment: cmd.Environment,
+	})
 	if err != nil {
 		return err
 	}
@@ -62,6 +66,8 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 
 	templates.WriteStatusList(templates.StatusListData{
 		ActiveCount: result.ActiveCount,
+		Limit:       result.Limit,
+		HasMore:     result.HasMore,
 		Applies:     applies,
 	})
 

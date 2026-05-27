@@ -14,6 +14,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -475,10 +476,29 @@ var (
 	ErrLockNotFound = fmt.Errorf("lock not found")
 )
 
-// GetStatus fetches all active schema changes.
-func GetStatus(endpoint string) (*apitypes.StatusResponse, error) {
+// StatusOptions controls the status list request.
+type StatusOptions struct {
+	Limit       int
+	Environment string
+}
+
+// GetStatus fetches recent schema changes.
+func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse, error) {
 	var result apitypes.StatusResponse
-	if err := doGetInto(endpoint, "/api/status", &result); err != nil {
+	requestPath := "/api/status"
+	if len(opts) > 0 {
+		values := url.Values{}
+		if opts[0].Limit > 0 {
+			values.Set("limit", strconv.Itoa(opts[0].Limit))
+		}
+		if opts[0].Environment != "" {
+			values.Set("environment", opts[0].Environment)
+		}
+		if encoded := values.Encode(); encoded != "" {
+			requestPath += "?" + encoded
+		}
+	}
+	if err := doGetInto(endpoint, requestPath, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil

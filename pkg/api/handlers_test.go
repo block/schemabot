@@ -129,6 +129,24 @@ func (s *staticApplyStore) Update(_ context.Context, apply *storage.Apply) error
 	return s.err
 }
 
+type recentApplyStore struct {
+	storage.ApplyStore
+	filter  storage.RecentAppliesFilter
+	applies []*storage.Apply
+	err     error
+}
+
+func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
+	s.filter = filter
+	if s.err != nil {
+		return nil, s.err
+	}
+	if filter.Limit > 0 && len(s.applies) > filter.Limit {
+		return s.applies[:filter.Limit], nil
+	}
+	return s.applies, nil
+}
+
 type capturingApplyStore struct {
 	storage.ApplyStore
 	mu        sync.Mutex
@@ -1046,6 +1064,92 @@ func TestProgressResponseFromProtoPreservesVSchemaChangeType(t *testing.T) {
 
 	require.Len(t, resp.Tables, 1)
 	assert.Equal(t, "vschema_update", resp.Tables[0].ChangeType)
+}
+
+func TestHandleStatusLimitAndEnvironment(t *testing.T) {
+	now := time.Now().UTC()
+	applies := &recentApplyStore{
+		applies: []*storage.Apply{
+			{
+				ApplyIdentifier: "apply-one",
+				Database:        "orders",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Completed,
+				Caller:          "cli",
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			},
+			{
+				ApplyIdentifier: "apply-two",
+				Database:        "payments",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Running,
+				Caller:          "cli",
+				CreatedAt:       now.Add(-time.Minute),
+				UpdatedAt:       now.Add(-time.Minute),
+			},
+			{
+				ApplyIdentifier: "apply-three",
+				Database:        "inventory",
+				Environment:     "staging",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Completed,
+				Caller:          "cli",
+				CreatedAt:       now.Add(-2 * time.Minute),
+				UpdatedAt:       now.Add(-2 * time.Minute),
+			},
+		},
+	}
+	stor := &mockStorageWithApplyStores{applies: applies}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?limit=2&environment=staging", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	assert.Equal(t, 3, applies.filter.Limit, "server should request one extra row to detect truncation")
+	assert.Equal(t, "staging", applies.filter.Environment)
+	assert.Equal(t, 2, resp.Limit)
+	assert.True(t, resp.HasMore)
+	assert.Equal(t, 1, resp.ActiveCount)
+	require.Len(t, resp.Applies, 2)
+	assert.Equal(t, "apply-one", resp.Applies[0].ApplyID)
+	assert.Equal(t, "apply-two", resp.Applies[1].ApplyID)
+}
+
+func TestParseStatusLimit(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		target    string
+		want      int
+		wantError bool
+	}{
+		{name: "default", target: "/api/status", want: defaultStatusLimit},
+		{name: "custom", target: "/api/status?limit=50", want: 50},
+		{name: "clamped", target: "/api/status?limit=5000", want: maxStatusLimit},
+		{name: "zero", target: "/api/status?limit=0", wantError: true},
+		{name: "not a number", target: "/api/status?limit=lots", wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.target, nil)
+			got, err := parseStatusLimit(req)
+			if tt.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestHealth(t *testing.T) {

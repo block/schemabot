@@ -196,9 +196,9 @@ type ApplyStore interface {
 	// and environment.
 	Update(ctx context.Context, apply *Apply) error
 
-	// GetRecent returns the most recent applies across all databases, ordered by start time desc.
+	// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
 	// Used by `schemabot status` (no args) to show recent activity.
-	GetRecent(ctx context.Context, limit int) ([]*Apply, error)
+	GetRecent(ctx context.Context, filter RecentAppliesFilter) ([]*Apply, error)
 
 	// GetInProgress returns all applies in non-terminal states.
 	// Note: For recovery, use FindNextApply which handles locking.
@@ -234,6 +234,12 @@ type ApplyStore interface {
 
 	// DeleteByPR removes all applies for a PR (cleanup on PR close/merge).
 	DeleteByPR(ctx context.Context, repo string, pr int) error
+}
+
+// RecentAppliesFilter controls recent apply queries for status views.
+type RecentAppliesFilter struct {
+	Limit       int
+	Environment string
 }
 
 // RetryableExpirationReason identifies why scheduler retry recovery stopped.

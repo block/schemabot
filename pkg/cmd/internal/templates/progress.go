@@ -707,6 +707,8 @@ type ActiveApplyData struct {
 // StatusListData contains data for rendering the status list.
 type StatusListData struct {
 	ActiveCount int
+	Limit       int
+	HasMore     bool
 	Applies     []ActiveApplyData
 }
 
@@ -778,6 +780,9 @@ func WriteStatusList(data StatusListData) {
 	}
 
 	fmt.Println()
+	if data.HasMore && data.Limit > 0 {
+		fmt.Printf("%sShowing the %d most recent schema changes. Use --limit N to show more.%s\n", ANSIDim, data.Limit, ANSIReset)
+	}
 	fmt.Printf("%sUse 'schemabot status <apply_id>' to view details%s\n", ANSIDim, ANSIReset)
 }
 

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
@@ -16,6 +17,11 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
+)
+
+const (
+	defaultStatusLimit = 20
+	maxStatusLimit     = 1000
 )
 
 // changeTypeToString converts a proto ChangeType enum to a lowercase string.
@@ -592,13 +598,27 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 }
 
 // handleStatus handles GET /api/status requests.
-// Returns recent schema changes (active first, then completed/failed).
+// Returns recent schema changes.
 func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
-	applies, err := s.storage.Applies().GetRecent(r.Context(), 20)
+	limit, err := parseStatusLimit(r)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	filter := storage.RecentAppliesFilter{
+		Limit:       limit + 1,
+		Environment: r.URL.Query().Get("environment"),
+	}
+	applies, err := s.storage.Applies().GetRecent(r.Context(), filter)
 	if err != nil {
 		s.logger.Error("get recent applies failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to get recent applies")
 		return
+	}
+	hasMore := len(applies) > limit
+	if hasMore {
+		applies = applies[:limit]
 	}
 
 	activeCount := 0
@@ -610,6 +630,8 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := &apitypes.StatusResponse{
 		ActiveCount: activeCount,
+		Limit:       limit,
+		HasMore:     hasMore,
 		Applies:     make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
 	}
 
@@ -645,6 +667,21 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+func parseStatusLimit(r *http.Request) (int, error) {
+	raw := r.URL.Query().Get("limit")
+	if raw == "" {
+		return defaultStatusLimit, nil
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit <= 0 {
+		return 0, fmt.Errorf("limit must be a positive integer")
+	}
+	if limit > maxStatusLimit {
+		return maxStatusLimit, nil
+	}
+	return limit, nil
 }
 
 // progressFromLocalStorage builds a ProgressResponse from local apply + task

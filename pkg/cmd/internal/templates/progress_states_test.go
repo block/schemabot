@@ -1,12 +1,15 @@
 package templates
 
 import (
+	"io"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLabel_PlanetScalePhases(t *testing.T) {
@@ -27,6 +30,53 @@ func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
 	assert.Contains(t, FormatProgressState(state.Apply.ValidatingDeployRequest), "Validating deploy request")
 	assert.Contains(t, FormatProgressState(state.Apply.Cancelled), "Cancelled")
 	assert.Contains(t, FormatProgressState(state.Apply.FailedRetryable), "Retrying")
+}
+
+func TestWriteStatusListHasMoreFooter(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 0,
+			Limit:       20,
+			HasMore:     true,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-example",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "Recent schema changes")
+	assert.Contains(t, output, "apply-example")
+	assert.Contains(t, output, "Showing the 20 most recent schema changes. Use --limit N to show more.")
+	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	original := os.Stdout
+	read, write, err := os.Pipe()
+	require.NoError(t, err)
+	defer func() {
+		os.Stdout = original
+	}()
+
+	os.Stdout = write
+	fn()
+	require.NoError(t, write.Close())
+
+	output, err := io.ReadAll(read)
+	require.NoError(t, err)
+	require.NoError(t, read.Close())
+
+	return string(output)
 }
 
 func TestProgressSymbol(t *testing.T) {
