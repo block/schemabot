@@ -152,14 +152,16 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		metrics.RecordSchedulerClaimFailure(ctx, "expire_retryable_error")
 		return
 	}
-	for _, apply := range expired {
-		s.logger.Error("scheduler: retry budget exhausted",
+	for _, expiration := range expired {
+		apply := expiration.Apply
+		s.logger.Error("scheduler: retryable apply expired",
 			"worker", workerID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"environment", apply.Environment,
-			"attempt", apply.Attempt)
-		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, "retry_budget_exhausted")
+			"attempt", apply.Attempt,
+			"reason", expiration.Reason)
+		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, string(expiration.Reason))
 	}
 
 	apply, err := s.storage.Applies().FindNextApply(ctx)

@@ -208,7 +208,7 @@ func (s *capturingApplyStore) FindNextApply(context.Context) (*storage.Apply, er
 	return &apply, nil
 }
 
-func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.Apply, error) {
+func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
 	return nil, nil
 }
 

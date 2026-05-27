@@ -585,6 +585,35 @@ func TestApplyStore_FindNextApplyClaimsRetryable(t *testing.T) {
 	assert.Nil(t, claimedAgain)
 }
 
+// TestApplyStore_FindNextApplySkipsOldRetryable verifies that automatic
+// scheduler recovery only redispatches recently updated retryable failures.
+// Old failures require deliberate operator action instead of being picked up
+// later by a policy or retry-budget change.
+func TestApplyStore_FindNextApplySkipsOldRetryable(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_old_retryable_claim", 501, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = NOW() - INTERVAL 2 DAY
+		WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.FailedRetryable, persisted.State)
+	assert.Equal(t, 0, persisted.Attempt)
+}
+
 func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -726,9 +755,9 @@ func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, persisted.State)
 }
 
-// TestApplyStore_ExpireRetryable verifies retry budget exhaustion at the
-// storage layer. A retryable apply that has used all attempts becomes failed,
-// and unfinished tasks are finalized as failed with completion timestamps.
+// TestApplyStore_ExpireRetryable verifies retryable expiry at the storage
+// layer. A retryable apply that has used all attempts becomes failed, and
+// unfinished tasks are finalized as failed with completion timestamps.
 func TestApplyStore_ExpireRetryable(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -773,9 +802,10 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 	expired, err := store.Applies().ExpireRetryable(ctx)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
-	assert.Equal(t, apply.ApplyIdentifier, expired[0].ApplyIdentifier)
-	assert.Equal(t, state.Apply.Failed, expired[0].State)
-	assert.NotNil(t, expired[0].CompletedAt)
+	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
+	assert.Equal(t, apply.ApplyIdentifier, expired[0].Apply.ApplyIdentifier)
+	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)
+	assert.NotNil(t, expired[0].Apply.CompletedAt)
 
 	persisted, err := store.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -794,6 +824,37 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 	require.NotNil(t, pendingTask)
 	assert.Equal(t, state.Task.Failed, pendingTask.State)
 	assert.NotNil(t, pendingTask.CompletedAt)
+}
+
+// TestApplyStore_ExpireRetryableExpiresOldFailures verifies that retryable
+// failures are not kept non-terminal forever after their recovery window passes.
+func TestApplyStore_ExpireRetryableExpiresOldFailures(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_old_expired", 502, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = NOW() - INTERVAL 2 DAY
+		WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	expired, err := store.Applies().ExpireRetryable(ctx)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, storage.RetryableExpirationRecoveryWindow, expired[0].Reason)
+	assert.Equal(t, apply.ApplyIdentifier, expired[0].Apply.ApplyIdentifier)
+	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)
+	assert.Equal(t, 0, expired[0].Apply.Attempt)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Failed, persisted.State)
+	assert.NotNil(t, persisted.CompletedAt)
 }
 
 func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestination(t *testing.T) {

@@ -62,7 +62,7 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 
 **reason** (scheduler claim failures): `storage_error`, `expire_retryable_error`, `unknown`
 
-**reason** (scheduler resume failures): `missing_deployment`, `no_client`, `resume_error`, `retry_budget_exhausted`
+**reason** (scheduler resume failures): `missing_deployment`, `no_client`, `resume_error`, `retry_budget_exhausted`, `recovery_window_expired`
 
 ### Check Ownership Misses
 

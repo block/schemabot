@@ -30,9 +30,17 @@ const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_i
 	a.state, a.error_message, a.options, a.attempt,
 	a.created_at, a.started_at, a.completed_at, a.updated_at`
 
-// maxRecoveryAttempts is the retry budget for failed_retryable applies. The
-// original apply attempt is separate; this counts scheduler redispatches.
-const maxRecoveryAttempts = 10
+const (
+	// maxRecoveryAttempts is the retry budget for failed_retryable applies. The
+	// original apply attempt is separate; this counts scheduler redispatches.
+	maxRecoveryAttempts = 10
+
+	// retryableRecoveryFreshnessDays prevents old retryable failures from
+	// being redispatched unexpectedly after retry policy or attempt budgets
+	// change. Old failures require deliberate operator action instead of
+	// automatic scheduler pickup.
+	retryableRecoveryFreshnessDays = 1
+)
 
 const (
 	applyTargetLockWait           = 10 * time.Second
@@ -553,10 +561,10 @@ func (s *applyStore) GetRecent(ctx context.Context, limit int) ([]*storage.Apply
 // Returns the claimed apply, or nil if nothing needs work.
 //
 // Matches queued pending applies with persisted tasks, stale active applies
-// where heartbeat expired > 1 minute, and failed_retryable applies that still
-// have retry budget. Apply creation/update enforces one active apply per
-// database/type/environment, so claims only need to lease one row and avoid
-// worker races on that row.
+// where heartbeat expired > 1 minute, and recently failed_retryable applies
+// that still have retry budget. Apply creation/update enforces one active
+// apply per database/type/environment, so claims only need to lease one row
+// and avoid worker races on that row.
 func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) {
 	// Read committed keeps concurrent SKIP LOCKED claims from taking next-key
 	// range locks that can serialize workers across otherwise independent targets.
@@ -570,7 +578,7 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 	activeStatePlaceholders := placeholders(len(activeStates))
 	queryArgs := []any{state.Apply.Pending}
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
-	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts)
+	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 
 	// Apply creation/update enforces at most one active apply per
 	// database/type/environment. The claim query only needs to find stale work;
@@ -581,7 +589,7 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 		WHERE (
 			(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
 			OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
-			OR (a.state = ? AND a.attempt < ?)
+			OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
 		)
 		ORDER BY a.created_at
 		LIMIT 1
@@ -657,8 +665,9 @@ func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 }
 
 // ExpireRetryable transitions failed_retryable applies that exhausted their
-// retry budget to permanent failed. Returns the applies updated.
-func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.Apply, error) {
+// retry budget or recovery freshness window to permanent failed. Returns the
+// applies updated.
+func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableApplyExpiration, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin expire retryable applies transaction: %w", err)
@@ -668,16 +677,19 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.Apply, err
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
-		WHERE state = ? AND attempt >= ?
+		WHERE state = ? AND (
+			attempt >= ?
+			OR updated_at < NOW() - INTERVAL ? DAY
+		)
 		FOR UPDATE
-	`, state.Apply.FailedRetryable, maxRecoveryAttempts)
+	`, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 	if err != nil {
-		return nil, fmt.Errorf("query exhausted retryable applies: %w", err)
+		return nil, fmt.Errorf("query expired retryable applies: %w", err)
 	}
 	applies, err := scanApplies(rows)
 	utils.CloseAndLog(rows)
 	if err != nil {
-		return nil, fmt.Errorf("scan exhausted retryable applies: %w", err)
+		return nil, fmt.Errorf("scan expired retryable applies: %w", err)
 	}
 	if len(applies) == 0 {
 		if err := tx.Commit(); err != nil {
@@ -687,8 +699,13 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.Apply, err
 	}
 
 	applyIDs := make([]any, 0, len(applies))
+	expirations := make([]*storage.RetryableApplyExpiration, 0, len(applies))
 	for _, apply := range applies {
 		applyIDs = append(applyIDs, apply.ID)
+		expirations = append(expirations, &storage.RetryableApplyExpiration{
+			Apply:  apply,
+			Reason: retryableExpirationReason(apply),
+		})
 	}
 
 	taskArgs := []any{state.Task.Failed}
@@ -721,7 +738,14 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.Apply, err
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
 	}
-	return applies, nil
+	return expirations, nil
+}
+
+func retryableExpirationReason(apply *storage.Apply) storage.RetryableExpirationReason {
+	if apply.Attempt >= maxRecoveryAttempts {
+		return storage.RetryableExpirationAttemptBudget
+	}
+	return storage.RetryableExpirationRecoveryWindow
 }
 
 // GetByDatabase returns applies for a specific database and optionally filtered by dbType and environment.

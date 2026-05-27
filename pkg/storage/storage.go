@@ -217,8 +217,9 @@ type ApplyStore interface {
 	Heartbeat(ctx context.Context, applyID int64) error
 
 	// ExpireRetryable transitions failed_retryable applies that exhausted their
-	// retry budget to permanent failed. Returns the applies updated.
-	ExpireRetryable(ctx context.Context) ([]*Apply, error)
+	// retry budget or recovery freshness window to permanent failed. Returns the
+	// applies updated.
+	ExpireRetryable(ctx context.Context) ([]*RetryableApplyExpiration, error)
 
 	// FindMissingSummaryComment returns GitHub-backed applies that should have
 	// a terminal summary comment but only have a progress comment. Used by
@@ -233,6 +234,21 @@ type ApplyStore interface {
 
 	// DeleteByPR removes all applies for a PR (cleanup on PR close/merge).
 	DeleteByPR(ctx context.Context, repo string, pr int) error
+}
+
+// RetryableExpirationReason identifies why scheduler retry recovery stopped.
+type RetryableExpirationReason string
+
+const (
+	RetryableExpirationAttemptBudget  RetryableExpirationReason = "retry_budget_exhausted"
+	RetryableExpirationRecoveryWindow RetryableExpirationReason = "recovery_window_expired"
+)
+
+// RetryableApplyExpiration is a failed_retryable apply that was made permanent
+// because scheduler recovery should no longer retry it automatically.
+type RetryableApplyExpiration struct {
+	Apply  *Apply
+	Reason RetryableExpirationReason
 }
 
 // TaskStore manages schema change tasks (individual DDLs within an apply).

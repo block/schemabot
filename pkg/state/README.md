@@ -51,7 +51,7 @@ stateDiagram-v2
     running --> waiting_for_cutover : atomic mode
     running --> revert_window : PlanetScale only
     failed_retryable --> running : scheduler retry
-    failed_retryable --> failed : retry budget exhausted
+    failed_retryable --> failed : retry budget or recovery window exhausted
 
     waiting_for_cutover --> cutting_over
     cutting_over --> completed
