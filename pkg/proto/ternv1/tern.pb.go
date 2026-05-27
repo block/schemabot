@@ -1310,14 +1310,11 @@ func (x *ProgressResponse) GetMetadata() map[string]string {
 
 // CutoverRequest triggers the cutover phase.
 type CutoverRequest struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Database string                 `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
-	// Database type: "vitess" or "mysql". Used by stateless clients.
-	Type string `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
 	// Environment: "staging" or "production".
-	Environment string `protobuf:"bytes,3,opt,name=environment,proto3" json:"environment,omitempty"`
-	// Scope cutover to a specific apply ID.
-	ApplyId       string `protobuf:"bytes,4,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
+	Environment string `protobuf:"bytes,1,opt,name=environment,proto3" json:"environment,omitempty"`
+	// Apply ID for the schema change to cut over.
+	ApplyId       string `protobuf:"bytes,2,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1350,20 +1347,6 @@ func (x *CutoverRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use CutoverRequest.ProtoReflect.Descriptor instead.
 func (*CutoverRequest) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{12}
-}
-
-func (x *CutoverRequest) GetDatabase() string {
-	if x != nil {
-		return x.Database
-	}
-	return ""
-}
-
-func (x *CutoverRequest) GetType() string {
-	if x != nil {
-		return x.Type
-	}
-	return ""
 }
 
 func (x *CutoverRequest) GetEnvironment() string {
@@ -1435,14 +1418,11 @@ func (x *CutoverResponse) GetErrorMessage() string {
 
 // RevertRequest reverts a completed schema change.
 type RevertRequest struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Database string                 `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
-	// Database type: "vitess" or "mysql". Used by stateless clients.
-	Type string `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
 	// Environment: "staging" or "production".
-	Environment string `protobuf:"bytes,3,opt,name=environment,proto3" json:"environment,omitempty"`
-	// Scope revert to a specific apply ID.
-	ApplyId       string `protobuf:"bytes,4,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
+	Environment string `protobuf:"bytes,1,opt,name=environment,proto3" json:"environment,omitempty"`
+	// Apply ID for the schema change to revert.
+	ApplyId       string `protobuf:"bytes,2,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1475,20 +1455,6 @@ func (x *RevertRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use RevertRequest.ProtoReflect.Descriptor instead.
 func (*RevertRequest) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{14}
-}
-
-func (x *RevertRequest) GetDatabase() string {
-	if x != nil {
-		return x.Database
-	}
-	return ""
-}
-
-func (x *RevertRequest) GetType() string {
-	if x != nil {
-		return x.Type
-	}
-	return ""
 }
 
 func (x *RevertRequest) GetEnvironment() string {
@@ -1560,14 +1526,11 @@ func (x *RevertResponse) GetErrorMessage() string {
 
 // SkipRevertRequest skips the revert window.
 type SkipRevertRequest struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Database string                 `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
-	// Database type: "vitess" or "mysql". Used by stateless clients.
-	Type string `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
 	// Environment: "staging" or "production".
-	Environment string `protobuf:"bytes,3,opt,name=environment,proto3" json:"environment,omitempty"`
-	// Scope skip-revert to a specific apply ID.
-	ApplyId       string `protobuf:"bytes,4,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
+	Environment string `protobuf:"bytes,1,opt,name=environment,proto3" json:"environment,omitempty"`
+	// Apply ID for the schema change to finalize without reverting.
+	ApplyId       string `protobuf:"bytes,2,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1600,20 +1563,6 @@ func (x *SkipRevertRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use SkipRevertRequest.ProtoReflect.Descriptor instead.
 func (*SkipRevertRequest) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{16}
-}
-
-func (x *SkipRevertRequest) GetDatabase() string {
-	if x != nil {
-		return x.Database
-	}
-	return ""
-}
-
-func (x *SkipRevertRequest) GetType() string {
-	if x != nil {
-		return x.Type
-	}
-	return ""
 }
 
 func (x *SkipRevertRequest) GetEnvironment() string {
@@ -1765,16 +1714,13 @@ func (x *HealthResponse) GetStatus() string {
 	return ""
 }
 
-// StopRequest pauses in-progress schema changes for a database.
+// StopRequest pauses an in-progress schema change by apply ID.
 type StopRequest struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Database string                 `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
-	// Database type: "vitess" or "mysql". Used by stateless clients.
-	Type string `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
 	// Environment: "staging" or "production".
-	Environment string `protobuf:"bytes,3,opt,name=environment,proto3" json:"environment,omitempty"`
-	// Scope stop to a specific apply ID.
-	ApplyId       string `protobuf:"bytes,4,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
+	Environment string `protobuf:"bytes,1,opt,name=environment,proto3" json:"environment,omitempty"`
+	// Apply ID for the schema change to stop.
+	ApplyId       string `protobuf:"bytes,2,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1807,20 +1753,6 @@ func (x *StopRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use StopRequest.ProtoReflect.Descriptor instead.
 func (*StopRequest) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{20}
-}
-
-func (x *StopRequest) GetDatabase() string {
-	if x != nil {
-		return x.Database
-	}
-	return ""
-}
-
-func (x *StopRequest) GetType() string {
-	if x != nil {
-		return x.Type
-	}
-	return ""
 }
 
 func (x *StopRequest) GetEnvironment() string {
@@ -1917,16 +1849,13 @@ func (x *StopResponse) GetSkippedCount() int64 {
 	return 0
 }
 
-// StartRequest resumes stopped schema changes for a database.
+// StartRequest resumes a stopped schema change by apply ID.
 type StartRequest struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Database string                 `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
-	// Database type: "vitess" or "mysql". Used by stateless clients.
-	Type string `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
 	// Environment: "staging" or "production".
-	Environment string `protobuf:"bytes,3,opt,name=environment,proto3" json:"environment,omitempty"`
-	// Scope start to a specific apply ID.
-	ApplyId       string `protobuf:"bytes,4,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
+	Environment string `protobuf:"bytes,1,opt,name=environment,proto3" json:"environment,omitempty"`
+	// Apply ID for the schema change to start.
+	ApplyId       string `protobuf:"bytes,2,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1959,20 +1888,6 @@ func (x *StartRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use StartRequest.ProtoReflect.Descriptor instead.
 func (*StartRequest) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{22}
-}
-
-func (x *StartRequest) GetDatabase() string {
-	if x != nil {
-		return x.Database
-	}
-	return ""
-}
-
-func (x *StartRequest) GetType() string {
-	if x != nil {
-		return x.Type
-	}
-	return ""
 }
 
 func (x *StartRequest) GetEnvironment() string {
@@ -2062,16 +1977,13 @@ func (x *StartResponse) GetSkippedCount() int64 {
 
 // VolumeRequest modifies the schema change speed/concurrency.
 type VolumeRequest struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Database string                 `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
-	// Database type: "vitess" or "mysql". Used by stateless clients.
-	Type string `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
 	// Environment: "staging" or "production".
-	Environment string `protobuf:"bytes,3,opt,name=environment,proto3" json:"environment,omitempty"`
+	Environment string `protobuf:"bytes,1,opt,name=environment,proto3" json:"environment,omitempty"`
+	// Apply ID for the schema change to adjust.
+	ApplyId string `protobuf:"bytes,2,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	// Volume level 1-11 (1=conservative, 11=aggressive).
-	Volume int32 `protobuf:"varint,4,opt,name=volume,proto3" json:"volume,omitempty"`
-	// Scope volume change to a specific apply ID.
-	ApplyId       string `protobuf:"bytes,5,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
+	Volume        int32 `protobuf:"varint,3,opt,name=volume,proto3" json:"volume,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2106,23 +2018,16 @@ func (*VolumeRequest) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{24}
 }
 
-func (x *VolumeRequest) GetDatabase() string {
-	if x != nil {
-		return x.Database
-	}
-	return ""
-}
-
-func (x *VolumeRequest) GetType() string {
-	if x != nil {
-		return x.Type
-	}
-	return ""
-}
-
 func (x *VolumeRequest) GetEnvironment() string {
 	if x != nil {
 		return x.Environment
+	}
+	return ""
+}
+
+func (x *VolumeRequest) GetApplyId() string {
+	if x != nil {
+		return x.ApplyId
 	}
 	return ""
 }
@@ -2132,13 +2037,6 @@ func (x *VolumeRequest) GetVolume() int32 {
 		return x.Volume
 	}
 	return 0
-}
-
-func (x *VolumeRequest) GetApplyId() string {
-	if x != nil {
-		return x.ApplyId
-	}
-	return ""
 }
 
 // VolumeResponse indicates whether the volume change was accepted.
@@ -2235,7 +2133,8 @@ const file_tern_proto_rawDesc = "" +
 	"\venvironment\x18\x06 \x01(\tR\venvironment\x12\x16\n" +
 	"\x06target\x18\b \x01(\tR\x06target\x12\x19\n" +
 	"\bhead_sha\x18\t \x01(\tR\aheadSha\x12\x1f\n" +
-	"\vschema_path\x18\n \x01(\tR\n" +
+	"\vschema_path\x18\n" +
+	" \x01(\tR\n" +
 	"schemaPath\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
@@ -2343,61 +2242,49 @@ const file_tern_proto_rawDesc = "" +
 	" \x03(\v2'.tern.v1.ProgressResponse.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"}\n" +
-	"\x0eCutoverRequest\x12\x1a\n" +
-	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
-	"\x04type\x18\x02 \x01(\tR\x04type\x12 \n" +
-	"\venvironment\x18\x03 \x01(\tR\venvironment\x12\x19\n" +
-	"\bapply_id\x18\x04 \x01(\tR\aapplyId\"R\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"M\n" +
+	"\x0eCutoverRequest\x12 \n" +
+	"\venvironment\x18\x01 \x01(\tR\venvironment\x12\x19\n" +
+	"\bapply_id\x18\x02 \x01(\tR\aapplyId\"R\n" +
 	"\x0fCutoverResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
-	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"|\n" +
-	"\rRevertRequest\x12\x1a\n" +
-	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
-	"\x04type\x18\x02 \x01(\tR\x04type\x12 \n" +
-	"\venvironment\x18\x03 \x01(\tR\venvironment\x12\x19\n" +
-	"\bapply_id\x18\x04 \x01(\tR\aapplyId\"Q\n" +
+	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"L\n" +
+	"\rRevertRequest\x12 \n" +
+	"\venvironment\x18\x01 \x01(\tR\venvironment\x12\x19\n" +
+	"\bapply_id\x18\x02 \x01(\tR\aapplyId\"Q\n" +
 	"\x0eRevertResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
-	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"\x80\x01\n" +
-	"\x11SkipRevertRequest\x12\x1a\n" +
-	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
-	"\x04type\x18\x02 \x01(\tR\x04type\x12 \n" +
-	"\venvironment\x18\x03 \x01(\tR\venvironment\x12\x19\n" +
-	"\bapply_id\x18\x04 \x01(\tR\aapplyId\"U\n" +
+	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"P\n" +
+	"\x11SkipRevertRequest\x12 \n" +
+	"\venvironment\x18\x01 \x01(\tR\venvironment\x12\x19\n" +
+	"\bapply_id\x18\x02 \x01(\tR\aapplyId\"U\n" +
 	"\x12SkipRevertResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"\x0f\n" +
 	"\rHealthRequest\"(\n" +
 	"\x0eHealthResponse\x12\x16\n" +
-	"\x06status\x18\x01 \x01(\tR\x06status\"z\n" +
-	"\vStopRequest\x12\x1a\n" +
-	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
-	"\x04type\x18\x02 \x01(\tR\x04type\x12 \n" +
-	"\venvironment\x18\x03 \x01(\tR\venvironment\x12\x19\n" +
-	"\bapply_id\x18\x04 \x01(\tR\aapplyId\"\xc2\x01\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\"J\n" +
+	"\vStopRequest\x12 \n" +
+	"\venvironment\x18\x01 \x01(\tR\venvironment\x12\x19\n" +
+	"\bapply_id\x18\x02 \x01(\tR\aapplyId\"\xc2\x01\n" +
 	"\fStopResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12'\n" +
 	"\x0fresume_deadline\x18\x03 \x01(\tR\x0eresumeDeadline\x12#\n" +
 	"\rstopped_count\x18\x04 \x01(\x03R\fstoppedCount\x12#\n" +
-	"\rskipped_count\x18\x05 \x01(\x03R\fskippedCount\"{\n" +
-	"\fStartRequest\x12\x1a\n" +
-	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
-	"\x04type\x18\x02 \x01(\tR\x04type\x12 \n" +
-	"\venvironment\x18\x03 \x01(\tR\venvironment\x12\x19\n" +
-	"\bapply_id\x18\x04 \x01(\tR\aapplyId\"\x9a\x01\n" +
+	"\rskipped_count\x18\x05 \x01(\x03R\fskippedCount\"K\n" +
+	"\fStartRequest\x12 \n" +
+	"\venvironment\x18\x01 \x01(\tR\venvironment\x12\x19\n" +
+	"\bapply_id\x18\x02 \x01(\tR\aapplyId\"\x9a\x01\n" +
 	"\rStartResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12#\n" +
 	"\rstarted_count\x18\x03 \x01(\x03R\fstartedCount\x12#\n" +
-	"\rskipped_count\x18\x04 \x01(\x03R\fskippedCount\"\x94\x01\n" +
-	"\rVolumeRequest\x12\x1a\n" +
-	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
-	"\x04type\x18\x02 \x01(\tR\x04type\x12 \n" +
-	"\venvironment\x18\x03 \x01(\tR\venvironment\x12\x16\n" +
-	"\x06volume\x18\x04 \x01(\x05R\x06volume\x12\x19\n" +
-	"\bapply_id\x18\x05 \x01(\tR\aapplyId\"\x99\x01\n" +
+	"\rskipped_count\x18\x04 \x01(\x03R\fskippedCount\"d\n" +
+	"\rVolumeRequest\x12 \n" +
+	"\venvironment\x18\x01 \x01(\tR\venvironment\x12\x19\n" +
+	"\bapply_id\x18\x02 \x01(\tR\aapplyId\x12\x16\n" +
+	"\x06volume\x18\x03 \x01(\x05R\x06volume\"\x99\x01\n" +
 	"\x0eVolumeResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12'\n" +

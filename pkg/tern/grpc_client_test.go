@@ -65,29 +65,29 @@ func (s *mockTernServer) Progress(ctx context.Context, req *ternv1.ProgressReque
 }
 
 func (s *mockTernServer) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
-	if req.Database == "" {
-		return nil, status.Error(codes.InvalidArgument, "database is required")
+	if req.ApplyId == "" {
+		return nil, status.Error(codes.InvalidArgument, "apply_id is required")
 	}
 	return &ternv1.CutoverResponse{Accepted: true}, nil
 }
 
 func (s *mockTernServer) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
-	if req.Database == "" {
-		return nil, status.Error(codes.InvalidArgument, "database is required")
+	if req.ApplyId == "" {
+		return nil, status.Error(codes.InvalidArgument, "apply_id is required")
 	}
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
 func (s *mockTernServer) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
-	if req.Database == "" {
-		return nil, status.Error(codes.InvalidArgument, "database is required")
+	if req.ApplyId == "" {
+		return nil, status.Error(codes.InvalidArgument, "apply_id is required")
 	}
 	return &ternv1.StartResponse{Accepted: true}, nil
 }
 
 func (s *mockTernServer) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	if req.Database == "" {
-		return nil, status.Error(codes.InvalidArgument, "database is required")
+	if req.ApplyId == "" {
+		return nil, status.Error(codes.InvalidArgument, "apply_id is required")
 	}
 	if req.Volume < 1 || req.Volume > 11 {
 		return nil, status.Error(codes.InvalidArgument, "volume must be between 1 and 11")
@@ -100,15 +100,15 @@ func (s *mockTernServer) Volume(ctx context.Context, req *ternv1.VolumeRequest) 
 }
 
 func (s *mockTernServer) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
-	if req.Database == "" {
-		return nil, status.Error(codes.InvalidArgument, "database is required")
+	if req.ApplyId == "" {
+		return nil, status.Error(codes.InvalidArgument, "apply_id is required")
 	}
 	return &ternv1.RevertResponse{Accepted: true}, nil
 }
 
 func (s *mockTernServer) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error) {
-	if req.Database == "" {
-		return nil, status.Error(codes.InvalidArgument, "database is required")
+	if req.ApplyId == "" {
+		return nil, status.Error(codes.InvalidArgument, "apply_id is required")
 	}
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
 }
@@ -228,7 +228,8 @@ func TestGRPCClient_Cutover(t *testing.T) {
 
 	t.Run("valid request", func(t *testing.T) {
 		resp, err := client.Cutover(t.Context(), &ternv1.CutoverRequest{
-			Database: "testdb",
+			ApplyId:     "apply-cut123",
+			Environment: "staging",
 		})
 		require.NoError(t, err)
 		assert.True(t, resp.Accepted)
@@ -241,13 +242,14 @@ func TestGRPCClient_Stop(t *testing.T) {
 
 	t.Run("valid request", func(t *testing.T) {
 		resp, err := client.Stop(t.Context(), &ternv1.StopRequest{
-			Database: "testdb",
+			ApplyId:     "apply-stop123",
+			Environment: "staging",
 		})
 		require.NoError(t, err)
 		assert.True(t, resp.Accepted)
 	})
 
-	t.Run("missing database", func(t *testing.T) {
+	t.Run("missing apply_id", func(t *testing.T) {
 		_, err := client.Stop(t.Context(), &ternv1.StopRequest{})
 		require.Error(t, err)
 	})
@@ -259,13 +261,14 @@ func TestGRPCClient_Start(t *testing.T) {
 
 	t.Run("valid request", func(t *testing.T) {
 		resp, err := client.Start(t.Context(), &ternv1.StartRequest{
-			Database: "testdb",
+			ApplyId:     "apply-start123",
+			Environment: "staging",
 		})
 		require.NoError(t, err)
 		assert.True(t, resp.Accepted)
 	})
 
-	t.Run("missing database", func(t *testing.T) {
+	t.Run("missing apply_id", func(t *testing.T) {
 		_, err := client.Start(t.Context(), &ternv1.StartRequest{})
 		require.Error(t, err)
 	})
@@ -277,8 +280,9 @@ func TestGRPCClient_Volume(t *testing.T) {
 
 	t.Run("valid request", func(t *testing.T) {
 		resp, err := client.Volume(t.Context(), &ternv1.VolumeRequest{
-			Database: "testdb",
-			Volume:   7,
+			ApplyId:     "apply-vol123",
+			Environment: "staging",
+			Volume:      7,
 		})
 		require.NoError(t, err)
 		assert.True(t, resp.Accepted)
@@ -287,8 +291,9 @@ func TestGRPCClient_Volume(t *testing.T) {
 
 	t.Run("invalid volume", func(t *testing.T) {
 		_, err := client.Volume(t.Context(), &ternv1.VolumeRequest{
-			Database: "testdb",
-			Volume:   15,
+			ApplyId:     "apply-vol123",
+			Environment: "staging",
+			Volume:      15,
 		})
 		require.Error(t, err)
 	})
@@ -300,7 +305,8 @@ func TestGRPCClient_Revert(t *testing.T) {
 
 	t.Run("valid request", func(t *testing.T) {
 		resp, err := client.Revert(t.Context(), &ternv1.RevertRequest{
-			Database: "testdb",
+			ApplyId:     "apply-rev123",
+			Environment: "staging",
 		})
 		require.NoError(t, err)
 		assert.True(t, resp.Accepted)
@@ -313,7 +319,8 @@ func TestGRPCClient_SkipRevert(t *testing.T) {
 
 	t.Run("valid request", func(t *testing.T) {
 		resp, err := client.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{
-			Database: "testdb",
+			ApplyId:     "apply-skip123",
+			Environment: "staging",
 		})
 		require.NoError(t, err)
 		assert.True(t, resp.Accepted)

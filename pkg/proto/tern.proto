@@ -387,13 +387,10 @@ message ProgressResponse {
 
 // CutoverRequest triggers the cutover phase.
 message CutoverRequest {
-  string database = 1;
-  // Database type: "vitess" or "mysql". Used by stateless clients.
-  string type = 2;
   // Environment: "staging" or "production".
-  string environment = 3;
-  // Scope cutover to a specific apply ID.
-  string apply_id = 4;
+  string environment = 1;
+  // Apply ID for the schema change to cut over.
+  string apply_id = 2;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.
@@ -404,13 +401,10 @@ message CutoverResponse {
 
 // RevertRequest reverts a completed schema change.
 message RevertRequest {
-  string database = 1;
-  // Database type: "vitess" or "mysql". Used by stateless clients.
-  string type = 2;
   // Environment: "staging" or "production".
-  string environment = 3;
-  // Scope revert to a specific apply ID.
-  string apply_id = 4;
+  string environment = 1;
+  // Apply ID for the schema change to revert.
+  string apply_id = 2;
 }
 
 // RevertResponse indicates whether the revert was accepted.
@@ -421,13 +415,10 @@ message RevertResponse {
 
 // SkipRevertRequest skips the revert window.
 message SkipRevertRequest {
-  string database = 1;
-  // Database type: "vitess" or "mysql". Used by stateless clients.
-  string type = 2;
   // Environment: "staging" or "production".
-  string environment = 3;
-  // Scope skip-revert to a specific apply ID.
-  string apply_id = 4;
+  string environment = 1;
+  // Apply ID for the schema change to finalize without reverting.
+  string apply_id = 2;
 }
 
 // SkipRevertResponse indicates whether the skip was accepted.
@@ -444,15 +435,12 @@ message HealthResponse {
   string status = 1;
 }
 
-// StopRequest pauses in-progress schema changes for a database.
+// StopRequest pauses an in-progress schema change by apply ID.
 message StopRequest {
-  string database = 1;
-  // Database type: "vitess" or "mysql". Used by stateless clients.
-  string type = 2;
   // Environment: "staging" or "production".
-  string environment = 3;
-  // Scope stop to a specific apply ID.
-  string apply_id = 4;
+  string environment = 1;
+  // Apply ID for the schema change to stop.
+  string apply_id = 2;
 }
 
 // StopResponse indicates whether the stop was accepted.
@@ -467,15 +455,12 @@ message StopResponse {
   int64 skipped_count = 5;
 }
 
-// StartRequest resumes stopped schema changes for a database.
+// StartRequest resumes a stopped schema change by apply ID.
 message StartRequest {
-  string database = 1;
-  // Database type: "vitess" or "mysql". Used by stateless clients.
-  string type = 2;
   // Environment: "staging" or "production".
-  string environment = 3;
-  // Scope start to a specific apply ID.
-  string apply_id = 4;
+  string environment = 1;
+  // Apply ID for the schema change to start.
+  string apply_id = 2;
 }
 
 // StartResponse indicates whether the start was accepted.
@@ -490,15 +475,12 @@ message StartResponse {
 
 // VolumeRequest modifies the schema change speed/concurrency.
 message VolumeRequest {
-  string database = 1;
-  // Database type: "vitess" or "mysql". Used by stateless clients.
-  string type = 2;
   // Environment: "staging" or "production".
-  string environment = 3;
+  string environment = 1;
+  // Apply ID for the schema change to adjust.
+  string apply_id = 2;
   // Volume level 1-11 (1=conservative, 11=aggressive).
-  int32 volume = 4;
-  // Scope volume change to a specific apply ID.
-  string apply_id = 5;
+  int32 volume = 3;
 }
 
 // VolumeResponse indicates whether the volume change was accepted.

@@ -1323,7 +1323,6 @@ func TestVolumeHandler(t *testing.T) {
 
 		require.NotNil(t, mock.volumeReq, "expected volume request to be captured")
 		assert.Equal(t, "apply-vol123", mock.volumeReq.ApplyId)
-		assert.Equal(t, "testdb", mock.volumeReq.Database)
 		assert.Equal(t, "staging", mock.volumeReq.Environment)
 	})
 
@@ -1520,7 +1519,6 @@ func TestStopHandler(t *testing.T) {
 
 		require.NotNil(t, mock.stopReq, "expected stop request to be captured")
 		assert.Equal(t, "apply-abc123", mock.stopReq.ApplyId)
-		assert.Equal(t, "testdb", mock.stopReq.Database)
 		assert.Equal(t, "staging", mock.stopReq.Environment)
 	})
 
@@ -1579,7 +1577,6 @@ func TestStartHandler(t *testing.T) {
 
 		require.NotNil(t, mock.startReq, "expected start request to be captured")
 		assert.Equal(t, "apply-xyz789", mock.startReq.ApplyId)
-		assert.Equal(t, "testdb", mock.startReq.Database)
 		assert.Equal(t, "staging", mock.startReq.Environment)
 	})
 
@@ -1637,7 +1634,6 @@ func TestCutoverHandler(t *testing.T) {
 
 		require.NotNil(t, mock.cutoverReq, "expected cutover request to be captured")
 		assert.Equal(t, "apply-cut123", mock.cutoverReq.ApplyId)
-		assert.Equal(t, "testdb", mock.cutoverReq.Database)
 		assert.Equal(t, "staging", mock.cutoverReq.Environment)
 	})
 
@@ -1692,7 +1688,7 @@ func TestRevertHandler(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 		require.NotNil(t, mock.revertReq)
 		assert.Equal(t, "apply-rev123", mock.revertReq.ApplyId)
-		assert.Equal(t, "testdb", mock.revertReq.Database)
+		assert.Equal(t, "staging", mock.revertReq.Environment)
 	})
 
 	t.Run("requires apply_id", func(t *testing.T) {
@@ -1731,7 +1727,7 @@ func TestSkipRevertHandler(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 		require.NotNil(t, mock.skipRevertReq)
 		assert.Equal(t, "apply-skip456", mock.skipRevertReq.ApplyId)
-		assert.Equal(t, "testdb", mock.skipRevertReq.Database)
+		assert.Equal(t, "staging", mock.skipRevertReq.Environment)
 	})
 
 	t.Run("requires apply_id", func(t *testing.T) {

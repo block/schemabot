@@ -176,7 +176,6 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := client.Cutover(r.Context(), &ternv1.CutoverRequest{
 		ApplyId:     applyID,
-		Database:    apply.Database,
 		Environment: apply.Environment,
 	})
 	if err != nil {
@@ -213,7 +212,6 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := client.Stop(r.Context(), &ternv1.StopRequest{
 		ApplyId:     applyID,
-		Database:    apply.Database,
 		Environment: apply.Environment,
 	})
 	if err != nil {
@@ -251,7 +249,6 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := client.Start(r.Context(), &ternv1.StartRequest{
 		ApplyId:     applyID,
-		Database:    apply.Database,
 		Environment: apply.Environment,
 	})
 	if err != nil {
@@ -314,7 +311,6 @@ func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := client.Volume(r.Context(), &ternv1.VolumeRequest{
 		ApplyId:     applyID,
-		Database:    apply.Database,
 		Environment: apply.Environment,
 		Volume:      req.Volume,
 	})
@@ -349,8 +345,8 @@ func (s *Service) handleRevert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := client.Revert(r.Context(), &ternv1.RevertRequest{
-		ApplyId:  applyID,
-		Database: apply.Database,
+		ApplyId:     applyID,
+		Environment: apply.Environment,
 	})
 	if err != nil {
 		metrics.RecordControlOperation(r.Context(), "revert", apply.Database, apply.Environment, "error")
@@ -384,8 +380,8 @@ func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := client.SkipRevert(r.Context(), &ternv1.SkipRevertRequest{
-		ApplyId:  applyID,
-		Database: apply.Database,
+		ApplyId:     applyID,
+		Environment: apply.Environment,
 	})
 	if err != nil {
 		metrics.RecordControlOperation(r.Context(), "skip_revert", apply.Database, apply.Environment, "error")

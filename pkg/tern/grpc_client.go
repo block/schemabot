@@ -432,7 +432,6 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 
 	if apply.ExternalID != "" && state.IsState(apply.State, state.Apply.Pending) {
 		_, err := c.client.Start(ctx, &ternv1.StartRequest{
-			Database:    apply.Database,
 			Environment: apply.Environment,
 			ApplyId:     apply.ExternalID,
 		})
@@ -509,7 +508,6 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 		// Only call Start if Tern confirms the apply is actually stopped.
 		if state.IsState(apply.State, state.Apply.Stopped) {
 			_, err := c.client.Start(ctx, &ternv1.StartRequest{
-				Database:    apply.Database,
 				Environment: apply.Environment,
 				ApplyId:     apply.ExternalID,
 			})

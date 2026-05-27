@@ -34,6 +34,10 @@ func (c applyErrorClient) Apply(context.Context, *ternv1.ApplyRequest) (*ternv1.
 	return nil, c.err
 }
 
+type noopControlClient struct {
+	Client
+}
+
 func TestServerProgressMapsMissingApplyDataToNotFound(t *testing.T) {
 	testCases := []struct {
 		name string
@@ -88,6 +92,67 @@ func TestServerApplyMapsEngineRetryabilityToStatusCode(t *testing.T) {
 			_, err := server.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: "plan-123"})
 			require.Error(t, err)
 			assert.Equal(t, tc.want, status.Code(err))
+		})
+	}
+}
+
+func TestServerControlRequiresApplyID(t *testing.T) {
+	server := NewServer(noopControlClient{})
+
+	testCases := []struct {
+		name string
+		call func(context.Context) error
+	}{
+		{
+			name: "cutover",
+			call: func(ctx context.Context) error {
+				_, err := server.Cutover(ctx, &ternv1.CutoverRequest{})
+				return err
+			},
+		},
+		{
+			name: "stop",
+			call: func(ctx context.Context) error {
+				_, err := server.Stop(ctx, &ternv1.StopRequest{})
+				return err
+			},
+		},
+		{
+			name: "start",
+			call: func(ctx context.Context) error {
+				_, err := server.Start(ctx, &ternv1.StartRequest{})
+				return err
+			},
+		},
+		{
+			name: "volume",
+			call: func(ctx context.Context) error {
+				_, err := server.Volume(ctx, &ternv1.VolumeRequest{Volume: 5})
+				return err
+			},
+		},
+		{
+			name: "revert",
+			call: func(ctx context.Context) error {
+				_, err := server.Revert(ctx, &ternv1.RevertRequest{})
+				return err
+			},
+		},
+		{
+			name: "skip revert",
+			call: func(ctx context.Context) error {
+				_, err := server.SkipRevert(ctx, &ternv1.SkipRevertRequest{})
+				return err
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call(t.Context())
+			require.Error(t, err)
+			assert.Equal(t, codes.InvalidArgument, status.Code(err))
+			assert.Contains(t, err.Error(), "apply_id is required")
 		})
 	}
 }

@@ -630,8 +630,7 @@ func TestLocalClient_Cutover_NoActiveMigration(t *testing.T) {
 	ctx := t.Context()
 	// Cutover without an active schema change should return an error
 	_, err = client.Cutover(ctx, &ternv1.CutoverRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Environment: localClientTestEnvironment,
 	})
 	assert.Error(t, err, "expected error for cutover without active schema change")
 }
@@ -660,8 +659,7 @@ func TestLocalClient_Stop_NoMigration(t *testing.T) {
 	ctx := t.Context()
 	// Stop with no active schema change returns error from Spirit engine
 	_, err = client.Stop(ctx, &ternv1.StopRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Environment: localClientTestEnvironment,
 	})
 	require.Error(t, err, "expected Stop() to return error when no active schema change")
 	// Error should mention no active schema change
@@ -691,8 +689,7 @@ func TestLocalClient_Start_NoStoppedMigration(t *testing.T) {
 	ctx := t.Context()
 	// Start requires a stopped schema change to resume - returns error when none exists
 	_, err = client.Start(ctx, &ternv1.StartRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Environment: localClientTestEnvironment,
 	})
 	require.Error(t, err, "expected Start() to return error when no stopped schema change")
 	// Error should mention no stopped schema change
@@ -722,9 +719,8 @@ func TestLocalClient_Volume_NoActiveMigration(t *testing.T) {
 	ctx := t.Context()
 	// Volume requires an active schema change - returns error when none exists
 	_, err = client.Volume(ctx, &ternv1.VolumeRequest{
-		Type:     "mysql",
-		Database: "testdb",
-		Volume:   5,
+		Environment: localClientTestEnvironment,
+		Volume:      5,
 	})
 	require.Error(t, err, "expected Volume() to return error when no active schema change")
 	// Error should mention no active schema change
@@ -754,8 +750,7 @@ func TestLocalClient_Revert_NoActiveMigration(t *testing.T) {
 	ctx := t.Context()
 	// Revert requires an active schema change - returns error when none exists
 	_, err = client.Revert(ctx, &ternv1.RevertRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Environment: localClientTestEnvironment,
 	})
 	require.Error(t, err, "expected Revert() to return error when no active schema change")
 	// Error should mention no active schema change
@@ -785,8 +780,7 @@ func TestLocalClient_SkipRevert_NoActiveMigration(t *testing.T) {
 	ctx := t.Context()
 	// SkipRevert requires an active schema change - returns error when none exists
 	_, err = client.SkipRevert(ctx, &ternv1.SkipRevertRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Environment: localClientTestEnvironment,
 	})
 	require.Error(t, err, "expected SkipRevert() to return error when no active schema change")
 	// Error should mention no active schema change
@@ -1095,7 +1089,7 @@ func TestLocalClient_Apply_AtomicHeartbeat(t *testing.T) {
 
 	// Trigger cutover to complete the apply
 	_, err = client.Cutover(ctx, &ternv1.CutoverRequest{
-		Database:    "testdb",
+		ApplyId:     applyResp.ApplyId,
 		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err, "cutover")
