@@ -20,10 +20,6 @@ var knownSettings = map[string]settingInfo{
 		Description: "Enable verbose Spirit debug logs (replication events, etc.)",
 		Default:     "false",
 	},
-	"require_review": {
-		Description: "Require PR approval before schemabot apply (checks CODEOWNERS, falls back to any non-self approval)",
-		Default:     "false",
-	},
 }
 
 // SettingsCmd manages server settings (git-style get/set/list).
@@ -54,13 +50,8 @@ func (cmd *SettingsCmd) Run(g *Globals) error {
 }
 
 // validateSettingKey checks if a key is a known setting.
-// Supports scoped keys like "require_review:owner/repo".
 func validateSettingKey(key string) error {
-	baseKey := key
-	if before, _, ok := strings.Cut(key, ":"); ok {
-		baseKey = before
-	}
-	if _, ok := knownSettings[baseKey]; !ok {
+	if _, ok := knownSettings[key]; !ok {
 		var keys []string
 		for k := range knownSettings {
 			keys = append(keys, k)

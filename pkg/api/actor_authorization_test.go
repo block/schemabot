@@ -160,6 +160,36 @@ func TestServerConfigValidatePRCommandAuthorization(t *testing.T) {
 			},
 			wantErr: "must not contain /",
 		},
+		{
+			name: "valid review policy admins",
+			mutate: func(cfg *ServerConfig) {
+				cfg.ReviewPolicy = ReviewPolicyConfig{
+					Enabled:    true,
+					AdminTeams: []string{"octocat/db-admins"},
+					AdminUsers: []string{"mona"},
+				}
+			},
+		},
+		{
+			name: "invalid review policy admin team",
+			mutate: func(cfg *ServerConfig) {
+				cfg.ReviewPolicy = ReviewPolicyConfig{
+					Enabled:    true,
+					AdminTeams: []string{"db-admins"},
+				}
+			},
+			wantErr: "review_policy.admin_teams",
+		},
+		{
+			name: "invalid review policy admin user",
+			mutate: func(cfg *ServerConfig) {
+				cfg.ReviewPolicy = ReviewPolicyConfig{
+					Enabled:    true,
+					AdminUsers: []string{"octocat/mona"},
+				}
+			},
+			wantErr: "review_policy.admin_users",
+		},
 	}
 
 	for _, tt := range tests {

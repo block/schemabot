@@ -159,7 +159,7 @@ const (
 	PreviewCommentBlockedByPriorEnv    PreviewType = "comment_blocked_prior_env"            // Blocked by staging (pending)
 	PreviewCommentBlockedByPriorFailed PreviewType = "comment_blocked_prior_env_failed"     // Blocked by staging (failed)
 	PreviewCommentBlockedByPriorInProg PreviewType = "comment_blocked_prior_env_inprogress" // Blocked by staging (in progress)
-	PreviewCommentReviewRequired       PreviewType = "comment_review_required"              // Review gate: CODEOWNERS approval needed
+	PreviewCommentReviewRequired       PreviewType = "comment_review_required"              // Review gate: approval needed
 	PreviewCommentReviewGateError      PreviewType = "comment_review_gate_error"            // Review gate: fail-closed error
 	PreviewCommentChecksGateFailing    PreviewType = "comment_checks_gate_failing"          // Checks gate: failing CI/lint
 	PreviewCommentChecksGateInProgress PreviewType = "comment_checks_gate_in_progress"      // Checks gate: CI still running
@@ -967,7 +967,7 @@ func previewApplyCommandAllOutput() {
 		{"BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
 		{"BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
 		{"BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
-		{"REVIEW REQUIRED (CODEOWNERS)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
+		{"REVIEW REQUIRED", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
 		{"REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
 		{"ACTOR AUTHORIZATION: NOT AUTHORIZED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized()) }},
 		{"ACTOR AUTHORIZATION: UNAVAILABLE", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable()) }},
@@ -1039,7 +1039,7 @@ func previewCommentLockingAllOutput() {
 		{"BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
 		{"BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
 		{"BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
-		{"REVIEW REQUIRED (CODEOWNERS)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
+		{"REVIEW REQUIRED", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
 		{"REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
 	}
 	printSections(sections)

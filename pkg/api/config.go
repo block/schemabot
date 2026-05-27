@@ -41,6 +41,10 @@ type ServerConfig struct {
 	// behavior is preserved.
 	PRCommandAuthorization PRCommandAuthorizationConfig `yaml:"pr_command_authorization,omitempty"`
 
+	// ReviewPolicy controls whose PR approvals satisfy the review gate before
+	// apply/apply-confirm proceeds.
+	ReviewPolicy ReviewPolicyConfig `yaml:"review_policy,omitempty"`
+
 	// DefaultReviewers are GitHub teams/users required to review schema changes.
 	DefaultReviewers []string `yaml:"default_reviewers"`
 
@@ -213,6 +217,28 @@ type PRCommandAuthorizationConfig struct {
 	AdminUsers []string `yaml:"admin_users,omitempty"`
 }
 
+// ReviewPolicyConfig configures the PR review gate.
+type ReviewPolicyConfig struct {
+	// Enabled turns on the review gate before apply/apply-confirm.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// AdminTeams are GitHub teams whose approvals satisfy the review gate for
+	// any configured database.
+	AdminTeams []string `yaml:"admin_teams,omitempty"`
+
+	// AdminUsers are GitHub users whose approvals satisfy the review gate for
+	// any configured database.
+	AdminUsers []string `yaml:"admin_users,omitempty"`
+
+	// IncludeDatabaseOperators allows configured database operator_teams and
+	// operator_users to satisfy the review gate. Defaults to true.
+	IncludeDatabaseOperators *bool `yaml:"include_database_operators,omitempty"`
+
+	// IncludeCodeowners allows matching CODEOWNERS approvals to satisfy the
+	// review gate. Defaults to false.
+	IncludeCodeowners bool `yaml:"include_codeowners,omitempty"`
+}
+
 // EnvironmentConfig holds per-environment database configuration.
 type EnvironmentConfig struct {
 	// DSN is the database connection string for local mode.
@@ -318,6 +344,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := validatePRCommandAuthorization(c.PRCommandAuthorization); err != nil {
+		return err
+	}
+	if err := validateReviewPolicy(c.ReviewPolicy); err != nil {
 		return err
 	}
 

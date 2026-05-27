@@ -35,6 +35,18 @@ func (c *ServerConfig) PRCommandAuthorizationEnabled() bool {
 	return c != nil && c.PRCommandAuthorization.Enabled
 }
 
+// ReviewPolicyEnabled returns true when apply/apply-confirm PR comments must
+// pass the review gate.
+func (c *ServerConfig) ReviewPolicyEnabled() bool {
+	return c != nil && c.ReviewPolicy.Enabled
+}
+
+// ReviewPolicyIncludesDatabaseOperators returns whether database-scoped
+// operator principals should satisfy the review gate. Defaults to true.
+func (c *ServerConfig) ReviewPolicyIncludesDatabaseOperators() bool {
+	return c == nil || c.ReviewPolicy.IncludeDatabaseOperators == nil || *c.ReviewPolicy.IncludeDatabaseOperators
+}
+
 // ParseGitHubTeamPrincipal splits a configured team principal in "org/team-slug"
 // form. Team principals are optional; callers should only parse values that were
 // explicitly configured.
@@ -54,6 +66,16 @@ func validatePRCommandAuthorization(config PRCommandAuthorizationConfig) error {
 		return err
 	}
 	if err := validateGitHubUsers("pr_command_authorization.admin_users", config.AdminUsers); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateReviewPolicy(config ReviewPolicyConfig) error {
+	if err := validateGitHubTeamPrincipals("review_policy.admin_teams", config.AdminTeams); err != nil {
+		return err
+	}
+	if err := validateGitHubUsers("review_policy.admin_users", config.AdminUsers); err != nil {
 		return err
 	}
 	return nil

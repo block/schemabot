@@ -13,9 +13,7 @@ func TestValidateSettingKey(t *testing.T) {
 		key     string
 		wantErr bool
 	}{
-		{name: "known setting", key: "require_review", wantErr: false},
 		{name: "known setting spirit", key: "spirit_debug_logs", wantErr: false},
-		{name: "scoped setting", key: "require_review:octocat/hello-world", wantErr: false},
 		{name: "unknown setting", key: "nonexistent", wantErr: true},
 		{name: "unknown scoped setting", key: "nonexistent:octocat/repo", wantErr: true},
 	}

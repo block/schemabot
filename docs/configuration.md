@@ -198,6 +198,47 @@ If the GitHub API is unreachable when checking statuses, the apply is blocked (f
 
 Set `require_passing_checks: false` to disable this gate.
 
+## Review Gate
+
+SchemaBot can block `apply` and `apply-confirm` until the PR has a satisfying review. This prevents unapproved schema changes from being applied to any environment.
+
+```yaml
+review_policy:
+  enabled: true
+  admin_teams:
+    - myorg/admins
+    - myorg/db-admins
+  include_database_operators: true   # default: true
+  include_codeowners: false          # default: false
+
+databases:
+  payments:
+    type: mysql
+    operator_teams:
+      - myorg/payments-operators
+    environments:
+      staging:
+        dsn: "env:STAGING_DSN"
+```
+
+When enabled, SchemaBot checks PR approval before proceeding. A satisfying review can come from:
+
+1. `review_policy.admin_teams` or `review_policy.admin_users`, which apply to every configured database.
+2. The target database's `operator_teams` or `operator_users` when `include_database_operators` is true.
+3. Matching CODEOWNERS when `include_codeowners` is true.
+
+The PR author's own approval never counts, even if they match one of the configured principals. If the GitHub API fails while checking reviews or team membership, SchemaBot blocks the apply and posts an error comment.
+
+CODEOWNERS support is opt-in because CODEOWNERS is repo-controlled while review policy is server-controlled. When `include_codeowners` is true, SchemaBot looks for CODEOWNERS in the standard GitHub locations on the base branch:
+
+1. `.github/CODEOWNERS`
+2. `CODEOWNERS`
+3. `docs/CODEOWNERS`
+
+The base branch is used, not the PR's head branch, to prevent a PR from relaxing its own approval requirements by modifying CODEOWNERS.
+
+Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. If a PR is force-pushed after approval, GitHub may dismiss approvals; `apply-confirm` re-checks the gate and blocks if the approval no longer satisfies the policy. Team membership and CODEOWNERS are evaluated fresh at each gate check.
+
 ## Multi-Environment Deployment
 
 For organizations that need isolated infrastructure per environment (e.g., separate staging and production deployments with their own GitHub Apps and databases), SchemaBot supports scoping each instance to a subset of environments using `allowed_environments`.

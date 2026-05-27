@@ -18,11 +18,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 )
 
 // setupFakeGitHubForReviewGate extends the standard plan flow with review gate
-// support: CODEOWNERS content, PR reviews endpoint, and a settings store toggle.
+// support: CODEOWNERS content and PR reviews endpoint.
 func setupFakeGitHubForReviewGate(
 	t *testing.T,
 	mux *http.ServeMux,
@@ -191,15 +192,22 @@ func setupFakeGitHubForReviewGate(
 	return result
 }
 
+func enableReviewPolicy(t *testing.T, svc *api.Service, dbName string, operatorUsers []string, operatorTeams []string) {
+	t.Helper()
+	svc.Config().ReviewPolicy.Enabled = true
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.OperatorUsers = operatorUsers
+	dbConfig.OperatorTeams = operatorTeams
+	svc.Config().Databases[dbName] = dbConfig
+}
+
 // TestE2EApplyBlockedByReviewGate verifies that `schemabot apply` posts a
-// "Review Required" comment when require_review is enabled and no CODEOWNERS
+// "Review Required" comment when review gating is enabled and no authorized
 // approval exists.
 func TestE2EApplyBlockedByReviewGate(t *testing.T) {
 	dbName := "webhook_review_gate_blocked"
 	svc := setupE2EService(t, dbName)
-
-	// Enable review gate
-	require.NoError(t, svc.Storage().Settings().Set(t.Context(), "require_review", "true"))
+	enableReviewPolicy(t, svc, dbName, []string{"bob"}, nil)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -213,9 +221,9 @@ func TestE2EApplyBlockedByReviewGate(t *testing.T) {
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
 
-	// No reviews, CODEOWNERS requires @dba-team
+	// No reviews, review policy requires an operator.
 	result := setupFakeGitHubForReviewGate(t, mux, schemaFiles, schemabotConfig, dbName,
-		"* @dba-team\n",
+		"",
 		nil, // no reviews
 	)
 
@@ -239,8 +247,8 @@ func TestE2EApplyBlockedByReviewGate(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Review Required")
-		assert.Contains(t, body, "@dba-team")
-		assert.Contains(t, body, "approval from a code owner")
+		assert.Contains(t, body, "@bob")
+		assert.Contains(t, body, "approval from an authorized reviewer")
 		assert.NotContains(t, body, "Schema Change Plan")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for review gate comment")
@@ -248,13 +256,11 @@ func TestE2EApplyBlockedByReviewGate(t *testing.T) {
 }
 
 // TestE2EApplyProceedsWithApproval verifies that `schemabot apply` proceeds
-// normally when require_review is enabled and a CODEOWNERS member has approved.
+// normally when review gating is enabled and a database operator has approved.
 func TestE2EApplyProceedsWithApproval(t *testing.T) {
 	dbName := "webhook_review_gate_approved"
 	svc := setupE2EService(t, dbName)
-
-	// Enable review gate
-	require.NoError(t, svc.Storage().Settings().Set(t.Context(), "require_review", "true"))
+	enableReviewPolicy(t, svc, dbName, []string{"bob"}, nil)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -268,9 +274,9 @@ func TestE2EApplyProceedsWithApproval(t *testing.T) {
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
 
-	// bob is a CODEOWNER and has approved
+	// bob is a configured database operator and has approved.
 	result := setupFakeGitHubForReviewGate(t, mux, schemaFiles, schemabotConfig, dbName,
-		"* @bob\n",
+		"",
 		[]*gh.PullRequestReview{
 			{
 				User:        &gh.User{Login: new("bob")},
@@ -308,12 +314,11 @@ func TestE2EApplyProceedsWithApproval(t *testing.T) {
 }
 
 // TestE2EApplyBlockedBySelfApproval verifies that the PR author's own approval
-// does not satisfy the review gate when they are also a CODEOWNER.
+// does not satisfy the review gate when they are also an authorized reviewer.
 func TestE2EApplyBlockedBySelfApproval(t *testing.T) {
 	dbName := "webhook_review_gate_self"
 	svc := setupE2EService(t, dbName)
-
-	require.NoError(t, svc.Storage().Settings().Set(t.Context(), "require_review", "true"))
+	enableReviewPolicy(t, svc, dbName, []string{"testuser", "bob"}, nil)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -327,9 +332,9 @@ func TestE2EApplyBlockedBySelfApproval(t *testing.T) {
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
 
-	// testuser is both PR author and CODEOWNER, and approved their own PR
+	// testuser is both PR author and authorized reviewer, and approved their own PR.
 	result := setupFakeGitHubForReviewGate(t, mux, schemaFiles, schemabotConfig, dbName,
-		"* @testuser @bob\n",
+		"",
 		[]*gh.PullRequestReview{
 			{
 				User:        &gh.User{Login: new("testuser")},
@@ -363,13 +368,12 @@ func TestE2EApplyBlockedBySelfApproval(t *testing.T) {
 	}
 }
 
-// TestE2EApplyNoCodeownersFile verifies that when no CODEOWNERS file exists
-// and no reviews are present, the review gate blocks apply.
+// TestE2EApplyNoCodeownersFile verifies that when no reviews are present, the
+// review gate blocks apply even without CODEOWNERS.
 func TestE2EApplyNoCodeownersFile_Blocked(t *testing.T) {
 	dbName := "webhook_review_gate_no_co"
 	svc := setupE2EService(t, dbName)
-
-	require.NoError(t, svc.Storage().Settings().Set(t.Context(), "require_review", "true"))
+	enableReviewPolicy(t, svc, dbName, []string{"bob"}, nil)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -408,19 +412,18 @@ func TestE2EApplyNoCodeownersFile_Blocked(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Review Required")
-		assert.Contains(t, body, "at least one approval")
+		assert.Contains(t, body, "authorized reviewer")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for review gate comment")
 	}
 }
 
-// TestE2EApplyNoCodeownersFile_Approved verifies that when no CODEOWNERS file
-// exists but someone (not the author) has approved, the gate passes.
+// TestE2EApplyNoCodeownersFile_Approved verifies that a configured operator
+// approval passes without CODEOWNERS.
 func TestE2EApplyNoCodeownersFile_Approved(t *testing.T) {
 	dbName := "webhook_review_gate_noco_ok"
 	svc := setupE2EService(t, dbName)
-
-	require.NoError(t, svc.Storage().Settings().Set(t.Context(), "require_review", "true"))
+	enableReviewPolicy(t, svc, dbName, []string{"bob"}, nil)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -434,7 +437,7 @@ func TestE2EApplyNoCodeownersFile_Approved(t *testing.T) {
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
 
-	// No CODEOWNERS, but bob approved
+	// No CODEOWNERS, but bob approved as a configured operator.
 	result := setupFakeGitHubForReviewGate(t, mux, schemaFiles, schemabotConfig, dbName,
 		"", // no CODEOWNERS
 		[]*gh.PullRequestReview{
@@ -471,14 +474,12 @@ func TestE2EApplyNoCodeownersFile_Approved(t *testing.T) {
 	}
 }
 
-// TestE2EApplyTeamSlugApproval verifies that when CODEOWNERS contains a team
-// slug, SchemaBot expands it via the GitHub Teams API and matches the approving
-// reviewer against the team membership.
+// TestE2EApplyTeamSlugApproval verifies that SchemaBot expands configured
+// operator teams via the GitHub Teams API and matches the approving reviewer.
 func TestE2EApplyTeamSlugApproval(t *testing.T) {
 	dbName := "webhook_review_gate_team"
 	svc := setupE2EService(t, dbName)
-
-	require.NoError(t, svc.Storage().Settings().Set(t.Context(), "require_review", "true"))
+	enableReviewPolicy(t, svc, dbName, nil, []string{"octocat/dba-team"})
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -492,9 +493,9 @@ func TestE2EApplyTeamSlugApproval(t *testing.T) {
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
 
-	// CODEOWNERS has only a team slug; bob (a team member) approved
+	// bob is a member of the configured operator team and approved.
 	result := setupFakeGitHubForReviewGate(t, mux, schemaFiles, schemabotConfig, dbName,
-		"* @octocat/dba-team\n",
+		"",
 		[]*gh.PullRequestReview{
 			{
 				User:        &gh.User{Login: new("bob")},
@@ -539,13 +540,12 @@ func TestE2EApplyTeamSlugApproval(t *testing.T) {
 	}
 }
 
-// TestE2EApplyTeamSlugBlocked verifies that when CODEOWNERS has a team slug
-// and the approver is NOT a team member, the gate blocks.
+// TestE2EApplyTeamSlugBlocked verifies that an approval from a non-member of
+// the configured operator team does not satisfy the gate.
 func TestE2EApplyTeamSlugBlocked(t *testing.T) {
 	dbName := "webhook_review_gate_team_no"
 	svc := setupE2EService(t, dbName)
-
-	require.NoError(t, svc.Storage().Settings().Set(t.Context(), "require_review", "true"))
+	enableReviewPolicy(t, svc, dbName, nil, []string{"octocat/dba-team"})
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -559,9 +559,9 @@ func TestE2EApplyTeamSlugBlocked(t *testing.T) {
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
 
-	// CODEOWNERS has only a team slug; dave (NOT a team member) approved
+	// dave is not a member of the configured operator team.
 	result := setupFakeGitHubForReviewGate(t, mux, schemaFiles, schemabotConfig, dbName,
-		"* @octocat/dba-team\n",
+		"",
 		[]*gh.PullRequestReview{
 			{
 				User:        &gh.User{Login: new("dave")},
@@ -605,14 +605,68 @@ func TestE2EApplyTeamSlugBlocked(t *testing.T) {
 	}
 }
 
+// TestE2EApplyCodeownersOptIn verifies that CODEOWNERS approvals satisfy the
+// review gate only when review policy explicitly includes CODEOWNERS.
+func TestE2EApplyCodeownersOptIn(t *testing.T) {
+	dbName := "webhook_review_gate_codeowners"
+	svc := setupE2EService(t, dbName)
+	svc.Config().ReviewPolicy.Enabled = true
+	svc.Config().ReviewPolicy.IncludeDatabaseOperators = new(false)
+	svc.Config().ReviewPolicy.IncludeCodeowners = true
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForReviewGate(t, mux, schemaFiles, schemabotConfig, dbName,
+		"schema/webhook_review_gate_codeowners/ @bob\n",
+		[]*gh.PullRequestReview{
+			{
+				User:        &gh.User{Login: new("bob")},
+				State:       new(ghclient.ReviewApproved),
+				SubmittedAt: &gh.Timestamp{Time: time.Now()},
+			},
+		},
+	)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.NotContains(t, body, "Review Required")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for plan comment")
+	}
+}
+
 // TestE2EApplyReviewGateDisabled verifies that apply proceeds normally when
-// require_review is not set.
+// review gating is not configured.
 func TestE2EApplyReviewGateDisabled(t *testing.T) {
 	dbName := "webhook_review_gate_off"
 	svc := setupE2EService(t, dbName)
-
-	// Explicitly ensure require_review is off (shared DB may have leftovers)
-	require.NoError(t, svc.Storage().Settings().Delete(t.Context(), "require_review"))
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)

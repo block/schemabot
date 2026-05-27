@@ -10,7 +10,7 @@ type ReviewGateData struct {
 	Database    string
 	Environment string
 	RequestedBy string
-	Owners      []string
+	Reviewers   []string
 	PRAuthor    string
 }
 
@@ -22,21 +22,21 @@ func RenderReviewRequired(data ReviewGateData) string {
 	writeDBEnvLine(&sb, data.Database, data.Environment)
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 
-	if len(data.Owners) > 0 {
-		sb.WriteString("\nSchema changes require approval from a code owner before applying.\n")
-		sb.WriteString("\n**Code owners** (from CODEOWNERS):\n")
-		for _, owner := range data.Owners {
-			fmt.Fprintf(&sb, "- @%s\n", owner)
+	if len(data.Reviewers) > 0 {
+		sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
+		sb.WriteString("\n**Authorized reviewers**:\n")
+		for _, reviewer := range data.Reviewers {
+			fmt.Fprintf(&sb, "- @%s\n", reviewer)
 		}
 	} else {
-		sb.WriteString("\nSchema changes require at least one approval before applying.\n")
+		sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
 	}
 
 	sb.WriteString("\n### Next steps\n")
-	if len(data.Owners) > 0 {
-		sb.WriteString("1. Request a review from a code owner above\n")
+	if len(data.Reviewers) > 0 {
+		sb.WriteString("1. Request a review from an authorized reviewer above\n")
 	} else {
-		sb.WriteString("1. Request a review from a teammate\n")
+		sb.WriteString("1. Request a review from a database operator or admin\n")
 	}
 	fmt.Fprintf(&sb, "2. Once approved, run `schemabot apply -e %s` again\n", data.Environment)
 

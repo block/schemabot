@@ -92,6 +92,27 @@ func (h *Handler) authorizePRCommandActor(
 		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonMissingActor}, nil
 	}
 
+	return h.authorizeConfiguredDatabaseActor(ctx, client, actor, database)
+}
+
+func (h *Handler) authorizeConfiguredDatabaseActor(
+	ctx context.Context,
+	client *ghclient.InstallationClient,
+	actor string,
+	database string,
+) (api.ActorAuthorizationResult, error) {
+	// Without server config, SchemaBot cannot know the trusted actor policy.
+	if h.service == nil {
+		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonMissingServerConfig}, fmt.Errorf("server config is unavailable")
+	}
+	config := h.service.Config()
+
+	// GitHub should provide a principal. Missing identity is unsafe for a
+	// mutating PR command or a review gate approval, so deny instead of guessing.
+	if strings.TrimSpace(actor) == "" {
+		return api.ActorAuthorizationResult{Reason: api.ActorAuthReasonMissingActor}, nil
+	}
+
 	// Authorization is scoped to the resolved server-side database config.
 	dbConfig := config.Database(database)
 	if dbConfig == nil {

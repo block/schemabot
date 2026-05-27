@@ -45,7 +45,7 @@ Under **Organization permissions**, grant:
 
 | Permission | Access | Used For |
 |-----------|--------|----------|
-| **Members** | Read | Verify GitHub team membership for CODEOWNERS review gates and PR command authorization |
+| **Members** | Read | Verify GitHub team membership for review policies, CODEOWNERS review gates, and PR command authorization |
 
 ### Subscribe to Events
 

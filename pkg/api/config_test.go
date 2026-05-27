@@ -1128,6 +1128,70 @@ require_passing_checks: false
 	})
 }
 
+func TestServerConfig_ReviewPolicy(t *testing.T) {
+	t.Run("nil receiver defaults to false", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.False(t, cfg.ReviewPolicyEnabled())
+	})
+
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg := &ServerConfig{}
+		assert.False(t, cfg.ReviewPolicyEnabled())
+	})
+
+	t.Run("explicitly enabled", func(t *testing.T) {
+		cfg := &ServerConfig{ReviewPolicy: ReviewPolicyConfig{Enabled: true}}
+		assert.True(t, cfg.ReviewPolicyEnabled())
+	})
+
+	t.Run("database operators included by default", func(t *testing.T) {
+		cfg := &ServerConfig{ReviewPolicy: ReviewPolicyConfig{Enabled: true}}
+		assert.True(t, cfg.ReviewPolicyIncludesDatabaseOperators())
+	})
+
+	t.Run("database operators can be disabled", func(t *testing.T) {
+		cfg := &ServerConfig{
+			ReviewPolicy: ReviewPolicyConfig{
+				Enabled:                  true,
+				IncludeDatabaseOperators: new(false),
+			},
+		}
+		assert.False(t, cfg.ReviewPolicyIncludesDatabaseOperators())
+	})
+
+	t.Run("YAML deserialization", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "config.yaml")
+		content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/testapp"
+review_policy:
+  enabled: true
+  admin_teams:
+    - octocat/admins
+  admin_users:
+    - mona
+  include_database_operators: false
+  include_codeowners: true
+`
+		err := os.WriteFile(configPath, []byte(content), 0644)
+		require.NoError(t, err)
+
+		cfg, err := LoadServerConfigFromFile(configPath)
+		require.NoError(t, err)
+
+		assert.True(t, cfg.ReviewPolicyEnabled())
+		assert.Equal(t, []string{"octocat/admins"}, cfg.ReviewPolicy.AdminTeams)
+		assert.Equal(t, []string{"mona"}, cfg.ReviewPolicy.AdminUsers)
+		assert.False(t, cfg.ReviewPolicyIncludesDatabaseOperators())
+		assert.True(t, cfg.ReviewPolicy.IncludeCodeowners)
+	})
+}
+
 func TestServerConfig_IsCheckRequired(t *testing.T) {
 	t.Run("nil receiver requires all checks", func(t *testing.T) {
 		var cfg *ServerConfig

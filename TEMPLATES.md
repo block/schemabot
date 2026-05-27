@@ -1078,7 +1078,7 @@ schemabot apply -e production
 </details>
 
 <details>
-<summary><a name="review-required-codeowners"></a><strong>Review Required (Codeowners)</strong></summary>
+<summary><a name="review-required"></a><strong>Review Required</strong></summary>
 
 
 ## Review Required
@@ -1087,14 +1087,14 @@ schemabot apply -e production
 
 *Requested by @aparajon at 2026-01-01 00:00:00 UTC*
 
-Schema changes require approval from a code owner before applying.
+Schema changes require approval from an authorized reviewer before applying.
 
-**Code owners** (from CODEOWNERS):
+**Authorized reviewers**:
 - @acme/schema-reviewers
 - @jdoe
 
 ### Next steps
-1. Request a review from a code owner above
+1. Request a review from an authorized reviewer above
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -4089,7 +4089,7 @@ schemabot apply -e production
 </details>
 
 <details>
-<summary><a name="review-required-codeowners"></a><strong>Review Required (Codeowners)</strong></summary>
+<summary><a name="review-required"></a><strong>Review Required</strong></summary>
 
 
 ## Review Required
@@ -4098,14 +4098,14 @@ schemabot apply -e production
 
 *Requested by @aparajon at 2026-01-01 00:00:00 UTC*
 
-Schema changes require approval from a code owner before applying.
+Schema changes require approval from an authorized reviewer before applying.
 
-**Code owners** (from CODEOWNERS):
+**Authorized reviewers**:
 - @acme/schema-reviewers
 - @jdoe
 
 ### Next steps
-1. Request a review from a code owner above
+1. Request a review from an authorized reviewer above
 2. Once approved, run `schemabot apply -e staging` again
 
 

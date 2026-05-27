@@ -188,13 +188,13 @@ func PreviewCommentApplyConfirmNoLock() string {
 	return RenderApplyConfirmNoLock("testapp", "staging")
 }
 
-// PreviewCommentReviewRequired renders a sample "review required" comment (CODEOWNERS gate).
+// PreviewCommentReviewRequired renders a sample "review required" comment.
 func PreviewCommentReviewRequired() string {
 	return RenderReviewRequired(ReviewGateData{
 		Database:    "testapp",
 		Environment: "staging",
 		RequestedBy: "aparajon",
-		Owners:      []string{"acme/schema-reviewers", "jdoe"},
+		Reviewers:   []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:    "aparajon",
 	})
 }

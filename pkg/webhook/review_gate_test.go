@@ -1,7 +1,6 @@
 package webhook
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -19,7 +18,6 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
-	"github.com/block/schemabot/pkg/storage"
 )
 
 func TestReviewGateErrorDetailTeamMembership(t *testing.T) {
@@ -39,55 +37,11 @@ func TestReviewGateErrorDetailGeneric(t *testing.T) {
 	assert.NotContains(t, detail, "GitHub App can read organization members")
 }
 
-// mockSettingsStore implements storage.SettingsStore for testing.
-type mockSettingsStore struct {
-	settings map[string]string
-}
-
-func (m *mockSettingsStore) Get(_ context.Context, key string) (*storage.Setting, error) {
-	if v, ok := m.settings[key]; ok {
-		return &storage.Setting{Key: key, Value: v}, nil
-	}
-	return nil, nil
-}
-
-func (m *mockSettingsStore) Set(_ context.Context, key, value string) error {
-	m.settings[key] = value
-	return nil
-}
-
-func (m *mockSettingsStore) List(_ context.Context) ([]*storage.Setting, error) {
-	var result []*storage.Setting
-	for k, v := range m.settings {
-		result = append(result, &storage.Setting{Key: k, Value: v})
-	}
-	return result, nil
-}
-
-func (m *mockSettingsStore) Delete(_ context.Context, key string) error {
-	delete(m.settings, key)
-	return nil
-}
-
-// reviewGateMockStorage implements storage.Storage with a working SettingsStore.
-type reviewGateMockStorage struct {
-	settings *mockSettingsStore
-}
-
-func (m *reviewGateMockStorage) Locks() storage.LockStore                      { return nil }
-func (m *reviewGateMockStorage) Plans() storage.PlanStore                      { return nil }
-func (m *reviewGateMockStorage) Applies() storage.ApplyStore                   { return nil }
-func (m *reviewGateMockStorage) Tasks() storage.TaskStore                      { return nil }
-func (m *reviewGateMockStorage) ApplyLogs() storage.ApplyLogStore              { return nil }
-func (m *reviewGateMockStorage) ApplyComments() storage.ApplyCommentStore      { return nil }
-func (m *reviewGateMockStorage) VitessApplyData() storage.VitessApplyDataStore { return nil }
-func (m *reviewGateMockStorage) Checks() storage.CheckStore                    { return nil }
-func (m *reviewGateMockStorage) Settings() storage.SettingsStore               { return m.settings }
-func (m *reviewGateMockStorage) Ping(_ context.Context) error                  { return nil }
-func (m *reviewGateMockStorage) Close() error                                  { return nil }
-
-func setupReviewGateHandler(t *testing.T, settings map[string]string) (*Handler, *http.ServeMux) {
+func setupReviewGateHandler(t *testing.T, config *api.ServerConfig) (*Handler, *http.ServeMux) {
 	t.Helper()
+	if config == nil {
+		config = &api.ServerConfig{}
+	}
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -100,10 +54,7 @@ func setupReviewGateHandler(t *testing.T, settings map[string]string) (*Handler,
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	st := &reviewGateMockStorage{
-		settings: &mockSettingsStore{settings: settings},
-	}
-	svc := api.New(st, nil, nil, logger)
+	svc := api.New(&emptyStorage{}, config, nil, logger)
 
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
@@ -174,37 +125,44 @@ func registerReviewsEndpoint(mux *http.ServeMux, reviews []*gh.PullRequestReview
 }
 
 func TestCheckReviewGate_Disabled(t *testing.T) {
-	h, _ := setupReviewGateHandler(t, map[string]string{})
+	h, _ := setupReviewGateHandler(t, nil)
 
 	client, err := h.ghClient.ForInstallation(12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/testdb")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
 	require.NoError(t, err)
 	assert.Nil(t, result, "gate should return nil when disabled")
 }
 
-func TestCheckReviewGate_EnabledNoCodeowners_NoReviews(t *testing.T) {
-	h, mux := setupReviewGateHandler(t, map[string]string{"require_review": "true"})
+func TestCheckReviewGate_NoReviewsBlocks(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
 
 	registerPREndpoint(mux, "alice")
-	registerCodeownersEndpoint(mux, "", false)
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{})
 
 	client, err := h.ghClient.ForInstallation(12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/testdb")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.False(t, result.Approved, "no CODEOWNERS + no reviews = blocked")
+	assert.False(t, result.Approved)
+	assert.Equal(t, []string{"bob"}, result.RequiredReviewers)
 }
 
-func TestCheckReviewGate_EnabledNoCodeowners_WithApproval(t *testing.T) {
-	h, mux := setupReviewGateHandler(t, map[string]string{"require_review": "true"})
+func TestCheckReviewGate_OperatorUserApproval(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
 
 	registerPREndpoint(mux, "alice")
-	registerCodeownersEndpoint(mux, "", false)
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
 		{
 			User:        &gh.User{Login: new("bob")},
@@ -216,20 +174,21 @@ func TestCheckReviewGate_EnabledNoCodeowners_WithApproval(t *testing.T) {
 	client, err := h.ghClient.ForInstallation(12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/testdb")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.True(t, result.Approved, "no CODEOWNERS + any non-self approval = approved")
+	assert.True(t, result.Approved)
 }
 
-func TestCheckReviewGate_ApprovedByCodeowner(t *testing.T) {
-	h, mux := setupReviewGateHandler(t, map[string]string{"require_review": "true"})
+func TestCheckReviewGate_AdminUserApproval(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.ReviewPolicy.AdminUsers = []string{"mona"}
+	}))
 
 	registerPREndpoint(mux, "alice")
-	registerCodeownersEndpoint(mux, "* @bob @carol\n", true)
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
 		{
-			User:        &gh.User{Login: new("bob")},
+			User:        &gh.User{Login: new("mona")},
 			State:       new(ghclient.ReviewApproved),
 			SubmittedAt: &gh.Timestamp{Time: time.Now()},
 		},
@@ -238,36 +197,42 @@ func TestCheckReviewGate_ApprovedByCodeowner(t *testing.T) {
 	client, err := h.ghClient.ForInstallation(12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/testdb")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
 }
 
 func TestCheckReviewGate_NotApproved(t *testing.T) {
-	h, mux := setupReviewGateHandler(t, map[string]string{"require_review": "true"})
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob", "carol"}
+		cfg.Databases["orders"] = db
+	}))
 
 	registerPREndpoint(mux, "alice")
-	registerCodeownersEndpoint(mux, "* @bob @carol\n", true)
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{})
 
 	client, err := h.ghClient.ForInstallation(12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/testdb")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
 	assert.Equal(t, "alice", result.PRAuthor)
-	assert.Contains(t, result.Owners, "bob")
-	assert.Contains(t, result.Owners, "carol")
+	assert.Contains(t, result.RequiredReviewers, "bob")
+	assert.Contains(t, result.RequiredReviewers, "carol")
 }
 
 func TestCheckReviewGate_SelfApprovalBlocked(t *testing.T) {
-	h, mux := setupReviewGateHandler(t, map[string]string{"require_review": "true"})
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"alice", "bob"}
+		cfg.Databases["orders"] = db
+	}))
 
 	registerPREndpoint(mux, "alice")
-	registerCodeownersEndpoint(mux, "* @alice @bob\n", true)
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
 		{
 			User:        &gh.User{Login: new("alice")},
@@ -279,34 +244,27 @@ func TestCheckReviewGate_SelfApprovalBlocked(t *testing.T) {
 	client, err := h.ghClient.ForInstallation(12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/testdb")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved, "self-approval should be blocked")
 }
 
-func TestCheckReviewGate_RepoSpecificSetting(t *testing.T) {
-	h, _ := setupReviewGateHandler(t, map[string]string{
-		"require_review":                     "false",
-		"require_review:octocat/hello-world": "true",
-	})
+func TestCheckReviewGate_DisabledByDefault(t *testing.T) {
+	h, _ := setupReviewGateHandler(t, actorAuthTestConfig(false))
 
-	// Repo-specific override is true, so gate should be enabled
-	enabled, err := h.isReviewGateEnabled(t.Context(), "octocat/hello-world")
-	require.NoError(t, err)
-	assert.True(t, enabled)
-
-	// Different repo falls back to global (false)
-	enabled, err = h.isReviewGateEnabled(t.Context(), "other/repo")
-	require.NoError(t, err)
+	enabled := h.isReviewGateEnabled("octocat/hello-world")
 	assert.False(t, enabled)
 }
 
-func TestCheckReviewGate_TeamSlugExpansion(t *testing.T) {
-	h, mux := setupReviewGateHandler(t, map[string]string{"require_review": "true"})
+func TestCheckReviewGate_OperatorTeamApproval(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorTeams = []string{"octocat/db-admins"}
+		cfg.Databases["orders"] = db
+	}))
 
 	registerPREndpoint(mux, "alice")
-	registerCodeownersEndpoint(mux, "* @octocat/dba-team\n", true)
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
 		{
 			User:        &gh.User{Login: new("bob")},
@@ -314,30 +272,25 @@ func TestCheckReviewGate_TeamSlugExpansion(t *testing.T) {
 			SubmittedAt: &gh.Timestamp{Time: time.Now()},
 		},
 	})
-
-	// Team members endpoint — bob is a member of dba-team
-	mux.HandleFunc("GET /orgs/octocat/teams/dba-team/members", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]*gh.User{
-			{Login: new("bob")},
-			{Login: new("carol")},
-		})
-	})
+	mux.HandleFunc("GET /orgs/octocat/teams/db-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
 
 	client, err := h.ghClient.ForInstallation(12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/testdb")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.True(t, result.Approved, "team member approval should pass gate")
+	assert.True(t, result.Approved)
 }
 
-func TestCheckReviewGate_TeamSlugNotApproved(t *testing.T) {
-	h, mux := setupReviewGateHandler(t, map[string]string{"require_review": "true"})
+func TestCheckReviewGate_OperatorTeamNotApproved(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorTeams = []string{"octocat/db-admins"}
+		cfg.Databases["orders"] = db
+	}))
 
 	registerPREndpoint(mux, "alice")
-	registerCodeownersEndpoint(mux, "* @octocat/dba-team\n", true)
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
 		{
 			User:        &gh.User{Login: new("dave")},
@@ -345,30 +298,26 @@ func TestCheckReviewGate_TeamSlugNotApproved(t *testing.T) {
 			SubmittedAt: &gh.Timestamp{Time: time.Now()},
 		},
 	})
-
-	// dave is NOT a member of dba-team
-	mux.HandleFunc("GET /orgs/octocat/teams/dba-team/members", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]*gh.User{
-			{Login: new("bob")},
-			{Login: new("carol")},
-		})
-	})
+	mux.HandleFunc("GET /orgs/octocat/teams/db-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
 
 	client, err := h.ghClient.ForInstallation(12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/testdb")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.False(t, result.Approved, "non-team-member approval should not pass gate")
+	assert.False(t, result.Approved)
 }
 
-func TestCheckReviewGate_ApprovedByNonOwner(t *testing.T) {
-	h, mux := setupReviewGateHandler(t, map[string]string{"require_review": "true"})
+func TestCheckReviewGate_CodeownersIgnoredByDefault(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
 
 	registerPREndpoint(mux, "alice")
-	registerCodeownersEndpoint(mux, "* @bob\n", true)
+	registerCodeownersEndpoint(mux, "* @dave\n", true)
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
 		{
 			User:        &gh.User{Login: new("dave")},
@@ -380,17 +329,20 @@ func TestCheckReviewGate_ApprovedByNonOwner(t *testing.T) {
 	client, err := h.ghClient.ForInstallation(12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/testdb")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.False(t, result.Approved, "approval by non-owner should not pass gate")
+	assert.False(t, result.Approved)
+	assert.Equal(t, []string{"bob"}, result.RequiredReviewers)
 }
 
-func TestCheckReviewGate_PathScopedOwners(t *testing.T) {
-	h, mux := setupReviewGateHandler(t, map[string]string{"require_review": "true"})
+func TestCheckReviewGate_CodeownersOptIn(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.ReviewPolicy.IncludeCodeowners = true
+		cfg.ReviewPolicy.IncludeDatabaseOperators = new(false)
+	}))
 
 	registerPREndpoint(mux, "alice")
-	// payments/ owned by bob, orders/ owned by carol
 	registerCodeownersEndpoint(mux, "schema/payments/ @bob\nschema/orders/ @carol\n", true)
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
 		{
@@ -403,16 +355,41 @@ func TestCheckReviewGate_PathScopedOwners(t *testing.T) {
 	client, err := h.ghClient.ForInstallation(12345)
 	require.NoError(t, err)
 
-	// bob approved — should pass for payments (bob owns it)
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/payments")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/payments")
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.True(t, result.Approved, "bob owns schema/payments/ and approved")
+	assert.True(t, result.Approved)
+	assert.Contains(t, result.RequiredReviewers, "bob")
 
-	// bob approved — should NOT pass for orders (carol owns it)
-	result, err = h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "schema/orders")
+	result, err = h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/orders")
 	require.NoError(t, err)
 	require.NotNil(t, result)
-	assert.False(t, result.Approved, "bob does not own schema/orders/")
-	assert.Contains(t, result.Owners, "carol")
+	assert.False(t, result.Approved)
+	assert.Contains(t, result.RequiredReviewers, "carol")
+}
+
+func TestCheckReviewGate_NoConfiguredReviewersErrors(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.ReviewPolicy.IncludeDatabaseOperators = new(false)
+	}))
+
+	registerPREndpoint(mux, "alice")
+	registerReviewsEndpoint(mux, nil)
+
+	client, err := h.ghClient.ForInstallation(12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "no configured reviewers")
+}
+
+func reviewGateTestConfig(opts ...func(*api.ServerConfig)) *api.ServerConfig {
+	cfg := actorAuthTestConfig(false)
+	cfg.ReviewPolicy = api.ReviewPolicyConfig{Enabled: true}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	return cfg
 }

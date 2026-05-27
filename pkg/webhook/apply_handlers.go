@@ -45,7 +45,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
-	// Tier 1: CODEOWNERS review gate (path-scoped to this database's schema directory)
+	// Tier 1: review gate (server-owned review policy for this database)
 	if blocked := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.Apply); blocked {
 		h.logger.Info("apply blocked by review gate", "repo", repo, "pr", pr, "environment", environment, "requested_by", requestedBy)
 		return
@@ -346,7 +346,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 		return
 	}
 
-	// Tier 1: CODEOWNERS review gate (re-check on confirm to prevent bypass)
+	// Tier 1: review gate (re-check on confirm to prevent bypass)
 	if blocked := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.ApplyConfirm); blocked {
 		h.logger.Info("apply-confirm blocked by review gate", "repo", repo, "pr", pr, "environment", environment, "requested_by", requestedBy)
 		return

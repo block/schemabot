@@ -196,36 +196,20 @@ func TestLocal_Settings_SetGetDelete(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	// Set require_review
-	out := runCLI(t, binPath, "settings", "require_review", "true", "--endpoint", endpoint)
-	e2eutil.AssertContains(t, out, "require_review")
+	out := runCLI(t, binPath, "settings", "spirit_debug_logs", "true", "--endpoint", endpoint)
+	e2eutil.AssertContains(t, out, "spirit_debug_logs")
 	e2eutil.AssertContains(t, out, "true")
 
-	// Get require_review
-	out = runCLI(t, binPath, "settings", "require_review", "--endpoint", endpoint)
-	e2eutil.AssertContains(t, out, "require_review")
+	out = runCLI(t, binPath, "settings", "spirit_debug_logs", "--endpoint", endpoint)
+	e2eutil.AssertContains(t, out, "spirit_debug_logs")
 	e2eutil.AssertContains(t, out, "true")
 
-	// Set to false
-	out = runCLI(t, binPath, "settings", "require_review", "false", "--endpoint", endpoint)
-	e2eutil.AssertContains(t, out, "require_review")
+	out = runCLI(t, binPath, "settings", "spirit_debug_logs", "false", "--endpoint", endpoint)
+	e2eutil.AssertContains(t, out, "spirit_debug_logs")
 	e2eutil.AssertContains(t, out, "false")
 
-	// Verify it reads back as false
-	out = runCLI(t, binPath, "settings", "require_review", "--endpoint", endpoint)
+	out = runCLI(t, binPath, "settings", "spirit_debug_logs", "--endpoint", endpoint)
 	e2eutil.AssertContains(t, out, "false")
-}
-
-func TestLocal_Settings_ScopedKey(t *testing.T) {
-	binPath := buildCLI(t)
-	endpoint := schemabotURL(t)
-
-	// Set repo-scoped key
-	out := runCLI(t, binPath, "settings", "require_review:octocat/hello-world", "true", "--endpoint", endpoint)
-	e2eutil.AssertContains(t, out, "require_review:octocat/hello-world")
-
-	// Clean up
-	runCLI(t, binPath, "settings", "require_review:octocat/hello-world", "false", "--endpoint", endpoint)
 }
 
 func TestLocal_Settings_UnknownKey(t *testing.T) {
@@ -241,7 +225,6 @@ func TestLocal_Settings_List(t *testing.T) {
 	endpoint := schemabotURL(t)
 
 	out := runCLI(t, binPath, "settings", "--endpoint", endpoint)
-	e2eutil.AssertContains(t, out, "require_review")
 	e2eutil.AssertContains(t, out, "spirit_debug_logs")
 }
 
