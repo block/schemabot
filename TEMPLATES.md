@@ -1495,12 +1495,12 @@ Schema changes are being applied. Progress updates will be posted as new comment
 
 ### Table Progress
 
-- **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%  
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-  ```
-  Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
 
 
 ---
@@ -1524,11 +1524,11 @@ schemabot stop apply-a1b2c3d4e5f6
 
 ### Table Progress
 
-- **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-  ```
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
 
 
 </details>
@@ -1545,11 +1545,11 @@ schemabot stop apply-a1b2c3d4e5f6
 
 ### Table Progress
 
-- **`users`**: 🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed  
+**`users`**: 🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-  ```
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
 
 
 > ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
@@ -1575,12 +1575,12 @@ schemabot apply -e staging
 
 ### Table Progress
 
-- **`users`**: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%  
+**`users`**: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-  ```
-  Rows: 156,342 / 397,453
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+Rows: 156,342 / 397,453
 
 
 ---
@@ -1606,23 +1606,23 @@ schemabot start apply-a1b2c3d4e5f6
 
 ### Table Progress
 
-- **`orders`**: ⏳ Queued  
+**`orders`**: ⏳ Queued
 
-  ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-  ```
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
-- **`users`**: ⏳ Queued  
+**`users`**: ⏳ Queued
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-  ```
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
 
-- **`products`**: ⏳ Queued  
+**`products`**: ⏳ Queued
 
-  ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-  ```
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
 
 
 ---
@@ -1648,24 +1648,24 @@ schemabot stop apply-a1b2c3d4e5f6
 
 ### Table Progress
 
-- **`orders`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 22%  
+**`orders`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 22%
 
-  ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-  ```
-  Rows: 321,450 / 1,466,232 · ETA: 5m 40s
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+Rows: 321,450 / 1,466,232 · ETA: 5m 40s
 
-- **`users`**: ⏳ Queued  
+**`users`**: ⏳ Queued
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-  ```
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
 
-- **`products`**: ⏳ Queued  
+**`products`**: ⏳ Queued
 
-  ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-  ```
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
 
 
 ---
@@ -1691,24 +1691,24 @@ schemabot stop apply-a1b2c3d4e5f6
 
 ### Table Progress
 
-- **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%  
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-  ```
-  Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 
-- **`products`**: ⏳ Queued  
+**`products`**: ⏳ Queued
 
-  ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-  ```
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
 
-- **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
-  ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-  ```
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
 
 ---
@@ -1734,24 +1734,24 @@ schemabot stop apply-a1b2c3d4e5f6
 
 ### Table Progress
 
-- **`products`**: 🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 17%  
+**`products`**: 🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 17%
 
-  ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-  ```
-  Rows: 87,231 / 523,140 · ETA: 7m 0s
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+Rows: 87,231 / 523,140 · ETA: 7m 0s
 
-- **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
-  ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-  ```
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
-- **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-  ```
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
 
 
 ---
@@ -1777,23 +1777,23 @@ schemabot stop apply-a1b2c3d4e5f6
 
 ### Table Progress
 
-- **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
-  ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-  ```
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
-- **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-  ```
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
 
-- **`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
-  ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-  ```
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
 
 
 </details>
@@ -1812,23 +1812,23 @@ schemabot stop apply-a1b2c3d4e5f6
 
 ### Table Progress
 
-- **`orders`**: 🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed  
+**`orders`**: 🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
 
-  ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-  ```
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
-- **`users`**: ⊘ Cancelled (not started)  
+**`users`**: ⊘ Cancelled (not started)
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-  ```
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
 
-- **`products`**: ⊘ Cancelled (not started)  
+**`products`**: ⊘ Cancelled (not started)
 
-  ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-  ```
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
 
 
 > ⚠️ **Error:** Error 1061: Duplicate key name 'idx_user_id'
@@ -1856,23 +1856,23 @@ schemabot apply -e staging
 
 ### Table Progress
 
-- **`users`**: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed  
+**`users`**: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-  ```
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
 
-- **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
-  ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-  ```
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
-- **`products`**: ⊘ Cancelled (not started)  
+**`products`**: ⊘ Cancelled (not started)
 
-  ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-  ```
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
 
 
 > ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
@@ -1900,18 +1900,18 @@ schemabot apply -e staging
 
 ### Table Progress
 
-- **`users`**: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72%  
+**`users`**: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72%
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-  ```
-  Rows: 1,055,687 / 1,466,232
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+Rows: 1,055,687 / 1,466,232
 
-- **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete  
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 
-  ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-  ```
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
 
 ---
@@ -1939,23 +1939,23 @@ schemabot start apply-a1b2c3d4e5f6
 
 ### Table Progress
 
-- **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover  
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
 
-  ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-  ```
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
-- **`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover  
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-  ```
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
 
-- **`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover  
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
 
-  ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-  ```
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
 
 
 ---
@@ -1983,23 +1983,23 @@ schemabot cutover apply-a1b2c3d4e5f6
 
 ### Table Progress
 
-- **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...  
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
 
-  ```sql
-  ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-  ```
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
 
-- **`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...  
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
 
-  ```sql
-  ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-  ```
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
 
-- **`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...  
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
 
-  ```sql
-  ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-  ```
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
 
 
 ---

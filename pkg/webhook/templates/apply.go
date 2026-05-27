@@ -297,40 +297,40 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 
 	switch status {
 	case state.Task.Pending:
-		fmt.Fprintf(sb, "- **`%s`**: \u23f3 Queued  \n", table.TableName)
+		fmt.Fprintf(sb, "**`%s`**: \u23f3 Queued\n", table.TableName)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Completed:
 		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(sb, "- **`%s`**: %s \u2713 Complete  \n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.WaitingForCutover:
 		bar := ui.ProgressBarWaitingCutover()
 		if table.ReadyToComplete {
-			fmt.Fprintf(sb, "- **`%s`**: %s \u2705 Ready for cutover  \n", table.TableName, bar)
+			fmt.Fprintf(sb, "**`%s`**: %s \u2705 Ready for cutover\n", table.TableName, bar)
 		} else {
-			fmt.Fprintf(sb, "- **`%s`**: %s Waiting for cutover  \n", table.TableName, bar)
+			fmt.Fprintf(sb, "**`%s`**: %s Waiting for cutover\n", table.TableName, bar)
 		}
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.CuttingOver:
 		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(sb, "- **`%s`**: %s \U0001f504 Cutting over...  \n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Cutting over...\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Failed:
 		bar := ui.ProgressBarFailed(table.PercentComplete)
-		fmt.Fprintf(sb, "- **`%s`**: %s \u274c Failed  \n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Cancelled:
-		fmt.Fprintf(sb, "- **`%s`**: \u2298 Cancelled (not started)  \n", table.TableName)
+		fmt.Fprintf(sb, "**`%s`**: \u2298 Cancelled (not started)\n", table.TableName)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.RevertWindow:
 		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(sb, "- **`%s`**: %s \u2713 Complete (pending revert)  \n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete (pending revert)\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Stopped:
@@ -349,12 +349,12 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 	if table.RowsTotal > 0 {
 		pct := ui.ClampPercent(table.PercentComplete)
 		bar := ui.ProgressBarRowCopy(pct)
-		fmt.Fprintf(sb, "- **`%s`**: %s %d%%  \n", table.TableName, bar, pct)
+		fmt.Fprintf(sb, "**`%s`**: %s %d%%\n", table.TableName, bar, pct)
 		writeDDLLine(sb, table.DDL)
 		writeRowsAndETA(sb, table)
 	} else {
 		// No row data yet (initializing or instant DDL)
-		fmt.Fprintf(sb, "- **`%s`**: Running...  \n", table.TableName)
+		fmt.Fprintf(sb, "**`%s`**: Running...\n", table.TableName)
 		writeDDLLine(sb, table.DDL)
 	}
 }
@@ -364,31 +364,29 @@ func renderStoppedTable(sb *strings.Builder, table TableProgressData) {
 	switch {
 	case table.PercentComplete >= 100:
 		bar := ui.ProgressBarStopped(100)
-		fmt.Fprintf(sb, "- **`%s`**: %s \u23f9\ufe0f Stopped (was waiting for cutover)  \n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \u23f9\ufe0f Stopped (was waiting for cutover)\n", table.TableName, bar)
 	case table.PercentComplete > 0:
 		pct := ui.ClampPercent(table.PercentComplete)
 		bar := ui.ProgressBarStopped(pct)
-		fmt.Fprintf(sb, "- **`%s`**: %s \u23f9\ufe0f Stopped at %d%%  \n", table.TableName, bar, pct)
+		fmt.Fprintf(sb, "**`%s`**: %s \u23f9\ufe0f Stopped at %d%%\n", table.TableName, bar, pct)
 	default:
-		fmt.Fprintf(sb, "- **`%s`**: \u23f9\ufe0f Stopped (not started)  \n", table.TableName)
+		fmt.Fprintf(sb, "**`%s`**: \u23f9\ufe0f Stopped (not started)\n", table.TableName)
 	}
 
 	writeDDLLine(sb, table.DDL)
 
 	// Show rows (no ETA) for stopped tables with progress
 	if table.RowsTotal > 0 && table.PercentComplete > 0 {
-		fmt.Fprintf(sb, "  Rows: %s / %s\n",
+		fmt.Fprintf(sb, "Rows: %s / %s\n",
 			ui.FormatNumber(ui.ClampRows(table.RowsCopied, table.RowsTotal)),
 			ui.FormatNumber(table.RowsTotal))
 	}
 }
 
 // writeDDLLine writes the DDL statement as a sql code block below the table name.
-// A blank line before the code fence is required for GitHub to render it as a
-// proper code block inside a list item (GFM spec).
 func writeDDLLine(sb *strings.Builder, rawDDL string) {
 	if rawDDL != "" {
-		fmt.Fprintf(sb, "\n  ```sql\n  %s\n  ```\n", ddl.FormatDDL(rawDDL))
+		fmt.Fprintf(sb, "\n```sql\n%s\n```\n", ddl.FormatDDL(rawDDL))
 	}
 }
 
@@ -399,12 +397,12 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 	}
 	copied := ui.ClampRows(table.RowsCopied, table.RowsTotal)
 	if table.ETASeconds > 0 {
-		fmt.Fprintf(sb, "  Rows: %s / %s \u00b7 ETA: %s\n",
+		fmt.Fprintf(sb, "Rows: %s / %s \u00b7 ETA: %s\n",
 			ui.FormatNumber(copied),
 			ui.FormatNumber(table.RowsTotal),
 			ui.FormatETA(table.ETASeconds))
 	} else {
-		fmt.Fprintf(sb, "  Rows: %s / %s\n",
+		fmt.Fprintf(sb, "Rows: %s / %s\n",
 			ui.FormatNumber(copied),
 			ui.FormatNumber(table.RowsTotal))
 	}

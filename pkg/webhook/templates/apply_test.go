@@ -75,6 +75,41 @@ func TestRenderApplyStatusComment_Completed(t *testing.T) {
 	assert.Equal(t, 2, strings.Count(result, "Complete"))
 }
 
+func TestRenderApplyStatusComment_SQLFencesAreTopLevel(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Completed,
+		Tables: []TableProgressData{
+			{
+				TableName: "example_cursor",
+				DDL: "CREATE TABLE `example_cursor` (" +
+					"`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, " +
+					"`source` VARCHAR(64) NOT NULL, " +
+					"PRIMARY KEY (`id`)" +
+					") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+				Status: state.Task.Completed,
+			},
+			{
+				TableName: "example_state",
+				DDL:       "ALTER TABLE `example_state` MODIFY COLUMN `version` VARCHAR(100) NOT NULL",
+				Status:    state.Task.Completed,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "### Table Progress")
+	assert.NotContains(t, result, "\n- **`")
+	assert.NotContains(t, result, "\n  ```sql")
+	assert.NotContains(t, result, "\n  CREATE TABLE")
+	assert.Contains(t, result, "**`example_cursor`**:")
+	assert.Contains(t, result, "\n```sql\nCREATE TABLE `example_cursor`")
+	assert.Contains(t, result, "\n```\n\n**`example_state`**:")
+	assert.Contains(t, result, "\n```sql\nALTER TABLE `example_state`")
+}
+
 func TestRenderApplyStatusComment_Failed(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:     "testapp",
