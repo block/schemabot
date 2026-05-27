@@ -50,6 +50,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
+wait_for_ready_pods() {
+    local selector="$1"
+    local timeout_seconds="${2:-120}"
+    local deadline=$((SECONDS + timeout_seconds))
+
+    until kubectl get pod -n "$NAMESPACE" -l "$selector" -o name 2>/dev/null | grep -q .; do
+        if ((SECONDS >= deadline)); then
+            echo "Timeout waiting for pods matching selector: $selector"
+            kubectl get pods -n "$NAMESPACE" -o wide || true
+            exit 1
+        fi
+        sleep 1
+    done
+
+    local remaining=$((deadline - SECONDS))
+    if ((remaining < 1)); then
+        remaining=1
+    fi
+    kubectl wait --for=condition=ready pod -l "$selector" -n "$NAMESPACE" --timeout="${remaining}s"
+}
+
 # --- Deploy ---
 
 echo "Creating namespace..."
@@ -57,18 +78,18 @@ kubectl create namespace "$NAMESPACE" 2>/dev/null || true
 
 echo "Deploying MySQL..."
 kubectl apply -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/mysql.yaml"
-kubectl wait --for=condition=ready pod -l app=mysql-control-plane -n "$NAMESPACE" --timeout=120s
-kubectl wait --for=condition=ready pod -l app=mysql-data-plane -n "$NAMESPACE" --timeout=120s
+wait_for_ready_pods "app=mysql-control-plane"
+wait_for_ready_pods "app=mysql-data-plane"
 
 echo "Installing data plane..."
 helm upgrade --install data-plane "$REPO_ROOT/charts/schemabot" \
     -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/data-plane-values.yaml"
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=data-plane -n "$NAMESPACE" --timeout=120s
+wait_for_ready_pods "app.kubernetes.io/instance=data-plane"
 
 echo "Installing control plane..."
 helm upgrade --install control-plane "$REPO_ROOT/charts/schemabot" \
     -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/control-plane-values.yaml"
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=control-plane -n "$NAMESPACE" --timeout=120s
+wait_for_ready_pods "app.kubernetes.io/instance=control-plane"
 
 # --- Port-forwards ---
 
