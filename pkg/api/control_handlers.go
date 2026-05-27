@@ -81,7 +81,7 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 // database is derived from storage so callers cannot target a different
 // database than the one originally planned.
 func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, dest any,
-	environment, applyID *string) (tern.Client, *storage.Apply, string, bool) {
+	applyID, environment *string) (tern.Client, *storage.Apply, string, bool) {
 
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
@@ -161,15 +161,15 @@ func ternApplyIDForStoredApply(apply *storage.Apply) string {
 
 // CutoverRequest is the HTTP request body for POST /api/cutover.
 type CutoverRequest struct {
-	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
+	Environment string `json:"environment"`
 	Caller      string `json:"caller,omitempty"`
 }
 
 // handleCutover handles POST /api/cutover requests.
 func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 	var req CutoverRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.Environment, &req.ApplyID)
+	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -196,8 +196,8 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 
 // StopRequest is the HTTP request body for POST /api/stop.
 type StopRequest struct {
-	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
+	Environment string `json:"environment"`
 	Caller      string `json:"caller,omitempty"`
 }
 
@@ -205,7 +205,7 @@ type StopRequest struct {
 // Stops all non-terminal tasks for the database.
 func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	var req StopRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.Environment, &req.ApplyID)
+	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -234,15 +234,15 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 
 // StartRequest is the HTTP request body for POST /api/start.
 type StartRequest struct {
-	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
+	Environment string `json:"environment"`
 	Caller      string `json:"caller,omitempty"`
 }
 
 // handleStart handles POST /api/start requests.
 func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	var req StartRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.Environment, &req.ApplyID)
+	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -299,7 +299,7 @@ type VolumeRequest struct {
 // handleVolume handles POST /api/volume requests.
 func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 	var req VolumeRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.Environment, &req.ApplyID)
+	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -331,15 +331,15 @@ func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 
 // RevertRequest is the HTTP request body for POST /api/revert.
 type RevertRequest struct {
-	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
+	Environment string `json:"environment"`
 	Caller      string `json:"caller,omitempty"`
 }
 
 // handleRevert handles POST /api/revert requests.
 func (s *Service) handleRevert(w http.ResponseWriter, r *http.Request) {
 	var req RevertRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.Environment, &req.ApplyID)
+	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -366,15 +366,15 @@ func (s *Service) handleRevert(w http.ResponseWriter, r *http.Request) {
 
 // SkipRevertRequest is the HTTP request body for POST /api/skip-revert.
 type SkipRevertRequest struct {
-	Environment string `json:"environment"`
 	ApplyID     string `json:"apply_id"`
+	Environment string `json:"environment"`
 	Caller      string `json:"caller,omitempty"`
 }
 
 // handleSkipRevert handles POST /api/skip-revert requests.
 func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 	var req SkipRevertRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.Environment, &req.ApplyID)
+	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}

@@ -387,10 +387,10 @@ message ProgressResponse {
 
 // CutoverRequest triggers the cutover phase.
 message CutoverRequest {
-  // Environment: "staging" or "production".
-  string environment = 1;
   // Apply ID for the schema change to cut over.
-  string apply_id = 2;
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.
@@ -401,10 +401,10 @@ message CutoverResponse {
 
 // RevertRequest reverts a completed schema change.
 message RevertRequest {
-  // Environment: "staging" or "production".
-  string environment = 1;
   // Apply ID for the schema change to revert.
-  string apply_id = 2;
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
 }
 
 // RevertResponse indicates whether the revert was accepted.
@@ -415,10 +415,10 @@ message RevertResponse {
 
 // SkipRevertRequest skips the revert window.
 message SkipRevertRequest {
-  // Environment: "staging" or "production".
-  string environment = 1;
   // Apply ID for the schema change to finalize without reverting.
-  string apply_id = 2;
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
 }
 
 // SkipRevertResponse indicates whether the skip was accepted.
@@ -437,10 +437,10 @@ message HealthResponse {
 
 // StopRequest pauses an in-progress schema change by apply ID.
 message StopRequest {
-  // Environment: "staging" or "production".
-  string environment = 1;
   // Apply ID for the schema change to stop.
-  string apply_id = 2;
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
 }
 
 // StopResponse indicates whether the stop was accepted.
@@ -457,10 +457,10 @@ message StopResponse {
 
 // StartRequest resumes a stopped schema change by apply ID.
 message StartRequest {
-  // Environment: "staging" or "production".
-  string environment = 1;
   // Apply ID for the schema change to start.
-  string apply_id = 2;
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
 }
 
 // StartResponse indicates whether the start was accepted.
@@ -475,10 +475,10 @@ message StartResponse {
 
 // VolumeRequest modifies the schema change speed/concurrency.
 message VolumeRequest {
-  // Environment: "staging" or "production".
-  string environment = 1;
   // Apply ID for the schema change to adjust.
-  string apply_id = 2;
+  string apply_id = 1;
+  // Environment: "staging" or "production".
+  string environment = 2;
   // Volume level 1-11 (1=conservative, 11=aggressive).
   int32 volume = 3;
 }
