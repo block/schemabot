@@ -284,6 +284,40 @@ func (e *retryableFailureEngine) Progress(context.Context, *engine.ProgressReque
 	}, nil
 }
 
+type leaseInspectingEngine struct {
+	engine.Engine
+
+	store         storage.Storage
+	applyID       int64
+	observedState string
+}
+
+func (e *leaseInspectingEngine) Name() string { return "lease-inspecting" }
+
+func (e *leaseInspectingEngine) Apply(ctx context.Context, _ *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	apply, err := e.store.Applies().Get(ctx, e.applyID)
+	if err != nil {
+		return nil, fmt.Errorf("get apply during engine apply: %w", err)
+	}
+	if apply == nil {
+		return nil, storage.ErrApplyNotFound
+	}
+	e.observedState = apply.State
+	return &engine.ApplyResult{Accepted: true}, nil
+}
+
+func (e *leaseInspectingEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{
+		State: engine.StateCompleted,
+		Tables: []engine.TableProgress{{
+			Namespace: "testdb",
+			Table:     "users",
+			State:     state.Task.Completed,
+			Progress:  100,
+		}},
+	}, nil
+}
+
 func TestLocalClient_NewLocalClient(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -539,6 +573,109 @@ func TestLocalClient_Apply(t *testing.T) {
 	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'users' AND COLUMN_NAME = 'email'").Scan(&columnCount)
 	require.NoError(t, err, "query columns")
 	assert.Equal(t, 1, columnCount, "expected email column to exist, got count %d", columnCount)
+}
+
+func TestLocalClient_GroupedApplyKeepsClaimLeaseRunning(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-lease-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{
+					{Namespace: "testdb", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN lease_note VARCHAR(255)", Operation: "alter"},
+				},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-lease-%d", time.Now().UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	task := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-lease-users-%d", time.Now().UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         planID,
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		State:          state.Task.Pending,
+		TableName:      "users",
+		Namespace:      "testdb",
+		DDL:            "ALTER TABLE `users` ADD COLUMN lease_note VARCHAR(255)",
+		DDLAction:      "alter",
+		Options:        storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	taskID, err := stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	claimed, err := stor.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, state.Apply.Pending, claimed.State)
+
+	persisted, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	require.Equal(t, state.Apply.Running, persisted.State)
+
+	inspectingEngine := &leaseInspectingEngine{store: stor, applyID: applyID}
+	client.spiritEngine = inspectingEngine
+
+	require.NoError(t, client.ResumeApply(ctx, claimed))
+	assert.Equal(t, state.Apply.Running, inspectingEngine.observedState)
+
+	completed, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, completed)
+	assert.Equal(t, state.Apply.Completed, completed.State)
 }
 
 func TestLocalClient_Progress(t *testing.T) {
