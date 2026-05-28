@@ -49,6 +49,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
@@ -267,6 +268,9 @@ func TestGRPC_StopStart(t *testing.T) {
 		var startResult grpcSimpleResponse
 		grpcDecodeJSON(t, startResp, &startResult)
 		require.True(t, startResult.Accepted, "start not accepted: %s", startResult.ErrorMessage)
+
+		testutil.WaitForAnyState(t, grpcSchemabotURL(t), apply.ApplyID,
+			[]string{state.Apply.Running, state.Apply.Completed}, 30*time.Second)
 	}
 
 	// Wait for completion

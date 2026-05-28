@@ -1616,6 +1616,58 @@ func TestGRPCClient_ResumeApplyCompletesQueuedStartWhenRemoteAlreadyActive(t *te
 	assert.Nil(t, controlReq)
 }
 
+func TestGRPCClient_ReconcileStoppedRemoteProgressKeepsQueuedStartPending(t *testing.T) {
+	// A Start request can be accepted while an older worker is still recording
+	// the remote stop. The stop sync must not consume the pending Start intent;
+	// the scheduler needs that durable request to claim and resume the apply.
+	now := time.Now()
+	remoteApply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-stop-with-pending-start",
+		ExternalID:      "remote-stop-with-pending-start",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+		StartedAt:       &now,
+	}
+	storedApply := *remoteApply
+	storedApply.State = state.Apply.Running
+	task := &storage.Task{
+		ID:             31,
+		TaskIdentifier: "task-stop-with-pending-start",
+		ApplyID:        remoteApply.ID,
+		TableName:      "users",
+		Namespace:      "default",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   remoteApply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	client := &GRPCClient{
+		storage: &mockStorage{
+			applies:         &mockApplyStore{apply: &storedApply},
+			tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+	}
+
+	err := client.reconcileTerminalRemoteProgress(t.Context(), remoteApply, []*ternv1.TableProgress{{
+		Namespace: "default",
+		TableName: "users",
+		Status:    state.Task.Stopped,
+	}}, now)
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Apply.Stopped, remoteApply.State)
+	assert.Equal(t, state.Task.Stopped, task.State)
+	controlReq, err := controlRequests.GetPending(t.Context(), remoteApply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq)
+}
+
 // TestGRPCClient_ResumeApply_SkipsStartWhenNotStopped verifies that ResumeApply
 // checks Tern's real state before calling Start. If Tern says the apply is already
 // completed (stored state diverged), Start is skipped and terminal state is

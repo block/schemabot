@@ -1893,7 +1893,7 @@ func TestStartHandler(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 		assert.Nil(t, mock.startReq, "request path should queue scheduler work without calling Tern start")
-		assert.Equal(t, state.Apply.Pending, apply.State)
+		assert.Equal(t, state.Apply.Stopped, apply.State)
 		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 		require.NoError(t, err)
 		require.NotNil(t, controlReq)
@@ -1989,7 +1989,7 @@ func TestStartHandler(t *testing.T) {
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
 		assert.Nil(t, mock.startReq, "request path should queue scheduler work without calling Tern start")
-		assert.Equal(t, state.Apply.Pending, apply.State)
+		assert.Equal(t, state.Apply.Running, apply.State)
 		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 		require.NoError(t, err)
 		require.NotNil(t, controlReq)
@@ -2030,7 +2030,7 @@ func TestStartHandler(t *testing.T) {
 		assert.Nil(t, mock.startReq, "request path should queue scheduler work without calling Tern start")
 		require.NotNil(t, mock.progressReq)
 		assert.Equal(t, "remote-apply-stoplag", mock.progressReq.ApplyId)
-		assert.Equal(t, state.Apply.Pending, apply.State)
+		assert.Equal(t, state.Apply.Running, apply.State)
 		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 		require.NoError(t, err)
 		require.NotNil(t, controlReq)

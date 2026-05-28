@@ -917,8 +917,14 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	if err := c.storage.Applies().Update(ctx, storedApply); err != nil {
 		return fmt.Errorf("update terminal remote gRPC apply %s: %w", storedApply.ApplyIdentifier, err)
 	}
-	if err := completePendingStartControlRequests(ctx, c.storage, storedApply); err != nil {
-		return err
+	// Stopped is a terminal apply state, but it is not completion of a pending
+	// Start request. A start can be queued while the previous worker is still
+	// recording the stop; leave that request pending so the scheduler can claim
+	// the stopped row and perform the resume.
+	if !state.IsState(storedApply.State, state.Apply.Stopped) {
+		if err := completePendingStartControlRequests(ctx, c.storage, storedApply); err != nil {
+			return err
+		}
 	}
 	c.logApplyStateTransition(ctx, storedApply, storage.LogLevelInfo, fmt.Sprintf("Remote apply reached terminal state: %s", storedApply.State), oldState)
 	*remoteApply = *storedApply

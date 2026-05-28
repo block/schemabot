@@ -189,7 +189,7 @@ func TestGRPCCLI_StopStart(t *testing.T) {
 		`CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)`, tableName))
 
 	grpcSeedRows(t, "staging", tableName, "name, data",
-		"CONCAT('user_', seq), REPEAT('x', 500)", 100000)
+		"CONCAT('user_', seq), REPEAT('x', 500)", 500000)
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
 
 	// Schema with INT->BIGINT PK change
@@ -246,6 +246,9 @@ func TestGRPCCLI_StopStart(t *testing.T) {
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
+
+		testutil.WaitForAnyState(t, endpoint, applyID,
+			[]string{state.Apply.Running, state.Apply.Completed}, 30*time.Second)
 	}
 
 	// Wait for completion

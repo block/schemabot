@@ -467,15 +467,6 @@ func (s *Service) persistStartRequestForScheduler(ctx context.Context, apply *st
 		return nil, "", err
 	}
 	if alreadyPending {
-		// A duplicate request should not rewind a scheduler-claimed apply from
-		// running back to pending. Only requeue stopped applies, which can happen
-		// if a previous request recorded intent but failed before updating the
-		// apply row.
-		if state.IsState(apply.State, state.Apply.Stopped) {
-			if err := s.queueApplyForSchedulerStart(ctx, apply); err != nil {
-				return nil, "", err
-			}
-		}
 		resp, err := startResponseFromControlRequest(controlReq)
 		if err != nil {
 			return nil, "", err
@@ -483,28 +474,11 @@ func (s *Service) persistStartRequestForScheduler(ctx context.Context, apply *st
 		return resp, startResponseStatusAlreadyRequested, nil
 	}
 
-	if err := s.queueApplyForSchedulerStart(ctx, apply); err != nil {
-		return nil, "", err
-	}
 	return &ternv1.StartResponse{
 		Accepted:     true,
 		StartedCount: startedCount,
 		SkippedCount: skippedCount,
 	}, startResponseStatusQueued, nil
-}
-
-func (s *Service) queueApplyForSchedulerStart(ctx context.Context, apply *storage.Apply) error {
-	apply.State = state.Apply.Pending
-	apply.CompletedAt = nil
-	now := time.Now()
-	if apply.StartedAt == nil {
-		apply.StartedAt = &now
-	}
-	apply.UpdatedAt = now
-	if err := s.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("queue apply %s for scheduler start: %w", apply.ApplyIdentifier, err)
-	}
-	return nil
 }
 
 func (s *Service) createStartControlRequest(ctx context.Context, apply *storage.Apply, caller string, startedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {

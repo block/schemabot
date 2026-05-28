@@ -585,9 +585,10 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 // and resumes the apply.
 // Returns the claimed apply, or nil if nothing needs work.
 //
-// Matches queued pending applies with persisted tasks, pending applies with a
-// durable control request, stale active applies where heartbeat expired > 1
-// minute, and recently failed_retryable applies that still have retry budget.
+// Matches queued pending applies with persisted tasks, pending or stopped applies
+// with a pending start control request, stale active applies where heartbeat
+// expired > 1 minute, and recently failed_retryable applies that still have retry
+// budget.
 // Apply creation/update enforces one active apply per database/type/environment,
 // so claims only need to lease one row and avoid worker races on that row.
 func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) {
@@ -607,6 +608,9 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 	queryArgs = append(queryArgs,
 		state.Apply.Pending,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.Apply.Stopped,
+		storage.ControlOperationStart, storage.ControlRequestPending)
 
 	// Apply creation/update enforces at most one active apply per
 	// database/type/environment. The claim query only needs to find stale work;
@@ -618,6 +622,14 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 				(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
 				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
 				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
+				OR (
+					a.state = ?
+					AND EXISTS (
+						SELECT 1
+						FROM apply_control_requests cr
+						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+					)
+				)
 				OR (
 					a.state = ?
 					AND EXISTS (
@@ -641,10 +653,10 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 	}
 
 	// Refresh the heartbeat as part of the claim before releasing the row lock.
-	// Pending and retryable applies become running while dispatch starts, so
-	// the leased row remains in the stale-recovery state family if the worker
-	// crashes before the engine starts.
-	if apply.State == state.Apply.Pending || apply.State == state.Apply.FailedRetryable {
+	// Pending, stopped-start, and retryable applies become running while the
+	// scheduler acts, so the leased row remains in the stale-recovery state
+	// family if the worker crashes before the engine starts.
+	if apply.State == state.Apply.Pending || apply.State == state.Apply.Stopped || apply.State == state.Apply.FailedRetryable {
 		var result sql.Result
 		nextState := state.Apply.Running
 		result, err = tx.ExecContext(ctx, `
