@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -20,6 +21,36 @@ func controlStatus(accepted bool) string {
 		return "success"
 	}
 	return "rejected"
+}
+
+type controlOperationHTTPError struct {
+	status int
+	err    error
+}
+
+func (e *controlOperationHTTPError) Error() string {
+	return e.err.Error()
+}
+
+func (e *controlOperationHTTPError) Unwrap() error {
+	return e.err
+}
+
+// controlConflictf marks an operator request as rejected rather than failed.
+// Storage, Tern, and scheduler errors still fall back to 500s.
+func controlConflictf(format string, args ...any) error {
+	return &controlOperationHTTPError{
+		status: http.StatusConflict,
+		err:    fmt.Errorf(format, args...),
+	}
+}
+
+func controlOperationHTTPStatus(err error) int {
+	var httpErr *controlOperationHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.status
+	}
+	return http.StatusInternalServerError
 }
 
 // logControlOperation appends an apply log entry for a control operation (cutover, stop, start, revert, etc.).
@@ -61,6 +92,7 @@ func (s *Service) logControlOperation(r *http.Request, applyID, caller, eventTyp
 
 // writeControlError logs and writes an HTTP error for a control operation.
 func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply *storage.Apply, err error) {
+	status := controlOperationHTTPStatus(err)
 	attrs := []any{"error", err}
 	if apply != nil {
 		attrs = append(attrs,
@@ -71,8 +103,13 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 			"environment", apply.Environment,
 		)
 	}
-	s.logger.Error(opName+" failed", attrs...)
-	s.writeError(w, http.StatusInternalServerError, opName+" failed: "+err.Error())
+	if status >= http.StatusInternalServerError {
+		s.logger.Error(opName+" failed", attrs...)
+		s.writeError(w, status, opName+" failed: "+err.Error())
+	} else {
+		s.logger.Warn(opName+" rejected", attrs...)
+		s.writeError(w, status, opName+" rejected: "+err.Error())
+	}
 }
 
 // decodeControlRequest decodes a control request (stop/start/cutover/volume),
@@ -247,6 +284,12 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := validateStartRequestState(apply); err != nil {
+		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, "rejected")
+		s.writeControlError(w, "start", apply, err)
+		return
+	}
+
 	resp, err := client.Start(r.Context(), &ternv1.StartRequest{
 		ApplyId:     applyID,
 		Environment: apply.Environment,
@@ -287,6 +330,62 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, httpResp)
+}
+
+func validateStartRequestState(apply *storage.Apply) error {
+	if apply.GetOptions().DeferDeploy && !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
+		return controlConflictf("schema change is not ready for deploy (current state: %s)", apply.State)
+	}
+	if !isStartRequestAllowedState(apply.State) {
+		return startNotAllowedForState(apply)
+	}
+	return nil
+}
+
+// isStartRequestAllowedState is an allowlist for states where /start has a
+// concrete action. New apply states must opt in here before they can reach Tern.
+func isStartRequestAllowedState(applyState string) bool {
+	return state.IsState(
+		applyState,
+		state.Apply.WaitingForDeploy,
+		state.Apply.Running,
+		state.Apply.Stopped,
+	)
+}
+
+func startNotAllowedForState(apply *storage.Apply) error {
+	switch {
+	case state.IsState(apply.State, state.Apply.Pending):
+		return controlConflictf("schema change is pending and no start request is queued")
+	case state.IsState(apply.State, state.Apply.Running):
+		return controlConflictf("schema change is still running; stop it before starting it again")
+	case state.IsState(apply.State, state.Apply.WaitingForCutover):
+		return controlConflictf("schema change is waiting for cutover; use cutover instead of start")
+	case state.IsState(apply.State, state.Apply.CuttingOver):
+		return controlConflictf("schema change is cutting over; start is not allowed")
+	case state.IsState(apply.State, state.Apply.RevertWindow):
+		return controlConflictf("schema change is in revert window; use revert or skip-revert instead of start")
+	case state.IsState(apply.State, state.Apply.FailedRetryable):
+		return controlConflictf("schema change is waiting for scheduler retry; start is not allowed")
+	case state.IsState(apply.State, state.Apply.Failed):
+		return controlConflictf("schema change failed and cannot be started")
+	case state.IsState(apply.State, state.Apply.Completed):
+		return controlConflictf("schema change already completed and cannot be started")
+	case state.IsState(apply.State, state.Apply.Cancelled):
+		return controlConflictf("schema change was cancelled and cannot be started")
+	case state.IsState(apply.State, state.Apply.Reverted):
+		return controlConflictf("schema change was reverted and cannot be started")
+	case state.IsState(apply.State,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest,
+	):
+		return controlConflictf("schema change is in setup state %s; start is not allowed", state.NormalizeState(apply.State))
+	default:
+		return controlConflictf("schema change is not stopped (current state: %s)", apply.State)
+	}
 }
 
 // VolumeRequest is the HTTP request body for POST /api/volume.

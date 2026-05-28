@@ -1791,6 +1791,132 @@ func TestStartHandler(t *testing.T) {
 		assert.Equal(t, "staging", mock.startReq.Environment)
 	})
 
+	t.Run("rejects deferred deploy before waiting for deploy", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := activeTestApply("apply-start-deferred")
+		apply.State = state.Apply.Pending
+		apply.Options = []byte(`{"defer_deploy":true}`)
+		svc := newControlTestService(mock, apply)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-start-deferred"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "not ready for deploy")
+		assert.Nil(t, mock.startReq)
+		assert.Equal(t, state.Apply.Pending, apply.State)
+	})
+
+	t.Run("rejects start for states without a start action", func(t *testing.T) {
+		tests := []struct {
+			name        string
+			applyState  string
+			wantMessage string
+		}{
+			{
+				name:        "pending",
+				applyState:  state.Apply.Pending,
+				wantMessage: "no start request is queued",
+			},
+			{
+				name:        "failed retryable",
+				applyState:  state.Apply.FailedRetryable,
+				wantMessage: "scheduler retry",
+			},
+			{
+				name:        "failed",
+				applyState:  state.Apply.Failed,
+				wantMessage: "failed and cannot be started",
+			},
+			{
+				name:        "cancelled",
+				applyState:  state.Apply.Cancelled,
+				wantMessage: "cancelled and cannot be started",
+			},
+			{
+				name:        "completed",
+				applyState:  state.Apply.Completed,
+				wantMessage: "already completed",
+			},
+			{
+				name:        "reverted",
+				applyState:  state.Apply.Reverted,
+				wantMessage: "reverted and cannot be started",
+			},
+			{
+				name:        "waiting for cutover",
+				applyState:  state.Apply.WaitingForCutover,
+				wantMessage: "use cutover",
+			},
+			{
+				name:        "cutting over",
+				applyState:  state.Apply.CuttingOver,
+				wantMessage: "cutting over",
+			},
+			{
+				name:        "revert window",
+				applyState:  state.Apply.RevertWindow,
+				wantMessage: "use revert or skip-revert",
+			},
+			{
+				name:        "preparing branch",
+				applyState:  state.Apply.PreparingBranch,
+				wantMessage: "setup state preparing_branch",
+			},
+			{
+				name:        "applying branch changes",
+				applyState:  state.Apply.ApplyingBranchChanges,
+				wantMessage: "setup state applying_branch_changes",
+			},
+			{
+				name:        "validating branch",
+				applyState:  state.Apply.ValidatingBranch,
+				wantMessage: "setup state validating_branch",
+			},
+			{
+				name:        "creating deploy request",
+				applyState:  state.Apply.CreatingDeployRequest,
+				wantMessage: "setup state creating_deploy_request",
+			},
+			{
+				name:        "validating deploy request",
+				applyState:  state.Apply.ValidatingDeployRequest,
+				wantMessage: "setup state validating_deploy_request",
+			},
+			{
+				name:        "unknown future state",
+				applyState:  "new_future_state",
+				wantMessage: "not stopped",
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				mock := &mockTernClient{}
+				apply := activeTestApply("apply-start-" + strings.ReplaceAll(tt.applyState, "_", "-"))
+				apply.State = tt.applyState
+				svc := newControlTestService(mock, apply)
+				mux := http.NewServeMux()
+				svc.ConfigureRoutes(mux)
+
+				body := fmt.Sprintf(`{"environment": "staging", "apply_id": %q}`, apply.ApplyIdentifier)
+				req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, req)
+
+				assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+				assert.Contains(t, w.Body.String(), tt.wantMessage)
+				assert.Nil(t, mock.startReq)
+			})
+		}
+	})
+
 	t.Run("requires apply_id", func(t *testing.T) {
 		mock := &mockTernClient{}
 		svc := newControlTestService(mock, activeTestApply("apply-active-start"))
