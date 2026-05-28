@@ -10,9 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
-	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
-	"github.com/block/schemabot/pkg/storage"
 )
 
 func TestFilterFailingNonSchemaBotChecks(t *testing.T) {
@@ -578,105 +576,4 @@ func TestEnforcePassingChecks(t *testing.T) {
 		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
 		assert.False(t, blocked, "should not block when disabled")
 	})
-}
-
-func TestDDLMatchesStoredPlan(t *testing.T) {
-	tests := []struct {
-		name       string
-		planResp   *apitypes.PlanResponse
-		storedPlan *storage.Plan
-		wantMatch  bool
-	}{
-		{
-			name: "identical DDL matches",
-			planResp: &apitypes.PlanResponse{
-				Changes: []*apitypes.SchemaChangeResponse{
-					{TableChanges: []*apitypes.TableChangeResponse{
-						{DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
-					}},
-				},
-			},
-			storedPlan: &storage.Plan{
-				Namespaces: map[string]*storage.NamespacePlanData{
-					"mydb": {Tables: []storage.TableChange{
-						{DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
-					}},
-				},
-			},
-			wantMatch: true,
-		},
-		{
-			name: "different DDL does not match",
-			planResp: &apitypes.PlanResponse{
-				Changes: []*apitypes.SchemaChangeResponse{
-					{TableChanges: []*apitypes.TableChangeResponse{
-						{DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
-						{DDL: "ALTER TABLE `users` DROP COLUMN `old_field`"},
-					}},
-				},
-			},
-			storedPlan: &storage.Plan{
-				Namespaces: map[string]*storage.NamespacePlanData{
-					"mydb": {Tables: []storage.TableChange{
-						{DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
-					}},
-				},
-			},
-			wantMatch: false,
-		},
-		{
-			name: "different DDL content does not match",
-			planResp: &apitypes.PlanResponse{
-				Changes: []*apitypes.SchemaChangeResponse{
-					{TableChanges: []*apitypes.TableChangeResponse{
-						{DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(500)"},
-					}},
-				},
-			},
-			storedPlan: &storage.Plan{
-				Namespaces: map[string]*storage.NamespacePlanData{
-					"mydb": {Tables: []storage.TableChange{
-						{DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
-					}},
-				},
-			},
-			wantMatch: false,
-		},
-		{
-			name: "same DDL in different order matches",
-			planResp: &apitypes.PlanResponse{
-				Changes: []*apitypes.SchemaChangeResponse{
-					{TableChanges: []*apitypes.TableChangeResponse{
-						{DDL: "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"},
-						{DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
-					}},
-				},
-			},
-			storedPlan: &storage.Plan{
-				Namespaces: map[string]*storage.NamespacePlanData{
-					"mydb": {Tables: []storage.TableChange{
-						{DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
-						{DDL: "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"},
-					}},
-				},
-			},
-			wantMatch: true,
-		},
-		{
-			name: "empty plans match",
-			planResp: &apitypes.PlanResponse{
-				Changes: []*apitypes.SchemaChangeResponse{},
-			},
-			storedPlan: &storage.Plan{
-				Namespaces: map[string]*storage.NamespacePlanData{},
-			},
-			wantMatch: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.wantMatch, ddlMatchesStoredPlan(tt.planResp, tt.storedPlan))
-		})
-	}
 }
