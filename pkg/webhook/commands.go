@@ -108,9 +108,9 @@ type CommandParser struct {
 // NewCommandParser creates a new command parser.
 func NewCommandParser() *CommandParser {
 	return &CommandParser{
-		commandRegex:      regexp.MustCompile(`(?i)schemabot\s+(` + commandNamePattern() + `)\b`),
-		mentionRegex:      regexp.MustCompile(`(?i)\bschemabot\b`),
-		helpRegex:         regexp.MustCompile(`(?i)schemabot\s+help\b`),
+		commandRegex:      regexp.MustCompile(`(?im)^ {0,3}schemabot[ \t]+(` + commandNamePattern() + `)\b`),
+		mentionRegex:      regexp.MustCompile(`(?im)^ {0,3}schemabot(?:[ \t]+|$)`),
+		helpRegex:         regexp.MustCompile(`(?im)^ {0,3}schemabot[ \t]+help\b`),
 		applyIDRegex:      regexp.MustCompile(`(?i)\b(apply[_-][a-f0-9]+)\b`),
 		environmentRegex:  regexp.MustCompile(`(?i)-e\s+(staging|production)`),
 		databaseRegex:     regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
@@ -144,11 +144,15 @@ type CommandResult struct {
 //     IsHelp=true so the dispatcher can branch on it without consulting the
 //     full spec table.
 //  2. The first registered command word that follows `schemabot ` is looked
-//     up in specByName and routed through applySpec.
-//  3. If `schemabot` appears but no registered command follows, the result is
-//     a bare IsMention so the dispatcher can post a friendly "invalid command"
-//     comment under the respond_to_unscoped policy.
+//     up in specByName and routed through applySpec. Commands must begin a
+//     non-code comment line so prose, filenames, URLs, and examples are not
+//     treated as directives.
+//  3. If a line starts with `schemabot` but no registered command follows, the
+//     result is a bare IsMention so the dispatcher can post a friendly
+//     "invalid command" comment under the respond_to_unscoped policy.
 func (p *CommandParser) ParseCommand(body string) CommandResult {
+	body = markdownDirectiveText(body)
+
 	if p.helpRegex.MatchString(body) {
 		return CommandResult{Action: action.Help, IsHelp: true, IsMention: true}
 	}
@@ -167,6 +171,27 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 		return CommandResult{IsMention: true}
 	}
 	return p.applySpec(spec, body)
+}
+
+func markdownDirectiveText(body string) string {
+	var b strings.Builder
+	inFence := false
+	for line := range strings.Lines(body) {
+		leadingSpaces := len(line) - len(strings.TrimLeft(line, " "))
+		if leadingSpaces <= 3 && isMarkdownFence(line[leadingSpaces:]) {
+			inFence = !inFence
+			continue
+		}
+		if inFence || strings.HasPrefix(line, "    ") || strings.HasPrefix(line, "\t") {
+			continue
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+func isMarkdownFence(line string) bool {
+	return strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~")
 }
 
 // applySpec populates CommandResult from a body using the per-command spec.

@@ -185,9 +185,74 @@ func TestParseCommand(t *testing.T) {
 		},
 		{
 			name: "unknown mention",
-			body: "hey schemabot what's up",
+			body: "schemabot what's up",
 			expected: CommandResult{
 				IsMention: true,
+			},
+		},
+		{
+			name:     "inline prose mention ignored",
+			body:     "I onboarded schemabot in this repo.",
+			expected: CommandResult{},
+		},
+		{
+			name:     "schemabot filename ignored",
+			body:     "With `schemabot.yaml` sitting at `files/migrations/`, the app uses declarative schema changes.",
+			expected: CommandResult{},
+		},
+		{
+			name:     "schemabot url ignored",
+			body:     "See https://github.com/block/schemabot for details.",
+			expected: CommandResult{},
+		},
+		{
+			name:     "quoted command ignored",
+			body:     "> schemabot plan -e staging",
+			expected: CommandResult{},
+		},
+		{
+			name: "command after prose on new line",
+			body: "Please run this:\n\nschemabot plan -e staging",
+			expected: CommandResult{
+				Action:      "plan",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "command with markdown indentation",
+			body: "  schemabot plan -e staging",
+			expected: CommandResult{
+				Action:      "plan",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name:     "command in fenced code block ignored",
+			body:     "```sh\nschemabot plan -e staging\n```",
+			expected: CommandResult{},
+		},
+		{
+			name:     "command in tilde fenced code block ignored",
+			body:     "~~~\nschemabot apply -e staging\n~~~",
+			expected: CommandResult{},
+		},
+		{
+			name:     "command in indented code block ignored",
+			body:     "    schemabot plan -e staging",
+			expected: CommandResult{},
+		},
+		{
+			name: "command after fenced example",
+			body: "```sh\nschemabot plan -e staging\n```\n\nschemabot plan -e production",
+			expected: CommandResult{
+				Action:      "plan",
+				Environment: "production",
+				Found:       true,
+				IsMention:   true,
 			},
 		},
 		{

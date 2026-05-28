@@ -293,6 +293,32 @@ func TestWebhookNoMention(t *testing.T) {
 	}
 }
 
+func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	for _, comment := range []string{
+		"With `schemabot.yaml` at `files/migrations/`, the app uses declarative schema changes.",
+		"```sh\nschemabot plan -e staging\n```",
+	} {
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: comment,
+			isPR:    true,
+		}, nil)
+
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+		select {
+		case <-comments:
+			t.Fatal("should not post a comment for prose or examples that mention SchemaBot")
+		default:
+		}
+	}
+}
+
 func TestWebhookEyesReaction(t *testing.T) {
 	h, _, reactions := newTestHandler(t)
 
