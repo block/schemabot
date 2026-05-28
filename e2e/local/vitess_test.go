@@ -1503,26 +1503,52 @@ func TestVitess_Apply_RevertWindow(t *testing.T) {
 	applyID := extractApplyIDFromLog(applyOut)
 	require.NotEmpty(t, applyID, "expected apply ID in output")
 
-	// Poll until we see revert_window (not completed — that means auto-skip fired)
-	var sawRevertWindow bool
-	deadline := time.Now().Add(testutil.PollDeadline)
-	for time.Now().Before(deadline) {
-		resp, err := client.GetProgress(endpoint, applyID)
-		if err == nil {
-			if resp.State == state.Apply.RevertWindow {
-				sawRevertWindow = true
-				break
-			}
-			if resp.State == state.Apply.Completed {
-				break
+	logsContainRevertWindow := func(logs []*client.LogEntry) bool {
+		for _, entry := range logs {
+			if state.IsState(entry.NewState, state.Apply.RevertWindow) {
+				return true
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		return false
 	}
-	require.True(t, sawRevertWindow, "expected revert_window state (revert enabled by default), but apply jumped to completed")
 
-	// Clean up: skip-revert to finalize
-	_, _ = client.CallSkipRevertAPI(endpoint, "staging", applyID)
+	// The e2e config uses a short revert window so the apply can auto-finalize
+	// before a progress poll observes the transient state. Apply logs are the
+	// durable record that the state transition happened.
+	var lastState string
+	var sawLiveRevertWindow bool
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			resp, err := client.GetProgress(endpoint, applyID)
+			if err == nil {
+				lastState = resp.State
+				if state.IsState(resp.State, state.Apply.RevertWindow) {
+					sawLiveRevertWindow = true
+					return true
+				}
+			}
+
+			logs, err := client.GetLogs(endpoint, "", "", applyID, 50)
+			if err != nil {
+				return false
+			}
+			return logsContainRevertWindow(logs)
+		},
+		func() string {
+			return fmt.Sprintf("expected revert_window state transition for apply %s, last progress state: %q", applyID, lastState)
+		},
+	)
+
+	if sawLiveRevertWindow {
+		skipResp, err := client.CallSkipRevertAPI(endpoint, "staging", applyID)
+		if err != nil || !skipResp.Accepted {
+			progress, progressErr := client.GetProgress(endpoint, applyID)
+			require.NoError(t, progressErr, "fetch progress after skip-revert race")
+			require.True(t, state.IsState(progress.State, state.Apply.Completed),
+				"skip-revert should be accepted unless the short revert window already finalized: response=%+v error=%v state=%q",
+				skipResp, err, progress.State)
+		}
+	}
 	waitForApplyState(t, endpoint, applyID, state.Apply.Completed, testutil.PollDeadline)
 }
 

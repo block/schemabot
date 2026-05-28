@@ -120,8 +120,8 @@ start_e2e_env() {
           -d "{\"org\":\"localscale-production\",\"database\":\"testapp-vitess\",\"keyspace\":\"${ks}\",\"vschema\":${vschema}}"
       fi
     done
-    bin/schemabot apply -s examples/vitess/schema -e staging --endpoint "$E2E_SCHEMABOT_URL" -y --allow-unsafe -o log > /dev/null
-    bin/schemabot apply -s examples/vitess/schema -e production --endpoint "$E2E_SCHEMABOT_URL" -y --allow-unsafe -o log > /dev/null
+    bin/schemabot apply -s examples/vitess/schema -e staging --endpoint "$E2E_SCHEMABOT_URL" -y --allow-unsafe --skip-revert -o log > /dev/null
+    bin/schemabot apply -s examples/vitess/schema -e production --endpoint "$E2E_SCHEMABOT_URL" -y --allow-unsafe --skip-revert -o log > /dev/null
   fi
 
   E2E_MANAGED=true
