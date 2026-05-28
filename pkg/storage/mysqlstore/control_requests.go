@@ -23,10 +23,20 @@ func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.A
 		return controlReq, alreadyPending, err
 	}
 
-	// At read committed, two first-time requests can both miss the row before
-	// one insert wins the unique key. Retry once so the loser reads the pending
-	// request and returns an already-requested response.
-	return s.requestPending(ctx, req)
+	slog.DebugContext(ctx, "retrying control request after duplicate insert",
+		"apply_id", req.ApplyID,
+		"operation", req.Operation)
+
+	// requestPending opens its transaction at READ COMMITTED. The unique key on
+	// apply_id + operation is the durable guard when two first-time callers both
+	// observe no row and race to insert. Retry once so the losing insert re-reads
+	// the winning row and returns "already requested"; if the retry also fails,
+	// return that storage error instead of hiding an unexpected conflict.
+	controlReq, alreadyPending, err = s.requestPending(ctx, req)
+	if err != nil {
+		return nil, false, fmt.Errorf("retry control request after duplicate insert for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+	}
+	return controlReq, alreadyPending, nil
 }
 
 func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
