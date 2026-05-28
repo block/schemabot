@@ -357,8 +357,6 @@ func startNotAllowedForState(apply *storage.Apply) error {
 	switch {
 	case state.IsState(apply.State, state.Apply.Pending):
 		return controlConflictf("schema change is pending and no start request is queued")
-	case state.IsState(apply.State, state.Apply.Running):
-		return controlConflictf("schema change is still running; stop it before starting it again")
 	case state.IsState(apply.State, state.Apply.WaitingForCutover):
 		return controlConflictf("schema change is waiting for cutover; use cutover instead of start")
 	case state.IsState(apply.State, state.Apply.CuttingOver):
