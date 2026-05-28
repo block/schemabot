@@ -274,8 +274,8 @@ func vitessResetVSchema(t *testing.T) {
 func vitessRestoreBaseSchema(t *testing.T, _ string) {
 	t.Helper()
 	start := time.Now()
-	// Cancel all pending Vitess online DDL migrations before cleaning up schema.
-	// Without this, a slow migration from a previous test can cause
+	// Cancel all pending Vitess online DDL work before cleaning up schema.
+	// Without this, a slow schema change from a previous test can cause
 	// singleton-context rejection when the next test submits DDL.
 	_, err := localscaleAdminPost(t, "/admin/reset-state", "{}")
 	if err != nil {
@@ -529,10 +529,10 @@ func TestVitess_Plan_UsesSchemaAPIWhenSafeSchemaChangesEnabled(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	// LocalScale has safe_migrations enabled by default, so the engine
+	// LocalScale has the safe schema change flag enabled by default, so the engine
 	// uses the PlanetScale schema API (branch-based diff) for plan instead
 	// of querying vtgate directly.
-	colName := fmt.Sprintf("schema_api_col_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("schema_api_col")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
@@ -569,7 +569,7 @@ func TestVitess_Apply_AddIndex_Sharded(t *testing.T) {
 	clearSchemaBotState(t)
 	defer vitessRestoreBaseSchema(t, "staging")
 
-	indexName := fmt.Sprintf("idx_e2e_%d", time.Now().UnixMilli()%100000)
+	indexName := uniqueSchemaIdentifier("idx_e2e")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/orders.sql": fmt.Sprintf(`CREATE TABLE `+"`orders`"+` (
     `+"`id`"+` bigint unsigned NOT NULL,
@@ -600,7 +600,7 @@ func TestVitess_Apply_AddColumn_Sharded(t *testing.T) {
 
 	defer vitessRestoreBaseSchema(t, "staging")
 
-	colName := fmt.Sprintf("col_e2e_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("col_e2e")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
   `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -631,7 +631,7 @@ func TestVitess_Apply_ConsecutiveApplies(t *testing.T) {
 	defer vitessRestoreBaseSchema(t, "staging")
 
 	// First apply: add a metadata-only column.
-	col1 := fmt.Sprintf("col_c1_%d", time.Now().UnixMilli()%100000)
+	col1 := uniqueSchemaIdentifier("col_c1")
 	schemaDir1 := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(col1),
 	}))
@@ -642,7 +642,7 @@ func TestVitess_Apply_ConsecutiveApplies(t *testing.T) {
 
 	// Second apply immediately after verifies that the previous deploy is fully
 	// finalized before another deploy starts.
-	col2 := fmt.Sprintf("col_c2_%d", time.Now().UnixMilli()%100000)
+	col2 := uniqueSchemaIdentifier("col_c2")
 	schemaDir2 := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumns(col1, col2),
 	}))
@@ -656,7 +656,7 @@ func TestVitess_Apply_ShardProgress(t *testing.T) {
 
 	defer vitessRestoreBaseSchema(t, "staging")
 
-	indexName := fmt.Sprintf("idx_sp_%d", time.Now().UnixMilli()%100000)
+	indexName := uniqueSchemaIdentifier("idx_sp")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/orders.sql": fmt.Sprintf(`CREATE TABLE `+"`orders`"+` (
     `+"`id`"+` bigint unsigned NOT NULL,
@@ -754,7 +754,7 @@ func TestVitess_Apply_LogMode_Lifecycle(t *testing.T) {
 
 	defer vitessRestoreBaseSchema(t, "staging")
 
-	colName := fmt.Sprintf("lm_col_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("lm_col")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
@@ -800,7 +800,7 @@ func TestVitess_Plan_AddIndex(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	indexName := fmt.Sprintf("idx_plan_%d", time.Now().UnixMilli()%100000)
+	indexName := uniqueSchemaIdentifier("idx_plan")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
   `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -825,7 +825,7 @@ func TestVitess_Plan_AddColumn(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	colName := fmt.Sprintf("col_plan_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("col_plan")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
   `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -885,7 +885,7 @@ func TestVitess_Plan_Deduplication(t *testing.T) {
 	// Add an index — this change is the same on both envs since
 	// neither env has this index. Note: earlier tests may have modified
 	// production, so we use an index change that's additive.
-	indexName := fmt.Sprintf("idx_dedup_%d", time.Now().UnixMilli()%100000)
+	indexName := uniqueSchemaIdentifier("idx_dedup")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
   `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -920,7 +920,7 @@ func TestVitess_Plan_DDLOnly_NoVSchemaMetadata(t *testing.T) {
 	endpoint := schemabotURL(t)
 
 	// Add a column — DDL only, no VSchema change
-	colName := fmt.Sprintf("col_novs_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("col_novs")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
@@ -946,7 +946,7 @@ func TestVitess_Apply_BranchValidation(t *testing.T) {
 	clearSchemaBotState(t)
 	defer vitessRestoreBaseSchema(t, "staging")
 
-	colName := fmt.Sprintf("col_val_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("col_val")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
@@ -1120,8 +1120,8 @@ func TestVitess_Apply_VSchemaWithDDL(t *testing.T) {
 	// are not yet detected by the plan differ — this tests that VSchema
 	// is propagated when DDL changes are present.
 	// Uses a nullable column addition (instant DDL) to avoid slow online DDL
-	// that could leave pending migrations interfering with subsequent tests.
-	colName := fmt.Sprintf("vs_col_%d", time.Now().UnixMilli()%100000)
+	// that could leave pending schema changes interfering with subsequent tests.
+	colName := uniqueSchemaIdentifier("vs_col")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 		"testapp_sharded/vschema.json": `{
@@ -1157,7 +1157,7 @@ func TestVitess_Apply_VSchemaTaskTracking(t *testing.T) {
 	defer vitessRestoreBaseSchema(t, "staging")
 
 	endpoint := schemabotURL(t)
-	colName := fmt.Sprintf("vt_col_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("vt_col")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 		"testapp_sharded/vschema.json": `{
@@ -1233,7 +1233,7 @@ func TestVitess_Apply_DropIndex_BlockedWithoutFlag(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 
-	indexName := fmt.Sprintf("idx_drop_%d", time.Now().UnixMilli()%100000)
+	indexName := uniqueSchemaIdentifier("idx_drop")
 	vitessAdminDDLRequire(t, os.Getenv("LOCALSCALE_URL"), "localscale-staging", "testapp_sharded",
 		fmt.Sprintf("ALTER TABLE `users` ADD INDEX `%s` (`full_name`)", indexName))
 	clearSchemaBotState(t)
@@ -1295,7 +1295,7 @@ func TestVitess_Apply_DeployRequestURL(t *testing.T) {
 
 	defer vitessRestoreBaseSchema(t, "staging")
 
-	colName := fmt.Sprintf("dr_col_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("dr_col")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
@@ -1323,7 +1323,7 @@ func TestVitess_Apply_SetupPhases(t *testing.T) {
 
 	defer vitessRestoreBaseSchema(t, "staging")
 
-	colName := fmt.Sprintf("sp_col_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("sp_col")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
@@ -1354,7 +1354,7 @@ func TestVitess_Progress_DeployRequestMetadata(t *testing.T) {
 	defer vitessRestoreBaseSchema(t, "staging")
 
 	endpoint := schemabotURL(t)
-	colName := fmt.Sprintf("pm_col_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("pm_col")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
@@ -1405,7 +1405,7 @@ func TestVitess_Apply_Timestamps(t *testing.T) {
 	// Use ADD INDEX (online DDL) because this test verifies per-table timestamps
 	// that are only populated during the VReplication copy/cutover lifecycle.
 	// Use --skip-revert to save 2s and stay within the 30s poll deadline.
-	indexName := fmt.Sprintf("idx_ts_%d", time.Now().UnixMilli()%100000)
+	indexName := uniqueSchemaIdentifier("idx_ts")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/orders.sql": fmt.Sprintf(`CREATE TABLE `+"`orders`"+` (
     `+"`id`"+` bigint unsigned NOT NULL,
@@ -1471,7 +1471,7 @@ func TestVitess_Apply_RevertWindow(t *testing.T) {
 
 	defer vitessRestoreBaseSchema(t, "staging")
 
-	indexName := fmt.Sprintf("idx_rv_%d", time.Now().UnixMilli()%100000)
+	indexName := uniqueSchemaIdentifier("idx_rv")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/orders.sql": fmt.Sprintf(`CREATE TABLE `+"`orders`"+` (
     `+"`id`"+` bigint unsigned NOT NULL,
@@ -1536,7 +1536,7 @@ func TestVitess_Apply_Cancel(t *testing.T) {
 	endpoint := schemabotURL(t)
 	// Use a non-instant DDL with deferred cutover so the deploy request reaches
 	// a stable actionable state before cancellation.
-	indexName := fmt.Sprintf("idx_cancel_%d", time.Now().UnixMilli()%100000)
+	indexName := uniqueSchemaIdentifier("idx_cancel")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithIndex(indexName),
 	}))
@@ -1625,7 +1625,7 @@ func TestVitess_Apply_DeferDeploy(t *testing.T) {
 	endpoint := schemabotURL(t)
 
 	// Plan via API
-	colName := fmt.Sprintf("defer_col_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("defer_col")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
@@ -1679,7 +1679,7 @@ func TestVitess_Apply_DeferDeploy_StartTooEarly(t *testing.T) {
 
 	endpoint := schemabotURL(t)
 
-	colName := fmt.Sprintf("early_col_%d", time.Now().UnixMilli()%100000)
+	colName := uniqueSchemaIdentifier("early_col")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
@@ -1716,11 +1716,11 @@ func TestVitess_Apply_BranchReuse(t *testing.T) {
 	clearSchemaBotState(t)
 	defer vitessRestoreBaseSchema(t, "staging")
 
-	branchName := fmt.Sprintf("reuse-e2e-%d", time.Now().UnixMilli()%100000)
+	branchName := fmt.Sprintf("reuse-e2e-%d", time.Now().UnixNano())
 	createBranchViaLocalScale(t, branchName)
 
 	// First apply: add a column using --branch
-	col1 := fmt.Sprintf("reuse_col1_%d", time.Now().UnixMilli()%100000)
+	col1 := uniqueSchemaIdentifier("reuse_col1")
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
   `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -1751,7 +1751,7 @@ func TestVitess_Apply_BranchReuse(t *testing.T) {
 
 	// Second apply on the same branch: add another column
 	clearSchemaBotStorage(t)
-	col2 := fmt.Sprintf("reuse_col2_%d", time.Now().UnixMilli()%100000)
+	col2 := uniqueSchemaIdentifier("reuse_col2")
 	schemaDir2 := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
   `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
