@@ -490,6 +490,7 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 				return fmt.Errorf("check stopped gRPC apply %s before start: unmapped remote state %s", apply.ApplyIdentifier, remoteApplyStateDescription(resp.State))
 			}
 			apply.State = remoteState
+			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
 			if isTerminalProtoState(resp.State) && !state.IsState(remoteState, state.Apply.Stopped) {
 				now := time.Now()
 				if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
@@ -924,10 +925,35 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 			return err
 		}
 	}
-	c.logApplyStateTransition(ctx, storedApply, storage.LogLevelInfo, fmt.Sprintf("Remote apply reached terminal state: %s", storedApply.State), oldState)
+	c.logApplyStateTransition(ctx, storedApply, remoteTerminalApplyLogLevel(storedApply), remoteTerminalApplyLogMessage(storedApply), oldState)
 	*remoteApply = *storedApply
 	metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Environment)
 	return nil
+}
+
+func remoteTerminalApplyLogLevel(apply *storage.Apply) string {
+	if apply != nil && state.IsState(apply.State, state.Apply.Failed) {
+		return storage.LogLevelError
+	}
+	return storage.LogLevelInfo
+}
+
+func remoteTerminalApplyLogMessage(apply *storage.Apply) string {
+	message := fmt.Sprintf("Remote apply reached terminal state: %s", apply.State)
+	if state.IsState(apply.State, state.Apply.Failed) && apply.ErrorMessage != "" {
+		return fmt.Sprintf("%s: %s", message, apply.ErrorMessage)
+	}
+	return message
+}
+
+func remoteProgressErrorMessage(applyState, remoteErrorMessage, existingErrorMessage string) string {
+	if state.IsState(applyState, state.Apply.Failed, state.Apply.FailedRetryable) {
+		if remoteErrorMessage == "" {
+			return existingErrorMessage
+		}
+		return remoteErrorMessage
+	}
+	return ""
 }
 
 // syncStoredTasksFromRemoteTasks mirrors the per-task table progress fields
@@ -1167,6 +1193,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					"remote_state", remoteApplyState)
 			}
 			apply.State = newState
+			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
 			apply.UpdatedAt = now
 
 			terminal := isTerminalProtoState(resp.State)

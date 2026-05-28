@@ -347,10 +347,12 @@ type capturingTernServer struct {
 	remoteApplyID    string
 	startApplyID     string
 	progressApplyID  string
+	progressReq      *ternv1.ProgressRequest
 	progressState    ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
 	progressStateSet bool
 	progressStates   []ternv1.State
 	progressTables   []*ternv1.TableProgress
+	progressError    string
 	progressErr      error
 	startCalled      bool // tracks whether Start was actually invoked
 }
@@ -382,6 +384,12 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
+	s.progressReq = &ternv1.ProgressRequest{
+		Database:    req.Database,
+		Type:        req.Type,
+		Environment: req.Environment,
+		ApplyId:     req.ApplyId,
+	}
 	s.progressApplyID = req.ApplyId
 	ps := s.progressState
 	psSet := s.progressStateSet
@@ -391,6 +399,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 		psSet = true
 	}
 	tables := s.progressTables
+	errorMessage := s.progressError
 	err := s.progressErr
 	s.mu.Unlock()
 	if err != nil {
@@ -399,7 +408,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	if !psSet {
 		ps = ternv1.State_STATE_COMPLETED
 	}
-	return &ternv1.ProgressResponse{State: ps, Tables: tables}, nil
+	return &ternv1.ProgressResponse{State: ps, Tables: tables, ErrorMessage: errorMessage}, nil
 }
 
 func (s *capturingTernServer) getStartApplyID() string {
@@ -412,6 +421,20 @@ func (s *capturingTernServer) getProgressApplyID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.progressApplyID
+}
+
+func (s *capturingTernServer) getProgressRequest() *ternv1.ProgressRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.progressReq == nil {
+		return nil
+	}
+	return &ternv1.ProgressRequest{
+		Database:    s.progressReq.Database,
+		Type:        s.progressReq.Type,
+		Environment: s.progressReq.Environment,
+		ApplyId:     s.progressReq.ApplyId,
+	}
 }
 
 func (s *capturingTernServer) getApplyRequest() *ternv1.ApplyRequest {
@@ -620,6 +643,10 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
 	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, req.DdlChanges[0].ChangeType)
 	assert.Equal(t, "remote-dispatched-123", server.getProgressApplyID())
+	progressReq := server.getProgressRequest()
+	require.NotNil(t, progressReq)
+	assert.Equal(t, storage.DatabaseTypeMySQL, progressReq.Type)
+	assert.Equal(t, "staging", progressReq.Environment)
 }
 
 func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
@@ -697,6 +724,79 @@ func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
 	require.NotNil(t, dispatchLog, "dispatch log should be present")
 	assert.Equal(t, state.Apply.Pending, dispatchLog.OldState)
 	assert.Equal(t, state.Apply.Running, dispatchLog.NewState)
+}
+
+func TestGRPCClient_ResumeApplyPersistsRemoteFailureMessage(t *testing.T) {
+	// Remote Tern failures should be copied into control-plane storage and logs
+	// so status and logs explain the failed schema change without data-plane logs.
+	server := &capturingTernServer{
+		remoteApplyID:    "remote-failed-123",
+		progressState:    ternv1.State_STATE_FAILED,
+		progressStateSet: true,
+		progressError:    "failed to connect to target database",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Failed,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              18,
+		ApplyIdentifier: "apply-control-failed",
+		PlanID:          110,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Deployment:      "us-west",
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	task := &storage.Task{
+		ID:             22,
+		TaskIdentifier: "task-failed",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		DDL:            "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:      "alter",
+		Namespace:      "default",
+		State:          state.Task.Pending,
+	}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-remote-failed",
+		}},
+		logs: logs,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	err := client.ResumeApply(ctx, apply)
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Equal(t, "failed to connect to target database", apply.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, task.State)
+	progressReq := server.getProgressRequest()
+	require.NotNil(t, progressReq)
+	assert.Equal(t, storage.DatabaseTypeVitess, progressReq.Type)
+	assert.Equal(t, "staging", progressReq.Environment)
+
+	var terminalLog *storage.ApplyLog
+	for _, log := range logs.logs {
+		if strings.Contains(log.Message, "Remote apply reached terminal state: failed") {
+			terminalLog = log
+			break
+		}
+	}
+	require.NotNil(t, terminalLog, "expected failed terminal state log")
+	assert.Equal(t, storage.LogLevelError, terminalLog.Level)
+	assert.Contains(t, terminalLog.Message, "failed to connect to target database")
 }
 
 func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *testing.T) {

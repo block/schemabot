@@ -1029,6 +1029,34 @@ func TestProgressByApplyIDResolvesExternalIDForRemoteApply(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, resp.State)
 }
 
+func TestProgressByApplyIDIncludesDatabaseType(t *testing.T) {
+	// Remote progress requests include the stored database type so the data plane
+	// can route progress even when an apply ID is the only stable identifier.
+	mock := &mockTernClient{
+		isRemote: true,
+		progressResp: &ternv1.ProgressResponse{
+			State: ternv1.State_STATE_RUNNING,
+		},
+	}
+	apply := activeTestApply("apply-active-remote")
+	apply.DatabaseType = storage.DatabaseTypeVitess
+	apply.ExternalID = "remote-active-remote"
+	svc := newControlTestService(mock, apply)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-active-remote", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, mock.progressReq)
+	assert.Equal(t, "remote-active-remote", mock.progressReq.ApplyId)
+	assert.Equal(t, "testdb", mock.progressReq.Database)
+	assert.Equal(t, storage.DatabaseTypeVitess, mock.progressReq.Type)
+	assert.Equal(t, "staging", mock.progressReq.Environment)
+}
+
 func TestExecuteApplyQueuesLocalApplyForScheduler(t *testing.T) {
 	applies := &capturingApplyStore{}
 	mock := &mockTernClient{}
