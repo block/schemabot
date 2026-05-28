@@ -3,10 +3,13 @@ package testutil
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"testing"
 	"time"
 
 	"github.com/docker/go-connections/nat"
+	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 )
 
@@ -52,6 +55,19 @@ func ContainerConnectionString(ctx context.Context, c interface {
 	return retryContainerOp(ctx, "ConnectionString", func() (string, error) {
 		return c.ConnectionString(ctx, args...)
 	})
+}
+
+// TableExists reports whether tableName exists in schemaName.
+func TableExists(t *testing.T, db *sql.DB, schemaName, tableName string) bool {
+	t.Helper()
+
+	var count int
+	err := db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+		schemaName, tableName,
+	).Scan(&count)
+	require.NoError(t, err)
+	return count > 0
 }
 
 func retryContainerOp(ctx context.Context, opName string, op func() (string, error)) (string, error) {

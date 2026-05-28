@@ -35,10 +35,7 @@ func TestEnsureSchema(t *testing.T) {
 	// Verify tables exist
 	tables := []string{"tasks", "plans", "locks", "checks", "settings", "vitess_apply_data", "vitess_tasks"}
 	for _, table := range tables {
-		var count int
-		err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'schemabot' AND table_name = ?", table).Scan(&count)
-		require.NoError(t, err, "Failed to check table %s", table)
-		assert.Equal(t, 1, count, "Table %s not found", table)
+		assert.True(t, testutil.TableExists(t, db, "schemabot", table), "Table %s not found", table)
 	}
 }
 
@@ -89,21 +86,62 @@ func TestEnsureSchema_CleansStaleSpiritTables(t *testing.T) {
 
 	// Verify all stale tables were dropped.
 	for _, tbl := range staleTables {
-		var count int
-		err := db.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'schemabot' AND table_name = ?", tbl,
-		).Scan(&count)
-		require.NoError(t, err)
-		assert.Equal(t, 0, count, "stale Spirit table %s should have been dropped", tbl)
+		assert.False(t, testutil.TableExists(t, db, "schemabot", tbl),
+			"stale Spirit table %s should have been dropped", tbl)
 	}
 
 	// Verify real tables still exist.
-	var count int
-	err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'schemabot' AND table_name = 'tasks'",
-	).Scan(&count)
+	assert.True(t, testutil.TableExists(t, db, "schemabot", "tasks"),
+		"real tasks table should still exist")
+
+	assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(t, ctx, dsn, db, logger)
+}
+
+func assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(
+	t *testing.T,
+	ctx context.Context,
+	dsn string,
+	db *sql.DB,
+	logger *slog.Logger,
+) {
+	t.Helper()
+	// Simulate pod A actively running EnsureSchema. The lock is the production
+	// coordination mechanism, and the shadow table represents Spirit work that
+	// must not be cleaned up by a second pod before it acquires the lock.
+	lockConn, err := acquireEnsureSchemaLock(ctx, dsn, logger)
 	require.NoError(t, err)
-	assert.Equal(t, 1, count, "real tasks table should still exist")
+	lockReleased := false
+	defer func() {
+		if !lockReleased {
+			utils.CloseAndLog(lockConn)
+		}
+	}()
+
+	const shadowTable = "_tasks_new"
+	_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY)", shadowTable))
+	require.NoError(t, err)
+
+	errs := make(chan error, 1)
+	go func() {
+		errs <- EnsureSchema(dsn, logger)
+	}()
+
+	waitForEnsureSchemaLockWaiter(t, db)
+	assert.True(t, testutil.TableExists(t, db, "schemabot", shadowTable),
+		"Spirit shadow table should not be cleaned while another pod holds the EnsureSchema lock")
+
+	utils.CloseAndLog(lockConn)
+	lockReleased = true
+
+	select {
+	case err := <-errs:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for EnsureSchema to finish after releasing lock")
+	}
+
+	assert.False(t, testutil.TableExists(t, db, "schemabot", shadowTable),
+		"stale Spirit shadow table should be cleaned after EnsureSchema acquires the lock")
 }
 
 func TestEnsureSchema_ConcurrentPods(t *testing.T) {
@@ -129,12 +167,23 @@ func TestEnsureSchema_ConcurrentPods(t *testing.T) {
 	}
 
 	// Verify tables exist after concurrent execution.
+	assert.True(t, testutil.TableExists(t, db, "schemabot", "tasks"),
+		"tasks table should exist after concurrent EnsureSchema")
+}
+
+func waitForEnsureSchemaLockWaiter(t *testing.T, db *sql.DB) {
+	t.Helper()
 	var count int
-	err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'schemabot' AND table_name = 'tasks'",
-	).Scan(&count)
-	require.NoError(t, err)
-	assert.Equal(t, 1, count, "tasks table should exist after concurrent EnsureSchema")
+	require.Eventually(t, func() bool {
+		err := db.QueryRowContext(t.Context(),
+			`SELECT COUNT(*) FROM information_schema.PROCESSLIST
+			 WHERE ID <> CONNECTION_ID()
+			   AND INFO LIKE '%GET_LOCK%'`,
+		).Scan(&count)
+		require.NoError(t, err)
+		return count > 0
+	}, 10*time.Second, 100*time.Millisecond,
+		"expected EnsureSchema to wait for the advisory lock, waiter count: %d", count)
 }
 
 // startEnsureSchemaContainer starts a MySQL container and returns the container, DSN, and DB.

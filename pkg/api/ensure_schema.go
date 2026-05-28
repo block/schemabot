@@ -26,8 +26,9 @@ const EnsureSchemaTimeout = 1 * time.Minute
 // Uses the same differ/Spirit mechanism as LocalClient for consistency.
 //
 // Concurrency-safe across pods: plans first without a lock (read-only diff),
-// and returns immediately if no changes are needed. When changes are detected,
-// acquires a MySQL advisory lock to serialize Spirit execution, then re-plans
+// and returns immediately if no changes are needed and no stale Spirit tables
+// are present. When changes or stale Spirit tables are detected, acquires a
+// MySQL advisory lock to serialize cleanup and Spirit execution, then re-plans
 // under the lock to confirm changes are still needed (another pod may have
 // applied them while we waited for the lock).
 func EnsureSchema(dsn string, logger *slog.Logger) error {
@@ -59,14 +60,6 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 		"files", schemaFileNames(schemaFiles),
 	)
 
-	// Clean up stale Spirit internal tables before planning. These are
-	// leftover from a previous interrupted schema change (e.g., pod killed
-	// mid-apply). Must happen before Plan so the diff sees the actual table
-	// state without stale artifacts like _tablename_new or _tablename_old.
-	if err := cleanStaleSpiritTables(ctx, dsn, logger); err != nil {
-		return fmt.Errorf("clean stale Spirit tables: %w", err)
-	}
-
 	// Use a quiet logger for Spirit — its internal operational messages
 	// (table locks, checksums, metadata lock release) are noise for
 	// EnsureSchema's small bootstrap DDL. SchemaBot logs the actual DDL
@@ -88,28 +81,54 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 		return fmt.Errorf("plan schema: %w", err)
 	}
 	if planResult.NoChanges {
-		logger.Info("storage schema up-to-date")
-		return nil
+		staleTables, err := staleSpiritTableNames(ctx, dsn)
+		if err != nil {
+			return fmt.Errorf("check stale Spirit tables: %w", err)
+		}
+		if len(staleTables) > 0 {
+			logger.Info("stale Spirit tables found with storage schema up-to-date",
+				"tables", staleTables,
+			)
+		} else {
+			logger.Info("storage schema up-to-date")
+			return nil
+		}
+	} else {
+		// Log what the fast-path plan found before acquiring the lock.
+		for _, tc := range planResult.FlatTableChanges() {
+			logger.Info("schema change detected (pre-lock)",
+				"table", tc.Table,
+				"operation", tc.Operation,
+				"ddl", tc.DDL,
+			)
+		}
 	}
 
-	// Log what the fast-path plan found before acquiring the lock.
-	for _, tc := range planResult.FlatTableChanges() {
-		logger.Info("schema change detected (pre-lock)",
-			"table", tc.Table,
-			"operation", tc.Operation,
-			"ddl", tc.DDL,
-		)
+	if planResult.NoChanges {
+		logger.Info("acquiring EnsureSchema advisory lock to clean stale Spirit tables")
+	} else {
+		logger.Info("acquiring EnsureSchema advisory lock to apply storage schema changes")
 	}
 
-	// Changes detected — acquire advisory lock to serialize across pods.
+	// Changes or stale Spirit tables detected — acquire advisory lock to
+	// serialize cleanup and Spirit execution across pods.
 	lockConn, err := acquireEnsureSchemaLock(ctx, dsn, logger)
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
 	defer utils.CloseAndLog(lockConn)
 
+	// Clean up stale Spirit internal tables only while holding the advisory
+	// lock. During a rolling deploy, another pod may be actively applying
+	// SchemaBot storage DDL; cleaning before the lock can delete that pod's
+	// shadow tables and make Spirit cancel with "table definition changed".
+	if err := cleanStaleSpiritTables(ctx, dsn, logger); err != nil {
+		return fmt.Errorf("clean stale Spirit tables: %w", err)
+	}
+
 	// Re-plan under the lock — another pod may have applied the changes
-	// while we were waiting for the lock.
+	// while we were waiting for the lock, or stale Spirit tables may have been
+	// removed above.
 	eng = spirit.New(spirit.Config{Logger: spiritLogger})
 	planResult, err = eng.Plan(ctx, &engine.PlanRequest{
 		Database:    "schemabot",
@@ -120,7 +139,7 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 		return fmt.Errorf("plan schema: %w", err)
 	}
 	if planResult.NoChanges {
-		logger.Info("storage schema up-to-date (applied by another pod)")
+		logger.Info("storage schema up-to-date")
 		return nil
 	}
 
@@ -175,6 +194,34 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 
 	logger.Info("storage schema applied successfully")
 	return nil
+}
+
+func staleSpiritTableNames(ctx context.Context, dsn string) ([]string, error) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	defer utils.CloseAndLog(db)
+
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+
+	// Load all tables here. table.WithoutUnderscoreTables would hide the
+	// Spirit internal tables this path needs to detect.
+	tables, err := table.LoadSchemaFromDB(ctx, db)
+	if err != nil {
+		return nil, fmt.Errorf("load schema: %w", err)
+	}
+
+	var names []string
+	for _, t := range tables {
+		if ddl.IsSpiritInternalTable(t.Name) {
+			names = append(names, t.Name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // readEmbeddedSchemaFiles reads the embedded MySQL schema files into a SchemaFiles map.
@@ -316,7 +363,8 @@ func acquireEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logge
 }
 
 // cleanStaleSpiritTables drops any Spirit internal tables left behind by a
-// previous interrupted schema change on the SchemaBot storage database. These
+// previous interrupted schema change on the SchemaBot storage database. Callers
+// must hold the EnsureSchema advisory lock before invoking this helper. These
 // are temporary tables (_tablename_new, _tablename_old, _tablename_chkpnt,
 // _spirit_sentinel, _spirit_checkpoint) that Spirit normally cleans up after
 // cutover. If a pod is killed mid-apply, they persist until the next startup.
@@ -340,6 +388,8 @@ func cleanStaleSpiritTables(ctx context.Context, dsn string, logger *slog.Logger
 		return fmt.Errorf("ping database: %w", err)
 	}
 
+	// Load all tables here. table.WithoutUnderscoreTables would hide the
+	// Spirit internal tables this cleanup path needs to drop.
 	tables, err := table.LoadSchemaFromDB(ctx, db)
 	if err != nil {
 		return fmt.Errorf("load schema: %w", err)
