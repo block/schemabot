@@ -456,6 +456,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil)
 }
 
+// handleUnlockCommand handles the "schemabot unlock" PR comment command.
 // It finds all locks held by this PR and releases them.
 func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64, requestedBy string) {
 	ctx, cancel := h.commandContext(30 * time.Second)
