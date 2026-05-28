@@ -696,6 +696,38 @@ func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, persisted.State)
 }
 
+func TestApplyStore_FindNextApplyClaimsPendingControlRequestWithoutTasks(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_pending_start_request", 503, state.Apply.Pending, "staging")
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	claimed, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.Pending, claimed.State)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Running, persisted.State)
+
+	claimedAgain, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimedAgain, "claim heartbeat should prevent another worker from immediately taking the same start request")
+}
+
 func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -1070,6 +1102,51 @@ func TestApplyStore_Options(t *testing.T) {
 	assert.True(t, opts.DeferCutover)
 	assert.False(t, opts.SkipRevert)
 	assert.Equal(t, 5, opts.Volume)
+}
+
+func TestApplyStore_UpdateOptions(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_update_options_test",
+		LockID:          lock.ID,
+		PlanID:          801,
+		Database:        "testdb",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "staging",
+		Engine:          "spirit",
+		State:           state.Apply.Stopped,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb"})
+
+	id, err := store.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	retrieved, err := store.Applies().Get(ctx, id)
+	require.NoError(t, err)
+	retrieved.State = state.Apply.Pending
+
+	require.NoError(t, store.Applies().Update(ctx, retrieved))
+
+	updated, err := store.Applies().Get(ctx, id)
+	require.NoError(t, err)
+	updatedOpts := updated.GetOptions()
+	assert.Equal(t, "testdb", updatedOpts.Target)
+
+	partial := *updated
+	partial.Options = nil
+	partial.State = state.Apply.Running
+	require.NoError(t, store.Applies().Update(ctx, &partial))
+
+	preserved, err := store.Applies().Get(ctx, id)
+	require.NoError(t, err)
+	preservedOpts := preserved.GetOptions()
+	assert.Equal(t, "testdb", preservedOpts.Target)
 }
 
 func TestApplyStore_AllFields(t *testing.T) {

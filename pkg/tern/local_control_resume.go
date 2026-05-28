@@ -392,6 +392,24 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 	}
 }
 
+// prepareStoppedTasksForResume turns a scheduler-claimed start request back into
+// runnable task work. The start intent stays pending until stopped task rows are
+// requeued and the apply is ready for execution, so a worker crash can still be
+// recovered by another scheduler worker.
+func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) {
+	if !startRequested {
+		return
+	}
+	for _, task := range tasks {
+		if !state.IsState(task.State, state.Task.Stopped) {
+			continue
+		}
+		task.CompletedAt = nil
+		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier))
+	}
+}
+
 // launchAtomicResume sends all DDLs to the engine in one call, marks tasks and
 // apply as RUNNING, logs the provided message, and then polls for completion.
 // Scheduler-owned calls block so the worker owns the apply until terminal or
@@ -509,7 +527,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		return nil
 	}
 
-	if state.IsState(apply.State, state.Apply.Pending) {
+	if state.IsState(apply.State, state.Apply.Pending) && apply.StartedAt == nil {
 		c.dispatchQueuedApply(ctx, apply, tasks, plan)
 		return ctx.Err()
 	}
@@ -532,6 +550,11 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	}
 
 	activeTasks := rp.ActiveTasks
+	startControlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return err
+	}
+	startRequested := startControlReq != nil
 
 	if len(activeTasks) == 0 {
 		c.logger.Info("all tasks already completed, marking apply as completed",
@@ -543,11 +566,17 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
 		}
+		if startRequested {
+			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+				return err
+			}
+		}
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
 	}
 
 	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
+	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
 
 	options := buildApplyOptions(apply)
 
@@ -571,6 +600,11 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 				fmt.Sprintf("Recovery failed: %v", err), apply.State, state.Apply.Failed)
 			return err
 		}
+		if startRequested {
+			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+				return err
+			}
+		}
 	} else {
 		// Sequential mode: process each task one at a time
 		now := time.Now()
@@ -578,6 +612,11 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+		}
+		if startRequested {
+			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+				return err
+			}
 		}
 
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,

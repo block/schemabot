@@ -504,13 +504,23 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 		}
 	}
 
-	_, err = writeTx.tx.ExecContext(ctx, `
+	optionsUpdate := ""
+	args := []any{
+		apply.State, apply.ErrorMessage, apply.Attempt,
+		apply.ExternalID,
+	}
+	if len(apply.Options) > 0 {
+		optionsUpdate = ", options = ?"
+		args = append(args, string(apply.Options))
+	}
+	args = append(args, apply.StartedAt, apply.CompletedAt, apply.ID)
+
+	_, err = writeTx.tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE applies
 		SET state = ?, error_message = ?, attempt = ?,
-		    external_id = ?, started_at = ?, completed_at = ?, updated_at = NOW()
+		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?
-	`, apply.State, apply.ErrorMessage, apply.Attempt,
-		apply.ExternalID, apply.StartedAt, apply.CompletedAt, apply.ID)
+	`, optionsUpdate), args...)
 	if err != nil {
 		return fmt.Errorf("update apply %d: %w", apply.ID, err)
 	}
@@ -575,11 +585,11 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 // and resumes the apply.
 // Returns the claimed apply, or nil if nothing needs work.
 //
-// Matches queued pending applies with persisted tasks, stale active applies
-// where heartbeat expired > 1 minute, and recently failed_retryable applies
-// that still have retry budget. Apply creation/update enforces one active
-// apply per database/type/environment, so claims only need to lease one row
-// and avoid worker races on that row.
+// Matches queued pending applies with persisted tasks, pending applies with a
+// durable control request, stale active applies where heartbeat expired > 1
+// minute, and recently failed_retryable applies that still have retry budget.
+// Apply creation/update enforces one active apply per database/type/environment,
+// so claims only need to lease one row and avoid worker races on that row.
 func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) {
 	// Read committed keeps concurrent SKIP LOCKED claims from taking next-key
 	// range locks that can serialize workers across otherwise independent targets.
@@ -594,6 +604,9 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 	queryArgs := []any{state.Apply.Pending}
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
+	queryArgs = append(queryArgs,
+		state.Apply.Pending,
+		storage.ControlOperationStart, storage.ControlRequestPending)
 
 	// Apply creation/update enforces at most one active apply per
 	// database/type/environment. The claim query only needs to find stale work;
@@ -602,10 +615,18 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 		SELECT %s
 		FROM applies a
 		WHERE (
-			(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
-			OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
-			OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
-		)
+				(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
+				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
+				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
+				OR (
+					a.state = ?
+					AND EXISTS (
+						SELECT 1
+						FROM apply_control_requests cr
+						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+					)
+				)
+			)
 		ORDER BY a.created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED

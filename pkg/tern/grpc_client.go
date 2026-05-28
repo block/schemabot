@@ -430,10 +430,16 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 		return errors.New(errMsg)
 	}
 
-	if apply.ExternalID != "" && state.IsState(apply.State, state.Apply.Pending) {
+	startControlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return err
+	}
+	startRequested := startControlReq != nil
+
+	if apply.ExternalID != "" && state.IsState(apply.State, state.Apply.Pending) && !startRequested {
 		_, err := c.client.Start(ctx, &ternv1.StartRequest{
-			Environment: apply.Environment,
 			ApplyId:     apply.ExternalID,
+			Environment: apply.Environment,
 		})
 		if err != nil {
 			return fmt.Errorf("start queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
@@ -451,9 +457,9 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 
 	// Check the real state from Tern before deciding what to do. Stored state
 	// may be stale (e.g. storage says "stopped" but Tern already resumed).
-	if state.IsState(apply.State, state.Apply.Stopped) {
+	if state.IsState(apply.State, state.Apply.Stopped) || startRequested {
 		oldState := apply.State
-		startRequested := false
+		remoteStartRequested := false
 		resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
 			ApplyId:     apply.ExternalID,
 			Database:    apply.Database,
@@ -508,8 +514,8 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 		// Only call Start if Tern confirms the apply is actually stopped.
 		if state.IsState(apply.State, state.Apply.Stopped) {
 			_, err := c.client.Start(ctx, &ternv1.StartRequest{
-				Environment: apply.Environment,
 				ApplyId:     apply.ExternalID,
+				Environment: apply.Environment,
 			})
 			if err != nil {
 				return fmt.Errorf("start via gRPC: %w", err)
@@ -519,13 +525,18 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 			if apply.StartedAt == nil {
 				apply.StartedAt = &now
 			}
-			startRequested = true
+			remoteStartRequested = true
 		}
 
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			return fmt.Errorf("update apply state: %w", err)
 		}
 		if startRequested {
+			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+				return err
+			}
+		}
+		if remoteStartRequested {
 			c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by scheduler", oldState)
 		} else if oldState != apply.State {
 			c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply state refreshed before scheduler start: %s -> %s", oldState, apply.State), oldState)
@@ -905,6 +916,9 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	storedApply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, storedApply); err != nil {
 		return fmt.Errorf("update terminal remote gRPC apply %s: %w", storedApply.ApplyIdentifier, err)
+	}
+	if err := completePendingStartControlRequests(ctx, c.storage, storedApply); err != nil {
+		return err
 	}
 	c.logApplyStateTransition(ctx, storedApply, storage.LogLevelInfo, fmt.Sprintf("Remote apply reached terminal state: %s", storedApply.State), oldState)
 	*remoteApply = *storedApply

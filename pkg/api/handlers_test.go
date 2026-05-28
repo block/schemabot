@@ -89,6 +89,7 @@ type mockStorageWithApplyStores struct {
 	tasks     storage.TaskStore
 	locks     storage.LockStore
 	applyLogs storage.ApplyLogStore
+	controls  storage.ControlRequestStore
 }
 
 func (m *mockStorageWithApplyStores) Plans() storage.PlanStore         { return m.plans }
@@ -96,6 +97,9 @@ func (m *mockStorageWithApplyStores) Applies() storage.ApplyStore      { return 
 func (m *mockStorageWithApplyStores) Tasks() storage.TaskStore         { return m.tasks }
 func (m *mockStorageWithApplyStores) Locks() storage.LockStore         { return m.locks }
 func (m *mockStorageWithApplyStores) ApplyLogs() storage.ApplyLogStore { return m.applyLogs }
+func (m *mockStorageWithApplyStores) ControlRequests() storage.ControlRequestStore {
+	return m.controls
+}
 
 type staticPlanStore struct {
 	storage.PlanStore
@@ -156,6 +160,70 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 		return applies[:filter.Limit], nil
 	}
 	return applies, nil
+}
+
+type memoryControlRequestStore struct {
+	storage.ControlRequestStore
+	mu       sync.Mutex
+	nextID   int64
+	requests []*storage.ApplyControlRequest
+}
+
+func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.requests {
+		if existing.ApplyID == req.ApplyID && existing.Operation == req.Operation {
+			if existing.Status == storage.ControlRequestPending {
+				return cloneControlRequest(existing), true, nil
+			}
+			existing.Status = storage.ControlRequestPending
+			existing.RequestedBy = req.RequestedBy
+			existing.ErrorMessage = ""
+			existing.Metadata = append(existing.Metadata[:0], req.Metadata...)
+			existing.CompletedAt = nil
+			return cloneControlRequest(existing), false, nil
+		}
+	}
+	s.nextID++
+	stored := cloneControlRequest(req)
+	stored.ID = s.nextID
+	s.requests = append(s.requests, stored)
+	return cloneControlRequest(stored), false, nil
+}
+
+func (s *memoryControlRequestStore) GetPending(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.requests) - 1; i >= 0; i-- {
+		req := s.requests[i]
+		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
+			return cloneControlRequest(req), nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *memoryControlRequestStore) CompletePending(_ context.Context, applyID int64, operation storage.ControlOperation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, req := range s.requests {
+		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
+			req.Status = storage.ControlRequestCompleted
+		}
+	}
+	return nil
+}
+
+func cloneControlRequest(req *storage.ApplyControlRequest) *storage.ApplyControlRequest {
+	if req == nil {
+		return nil
+	}
+	clone := *req
+	if req.Metadata != nil {
+		clone.Metadata = append([]byte(nil), req.Metadata...)
+	}
+	return &clone
 }
 
 type capturingApplyStore struct {
@@ -479,6 +547,14 @@ func activeTestApply(applyID string) *storage.Apply {
 	}
 }
 
+func stoppedTestApply(applyID string) *storage.Apply {
+	apply := activeTestApply(applyID)
+	apply.State = state.Apply.Stopped
+	startedAt := time.Now().Add(-time.Minute)
+	apply.StartedAt = &startedAt
+	return apply
+}
+
 func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) (*Service, *capturingTaskStore) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	tasks := &capturingTaskStore{}
@@ -491,6 +567,7 @@ func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) 
 		tasks:     tasks,
 		locks:     &emptyLockStore{},
 		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
 	}, testServerConfig(), map[string]tern.Client{
 		"default/staging": client,
 	}, logger), tasks
@@ -503,8 +580,9 @@ func newControlTestService(client tern.Client, apply *storage.Apply) *Service {
 func newControlTestServiceWithTasks(client tern.Client, apply *storage.Apply, tasks []*storage.Task) *Service {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	return New(&mockStorageWithApplyStores{
-		applies: &staticApplyStore{apply: apply},
-		tasks:   &capturingTaskStore{tasks: tasks},
+		applies:  &staticApplyStore{apply: apply},
+		tasks:    &capturingTaskStore{tasks: tasks},
+		controls: &memoryControlRequestStore{},
 	}, testServerConfig(), map[string]tern.Client{
 		"default/staging": client,
 	}, logger)
@@ -1767,14 +1845,16 @@ func TestStopHandler(t *testing.T) {
 }
 
 func TestStartHandler(t *testing.T) {
-	t.Run("passes apply_id to tern client", func(t *testing.T) {
+	t.Run("passes apply_id to tern client for deferred deploy", func(t *testing.T) {
 		mock := &mockTernClient{
 			startResp: &ternv1.StartResponse{
 				Accepted:     true,
 				StartedCount: 3,
 			},
 		}
-		svc := newControlTestService(mock, activeTestApply("apply-xyz789"))
+		apply := activeTestApply("apply-xyz789")
+		apply.State = state.Apply.WaitingForDeploy
+		svc := newControlTestService(mock, apply)
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -1791,24 +1871,255 @@ func TestStartHandler(t *testing.T) {
 		assert.Equal(t, "staging", mock.startReq.Environment)
 	})
 
-	t.Run("rejects deferred deploy before waiting for deploy", func(t *testing.T) {
+	t.Run("queues stopped apply for scheduler by apply_id", func(t *testing.T) {
 		mock := &mockTernClient{}
-		apply := activeTestApply("apply-start-deferred")
-		apply.State = state.Apply.Pending
-		apply.Options = []byte(`{"defer_deploy":true}`)
-		svc := newControlTestService(mock, apply)
+		apply := stoppedTestApply("apply-xyz789")
+		task := &storage.Task{
+			ID:             10,
+			TaskIdentifier: "task-start-xyz789",
+			ApplyID:        apply.ID,
+			State:          state.Task.Stopped,
+		}
+		svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"environment": "staging", "apply_id": "apply-start-deferred"}`
+		body := `{"environment": "staging", "apply_id": "apply-xyz789"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, req)
 
-		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
-		assert.Contains(t, w.Body.String(), "not ready for deploy")
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		assert.Nil(t, mock.startReq, "request path should queue scheduler work without calling Tern start")
+		assert.Equal(t, state.Apply.Pending, apply.State)
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, controlReq)
+		assert.Equal(t, state.Task.Stopped, task.State)
+
+		var resp apitypes.StartResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.True(t, resp.Accepted, "expected accepted=true")
+		assert.Equal(t, int64(1), resp.StartedCount)
+	})
+
+	t.Run("returns already requested for duplicate queued start", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := stoppedTestApply("apply-start-already-requested")
+		task := &storage.Task{
+			ID:             12,
+			TaskIdentifier: "task-start-already-requested",
+			ApplyID:        apply.ID,
+			State:          state.Task.Stopped,
+		}
+		completedTask := &storage.Task{
+			ID:             13,
+			TaskIdentifier: "task-start-already-complete",
+			ApplyID:        apply.ID,
+			State:          state.Task.Completed,
+		}
+		svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task, completedTask})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-start-already-requested"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var firstResp apitypes.StartResponse
+		err := json.NewDecoder(w.Body).Decode(&firstResp)
+		require.NoError(t, err)
+		assert.True(t, firstResp.Accepted)
+		assert.Equal(t, int64(1), firstResp.StartedCount)
+		assert.Equal(t, int64(1), firstResp.SkippedCount)
+
+		retryReq := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		retryReq.Header.Set("Content-Type", "application/json")
+		retryW := httptest.NewRecorder()
+		mux.ServeHTTP(retryW, retryReq)
+
+		assert.Equal(t, http.StatusAccepted, retryW.Code, retryW.Body.String())
+		var resp apitypes.StartResponse
+		err = json.NewDecoder(retryW.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, "already_requested", resp.Status)
+		assert.Equal(t, int64(1), resp.StartedCount)
+		assert.Equal(t, int64(1), resp.SkippedCount)
+
+		apply.State = state.Apply.Running
+		task.State = state.Task.Pending
+		claimedRetryReq := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		claimedRetryReq.Header.Set("Content-Type", "application/json")
+		claimedRetryW := httptest.NewRecorder()
+		mux.ServeHTTP(claimedRetryW, claimedRetryReq)
+
+		assert.Equal(t, http.StatusAccepted, claimedRetryW.Code, claimedRetryW.Body.String())
+		err = json.NewDecoder(claimedRetryW.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, "already_requested", resp.Status)
+		assert.Equal(t, state.Apply.Running, apply.State, "duplicate start must not rewind a scheduler-claimed apply")
+	})
+
+	t.Run("queues stopped tasks when stored apply row is still running", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := activeTestApply("apply-running-stoplag")
+		task := &storage.Task{
+			ID:             11,
+			TaskIdentifier: "task-running-stoplag",
+			ApplyID:        apply.ID,
+			State:          state.Task.Stopped,
+		}
+		svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-running-stoplag"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		assert.Nil(t, mock.startReq, "request path should queue scheduler work without calling Tern start")
+		assert.Equal(t, state.Apply.Pending, apply.State)
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, controlReq)
+		assert.Equal(t, state.Task.Stopped, task.State)
+
+		var resp apitypes.StartResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.True(t, resp.Accepted, "expected accepted=true")
+		assert.Equal(t, int64(1), resp.StartedCount)
+	})
+
+	t.Run("queues remote stopped apply when stored apply row is still running", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			progressResp: &ternv1.ProgressResponse{
+				State: ternv1.State_STATE_STOPPED,
+				Tables: []*ternv1.TableProgress{{
+					TableName: "users",
+					Status:    state.Task.Stopped,
+				}},
+			},
+		}
+		apply := activeTestApply("apply-remote-stoplag")
+		apply.ExternalID = "remote-apply-stoplag"
+		svc := newControlTestServiceWithTasks(mock, apply, nil)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-remote-stoplag"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		assert.Nil(t, mock.startReq, "request path should queue scheduler work without calling Tern start")
+		require.NotNil(t, mock.progressReq)
+		assert.Equal(t, "remote-apply-stoplag", mock.progressReq.ApplyId)
+		assert.Equal(t, state.Apply.Pending, apply.State)
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, controlReq)
+
+		var resp apitypes.StartResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.True(t, resp.Accepted, "expected accepted=true")
+		assert.Equal(t, int64(1), resp.StartedCount)
+	})
+
+	t.Run("returns already requested for remote duplicate after scheduler claim", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			progressResp: &ternv1.ProgressResponse{
+				State: ternv1.State_STATE_STOPPED,
+				Tables: []*ternv1.TableProgress{{
+					TableName: "users",
+					Status:    state.Task.Stopped,
+				}},
+			},
+		}
+		apply := activeTestApply("apply-remote-already-requested")
+		apply.ExternalID = "remote-apply-already-requested"
+		svc := newControlTestServiceWithTasks(mock, apply, nil)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-remote-already-requested"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		apply.State = state.Apply.Running
+		mock.progressReq = nil
+		mock.progressResp = &ternv1.ProgressResponse{State: ternv1.State_STATE_RUNNING}
+		retryReq := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		retryReq.Header.Set("Content-Type", "application/json")
+		retryW := httptest.NewRecorder()
+		mux.ServeHTTP(retryW, retryReq)
+
+		assert.Equal(t, http.StatusAccepted, retryW.Code, retryW.Body.String())
+		var resp apitypes.StartResponse
+		err := json.NewDecoder(retryW.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, "already_requested", resp.Status)
+		assert.Nil(t, mock.progressReq, "duplicate start should not re-check remote state while durable request is pending")
 		assert.Nil(t, mock.startReq)
+		assert.Equal(t, state.Apply.Running, apply.State)
+	})
+
+	t.Run("requires apply_id", func(t *testing.T) {
+		mock := &mockTernClient{}
+		svc := newControlTestService(mock, activeTestApply("apply-active-start"))
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "apply_id is required")
+		assert.Nil(t, mock.startReq)
+	})
+
+	t.Run("deferred deploy rejects start before waiting_for_deploy", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := activeTestApply("apply-defer-pending")
+		apply.State = state.Apply.Pending
+		apply.SetOptions(storage.ApplyOptions{DeferDeploy: true})
+		svc := newControlTestServiceWithTasks(mock, apply, nil)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-defer-pending"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Contains(t, w.Body.String(), "not ready for deploy")
+		assert.Nil(t, mock.startReq, "start should only reach Tern after the apply is waiting for deploy")
 		assert.Equal(t, state.Apply.Pending, apply.State)
 	})
 
@@ -1819,7 +2130,12 @@ func TestStartHandler(t *testing.T) {
 			wantMessage string
 		}{
 			{
-				name:        "pending",
+				name:        "running with no stopped tasks",
+				applyState:  state.Apply.Running,
+				wantMessage: "still running",
+			},
+			{
+				name:        "pending with no pending start request",
 				applyState:  state.Apply.Pending,
 				wantMessage: "no start request is queued",
 			},
@@ -1900,7 +2216,7 @@ func TestStartHandler(t *testing.T) {
 				mock := &mockTernClient{}
 				apply := activeTestApply("apply-start-" + strings.ReplaceAll(tt.applyState, "_", "-"))
 				apply.State = tt.applyState
-				svc := newControlTestService(mock, apply)
+				svc := newControlTestServiceWithTasks(mock, apply, nil)
 				mux := http.NewServeMux()
 				svc.ConfigureRoutes(mux)
 
@@ -1913,25 +2229,9 @@ func TestStartHandler(t *testing.T) {
 				assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
 				assert.Contains(t, w.Body.String(), tt.wantMessage)
 				assert.Nil(t, mock.startReq)
+				assert.Nil(t, mock.progressReq)
 			})
 		}
-	})
-
-	t.Run("requires apply_id", func(t *testing.T) {
-		mock := &mockTernClient{}
-		svc := newControlTestService(mock, activeTestApply("apply-active-start"))
-		mux := http.NewServeMux()
-		svc.ConfigureRoutes(mux)
-
-		body := `{"environment": "staging"}`
-		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
-
-		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-		assert.Contains(t, w.Body.String(), "apply_id is required")
-		assert.Nil(t, mock.startReq)
 	})
 
 	t.Run("missing environment", func(t *testing.T) {

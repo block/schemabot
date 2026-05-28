@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -276,6 +277,19 @@ type StartRequest struct {
 	Caller      string `json:"caller,omitempty"`
 }
 
+type startControlRequestMetadata struct {
+	StartedCount int64 `json:"started_count,omitempty"`
+	// SkippedCount preserves how many task rows were already terminal when the
+	// start was accepted. Duplicate start calls use this metadata so clients see
+	// the same "already complete" count as the original request.
+	SkippedCount int64 `json:"skipped_count,omitempty"`
+}
+
+const (
+	startResponseStatusQueued           = "queued"
+	startResponseStatusAlreadyRequested = "already_requested"
+)
+
 // handleStart handles POST /api/start requests.
 func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	var req StartRequest
@@ -290,31 +304,52 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := client.Start(r.Context(), &ternv1.StartRequest{
-		ApplyId:     applyID,
-		Environment: apply.Environment,
-	})
+	var resp *ternv1.StartResponse
+	var err error
+	responseStatus := ""
+	queuedForScheduler := false
+	switch {
+	case state.IsState(apply.State, state.Apply.WaitingForDeploy):
+		resp, err = client.Start(r.Context(), &ternv1.StartRequest{
+			ApplyId:     applyID,
+			Environment: apply.Environment,
+		})
+	case state.IsState(apply.State, state.Apply.Pending):
+		resp, responseStatus, err = s.startResponseForPendingStartRequest(r.Context(), apply)
+		queuedForScheduler = err == nil && resp.Accepted
+	case storedApplyMayHaveStoppedTasksForStart(apply.State):
+		var foundPendingStart bool
+		if state.IsState(apply.State, state.Apply.Running) {
+			// A scheduler claim moves an accepted start request back to running
+			// before the worker necessarily completes the durable request. Treat
+			// client retries in that window as idempotent duplicates.
+			resp, responseStatus, foundPendingStart, err = s.pendingStartResponseIfPresent(r.Context(), apply)
+			queuedForScheduler = err == nil && foundPendingStart && resp.Accepted
+		}
+		if err == nil && !foundPendingStart && client.IsRemote() && apply.ExternalID != "" {
+			resp, responseStatus, err = s.queueRemoteStoppedApplyForScheduler(r.Context(), client, apply, req.Caller)
+		} else if err == nil && !foundPendingStart {
+			resp, responseStatus, err = s.queueStoppedApplyForScheduler(r.Context(), apply, req.Caller)
+		}
+		queuedForScheduler = queuedForScheduler || (err == nil && resp.Accepted)
+	default:
+		err = startNotAllowedForState(apply)
+	}
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, "error")
+		status := "error"
+		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
+			status = "rejected"
+		}
+		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, status)
 		s.writeControlError(w, "start", apply, err)
 		return
 	}
+
 	metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventStartRequested, "Start requested by user")
-	}
-
-	// For remote (gRPC) clients, update local apply state and restart the
-	// background progress poller. Without this, the local applies.state stays
-	// "stopped" permanently because the old poller exited when it saw the
-	// terminal state.
-	var syncErr string
-	if resp.Accepted && client.IsRemote() {
-		// Mark running before ResumeApply so it doesn't re-issue a Start RPC.
-		apply.State = state.Apply.Running
-		if resumeErr := client.ResumeApply(r.Context(), apply); resumeErr != nil {
-			s.logger.Error("failed to resume apply tracking after start", "apply_id", apply.ApplyIdentifier, "error", resumeErr)
-			syncErr = "schema change was started successfully, but the status and progress endpoints may show stale state until the next recovery cycle"
+		if queuedForScheduler {
+			s.wakeScheduler(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		}
 	}
 
@@ -323,31 +358,262 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		ErrorMessage: resp.ErrorMessage,
 		StartedCount: resp.StartedCount,
 		SkippedCount: resp.SkippedCount,
-	}
-	if syncErr != "" {
-		httpResp.ErrorCode = apitypes.ErrCodeStateSyncFailed
-		httpResp.ErrorMessage = syncErr
+		Status:       responseStatus,
 	}
 
-	s.writeJSON(w, http.StatusOK, httpResp)
+	httpStatus := http.StatusOK
+	if responseStatus == startResponseStatusAlreadyRequested {
+		httpStatus = http.StatusAccepted
+	}
+	s.writeJSON(w, httpStatus, httpResp)
+}
+
+// queueStoppedApplyForScheduler makes a user start request claimable by a
+// scheduler worker. Resuming stopped table work can outlive the HTTP request,
+// so the handler only records intent and wakes the scheduler.
+func (s *Service) queueStoppedApplyForScheduler(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.StartResponse, string, error) {
+	if !storedApplyMayHaveStoppedTasksForStart(apply.State) {
+		return nil, "", startNotAllowedForState(apply)
+	}
+	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	var startedCount int64
+	var skippedCount int64
+	for _, task := range tasks {
+		switch {
+		case state.IsState(task.State, state.Task.Stopped):
+			startedCount++
+		case state.IsTerminalTaskState(task.State):
+			skippedCount++
+		}
+	}
+	if startedCount == 0 {
+		if state.IsState(apply.State, state.Apply.Stopped) {
+			return nil, "", controlConflictf("no stopped tasks for apply %s", apply.ApplyIdentifier)
+		}
+		return nil, "", startNotAllowedForState(apply)
+	}
+	if state.IsState(apply.State, state.Apply.Running) {
+		s.logger.Info("queueing start for stopped tasks while stored apply is still running",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"stopped_count", startedCount,
+			"terminal_count", skippedCount)
+	}
+	return s.persistStartRequestForScheduler(ctx, apply, caller, startedCount, skippedCount)
+}
+
+// queueRemoteStoppedApplyForScheduler validates remote stopped state before
+// recording scheduler work. In gRPC mode, progress can show the data plane as
+// stopped before the control-plane task rows have synced to stopped, so the
+// remote apply state is the start gate.
+func (s *Service) queueRemoteStoppedApplyForScheduler(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*ternv1.StartResponse, string, error) {
+	if !storedApplyMayHaveStoppedTasksForStart(apply.State) {
+		return nil, "", startNotAllowedForState(apply)
+	}
+	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ExternalID,
+		Database:    apply.Database,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("check remote apply %s before start: %w", apply.ApplyIdentifier, err)
+	}
+	remoteState := tern.ProtoStateToStorage(resp.State)
+	if !state.IsState(remoteState, state.Apply.Stopped) {
+		if remoteState == "" {
+			remoteState = resp.State.String()
+		}
+		return nil, "", controlConflictf("schema change is not stopped (remote state: %s, current state: %s)", remoteState, apply.State)
+	}
+	startedCount, skippedCount := remoteStoppedApplyStartCounts(resp.Tables)
+	if startedCount == 0 {
+		startedCount = 1
+	}
+	if state.IsState(apply.State, state.Apply.Running) {
+		s.logger.Info("queueing remote start while stored apply is still running",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"remote_state", remoteState,
+			"stopped_count", startedCount,
+			"terminal_count", skippedCount)
+	}
+	return s.persistStartRequestForScheduler(ctx, apply, caller, startedCount, skippedCount)
+}
+
+func remoteStoppedApplyStartCounts(tables []*ternv1.TableProgress) (int64, int64) {
+	var startedCount int64
+	var skippedCount int64
+	for _, table := range tables {
+		taskState := state.NormalizeTaskStatus(table.Status)
+		switch {
+		case state.IsState(taskState, state.Task.Stopped):
+			startedCount++
+		case state.IsTerminalTaskState(taskState):
+			skippedCount++
+		}
+	}
+	return startedCount, skippedCount
+}
+
+func (s *Service) persistStartRequestForScheduler(ctx context.Context, apply *storage.Apply, caller string, startedCount, skippedCount int64) (*ternv1.StartResponse, string, error) {
+	controlReq, alreadyPending, err := s.createStartControlRequest(ctx, apply, caller, startedCount, skippedCount)
+	if err != nil {
+		return nil, "", err
+	}
+	if alreadyPending {
+		// A duplicate request should not rewind a scheduler-claimed apply from
+		// running back to pending. Only requeue stopped applies, which can happen
+		// if a previous request recorded intent but failed before updating the
+		// apply row.
+		if state.IsState(apply.State, state.Apply.Stopped) {
+			if err := s.queueApplyForSchedulerStart(ctx, apply); err != nil {
+				return nil, "", err
+			}
+		}
+		resp, err := startResponseFromControlRequest(controlReq)
+		if err != nil {
+			return nil, "", err
+		}
+		return resp, startResponseStatusAlreadyRequested, nil
+	}
+
+	if err := s.queueApplyForSchedulerStart(ctx, apply); err != nil {
+		return nil, "", err
+	}
+	return &ternv1.StartResponse{
+		Accepted:     true,
+		StartedCount: startedCount,
+		SkippedCount: skippedCount,
+	}, startResponseStatusQueued, nil
+}
+
+func (s *Service) queueApplyForSchedulerStart(ctx context.Context, apply *storage.Apply) error {
+	apply.State = state.Apply.Pending
+	apply.CompletedAt = nil
+	now := time.Now()
+	if apply.StartedAt == nil {
+		apply.StartedAt = &now
+	}
+	apply.UpdatedAt = now
+	if err := s.storage.Applies().Update(ctx, apply); err != nil {
+		return fmt.Errorf("queue apply %s for scheduler start: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
+func (s *Service) createStartControlRequest(ctx context.Context, apply *storage.Apply, caller string, startedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, false, fmt.Errorf("control request store is not available")
+	}
+	metadata, err := json.Marshal(startControlRequestMetadata{
+		StartedCount: startedCount,
+		SkippedCount: skippedCount,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal start control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	controlReq, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
+		Metadata:    metadata,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("record start control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return controlReq, alreadyPending, nil
+}
+
+func (s *Service) startResponseForPendingStartRequest(ctx context.Context, apply *storage.Apply) (*ternv1.StartResponse, string, error) {
+	resp, responseStatus, found, err := s.pendingStartResponseIfPresent(ctx, apply)
+	if err != nil {
+		return nil, "", err
+	}
+	if !found {
+		return nil, "", startNotAllowedForState(apply)
+	}
+	return resp, responseStatus, nil
+}
+
+func (s *Service) pendingStartResponseIfPresent(ctx context.Context, apply *storage.Apply) (*ternv1.StartResponse, string, bool, error) {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, "", false, fmt.Errorf("control request store is not available")
+	}
+	controlReq, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("load pending start control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if controlReq == nil {
+		return nil, "", false, nil
+	}
+	resp, err := startResponseFromControlRequest(controlReq)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return resp, startResponseStatusAlreadyRequested, true, nil
+}
+
+func startResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (*ternv1.StartResponse, error) {
+	resp := &ternv1.StartResponse{}
+	if controlReq == nil {
+		return resp, nil
+	}
+	var metadata startControlRequestMetadata
+	if len(controlReq.Metadata) > 0 {
+		if err := json.Unmarshal(controlReq.Metadata, &metadata); err != nil {
+			return nil, fmt.Errorf("decode start control request metadata for request %d: %w", controlReq.ID, err)
+		}
+	}
+	resp.StartedCount = metadata.StartedCount
+	resp.SkippedCount = metadata.SkippedCount
+	switch controlReq.Status {
+	case storage.ControlRequestPending, storage.ControlRequestCompleted:
+		resp.Accepted = true
+	case storage.ControlRequestFailed:
+		resp.ErrorMessage = controlReq.ErrorMessage
+	default:
+		resp.ErrorMessage = fmt.Sprintf("start control request has unknown status: %s", controlReq.Status)
+	}
+	return resp, nil
+}
+
+// storedApplyMayHaveStoppedTasksForStart keeps start requests aligned with the
+// durable task rows, not only the derived apply row. Stop persists stopped task
+// rows before the apply row necessarily reflects the derived stopped state, so
+// a user can start after progress shows stopped while the stored apply still
+// says running.
+func storedApplyMayHaveStoppedTasksForStart(storedApplyState string) bool {
+	return state.IsState(storedApplyState, state.Apply.Stopped) ||
+		state.IsState(storedApplyState, state.Apply.Running)
 }
 
 func validateStartRequestState(apply *storage.Apply) error {
-	if apply.GetOptions().DeferDeploy && !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
-		return controlConflictf("schema change is not ready for deploy (current state: %s)", apply.State)
-	}
 	if !isStartRequestAllowedState(apply.State) {
 		return startNotAllowedForState(apply)
+	}
+	if apply.GetOptions().DeferDeploy && !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
+		return controlConflictf("schema change is not ready for deploy (current state: %s)", apply.State)
 	}
 	return nil
 }
 
 // isStartRequestAllowedState is an allowlist for states where /start has a
-// concrete action. New apply states must opt in here before they can reach Tern.
+// concrete action. New apply states must opt in here before they can reach the
+// scheduler or Tern start paths.
 func isStartRequestAllowedState(applyState string) bool {
 	return state.IsState(
 		applyState,
 		state.Apply.WaitingForDeploy,
+		state.Apply.Pending,
 		state.Apply.Running,
 		state.Apply.Stopped,
 	)
@@ -357,6 +623,11 @@ func startNotAllowedForState(apply *storage.Apply) error {
 	switch {
 	case state.IsState(apply.State, state.Apply.Pending):
 		return controlConflictf("schema change is pending and no start request is queued")
+	case state.IsState(apply.State, state.Apply.Running):
+		// Running applies may reach this helper after the handler checks for
+		// stopped task rows. Without stopped task rows, there is no scheduler
+		// start work to queue.
+		return controlConflictf("schema change is still running; stop it before starting it again")
 	case state.IsState(apply.State, state.Apply.WaitingForCutover):
 		return controlConflictf("schema change is waiting for cutover; use cutover instead of start")
 	case state.IsState(apply.State, state.Apply.CuttingOver):

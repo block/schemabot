@@ -348,6 +348,55 @@ func TestK8s_Progress(t *testing.T) {
 	testutil.WaitForState(t, ep, applyID, state.Apply.Completed, testutil.PollDeadline)
 }
 
+// TestK8s_StopStartThroughScheduler verifies that a stopped gRPC apply is
+// resumed through durable control-plane scheduler state. The API accepts the
+// start request before the data plane performs the resume, then the scheduler
+// completes the handoff and the schema change finishes on the target database.
+func TestK8s_StopStartThroughScheduler(t *testing.T) {
+	fixture := startRunningIndexAddApply(t, "k8s_stopstart")
+
+	stopResp, err := client.CallStopAPI(fixture.Endpoint, "staging", fixture.ApplyID)
+	require.NoError(t, err, "stop API call")
+	require.True(t, stopResp.Accepted, "stop not accepted: %s", stopResp.ErrorMessage)
+
+	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Stopped, testutil.PollDeadline)
+
+	startResp, err := client.CallStartAPI(fixture.Endpoint, "staging", fixture.ApplyID)
+	require.NoError(t, err, "start API call")
+	require.True(t, startResp.Accepted, "start not accepted: %s", startResp.ErrorMessage)
+	assert.Equal(t, "queued", startResp.Status)
+
+	waitForControlPlaneStartControlRequestCompleted(t, fixture.ApplyID)
+	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
+	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
+}
+
+func waitForControlPlaneStartControlRequestCompleted(t *testing.T, applyID string) {
+	t.Helper()
+
+	db, err := sql.Open("mysql", testutil.SchemabotDSN(t))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()))
+
+	var status string
+	var lastErr error
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			lastErr = db.QueryRowContext(t.Context(), `
+				SELECT cr.status
+				FROM apply_control_requests cr
+				JOIN applies a ON a.id = cr.apply_id
+				WHERE a.apply_identifier = ? AND cr.operation = ?
+			`, applyID, storage.ControlOperationStart).Scan(&status)
+			return lastErr == nil && status == string(storage.ControlRequestCompleted)
+		},
+		func() string {
+			return fmt.Sprintf("start control request was not completed for %s: status=%q last_err=%v",
+				applyID, status, lastErr)
+		})
+}
+
 // TestK8s_ProgressStableAcrossDataPlaneReplicas verifies that gRPC progress is
 // stable when a data-plane service has multiple pods. Only one pod owns the
 // in-memory Spirit runner, but every pod must be able to answer Progress from

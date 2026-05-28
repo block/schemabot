@@ -250,6 +250,7 @@ type StartResponse struct {
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
 	SkippedCount int64  `json:"skipped_count"`
+	Status       string `json:"status,omitempty"`
 	StartedCount int64  `json:"started_count"`
 }
 
