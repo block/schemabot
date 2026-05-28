@@ -52,6 +52,7 @@ export SCHEMABOT_PORT=0
 export SCHEMABOT_MYSQL_PORT=0
 export STAGING_MYSQL_PORT=0
 export PRODUCTION_MYSQL_PORT=0
+export LOCALSCALE_PORT=0
 
 # E2E environment management
 E2E_MANAGED=false
@@ -86,21 +87,42 @@ start_e2e_env() {
   # Get MySQL ports for DSNs
   MYSQL_SCHEMABOT_PORT=$(docker compose -f "$COMPOSE_FILE" port mysql-schemabot 3306 | cut -d: -f2)
   MYSQL_STAGING_PORT=$(docker compose -f "$COMPOSE_FILE" port mysql-staging 3306 | cut -d: -f2)
+  MYSQL_PRODUCTION_PORT=$(docker compose -f "$COMPOSE_FILE" port mysql-production 3306 | cut -d: -f2)
+  LOCALSCALE_ADDR=$(docker compose -f "$COMPOSE_FILE" port localscale 8080)
 
   export E2E_MYSQL_DSN="root:testpassword@tcp(127.0.0.1:${MYSQL_SCHEMABOT_PORT})/schemabot?parseTime=true"
   export E2E_TESTAPP_STAGING_DSN="root:testpassword@tcp(127.0.0.1:${MYSQL_STAGING_PORT})/testapp?parseTime=true"
+  export E2E_TESTAPP_PRODUCTION_DSN="root:testpassword@tcp(127.0.0.1:${MYSQL_PRODUCTION_PORT})/testapp?parseTime=true"
+  export LOCALSCALE_URL="http://${LOCALSCALE_ADDR}"
 
   echo ""
   echo "Services ready!"
   echo "  SchemaBot: $E2E_SCHEMABOT_URL"
   echo "  SchemaBot MySQL: 127.0.0.1:${MYSQL_SCHEMABOT_PORT}"
   echo "  Staging MySQL: 127.0.0.1:${MYSQL_STAGING_PORT}"
+  echo "  Production MySQL: 127.0.0.1:${MYSQL_PRODUCTION_PORT}"
+  echo "  LocalScale: $LOCALSCALE_URL"
   echo ""
 
   # Apply base schema
   make build > /dev/null 2>&1
   bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint "$E2E_SCHEMABOT_URL" -y --watch=false > /dev/null 2>&1 || true
   bin/schemabot apply -s examples/mysql/schema/testapp -e production --endpoint "$E2E_SCHEMABOT_URL" -y --watch=false > /dev/null 2>&1 || true
+  if [[ "$PACKAGE" == *e2e/local* && "$TEST_NAME" == *Vitess* ]]; then
+    for ks in testapp testapp_sharded; do
+      if [ -f "examples/vitess/schema/${ks}/vschema.json" ]; then
+        vschema=$(tr -d '\n' < "examples/vitess/schema/${ks}/vschema.json")
+        curl -fsS --max-time 10 -o /dev/null -X POST "${LOCALSCALE_URL}/admin/seed-vschema" \
+          -H "Content-Type: application/json" \
+          -d "{\"org\":\"localscale-staging\",\"database\":\"testapp-vitess\",\"keyspace\":\"${ks}\",\"vschema\":${vschema}}"
+        curl -fsS --max-time 10 -o /dev/null -X POST "${LOCALSCALE_URL}/admin/seed-vschema" \
+          -H "Content-Type: application/json" \
+          -d "{\"org\":\"localscale-production\",\"database\":\"testapp-vitess\",\"keyspace\":\"${ks}\",\"vschema\":${vschema}}"
+      fi
+    done
+    bin/schemabot apply -s examples/vitess/schema -e staging --endpoint "$E2E_SCHEMABOT_URL" -y --allow-unsafe --skip-revert -o log > /dev/null
+    bin/schemabot apply -s examples/vitess/schema -e production --endpoint "$E2E_SCHEMABOT_URL" -y --allow-unsafe --skip-revert -o log > /dev/null
+  fi
 
   E2E_MANAGED=true
 }
