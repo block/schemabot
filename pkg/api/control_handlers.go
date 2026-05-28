@@ -318,14 +318,13 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		resp, responseStatus, err = s.startResponseForPendingStartRequest(r.Context(), apply)
 		queuedForScheduler = err == nil && resp.Accepted
 	case storedApplyMayHaveStoppedTasksForStart(apply.State):
+		// A queued or scheduler-claimed start can leave the durable request
+		// pending while the stored apply is stopped or running. Treat retries in
+		// either state as idempotent duplicates instead of revalidating remote
+		// state or recording another request.
 		var foundPendingStart bool
-		if state.IsState(apply.State, state.Apply.Running) {
-			// A scheduler claim moves an accepted start request back to running
-			// before the worker necessarily completes the durable request. Treat
-			// client retries in that window as idempotent duplicates.
-			resp, responseStatus, foundPendingStart, err = s.pendingStartResponseIfPresent(r.Context(), apply)
-			queuedForScheduler = err == nil && foundPendingStart && resp.Accepted
-		}
+		resp, responseStatus, foundPendingStart, err = s.pendingStartResponseIfPresent(r.Context(), apply)
+		queuedForScheduler = err == nil && foundPendingStart && resp.Accepted
 		if err == nil && !foundPendingStart && client.IsRemote() && apply.ExternalID != "" {
 			resp, responseStatus, err = s.queueRemoteStoppedApplyForScheduler(r.Context(), client, apply, req.Caller)
 		} else if err == nil && !foundPendingStart {
@@ -370,7 +369,8 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 
 // queueStoppedApplyForScheduler makes a user start request claimable by a
 // scheduler worker. Resuming stopped table work can outlive the HTTP request,
-// so the handler only records intent and wakes the scheduler.
+// so the handler records intent, normalizes a lagging stored apply row to
+// stopped, and wakes the scheduler.
 func (s *Service) queueStoppedApplyForScheduler(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.StartResponse, string, error) {
 	if !storedApplyMayHaveStoppedTasksForStart(apply.State) {
 		return nil, "", startNotAllowedForState(apply)
@@ -402,6 +402,9 @@ func (s *Service) queueStoppedApplyForScheduler(ctx context.Context, apply *stor
 			"environment", apply.Environment,
 			"stopped_count", startedCount,
 			"terminal_count", skippedCount)
+		if err := s.ensureStoredApplyStoppedForStartClaim(ctx, apply); err != nil {
+			return nil, "", err
+		}
 	}
 	return s.persistStartRequestForScheduler(ctx, apply, caller, startedCount, skippedCount)
 }
@@ -442,8 +445,32 @@ func (s *Service) queueRemoteStoppedApplyForScheduler(ctx context.Context, clien
 			"remote_state", remoteState,
 			"stopped_count", startedCount,
 			"terminal_count", skippedCount)
+		if err := s.ensureStoredApplyStoppedForStartClaim(ctx, apply); err != nil {
+			return nil, "", err
+		}
 	}
 	return s.persistStartRequestForScheduler(ctx, apply, caller, startedCount, skippedCount)
+}
+
+func (s *Service) ensureStoredApplyStoppedForStartClaim(ctx context.Context, apply *storage.Apply) error {
+	if !state.IsState(apply.State, state.Apply.Running) {
+		return nil
+	}
+	applyStore := s.storage.Applies()
+	if applyStore == nil {
+		return fmt.Errorf("apply store is not available")
+	}
+
+	previousApply := *apply
+	now := time.Now()
+	apply.State = state.Apply.Stopped
+	apply.CompletedAt = nil
+	apply.UpdatedAt = now
+	if err := applyStore.Update(ctx, apply); err != nil {
+		*apply = previousApply
+		return fmt.Errorf("mark stored apply %s stopped before scheduler start: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
 }
 
 func remoteStoppedApplyStartCounts(tables []*ternv1.TableProgress) (int64, int64) {

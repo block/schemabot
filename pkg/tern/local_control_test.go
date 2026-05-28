@@ -21,11 +21,23 @@ type controlTestApplyStore struct {
 	apply *storage.Apply
 }
 
+func (s *controlTestApplyStore) Get(_ context.Context, id int64) (*storage.Apply, error) {
+	if s.apply == nil || s.apply.ID != id {
+		return nil, nil
+	}
+	return s.apply, nil
+}
+
 func (s *controlTestApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
 	if s.apply == nil || s.apply.ApplyIdentifier != applyIdentifier {
 		return nil, nil
 	}
 	return s.apply, nil
+}
+
+func (s *controlTestApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	s.apply = apply
+	return nil
 }
 
 type controlTestTaskStore struct {
@@ -39,6 +51,16 @@ func (s *controlTestTaskStore) GetByApplyID(_ context.Context, _ int64) ([]*stor
 
 func (s *controlTestTaskStore) GetByDatabase(_ context.Context, _ string) ([]*storage.Task, error) {
 	return s.tasks, nil
+}
+
+func (s *controlTestTaskStore) Update(_ context.Context, task *storage.Task) error {
+	for i, storedTask := range s.tasks {
+		if storedTask.ID == task.ID || storedTask.TaskIdentifier == task.TaskIdentifier {
+			s.tasks[i] = task
+			return nil
+		}
+	}
+	return storage.ErrTaskNotFound
 }
 
 type controlTestApplyLogStore struct {
@@ -110,6 +132,26 @@ func (e *controlCaptureEngine) Stop(_ context.Context, req *engine.ControlReques
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
+func (e *controlCaptureEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{}, nil
+}
+
+func newMySQLControlTestClient(apply *storage.Apply, tasks []*storage.Task, eng *controlCaptureEngine) *LocalClient {
+	return &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &controlTestStorage{
+			applies:   &controlTestApplyStore{apply: apply},
+			tasks:     &controlTestTaskStore{tasks: tasks},
+			applyLogs: &controlTestApplyLogStore{},
+		},
+		spiritEngine: eng,
+		logger:       slog.Default(),
+	}
+}
+
 func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, vitessData *storage.VitessApplyData, vitessDataErr error, eng *controlCaptureEngine) *LocalClient {
 	return &LocalClient{
 		config: LocalConfig{
@@ -125,6 +167,39 @@ func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, vit
 		planetscaleEngine: eng,
 		logger:            slog.Default(),
 	}
+}
+
+// Local MySQL stop is resumable: stopped task rows and the stored apply row
+// should move to stopped together so a later scheduler-owned start can claim
+// the apply without waiting for stale heartbeat recovery.
+func TestLocalClient_StopMarksMySQLApplyStopped(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop",
+		Database:       "testdb",
+		State:          state.Task.Running,
+	}
+	eng := &controlCaptureEngine{}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.StoppedCount)
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Nil(t, apply.CompletedAt)
+	require.NotNil(t, eng.stopReq, "stop should call the engine")
 }
 
 // PlanetScale cutover must include the durable deploy metadata recorded for the
