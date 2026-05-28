@@ -605,10 +605,18 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	failuresOnly, err := parseStatusFailuresOnly(r)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	filter := storage.RecentAppliesFilter{
 		Limit:       limit + 1,
 		Environment: r.URL.Query().Get("environment"),
+	}
+	if failuresOnly {
+		filter.States = []string{state.Apply.Failed, state.Apply.FailedRetryable}
 	}
 	applies, err := s.storage.Applies().GetRecent(r.Context(), filter)
 	if err != nil {
@@ -623,51 +631,58 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	activeCount := 0
 	for _, apply := range applies {
-		if !state.IsTerminalApplyState(apply.State) {
+		if !failuresOnly && !state.IsTerminalApplyState(apply.State) {
 			activeCount++
 		}
 	}
 
 	resp := &apitypes.StatusResponse{
-		ActiveCount: activeCount,
-		Limit:       limit,
-		MaxLimit:    maxStatusLimit,
-		HasMore:     hasMore,
-		Applies:     make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
+		ActiveCount:  activeCount,
+		Limit:        limit,
+		MaxLimit:     maxStatusLimit,
+		HasMore:      hasMore,
+		FailuresOnly: failuresOnly,
+		Applies:      make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
 	}
 
 	for _, apply := range applies {
-		caller := apply.Caller
-		if caller == "" {
-			caller = "cli"
-			if apply.PullRequest > 0 && apply.Repository != "" {
-				caller = fmt.Sprintf("%s#%d", apply.Repository, apply.PullRequest)
-			}
-		}
-
-		active := &apitypes.ActiveApplyResponse{
-			ApplyID:     apply.ApplyIdentifier,
-			Database:    apply.Database,
-			Environment: apply.Environment,
-			State:       apply.State,
-			Engine:      apply.Engine,
-			Caller:      caller,
-			UpdatedAt:   apply.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
-		}
-		if apply.StartedAt != nil {
-			active.StartedAt = apply.StartedAt.Format("2006-01-02T15:04:05Z07:00")
-		}
-		if apply.CompletedAt != nil {
-			active.CompletedAt = apply.CompletedAt.Format("2006-01-02T15:04:05Z07:00")
-		}
-		opts := storage.ParseApplyOptions(apply.Options)
-		if opts.Volume > 0 {
-			active.Volume = opts.Volume
-		}
-		resp.Applies = append(resp.Applies, active)
+		resp.Applies = append(resp.Applies, activeApplyResponseFromStorage(apply))
 	}
 
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+func activeApplyResponseFromStorage(apply *storage.Apply) *apitypes.ActiveApplyResponse {
+	caller := apply.Caller
+	if caller == "" {
+		caller = "cli"
+		if apply.PullRequest > 0 && apply.Repository != "" {
+			caller = fmt.Sprintf("%s#%d", apply.Repository, apply.PullRequest)
+		}
+	}
+
+	active := &apitypes.ActiveApplyResponse{
+		ApplyID:      apply.ApplyIdentifier,
+		ExternalID:   apply.ExternalID,
+		Database:     apply.Database,
+		Environment:  apply.Environment,
+		State:        apply.State,
+		Engine:       apply.Engine,
+		Caller:       caller,
+		ErrorMessage: apply.ErrorMessage,
+		UpdatedAt:    apply.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+	}
+	if apply.StartedAt != nil {
+		active.StartedAt = apply.StartedAt.Format("2006-01-02T15:04:05Z07:00")
+	}
+	if apply.CompletedAt != nil {
+		active.CompletedAt = apply.CompletedAt.Format("2006-01-02T15:04:05Z07:00")
+	}
+	opts := storage.ParseApplyOptions(apply.Options)
+	if opts.Volume > 0 {
+		active.Volume = opts.Volume
+	}
+	return active
 }
 
 func parseStatusLimit(r *http.Request) (int, error) {
@@ -683,6 +698,18 @@ func parseStatusLimit(r *http.Request) (int, error) {
 		return maxStatusLimit, nil
 	}
 	return limit, nil
+}
+
+func parseStatusFailuresOnly(r *http.Request) (bool, error) {
+	raw := r.URL.Query().Get("failed")
+	if raw == "" {
+		return false, nil
+	}
+	failed, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("failed must be a boolean")
+	}
+	return failed, nil
 }
 
 // progressFromLocalStorage builds a ProgressResponse from local apply + task

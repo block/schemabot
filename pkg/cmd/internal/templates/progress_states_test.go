@@ -84,6 +84,64 @@ func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
 	assert.NotContains(t, output, "Use --limit N to show more.")
 }
 
+func TestWriteStatusListExternalID(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount:    0,
+			Limit:          20,
+			MaxLimit:       1000,
+			HasMore:        false,
+			ShowExternalID: true,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-complete",
+					ExternalID:  "external-123",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "EXTERNAL ID")
+	assert.Contains(t, output, "external-123")
+	assert.Contains(t, output, "apply-complete")
+}
+
+func TestWriteStatusListFailedOnly(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			Limit:        20,
+			MaxLimit:     1000,
+			FailuresOnly: true,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:      "apply-failed",
+					ExternalID:   "external-failed",
+					Database:     "payments",
+					Environment:  "staging",
+					State:        state.Apply.Failed,
+					StartedAt:    "2026-05-28T11:00:00Z",
+					CompletedAt:  "2026-05-28T11:00:03Z",
+					Caller:       "github:alice",
+					ErrorMessage: "failed to apply schema change\nbecause duplicate column name 'status'",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "Recent failed schema changes")
+	assert.Contains(t, output, "apply-failed")
+	assert.Contains(t, output, "payments")
+	assert.Contains(t, output, "github:alice")
+	assert.Contains(t, output, "failed to apply schema change because duplicate column name 'status'")
+	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
+}
+
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 

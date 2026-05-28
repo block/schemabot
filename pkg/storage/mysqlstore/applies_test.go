@@ -477,6 +477,7 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_recent_staging_old", 210, state.Apply.Completed, "staging")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_recent_production", 211, state.Apply.Completed, "production")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_recent_staging_new", 212, state.Apply.Completed, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_recent_staging_failed", 213, state.Apply.Failed, "staging")
 
 	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
 		Limit:       1,
@@ -484,13 +485,22 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
-	assert.Equal(t, "apply_recent_staging_new", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_recent_staging_failed", applies[0].ApplyIdentifier)
 
 	applies, err = store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{Limit: 2})
 	require.NoError(t, err)
 	require.Len(t, applies, 2)
-	assert.Equal(t, "apply_recent_staging_new", applies[0].ApplyIdentifier)
-	assert.Equal(t, "apply_recent_production", applies[1].ApplyIdentifier)
+	assert.Equal(t, "apply_recent_staging_failed", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_recent_staging_new", applies[1].ApplyIdentifier)
+
+	applies, err = store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit:       10,
+		Environment: "staging",
+		States:      []string{state.Apply.Failed, state.Apply.FailedRetryable},
+	})
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, "apply_recent_staging_failed", applies[0].ApplyIdentifier)
 }
 
 func TestApplyStore_Update(t *testing.T) {

@@ -240,6 +240,7 @@ type ApplyStore interface {
 type RecentAppliesFilter struct {
 	Limit       int
 	Environment string
+	States      []string
 }
 
 // RetryableExpirationReason identifies why scheduler retry recovery stopped.

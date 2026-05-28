@@ -29,6 +29,7 @@ CREATE TABLE `applies` (
   KEY `idx_repo_pr` (`repository`,`pull_request`),
   KEY `idx_created_id` (`created_at`,`id`),
   KEY `idx_environment_created_id` (`environment`,`created_at`,`id`),
-  KEY `idx_completed_at_state` (`completed_at`,`state`),
-  KEY `idx_state` (`state`)
+  KEY `idx_state_created_id` (`state`,`created_at`,`id`),
+  KEY `idx_environment_state_created_id` (`environment`,`state`,`created_at`,`id`),
+  KEY `idx_completed_at_state` (`completed_at`,`state`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

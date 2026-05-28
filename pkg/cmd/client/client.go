@@ -480,6 +480,7 @@ var (
 type StatusOptions struct {
 	Limit       int
 	Environment string
+	Failed      bool
 }
 
 // GetStatus fetches recent schema changes.
@@ -493,6 +494,9 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		}
 		if opts[0].Environment != "" {
 			values.Set("environment", opts[0].Environment)
+		}
+		if opts[0].Failed {
+			values.Set("failed", "true")
 		}
 		if encoded := values.Encode(); encoded != "" {
 			requestPath += "?" + encoded

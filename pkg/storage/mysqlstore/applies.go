@@ -545,9 +545,17 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 		FROM applies
 	`
 	var args []any
+	var where []string
 	if filter.Environment != "" {
-		query += " WHERE environment = ?"
+		where = append(where, "environment = ?")
 		args = append(args, filter.Environment)
+	}
+	if len(filter.States) > 0 {
+		where = append(where, fmt.Sprintf("state IN (%s)", placeholders(len(filter.States))))
+		args = append(args, stringArgs(filter.States)...)
+	}
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
 	}
 	query += " ORDER BY created_at DESC, id DESC LIMIT ?"
 	args = append(args, filter.Limit)

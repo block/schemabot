@@ -335,23 +335,26 @@ type DatabaseHistoryResponse struct {
 
 // ActiveApplyResponse represents a schema change in the status list.
 type ActiveApplyResponse struct {
-	ApplyID     string `json:"apply_id"`
-	Database    string `json:"database"`
-	Environment string `json:"environment"`
-	State       string `json:"state"`
-	Engine      string `json:"engine"`
-	Caller      string `json:"caller"`
-	StartedAt   string `json:"started_at,omitempty"`
-	CompletedAt string `json:"completed_at,omitempty"`
-	UpdatedAt   string `json:"updated_at"`
-	Volume      int    `json:"volume,omitempty"`
+	ApplyID      string `json:"apply_id"`
+	ExternalID   string `json:"external_id,omitempty"`
+	Database     string `json:"database"`
+	Environment  string `json:"environment"`
+	State        string `json:"state"`
+	Engine       string `json:"engine"`
+	Caller       string `json:"caller"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	StartedAt    string `json:"started_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
+	UpdatedAt    string `json:"updated_at"`
+	Volume       int    `json:"volume,omitempty"`
 }
 
 // StatusResponse is the HTTP response for GET /api/status.
 type StatusResponse struct {
-	ActiveCount int                    `json:"active_count"`
-	Limit       int                    `json:"limit,omitempty"`
-	MaxLimit    int                    `json:"max_limit,omitempty"`
-	HasMore     bool                   `json:"has_more,omitempty"`
-	Applies     []*ActiveApplyResponse `json:"applies"`
+	ActiveCount  int                    `json:"active_count"`
+	Limit        int                    `json:"limit,omitempty"`
+	MaxLimit     int                    `json:"max_limit,omitempty"`
+	HasMore      bool                   `json:"has_more,omitempty"`
+	FailuresOnly bool                   `json:"failures_only,omitempty"`
+	Applies      []*ActiveApplyResponse `json:"applies"`
 }
