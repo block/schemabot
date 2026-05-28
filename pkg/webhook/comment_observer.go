@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -34,6 +35,10 @@ type CommentObserver struct {
 	// Used by the webhook handler to update check runs on terminal state.
 	// Optional — nil means no hook.
 	OnTerminalHook func(apply *storage.Apply)
+
+	// clock is the time source used for adaptive rate-limit math. Defaults
+	// to clock.Real{} in NewCommentObserver; tests may inject clock.Fake.
+	clock clock.Clock
 
 	mu                sync.Mutex
 	lastProgressPost  time.Time
@@ -67,6 +72,11 @@ type CommentObserverConfig struct {
 	// OnTerminalHook is called after the summary comment is posted.
 	// Used to update check runs on terminal state.
 	OnTerminalHook func(apply *storage.Apply)
+
+	// Clock is the time source for adaptive rate-limit math. Optional —
+	// nil defaults to clock.Real{}. Tests inject clock.Fake to make the
+	// stagnant / active transition observable without sleeping.
+	Clock clock.Clock
 }
 
 // SetApplyID sets the apply ID after the apply record is created.
@@ -77,6 +87,10 @@ func (o *CommentObserver) SetApplyID(id int64) {
 
 // NewCommentObserver creates a new CommentObserver for posting PR comments.
 func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
+	clk := cfg.Clock
+	if clk == nil {
+		clk = clock.Real{}
+	}
 	return &CommentObserver{
 		ghClient:       cfg.GHClient,
 		stor:           cfg.Storage,
@@ -87,6 +101,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		deferCutover:   cfg.DeferCutover,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
+		clock:          clk,
 	}
 }
 
@@ -97,7 +112,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	now := time.Now()
+	now := o.clock.Now()
 	currentState := apply.State
 
 	// Check if a cutover comment was posted by an external handler.

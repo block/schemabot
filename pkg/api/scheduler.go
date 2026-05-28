@@ -176,7 +176,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		return
 	}
 
-	start := time.Now()
+	start := s.clock.Now()
 	s.logger.Info("scheduler: claimed apply",
 		"worker", workerID,
 		"apply_id", apply.ApplyIdentifier,
@@ -243,7 +243,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		return
 	}
 
-	duration := time.Since(start)
+	duration := s.clock.Now().Sub(start)
 	s.logger.Info("scheduler: resumed apply",
 		"worker", workerID,
 		"apply_id", apply.ApplyIdentifier,
