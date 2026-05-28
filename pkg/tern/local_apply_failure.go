@@ -47,10 +47,6 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 // markApplyRetryableWithTasks pauses an apply after a retryable engine failure.
 // Non-terminal tasks move to failed_retryable so scheduler recovery can decide
 // which work to re-dispatch on the next attempt.
-
-// markApplyRetryableWithTasks pauses an apply after a retryable engine failure.
-// Non-terminal tasks move to failed_retryable so scheduler recovery can decide
-// which work to re-dispatch on the next attempt.
 func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
@@ -84,7 +80,3 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 		obs.OnProgress(apply, tasks)
 	}
 }
-
-// finalizeSequentialApply updates the apply state based on sequential task outcomes.
-// Permanent failures cancel remaining pending tasks; retryable failures leave
-// pending tasks queued for scheduler recovery.

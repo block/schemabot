@@ -93,9 +93,6 @@ const (
 
 // checkTaskReady verifies a task is ready to execute by checking context cancellation
 // and re-fetching the task's current state from storage.
-
-// checkTaskReady verifies a task is ready to execute by checking context cancellation
-// and re-fetching the task's current state from storage.
 func (c *LocalClient) checkTaskReady(ctx context.Context, task *storage.Task) taskAction {
 	if ctx.Err() != nil {
 		c.logger.Info("apply context cancelled, stopping sequential loop",
@@ -122,9 +119,6 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, task *storage.Task) ta
 	}
 	return taskContinue
 }
-
-// runEngineTask calls the engine for a single DDL, marks the task running, and polls to completion.
-// Returns the outcome: taskContinue (completed), taskFailed, or taskStopped.
 
 // runEngineTask calls the engine for a single DDL, marks the task running, and polls to completion.
 // Returns the outcome: taskContinue (completed), taskFailed, or taskStopped.
@@ -204,10 +198,6 @@ type atomicPollState struct {
 	// engine is unreachable (e.g., branch deleted mid-apply).
 	consecutiveErrors int
 }
-
-// startApplyHeartbeat starts a background goroutine that heartbeats the apply
-// every 10 seconds, preventing the scheduler from treating it as crashed.
-// Returns a cancel function that stops the heartbeat. Must be deferred by the caller.
 
 // startApplyHeartbeat starts a background goroutine that heartbeats the apply
 // every 10 seconds, preventing the scheduler from treating it as crashed.
@@ -327,16 +317,12 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Ta
 }
 
 // markTaskFailed sets a task to FAILED state with the given error message and persists it.
-
-// markTaskFailed sets a task to FAILED state with the given error message and persists it.
 func (c *LocalClient) markTaskFailed(ctx context.Context, task *storage.Task, errMsg string) {
 	now := time.Now()
 	task.ErrorMessage = errMsg
 	task.CompletedAt = &now
 	c.transitionTaskState(ctx, task, 0, state.Task.Failed, "")
 }
-
-// markTaskRetryable records a task failure that scheduler recovery may retry.
 
 // markTaskRetryable records a task failure that scheduler recovery may retry.
 func (c *LocalClient) markTaskRetryable(ctx context.Context, task *storage.Task, errMsg string) {
@@ -397,12 +383,3 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		c.clearObserver(apply.ID)
 	}
 }
-
-// deriveOverallState determines the overall state from a list of tasks.
-// Priority order:
-// 1. RUNNING/WAITING_FOR_CUTOVER/CUTTING_OVER - active work in progress
-// 2. FAILED - at least one task failed (CANCELLED tasks also indicate failure)
-// 3. FAILED_RETRYABLE - scheduler recovery may retry failed task work
-// 4. PENDING - more work queued
-// 5. STOPPED - apply was stopped (even if some tasks completed)
-// 6. COMPLETED - all tasks completed successfully

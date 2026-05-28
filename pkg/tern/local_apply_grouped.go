@@ -233,9 +233,6 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 
 // handleAtomicProgressTick processes a single progress poll tick in atomic mode.
 // Returns true when the apply has reached a terminal state.
-
-// handleAtomicProgressTick processes a single progress poll tick in atomic mode.
-// Returns true when the apply has reached a terminal state.
 func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState) bool {
 	result, err := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    apply.Database,
@@ -460,9 +457,6 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 // markRevertSkipped sets RevertSkippedAt on the VitessApplyData record so
 // progress consumers know finalization is in progress.
-
-// markRevertSkipped sets RevertSkippedAt on the VitessApplyData record so
-// progress consumers know finalization is in progress.
 func (c *LocalClient) markRevertSkipped(ctx context.Context, apply *storage.Apply) {
 	now := time.Now()
 	if vad, err := c.storage.VitessApplyData().GetByApplyID(ctx, apply.ID); err == nil {
@@ -475,9 +469,6 @@ func (c *LocalClient) markRevertSkipped(ctx context.Context, apply *storage.Appl
 
 // revertWindowDuration returns the configured revert window duration,
 // falling back to PlanetScale's default of 30 minutes.
-
-// revertWindowDuration returns the configured revert window duration,
-// falling back to PlanetScale's default of 30 minutes.
 func (c *LocalClient) revertWindowDuration() time.Duration {
 	if s := c.config.Metadata["revert_window_duration"]; s != "" {
 		if d, err := time.ParseDuration(s); err == nil && d > 0 {
@@ -486,10 +477,6 @@ func (c *LocalClient) revertWindowDuration() time.Duration {
 	}
 	return defaultRevertWindowDuration
 }
-
-// revertWindowDeadline computes when the revert window expires.
-// Uses deployed_at from engine metadata (accurate to PlanetScale's clock) plus
-// the configured revert period. Falls back to stateEnteredAt if metadata is unavailable.
 
 // revertWindowDeadline computes when the revert window expires.
 // Uses deployed_at from engine metadata (accurate to PlanetScale's clock) plus
@@ -506,8 +493,6 @@ func (c *LocalClient) revertWindowDeadline(resumeState *engine.ResumeState, stat
 	}
 	return time.Time{}
 }
-
-// logAtomicProgress logs per-table progress to apply_logs every 10 seconds.
 
 // logAtomicProgress logs per-table progress to apply_logs every 10 seconds.
 func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Apply, result *engine.ProgressResult, ps *atomicPollState, now time.Time) {
@@ -530,8 +515,6 @@ func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Appl
 	}
 	ps.lastProgressLog = now
 }
-
-// syncAtomicTaskProgress updates all tasks with engine state and per-table progress.
 
 // syncAtomicTaskProgress updates all tasks with engine state and per-table progress.
 func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) {
@@ -600,11 +583,6 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 // the engine progress result. VSchema tasks have no per-migration rows in
 // SHOW VITESS_MIGRATIONS — their state tracks the deploy request's VSchema
 // application phase (in_progress_vschema).
-
-// deriveVSchemaTaskState determines the state for a VSchema task based on
-// the engine progress result. VSchema tasks have no per-migration rows in
-// SHOW VITESS_MIGRATIONS — their state tracks the deploy request's VSchema
-// application phase (in_progress_vschema).
 func (c *LocalClient) deriveVSchemaTaskState(task *storage.Task, result *engine.ProgressResult, taskState string, now time.Time) string {
 	if state.IsTerminalTaskState(task.State) {
 		return task.State
@@ -640,5 +618,3 @@ func (c *LocalClient) deriveVSchemaTaskState(task *storage.Task, result *engine.
 		return task.State
 	}
 }
-
-// pollTaskToCompletion polls a single task to completion (sequential mode).

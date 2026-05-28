@@ -45,10 +45,6 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 // findBlockingTask checks if any non-terminal task for this database is truly active.
 // Returns the blocking task's identifier, or "" if no conflict exists.
 // As a side effect, resolves stale tasks by checking engine state.
-
-// findBlockingTask checks if any non-terminal task for this database is truly active.
-// Returns the blocking task's identifier, or "" if no conflict exists.
-// As a side effect, resolves stale tasks by checking engine state.
 func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan) string {
 	for _, t := range tasks {
 		c.logger.Debug("conflict check: checking task", "task_id", t.TaskIdentifier, "state", t.State, "is_terminal", state.IsTerminalTaskState(t.State))
@@ -66,10 +62,6 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 	}
 	return ""
 }
-
-// tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
-// If the engine reports terminal or "no active schema change", the task is updated in storage.
-// Returns true if the task was resolved (no longer blocking).
 
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
 // If the engine reports terminal or "no active schema change", the task is updated in storage.
@@ -120,8 +112,6 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 }
 
 // logApplyEvent appends a log entry for an apply operation.
-
-// logApplyEvent appends a log entry for an apply operation.
 func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *int64, level, eventType, source, message string, oldState, newState string) {
 	log := &storage.ApplyLog{
 		ApplyID:   applyID,
@@ -138,10 +128,6 @@ func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *
 		c.logger.Warn("failed to log apply event", "error", err, "event", eventType, "message", message)
 	}
 }
-
-// setupSpiritLogging wires up Spirit's log callback to route engine logs to the apply_logs table.
-// Builds a table-name-to-task lookup so each log line is attributed to the correct task.
-// Returns a cleanup function that must be deferred.
 
 // setupSpiritLogging wires up Spirit's log callback to route engine logs to the apply_logs table.
 // Builds a table-name-to-task lookup so each log line is attributed to the correct task.
@@ -185,9 +171,6 @@ func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.App
 
 // transitionTaskState updates a task's state, persists it, and optionally logs a state transition.
 // Fields like CompletedAt, StartedAt, ErrorMessage, or progress must be set on the task BEFORE calling this.
-
-// transitionTaskState updates a task's state, persists it, and optionally logs a state transition.
-// Fields like CompletedAt, StartedAt, ErrorMessage, or progress must be set on the task BEFORE calling this.
 func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) {
 	oldState := task.State
 	task.State = newState
@@ -201,10 +184,6 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 			logMsg, oldState, newState)
 	}
 }
-
-// markTasksRunning sets DDL tasks to running state with a start timestamp.
-// VSchema tasks are skipped — their state is driven by the deploy request
-// lifecycle (deriveVSchemaTaskState), not by apply start.
 
 // markTasksRunning sets DDL tasks to running state with a start timestamp.
 // VSchema tasks are skipped — their state is driven by the deploy request
@@ -223,9 +202,6 @@ func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Tas
 		}
 	}
 }
-
-// runWithRecovery wraps an apply function with panic recovery so a single panic
-// doesn't crash the entire process. On panic, all tasks and the apply are marked failed.
 
 // runWithRecovery wraps an apply function with panic recovery so a single panic
 // doesn't crash the entire process. On panic, all tasks and the apply are marked failed.
@@ -381,17 +357,9 @@ func deriveOverallState(tasks []*storage.Task) string {
 
 // deriveApplyPhase returns the apply state transition from an engine event.
 // Returns empty string if the event is informational (no state transition).
-
-// deriveApplyPhase returns the apply state transition from an engine event.
-// Returns empty string if the event is informational (no state transition).
 func deriveApplyPhase(event engine.ApplyEvent) string {
 	return event.NewState
 }
-
-// applyEventStateTransition updates an apply's state based on an engine event.
-// Skips the write if the state hasn't changed. On DB write failure, rolls back
-// the in-memory state so the next event with the same NewState retries.
-// Returns the new state if a transition occurred, or empty string if skipped.
 
 // applyEventStateTransition updates an apply's state based on an engine event.
 // Skips the write if the state hasn't changed. On DB write failure, rolls back
@@ -412,10 +380,6 @@ func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, up
 	}
 	return newState
 }
-
-// planNamespacesToChanges converts stored plan namespace data to engine schema
-// changes for the Apply call. VSchema metadata is only set when the plan
-// stored a VSchema diff (i.e., the Plan detected a real change).
 
 // planNamespacesToChanges converts stored plan namespace data to engine schema
 // changes for the Apply call. VSchema metadata is only set when the plan
