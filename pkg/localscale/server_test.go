@@ -100,6 +100,22 @@ func TestDeriveDeployState_InstantDDLRequestedControlsRevertWindow(t *testing.T)
 	require.Equal(t, dr.Complete, deriveDeployState(migrations, true, true))
 }
 
+func TestNeedsCompleteCommandUsesProgressWhenReadyFlagLags(t *testing.T) {
+	require.True(t, needsCompleteCommand(migrationInfo{
+		status:   state.Vitess.Running,
+		progress: 100,
+	}))
+	require.True(t, needsCompleteCommand(migrationInfo{
+		status:          state.Vitess.Running,
+		readyToComplete: true,
+		progress:        50,
+	}))
+	require.False(t, needsCompleteCommand(migrationInfo{
+		status:   state.Vitess.Complete,
+		progress: 100,
+	}))
+}
+
 func TestQualifyAlterTableName(t *testing.T) {
 	tests := []struct {
 		name   string

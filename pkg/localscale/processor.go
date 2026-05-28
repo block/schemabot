@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/block/schemabot/pkg/state"
@@ -167,13 +168,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			// alterVitessMigrations issues per-UUID commands, so already-completed
 			// migrations are safely ignored by Vitess.
 			if cutoverRequested {
-				hasWaiting := false
-				for _, m := range migrations {
-					if m.readyToComplete && m.status != state.Vitess.Complete {
-						hasWaiting = true
-						break
-					}
-				}
+				hasWaiting := slices.ContainsFunc(migrations, needsCompleteCommand)
 				if hasWaiting {
 					if err := s.alterVitessMigrations(ctx, backend, r.migrationContext, "COMPLETE"); err != nil {
 						s.logger.Error("processor: COMPLETE migrations failed", "number", r.number, "error", err)
@@ -324,8 +319,18 @@ func (s *Server) updateDeployState(ctx context.Context, ref deployRequest, newSt
 type migrationInfo struct {
 	status          string
 	readyToComplete bool
+	progress        int
 	ddlAction       string // "create", "alter", "drop"
 	message         string
+}
+
+func needsCompleteCommand(m migrationInfo) bool {
+	switch m.status {
+	case state.Vitess.Complete, state.Vitess.Failed, state.Vitess.Cancelled:
+		return false
+	default:
+		return m.readyToComplete || m.progress >= 100
+	}
 }
 
 // deriveDeployState maps a set of Vitess migration statuses to a single PlanetScale

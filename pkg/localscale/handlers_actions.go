@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/block/spirit/pkg/utils"
 	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
@@ -484,9 +485,14 @@ func (s *Server) getMigrationInfos(ctx context.Context, backend *databaseBackend
 	}
 	var migrations []migrationInfo
 	for _, colMap := range colMaps {
+		progress, err := strconv.Atoi(colMap["progress"])
+		if err != nil && colMap["progress"] != "" {
+			s.logger.Debug("parse vitess migration progress", "migration_context", migrationContext, "value", colMap["progress"], "error", err)
+		}
 		migrations = append(migrations, migrationInfo{
 			status:          colMap["migration_status"],
 			readyToComplete: colMap["ready_to_complete"] == "1",
+			progress:        progress,
 			ddlAction:       colMap["ddl_action"],
 			message:         colMap["message"],
 		})
