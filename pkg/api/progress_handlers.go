@@ -631,6 +631,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	resp := &apitypes.StatusResponse{
 		ActiveCount: activeCount,
 		Limit:       limit,
+		MaxLimit:    maxStatusLimit,
 		HasMore:     hasMore,
 		Applies:     make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
 	}

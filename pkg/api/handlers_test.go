@@ -1119,6 +1119,7 @@ func TestHandleStatusLimitAndEnvironment(t *testing.T) {
 	assert.Equal(t, 3, applies.filter.Limit, "server should request one extra row to detect truncation")
 	assert.Equal(t, "staging", applies.filter.Environment)
 	assert.Equal(t, 2, resp.Limit)
+	assert.Equal(t, maxStatusLimit, resp.MaxLimit)
 	assert.True(t, resp.HasMore)
 	assert.Equal(t, 1, resp.ActiveCount)
 	require.Len(t, resp.Applies, 2)

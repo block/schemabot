@@ -708,6 +708,7 @@ type ActiveApplyData struct {
 type StatusListData struct {
 	ActiveCount int
 	Limit       int
+	MaxLimit    int
 	HasMore     bool
 	Applies     []ActiveApplyData
 }
@@ -781,7 +782,11 @@ func WriteStatusList(data StatusListData) {
 
 	fmt.Println()
 	if data.HasMore && data.Limit > 0 {
-		fmt.Printf("%sShowing the %d most recent schema changes. Use --limit N to show more.%s\n", ANSIDim, data.Limit, ANSIReset)
+		if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
+			fmt.Printf("%sShowing the %d most recent schema changes. This server caps status history at %d.%s\n", ANSIDim, data.Limit, data.MaxLimit, ANSIReset)
+		} else {
+			fmt.Printf("%sShowing the %d most recent schema changes. Use --limit N to show more.%s\n", ANSIDim, data.Limit, ANSIReset)
+		}
 	}
 	fmt.Printf("%sUse 'schemabot status <apply_id>' to view details%s\n", ANSIDim, ANSIReset)
 }

@@ -351,6 +351,7 @@ type ActiveApplyResponse struct {
 type StatusResponse struct {
 	ActiveCount int                    `json:"active_count"`
 	Limit       int                    `json:"limit,omitempty"`
+	MaxLimit    int                    `json:"max_limit,omitempty"`
 	HasMore     bool                   `json:"has_more,omitempty"`
 	Applies     []*ActiveApplyResponse `json:"applies"`
 }

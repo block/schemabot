@@ -37,6 +37,7 @@ func TestWriteStatusListHasMoreFooter(t *testing.T) {
 		WriteStatusList(StatusListData{
 			ActiveCount: 0,
 			Limit:       20,
+			MaxLimit:    1000,
 			HasMore:     true,
 			Applies: []ActiveApplyData{
 				{
@@ -56,6 +57,31 @@ func TestWriteStatusListHasMoreFooter(t *testing.T) {
 	assert.Contains(t, output, "apply-example")
 	assert.Contains(t, output, "Showing the 20 most recent schema changes. Use --limit N to show more.")
 	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
+}
+
+func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 0,
+			Limit:       1000,
+			MaxLimit:    1000,
+			HasMore:     true,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-example",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "Showing the 1000 most recent schema changes. This server caps status history at 1000.")
+	assert.NotContains(t, output, "Use --limit N to show more.")
 }
 
 func captureStdout(t *testing.T, fn func()) string {

@@ -67,6 +67,7 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 	templates.WriteStatusList(templates.StatusListData{
 		ActiveCount: result.ActiveCount,
 		Limit:       result.Limit,
+		MaxLimit:    result.MaxLimit,
 		HasMore:     result.HasMore,
 		Applies:     applies,
 	})
