@@ -115,9 +115,10 @@ func TestWriteStatusListExternalID(t *testing.T) {
 func TestWriteStatusListFailedOnly(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteStatusList(StatusListData{
-			Limit:        20,
-			MaxLimit:     1000,
-			FailuresOnly: true,
+			Limit:          20,
+			MaxLimit:       1000,
+			FailuresOnly:   true,
+			ShowExternalID: true,
 			Applies: []ActiveApplyData{
 				{
 					ApplyID:      "apply-failed",
@@ -135,11 +136,12 @@ func TestWriteStatusListFailedOnly(t *testing.T) {
 	})
 
 	assert.Contains(t, output, "Recent failed schema changes")
-	assert.Contains(t, output, "apply-failed")
-	assert.Contains(t, output, "payments")
-	assert.Contains(t, output, "github:alice")
+	assert.Contains(t, output, "payments staging: Failed (github:alice; external_id=external-failed) [2026-05-28 11:00:03 UTC]")
 	assert.Contains(t, output, "failed to apply schema change because duplicate column name 'status'")
-	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
+	assert.Contains(t, output, "schemabot status apply-failed")
+	assert.NotContains(t, output, "APPLY ID")
+	assert.NotContains(t, output, "REASON")
+	assert.NotContains(t, output, "Use 'schemabot status <apply_id>' to view details")
 }
 
 func captureStdout(t *testing.T, fn func()) string {

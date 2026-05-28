@@ -24,6 +24,7 @@ import (
 )
 
 var statusApplyRowRE = regexp.MustCompile(`(?m)^  apply-\S+`)
+var statusFollowUpCommandRE = regexp.MustCompile(`(?m)^schemabot status apply-\S+`)
 
 // TestCLI_Status_DefaultLimitShowsTwentyMostRecent verifies that the no-flag
 // recent status view uses the operator-facing default and tells users how to
@@ -76,7 +77,8 @@ func TestCLI_Status_LimitShowsRequestedRecentApplies(t *testing.T) {
 }
 
 // TestCLI_Status_FailedShowsOnlyFailedApplies verifies that --failed switches
-// to the failure-focused view and excludes successful terminal history.
+// to the failure-focused view with follow-up commands and excludes successful
+// terminal history.
 func TestCLI_Status_FailedShowsOnlyFailedApplies(t *testing.T) {
 	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
 	endpoint, store := startStatusOnlySchemaBot(t)
@@ -91,6 +93,7 @@ func TestCLI_Status_FailedShowsOnlyFailedApplies(t *testing.T) {
 		ApplyID:      "apply-status-failed-permanent",
 		Database:     "status_failed_permanent",
 		State:        state.Apply.Failed,
+		ExternalID:   "remote-failed-permanent",
 		ErrorMessage: "syntax error near column definition",
 	})
 	seedStatusApply(t, store, statusApplySeed{
@@ -103,14 +106,23 @@ func TestCLI_Status_FailedShowsOnlyFailedApplies(t *testing.T) {
 	out := runCLI(t, binPath, "status", "--endpoint", endpoint, "--failed")
 	stripped := stripANSI(out)
 
-	assert.Equal(t, 2, statusApplyRowCount(out))
+	assert.Equal(t, 2, statusFollowUpCommandCount(out))
 	assert.Contains(t, stripped, "Recent failed schema changes")
-	assert.Contains(t, stripped, "apply-status-failed-permanent")
+	assert.Contains(t, stripped, "status_failed_permanent staging: Failed (github:tester) [")
 	assert.Contains(t, stripped, "syntax error near column definition")
-	assert.Contains(t, stripped, "apply-status-failed-retryable")
+	assert.Contains(t, stripped, "schemabot status apply-status-failed-permanent")
+	assert.Contains(t, stripped, "status_failed_retryable staging: Retrying (github:tester) [")
 	assert.Contains(t, stripped, "temporary engine failure")
+	assert.Contains(t, stripped, "schemabot status apply-status-failed-retryable")
+	assert.NotContains(t, stripped, "REASON")
 	assert.NotContains(t, stripped, "apply-status-failed-success")
 	assert.NotContains(t, stripped, "this should not render")
+
+	externalOut := runCLI(t, binPath, "status", "--endpoint", endpoint, "--failed", "--external-id")
+	external := stripANSI(externalOut)
+
+	assert.Equal(t, 2, statusFollowUpCommandCount(externalOut))
+	assert.Contains(t, external, "status_failed_permanent staging: Failed (github:tester; external_id=remote-failed-permanent) [")
 }
 
 // TestCLI_Status_ExternalIDShowsRemoteApplyIDs verifies that --external-id adds
@@ -271,4 +283,8 @@ func seedStatusApply(t *testing.T, store *schemabotmysql.Storage, seed statusApp
 
 func statusApplyRowCount(output string) int {
 	return len(statusApplyRowRE.FindAllString(stripANSI(output), -1))
+}
+
+func statusFollowUpCommandCount(output string) int {
+	return len(statusFollowUpCommandRE.FindAllString(stripANSI(output), -1))
 }

@@ -13,7 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
-const maxStatusFailureReasonWidth = 120
+const maxStatusFailureReasonWidth = 240
 
 // Indentation for progress rendering.
 // indentTable is the prefix for table names. Aligns with keyspace name after "── " in headers.
@@ -731,7 +731,6 @@ func WriteStatusList(data StatusListData) {
 	}
 	if data.FailuresOnly {
 		writeFailedStatusList(data)
-		writeStatusListFooter(data)
 		return
 	}
 
@@ -848,80 +847,27 @@ func writeFailedStatusList(data StatusListData) {
 	fmt.Printf("%sRecent failed schema changes%s\n", ANSIBold, ANSIReset)
 	fmt.Println()
 
-	maxID := 8        // "APPLY ID"
-	maxExternal := 11 // "EXTERNAL ID"
-	maxDB := 8        // "DATABASE"
-	maxEnv := 3       // "ENV"
-	maxState := 5     // "STATE"
-	maxFailed := 6    // "FAILED"
-	maxCaller := 6    // "CALLER"
-	maxReason := 6    // "REASON"
-	for _, a := range data.Applies {
-		maxID = maxLen(maxID, len(a.ApplyID))
-		if data.ShowExternalID {
-			maxExternal = maxLen(maxExternal, len(statusExternalID(a)))
+	for i, a := range data.Applies {
+		if i > 0 {
+			fmt.Println()
 		}
-		maxDB = maxLen(maxDB, len(a.Database))
-		maxEnv = maxLen(maxEnv, len(a.Environment))
-		maxState = maxLen(maxState, len(state.Label(a.State)))
-		maxFailed = maxLen(maxFailed, len(formatFailureAt(a)))
-		maxCaller = maxLen(maxCaller, len(shortCaller(a.Caller)))
-		maxReason = maxLen(maxReason, len(compactStatusFailureReason(a.ErrorMessage)))
+		fmt.Printf("%s %s: %s (%s) [%s] %s\n",
+			a.Database,
+			a.Environment,
+			state.Label(a.State),
+			statusFailureActor(a, data.ShowExternalID),
+			formatFailureTimestamp(a),
+			compactStatusFailureReason(a.ErrorMessage))
+		fmt.Printf("schemabot status %s\n", a.ApplyID)
 	}
 
-	if data.ShowExternalID {
-		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s%s\n",
-			ANSIDim,
-			maxID, "APPLY ID",
-			maxExternal, "EXTERNAL ID",
-			maxDB, "DATABASE",
-			maxEnv, "ENV",
-			maxState, "STATE",
-			maxFailed, "FAILED",
-			maxCaller, "CALLER",
-			maxReason, "REASON",
-			ANSIReset)
-	} else {
-		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s%s\n",
-			ANSIDim,
-			maxID, "APPLY ID",
-			maxDB, "DATABASE",
-			maxEnv, "ENV",
-			maxState, "STATE",
-			maxFailed, "FAILED",
-			maxCaller, "CALLER",
-			maxReason, "REASON",
-			ANSIReset)
-	}
-
-	for _, a := range data.Applies {
-		label := state.Label(a.State)
-		colorFn := stateColorFunc(a.State)
-		padded := fmt.Sprintf("%-*s", maxState, label)
-		coloredState := padded
-		if colorFn != nil {
-			coloredState = colorFn(padded)
-		}
-
-		if data.ShowExternalID {
-			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
-				maxID, a.ApplyID,
-				maxExternal, statusExternalID(a),
-				maxDB, a.Database,
-				maxEnv, a.Environment,
-				coloredState,
-				maxFailed, formatFailureAt(a),
-				maxCaller, shortCaller(a.Caller),
-				compactStatusFailureReason(a.ErrorMessage))
+	if data.HasMore && data.Limit > 0 {
+		fmt.Println()
+		item := "failed schema changes"
+		if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
+			fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
 		} else {
-			fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
-				maxID, a.ApplyID,
-				maxDB, a.Database,
-				maxEnv, a.Environment,
-				coloredState,
-				maxFailed, formatFailureAt(a),
-				maxCaller, shortCaller(a.Caller),
-				compactStatusFailureReason(a.ErrorMessage))
+			fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
 		}
 	}
 }
@@ -933,14 +879,30 @@ func statusExternalID(a ActiveApplyData) string {
 	return a.ExternalID
 }
 
-func formatFailureAt(a ActiveApplyData) string {
-	if a.CompletedAt != "" {
-		return formatStartedAt(a.CompletedAt)
+func statusFailureActor(a ActiveApplyData, showExternalID bool) string {
+	caller := shortCaller(a.Caller)
+	if !showExternalID {
+		return caller
 	}
-	if a.UpdatedAt != "" {
-		return formatStartedAt(a.UpdatedAt)
+	return caller + "; external_id=" + statusExternalID(a)
+}
+
+func formatFailureTimestamp(a ActiveApplyData) string {
+	timestamp := a.CompletedAt
+	if timestamp == "" {
+		timestamp = a.UpdatedAt
 	}
-	return formatStartedAt(a.StartedAt)
+	if timestamp == "" {
+		timestamp = a.StartedAt
+	}
+	if timestamp == "" {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		return timestamp
+	}
+	return t.UTC().Format("2006-01-02 15:04:05 UTC")
 }
 
 func compactStatusFailureReason(reason string) string {
