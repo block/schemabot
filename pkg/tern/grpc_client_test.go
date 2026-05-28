@@ -645,7 +645,7 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	assert.Equal(t, "remote-dispatched-123", server.getProgressApplyID())
 	progressReq := server.getProgressRequest()
 	require.NotNil(t, progressReq)
-	assert.Equal(t, storage.DatabaseTypeMySQL, progressReq.Type)
+	assert.Empty(t, progressReq.Type)
 	assert.Equal(t, "staging", progressReq.Environment)
 }
 
@@ -784,7 +784,7 @@ func TestGRPCClient_ResumeApplyPersistsRemoteFailureMessage(t *testing.T) {
 	assert.Equal(t, state.Task.Failed, task.State)
 	progressReq := server.getProgressRequest()
 	require.NotNil(t, progressReq)
-	assert.Equal(t, storage.DatabaseTypeVitess, progressReq.Type)
+	assert.Empty(t, progressReq.Type)
 	assert.Equal(t, "staging", progressReq.Environment)
 
 	var terminalLog *storage.ApplyLog

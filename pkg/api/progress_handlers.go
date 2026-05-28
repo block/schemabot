@@ -132,32 +132,6 @@ func (s *Service) deploymentForDatabaseEnvironment(database, deployment, environ
 	return resolved.Deployment, nil
 }
 
-// progressTargetForDatabaseEnvironment resolves the routing metadata needed for
-// progress RPCs. Stored apply metadata stays authoritative for active work.
-func (s *Service) progressTargetForDatabaseEnvironment(database string, apply *storage.Apply, environment string) (ResolvedDatabaseTarget, error) {
-	target := ResolvedDatabaseTarget{}
-	if apply != nil {
-		target.DatabaseType = apply.DatabaseType
-		target.Deployment = apply.Deployment
-	}
-	if target.DatabaseType != "" && target.Deployment != "" {
-		return target, nil
-	}
-
-	resolved, err := s.config.ResolveDatabaseTarget(database, environment)
-	if err != nil {
-		return target, err
-	}
-	if target.DatabaseType == "" {
-		target.DatabaseType = resolved.DatabaseType
-	}
-	if target.Deployment == "" {
-		target.Deployment = resolved.Deployment
-	}
-	target.Target = resolved.Target
-	return target, nil
-}
-
 // progressResponseFromProto converts a protobuf ProgressResponse to an HTTP ProgressResponse.
 func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.ProgressResponse {
 	progressState := tern.ProtoStateToStorage(resp.State)
