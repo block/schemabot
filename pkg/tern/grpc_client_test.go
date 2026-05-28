@@ -385,8 +385,6 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
 	s.progressReq = &ternv1.ProgressRequest{
-		Database:    req.Database,
-		Type:        req.Type,
 		Environment: req.Environment,
 		ApplyId:     req.ApplyId,
 	}
@@ -430,8 +428,6 @@ func (s *capturingTernServer) getProgressRequest() *ternv1.ProgressRequest {
 		return nil
 	}
 	return &ternv1.ProgressRequest{
-		Database:    s.progressReq.Database,
-		Type:        s.progressReq.Type,
 		Environment: s.progressReq.Environment,
 		ApplyId:     s.progressReq.ApplyId,
 	}
@@ -645,7 +641,7 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	assert.Equal(t, "remote-dispatched-123", server.getProgressApplyID())
 	progressReq := server.getProgressRequest()
 	require.NotNil(t, progressReq)
-	assert.Empty(t, progressReq.Type)
+	assert.Equal(t, "remote-dispatched-123", progressReq.ApplyId)
 	assert.Equal(t, "staging", progressReq.Environment)
 }
 
@@ -784,7 +780,7 @@ func TestGRPCClient_ResumeApplyPersistsRemoteFailureMessage(t *testing.T) {
 	assert.Equal(t, state.Task.Failed, task.State)
 	progressReq := server.getProgressRequest()
 	require.NotNil(t, progressReq)
-	assert.Empty(t, progressReq.Type)
+	assert.Equal(t, "remote-failed-123", progressReq.ApplyId)
 	assert.Equal(t, "staging", progressReq.Environment)
 
 	var terminalLog *storage.ApplyLog

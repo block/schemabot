@@ -1029,9 +1029,9 @@ func TestProgressByApplyIDResolvesExternalIDForRemoteApply(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, resp.State)
 }
 
-func TestProgressByApplyIDDoesNotSendDatabaseType(t *testing.T) {
+func TestProgressByApplyIDOnlySendsApplyIDAndEnvironment(t *testing.T) {
 	// Remote progress lookups use the apply ID as the stable routing key. The
-	// data plane should not need a database type hint to interpret that ID.
+	// data plane should not need database routing hints to interpret that ID.
 	mock := &mockTernClient{
 		isRemote: true,
 		progressResp: &ternv1.ProgressResponse{
@@ -1052,8 +1052,6 @@ func TestProgressByApplyIDDoesNotSendDatabaseType(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	require.NotNil(t, mock.progressReq)
 	assert.Equal(t, "remote-active-remote", mock.progressReq.ApplyId)
-	assert.Equal(t, "testdb", mock.progressReq.Database)
-	assert.Empty(t, mock.progressReq.Type)
 	assert.Equal(t, "staging", mock.progressReq.Environment)
 }
 
