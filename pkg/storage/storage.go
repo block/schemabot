@@ -23,6 +23,9 @@ type Storage interface {
 	// ApplyLogs returns the apply logs store.
 	ApplyLogs() ApplyLogStore
 
+	// ControlRequests returns the apply control request store.
+	ControlRequests() ControlRequestStore
+
 	// ApplyComments returns the apply comment store.
 	ApplyComments() ApplyCommentStore
 
@@ -324,4 +327,20 @@ type ApplyLogStore interface {
 
 	// List returns logs matching the filter criteria, ordered by created_at.
 	List(ctx context.Context, filter ApplyLogFilter) ([]*ApplyLog, error)
+}
+
+// ControlRequestStore manages durable user control requests.
+// A control request is behavioral state, not just audit: scheduler workers use
+// pending rows to recover accepted operations after process restarts.
+type ControlRequestStore interface {
+	// RequestPending records a pending request for an apply operation. If the
+	// same operation is already pending for the apply, the existing request is
+	// returned with alreadyPending=true.
+	RequestPending(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
+
+	// GetPending returns the pending request for an apply operation.
+	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)
+
+	// CompletePending marks the pending request for an apply operation completed.
+	CompletePending(ctx context.Context, applyID int64, operation ControlOperation) error
 }

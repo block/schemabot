@@ -1,22 +1,23 @@
 # storage
 
-Package `storage` defines the persistence interfaces for SchemaBot. All state — locks, plans, applies, tasks, logs, settings — flows through these interfaces. The MySQL implementation lives in [`storage/mysqlstore`](./mysqlstore/).
+Package `storage` defines the persistence interfaces for SchemaBot. All state — locks, plans, applies, tasks, logs, control requests, settings — flows through these interfaces. The MySQL implementation lives in [`storage/mysqlstore`](./mysqlstore/).
 
 ## Interface Hierarchy
 
-`Storage` is the top-level interface that provides access to seven specialized stores:
+`Storage` is the top-level interface that provides access to specialized stores:
 
 ```go
 type Storage interface {
-    Locks()     LockStore
-    Plans()     PlanStore
-    Applies()   ApplyStore
-    Tasks()     TaskStore
-    ApplyLogs() ApplyLogStore
-    Checks()    CheckStore
-    Settings()  SettingsStore
-    Ping(ctx)   error
-    Close()     error
+    Locks()           LockStore
+    Plans()           PlanStore
+    Applies()         ApplyStore
+    Tasks()           TaskStore
+    ApplyLogs()       ApplyLogStore
+    ControlRequests() ControlRequestStore
+    Checks()          CheckStore
+    Settings()        SettingsStore
+    Ping(ctx)         error
+    Close()           error
 }
 ```
 
@@ -27,6 +28,7 @@ type Storage interface {
 | `ApplyStore` | Schema change execution state, heartbeat-based leasing |
 | `TaskStore` | Individual DDL tasks within an apply, progress tracking |
 | `ApplyLogStore` | Audit trail (state transitions, errors, progress events) |
+| `ControlRequestStore` | Durable user control intent that can be recovered by workers |
 | `CheckStore` | GitHub status check state |
 | `SettingsStore` | Admin-level key-value settings |
 
@@ -61,6 +63,7 @@ The apply store supports crash recovery through heartbeat-based leasing:
 - **Apply**: Links to plan and lock, state, environment, engine, options (defer_cutover, volume)
 - **Task**: Single DDL within an apply — table name, DDL, state, progress (rows copied/total, ETA)
 - **ApplyLog**: Level, event type, source (schemabot/spirit), message, state transitions
+- **ApplyControlRequest**: Durable control operation intent and processing status
 
 ## MySQL Implementation
 

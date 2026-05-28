@@ -34,6 +34,7 @@ func (m *mockStorage) Plans() storage.PlanStore                      { return ni
 func (m *mockStorage) Applies() storage.ApplyStore                   { return nil }
 func (m *mockStorage) Tasks() storage.TaskStore                      { return nil }
 func (m *mockStorage) ApplyLogs() storage.ApplyLogStore              { return nil }
+func (m *mockStorage) ControlRequests() storage.ControlRequestStore  { return nil }
 func (m *mockStorage) ApplyComments() storage.ApplyCommentStore      { return nil }
 func (m *mockStorage) VitessApplyData() storage.VitessApplyDataStore { return nil }
 func (m *mockStorage) Checks() storage.CheckStore                    { return nil }

@@ -352,7 +352,7 @@ type Apply struct {
 	// ErrorMessage contains error details if state is failed.
 	ErrorMessage string
 
-	// Options contains engine-specific options as JSON.
+	// Options contains durable apply options and scheduler metadata as JSON.
 	// Use ParseApplyOptions() to get typed access.
 	Options []byte
 
@@ -373,7 +373,7 @@ type Apply struct {
 	UpdatedAt time.Time
 }
 
-// ApplyOptions contains engine-specific options for an apply.
+// ApplyOptions contains durable user and engine options for an apply.
 // Stored as JSON in the database for flexibility across engine types.
 type ApplyOptions struct {
 	// AllowUnsafe permits destructive changes (DROP TABLE, DROP COLUMN).
@@ -401,6 +401,42 @@ type ApplyOptions struct {
 	// Target is the opaque endpoint-discovery target forwarded to Tern.
 	// Defaults to the apply database when empty.
 	Target string `json:"target,omitempty"`
+}
+
+// ControlOperation identifies a user-requested control operation.
+type ControlOperation string
+
+const (
+	// ControlOperationStart resumes a stopped apply.
+	ControlOperationStart ControlOperation = "start"
+)
+
+// ControlRequestStatus is the durable processing status for a control request.
+type ControlRequestStatus string
+
+const (
+	// ControlRequestPending means a scheduler worker still needs to act.
+	ControlRequestPending ControlRequestStatus = "pending"
+	// ControlRequestCompleted means the requested operation has been accepted.
+	ControlRequestCompleted ControlRequestStatus = "completed"
+	// ControlRequestFailed means the requested operation reached a terminal error.
+	ControlRequestFailed ControlRequestStatus = "failed"
+)
+
+// ApplyControlRequest records durable user control intent.
+// Use this when an HTTP control operation can be accepted before the engine has
+// actually performed the operation.
+type ApplyControlRequest struct {
+	ID           int64
+	ApplyID      int64
+	Operation    ControlOperation
+	Status       ControlRequestStatus
+	RequestedBy  string
+	ErrorMessage string
+	Metadata     []byte
+	CompletedAt  *time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // ApplyOptionsFromMap converts API/proto option strings into typed storage options.
