@@ -37,7 +37,8 @@ type CommentObserver struct {
 	OnTerminalHook func(apply *storage.Apply)
 
 	// clock is the time source used for adaptive rate-limit math. Defaults
-	// to clock.Real{} in NewCommentObserver; tests may inject clock.Fake.
+	// to clock.Real{} in NewCommentObserver; tests may inject a *clock.Fake
+	// via clock.NewFake(start).
 	clock clock.Clock
 
 	mu                sync.Mutex
@@ -74,7 +75,8 @@ type CommentObserverConfig struct {
 	OnTerminalHook func(apply *storage.Apply)
 
 	// Clock is the time source for adaptive rate-limit math. Optional —
-	// nil defaults to clock.Real{}. Tests inject clock.Fake to make the
+	// nil or typed-nil defaults to clock.Real{} (via clock.Default). Tests
+	// inject a *clock.Fake via clock.NewFake(start) to make the
 	// stagnant / active transition observable without sleeping.
 	Clock clock.Clock
 }
@@ -87,10 +89,7 @@ func (o *CommentObserver) SetApplyID(id int64) {
 
 // NewCommentObserver creates a new CommentObserver for posting PR comments.
 func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
-	clk := cfg.Clock
-	if clk == nil {
-		clk = clock.Real{}
-	}
+	clk := clock.Default(cfg.Clock)
 	return &CommentObserver{
 		ghClient:       cfg.GHClient,
 		stor:           cfg.Storage,

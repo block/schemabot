@@ -205,14 +205,20 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 }
 
 // SetClock overrides the time source used by orchestration loops (currently
-// the scheduler claim-duration measurement). Call before StartScheduler.
+// the scheduler claim-duration measurement). Must be called before
+// StartScheduler — once scheduler workers are running they read s.clock
+// concurrently, so swapping the field is rejected to avoid a data race.
 // Production callers should leave the default clock.Real{} in place; tests
-// use clock.NewFake to make timing observable.
-func (s *Service) SetClock(c clock.Clock) {
-	if c == nil {
-		return
+// use clock.NewFake to make timing observable. A nil or typed-nil c is
+// coalesced to clock.Real{} via clock.Default.
+func (s *Service) SetClock(c clock.Clock) error {
+	s.schedulerMu.Lock()
+	defer s.schedulerMu.Unlock()
+	if s.stopRecovery != nil {
+		return fmt.Errorf("cannot change clock while scheduler is running")
 	}
-	s.clock = c
+	s.clock = clock.Default(c)
+	return nil
 }
 
 // SetSchedulerPollInterval sets the scheduler worker poll interval.

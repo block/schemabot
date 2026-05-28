@@ -39,6 +39,25 @@ func TestFake_SetPinsToTime(t *testing.T) {
 	assert.Equal(t, pin, f.Now())
 }
 
+func TestDefault_NilInterfaceReturnsReal(t *testing.T) {
+	got := Default(nil)
+	assert.IsType(t, Real{}, got)
+	assert.NotPanics(t, func() { _ = got.Now() })
+}
+
+func TestDefault_TypedNilFakeReturnsReal(t *testing.T) {
+	var f *Fake // typed-nil
+	got := Default(f)
+	assert.IsType(t, Real{}, got)
+	assert.NotPanics(t, func() { _ = got.Now() })
+}
+
+func TestDefault_NonNilPassesThrough(t *testing.T) {
+	f := NewFake(time.Unix(42, 0))
+	got := Default(f)
+	assert.Same(t, f, got)
+}
+
 func TestFake_ConcurrentAdvanceAndNowIsRaceFree(t *testing.T) {
 	f := NewFake(time.Unix(0, 0))
 	var wg sync.WaitGroup

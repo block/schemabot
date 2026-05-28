@@ -4,6 +4,7 @@
 package clock
 
 import (
+	"reflect"
 	"sync"
 	"time"
 )
@@ -52,4 +53,22 @@ func (f *Fake) Set(t time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.now = t
+}
+
+// Default returns c if it is a usable Clock, otherwise Real{}. This guards
+// against both a plain nil interface and a typed-nil implementation
+// (e.g., a nil *Fake stored in a Clock interface), either of which would
+// otherwise panic on a later Now() call.
+func Default(c Clock) Clock {
+	if c == nil {
+		return Real{}
+	}
+	v := reflect.ValueOf(c)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+		if v.IsNil() {
+			return Real{}
+		}
+	}
+	return c
 }
