@@ -116,7 +116,10 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-const grpcProgressPollInterval = 500 * time.Millisecond
+const (
+	grpcProgressPollInterval       = 500 * time.Millisecond
+	maxGRPCProgressPollErrorStreak = 10
+)
 
 // GRPCClient implements Client using gRPC.
 // It delegates execution to a remote Tern service but SchemaBot still manages
@@ -704,6 +707,27 @@ func isRetryableRemoteApplyError(err error) bool {
 	}
 }
 
+func isTerminalRemoteProgressError(err error) bool {
+	if err == nil {
+		return false
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+
+	switch st.Code() {
+	case codes.InvalidArgument, codes.AlreadyExists, codes.PermissionDenied, codes.Unauthenticated,
+		codes.FailedPrecondition, codes.OutOfRange, codes.Unimplemented, codes.DataLoss:
+		return true
+	case codes.OK, codes.NotFound, codes.Internal, codes.Unknown, codes.Unavailable, codes.ResourceExhausted,
+		codes.Aborted, codes.Canceled, codes.DeadlineExceeded:
+		return false
+	default:
+		return false
+	}
+}
+
 func (c *GRPCClient) prepareDispatchTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.FailedRetryable) {
@@ -1127,6 +1151,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 	heartbeatTicker := time.NewTicker(10 * time.Second)
 	defer heartbeatTicker.Stop()
 
+	consecutiveProgressErrors := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -1147,14 +1172,33 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					message := fmt.Sprintf("remote apply %s was not found by data plane", apply.ExternalID)
 					return c.failMissingRemoteApply(ctx, apply, message, err)
 				}
+				if isTerminalRemoteProgressError(err) {
+					message := fmt.Sprintf("remote progress failed for remote apply %s: %v", apply.ExternalID, err)
+					if markErr := c.markRemoteApplyFailed(ctx, apply, nil, message, false); markErr != nil {
+						return fmt.Errorf("mark remote apply %s failed after terminal progress error: %w", apply.ApplyIdentifier, markErr)
+					}
+					return fmt.Errorf("poll remote apply %s for %s: %w", apply.ExternalID, apply.ApplyIdentifier, err)
+				}
+				consecutiveProgressErrors++
 				slog.Warn("remote gRPC progress poll failed",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,
 					"environment", apply.Environment,
+					"consecutive_errors", consecutiveProgressErrors,
+					"max_consecutive_errors", maxGRPCProgressPollErrorStreak,
 					"error", err)
+				if consecutiveProgressErrors >= maxGRPCProgressPollErrorStreak {
+					message := fmt.Sprintf("remote progress polling failed after %d consecutive errors for remote apply %s: %v",
+						consecutiveProgressErrors, apply.ExternalID, err)
+					if markErr := c.markRemoteApplyFailed(ctx, apply, nil, message, true); markErr != nil {
+						return fmt.Errorf("mark remote apply %s retryable after progress polling errors: %w", apply.ApplyIdentifier, markErr)
+					}
+					return fmt.Errorf("poll remote apply %s for %s: %w", apply.ExternalID, apply.ApplyIdentifier, err)
+				}
 				continue
 			}
+			consecutiveProgressErrors = 0
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id", apply.ExternalID)
 				return c.failMissingRemoteApply(ctx, apply, message, nil)

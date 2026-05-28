@@ -62,6 +62,7 @@ import (
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -238,6 +239,130 @@ func waitForControlPlaneApplyLogs(t *testing.T, endpoint string, applyID, tableN
 		},
 		func() string {
 			return fmt.Sprintf("control-plane apply logs did not contain the full remote lifecycle for %s: api_logs=%s last_err=%v",
+				applyID, formatLogEntries(logs), lastErr)
+		})
+}
+
+// TestK8s_RemoteFailureErrorVisibleInControlPlaneStatus verifies that a remote
+// terminal failure observed over gRPC is copied into the control plane's status
+// and logs. Operators should not need data-plane access to see why the apply
+// failed.
+func TestK8s_RemoteFailureErrorVisibleInControlPlaneStatus(t *testing.T) {
+	cleanupState(t)
+
+	endpoint := testutil.Endpoint(t)
+	failureMessage := "remote schema change failed while checking target connectivity"
+	tableName := testutil.UniqueTableName("k8s_remote_failure")
+
+	dataPlaneApplyID := createStoredK8sApplyWithTask(t, storageDSNs(t)[0], &storage.Apply{
+		ApplyIdentifier: testutil.UniqueTableName("apply-remote-failed"),
+		Database:        "testapp",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testapp",
+		Environment:     "staging",
+		Caller:          "e2e",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Failed,
+		ErrorMessage:    failureMessage,
+	}, &storage.Task{
+		TaskIdentifier: testutil.UniqueTableName("task-remote-failed"),
+		Database:       "testapp",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Namespace:      "testapp",
+		TableName:      tableName,
+		DDL:            fmt.Sprintf("ALTER TABLE `%s` ADD COLUMN `status_flag` int NULL", tableName),
+		DDLAction:      "alter",
+		Engine:         storage.EngineSpirit,
+		Environment:    "staging",
+		State:          state.Task.Failed,
+		ErrorMessage:   failureMessage,
+	})
+
+	controlPlaneApplyID := createStoredK8sApplyWithTask(t, testutil.SchemabotDSN(t), &storage.Apply{
+		ApplyIdentifier: testutil.UniqueTableName("apply-control-failed"),
+		Database:        "testapp",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "data-plane",
+		Environment:     "staging",
+		Caller:          "e2e",
+		ExternalID:      dataPlaneApplyID,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+	}, &storage.Task{
+		TaskIdentifier: testutil.UniqueTableName("task-control-failed"),
+		Database:       "testapp",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Namespace:      "testapp",
+		TableName:      tableName,
+		DDL:            fmt.Sprintf("ALTER TABLE `%s` ADD COLUMN `status_flag` int NULL", tableName),
+		DDLAction:      "alter",
+		Engine:         storage.EngineSpirit,
+		Environment:    "staging",
+		State:          state.Task.Running,
+	})
+	markControlPlaneHeartbeatStale(t, controlPlaneApplyID)
+
+	var (
+		progress *apitypes.ProgressResponse
+		lastErr  error
+	)
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			progress, lastErr = testutil.FetchProgress(endpoint, controlPlaneApplyID)
+			return lastErr == nil &&
+				state.IsState(progress.State, state.Apply.Failed) &&
+				progress.ErrorMessage == failureMessage
+		},
+		func() string {
+			if progress == nil {
+				return fmt.Sprintf("timeout waiting for remote failure to appear in control-plane status for %s: last_err=%v", controlPlaneApplyID, lastErr)
+			}
+			return fmt.Sprintf("timeout waiting for remote failure to appear in control-plane status for %s: state=%s error=%q last_err=%v",
+				controlPlaneApplyID, progress.State, progress.ErrorMessage, lastErr)
+		})
+
+	require.Len(t, progress.Tables, 1)
+	assert.Equal(t, tableName, progress.Tables[0].TableName)
+	assert.Equal(t, state.Task.Failed, progress.Tables[0].Status)
+	waitForControlPlaneFailureLog(t, endpoint, controlPlaneApplyID, failureMessage)
+}
+
+func createStoredK8sApplyWithTask(t *testing.T, dsn string, apply *storage.Apply, task *storage.Task) string {
+	t.Helper()
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()))
+
+	now := time.Now()
+	task.CreatedAt = now
+	task.UpdatedAt = now
+	if task.StartedAt == nil && !state.IsState(task.State, state.Task.Pending) {
+		task.StartedAt = &now
+	}
+	if task.CompletedAt == nil && state.IsTerminalTaskState(task.State) {
+		task.CompletedAt = &now
+	}
+
+	store := mysqlstore.New(db)
+	_, err = store.Applies().CreateWithTasks(t.Context(), apply, []*storage.Task{task})
+	require.NoError(t, err)
+	return apply.ApplyIdentifier
+}
+
+func waitForControlPlaneFailureLog(t *testing.T, endpoint, applyID, failureMessage string) {
+	t.Helper()
+
+	var logs []*client.LogEntry
+	var lastErr error
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			logs, lastErr = client.GetLogs(endpoint, "", "", applyID, 50)
+			return lastErr == nil && hasLogTransitionTo(logs, "Remote apply reached terminal state: failed: "+failureMessage, state.Apply.Failed)
+		},
+		func() string {
+			return fmt.Sprintf("control-plane apply logs did not contain remote failure for %s: api_logs=%s last_err=%v",
 				applyID, formatLogEntries(logs), lastErr)
 		})
 }

@@ -799,6 +799,102 @@ func TestGRPCClient_ResumeApplyPersistsRemoteFailureMessage(t *testing.T) {
 	assert.Contains(t, terminalLog.Message, "failed to connect to target database")
 }
 
+func TestGRPCClient_ProgressPollTerminalErrorFailsApply(t *testing.T) {
+	// Permanent progress RPC errors mean the control plane cannot observe the
+	// remote apply. The apply should fail with that error instead of polling
+	// forever and leaving operators with an in-progress status.
+	server := &capturingTernServer{
+		progressErr: status.Error(codes.InvalidArgument, `invalid apply_id "apply-remote": strconv.ParseInt: invalid syntax`),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              24,
+		ApplyIdentifier: "apply-terminal-progress-error",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Deployment:      "us-west",
+		Environment:     "staging",
+		ExternalID:      "apply-remote",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             30,
+		TaskIdentifier: "task-terminal-progress-error",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    logs,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid apply_id")
+
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "invalid apply_id")
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, task.ErrorMessage, "invalid apply_id")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply failed: remote progress failed"))
+}
+
+func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) {
+	// Retryable progress RPC errors can happen while the remote service is
+	// unavailable. After repeated failures, the apply should pause for scheduler
+	// recovery and expose the polling error through status and logs.
+	server := &capturingTernServer{
+		progressErr: status.Error(codes.Unavailable, "remote service unavailable"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              25,
+		ApplyIdentifier: "apply-retryable-progress-error",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "us-west",
+		Environment:     "staging",
+		ExternalID:      "remote-retryable",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             31,
+		TaskIdentifier: "task-retryable-progress-error",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    logs,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote service unavailable")
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remote progress polling failed after 10 consecutive errors")
+	assert.Nil(t, apply.CompletedAt)
+	assert.Equal(t, state.Task.FailedRetryable, task.State)
+	assert.Contains(t, task.ErrorMessage, "remote progress polling failed after 10 consecutive errors")
+	assert.Nil(t, task.CompletedAt)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply failed: remote progress polling failed after 10 consecutive errors"))
+}
+
 func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *testing.T) {
 	// A freshly dispatched remote apply can report pending before the remote
 	// engine starts copying rows. SchemaBot has already claimed the queued apply
