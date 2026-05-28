@@ -48,8 +48,9 @@ func defaultMySQLServer() *server.Server {
 // portAllocator manages a pool of ports from a fixed range.
 // Used to give branch proxies predictable ports that can be exposed in Docker.
 type portAllocator struct {
-	mu   sync.Mutex
-	free []int
+	mu    sync.Mutex
+	free  []int
+	inUse map[int]struct{}
 }
 
 func newPortAllocator(start, end int) *portAllocator {
@@ -57,23 +58,34 @@ func newPortAllocator(start, end int) *portAllocator {
 	for p := start; p <= end; p++ {
 		ports = append(ports, p)
 	}
-	return &portAllocator{free: ports}
+	return &portAllocator{free: ports, inUse: make(map[int]struct{}, len(ports))}
 }
 
 func (a *portAllocator) acquire() (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.inUse == nil {
+		a.inUse = make(map[int]struct{}, len(a.free))
+	}
 	if len(a.free) == 0 {
 		return 0, fmt.Errorf("proxy port range exhausted")
 	}
 	port := a.free[0]
 	a.free = a.free[1:]
+	a.inUse[port] = struct{}{}
 	return port, nil
 }
 
 func (a *portAllocator) release(port int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.inUse == nil {
+		return
+	}
+	if _, ok := a.inUse[port]; !ok {
+		return
+	}
+	delete(a.inUse, port)
 	a.free = append(a.free, port)
 }
 

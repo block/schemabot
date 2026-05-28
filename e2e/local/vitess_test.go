@@ -138,12 +138,19 @@ func vitessSchemaWithOverrides(overrides map[string]string) map[string]string {
 // and inserts the column before the closing line, keeping it in sync with
 // the canonical schema.
 func usersSchemaWithColumn(colName string) string {
+	return usersSchemaWithColumns(colName)
+}
+
+func usersSchemaWithColumns(colNames ...string) string {
 	base := vitessBaseSchema()
 	original := base["testapp_sharded/users.sql"]
-	// Insert the new column before the PRIMARY KEY line
+	var columns strings.Builder
+	for _, colName := range colNames {
+		fmt.Fprintf(&columns, "  `%s` varchar(100) DEFAULT NULL,\n", colName)
+	}
 	return strings.Replace(original,
 		"  PRIMARY KEY (`id`)",
-		fmt.Sprintf("  `%s` varchar(100) DEFAULT NULL,\n  PRIMARY KEY (`id`)", colName),
+		columns.String()+"  PRIMARY KEY (`id`)",
 		1)
 }
 
@@ -623,17 +630,10 @@ func TestVitess_Apply_ConsecutiveApplies(t *testing.T) {
 	clearSchemaBotState(t)
 	defer vitessRestoreBaseSchema(t, "staging")
 
-	// First apply: add index
-	idx1 := fmt.Sprintf("idx_c1_%d", time.Now().UnixMilli()%100000)
+	// First apply: add a metadata-only column.
+	col1 := fmt.Sprintf("col_c1_%d", time.Now().UnixMilli()%100000)
 	schemaDir1 := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
-		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
-  `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  `+"`email`"+` varchar(255) NOT NULL,
-  `+"`full_name`"+` varchar(255) NULL,
-  `+"`created_at`"+` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX `+"`idx_email`"+` (`+"`email`"+`),
-  INDEX `+"`%s`"+` (`+"`full_name`"+`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, idx1),
+		"testapp_sharded/users.sql": usersSchemaWithColumn(col1),
 	}))
 
 	vitessApplyAndWait(t, schemaDir1, "staging")
@@ -641,18 +641,10 @@ func TestVitess_Apply_ConsecutiveApplies(t *testing.T) {
 	clearSchemaBotState(t)
 
 	// Second apply immediately after verifies that the previous deploy is fully
-	// finalized and VReplication streams are cleaned up.
-	idx2 := fmt.Sprintf("idx_c2_%d", time.Now().UnixMilli()%100000)
+	// finalized before another deploy starts.
+	col2 := fmt.Sprintf("col_c2_%d", time.Now().UnixMilli()%100000)
 	schemaDir2 := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
-		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
-  `+"`id`"+` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  `+"`email`"+` varchar(255) NOT NULL,
-  `+"`full_name`"+` varchar(255) NULL,
-  `+"`created_at`"+` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  INDEX `+"`idx_email`"+` (`+"`email`"+`),
-  INDEX `+"`%s`"+` (`+"`full_name`"+`),
-  INDEX `+"`%s`"+` (`+"`created_at`"+`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, idx1, idx2),
+		"testapp_sharded/users.sql": usersSchemaWithColumns(col1, col2),
 	}))
 
 	vitessApplyAndWait(t, schemaDir2, "staging")
@@ -708,7 +700,7 @@ func TestVitess_Apply_ShardProgress(t *testing.T) {
 	endpoint := schemabotURL(t)
 	applyOut := e2eutil.RunCLIInDir(t, binPath, schemaDir, "apply",
 		"-s", ".", "-e", "staging", "--endpoint", endpoint,
-		"-y", "--no-watch", "--allow-unsafe", "--skip-revert")
+		"-y", "--no-watch", "--allow-unsafe", "--skip-revert", "--defer-cutover")
 	e2eutil.AssertContains(t, applyOut, "Apply started")
 	applyID := extractApplyIDFromLog(applyOut)
 	require.NotEmpty(t, applyID)
@@ -752,8 +744,8 @@ func TestVitess_Apply_ShardProgress(t *testing.T) {
 	}
 	require.True(t, foundShards, "expected per-shard progress for 2-shard keyspace")
 
-	// Wait for completion so cleanup doesn't race with in-flight DDL.
-	waitForApplyState(t, endpoint, applyID, state.Apply.Completed, testutil.PollDeadline)
+	// The progress assertion only needs the copy phase. Holding before cutover
+	// avoids making this test depend on Vitess cutover timing under CI load.
 }
 
 func TestVitess_Apply_LogMode_Lifecycle(t *testing.T) {

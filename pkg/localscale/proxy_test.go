@@ -81,7 +81,7 @@ func TestTrackProxyDoesNotReleaseOldPortBeforeCloseCompletes(t *testing.T) {
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		proxies:   make(map[string]*branchProxy),
 		proxyHost: "127.0.0.1",
-		portAlloc: &portAllocator{free: []int{port1, port2}},
+		portAlloc: newTestPortAllocator(port1, port2),
 	}
 
 	listenAddr, err := s.proxyListenAddr()
@@ -108,6 +108,56 @@ func TestTrackProxyDoesNotReleaseOldPortBeforeCloseCompletes(t *testing.T) {
 
 	releaseOldConn()
 	s.wg.Wait()
+}
+
+func TestPortAllocatorIgnoresDuplicateRelease(t *testing.T) {
+	port1 := freeTCPPort(t)
+	port2 := freeTCPPort(t)
+	require.NotEqual(t, port1, port2)
+
+	alloc := newTestPortAllocator(port1, port2)
+	acquired, err := alloc.acquire()
+	require.NoError(t, err)
+	require.Equal(t, port1, acquired)
+
+	alloc.release(acquired)
+	alloc.release(acquired)
+
+	next, err := alloc.acquire()
+	require.NoError(t, err)
+	require.Equal(t, port2, next)
+	next, err = alloc.acquire()
+	require.NoError(t, err)
+	require.Equal(t, port1, next)
+	_, err = alloc.acquire()
+	require.Error(t, err)
+}
+
+func TestNewBranchProxyWithRetrySkipsOccupiedPort(t *testing.T) {
+	port1 := freeTCPPort(t)
+	port2 := freeTCPPort(t)
+	require.NotEqual(t, port1, port2)
+
+	held, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port1)))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(held)
+
+	s := &Server{
+		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		proxyHost: "127.0.0.1",
+		portAlloc: newTestPortAllocator(port1, port2),
+	}
+
+	proxy, err := s.newBranchProxyWithRetry(t.Context(), "root@tcp(127.0.0.1:1)/", "", nil, nil)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(proxy)
+
+	_, portStr, err := net.SplitHostPort(proxy.Addr())
+	require.NoError(t, err)
+	require.Equal(t, strconv.Itoa(port2), portStr)
+
+	_, err = s.portAlloc.acquire()
+	require.Error(t, err, "occupied port should stay out of the free pool")
 }
 
 func newTestBranchProxy(t *testing.T) *branchProxy {
@@ -148,4 +198,11 @@ func freeTCPPort(t *testing.T) int {
 	port, err := strconv.Atoi(portStr)
 	require.NoError(t, err)
 	return port
+}
+
+func newTestPortAllocator(ports ...int) *portAllocator {
+	return &portAllocator{
+		free:  append([]int(nil), ports...),
+		inUse: make(map[int]struct{}, len(ports)),
+	}
 }
