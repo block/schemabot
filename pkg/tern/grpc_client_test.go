@@ -385,8 +385,8 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
 	s.progressReq = &ternv1.ProgressRequest{
-		Environment: req.Environment,
 		ApplyId:     req.ApplyId,
+		Environment: req.Environment,
 	}
 	s.progressApplyID = req.ApplyId
 	ps := s.progressState
@@ -428,8 +428,8 @@ func (s *capturingTernServer) getProgressRequest() *ternv1.ProgressRequest {
 		return nil
 	}
 	return &ternv1.ProgressRequest{
-		Environment: s.progressReq.Environment,
 		ApplyId:     s.progressReq.ApplyId,
+		Environment: s.progressReq.Environment,
 	}
 }
 
