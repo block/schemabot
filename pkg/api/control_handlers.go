@@ -428,7 +428,6 @@ func (s *Service) queueRemoteStoppedApplyForScheduler(ctx context.Context, clien
 	}
 	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
 		ApplyId:     apply.ExternalID,
-		Database:    apply.Database,
 		Environment: apply.Environment,
 	})
 	if err != nil {
