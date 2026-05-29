@@ -87,7 +87,10 @@ func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *test
 				logger: slog.Default(),
 			}
 
-			_, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: "apply-missing"})
+			_, err := client.Progress(t.Context(), &ternv1.ProgressRequest{
+				ApplyId:     "apply-missing",
+				Environment: "staging",
+			})
 			require.ErrorIs(t, err, tc.wantError)
 		})
 	}

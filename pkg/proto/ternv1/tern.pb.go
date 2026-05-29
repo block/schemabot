@@ -878,15 +878,11 @@ func (x *ApplyResponse) GetApplyId() string {
 
 // ProgressRequest requests detailed progress for an active schema change.
 type ProgressRequest struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Database string                 `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
-	// Database type: "vitess" or "mysql". Used by stateless clients.
-	Type string `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Apply ID for the schema change to inspect.
+	ApplyId string `protobuf:"bytes,1,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	// Environment: "staging" or "production".
-	Environment string `protobuf:"bytes,3,opt,name=environment,proto3" json:"environment,omitempty"`
-	// Optional: scope progress to a specific apply ID.
-	// If empty, returns progress for the active schema change.
-	ApplyId       string `protobuf:"bytes,4,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
+	Environment   string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -921,16 +917,9 @@ func (*ProgressRequest) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{8}
 }
 
-func (x *ProgressRequest) GetDatabase() string {
+func (x *ProgressRequest) GetApplyId() string {
 	if x != nil {
-		return x.Database
-	}
-	return ""
-}
-
-func (x *ProgressRequest) GetType() string {
-	if x != nil {
-		return x.Type
+		return x.ApplyId
 	}
 	return ""
 }
@@ -938,13 +927,6 @@ func (x *ProgressRequest) GetType() string {
 func (x *ProgressRequest) GetEnvironment() string {
 	if x != nil {
 		return x.Environment
-	}
-	return ""
-}
-
-func (x *ProgressRequest) GetApplyId() string {
-	if x != nil {
-		return x.ApplyId
 	}
 	return ""
 }
@@ -2188,12 +2170,10 @@ const file_tern_proto_rawDesc = "" +
 	"\rApplyResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12\x19\n" +
-	"\bapply_id\x18\x03 \x01(\tR\aapplyId\"~\n" +
-	"\x0fProgressRequest\x12\x1a\n" +
-	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
-	"\x04type\x18\x02 \x01(\tR\x04type\x12 \n" +
-	"\venvironment\x18\x03 \x01(\tR\venvironment\x12\x19\n" +
-	"\bapply_id\x18\x04 \x01(\tR\aapplyId\"\xa7\x02\n" +
+	"\bapply_id\x18\x03 \x01(\tR\aapplyId\"N\n" +
+	"\x0fProgressRequest\x12\x19\n" +
+	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
+	"\venvironment\x18\x02 \x01(\tR\venvironment\"\xa7\x02\n" +
 	"\rShardProgress\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1f\n" +

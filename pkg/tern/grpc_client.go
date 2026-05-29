@@ -456,7 +456,6 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 		startRequested := false
 		resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
 			ApplyId:     apply.ExternalID,
-			Database:    apply.Database,
 			Environment: apply.Environment,
 		})
 		if err == nil {
@@ -1095,9 +1094,8 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 		case <-ticker.C:
 			// Poll progress from remote Tern
 			resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-				Database:    apply.Database,
-				Environment: apply.Environment,
 				ApplyId:     apply.ExternalID,
+				Environment: apply.Environment,
 			})
 			if err != nil {
 				if status.Code(err) == codes.NotFound {

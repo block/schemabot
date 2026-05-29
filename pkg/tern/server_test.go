@@ -57,7 +57,10 @@ func TestServerProgressMapsMissingApplyDataToNotFound(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			server := NewServer(progressErrorClient{err: tc.err})
 
-			_, err := server.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: "missing"})
+			_, err := server.Progress(t.Context(), &ternv1.ProgressRequest{
+				ApplyId:     "missing",
+				Environment: "staging",
+			})
 			require.Error(t, err)
 			assert.Equal(t, codes.NotFound, status.Code(err))
 		})

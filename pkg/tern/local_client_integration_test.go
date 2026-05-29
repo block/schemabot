@@ -228,9 +228,8 @@ func waitForApplyComplete(t *testing.T, client *LocalClient, ctx context.Context
 	waitutil.Poll(t, 30*time.Second, 500*time.Millisecond,
 		func() bool {
 			progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
-				Type:     "mysql",
-				Database: "testdb",
-				ApplyId:  applyID,
+				ApplyId:     applyID,
+				Environment: "staging",
 			})
 			if err != nil {
 				t.Logf("Progress() error: %v", err)
@@ -701,8 +700,7 @@ func TestLocalClient_Progress(t *testing.T) {
 
 	ctx := t.Context()
 	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
-		Type:     "mysql",
-		Database: "testdb",
+		Environment: "staging",
 	})
 	require.NoError(t, err, "Progress() returned error")
 	// With no active schema change, state should be STATE_NO_ACTIVE_CHANGE
@@ -710,8 +708,7 @@ func TestLocalClient_Progress(t *testing.T) {
 }
 
 func TestLocalClient_Progress_UsesConfigDatabase(t *testing.T) {
-	// In local mode, LocalClient always uses the database from config,
-	// not from the request. This test verifies that behavior.
+	// In local mode, LocalClient always uses the database from config.
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -734,10 +731,8 @@ func TestLocalClient_Progress_UsesConfigDatabase(t *testing.T) {
 	defer utils.CloseAndLog(client)
 
 	ctx := t.Context()
-	// Even with empty database in request, LocalClient uses config.Database
 	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
-		Type:     "mysql",
-		Database: "", // ignored in local mode
+		Environment: "staging",
 	})
 	require.NoError(t, err, "Progress() should succeed with config database")
 	// With no active schema change, state should be STATE_NO_ACTIVE_CHANGE
@@ -1024,8 +1019,8 @@ func TestLocalClient_Apply_MultiTableSequential(t *testing.T) {
 	waitutil.Poll(t, 30*time.Second, 500*time.Millisecond,
 		func() bool {
 			progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
-				Type:     "mysql",
-				Database: "testdb",
+				ApplyId:     applyResp.ApplyId,
+				Environment: "staging",
 			})
 			if err != nil {
 				t.Logf("Progress() error: %v", err)

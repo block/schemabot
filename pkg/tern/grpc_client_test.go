@@ -55,8 +55,8 @@ func (s *mockTernServer) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*
 }
 
 func (s *mockTernServer) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
-	if req.Database == "" {
-		return nil, status.Error(codes.InvalidArgument, "database is required")
+	if req.ApplyId == "" {
+		return nil, status.Error(codes.InvalidArgument, "apply_id is required")
 	}
 	return &ternv1.ProgressResponse{
 		State:  ternv1.State_STATE_RUNNING,
@@ -215,7 +215,8 @@ func TestGRPCClient_Progress(t *testing.T) {
 
 	t.Run("valid request", func(t *testing.T) {
 		resp, err := client.Progress(t.Context(), &ternv1.ProgressRequest{
-			Database: "testdb",
+			ApplyId:     "apply-progress123",
+			Environment: "staging",
 		})
 		require.NoError(t, err)
 		assert.Equal(t, ternv1.State_STATE_RUNNING, resp.State)

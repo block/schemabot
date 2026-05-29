@@ -407,7 +407,6 @@ func waitForDataPlanePodsRowCopyProgress(t *testing.T, endpoints []dataPlanePodE
 				ctx, cancel := context.WithTimeout(t.Context(), testutil.ProgressTimeout)
 				resp, err := clients[endpoint.pod].Progress(ctx, &ternv1.ProgressRequest{
 					ApplyId:     applyID,
-					Database:    "testapp",
 					Environment: "staging",
 				})
 				cancel()

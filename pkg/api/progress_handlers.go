@@ -214,8 +214,8 @@ func (s *Service) GetProgress(ctx context.Context, database, environment string)
 	}
 
 	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:  ternApplyID,
-		Database: database,
+		ApplyId:     ternApplyID,
+		Environment: environment,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("progress for %s: %w", database, err)
@@ -311,8 +311,8 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, err := client.Progress(r.Context(), &ternv1.ProgressRequest{
-		ApplyId:  ternApplyID,
-		Database: database,
+		ApplyId:     ternApplyID,
+		Environment: environment,
 	})
 	if err != nil {
 		s.logger.Error("progress failed", "database", database, "error", err)
@@ -404,8 +404,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	}
 
 	resp, err := client.Progress(r.Context(), &ternv1.ProgressRequest{
-		ApplyId:  ternApplyID,
-		Database: apply.Database,
+		ApplyId:     ternApplyID,
+		Environment: apply.Environment,
 	})
 	if err != nil {
 		s.logger.Error("progress failed", "apply_id", applyID, "database", apply.Database, "error", err)
@@ -813,8 +813,8 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 	}
 
 	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:  apply.ExternalID,
-		Database: apply.Database,
+		ApplyId:     apply.ExternalID,
+		Environment: apply.Environment,
 	})
 	if err != nil {
 		return fmt.Errorf("progress RPC: %w", err)

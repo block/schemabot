@@ -82,7 +82,7 @@ service Tern {
   // The overall state is derived from task priority:
   //   running > waiting_for_cutover > cutting_over > pending > stopped > failed > completed
   //
-  // If no schema change exists for the database, returns STATE_NO_ACTIVE_CHANGE.
+  // If no schema change exists for the apply, returns STATE_NO_ACTIVE_CHANGE.
   rpc Progress(ProgressRequest) returns (ProgressResponse) {
     option (google.api.http) = {
       post: "/v1/progress"
@@ -332,14 +332,10 @@ message ApplyResponse {
 
 // ProgressRequest requests detailed progress for an active schema change.
 message ProgressRequest {
-  string database = 1;
-  // Database type: "vitess" or "mysql". Used by stateless clients.
-  string type = 2;
+  // Apply ID for the schema change to inspect.
+  string apply_id = 1;
   // Environment: "staging" or "production".
-  string environment = 3;
-  // Optional: scope progress to a specific apply ID.
-  // If empty, returns progress for the active schema change.
-  string apply_id = 4;
+  string environment = 2;
 }
 
 // ShardProgress contains progress information for a single Vitess shard.
