@@ -9,7 +9,7 @@ import (
 )
 
 // Volume adjusts schema change speed by setting the Vitess throttle ratio.
-// Volume 1 = fully throttled (ratio 1.0), Volume 11 = full speed (ratio 0.0).
+// Volume 1 = max throttle (ratio 0.95), Volume 11 = full speed (ratio 0.0).
 // NOTE: Volume/Throttle requires the PlanetScale client to be initialized with a
 // base URL (via Credentials.DSN). This is wired in the tern layer.
 func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine.VolumeResult, error) {
