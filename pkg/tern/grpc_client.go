@@ -788,11 +788,25 @@ func (c *GRPCClient) reloadStoredApplyForRemoteTransition(ctx context.Context, r
 	if storedApply == nil {
 		return nil, storedApplyTransitionMissing, nil
 	}
-	if state.IsTerminalApplyState(storedApply.State) && (!allowStoppedStoredApply || !state.IsState(storedApply.State, state.Apply.Stopped)) {
+	if storedTerminalApplyBlocksRemoteTransition(storedApply, allowStoppedStoredApply) {
 		*remoteApply = *storedApply
 		return storedApply, storedApplyTransitionAlreadyTerminal, nil
 	}
 	return storedApply, storedApplyTransitionReady, nil
+}
+
+// A terminal stored apply is usually authoritative: a stale worker must not
+// overwrite a newer completed/failed/reverted result. Stopped is the one
+// terminal state that may still be superseded when the caller is reconciling an
+// exact remote apply ID that is missing or no longer active.
+func storedTerminalApplyBlocksRemoteTransition(storedApply *storage.Apply, allowStoppedStoredApply bool) bool {
+	if storedApply == nil || !state.IsTerminalApplyState(storedApply.State) {
+		return false
+	}
+	if allowStoppedStoredApply && state.IsState(storedApply.State, state.Apply.Stopped) {
+		return false
+	}
+	return true
 }
 
 func logSkippedRemoteApplyTransition(operation string, remoteApply, storedApply *storage.Apply, status storedApplyTransitionStatus, err error) {
