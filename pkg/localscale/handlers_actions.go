@@ -392,31 +392,56 @@ func (s *Server) alterVitessMigrations(ctx context.Context, backend *databaseBac
 	if err != nil {
 		return err
 	}
-	var firstErr error
+	targets := make(map[string][]string)
 	for _, m := range migrations {
 		uuid := m["migration_uuid"]
 		keyspace := m["_keyspace"]
-		if uuid == "" || keyspace == "" {
-			s.logger.Warn("skipping migration with missing uuid or keyspace", "uuid", uuid, "keyspace", keyspace)
-			continue
+		shard := m["shard"]
+		if uuid == "" {
+			err := fmt.Errorf("migration for context %s is missing uuid: keyspace=%q shard=%q", migrationContext, keyspace, shard)
+			s.logger.Warn("migration control will fail because migration row is missing uuid", "keyspace", keyspace, "shard", shard, "error", err)
+			return err
+		}
+		if keyspace == "" {
+			err := fmt.Errorf("migration for context %s is missing keyspace: uuid=%q shard=%q", migrationContext, uuid, shard)
+			s.logger.Warn("migration control will fail because migration row is missing keyspace", "uuid", uuid, "shard", shard, "error", err)
+			return err
+		}
+		if shard == "" {
+			err := fmt.Errorf("migration for context %s is missing shard: uuid=%q keyspace=%q", migrationContext, uuid, keyspace)
+			s.logger.Warn("migration control will fail because migration row is missing shard", "uuid", uuid, "keyspace", keyspace, "error", err)
+			return err
 		}
 		if err := validateSessionString(uuid); err != nil {
 			s.logger.Warn("skipping migration with invalid UUID", "uuid", uuid, "error", err)
 			continue
 		}
-		db, ok := backend.vtgateDBs[keyspace]
-		if !ok {
+		if _, ok := backend.vtgateDBs[keyspace]; !ok {
 			s.logger.Warn("unknown keyspace for migration", "uuid", uuid, "keyspace", keyspace)
 			continue
 		}
-		stmt := fmt.Sprintf("ALTER VITESS_MIGRATION '%s' %s", uuid, action)
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			s.logger.Warn("alter vitess_migration failed", "keyspace", keyspace, "action", action, "uuid", uuid, "error", err)
+		targets[keyspace] = append(targets[keyspace], uuid)
+	}
+
+	var firstErr error
+	for keyspace, uuids := range targets {
+		db := backend.vtgateDBs[keyspace]
+		err := func() error {
+			for _, uuid := range uuids {
+				stmt := fmt.Sprintf("ALTER VITESS_MIGRATION '%s' %s", uuid, action)
+				if _, err := db.ExecContext(ctx, stmt); err != nil {
+					return fmt.Errorf("alter vitess_migration %s %s: %w", uuid, action, err)
+				}
+			}
+			return nil
+		}()
+		if err != nil {
+			s.logger.Warn("alter vitess_migration failed", "keyspace", keyspace, "action", action, "migration_count", len(uuids), "error", err)
 			if firstErr == nil {
-				firstErr = fmt.Errorf("alter vitess_migration %s %s on %s: %w", uuid, action, keyspace, err)
+				firstErr = fmt.Errorf("alter vitess_migration %s on %s: %w", action, keyspace, err)
 			}
 		} else {
-			s.logger.Info("alter vitess_migration", "keyspace", keyspace, "action", action, "uuid", uuid)
+			s.logger.Info("alter vitess_migration", "keyspace", keyspace, "action", action, "migration_count", len(uuids))
 		}
 	}
 	return firstErr
