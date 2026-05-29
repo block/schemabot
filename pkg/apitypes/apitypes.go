@@ -261,7 +261,7 @@ type VolumeResponse struct {
 	NewVolume      int32  `json:"new_volume"`
 }
 
-// ProgressResponse is the HTTP response for GET /api/progress/{database}.
+// ProgressResponse is the HTTP response for GET /api/progress/apply/{apply_id}.
 type ProgressResponse struct {
 	State        string                   `json:"state"`
 	Engine       string                   `json:"engine"`

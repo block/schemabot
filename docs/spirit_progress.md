@@ -6,9 +6,9 @@ How progress data flows from Spirit through SchemaBot to the CLI/TUI
 ## Data flow overview
 
 ```
-Spirit Runner       → Engine wrapper    → LocalClient.Progress → API                   → CLI/TUI
-(in-memory)           (spirit.go)         (local_client.go)      (progress_handlers.go)   (watch_tui.go)
-runner.Progress()     Progress()          Progress()             handleProgress()          fetchProgress()
+Spirit Runner       → Engine wrapper    → LocalClient.Progress → API                          → CLI/TUI
+(in-memory)           (spirit.go)         (local_client.go)      (progress_handlers.go)          (watch_tui.go)
+runner.Progress()     Progress()          Progress()             handleProgressByApplyID()       fetchProgress()
 ```
 
 Each layer adds, transforms, or merges data. Understanding which values are live
@@ -53,7 +53,7 @@ message `"No active schema change"`.
 
 `pkg/tern/local_client.go` `Progress()`:
 
-1. Loads ALL tasks for this database from storage.
+1. Loads ALL tasks for the requested apply from storage.
 2. Picks the most relevant task (priority: running > pending > terminal).
 3. Calls `eng.Progress()` to get live engine data.
 4. Merges live + stored:
@@ -128,8 +128,8 @@ One Spirit runner per table, processed in order. `pollTaskToCompletion` polls ev
 
 ### API (`pkg/api/progress_handlers.go`)
 
-`progressResponseFromProto()` does a direct proto → JSON mapping. `handleProgress()` and
-`handleProgressByApplyID()` add apply-level fields: `apply_id`, `database`, `environment`, `volume`.
+`progressResponseFromProto()` does a direct proto → JSON mapping. `handleProgressByApplyID()`
+adds apply-level fields: `apply_id`, `database`, `environment`, `volume`.
 
 Volume is read from the apply's stored options, not from the engine.
 

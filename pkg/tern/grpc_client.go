@@ -76,8 +76,7 @@ package tern
 //	    │ apply_identifier="apply-abc123"
 //	    ▼
 //	SchemaBot HTTP API
-//	    │ resolveApplyID("apply-abc123")
-//	    │   → storage lookup → external_id="tern-42"
+//	    │ storage lookup → external_id="tern-42"
 //	    ▼
 //	GRPCClient.Progress(ApplyId: "tern-42")
 //	    │
@@ -89,12 +88,12 @@ package tern
 //
 // The API layer generates apply_identifier as a SchemaBot UUID when it queues
 // the apply. The scheduler later dispatches the queued apply to remote Tern and
-// stores Tern's ApplyId as external_id. The resolveApplyID helper translates
-// apply_identifier → external_id before calling Tern.
+// stores Tern's ApplyId as external_id. Apply-scoped HTTP handlers load the
+// stored apply row and send external_id to Tern when it is present.
 //
 // In local mode, LocalClient runs in the same process and writes to the same
-// database as the API layer. There is no remote Tern ID, so external_id stays
-// empty and resolveApplyID falls through to the SchemaBot apply_identifier.
+// database as the API layer. There is no remote Tern ID, so apply-scoped HTTP
+// handlers send the SchemaBot apply_identifier to LocalClient.
 
 import (
 	"context"

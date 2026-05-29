@@ -16,7 +16,6 @@ import (
 	gomysql "github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/secrets"
-	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -373,12 +372,6 @@ func (s *Service) HandleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	s.handleProgressByApplyID(w, r)
 }
 
-// HandleProgress is the HTTP handler for GET /api/progress/{database}.
-// Returns progress for the active apply on the given database/environment.
-func (s *Service) HandleProgress(w http.ResponseWriter, r *http.Request) {
-	s.handleProgress(w, r)
-}
-
 // HandleStatus is the HTTP handler for GET /api/status.
 // Returns recent applies across all databases.
 func (s *Service) HandleStatus(w http.ResponseWriter, r *http.Request) {
@@ -462,7 +455,6 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	// Orchestration API
 	mux.HandleFunc("POST /api/plan", s.handlePlan)
 	mux.HandleFunc("POST /api/apply", s.handleApply)
-	mux.HandleFunc("GET /api/progress/{database}", s.handleProgress)
 	mux.HandleFunc("GET /api/progress/apply/{apply_id}", s.handleProgressByApplyID)
 	mux.HandleFunc("GET /api/history/{database}", s.handleDatabaseHistory)
 	mux.HandleFunc("POST /api/cutover", s.handleCutover)
@@ -488,70 +480,6 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/settings", s.handleSettingsSet)
 
 	// GitHub webhook endpoint — registered externally via RegisterWebhook
-}
-
-// resolveApplyID translates a SchemaBot apply_identifier into the ID that the
-// Tern backend expects.
-//
-// gRPC mode (external_id is set by ExecuteApply when Tern is remote):
-//
-//	caller sends "apply-abc123"
-//	  → storage lookup: apply_identifier="apply-abc123", external_id="tern-42"
-//	  → returns "tern-42" (Tern's ID)
-//	  → GRPCClient sends ApplyId:"tern-42" to remote Tern
-//
-// Local mode (external_id is empty):
-//
-// API-created local applies are queued in the same database as the API layer.
-// They never set external_id because there is no remote Tern; scheduler workers
-// dispatch them through LocalClient.ResumeApply().
-//
-//	caller sends "apply-def456"
-//	  → storage lookup: apply_identifier="apply-def456", external_id=""
-//	  → external_id is empty, falls through to return apply_identifier
-//	  → returns "apply-def456"
-//	  → LocalClient receives ApplyId and scopes to that apply
-func (s *Service) resolveApplyID(ctx context.Context, applyIdentifier string) (string, error) {
-	if applyIdentifier == "" {
-		return "", nil
-	}
-	applyStore := s.storage.Applies()
-	if applyStore == nil {
-		return applyIdentifier, nil
-	}
-	apply, err := applyStore.GetByApplyIdentifier(ctx, applyIdentifier)
-	if err != nil {
-		return "", fmt.Errorf("failed to look up apply %q: %w", applyIdentifier, err)
-	}
-	if apply == nil {
-		return "", fmt.Errorf("apply %q not found", applyIdentifier)
-	}
-	if apply.ExternalID != "" {
-		return apply.ExternalID, nil
-	}
-	return apply.ApplyIdentifier, nil
-}
-
-// findActiveApplyID finds the active (non-terminal) apply for a database/environment
-// and returns the Tern-facing apply ID.
-func (s *Service) findActiveApplyID(ctx context.Context, database, environment string) (string, *storage.Apply, error) {
-	applyStore := s.storage.Applies()
-	if applyStore == nil {
-		return "", nil, nil
-	}
-	applies, err := applyStore.GetByDatabase(ctx, database, "", environment)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to look up active applies for %s/%s: %w", database, environment, err)
-	}
-	for _, apply := range applies {
-		if !state.IsTerminalApplyState(apply.State) {
-			if apply.ExternalID != "" {
-				return apply.ExternalID, apply, nil
-			}
-			return apply.ApplyIdentifier, apply, nil
-		}
-	}
-	return "", nil, nil
 }
 
 // Config returns the service's server configuration.

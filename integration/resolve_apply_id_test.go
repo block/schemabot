@@ -26,16 +26,16 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// TestResolveApplyID_ControlOperations verifies the full gRPC mode flow:
+// TestRemoteApplyID_ControlOperations verifies the full gRPC mode flow:
 //
 //  1. Plan + Apply through SchemaBot HTTP API → GRPCClient → remote Tern
 //  2. SchemaBot generates its own apply_identifier, stores Tern's as external_id
-//  3. apply_identifier != external_id (the whole point of resolveApplyID)
-//  4. Progress (with apply_id, by apply path, by database) all work correctly
+//  3. apply_identifier != external_id
+//  4. Apply-scoped progress resolves to the remote external_id
 //  5. Apply completes end-to-end (Spirit creates the table)
 //
 // Uses a real Tern gRPC server backed by LocalClient + Spirit + MySQL.
-func TestResolveApplyID_ControlOperations(t *testing.T) {
+func TestRemoteApplyID_ControlOperations(t *testing.T) {
 	ctx := t.Context()
 
 	// 1. Use the global Tern gRPC server (set up by TestMain).
@@ -134,22 +134,10 @@ func TestResolveApplyID_ControlOperations(t *testing.T) {
 	storedApply := waitForStoredExternalID(t, st.Applies(), applyIdentifier, 10*time.Second)
 	require.NotEmpty(t, storedApply.ExternalID, "external_id should be set by remote Tern")
 	require.NotEqual(t, applyIdentifier, storedApply.ExternalID,
-		"apply_identifier and external_id must differ — resolveApplyID translates between them")
+		"apply_identifier and external_id must differ")
 	t.Logf("apply_identifier=%s external_id=%s", applyIdentifier, storedApply.ExternalID)
 
-	// 6. Progress with apply_id query param.
-	t.Run("progress with apply_id resolves external_id", func(t *testing.T) {
-		code, body := doGet(t, ctx, baseURL, "/api/progress/"+appDBName+"?environment=staging&apply_id="+applyIdentifier)
-		t.Logf("progress response (%d): %s", code, string(body))
-		require.Equal(t, http.StatusOK, code, string(body))
-
-		var progress map[string]any
-		require.NoError(t, json.Unmarshal(body, &progress))
-		state, _ := progress["state"].(string)
-		assert.NotEmpty(t, state, "expected non-empty state in progress response")
-	})
-
-	// 7. Progress by apply path.
+	// 6. Progress by apply path.
 	t.Run("progress by apply path resolves external_id", func(t *testing.T) {
 		code, body := doGet(t, ctx, baseURL, "/api/progress/apply/"+applyIdentifier)
 		require.Equal(t, http.StatusOK, code, string(body))
@@ -160,21 +148,15 @@ func TestResolveApplyID_ControlOperations(t *testing.T) {
 		assert.NotEmpty(t, state)
 	})
 
-	// 8. Progress by database (no apply_id).
-	t.Run("progress by database finds active apply", func(t *testing.T) {
+	t.Run("progress by database is not registered", func(t *testing.T) {
 		code, body := doGet(t, ctx, baseURL, "/api/progress/"+appDBName+"?environment=staging")
-		require.Equal(t, http.StatusOK, code, string(body))
-
-		var progress map[string]any
-		require.NoError(t, json.Unmarshal(body, &progress))
-		state, _ := progress["state"].(string)
-		assert.NotEmpty(t, state)
+		require.Equal(t, http.StatusNotFound, code, string(body))
 	})
 
-	// 9. Wait for completion.
+	// 7. Wait for completion.
 	waitForState(t, baseURL, applyIdentifier, "completed", 3*time.Minute)
 
-	// 10. Verify the table was actually created.
+	// 8. Verify the table was actually created.
 	testdbDSN := strings.Replace(targetDSN, "/target_test", "/testdb", 1)
 	appDB, err := sql.Open("mysql", testdbDSN)
 	require.NoError(t, err)

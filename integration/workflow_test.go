@@ -1268,12 +1268,14 @@ CREATE TABLE orders (
 		"environment": "staging",
 	})
 	t.Logf("Apply response: %v", applyResp)
+	applyID, ok := applyResp["apply_id"].(string)
+	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResp)
 
 	// Step 3: Poll progress until we see failed state
 	var lastState string
 	var errorMessage string
 	for range 30 {
-		progressHTTPReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/api/progress/"+appDBName+"?environment=staging", nil)
+		progressHTTPReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/api/progress/apply/"+applyID, nil)
 		require.NoError(t, err, "create progress request")
 		resp, err := http.DefaultClient.Do(progressHTTPReq)
 		require.NoError(t, err, "GET /api/progress error")
@@ -1377,7 +1379,9 @@ CREATE TABLE ccc_cancelled (
 		"plan_id":     planID,
 		"environment": "staging",
 	})
-	t.Logf("Apply started: %v", applyResp["apply_id"])
+	applyID, ok := applyResp["apply_id"].(string)
+	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResp)
+	t.Logf("Apply started: %v", applyID)
 
 	// Step 3: Poll progress until the retryable failure is durable in storage.
 	// The request that observes the engine failure can briefly return failed
@@ -1386,7 +1390,7 @@ CREATE TABLE ccc_cancelled (
 	var errorMessage string
 	var finalTables []any
 	for range 60 {
-		progressHTTPReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/api/progress/"+appDBName+"?environment=staging", nil)
+		progressHTTPReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/api/progress/apply/"+applyID, nil)
 		require.NoError(t, err, "create progress request")
 		resp, err := http.DefaultClient.Do(progressHTTPReq)
 		require.NoError(t, err, "GET /api/progress error")

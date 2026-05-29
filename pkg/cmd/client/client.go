@@ -151,27 +151,32 @@ func GetDatabaseHistory(endpoint, database, environment string) (*apitypes.Datab
 	return &result, nil
 }
 
-// CheckActiveSchemaChange checks if there's an active schema change for the database.
-// Returns nil if no active schema change.
+// CheckActiveSchemaChange checks status for an active schema change on the
+// database/environment pair. Returns nil if no active schema change is listed.
 type ActiveSchemaChange struct {
 	State   string
 	ApplyID string
 }
 
 func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSchemaChange, error) {
-	var result apitypes.ProgressResponse
-	path := fmt.Sprintf("/api/progress/%s?environment=%s", url.PathEscape(database), url.QueryEscape(environment))
-	if err := doGetInto(endpoint, path, &result); err != nil {
-		if IsNotFound(err) {
-			return nil, nil
-		}
+	var result apitypes.StatusResponse
+	query := url.Values{}
+	query.Set("environment", environment)
+	query.Set("limit", "1000")
+	if err := doGetInto(endpoint, "/api/status?"+query.Encode(), &result); err != nil {
 		return nil, err
 	}
 
-	if state.IsState(result.State, state.NoActiveChange) {
-		return nil, nil
+	for _, apply := range result.Applies {
+		if apply.Database != database || apply.Environment != environment {
+			continue
+		}
+		if state.IsTerminalApplyState(apply.State) {
+			continue
+		}
+		return &ActiveSchemaChange{State: apply.State, ApplyID: apply.ApplyID}, nil
 	}
-	return &ActiveSchemaChange{State: result.State, ApplyID: result.ApplyID}, nil
+	return nil, nil
 }
 
 // ReadSchemaFiles reads .sql files from a directory and groups them by namespace.

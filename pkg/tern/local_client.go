@@ -626,7 +626,7 @@ func (c *LocalClient) getEngine() engine.Engine {
 
 // Progress returns detailed progress for an active schema change.
 // Returns ALL tasks for the current apply: completed, running, and pending.
-// If req.ApplyId is set, scopes to that specific apply. Otherwise queries by database.
+// req.ApplyId is required so progress is always scoped to a single apply.
 func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	var tasks []*storage.Task
 	var err error

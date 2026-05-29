@@ -34,7 +34,6 @@ Plan requests resolve `database + environment` through server config, then store
 |--------|------|---------|-------------|
 | POST | `/api/plan` | `handlePlan` | Generate a schema change plan |
 | POST | `/api/apply` | `handleApply` | Execute a plan |
-| GET | `/api/progress/{database}` | `handleProgress` | Poll progress for latest schema change for a database |
 | GET | `/api/progress/apply/{apply_id}` | `handleProgressByApplyID` | Progress by apply ID |
 
 ### Control Operations

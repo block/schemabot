@@ -218,20 +218,6 @@ func grpcApply(t *testing.T, planID, env string, opts map[string]string) grpcApp
 	return result
 }
 
-func grpcProgress(t *testing.T, database, env string) grpcProgressResponse {
-	t.Helper()
-	path := fmt.Sprintf("/api/progress/%s?environment=%s", database, env)
-	resp := grpcGet(t, path)
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		require.Failf(t, "progress failed", "status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-	var result grpcProgressResponse
-	grpcDecodeJSON(t, resp, &result)
-	return result
-}
-
 func grpcProgressByApplyID(t *testing.T, applyID string) grpcProgressResponse {
 	t.Helper()
 	path := fmt.Sprintf("/api/progress/apply/%s", applyID)
@@ -246,27 +232,27 @@ func grpcProgressByApplyID(t *testing.T, applyID string) grpcProgressResponse {
 	return result
 }
 
-func grpcWaitForState(t *testing.T, database, env, expectedState string, timeout time.Duration) {
+func grpcWaitForApplyState(t *testing.T, applyID, expectedState string, timeout time.Duration) {
 	t.Helper()
 	var lastState string
 	testutil.Poll(t, timeout, 500*time.Millisecond,
 		func() bool {
-			prog := grpcProgress(t, database, env)
+			prog := grpcProgressByApplyID(t, applyID)
 			lastState = prog.State
 			return state.IsState(prog.State, expectedState)
 		},
 		func() string {
-			return fmt.Sprintf("waiting for state %q, last state: %s", expectedState, lastState)
+			return fmt.Sprintf("waiting for apply %s state %q, last state: %s", applyID, expectedState, lastState)
 		},
 	)
 }
 
-func grpcWaitForAnyState(t *testing.T, database, env string, expectedStates []string, timeout time.Duration) string {
+func grpcWaitForApplyAnyState(t *testing.T, applyID string, expectedStates []string, timeout time.Duration) string {
 	t.Helper()
 	var lastState, matched string
 	testutil.Poll(t, timeout, 500*time.Millisecond,
 		func() bool {
-			prog := grpcProgress(t, database, env)
+			prog := grpcProgressByApplyID(t, applyID)
 			lastState = prog.State
 			for _, expectedState := range expectedStates {
 				if state.IsState(prog.State, expectedState) {
@@ -277,7 +263,7 @@ func grpcWaitForAnyState(t *testing.T, database, env string, expectedStates []st
 			return false
 		},
 		func() string {
-			return fmt.Sprintf("waiting for any of states %v, last state: %s", expectedStates, lastState)
+			return fmt.Sprintf("waiting for apply %s any of states %v, last state: %s", applyID, expectedStates, lastState)
 		},
 	)
 	return matched
@@ -289,52 +275,30 @@ func grpcEnsureNoActiveChange(t *testing.T, database, env string) {
 
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		prog := grpcProgress(t, database, env)
+		active := grpcFindLatestApplyForDatabase(t, database, env)
 
-		// No active change includes completed because in gRPC mode,
-		// completed tasks are terminal and don't hold locks. The Tern service's
-		// SkipRevert requires a non-terminal task, so we clear storage directly instead.
-		if state.IsState(prog.State, state.NoActiveChange, state.Apply.Completed, state.Apply.RevertWindow, state.Apply.Reverted) {
-			// Clean up Tern storage so the next test starts with a fresh state
+		// Completed and reverted tasks are terminal and don't hold locks. The
+		// Tern service's SkipRevert requires a non-terminal task, so tests clear
+		// storage directly instead.
+		if active == nil || state.IsTerminalApplyState(active.State) ||
+			state.IsState(active.State, state.Apply.RevertWindow, state.Apply.Reverted) {
 			grpcClearTernStorage(t, env)
 			grpcClearSchemabotState(t)
 			return
 		}
 
-		// Failed - clear all state
-		if state.IsState(prog.State, state.Apply.Failed, state.Apply.FailedRetryable) {
+		if state.IsState(active.State, state.Apply.FailedRetryable) {
 			grpcClearTernStorage(t, env)
 			grpcClearSchemabotState(t)
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 
-		// Stopped - start it so it can reach completion
-		if state.IsState(prog.State, state.Apply.Stopped) {
-			if prog.ApplyID == "" {
-				grpcClearTernStorage(t, env)
-				grpcClearSchemabotState(t)
-				return
-			}
-			resp := grpcPost(t, "/api/start", map[string]string{
-				"environment": env,
-				"apply_id":    prog.ApplyID,
-			})
-			_ = resp.Body.Close()
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
 		// Waiting for cutover - trigger it
-		if state.IsState(prog.State, state.Apply.WaitingForCutover) {
-			if prog.ApplyID == "" {
-				grpcClearTernStorage(t, env)
-				grpcClearSchemabotState(t)
-				return
-			}
+		if state.IsState(active.State, state.Apply.WaitingForCutover) {
 			resp := grpcPost(t, "/api/cutover", map[string]string{
 				"environment": env,
-				"apply_id":    prog.ApplyID,
+				"apply_id":    active.ApplyID,
 			})
 			_ = resp.Body.Close()
 			time.Sleep(1 * time.Second)
@@ -514,12 +478,24 @@ type grpcStatusApplyEntry struct {
 
 func grpcStatus(t *testing.T) grpcStatusResponse {
 	t.Helper()
-	resp := grpcGet(t, "/api/status")
+	resp := grpcGet(t, "/api/status?limit=1000")
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode, "status endpoint returned non-200")
 	var result grpcStatusResponse
 	grpcDecodeJSON(t, resp, &result)
 	return result
+}
+
+func grpcFindLatestApplyForDatabase(t *testing.T, database, env string) *grpcStatusApplyEntry {
+	t.Helper()
+	status := grpcStatus(t)
+	for i := range status.Applies {
+		apply := status.Applies[i]
+		if apply.Database == database && apply.Environment == env {
+			return &apply
+		}
+	}
+	return nil
 }
 
 // grpcWaitForStatusState polls the /api/status endpoint until the given

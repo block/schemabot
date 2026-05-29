@@ -537,8 +537,8 @@ Apply flow:
 
 Subsequent RPCs (Progress, Stop, Start, Cutover, Volume):
   HTTP caller sends apply_id="apply-abc123"
-    → resolveApplyID("apply-abc123")
-    → storage lookup → external_id="tern-42"
+    → storage lookup for apply "apply-abc123"
+    → external_id="tern-42"
     → GRPCClient sends ApplyId:"tern-42" to Tern
 ```
 
@@ -557,9 +557,8 @@ Apply flow (local):
 
 Subsequent RPCs (local):
   HTTP caller sends apply_id="apply-def456"
-    → resolveApplyID("apply-def456")
-    → storage lookup → external_id="" (empty)
-    → falls through to return apply_identifier="apply-def456"
+    → storage lookup for apply "apply-def456"
+    → external_id="" (empty)
     → LocalClient receives ApplyId:"apply-def456"
     → scopes task lookup to that apply
 ```

@@ -63,12 +63,9 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// Check for existing active schema change
 	active, err := client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
 	if err != nil {
-		// Ignore errors - progress API may fail if no schema change exists
-	} else if active != nil && active.State != "" && !state.IsState(active.State, state.NoActiveChange) {
+		// Ignore status preflight errors; apply is still guarded server-side.
+	} else if active != nil && active.State != "" {
 		progressCmd := fmt.Sprintf("schemabot status %s", active.ApplyID)
-		if active.ApplyID == "" {
-			progressCmd = fmt.Sprintf("schemabot status -d %s -e %s", cfg.Database, cmd.Environment)
-		}
 		var stateMsg string
 		switch {
 		case state.IsState(active.State, state.Apply.WaitingForDeploy):
@@ -90,11 +87,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 			fmt.Println(stateMsg)
 			fmt.Println()
 			if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
-				if active.ApplyID != "" {
-					fmt.Printf("To trigger cutover:  schemabot cutover -e %s %s\n", cmd.Environment, active.ApplyID)
-				} else {
-					fmt.Printf("To find the apply ID: schemabot status -d %s -e %s\n", cfg.Database, cmd.Environment)
-				}
+				fmt.Printf("To trigger cutover:  schemabot cutover -e %s %s\n", cmd.Environment, active.ApplyID)
 			}
 			fmt.Printf("To watch and manage: %s\n", progressCmd)
 			return fmt.Errorf("schema change already in progress")

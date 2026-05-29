@@ -38,8 +38,8 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	// Check for existing active schema change
 	active, err := client.CheckActiveSchemaChange(ep, database, environment)
 	if err != nil {
-		// Ignore errors - progress API may fail if no schema change exists
-	} else if active != nil && active.State != "" && !state.IsState(active.State, state.NoActiveChange) {
+		// Ignore status preflight errors; apply is still guarded server-side.
+	} else if active != nil && active.State != "" {
 		switch {
 		case state.IsState(active.State, state.Apply.WaitingForDeploy):
 			return fmt.Errorf("cannot rollback: a schema change is waiting for deploy")
