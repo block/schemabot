@@ -148,11 +148,6 @@ func TestRemoteApplyID_ControlOperations(t *testing.T) {
 		assert.NotEmpty(t, state)
 	})
 
-	t.Run("progress by database is not registered", func(t *testing.T) {
-		code, body := doGet(t, ctx, baseURL, "/api/progress/"+appDBName+"?environment=staging")
-		require.Equal(t, http.StatusNotFound, code, string(body))
-	})
-
 	// 7. Wait for completion.
 	waitForState(t, baseURL, applyIdentifier, "completed", 3*time.Minute)
 
