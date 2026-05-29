@@ -381,6 +381,209 @@ func (c *GRPCClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1
 	return c.client.Stop(ctx, req)
 }
 
+func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+	controlReq, err := pendingStopControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return false, err
+	}
+	if controlReq == nil {
+		return false, nil
+	}
+	if completed, err := completePendingStopIfStoredApplyResolved(ctx, c.storage, apply); err != nil {
+		return true, err
+	} else if completed {
+		slog.Info("completing pending gRPC stop request for resolved apply",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Pending remote stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		return true, nil
+	}
+	if state.IsTerminalApplyState(apply.State) {
+		slog.Info("completing pending gRPC stop request for terminal apply",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Pending remote stop request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	if apply.ExternalID == "" {
+		if err := c.stopUndispatchedApply(ctx, apply, controlRequestCaller(controlReq)); err != nil {
+			return true, err
+		}
+		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+
+	resp, err := c.client.Stop(ctx, &ternv1.StopRequest{
+		ApplyId:     apply.ExternalID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		if completed, completeErr := c.completeRemoteStopFromTerminalProgress(ctx, apply, controlReq); completeErr == nil && completed {
+			return true, nil
+		} else if completeErr != nil {
+			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w; terminal progress reconciliation also failed: %w", apply.ApplyIdentifier, apply.ExternalID, err, completeErr)
+		}
+		return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, apply.ExternalID, err)
+	}
+	if resp == nil || !resp.Accepted {
+		errorMessage := "not accepted"
+		if resp != nil && resp.ErrorMessage != "" {
+			errorMessage = resp.ErrorMessage
+		}
+		return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %s", apply.ApplyIdentifier, apply.ExternalID, errorMessage)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Remote stop accepted for apply %s%s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+
+	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ExternalID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, apply.ExternalID, err)
+	}
+	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
+		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: no active schema change", apply.ApplyIdentifier, apply.ExternalID)
+	}
+	remoteState := ProtoStateToStorage(progress.State)
+	if remoteState == "" {
+		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: unmapped remote state %s", apply.ApplyIdentifier, apply.ExternalID, remoteApplyStateDescription(progress.State))
+	}
+	now := time.Now()
+	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
+		apply.StartedAt = &now
+	}
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState)
+	apply.UpdatedAt = now
+	if isTerminalProtoState(progress.State) {
+		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now); err != nil {
+			return true, err
+		}
+		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+
+	storedTasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return true, fmt.Errorf("load tasks to sync remote gRPC stop for %s: %w", apply.ApplyIdentifier, err)
+	}
+	if err := c.syncStoredTasksFromRemoteTasks(ctx, apply, storedTasks, progress.Tables, now); err != nil {
+		return true, err
+	}
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return true, fmt.Errorf("sync nonterminal remote gRPC stop state for %s: %w", apply.ApplyIdentifier, err)
+	}
+	return true, fmt.Errorf("remote gRPC stop for apply %s accepted but remote state is still %s", apply.ApplyIdentifier, remoteState)
+}
+
+func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest) (bool, error) {
+	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ExternalID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		slog.Warn("remote gRPC stop error could not be reconciled from progress",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"error", err)
+		return false, nil
+	}
+	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !isTerminalProtoState(progress.State) {
+		slog.Warn("remote gRPC stop error found nonterminal progress; durable stop request remains pending for scheduler retry",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"remote_state", progress.State.String(),
+			"remote_state_number", int32(progress.State))
+		return false, nil
+	}
+	remoteState := ProtoStateToStorage(progress.State)
+	if remoteState == "" {
+		return false, fmt.Errorf("sync remote gRPC stop for apply %s remote %s after stop error: unmapped remote state %s", apply.ApplyIdentifier, apply.ExternalID, remoteApplyStateDescription(progress.State))
+	}
+	now := time.Now()
+	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
+		apply.StartedAt = &now
+	}
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState)
+	apply.UpdatedAt = now
+	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now); err != nil {
+		return false, err
+	}
+	if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+		return false, err
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Remote stop request completed from terminal progress after stop error%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+	return true, nil
+}
+
+func (c *GRPCClient) stopUndispatchedApply(ctx context.Context, apply *storage.Apply, caller string) error {
+	now := time.Now()
+	taskState := state.Task.Stopped
+	applyState := state.Apply.Stopped
+	if apply.DatabaseType == storage.DatabaseTypeVitess {
+		taskState = state.Task.Cancelled
+		applyState = state.Apply.Cancelled
+	}
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("load tasks for undispatched stop %s: %w", apply.ApplyIdentifier, err)
+	}
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			slog.Info("leaving terminal gRPC task unchanged during undispatched stop",
+				"apply_id", apply.ApplyIdentifier,
+				"task_id", task.TaskIdentifier,
+				"table", task.TableName,
+				"task_state", task.State)
+			continue
+		}
+		task.State = taskState
+		if state.IsState(taskState, state.Task.Cancelled) {
+			task.CompletedAt = &now
+		}
+		task.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			return fmt.Errorf("update task %s for undispatched stop %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
+	}
+	oldState := apply.State
+	apply.State = applyState
+	apply.CompletedAt = nil
+	if state.IsState(applyState, state.Apply.Cancelled) {
+		apply.CompletedAt = &now
+	}
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return fmt.Errorf("update undispatched stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply stopped before dispatch: %s%s", apply.State, callerApplyLogSuffix(caller)), oldState)
+	return nil
+}
+
 func (c *GRPCClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	return c.client.Start(ctx, req)
 }
@@ -420,6 +623,9 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 	if apply == nil {
 		return fmt.Errorf("apply is required")
 	}
+	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+		return err
+	}
 
 	if shouldDispatchQueuedRemoteApply(apply) {
 		return c.dispatchPendingApply(ctx, apply)
@@ -439,6 +645,9 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 	startRequested := startControlReq != nil
 
 	if apply.ExternalID != "" && state.IsState(apply.State, state.Apply.Pending) && !startRequested {
+		if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+			return err
+		}
 		_, err := c.client.Start(ctx, &ternv1.StartRequest{
 			ApplyId:     apply.ExternalID,
 			Environment: apply.Environment,
@@ -525,6 +734,9 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 
 		// Only call Start if Tern confirms the apply is actually stopped.
 		if state.IsState(apply.State, state.Apply.Stopped) {
+			if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+				return err
+			}
 			_, err := c.client.Start(ctx, &ternv1.StartRequest{
 				ApplyId:     apply.ExternalID,
 				Environment: apply.Environment,
@@ -612,6 +824,9 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	target := options["target"]
 	if target == "" {
 		target = apply.Database
+	}
+	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+		return err
 	}
 
 	resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
@@ -947,6 +1162,11 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 		if err != nil {
 			return err
 		}
+		if storedApply != nil && state.IsTerminalApplyState(storedApply.State) {
+			if err := completePendingStopControlRequests(ctx, c.storage, storedApply); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 
@@ -981,6 +1201,9 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	storedApply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, storedApply); err != nil {
 		return fmt.Errorf("update terminal remote gRPC apply %s: %w", storedApply.ApplyIdentifier, err)
+	}
+	if err := completePendingStopControlRequests(ctx, c.storage, storedApply); err != nil {
+		return err
 	}
 	// Stopped is a terminal apply state, but it is not completion of a pending
 	// Start request. A start can be queued while the previous worker is still
@@ -1204,6 +1427,18 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				return fmt.Errorf("heartbeat gRPC apply %s: %w", apply.ApplyIdentifier, err)
 			}
 		case <-ticker.C:
+			if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+				slog.Warn("pending gRPC stop request processing failed; current apply owner will exit for scheduler retry",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"error", err)
+				return err
+			} else if handled {
+				return nil
+			}
+
 			// Poll progress from remote Tern
 			resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
 				ApplyId:     apply.ExternalID,

@@ -90,6 +90,7 @@ type controlTestStorage struct {
 	tasks           storage.TaskStore
 	applyLogs       storage.ApplyLogStore
 	vitessApplyData storage.VitessApplyDataStore
+	controlRequests storage.ControlRequestStore
 }
 
 func (s *controlTestStorage) Applies() storage.ApplyStore {
@@ -106,6 +107,13 @@ func (s *controlTestStorage) ApplyLogs() storage.ApplyLogStore {
 
 func (s *controlTestStorage) VitessApplyData() storage.VitessApplyDataStore {
 	return s.vitessApplyData
+}
+
+func (s *controlTestStorage) ControlRequests() storage.ControlRequestStore {
+	if s.controlRequests != nil {
+		return s.controlRequests
+	}
+	return &testControlRequestStore{}
 }
 
 type controlCaptureEngine struct {

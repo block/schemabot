@@ -38,6 +38,15 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	var stoppedByUser bool
 
 	for i, task := range tasks {
+		if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+			c.logger.Warn("pending stop request processing failed; current apply owner will exit for scheduler retry",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+			return
+		} else if handled {
+			stoppedByUser = true
+			break
+		}
+
 		action := c.checkTaskReady(ctx, task)
 		if action == taskStopped {
 			stoppedByUser = true
@@ -53,7 +62,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			"elapsed_ms", time.Since(seqStart).Milliseconds(),
 		)
 
-		action = c.runEngineTask(ctx, task, plan, options, creds)
+		action = c.runEngineTask(ctx, apply, task, plan, options, creds)
 
 		// Notify observer after each task completes
 		if obs := c.getObserver(apply.ID); obs != nil {
@@ -63,6 +72,9 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		if action == taskFailed {
 			failedTask = task
 			break
+		}
+		if action == taskAbort {
+			return
 		}
 		if action == taskStopped {
 			stoppedByUser = true
@@ -89,6 +101,7 @@ const (
 	taskFailed                     // Task failed, stop processing
 	taskStopped                    // Task/apply was stopped by user, stop processing
 	taskSkip                       // Task should be skipped (error fetching state)
+	taskAbort                      // Current owner should exit without changing final state
 )
 
 // checkTaskReady verifies a task is ready to execute by checking context cancellation
@@ -122,7 +135,15 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, task *storage.Task) ta
 
 // runEngineTask calls the engine for a single DDL, marks the task running, and polls to completion.
 // Returns the outcome: taskContinue (completed), taskFailed, or taskStopped.
-func (c *LocalClient) runEngineTask(ctx context.Context, task *storage.Task, plan *storage.Plan, options map[string]string, creds *engine.Credentials) taskAction {
+func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, plan *storage.Plan, options map[string]string, creds *engine.Credentials) taskAction {
+	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+		c.logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for scheduler retry",
+			"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+		return taskAbort
+	} else if handled {
+		return taskStopped
+	}
+
 	// Sequential mode: one DDL per engine call. Use the task identifier as
 	// MigrationContext so each table's schema change is tracked independently.
 	result, err := c.getEngine().Apply(ctx, &engine.ApplyRequest{
@@ -158,7 +179,10 @@ func (c *LocalClient) runEngineTask(ctx context.Context, task *storage.Task, pla
 	c.logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
 	// Poll to completion
-	c.pollTaskToCompletion(ctx, task, creds)
+	pollAction := c.pollTaskToCompletion(ctx, apply, task, creds)
+	if pollAction == taskAbort || pollAction == taskStopped {
+		return pollAction
+	}
 
 	switch task.State {
 	case state.Task.Failed, state.Task.FailedRetryable:
@@ -224,7 +248,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
 
 // pollTaskToCompletion polls a single task to completion (sequential mode).
-func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Task, creds *engine.Credentials) {
+func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials) taskAction {
 	eng := c.getEngine()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -232,8 +256,17 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Ta
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return taskStopped
 		case <-ticker.C:
+			if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+				c.logger.Warn("pending stop request processing failed; current apply owner will exit for scheduler retry",
+					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+				return taskAbort
+			} else if handled {
+				task.State = state.Task.Stopped
+				return taskStopped
+			}
+
 			// Re-fetch task state from storage to detect external changes (e.g., Stop).
 			// This also guards against a race where a new apply starts and the engine's
 			// runningMigration no longer corresponds to this task.
@@ -241,7 +274,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Ta
 			if fetchErr == nil && freshTask != nil && state.IsTerminalTaskState(freshTask.State) {
 				// Task was already marked terminal externally — stop polling
 				task.State = freshTask.State
-				return
+				return taskContinue
 			}
 
 			result, err := eng.Progress(ctx, &engine.ProgressRequest{
@@ -299,7 +332,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, task *storage.Ta
 					"rows_copied", task.RowsCopied,
 					"rows_total", task.RowsTotal,
 				)
-				return
+				return taskContinue
 			}
 
 			c.transitionTaskState(ctx, task, 0, task.State, "")
@@ -344,6 +377,20 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 // pending tasks queued for scheduler recovery.
 func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) {
 	now := time.Now()
+	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
+		c.logger.Error("failed to reload apply before sequential finalization", "apply_id", apply.ApplyIdentifier, "error", err)
+		return
+	} else if freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
+		c.logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
+			"apply_id", apply.ApplyIdentifier,
+			"stored_state", freshApply.State)
+		*apply = *freshApply
+		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending stop request for terminal sequential apply",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+		}
+		return
+	}
 	switch {
 	case failedTask != nil && failedTask.State == state.Task.FailedRetryable:
 		apply.State = state.Apply.FailedRetryable
@@ -367,6 +414,13 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+	}
+	if state.IsTerminalApplyState(apply.State) {
+		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending stop request after sequential finalization",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+			return
+		}
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 

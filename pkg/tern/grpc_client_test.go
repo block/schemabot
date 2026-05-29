@@ -345,6 +345,7 @@ type capturingTernServer struct {
 	applyReq         *ternv1.ApplyRequest
 	applyErr         error
 	remoteApplyID    string
+	stopApplyID      string
 	startApplyID     string
 	progressApplyID  string
 	progressReq      *ternv1.ProgressRequest
@@ -382,6 +383,13 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 	return &ternv1.StartResponse{Accepted: true}, nil
 }
 
+func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
+	s.mu.Lock()
+	s.stopApplyID = req.ApplyId
+	s.mu.Unlock()
+	return &ternv1.StopResponse{Accepted: true}, nil
+}
+
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
 	s.progressReq = &ternv1.ProgressRequest{
@@ -413,6 +421,12 @@ func (s *capturingTernServer) getStartApplyID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.startApplyID
+}
+
+func (s *capturingTernServer) getStopApplyID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopApplyID
 }
 
 func (s *capturingTernServer) getProgressApplyID() string {
@@ -1742,6 +1756,65 @@ func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
+}
+
+func TestGRPCClient_ResumeApplyProcessesQueuedStop(t *testing.T) {
+	// A pending durable stop is processed by the scheduler-owned worker before
+	// resume/start work. The worker mirrors remote stopped progress to storage
+	// before completing the durable request.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			TableName: "users",
+			Status:    state.Task.Stopped,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-stop-claimed",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		ExternalID:      "remote-stop-claimed",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-claimed",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.NoError(t, err)
+
+	assert.Equal(t, "remote-stop-claimed", server.getStopApplyID())
+	assert.Equal(t, "remote-stop-claimed", server.getProgressApplyID())
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Equal(t, state.Task.Stopped, task.State)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote stop accepted for apply remote-stop-claimed (caller: cli:alice)"))
 }
 
 func TestGRPCClient_ResumeApplyCompletesQueuedStartWhenRemoteAlreadyActive(t *testing.T) {

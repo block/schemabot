@@ -15,10 +15,12 @@ import (
 // Cutover triggers the cutover phase when defer_cutover was used.
 func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	var task *storage.Task
+	var apply *storage.Apply
 	var err error
 
 	if req.ApplyId != "" {
-		apply, lookupErr := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+		var lookupErr error
+		apply, lookupErr = c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
 		if lookupErr != nil || apply == nil {
 			return nil, fmt.Errorf("apply %s not found", req.ApplyId)
 		}
@@ -41,6 +43,23 @@ func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (
 
 	if task == nil {
 		return nil, fmt.Errorf("no active schema change")
+	}
+	if apply == nil {
+		apply, err = c.storage.Applies().Get(ctx, task.ApplyID)
+		if err != nil {
+			return nil, fmt.Errorf("load apply %d before cutover: %w", task.ApplyID, err)
+		}
+		if apply == nil {
+			return nil, fmt.Errorf("load apply %d before cutover: %w", task.ApplyID, storage.ErrApplyNotFound)
+		}
+	}
+	if controlReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+		return nil, fmt.Errorf("check pending stop request before cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	} else if controlReq != nil {
+		c.logger.Info("cutover blocked because stop request is pending",
+			"apply_id", apply.ApplyIdentifier,
+			"requested_by", controlRequestCaller(controlReq))
+		return nil, fmt.Errorf("schema change has a pending stop request; cutover is blocked until stop is processed")
 	}
 
 	creds := c.credentials()
@@ -69,6 +88,10 @@ func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (
 
 // Stop pauses an in-progress schema change.
 func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
+	return c.stop(ctx, req, "")
+}
+
+func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller string) (*ternv1.StopResponse, error) {
 	c.logger.Info("Stop requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
 	tasks, err := c.storage.Tasks().GetByDatabase(ctx, c.config.Database)
 	if err != nil {
@@ -77,12 +100,14 @@ func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv
 
 	// If an apply_id was specified, resolve it and filter tasks to that apply only.
 	var targetApplyID int64
+	var targetApply *storage.Apply
 	if req.ApplyId != "" {
 		apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
 		if err != nil || apply == nil {
 			return nil, fmt.Errorf("apply %s not found", req.ApplyId)
 		}
 		targetApplyID = apply.ID
+		targetApply = apply
 	}
 
 	creds := c.credentials()
@@ -128,9 +153,14 @@ func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv
 			// and call failApplyWithTasks, but we set cancelled first so the
 			// apply record reflects the true outcome. failApplyWithTasks skips
 			// tasks already in terminal state, so the cancelled tasks are preserved.
-			c.markApplyCancelled(ctx, applyID)
+			if err := c.markApplyCancelled(ctx, applyID); err != nil {
+				return nil, err
+			}
 		} else if err := c.markApplyStopped(ctx, applyID); err != nil {
 			return nil, err
+		}
+		if caller != "" {
+			eventMsg += callerApplyLogSuffix(caller)
 		}
 		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			eventMsg, "", "")
@@ -143,6 +173,17 @@ func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv
 	// Edge case: stop was requested but all tasks had already completed.
 	// Mark the apply as completed so the TUI sees a clean terminal state.
 	if stoppedCount == 0 && skippedCount > 0 && applyID > 0 {
+		if targetApply != nil && state.IsTerminalApplyState(targetApply.State) && !state.IsState(targetApply.State, state.Apply.Completed) {
+			c.logger.Info("all tasks are terminal and apply is already terminal; preserving apply state during stop",
+				"apply_id", targetApply.ApplyIdentifier,
+				"state", targetApply.State,
+				"skipped_count", skippedCount)
+			return &ternv1.StopResponse{
+				Accepted:     true,
+				StoppedCount: 0,
+				SkippedCount: skippedCount,
+			}, nil
+		}
 		return c.handleStopAllCompleted(ctx, applyID, skippedCount)
 	}
 
@@ -151,6 +192,63 @@ func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
 	}, nil
+}
+
+func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+	controlReq, err := pendingStopControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return false, err
+	}
+	if controlReq == nil {
+		return false, nil
+	}
+	if completed, err := completePendingStopIfStoredApplyResolved(ctx, c.storage, apply); err != nil {
+		return true, err
+	} else if completed {
+		c.logger.Info("completing pending stop request for resolved apply",
+			"apply_id", apply.ApplyIdentifier,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Pending stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		return true, nil
+	}
+	if state.IsTerminalApplyState(apply.State) {
+		c.logger.Info("completing pending stop request for terminal apply",
+			"apply_id", apply.ApplyIdentifier,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Pending stop request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+
+	stopCtx := context.WithoutCancel(ctx)
+	resp, err := c.stop(stopCtx, &ternv1.StopRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: apply.Environment,
+	}, controlRequestCaller(controlReq))
+	if err != nil {
+		return true, fmt.Errorf("process pending stop for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if resp == nil || !resp.Accepted {
+		errorMessage := "not accepted"
+		if resp != nil && resp.ErrorMessage != "" {
+			errorMessage = resp.ErrorMessage
+		}
+		return true, fmt.Errorf("process pending stop for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+	}
+	completed, err := completePendingStopIfStoredApplyResolved(stopCtx, c.storage, apply)
+	if err != nil {
+		return true, err
+	}
+	if !completed {
+		return true, fmt.Errorf("process pending stop for apply %s: storage did not reach a resolved stop state", apply.ApplyIdentifier)
+	}
+	return true, nil
 }
 
 // stopEngineForTasks calls eng.Stop() if any targeted task is actively running.
@@ -300,19 +398,22 @@ func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) error
 // databases where cancelling the deploy request is permanent. This runs before
 // the apply goroutine sees the context cancellation, so failApplyWithTasks
 // will find the apply already terminal and leave it alone.
-func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) {
+func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) error {
 	apply, err := c.storage.Applies().Get(ctx, applyID)
-	if err != nil || apply == nil {
-		c.logger.Error("failed to load apply for cancellation", "apply_id", applyID, "error", err)
-		return
+	if err != nil {
+		return fmt.Errorf("load apply %d for cancelled state: %w", applyID, err)
+	}
+	if apply == nil {
+		return fmt.Errorf("load apply %d for cancelled state: %w", applyID, storage.ErrApplyNotFound)
 	}
 	now := time.Now()
 	apply.State = state.Apply.Cancelled
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to mark apply as cancelled", "apply_id", apply.ApplyIdentifier, "error", err)
+		return fmt.Errorf("mark apply %s cancelled: %w", apply.ApplyIdentifier, err)
 	}
+	return nil
 }
 
 // controlSetup resolves the active task, credentials, and engine for a control operation.

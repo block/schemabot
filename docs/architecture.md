@@ -149,6 +149,40 @@ Each engine uses shared external signals for control:
 These signals are durable and accessible from any instance — the engine running in
 the background detects the signal regardless of which SchemaBot instance triggered it.
 
+SchemaBot also stores durable control requests for operations whose accepted
+intent must survive API handler exits or process restarts. For example, `stop`
+and stopped-state `start` requests are recorded in `apply_control_requests`
+before the engine side effect is performed. The active scheduler-owned apply
+worker consumes the request, performs or forwards the engine control operation,
+syncs SchemaBot storage to the resulting state, and only then marks the control
+request completed.
+
+`stop` is the highest-priority control intent. Once SchemaBot accepts a stop
+request, no actor should knowingly advance that apply toward deploy, cutover, or
+completion until the stop request has been observed and processed. The API
+therefore records the durable stop request first, then immediately attempts a
+safe engine stop as a fast path for local/in-process Tern clients. If the
+immediate stop succeeds, the active engine is interrupted without waiting for the
+scheduler owner's next poll. If it fails or is not accepted, SchemaBot logs the
+result and leaves the durable request pending so the current owner, or a later
+recovered owner, can retry and reconcile final state. Remote gRPC Tern clients
+skip the API fast path because the scheduler owner must both stop the remote
+data plane and reconcile SchemaBot's local storage in one owner-controlled flow.
+
+Forward-progress controls must fail closed while a stop is pending. User-driven
+cutover is rejected when a pending stop request exists, and scheduler-owned
+pollers check for pending stops before continuing progress work. This avoids the
+unsafe interleaving where `/api/stop` returns accepted while another path moves
+the same apply from `waiting_for_cutover` into cutover or completion before the
+stop can be applied.
+
+This preserves single-owner semantics for running applies: a fresh running apply
+with a pending stop request is still owned by its current worker, not claimed by
+a second scheduler worker. If that worker or process exits before acting, the
+stale heartbeat makes the apply claimable through the normal scheduler recovery
+path, and the next worker processes the pending control request before resuming
+or dispatching more work.
+
 ## Tern Layer (Orchestrator)
 
 Tern is the orchestration layer. It manages the schema change lifecycle: creating records, calling the engine, polling for progress, and tracking state. It defines a proto interface (`Plan`, `Apply`, `Progress`, `Cutover`, `Stop`, `Start`, `Volume`, `Revert`, `SkipRevert`).

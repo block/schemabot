@@ -409,6 +409,8 @@ type ControlOperation string
 const (
 	// ControlOperationStart resumes a stopped apply.
 	ControlOperationStart ControlOperation = "start"
+	// ControlOperationStop stops an active apply.
+	ControlOperationStop ControlOperation = "stop"
 )
 
 // ControlRequestStatus is the durable processing status for a control request.

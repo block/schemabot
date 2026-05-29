@@ -79,6 +79,13 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		c.logger.Error("failed to set started_at", "apply_id", apply.ApplyIdentifier, "error", err)
 	}
+	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+		c.logger.Warn("pending stop request processing failed before grouped engine apply; current apply owner will exit for scheduler retry",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return
+	} else if handled {
+		return
+	}
 
 	// Grouped mode: all DDLs in one engine call. Use the apply identifier as
 	// MigrationContext so all table work shares one context for progress tracking.
@@ -232,8 +239,17 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 }
 
 // handleAtomicProgressTick processes a single progress poll tick in atomic mode.
-// Returns true when the apply has reached a terminal state.
+// Returns true when polling should stop because the apply reached a terminal state
+// or this owner attempt must exit for scheduler retry.
 func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState) bool {
+	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+		c.logger.Warn("pending stop request processing failed; current apply owner will exit for scheduler retry",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return true
+	} else if handled {
+		return true
+	}
+
 	result, err := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    apply.Database,
 		Credentials: creds,
@@ -293,6 +309,13 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Update all tasks with engine progress
 	c.syncAtomicTaskProgress(ctx, tasks, result, newState, now)
+	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+		c.logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for scheduler retry",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return true
+	} else if handled {
+		return true
+	}
 
 	opts := apply.GetOptions()
 	controlReq := &engine.ControlRequest{
@@ -386,6 +409,22 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// Update apply state
 	apply.State = taskStateToApplyState(newState)
 	apply.UpdatedAt = now
+	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
+		c.logger.Error("failed to reload apply before progress state update", "apply_id", apply.ApplyIdentifier, "error", err)
+		return true
+	} else if freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
+		c.logger.Info("apply already terminal in storage, not overwriting with stale progress state",
+			"apply_id", apply.ApplyIdentifier,
+			"stored_state", freshApply.State,
+			"progress_state", apply.State)
+		*apply = *freshApply
+		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending stop request for terminal apply; current apply owner will exit for scheduler retry",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+			return true
+		}
+		return true
+	}
 
 	if result.State.IsTerminal() {
 		retryableFailure := state.IsState(newState, state.Task.FailedRetryable)
@@ -409,6 +448,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+		}
+		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+			c.logger.Warn("failed to complete pending stop request after terminal progress reconciliation; current apply owner will exit for scheduler retry",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+			return true
 		}
 		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
 		switch {

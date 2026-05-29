@@ -85,6 +85,14 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		if err != nil {
 			return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
 		}
+		if controlReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+			return nil, fmt.Errorf("check pending stop before deferred deploy start for apply %s: %w", apply.ApplyIdentifier, err)
+		} else if controlReq != nil {
+			c.logger.Info("deferred deploy start blocked because stop request is pending",
+				"apply_id", apply.ApplyIdentifier,
+				"requested_by", controlRequestCaller(controlReq))
+			return nil, fmt.Errorf("schema change has a pending stop request; start is blocked until stop is processed")
+		}
 		result, err := eng.Start(ctx, controlReq)
 		if err != nil {
 			return nil, fmt.Errorf("start deferred deploy: %w", err)
@@ -213,6 +221,15 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	var stoppedByUser bool
 
 	for i, task := range tasks {
+		if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+			c.logger.Warn("pending stop request processing failed; current apply owner will exit for scheduler retry",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+			return
+		} else if handled {
+			stoppedByUser = true
+			break
+		}
+
 		action := c.checkTaskReady(ctx, task)
 		if action == taskStopped {
 			stoppedByUser = true
@@ -253,7 +270,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			continue
 		}
 
-		action = c.runEngineTask(ctx, task, plan, options, creds)
+		action = c.runEngineTask(ctx, apply, task, plan, options, creds)
 
 		taskID := task.ID
 		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
@@ -263,6 +280,9 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		if action == taskFailed {
 			failedTask = task
 			break
+		}
+		if action == taskAbort {
+			return
 		}
 		if action == taskStopped {
 			stoppedByUser = true
@@ -510,6 +530,10 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		}
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
+	}
+
+	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+		return err
 	}
 
 	// Get the plan to retrieve original DDLs

@@ -242,6 +242,7 @@ type StopResponse struct {
 	ErrorMessage string `json:"error_message,omitempty"`
 	StoppedCount int64  `json:"stopped_count"`
 	SkippedCount int64  `json:"skipped_count"`
+	Status       string `json:"status,omitempty"`
 }
 
 // StartResponse is the HTTP response for POST /api/start.

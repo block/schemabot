@@ -22,8 +22,20 @@ type exactProgressApplyStore struct {
 	err   error
 }
 
+func (s *exactProgressApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	return s.apply, s.err
+}
+
 func (s *exactProgressApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
 	return s.apply, s.err
+}
+
+func (s *exactProgressApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.apply = apply
+	return nil
 }
 
 type exactProgressTaskStore struct {
@@ -36,8 +48,68 @@ func (s *exactProgressTaskStore) GetByApplyID(context.Context, int64) ([]*storag
 	return s.tasks, s.err
 }
 
+func (s *exactProgressTaskStore) Get(_ context.Context, taskIdentifier string) (*storage.Task, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	for _, task := range s.tasks {
+		if task.TaskIdentifier == taskIdentifier {
+			return task, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *exactProgressTaskStore) GetByDatabase(context.Context, string) ([]*storage.Task, error) {
+	return s.tasks, s.err
+}
+
 func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
 	return s.err
+}
+
+type fakeControlEngine struct {
+	engine.Engine
+	stopCount int
+}
+
+func (e *fakeControlEngine) Name() string { return "fake" }
+
+func (e *fakeControlEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	return nil, nil
+}
+
+func (e *fakeControlEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	return nil, nil
+}
+
+func (e *fakeControlEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{State: engine.StateRunning}, nil
+}
+
+func (e *fakeControlEngine) Stop(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.stopCount++
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+func (e *fakeControlEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+func (e *fakeControlEngine) Cutover(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+func (e *fakeControlEngine) Revert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+func (e *fakeControlEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
+	return &engine.VolumeResult{Accepted: true}, nil
 }
 
 type exactProgressStorage struct {
@@ -173,6 +245,104 @@ func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *test
 			require.ErrorIs(t, err, tc.wantError)
 		})
 	}
+}
+
+func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              123,
+		ApplyIdentifier: "apply-stop-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             456,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-local",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fakeEngine.stopCount)
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
+}
+
+func TestLocalClient_StopPreservesTerminalCancelledApply(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              124,
+		ApplyIdentifier: "apply-cancelled-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Cancelled,
+	}
+	task := &storage.Task{
+		ID:             457,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cancelled-local",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		TableName:      "users",
+		State:          state.Task.Cancelled,
+	}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
+		},
+		planetscaleEngine: fakeEngine,
+		logger:            slog.Default(),
+	}
+
+	resp, err := client.stop(t.Context(), &ternv1.StopRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: apply.Environment,
+	}, "cli:second")
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(0), resp.StoppedCount)
+	assert.Equal(t, int64(1), resp.SkippedCount)
+	assert.Equal(t, 0, fakeEngine.stopCount)
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
 }
 
 func TestTaskStateWithNoBackwardProgressPolicyCoversTaskStates(t *testing.T) {

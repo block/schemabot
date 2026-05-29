@@ -760,6 +760,27 @@ func TestApplyStore_FindNextApplyClaimsStoppedStartControlRequest(t *testing.T) 
 	assert.Nil(t, claimedAgain, "claim transition should prevent another worker from taking the same stopped start request")
 }
 
+func TestApplyStore_FindNextApplyDoesNotClaimFreshRunningStopControlRequest(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_running_stop_request", 505, state.Apply.Running, "staging")
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStop,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	claimed, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "fresh running applies are owned by their active worker; pending stop must not create a second owner")
+}
+
 func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

@@ -120,6 +120,9 @@ type staticApplyStore struct {
 func (s *staticApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
 	return s.apply, s.err
 }
+func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	return s.apply, s.err
+}
 func (s *staticApplyStore) GetByDatabase(context.Context, string, string, string) ([]*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
@@ -372,6 +375,26 @@ func (s *noopApplyLogStore) Append(context.Context, *storage.ApplyLog) error {
 	return nil
 }
 
+type capturingApplyLogStore struct {
+	storage.ApplyLogStore
+	logs []*storage.ApplyLog
+}
+
+func (s *capturingApplyLogStore) Append(_ context.Context, log *storage.ApplyLog) error {
+	stored := *log
+	s.logs = append(s.logs, &stored)
+	return nil
+}
+
+func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
+	for _, log := range logs {
+		if strings.Contains(log.Message, want) {
+			return true
+		}
+	}
+	return false
+}
+
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
 	healthErr      error
@@ -390,6 +413,7 @@ type mockTernClient struct {
 	stopResp       *ternv1.StopResponse
 	stopErr        error
 	stopReq        *ternv1.StopRequest // captured request
+	stopHook       func()
 	startResp      *ternv1.StartResponse
 	startErr       error
 	startReq       *ternv1.StartRequest // captured request
@@ -440,6 +464,9 @@ func (m *mockTernClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest
 }
 func (m *mockTernClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
 	m.stopReq = req
+	if m.stopHook != nil {
+		m.stopHook()
+	}
 	if m.stopResp != nil {
 		return m.stopResp, m.stopErr
 	}
@@ -1800,14 +1827,24 @@ func TestControlHandlerRejectsApplyEnvironmentMismatch(t *testing.T) {
 }
 
 func TestStopHandler(t *testing.T) {
-	t.Run("passes apply_id to tern client", func(t *testing.T) {
-		mock := &mockTernClient{
-			stopResp: &ternv1.StopResponse{
-				Accepted:     true,
-				StoppedCount: 2,
+	t.Run("queues stop request for apply owner", func(t *testing.T) {
+		mock := &mockTernClient{stopResp: &ternv1.StopResponse{Accepted: true, StoppedCount: 1, SkippedCount: 1}}
+		apply := activeTestApply("apply-abc123")
+		tasks := []*storage.Task{
+			{
+				ID:             20,
+				TaskIdentifier: "task-stop-abc123",
+				ApplyID:        apply.ID,
+				State:          state.Task.Running,
+			},
+			{
+				ID:             21,
+				TaskIdentifier: "task-stop-completed",
+				ApplyID:        apply.ID,
+				State:          state.Task.Completed,
 			},
 		}
-		svc := newControlTestService(mock, activeTestApply("apply-abc123"))
+		svc := newControlTestServiceWithTasks(mock, apply, tasks)
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
@@ -1819,9 +1856,133 @@ func TestStopHandler(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-		require.NotNil(t, mock.stopReq, "expected stop request to be captured")
+		require.NotNil(t, mock.stopReq, "handler should persist durable intent and issue immediate stop")
 		assert.Equal(t, "apply-abc123", mock.stopReq.ApplyId)
 		assert.Equal(t, "staging", mock.stopReq.Environment)
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		require.NotNil(t, controlReq)
+
+		var resp apitypes.StopResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, int64(1), resp.StoppedCount)
+		assert.Equal(t, int64(1), resp.SkippedCount)
+		assert.Empty(t, resp.Status)
+	})
+
+	t.Run("completes durable stop request when immediate local stop stores stopped state", func(t *testing.T) {
+		apply := activeTestApply("apply-local-stop-completes")
+		mock := &mockTernClient{
+			stopResp: &ternv1.StopResponse{Accepted: true, StoppedCount: 1},
+			stopHook: func() {
+				apply.State = state.Apply.Stopped
+			},
+		}
+		task := &storage.Task{
+			ID:             23,
+			TaskIdentifier: "task-local-stop-completes",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}
+		svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-local-stop-completes", "caller": "cli:local"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.NotNil(t, mock.stopReq)
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		assert.Nil(t, controlReq)
+
+		var resp apitypes.StopResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, int64(1), resp.StoppedCount)
+	})
+
+	t.Run("remote stop queues durable request without immediate remote stop", func(t *testing.T) {
+		mock := &mockTernClient{isRemote: true, stopResp: &ternv1.StopResponse{Accepted: true}}
+		apply := activeTestApply("apply-remote-stop")
+		apply.ExternalID = "remote-apply-stop"
+		task := &storage.Task{
+			ID:             23,
+			TaskIdentifier: "task-remote-stop",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}
+		svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-remote-stop", "caller": "cli:remote"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		assert.Nil(t, mock.stopReq, "remote stop must be reconciled by the scheduler owner")
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		require.NotNil(t, controlReq)
+
+		var resp apitypes.StopResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, int64(1), resp.StoppedCount)
+	})
+
+	t.Run("returns already requested for duplicate queued stop", func(t *testing.T) {
+		mock := &mockTernClient{stopResp: &ternv1.StopResponse{Accepted: true, StoppedCount: 1}}
+		apply := activeTestApply("apply-stop-already-requested")
+		task := &storage.Task{
+			ID:             22,
+			TaskIdentifier: "task-stop-already-requested",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}
+		svc := newControlTestServiceWithTasks(mock, apply, []*storage.Task{task})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		logs := &capturingApplyLogStore{}
+		require.IsType(t, &mockStorageWithApplyStores{}, svc.storage)
+		svc.storage.(*mockStorageWithApplyStores).applyLogs = logs
+
+		body := `{"environment": "staging", "apply_id": "apply-stop-already-requested", "caller": "cli:first"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		retryBody := `{"environment": "staging", "apply_id": "apply-stop-already-requested", "caller": "cli:second"}`
+		retryReq := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(retryBody))
+		retryReq.Header.Set("Content-Type", "application/json")
+		retryW := httptest.NewRecorder()
+		mux.ServeHTTP(retryW, retryReq)
+
+		assert.Equal(t, http.StatusAccepted, retryW.Code, retryW.Body.String())
+		require.NotNil(t, mock.stopReq)
+		assert.Equal(t, "apply-stop-already-requested", mock.stopReq.ApplyId)
+		var resp apitypes.StopResponse
+		err := json.NewDecoder(retryW.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, int64(1), resp.StoppedCount)
+		assert.Equal(t, "already_requested", resp.Status)
+		assert.True(t, hasApplyLogMessageContaining(logs.logs, "Stop requested by user (caller: cli:first)"))
+		assert.True(t, hasApplyLogMessageContaining(logs.logs, "Stop requested by user while stop request already pending (caller: cli:second)"))
 	})
 
 	t.Run("requires apply_id", func(t *testing.T) {
@@ -1882,6 +2043,33 @@ func TestStartHandler(t *testing.T) {
 		require.NotNil(t, mock.startReq, "expected start request to be captured")
 		assert.Equal(t, "apply-xyz789", mock.startReq.ApplyId)
 		assert.Equal(t, "staging", mock.startReq.Environment)
+	})
+
+	t.Run("rejects start while stop request is pending", func(t *testing.T) {
+		mock := &mockTernClient{startResp: &ternv1.StartResponse{Accepted: true}}
+		apply := activeTestApply("apply-start-stop-pending")
+		apply.State = state.Apply.WaitingForDeploy
+		svc := newControlTestService(mock, apply)
+		_, alreadyPending, err := svc.storage.ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:stopper",
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-start-stop-pending", "caller": "cli:starter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		assert.Nil(t, mock.startReq)
+		assert.Contains(t, w.Body.String(), "pending stop request")
 	})
 
 	t.Run("queues stopped apply for scheduler by apply_id", func(t *testing.T) {
@@ -2285,6 +2473,38 @@ func TestCutoverHandler(t *testing.T) {
 		require.NotNil(t, mock.cutoverReq, "expected cutover request to be captured")
 		assert.Equal(t, "apply-cut123", mock.cutoverReq.ApplyId)
 		assert.Equal(t, "staging", mock.cutoverReq.Environment)
+	})
+
+	t.Run("rejects cutover while stop request is pending", func(t *testing.T) {
+		mock := &mockTernClient{
+			cutoverResp: &ternv1.CutoverResponse{Accepted: true},
+		}
+		apply := activeTestApply("apply-cutover-stop-pending")
+		logs := &capturingApplyLogStore{}
+		controlRequests := &memoryControlRequestStore{requests: []*storage.ApplyControlRequest{{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:stopper",
+		}}}
+		svc := newControlTestService(mock, apply)
+		require.IsType(t, &mockStorageWithApplyStores{}, svc.storage)
+		store := svc.storage.(*mockStorageWithApplyStores)
+		store.controls = controlRequests
+		store.applyLogs = logs
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-cutover-stop-pending", "caller": "cli:cutter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		assert.Nil(t, mock.cutoverReq)
+		assert.Contains(t, w.Body.String(), "pending stop request")
+		assert.True(t, hasApplyLogMessageContaining(logs.logs, "Pending stop request blocked cutover (caller: cli:stopper)"))
 	})
 
 	t.Run("requires apply_id", func(t *testing.T) {
