@@ -67,6 +67,9 @@ func applyErrorCode(err error) codes.Code {
 }
 
 func (s *Server) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
+	if err := requireApplyID(req.ApplyId); err != nil {
+		return nil, err
+	}
 	resp, err := s.client.Progress(ctx, req)
 	if err != nil {
 		if errors.Is(err, storage.ErrApplyNotFound) || errors.Is(err, storage.ErrTaskNotFound) {
@@ -78,7 +81,7 @@ func (s *Server) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*te
 }
 
 func (s *Server) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
-	if err := requireControlApplyID(req.ApplyId); err != nil {
+	if err := requireApplyID(req.ApplyId); err != nil {
 		return nil, err
 	}
 	resp, err := s.client.Cutover(ctx, req)
@@ -89,7 +92,7 @@ func (s *Server) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*tern
 }
 
 func (s *Server) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
-	if err := requireControlApplyID(req.ApplyId); err != nil {
+	if err := requireApplyID(req.ApplyId); err != nil {
 		return nil, err
 	}
 	resp, err := s.client.Stop(ctx, req)
@@ -100,7 +103,7 @@ func (s *Server) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.Sto
 }
 
 func (s *Server) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
-	if err := requireControlApplyID(req.ApplyId); err != nil {
+	if err := requireApplyID(req.ApplyId); err != nil {
 		return nil, err
 	}
 	resp, err := s.client.Start(ctx, req)
@@ -111,7 +114,7 @@ func (s *Server) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.S
 }
 
 func (s *Server) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	if err := requireControlApplyID(req.ApplyId); err != nil {
+	if err := requireApplyID(req.ApplyId); err != nil {
 		return nil, err
 	}
 	resp, err := s.client.Volume(ctx, req)
@@ -122,7 +125,7 @@ func (s *Server) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1
 }
 
 func (s *Server) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
-	if err := requireControlApplyID(req.ApplyId); err != nil {
+	if err := requireApplyID(req.ApplyId); err != nil {
 		return nil, err
 	}
 	resp, err := s.client.Revert(ctx, req)
@@ -133,7 +136,7 @@ func (s *Server) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1
 }
 
 func (s *Server) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error) {
-	if err := requireControlApplyID(req.ApplyId); err != nil {
+	if err := requireApplyID(req.ApplyId); err != nil {
 		return nil, err
 	}
 	resp, err := s.client.SkipRevert(ctx, req)
@@ -143,7 +146,7 @@ func (s *Server) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequest) 
 	return resp, nil
 }
 
-func requireControlApplyID(applyID string) error {
+func requireApplyID(applyID string) error {
 	if applyID == "" {
 		return status.Error(codes.InvalidArgument, "apply_id is required")
 	}

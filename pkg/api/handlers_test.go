@@ -964,6 +964,42 @@ func TestProgressByDatabaseServesQueuedRemoteApplyFromStorage(t *testing.T) {
 	assert.Equal(t, "users", resp.Tables[0].TableName)
 }
 
+func TestProgressByDatabaseWithNoActiveApplyDoesNotPollTern(t *testing.T) {
+	mock := &mockTernClient{
+		progressErr: errors.New("progress should not be called without apply_id"),
+	}
+	cfg := testServerConfig()
+	cfg.Databases = map[string]DatabaseConfig{
+		"testdb": {
+			Type: storage.DatabaseTypeMySQL,
+			Environments: map[string]EnvironmentConfig{
+				"staging": {Target: "testdb", Deployment: DefaultDeployment},
+			},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		DefaultDeployment + "/staging": mock,
+	}, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/testdb?environment=staging", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Nil(t, mock.progressReq, "progress should not be called without apply_id")
+
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, state.NoActiveChange, resp.State)
+	assert.Equal(t, "testdb", resp.Database)
+	assert.Equal(t, "staging", resp.Environment)
+}
+
 func TestExecuteApplyQueuesLocalApplyForScheduler(t *testing.T) {
 	applies := &capturingApplyStore{}
 	mock := &mockTernClient{}

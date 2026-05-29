@@ -101,7 +101,7 @@ type TernClient interface {
 	//
 	//	running > waiting_for_cutover > cutting_over > pending > stopped > failed > completed
 	//
-	// If no schema change exists for the apply, returns STATE_NO_ACTIVE_CHANGE.
+	// Unknown apply IDs return NOT_FOUND.
 	Progress(ctx context.Context, in *ProgressRequest, opts ...grpc.CallOption) (*ProgressResponse, error)
 	// Cutover triggers the table swap phase for a schema change that was started
 	// with defer_cutover=true. Only valid when state is waiting_for_cutover.
@@ -342,7 +342,7 @@ type TernServer interface {
 	//
 	//	running > waiting_for_cutover > cutting_over > pending > stopped > failed > completed
 	//
-	// If no schema change exists for the apply, returns STATE_NO_ACTIVE_CHANGE.
+	// Unknown apply IDs return NOT_FOUND.
 	Progress(context.Context, *ProgressRequest) (*ProgressResponse, error)
 	// Cutover triggers the table swap phase for a schema change that was started
 	// with defer_cutover=true. Only valid when state is waiting_for_cutover.

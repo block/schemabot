@@ -229,7 +229,7 @@ func waitForApplyComplete(t *testing.T, client *LocalClient, ctx context.Context
 		func() bool {
 			progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
 				ApplyId:     applyID,
-				Environment: "staging",
+				Environment: localClientTestEnvironment,
 			})
 			if err != nil {
 				t.Logf("Progress() error: %v", err)
@@ -677,68 +677,6 @@ func TestLocalClient_GroupedApplyKeepsClaimLeaseRunning(t *testing.T) {
 	assert.Equal(t, state.Apply.Completed, completed.State)
 }
 
-func TestLocalClient_Progress(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	container, dsn := setupMySQLContainer(t)
-	_ = container              // container is managed by TestMain
-	setupStorageSchema(t, dsn) // need tasks table
-	cleanupTasks(t, dsn)       // ensure no leftover tasks from other tests
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	stor := createStorage(t, dsn)
-
-	client, err := NewLocalClient(LocalConfig{
-		Database:  "testdb",
-		Type:      "mysql",
-		TargetDSN: dsn,
-	}, stor, logger)
-	require.NoError(t, err, "failed to create client")
-	defer utils.CloseAndLog(client)
-
-	ctx := t.Context()
-	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
-		Environment: "staging",
-	})
-	require.NoError(t, err, "Progress() returned error")
-	// With no active schema change, state should be STATE_NO_ACTIVE_CHANGE
-	assert.Equal(t, ternv1.State_STATE_NO_ACTIVE_CHANGE, resp.State, "expected STATE_NO_ACTIVE_CHANGE when no active schema change, got: %v", resp.State)
-}
-
-func TestLocalClient_Progress_UsesConfigDatabase(t *testing.T) {
-	// In local mode, LocalClient always uses the database from config.
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	container, dsn := setupMySQLContainer(t)
-	_ = container              // container is managed by TestMain
-	cleanupTestTables(t, dsn)  // remove leftover tables from prior tests
-	setupStorageSchema(t, dsn) // need storage tables
-	cleanupTasks(t, dsn)       // ensure no leftover tasks from other tests
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	stor := createStorage(t, dsn)
-
-	client, err := NewLocalClient(LocalConfig{
-		Database:  "testdb",
-		Type:      "mysql",
-		TargetDSN: dsn,
-	}, stor, logger)
-	require.NoError(t, err, "failed to create client")
-	defer utils.CloseAndLog(client)
-
-	ctx := t.Context()
-	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
-		Environment: "staging",
-	})
-	require.NoError(t, err, "Progress() should succeed with config database")
-	// With no active schema change, state should be STATE_NO_ACTIVE_CHANGE
-	assert.Equal(t, ternv1.State_STATE_NO_ACTIVE_CHANGE, resp.State, "expected STATE_NO_ACTIVE_CHANGE when no active schema change, got: %v", resp.State)
-}
-
 func TestLocalClient_Cutover_NoActiveMigration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -1020,7 +958,7 @@ func TestLocalClient_Apply_MultiTableSequential(t *testing.T) {
 		func() bool {
 			progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
 				ApplyId:     applyResp.ApplyId,
-				Environment: "staging",
+				Environment: localClientTestEnvironment,
 			})
 			if err != nil {
 				t.Logf("Progress() error: %v", err)

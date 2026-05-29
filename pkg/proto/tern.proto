@@ -82,7 +82,7 @@ service Tern {
   // The overall state is derived from task priority:
   //   running > waiting_for_cutover > cutting_over > pending > stopped > failed > completed
   //
-  // If no schema change exists for the apply, returns STATE_NO_ACTIVE_CHANGE.
+  // Unknown apply IDs return NOT_FOUND.
   rpc Progress(ProgressRequest) returns (ProgressResponse) {
     option (google.api.http) = {
       post: "/v1/progress"

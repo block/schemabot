@@ -183,6 +183,15 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 	return httpResp
 }
 
+func noActiveProgressResponse(database, environment string) *apitypes.ProgressResponse {
+	return &apitypes.ProgressResponse{
+		State:       state.NoActiveChange,
+		Engine:      "Unknown",
+		Database:    database,
+		Environment: environment,
+	}
+}
+
 // GetProgress fetches the current progress for a database from its tern client.
 // This is used by the webhook handler to populate table-level progress in PR comments.
 func (s *Service) GetProgress(ctx context.Context, database, environment string) (*apitypes.ProgressResponse, error) {
@@ -203,6 +212,9 @@ func (s *Service) GetProgress(ctx context.Context, database, environment string)
 	deployment, err = s.deploymentForDatabaseEnvironment(database, deployment, environment)
 	if err != nil {
 		return nil, fmt.Errorf("resolve deployment for %s/%s: %w", database, environment, err)
+	}
+	if ternApplyID == "" {
+		return noActiveProgressResponse(database, environment), nil
 	}
 
 	client, err := s.TernClient(deployment, environment)
@@ -290,6 +302,10 @@ func (s *Service) handleProgress(w http.ResponseWriter, r *http.Request) {
 	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
 	if err != nil {
 		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound, err.Error())
+		return
+	}
+	if ternApplyID == "" {
+		s.writeJSON(w, http.StatusOK, noActiveProgressResponse(database, environment))
 		return
 	}
 

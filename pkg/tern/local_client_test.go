@@ -59,6 +59,15 @@ func TestLocalClient_Apply_RequiresEnvironmentField(t *testing.T) {
 	require.ErrorContains(t, err, "environment is required")
 }
 
+func TestLocalClient_ProgressRequiresApplyID(t *testing.T) {
+	client := &LocalClient{logger: slog.Default()}
+
+	_, err := client.Progress(t.Context(), &ternv1.ProgressRequest{
+		Environment: "staging",
+	})
+	require.ErrorContains(t, err, "apply_id is required")
+}
+
 func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *testing.T) {
 	testCases := []struct {
 		name      string

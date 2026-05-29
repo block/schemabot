@@ -99,13 +99,20 @@ func TestServerApplyMapsEngineRetryabilityToStatusCode(t *testing.T) {
 	}
 }
 
-func TestServerControlRequiresApplyID(t *testing.T) {
+func TestServerApplyScopedRPCsRequireApplyID(t *testing.T) {
 	server := NewServer(noopControlClient{})
 
 	testCases := []struct {
 		name string
 		call func(context.Context) error
 	}{
+		{
+			name: "progress",
+			call: func(ctx context.Context) error {
+				_, err := server.Progress(ctx, &ternv1.ProgressRequest{})
+				return err
+			},
+		},
 		{
 			name: "cutover",
 			call: func(ctx context.Context) error {

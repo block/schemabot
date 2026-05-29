@@ -631,31 +631,23 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	var tasks []*storage.Task
 	var err error
 
-	if req.ApplyId != "" {
-		// Scope to specific apply.
-		apply, lookupErr := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-		if lookupErr != nil {
-			return nil, fmt.Errorf("get apply %s: %w", req.ApplyId, lookupErr)
-		}
-		if apply == nil {
-			return nil, fmt.Errorf("get apply %s: %w", req.ApplyId, storage.ErrApplyNotFound)
-		}
-		tasks, err = c.storage.Tasks().GetByApplyID(ctx, apply.ID)
-		if err != nil {
-			return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, err)
-		}
-		if len(tasks) == 0 {
-			return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, storage.ErrTaskNotFound)
-		}
-	} else {
-		// Fall back to database lookup — this means the caller didn't provide
-		// an apply_id, which makes it ambiguous if multiple applies exist.
-		c.logger.Warn("Progress: no apply_id provided, falling back to database lookup",
-			"database", c.config.Database)
-		tasks, err = c.storage.Tasks().GetByDatabase(ctx, c.config.Database)
-		if err != nil {
-			return nil, fmt.Errorf("get tasks failed: %w", err)
-		}
+	if req.ApplyId == "" {
+		return nil, fmt.Errorf("apply_id is required")
+	}
+
+	apply, lookupErr := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+	if lookupErr != nil {
+		return nil, fmt.Errorf("get apply %s: %w", req.ApplyId, lookupErr)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("get apply %s: %w", req.ApplyId, storage.ErrApplyNotFound)
+	}
+	tasks, err = c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, err)
+	}
+	if len(tasks) == 0 {
+		return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, storage.ErrTaskNotFound)
 	}
 
 	c.logger.Debug("Progress: found tasks", "count", len(tasks), "database", c.config.Database, "apply_id", req.ApplyId)
