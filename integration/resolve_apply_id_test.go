@@ -146,6 +146,7 @@ func TestRemoteApplyID_ControlOperations(t *testing.T) {
 		require.NoError(t, json.Unmarshal(body, &progress))
 		state, _ := progress["state"].(string)
 		assert.NotEmpty(t, state)
+		assert.Equal(t, applyIdentifier, progress["apply_id"])
 	})
 
 	// 7. Wait for completion.
