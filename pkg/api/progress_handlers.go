@@ -248,14 +248,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Resolve to the Tern-facing ID: external_id (remote engine's apply identifier) or apply_identifier (local mode).
-	ternApplyID := apply.ApplyIdentifier
-	if apply.ExternalID != "" {
-		ternApplyID = apply.ExternalID
-	}
-
 	resp, err := client.Progress(r.Context(), &ternv1.ProgressRequest{
-		ApplyId:     ternApplyID,
+		ApplyId:     ternApplyIDForStoredApply(apply),
 		Environment: apply.Environment,
 	})
 	if err != nil {

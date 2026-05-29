@@ -574,6 +574,84 @@ func TestLocalClient_Apply(t *testing.T) {
 	assert.Equal(t, 1, columnCount, "expected email column to exist, got count %d", columnCount)
 }
 
+// TestLocalClient_Progress verifies that progress is scoped to a concrete apply
+// and returns the stored task details for that apply.
+func TestLocalClient_Progress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-progress-%d", now.UnixNano()),
+		PlanID:          1,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Environment:     localClientTestEnvironment,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Stopped,
+		Caller:          "test",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	task := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-progress-%d", now.UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         apply.Engine,
+		Environment:    apply.Environment,
+		State:          state.Task.Stopped,
+		Namespace:      "testdb",
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255)",
+		DDLAction:      "alter",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	_, err = stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+
+	progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, apply.ApplyIdentifier, progress.ApplyId)
+	assert.Equal(t, ternv1.State_STATE_STOPPED, progress.State)
+	assert.Equal(t, ternv1.Engine_ENGINE_SPIRIT, progress.Engine)
+	require.Len(t, progress.Tables, 1)
+	assert.Equal(t, "testdb", progress.Tables[0].Namespace)
+	assert.Equal(t, "users", progress.Tables[0].TableName)
+	assert.Equal(t, state.Task.Stopped, progress.Tables[0].Status)
+	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, progress.Tables[0].ChangeType)
+	assert.Equal(t, task.DDL, progress.Tables[0].Ddl)
+}
+
 func TestLocalClient_GroupedApplyKeepsClaimLeaseRunning(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")

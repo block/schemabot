@@ -189,6 +189,15 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, d
 	return client, apply, resolvedApplyID, true
 }
 
+// ternApplyIDForStoredApply returns the identifier that a Tern RPC expects for
+// an apply-scoped control or progress request.
+//
+// HTTP callers use SchemaBot's apply_identifier. In remote gRPC mode,
+// SchemaBot queues work locally first; after the scheduler dispatches it, Tern
+// returns its own apply ID and SchemaBot stores that value as external_id.
+// Subsequent RPCs to remote Tern must use external_id. In local mode, the API
+// layer and LocalClient share storage, so external_id stays empty and the
+// apply_identifier is already the Tern-facing ID.
 func ternApplyIDForStoredApply(apply *storage.Apply) string {
 	if apply.ExternalID != "" {
 		return apply.ExternalID
