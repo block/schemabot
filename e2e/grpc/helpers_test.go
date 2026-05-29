@@ -277,9 +277,9 @@ func grpcEnsureNoActiveChange(t *testing.T, database, env string) {
 	for time.Now().Before(deadline) {
 		active := grpcFindLatestApplyForDatabase(t, database, env)
 
-		// Completed and reverted tasks are terminal and don't hold locks. The
-		// Tern service's SkipRevert requires a non-terminal task, so tests clear
-		// storage directly instead.
+		// Terminal applies, including failed applies, do not hold active locks.
+		// The Tern service's SkipRevert requires a non-terminal task, so tests
+		// clear storage directly instead.
 		if active == nil || state.IsTerminalApplyState(active.State) ||
 			state.IsState(active.State, state.Apply.RevertWindow, state.Apply.Reverted) {
 			grpcClearTernStorage(t, env)
