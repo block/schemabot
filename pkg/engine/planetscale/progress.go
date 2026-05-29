@@ -1,0 +1,601 @@
+package planetscale
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	ps "github.com/planetscale/planetscale-go/planetscale"
+
+	"github.com/block/spirit/pkg/utils"
+
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/psclient"
+	"github.com/block/schemabot/pkg/state"
+)
+
+// Progress polls deploy request status from PlanetScale's API and optionally queries
+// SHOW VITESS_MIGRATIONS for per-table, per-shard row counts and ETA.
+func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	if req.ResumeState == nil || req.ResumeState.Metadata == "" {
+		return &engine.ProgressResult{
+			State:   engine.StatePending,
+			Message: "No active schema change",
+		}, nil
+	}
+
+	meta, err := decodePSMetadata(req.ResumeState.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("decode resume state: %w", err)
+	}
+
+	if meta.DeployRequestID == 0 {
+		return &engine.ProgressResult{
+			State:   engine.StatePending,
+			Message: fmt.Sprintf("Setting up branch %s", meta.BranchName),
+		}, nil
+	}
+
+	client, err := e.getClient(req.Credentials)
+	if err != nil {
+		return nil, fmt.Errorf("get planetscale client: %w", err)
+	}
+
+	dr, err := e.getDeployRequest(ctx, client, credOrg(req.Credentials), req.Database, meta.DeployRequestID)
+	if err != nil {
+		// Deploy request not found is permanent (e.g., server restarted
+		// with fresh LocalScale state but stale apply record).
+		var psErr *ps.Error
+		if errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound {
+			return nil, engine.NewPermanentError("deploy request #%d not found: %w", meta.DeployRequestID, err)
+		}
+		return nil, fmt.Errorf("get deploy request: %w", err)
+	}
+
+	engineState := deployStateToEngineState(dr.DeploymentState)
+
+	// Deferred deploy: the deploy request is ready but hasn't been triggered yet.
+	if meta.DeferredDeploy && dr.DeploymentState == deployState.Ready {
+		engineState = engine.StateWaitingForDeploy
+	}
+
+	// Update instant DDL flag from deploy request if not already set.
+	if !meta.IsInstant && dr.Deployment != nil && dr.Deployment.InstantDDLEligible {
+		meta.IsInstant = true
+	}
+
+	// Update metadata with DeployedAt when available (used by tern layer for
+	// revert window timeout calculation).
+	if dr.DeployedAt != nil && meta.DeployedAt == nil {
+		meta.DeployedAt = dr.DeployedAt
+		if encoded, encErr := encodePSMetadata(meta); encErr == nil {
+			req.ResumeState = &engine.ResumeState{
+				MigrationContext: req.ResumeState.MigrationContext,
+				Metadata:         encoded,
+			}
+		}
+	}
+
+	e.logger.Debug("progress poll",
+		"database", req.Database,
+		"deploy_request", meta.DeployRequestID,
+		"deploy_state", dr.DeploymentState,
+		"engine_state", engineState,
+		"is_instant", meta.IsInstant,
+		"has_migration_context", req.ResumeState != nil && req.ResumeState.MigrationContext != "",
+		"has_vtgate_dsn", req.Credentials.DSN != "",
+	)
+
+	result := &engine.ProgressResult{
+		State:       engineState,
+		Message:     deployStateToMessage(dr.DeploymentState),
+		ResumeState: req.ResumeState,
+	}
+
+	// Enrich with per-shard progress from SHOW VITESS_MIGRATIONS.
+	// Requires a vtgate DSN (Credentials.DSN) and a migration context
+	// (from VitessApplyData) to query per-shard state.
+	hasMigrationContext := req.Credentials.DSN != "" &&
+		req.ResumeState != nil && req.ResumeState.MigrationContext != ""
+	if hasMigrationContext {
+		tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
+		e.logger.Debug("vitess migrations queried",
+			"database", req.Database,
+			"table_count", len(tables),
+			"overall_progress", overallProgress,
+		)
+		if len(tables) > 0 {
+			result.Tables = tables
+			if overallProgress > 0 {
+				result.Progress = overallProgress
+			}
+		}
+	} else {
+		e.logger.Debug("skipping per-shard progress",
+			"database", req.Database,
+			"has_vtgate_dsn", req.Credentials.DSN != "",
+			"has_migration_context", req.ResumeState != nil && req.ResumeState.MigrationContext != "",
+		)
+	}
+
+	// Propagate instant DDL flag to all tables. Instant DDL may complete
+	// before migration context discovery, so we use the flag from deploy
+	// metadata as the authoritative source.
+	if meta.IsInstant {
+		e.logger.Debug("marking tables as instant DDL",
+			"database", req.Database,
+			"table_count", len(result.Tables),
+		)
+		for i := range result.Tables {
+			result.Tables[i].IsInstant = true
+		}
+	}
+
+	return result, nil
+}
+
+// captureExistingContexts returns the set of migration_context values currently
+// in SHOW VITESS_MIGRATIONS. Used as a baseline before deploying so that new
+// contexts can be identified after deploy.
+func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials) map[string]bool {
+	existing := make(map[string]bool)
+	if creds.DSN == "" {
+		return existing
+	}
+
+	branch := mainBranch(creds)
+	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
+		Organization: credOrg(creds),
+		Database:     database,
+		Branch:       branch,
+	})
+	if err != nil {
+		e.logger.Warn("captureExistingContexts: failed to list keyspaces", "error", err)
+		return existing
+	}
+
+	for _, ks := range keyspaces {
+		rows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, "")
+		if err != nil {
+			e.logger.Debug("capture existing contexts: query failed", "keyspace", ks.Name, "error", err)
+			continue
+		}
+		for _, r := range rows {
+			if r.MigrationContext != "" {
+				existing[r.MigrationContext] = true
+			}
+		}
+	}
+
+	e.logger.Info("captured schema change context baseline", "count", len(existing))
+	return existing
+}
+
+// discoverMigrationContext finds the new migration_context that appeared after
+// deploying by comparing current contexts against the pre-deploy baseline.
+func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]bool) string {
+	if creds.DSN == "" {
+		e.logger.Debug("skipping schema change context discovery, no DSN configured")
+		return ""
+	}
+
+	e.logger.Info("discovering schema change context", "database", database, "baseline_count", len(existingContexts))
+
+	branch := mainBranch(creds)
+	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
+		Organization: credOrg(creds),
+		Database:     database,
+		Branch:       branch,
+	})
+	if err != nil {
+		e.logger.Warn("failed to list keyspaces for schema change context discovery", "error", err)
+		return ""
+	}
+
+	for _, ks := range keyspaces {
+		rows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, "")
+		if err != nil {
+			e.logger.Debug("failed to query schema changes for keyspace", "keyspace", ks.Name, "error", err)
+			continue
+		}
+		for _, r := range rows {
+			if r.MigrationContext != "" && !existingContexts[r.MigrationContext] {
+				e.logger.Info("discovered schema change context", "context", r.MigrationContext)
+				return r.MigrationContext
+			}
+		}
+	}
+
+	e.logger.Warn("schema change context not discovered yet")
+	return ""
+}
+
+// vitessMigrationRow holds a single row from SHOW VITESS_MIGRATIONS.
+type vitessMigrationRow struct {
+	MigrationUUID    string
+	MigrationContext string
+	Keyspace         string
+	Shard            string
+	Table            string
+	Status           string // queued, running, ready_to_complete, complete, failed, cancelled
+	ReadyToComplete  bool
+	DDLAction        string
+	Progress         int
+	ETASeconds       int64
+	RowsCopied       int64
+	TableRows        int64
+	IsImmediate      bool
+	CutoverAttempts  int
+	StartedAt        *time.Time
+	CompletedAt      *time.Time
+}
+
+// queryVitessMigrations queries SHOW VITESS_MIGRATIONS across all keyspaces via vtgate
+// and aggregates per-shard results into per-table TableProgress entries.
+func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, migrationContext string) ([]engine.TableProgress, int) {
+	branch := mainBranch(creds)
+	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
+		Organization: credOrg(creds),
+		Database:     database,
+		Branch:       branch,
+	})
+	if err != nil {
+		e.logger.Warn("queryVitessMigrations: failed to list keyspaces", "error", err)
+		return nil, 0
+	}
+
+	var allRows []vitessMigrationRow
+	for _, ks := range keyspaces {
+		rows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, migrationContext)
+		if err != nil {
+			e.logger.Error("per-shard progress query failed", "keyspace", ks.Name, "database", database, "error", err)
+			continue
+		}
+		allRows = append(allRows, rows...)
+	}
+
+	if len(allRows) == 0 {
+		return nil, 0
+	}
+
+	return aggregateShardProgress(allRows)
+}
+
+// showVitessMigrationsForKeyspace connects to vtgate and runs
+// SHOW VITESS_MIGRATIONS LIKE '<context>' for a single keyspace.
+// If migrationContext is empty, returns all migrations.
+func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keyspace, migrationContext string) ([]vitessMigrationRow, error) {
+	if migrationContext != "" {
+		if err := validateMigrationContext(migrationContext); err != nil {
+			return nil, fmt.Errorf("validate context for keyspace %s: %w", keyspace, err)
+		}
+	}
+
+	db, err := e.getVtgateDB(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("get vtgate connection for keyspace %s: %w", keyspace, err)
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get connection: %w", err)
+	}
+	defer utils.CloseAndLog(conn)
+
+	if _, err := conn.ExecContext(ctx, "USE `"+keyspace+"`"); err != nil {
+		return nil, fmt.Errorf("use keyspace %s: %w", keyspace, err)
+	}
+
+	query := "SHOW VITESS_MIGRATIONS"
+	if migrationContext != "" {
+		query += " LIKE '" + migrationContext + "'"
+	}
+	rows, err := conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("show vitess_migrations: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("get columns: %w", err)
+	}
+
+	var result []vitessMigrationRow
+	for rows.Next() {
+		colValues := make([]sql.NullString, len(columns))
+		colPtrs := make([]any, len(columns))
+		for i := range colValues {
+			colPtrs[i] = &colValues[i]
+		}
+		if err := rows.Scan(colPtrs...); err != nil {
+			e.logger.Debug("scan vitess_migrations row", "keyspace", keyspace, "error", err)
+			continue
+		}
+		colMap := make(map[string]string)
+		for i, col := range columns {
+			if colValues[i].Valid {
+				colMap[col] = colValues[i].String
+			}
+		}
+
+		row := vitessMigrationRow{
+			MigrationUUID:    colMap["migration_uuid"],
+			MigrationContext: colMap["migration_context"],
+			Keyspace:         colMap["keyspace"],
+			Shard:            colMap["shard"],
+			Table:            colMap["mysql_table"],
+			Status:           colMap["migration_status"],
+			ReadyToComplete:  colMap["ready_to_complete"] == "1",
+			DDLAction:        colMap["ddl_action"],
+			IsImmediate:      colMap["is_immediate_operation"] == "1",
+		}
+		if v, err := strconv.Atoi(colMap["progress"]); err != nil && colMap["progress"] != "" {
+			e.logger.Debug("parse vitess_migrations field", "field", "progress", "value", colMap["progress"], "error", err)
+		} else {
+			row.Progress = v
+		}
+		if v, err := parseInt64(colMap["eta_seconds"]); err != nil {
+			e.logger.Debug("parse vitess_migrations field", "field", "eta_seconds", "value", colMap["eta_seconds"], "error", err)
+		} else {
+			row.ETASeconds = v
+		}
+		if v, err := parseInt64(colMap["rows_copied"]); err != nil {
+			e.logger.Debug("parse vitess_migrations field", "field", "rows_copied", "value", colMap["rows_copied"], "error", err)
+		} else {
+			row.RowsCopied = v
+		}
+		if v, err := parseInt64(colMap["table_rows"]); err != nil {
+			e.logger.Debug("parse vitess_migrations field", "field", "table_rows", "value", colMap["table_rows"], "error", err)
+		} else {
+			row.TableRows = v
+		}
+		if v, err := parseInt64(colMap["cutover_attempts"]); err == nil {
+			row.CutoverAttempts = int(v)
+		}
+
+		if ts, parseErr := time.Parse("2006-01-02 15:04:05", colMap["started_timestamp"]); parseErr == nil {
+			row.StartedAt = &ts
+		}
+		if ts, parseErr := time.Parse("2006-01-02 15:04:05", colMap["completed_timestamp"]); parseErr == nil {
+			row.CompletedAt = &ts
+		}
+
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+// validateMigrationContext rejects migration context strings containing unsafe characters.
+func validateMigrationContext(s string) error {
+	if strings.ContainsAny(s, "'\"\\`") {
+		return fmt.Errorf("invalid context: contains unsafe characters")
+	}
+	return nil
+}
+
+func parseInt64(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	return strconv.ParseInt(s, 10, 64)
+}
+
+// aggregateShardProgress groups SHOW VITESS_MIGRATIONS rows by migration_uuid
+// and produces per-table progress with per-shard breakdown.
+func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, int) {
+	type tableKey struct {
+		keyspace string
+		table    string
+		uuid     string
+	}
+	type shardData struct {
+		shard           string
+		status          string
+		readyToComplete bool
+		progress        int
+		rowsCopied      int64
+		tableRows       int64
+		etaSeconds      int64
+		isImmediate     bool
+		cutoverAttempts int
+		startedAt       *time.Time
+		completedAt     *time.Time
+	}
+
+	tableShards := make(map[tableKey][]shardData)
+	tableOrder := make([]tableKey, 0)
+
+	for _, r := range rows {
+		key := tableKey{keyspace: r.Keyspace, table: r.Table, uuid: r.MigrationUUID}
+		if _, exists := tableShards[key]; !exists {
+			tableOrder = append(tableOrder, key)
+		}
+		tableShards[key] = append(tableShards[key], shardData{
+			shard:           r.Shard,
+			status:          r.Status,
+			readyToComplete: r.ReadyToComplete,
+			progress:        r.Progress,
+			rowsCopied:      r.RowsCopied,
+			tableRows:       r.TableRows,
+			etaSeconds:      r.ETASeconds,
+			isImmediate:     r.IsImmediate,
+			cutoverAttempts: r.CutoverAttempts,
+			startedAt:       r.StartedAt,
+			completedAt:     r.CompletedAt,
+		})
+	}
+
+	var totalRowsCopied, totalTableRows int64
+	var tables []engine.TableProgress
+
+	for _, key := range tableOrder {
+		shards := tableShards[key]
+
+		// Sort shards by Vitess key range for consistent ordering
+		sort.Slice(shards, func(i, j int) bool {
+			return shardLess(shards[i].shard, shards[j].shard)
+		})
+
+		var tblRowsCopied, tblTableRows, maxETA int64
+		var tblProgress int
+		var tblStartedAt *time.Time
+		var latestCompletedAt *time.Time
+		allShardsCompleted := true
+		shardProgress := make([]engine.ShardProgress, len(shards))
+		isInstant := true
+
+		// Determine aggregate table state from shard states
+		tableState := state.Vitess.Complete
+		for i, sh := range shards {
+			tblTableRows += sh.tableRows
+			if sh.etaSeconds > maxETA {
+				maxETA = sh.etaSeconds
+			}
+			if !sh.isImmediate {
+				isInstant = false
+			}
+			// Table started_at = earliest shard started_at
+			if sh.startedAt != nil && (tblStartedAt == nil || sh.startedAt.Before(*tblStartedAt)) {
+				tblStartedAt = sh.startedAt
+			}
+			// Track latest completed_at across shards
+			if sh.completedAt == nil {
+				allShardsCompleted = false
+			} else if latestCompletedAt == nil || sh.completedAt.After(*latestCompletedAt) {
+				latestCompletedAt = sh.completedAt
+			}
+
+			// Resolve effective shard state: running + ready_to_complete = ready_to_complete
+			shardState := sh.status
+			if sh.status == state.Vitess.Running && sh.readyToComplete {
+				shardState = state.Vitess.ReadyToComplete
+			}
+
+			shardPct := sh.progress
+			shardCopied := sh.rowsCopied
+			// When a shard is ready for cutover, the copy phase is complete.
+			// Clamp to 100% since Vitess row counts can lag behind slightly.
+			if shardState == state.Vitess.ReadyToComplete || shardState == state.Vitess.Complete {
+				shardPct = 100
+				if sh.tableRows > 0 && shardCopied < sh.tableRows {
+					shardCopied = sh.tableRows
+				}
+			}
+
+			tblRowsCopied += shardCopied
+
+			shardProgress[i] = engine.ShardProgress{
+				Shard:           sh.shard,
+				State:           shardState,
+				Progress:        shardPct,
+				RowsCopied:      shardCopied,
+				RowsTotal:       sh.tableRows,
+				ETASeconds:      sh.etaSeconds,
+				CutoverAttempts: sh.cutoverAttempts,
+			}
+
+			tableState = resolveTableState(tableState, shardState)
+		}
+
+		if tblTableRows > 0 {
+			tblProgress = int(tblRowsCopied * 100 / tblTableRows)
+		} else if tableState == state.Vitess.Complete || tableState == state.Vitess.ReadyToComplete {
+			tblProgress = 100
+		}
+
+		totalRowsCopied += tblRowsCopied
+		totalTableRows += tblTableRows
+
+		// Table completed_at is only set when all shards have completed.
+		var tblCompletedAt *time.Time
+		if allShardsCompleted {
+			tblCompletedAt = latestCompletedAt
+		}
+
+		tables = append(tables, engine.TableProgress{
+			Namespace:   key.keyspace,
+			Table:       key.table,
+			State:       tableState,
+			Progress:    tblProgress,
+			RowsCopied:  tblRowsCopied,
+			RowsTotal:   tblTableRows,
+			ETASeconds:  maxETA,
+			Shards:      shardProgress,
+			IsInstant:   isInstant,
+			StartedAt:   tblStartedAt,
+			CompletedAt: tblCompletedAt,
+		})
+	}
+
+	overallProgress := 0
+	if totalTableRows > 0 {
+		overallProgress = int(totalRowsCopied * 100 / totalTableRows)
+	} else if len(tables) > 0 {
+		allDone := true
+		for _, t := range tables {
+			if t.State != state.Vitess.Complete && t.State != state.Vitess.ReadyToComplete {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			overallProgress = 100
+		}
+	}
+
+	return tables, overallProgress
+}
+
+// resolveTableState merges a shard's state into the current table state.
+// A table has one Vitess migration per shard, each in a different state.
+// This picks the "worst" state so the table reflects the least-progressed shard:
+//
+//	failed            — any shard failed, table is failed
+//	running           — at least one shard still copying rows
+//	queued            — at least one shard not started, none running or failed
+//	ready_to_complete — all shards done copying, waiting for cutover
+//	complete          — all shards finished (initial value)
+func resolveTableState(tableState, shardState string) string {
+	switch shardState {
+	case state.Vitess.Failed, state.Vitess.Cancelled:
+		return state.Vitess.Failed
+	case state.Vitess.Running:
+		if tableState != state.Vitess.Failed {
+			return state.Vitess.Running
+		}
+	case state.Vitess.Queued, state.Vitess.Ready, state.Vitess.Requested:
+		if tableState != state.Vitess.Failed && tableState != state.Vitess.Running {
+			return state.Vitess.Queued
+		}
+	case state.Vitess.ReadyToComplete:
+		if tableState == state.Vitess.Complete {
+			return state.Vitess.ReadyToComplete
+		}
+	}
+	return tableState
+}
+
+// shardLess compares two Vitess shard key ranges for sorting.
+func shardLess(a, b string) bool {
+	aStart := ""
+	bStart := ""
+	if idx := strings.Index(a, "-"); idx > 0 {
+		aStart = a[:idx]
+	}
+	if idx := strings.Index(b, "-"); idx > 0 {
+		bStart = b[:idx]
+	}
+	if aStart == "" && bStart != "" {
+		return true
+	}
+	if aStart != "" && bStart == "" {
+		return false
+	}
+	return aStart < bStart
+}
