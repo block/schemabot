@@ -2007,9 +2007,53 @@ func TestGRPCClient_ResumeApplyFailsWhenStoppedRemoteHasNoActiveProgress(t *test
 	startCalled := server.startCalled
 	server.mu.Unlock()
 	assert.False(t, startCalled, "Start should not be called when the remote apply is missing")
-	assert.Equal(t, state.Apply.Stopped, apply.State)
-	assert.Equal(t, state.Task.Stopped, task.State)
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote stopped-state check returned no active schema change"))
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "no active schema change")
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, task.ErrorMessage, "no active schema change")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply failed: remote apply remote-stopped-no-active returned no active schema change"))
+}
+
+func TestGRPCClient_ResumeApplyFailsWhenStoppedRemoteIsNotFound(t *testing.T) {
+	// A stored stopped apply with a missing exact remote apply ID is inconsistent
+	// cross-plane state. Fail the stored apply instead of leaving it resumable.
+	server := &capturingTernServer{
+		progressErr: status.Error(codes.NotFound, "apply not found"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-stopped-not-found",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-stopped-not-found",
+		State:           state.Apply.Stopped,
+	}
+	task := &storage.Task{
+		ID:             12,
+		TaskIdentifier: "task-stopped-not-found",
+		State:          state.Task.Stopped,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    &mockApplyLogStore{},
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply not found")
+
+	server.mu.Lock()
+	startCalled := server.startCalled
+	server.mu.Unlock()
+	assert.False(t, startCalled, "Start should not be called when the remote apply is missing")
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remote-stopped-not-found")
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, task.ErrorMessage, "remote-stopped-not-found")
 }
 
 func TestGRPCClient_PollFailsWhenRemoteApplyIsNotFound(t *testing.T) {

@@ -468,15 +468,14 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 		})
 		if err == nil {
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
-				message := fmt.Sprintf("Remote stopped-state check returned no active schema change for remote apply %s; scheduler will not request remote start", apply.ExternalID)
+				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id during stopped-state check", apply.ExternalID)
 				slog.Warn("remote gRPC stopped-state check returned no active schema change; scheduler will not request remote start",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,
 					"environment", apply.Environment,
 					"stored_state", apply.State)
-				c.logApplyWarning(ctx, apply, message)
-				return fmt.Errorf("check stopped gRPC apply %s before start: no active schema change for remote apply %s", apply.ApplyIdentifier, apply.ExternalID)
+				return c.failMissingStoppedRemoteApply(ctx, apply, message, nil)
 			}
 			remoteState := ProtoStateToStorage(resp.State)
 			if remoteState == "" {
@@ -502,6 +501,17 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 				return c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now)
 			}
 		} else {
+			if status.Code(err) == codes.NotFound {
+				message := fmt.Sprintf("remote apply %s was not found by data plane during stopped-state check", apply.ExternalID)
+				return c.failMissingStoppedRemoteApply(ctx, apply, message, err)
+			}
+			if isTerminalRemoteProgressError(err) {
+				message := fmt.Sprintf("remote stopped-state check failed for remote apply %s: %v", apply.ExternalID, err)
+				if markErr := c.markStoppedRemoteApplyFailed(ctx, apply, message, false); markErr != nil {
+					return fmt.Errorf("mark remote apply %s failed after stopped-state check error: %w", apply.ApplyIdentifier, markErr)
+				}
+				return fmt.Errorf("check stopped gRPC apply %s before start: %w", apply.ApplyIdentifier, err)
+			}
 			message := fmt.Sprintf("Remote stopped-state check failed before scheduler start: %v", err)
 			slog.Warn("remote gRPC stopped-state check failed; scheduler will not request remote start",
 				"apply_id", apply.ApplyIdentifier,
@@ -770,7 +780,7 @@ const (
 	storedApplyTransitionAlreadyTerminal storedApplyTransitionStatus = "already_terminal"
 )
 
-func (c *GRPCClient) reloadStoredApplyForRemoteTransition(ctx context.Context, remoteApply *storage.Apply) (*storage.Apply, storedApplyTransitionStatus, error) {
+func (c *GRPCClient) reloadStoredApplyForRemoteTransition(ctx context.Context, remoteApply *storage.Apply, allowStoppedStoredApply bool) (*storage.Apply, storedApplyTransitionStatus, error) {
 	storedApply, err := c.storage.Applies().Get(ctx, remoteApply.ID)
 	if err != nil {
 		return nil, storedApplyTransitionReloadFailed, fmt.Errorf("reload remote gRPC apply %s: %w", remoteApply.ApplyIdentifier, err)
@@ -778,7 +788,7 @@ func (c *GRPCClient) reloadStoredApplyForRemoteTransition(ctx context.Context, r
 	if storedApply == nil {
 		return nil, storedApplyTransitionMissing, nil
 	}
-	if state.IsTerminalApplyState(storedApply.State) {
+	if state.IsTerminalApplyState(storedApply.State) && (!allowStoppedStoredApply || !state.IsState(storedApply.State, state.Apply.Stopped)) {
 		*remoteApply = *storedApply
 		return storedApply, storedApplyTransitionAlreadyTerminal, nil
 	}
@@ -810,7 +820,15 @@ func logSkippedRemoteApplyTransition(operation string, remoteApply, storedApply 
 }
 
 func (c *GRPCClient) markRemoteApplyFailed(ctx context.Context, remoteApply *storage.Apply, storedTasks []*storage.Task, message string, retryable bool) error {
-	storedApply, transitionStatus, err := c.reloadStoredApplyForRemoteTransition(ctx, remoteApply)
+	return c.markRemoteApplyFailedWithOptions(ctx, remoteApply, storedTasks, message, retryable, false)
+}
+
+func (c *GRPCClient) markStoppedRemoteApplyFailed(ctx context.Context, remoteApply *storage.Apply, message string, retryable bool) error {
+	return c.markRemoteApplyFailedWithOptions(ctx, remoteApply, nil, message, retryable, true)
+}
+
+func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remoteApply *storage.Apply, storedTasks []*storage.Task, message string, retryable, allowStoppedStoredApply bool) error {
+	storedApply, transitionStatus, err := c.reloadStoredApplyForRemoteTransition(ctx, remoteApply, allowStoppedStoredApply)
 	if transitionStatus != storedApplyTransitionReady {
 		logSkippedRemoteApplyTransition("mark remote gRPC apply failed", remoteApply, storedApply, transitionStatus, err)
 		if err != nil {
@@ -885,12 +903,22 @@ func (c *GRPCClient) failMissingRemoteApply(ctx context.Context, remoteApply *st
 	return fmt.Errorf("poll remote apply %s for %s: %s", remoteApply.ExternalID, remoteApply.ApplyIdentifier, message)
 }
 
+func (c *GRPCClient) failMissingStoppedRemoteApply(ctx context.Context, remoteApply *storage.Apply, message string, cause error) error {
+	if err := c.markStoppedRemoteApplyFailed(ctx, remoteApply, message, false); err != nil {
+		return fmt.Errorf("mark missing stopped remote apply %s failed: %w", remoteApply.ApplyIdentifier, err)
+	}
+	if cause != nil {
+		return fmt.Errorf("check stopped remote apply %s for %s: %w", remoteApply.ExternalID, remoteApply.ApplyIdentifier, cause)
+	}
+	return fmt.Errorf("check stopped remote apply %s for %s: %s", remoteApply.ExternalID, remoteApply.ApplyIdentifier, message)
+}
+
 func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remoteApply *storage.Apply, remoteTasks []*ternv1.TableProgress, now time.Time) error {
 	// reloadStoredApplyForRemoteTransition may overwrite remoteApply with the
 	// stored row when it finds an already-terminal stored apply. Keep the remote
 	// Progress result available for the stopped-row exception below.
 	remoteApplyFromProgress := *remoteApply
-	storedApply, transitionStatus, err := c.reloadStoredApplyForRemoteTransition(ctx, remoteApply)
+	storedApply, transitionStatus, err := c.reloadStoredApplyForRemoteTransition(ctx, remoteApply, false)
 
 	// A scheduler claim can start from a stale stored "stopped" row. If the
 	// exact remote apply has already advanced to another terminal state, the
