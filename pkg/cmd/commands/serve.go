@@ -20,6 +20,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
@@ -187,7 +188,12 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 
 	// Wrap mux with OTel HTTP instrumentation for automatic request
 	// duration, request body size, and response body size metrics.
-	handler := otelhttp.NewHandler(mux, "schemabot")
+	metricHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		labeler, _ := otelhttp.LabelerFromContext(r.Context())
+		labeler.Add(metrics.EnvironmentAttribute(""))
+		mux.ServeHTTP(w, r)
+	})
+	handler := otelhttp.NewHandler(metricHandler, "schemabot")
 
 	// Create server
 	server := &http.Server{

@@ -20,6 +20,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/mysql"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -70,7 +71,11 @@ func TestMetricsAfterRequests(t *testing.T) {
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 	mux.Handle("GET /metrics", tel.MetricsHandler)
-	handler := otelhttp.NewHandler(mux, "schemabot")
+	handler := otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		labeler, _ := otelhttp.LabelerFromContext(r.Context())
+		labeler.Add(metrics.EnvironmentAttribute(""))
+		mux.ServeHTTP(w, r)
+	}), "schemabot")
 
 	ts := httptest.NewServer(handler)
 	defer ts.Close()
@@ -116,6 +121,8 @@ func TestMetricsAfterRequests(t *testing.T) {
 		"/metrics should contain http_server_request_body_size")
 	assert.True(t, strings.Contains(metricsText, "http_server_response_body_size"),
 		"/metrics should contain http_server_response_body_size")
+	assert.True(t, strings.Contains(metricsText, `environment="unknown"`),
+		"/metrics should contain an environment label on HTTP server metrics")
 
 	// The custom plans counter only appears after its first increment,
 	// so we don't assert it here — it's tested in TestRecordPlanMetric.

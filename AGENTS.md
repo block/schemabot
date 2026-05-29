@@ -61,6 +61,8 @@ CI mirrors local dev exactly — each job runs the corresponding make target.
 
 Use `fix(github)` or `feat(github)` for changes that affect the GitHub PR UX (comments, check runs, reactions) — even if the code lives in `pkg/webhook/`. The scope describes *what the user sees*, not the package name.
 
+Use `fix(observability)` or `feat(observability)` for changes that affect telemetry, metrics, tracing, logging, dashboards, or operator-facing observability behavior — even if the code lives in another package. Use `feat(observability)` when adding or expanding observable signal, such as a new metric, label/dimension, trace attribute, or structured log field.
+
 ### Commit Checklist (MANDATORY — do these every time before `git commit`)
 
 1. `gofmt -w` on all changed `.go` files

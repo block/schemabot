@@ -4,26 +4,35 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 
 ## Custom Metrics
 
+Every SchemaBot-owned metric emits a non-empty `environment` attribute. Metrics
+that are not scoped to one schema-change environment use `environment="unknown"`.
+Some attributes listed below are optional and only appear when that context is
+available, such as `repository`, `github_app`, and `installation_id`.
+
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
 | `schemabot.plans.total` | Counter | repository, database, environment, status | Total plan operations |
 | `schemabot.plan.duration_seconds` | Histogram | repository, database, environment, status | Plan execution time |
 | `schemabot.applies.total` | Counter | repository, database, environment, status | Total apply operations |
 | `schemabot.apply.duration_seconds` | Histogram | repository, database, environment, status | Apply API call time |
+| `schemabot.schema_freshness.rejected.total` | Counter | action, environment | Plan/apply/apply-confirm rejected because PR HEAD advanced after discovery loaded schema files |
+| `schemabot.command.rejected_stale_plan.total` | Counter | action, environment | Apply-confirm rejected because PR HEAD advanced after the confirmation plan was posted |
+| `schemabot.source_policy.blocks_total` | Counter | operation, database, environment, reason | Trusted-source plan/apply requests blocked by source policy |
+| `schemabot.pr_command_actor_authorization.total` | Counter | command, database, environment, repository, status, reason | GitHub PR command actor authorization decisions |
 | `schemabot.schema_request.errors_total` | Counter | repository, command, database, environment, reason | Schema request errors by reason |
 | `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies |
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
-| `schemabot.webhook.events_total` | Counter | event_type, action, repository, status | GitHub webhook events |
-| `schemabot.github.requests_total` | Counter | operation, category, resource, status, repository, github_app, installation_id | GitHub API responses observed by SchemaBot |
-| `schemabot.github.rate_limit.limit` | Gauge | operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
-| `schemabot.github.rate_limit.remaining` | Gauge | operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
-| `schemabot.github.rate_limit.used` | Gauge | operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
+| `schemabot.webhook.events_total` | Counter | environment, event_type, action, repository, status | GitHub webhook events |
+| `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API responses observed by SchemaBot |
+| `schemabot.github.rate_limit.limit` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
+| `schemabot.github.rate_limit.remaining` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
+| `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
-| `schemabot.lock_operations_total` | Counter | operation, database, status | Lock acquire/release operations |
+| `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
 | `schemabot.scheduler.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the scheduler |
 | `schemabot.scheduler.resume_failures_total` | Counter | database, environment, reason | Scheduler resume attempts that failed |
-| `schemabot.scheduler.claim_failures_total` | Counter | reason | Scheduler claim attempts that failed |
+| `schemabot.scheduler.claim_failures_total` | Counter | environment, reason | Scheduler claim attempts that failed |
 | `schemabot.scheduler.claim_duration_seconds` | Histogram | database, environment, previous_state | Scheduler claim and resume duration |
 
 ### Attribute Values
@@ -31,6 +40,20 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 **status** (plans): `success`, `error`
 
 **status** (applies): `success`, `error`, `rejected`, `conflict`
+
+**action** (schema freshness): `plan`, `apply`, `apply_confirm`, `unknown`
+
+**action** (stale plan): `apply_confirm`
+
+**operation** (source policy): `plan`, `apply`, `unknown`
+
+**reason** (source policy): `missing_server_config`, `missing_database_config`, `missing_repository`, `missing_pull_request`, `missing_schema_path`, `unauthorized_repo`, `unauthorized_schema_dir`, `unknown`
+
+**command** (PR command actor authorization): `apply`, `apply_confirm`, `rollback`, `rollback_confirm`, `unlock`, `cutover`, `stop`, `start`, `volume`, `revert`, `skip_revert`, `unknown`
+
+**status** (PR command actor authorization): `allowed`, `denied`, `error`, `skipped`, `unknown`
+
+**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
 
 **operation** (check ownership): `apply_finished`, `rollback_finished`
 
@@ -192,18 +215,22 @@ Operation values:
 
 The `otelhttp` middleware automatically produces standard HTTP metrics for every endpoint:
 
-| Metric | Type | Description |
-|---|---|---|
-| `http.server.request.duration` | Histogram | Request latency by method and status code |
-| `http.server.request.body.size` | Histogram | Request body sizes |
-| `http.server.response.body.size` | Histogram | Response body sizes |
+| Metric | Type | Attributes | Description |
+|---|---|---|---|
+| `http.server.request.duration` | Histogram | environment, http.request.method, http.response.status_code | Request latency by method and status code |
+| `http.server.request.body.size` | Histogram | environment | Request body sizes |
+| `http.server.response.body.size` | Histogram | environment | Response body sizes |
+
+SchemaBot attaches `environment="unknown"` to these process-wide HTTP metrics
+because routing-level request metrics do not belong to one schema-change
+environment. Environment-specific operation metrics use the real environment.
 
 ## Adding New Metrics
 
 Define recording functions in `metrics.go` following the existing pattern:
 
 ```go
-func RecordXxx(ctx context.Context, attrs ...string) {
+func RecordXxx(ctx context.Context, database, environment, status string) {
     meter := otel.Meter(meterName)
     counter, err := meter.Int64Counter("schemabot.xxx.total",
         otelmetric.WithDescription("Description"),
@@ -213,7 +240,11 @@ func RecordXxx(ctx context.Context, attrs ...string) {
         slog.Warn("failed to create counter", "error", err)
         return
     }
-    counter.Add(ctx, 1, otelmetric.WithAttributes(...))
+    counter.Add(ctx, 1, otelmetric.WithAttributes(
+        attribute.String("database", database),
+        EnvironmentAttribute(environment),
+        attribute.String("status", status),
+    ))
 }
 ```
 

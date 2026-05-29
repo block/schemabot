@@ -91,7 +91,7 @@ func (h *Handler) assertPlanStillCurrent(
 		"requested_by", requestedBy,
 	)
 
-	metrics.RecordStalePlanRejected(ctx)
+	metrics.RecordStalePlanRejected(ctx, environment)
 
 	h.postComment(repo, pr, installationID, templates.RenderStalePlanRejection(templates.StalePlanRejectionData{
 		RequestedBy: requestedBy,

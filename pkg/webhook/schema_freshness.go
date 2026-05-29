@@ -54,7 +54,7 @@ func (h *Handler) assertSchemaStillCurrent(
 		"requested_by", requestedBy,
 	)
 
-	metrics.RecordSchemaFreshnessRejected(ctx, metricActionKey(action))
+	metrics.RecordSchemaFreshnessRejected(ctx, metricActionKey(action), environment)
 
 	h.postComment(repo, pr, installationID, templates.RenderStaleSchemaRejection(templates.StaleSchemaRejectionData{
 		RequestedBy:  requestedBy,

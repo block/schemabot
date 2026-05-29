@@ -16,6 +16,18 @@ import (
 // Meter name used for all SchemaBot metrics.
 const meterName = "schemabot"
 
+const unknownEnvironment = "unknown"
+
+// EnvironmentAttribute returns the canonical environment metric attribute.
+// Use "unknown" for process-wide or integration metrics that do not belong to
+// a single SchemaBot environment.
+func EnvironmentAttribute(environment string) attribute.KeyValue {
+	if environment == "" {
+		environment = unknownEnvironment
+	}
+	return attribute.String("environment", environment)
+}
+
 // RecordPlan increments the plans counter with database, environment, and status attributes.
 // Status should be "success" or "error".
 //
@@ -35,7 +47,7 @@ func RecordPlan(ctx context.Context, repo, database, environment, status string)
 		otelmetric.WithAttributes(
 			attribute.String("repository", repo),
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("status", status),
 		),
 	)
@@ -56,7 +68,7 @@ func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, datab
 		otelmetric.WithAttributes(
 			attribute.String("repository", repo),
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("status", status),
 		),
 	)
@@ -78,7 +90,7 @@ func RecordApply(ctx context.Context, repo, database, environment, status string
 		otelmetric.WithAttributes(
 			attribute.String("repository", repo),
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("status", status),
 		),
 	)
@@ -100,7 +112,7 @@ func RecordApplyDuration(ctx context.Context, duration time.Duration, repo, data
 		otelmetric.WithAttributes(
 			attribute.String("repository", repo),
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("status", status),
 		),
 	)
@@ -120,7 +132,7 @@ var knownSchemaFreshnessActions = map[string]bool{
 // schema files. The metric name is action-neutral because the same rejection fires
 // for read-only plan as well as mutating apply paths. A spike indicates aggressive
 // force-pushing, webhook replay, or a regression in the schema-freshness guard.
-func RecordSchemaFreshnessRejected(ctx context.Context, action string) {
+func RecordSchemaFreshnessRejected(ctx context.Context, action, environment string) {
 	if !knownSchemaFreshnessActions[action] {
 		action = "unknown"
 	}
@@ -136,6 +148,7 @@ func RecordSchemaFreshnessRejected(ctx context.Context, action string) {
 	counter.Add(ctx, 1,
 		otelmetric.WithAttributes(
 			attribute.String("action", action),
+			EnvironmentAttribute(environment),
 		),
 	)
 }
@@ -151,7 +164,7 @@ func RecordSchemaFreshnessRejected(ctx context.Context, action string) {
 // across deliveries. A spike here indicates humans pushing aggressively
 // during PR review; sustained activity suggests reviewers need a tighter
 // "freeze the branch" workflow during apply confirmation.
-func RecordStalePlanRejected(ctx context.Context) {
+func RecordStalePlanRejected(ctx context.Context, environment string) {
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64Counter("schemabot.command.rejected_stale_plan.total",
 		otelmetric.WithDescription("apply-confirm rejected because PR HEAD advanced after the confirmation plan was posted"),
@@ -164,6 +177,7 @@ func RecordStalePlanRejected(ctx context.Context) {
 	counter.Add(ctx, 1,
 		otelmetric.WithAttributes(
 			attribute.String("action", "apply_confirm"),
+			EnvironmentAttribute(environment),
 		),
 	)
 }
@@ -206,7 +220,7 @@ func RecordSourcePolicyBlock(ctx context.Context, operation, database, environme
 		otelmetric.WithAttributes(
 			attribute.String("operation", operation),
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("reason", reason),
 		),
 	)
@@ -275,7 +289,7 @@ func RecordPRCommandActorAuthorization(ctx context.Context, command, database, e
 		otelmetric.WithAttributes(
 			attribute.String("command", command),
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("repository", repository),
 			attribute.String("status", status),
 			attribute.String("reason", reason),
@@ -312,7 +326,7 @@ func RecordCheckOwnershipMiss(ctx context.Context, operation, repository, databa
 			attribute.String("repository", repository),
 			attribute.String("database", database),
 			attribute.String("database_type", databaseType),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 		),
 	)
 }
@@ -332,7 +346,7 @@ func AdjustActiveApplies(ctx context.Context, delta int64, database, environment
 	counter.Add(ctx, delta,
 		otelmetric.WithAttributes(
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 		),
 	)
 }
@@ -368,7 +382,7 @@ func RecordControlOperation(ctx context.Context, operation, database, environmen
 		otelmetric.WithAttributes(
 			attribute.String("operation", operation),
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("status", status),
 		),
 	)
@@ -391,6 +405,7 @@ func RecordLockOperation(ctx context.Context, operation, database, status string
 		otelmetric.WithAttributes(
 			attribute.String("operation", operation),
 			attribute.String("database", database),
+			EnvironmentAttribute(""),
 			attribute.String("status", status),
 		),
 	)
@@ -411,7 +426,7 @@ func RecordSchedulerResume(ctx context.Context, database, environment, previousS
 	counter.Add(ctx, 1,
 		otelmetric.WithAttributes(
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("previous_state", previousState),
 		),
 	)
@@ -431,14 +446,15 @@ func RecordSchedulerResumeFailure(ctx context.Context, database, environment, re
 	counter.Add(ctx, 1,
 		otelmetric.WithAttributes(
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("reason", reason),
 		),
 	)
 }
 
 var knownSchedulerClaimFailureReasons = map[string]bool{
-	"storage_error": true,
+	"expire_retryable_error": true,
+	"storage_error":          true,
 }
 
 // RecordSchedulerClaimFailure increments the scheduler claim failure counter.
@@ -457,6 +473,7 @@ func RecordSchedulerClaimFailure(ctx context.Context, reason string) {
 	}
 	counter.Add(ctx, 1,
 		otelmetric.WithAttributes(
+			EnvironmentAttribute(""),
 			attribute.String("reason", reason),
 		),
 	)
@@ -476,7 +493,7 @@ func RecordSchedulerClaimDuration(ctx context.Context, duration time.Duration, d
 	hist.Record(ctx, duration.Seconds(),
 		otelmetric.WithAttributes(
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("previous_state", previousState),
 		),
 	)
@@ -520,7 +537,7 @@ func RecordSchemaRequestError(ctx context.Context, repo, command, database, envi
 			attribute.String("repository", repo),
 			attribute.String("command", command),
 			attribute.String("database", database),
-			attribute.String("environment", environment),
+			EnvironmentAttribute(environment),
 			attribute.String("reason", reason),
 		),
 	)
@@ -675,6 +692,7 @@ func RecordGitHubRateLimit(ctx context.Context, sample GitHubRateLimitSample) {
 func gitHubMetricAttributes(operation, resource, repository, githubApp string, installationID int64) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		attribute.String("operation", operation),
+		EnvironmentAttribute(""),
 		attribute.String("resource", resource),
 	}
 	if repository != "" {
@@ -819,6 +837,7 @@ func RecordWebhookEvent(ctx context.Context, eventType, action, repo, status str
 		return
 	}
 	attrs := []attribute.KeyValue{
+		EnvironmentAttribute(""),
 		attribute.String("event_type", eventType),
 		attribute.String("status", status),
 	}
@@ -881,6 +900,7 @@ func RecordStatusCheckOperation(ctx context.Context, op StatusCheckOperation) {
 		return
 	}
 	attrs := []attribute.KeyValue{
+		EnvironmentAttribute(op.Environment),
 		attribute.String("operation", op.Operation),
 		attribute.String("status", op.Status),
 	}
@@ -889,9 +909,6 @@ func RecordStatusCheckOperation(ctx context.Context, op StatusCheckOperation) {
 	}
 	if op.DatabaseType != "" {
 		attrs = append(attrs, attribute.String("database_type", op.DatabaseType))
-	}
-	if op.Environment != "" {
-		attrs = append(attrs, attribute.String("environment", op.Environment))
 	}
 	if op.Repository != "" {
 		attrs = append(attrs, attribute.String("repository", op.Repository))

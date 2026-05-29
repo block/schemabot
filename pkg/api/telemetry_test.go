@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -169,7 +170,11 @@ func TestOtelHTTPMetrics(t *testing.T) {
 	svc := newTestService()
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
-	handler := otelhttp.NewHandler(mux, "schemabot")
+	handler := otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		labeler, _ := otelhttp.LabelerFromContext(r.Context())
+		labeler.Add(metrics.EnvironmentAttribute(""))
+		mux.ServeHTTP(w, r)
+	}), "schemabot")
 
 	// Hit /health — the one route guaranteed to work with mock storage.
 	req := httptest.NewRequestWithContext(t.Context(), "GET", "/health", nil)
@@ -191,22 +196,25 @@ func TestOtelHTTPMetrics(t *testing.T) {
 	assert.True(t, metricNames["http.server.request.body.size"], "expected http.server.request.body.size metric")
 	assert.True(t, metricNames["http.server.response.body.size"], "expected http.server.response.body.size metric")
 
-	// Verify the duration histogram has data points with expected attributes.
+	// Verify HTTP server metrics have expected attributes.
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
+			if !strings.HasPrefix(m.Name, "http.server.") {
+				continue
+			}
+			assertMetricDataPointsHaveEnvironment(t, m)
 			if m.Name != "http.server.request.duration" {
 				continue
 			}
 			hist, ok := m.Data.(metricdata.Histogram[float64])
 			require.True(t, ok)
-			assert.GreaterOrEqual(t, len(hist.DataPoints), 1, "expected at least one duration data point")
+			assert.GreaterOrEqual(t, len(hist.DataPoints), 1, "expected at least one data point for %s", m.Name)
 
-			// Verify data points have standard HTTP attributes.
 			for _, dp := range hist.DataPoints {
 				_, hasMethod := dp.Attributes.Value(attribute.Key("http.request.method"))
-				assert.True(t, hasMethod, "expected http.request.method attribute on duration data point")
+				assert.True(t, hasMethod, "expected http.request.method attribute on %s data point", m.Name)
 				_, hasStatus := dp.Attributes.Value(attribute.Key("http.response.status_code"))
-				assert.True(t, hasStatus, "expected http.response.status_code attribute on duration data point")
+				assert.True(t, hasStatus, "expected http.response.status_code attribute on %s data point", m.Name)
 			}
 		}
 	}
@@ -224,6 +232,102 @@ func collectMetricNames(t *testing.T, reader *sdkmetric.ManualReader) map[string
 		}
 	}
 	return names
+}
+
+func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordPlan(t.Context(), "org/repo", "mydb", "staging", "success")
+	metrics.RecordPlanDuration(t.Context(), time.Second, "org/repo", "mydb", "staging", "success")
+	metrics.RecordApply(t.Context(), "org/repo", "mydb", "staging", "success")
+	metrics.RecordApplyDuration(t.Context(), time.Second, "org/repo", "mydb", "staging", "success")
+	metrics.RecordSchemaFreshnessRejected(t.Context(), "apply", "staging")
+	metrics.RecordStalePlanRejected(t.Context(), "staging")
+	metrics.RecordSourcePolicyBlock(t.Context(), "plan", "mydb", "staging", "unauthorized_repo")
+	metrics.RecordPRCommandActorAuthorization(t.Context(), "apply", "mydb", "staging", "org/repo", "allowed", "allowed_admin_user")
+	metrics.RecordCheckOwnershipMiss(t.Context(), "apply_finished", "org/repo", "mydb", "mysql", "staging")
+	metrics.AdjustActiveApplies(t.Context(), 1, "mydb", "staging")
+	metrics.RecordControlOperation(t.Context(), "stop", "mydb", "staging", "success")
+	metrics.RecordLockOperation(t.Context(), "acquire", "mydb", "success")
+	metrics.RecordSchedulerResume(t.Context(), "mydb", "staging", "running")
+	metrics.RecordSchedulerResumeFailure(t.Context(), "mydb", "staging", "no_client")
+	metrics.RecordSchedulerClaimFailure(t.Context(), "storage_error")
+	metrics.RecordSchedulerClaimDuration(t.Context(), time.Second, "mydb", "staging", "running")
+	metrics.RecordSchemaRequestError(t.Context(), "org/repo", "apply", "mydb", "staging", "invalid_config")
+	metrics.RecordGitHubRequest(t.Context(), metrics.GitHubRequestSample{
+		Operation:  metrics.GitHubOperationFetchPullRequest,
+		Category:   metrics.GitHubRequestCategoryRead,
+		Resource:   metrics.GitHubRateLimitResourceCore,
+		Status:     metrics.GitHubRequestStatusSuccess,
+		Repository: "org/repo",
+	})
+	metrics.RecordGitHubRateLimit(t.Context(), metrics.GitHubRateLimitSample{
+		Operation:  metrics.GitHubOperationFetchPullRequest,
+		Resource:   metrics.GitHubRateLimitResourceCore,
+		Repository: "org/repo",
+		Limit:      100,
+		Remaining:  99,
+		Used:       1,
+	})
+	metrics.RecordWebhookEvent(t.Context(), "issue_comment", "created", "org/repo", "processed")
+	metrics.RecordStatusCheckOperation(t.Context(), metrics.StatusCheckOperation{
+		Operation:  "aggregate_check_sync",
+		Repository: "org/repo",
+		Status:     "blocked",
+	})
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	var checked int
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if !strings.HasPrefix(m.Name, "schemabot.") {
+				continue
+			}
+			checked++
+			assertMetricDataPointsHaveEnvironment(t, m)
+		}
+	}
+	require.NotZero(t, checked, "expected SchemaBot metrics to be collected")
+}
+
+func assertMetricDataPointsHaveEnvironment(t *testing.T, m metricdata.Metrics) {
+	t.Helper()
+	switch data := m.Data.(type) {
+	case metricdata.Sum[int64]:
+		for _, dp := range data.DataPoints {
+			assertMetricAttributesHaveEnvironment(t, m.Name, dp.Attributes)
+		}
+	case metricdata.Gauge[int64]:
+		for _, dp := range data.DataPoints {
+			assertMetricAttributesHaveEnvironment(t, m.Name, dp.Attributes)
+		}
+	case metricdata.Histogram[float64]:
+		for _, dp := range data.DataPoints {
+			assertMetricAttributesHaveEnvironment(t, m.Name, dp.Attributes)
+		}
+	case metricdata.Histogram[int64]:
+		for _, dp := range data.DataPoints {
+			assertMetricAttributesHaveEnvironment(t, m.Name, dp.Attributes)
+		}
+	default:
+		t.Fatalf("unsupported metric data type %T for %s", m.Data, m.Name)
+	}
+}
+
+func assertMetricAttributesHaveEnvironment(t *testing.T, metricName string, attrs attribute.Set) {
+	t.Helper()
+	environment, ok := attrs.Value(attribute.Key("environment"))
+	require.True(t, ok, "%s metric data point missing environment attribute: %v", metricName, attrs)
+	assert.NotEmpty(t, environment.AsString(), "%s metric environment attribute must be non-empty", metricName)
 }
 
 func TestRecordApplyMetrics(t *testing.T) {
@@ -529,13 +633,36 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 	metrics.RecordSchedulerResume(t.Context(), "testdb", "staging", "running")
 	metrics.RecordSchedulerResumeFailure(t.Context(), "testdb", "staging", "no_client")
 	metrics.RecordSchedulerClaimFailure(t.Context(), "storage_error")
+	metrics.RecordSchedulerClaimFailure(t.Context(), "expire_retryable_error")
 	metrics.RecordSchedulerClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "staging", "running")
 
-	names := collectMetricNames(t, reader)
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	names := make(map[string]bool)
+	var sawExpireRetryableError bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			names[m.Name] = true
+			if m.Name != "schemabot.scheduler.claim_failures_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			for _, dp := range sum.DataPoints {
+				reason, hasReason := dp.Attributes.Value(attribute.Key("reason"))
+				require.True(t, hasReason)
+				if reason.AsString() == "expire_retryable_error" {
+					sawExpireRetryableError = true
+				}
+			}
+		}
+	}
 	assert.True(t, names["schemabot.scheduler.resumed_total"], "expected schemabot.scheduler.resumed_total")
 	assert.True(t, names["schemabot.scheduler.resume_failures_total"], "expected schemabot.scheduler.resume_failures_total")
 	assert.True(t, names["schemabot.scheduler.claim_failures_total"], "expected schemabot.scheduler.claim_failures_total")
 	assert.True(t, names["schemabot.scheduler.claim_duration_seconds"], "expected schemabot.scheduler.claim_duration_seconds")
+	assert.True(t, sawExpireRetryableError, "expected expire_retryable_error claim failure reason to be preserved")
 }
 
 // setupTraceTest creates an in-memory trace exporter and configures the global
