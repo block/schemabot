@@ -577,6 +577,11 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 
 	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
 	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
+	if startRequested {
+		if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+			return err
+		}
+	}
 
 	options := buildApplyOptions(apply)
 
@@ -600,11 +605,6 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 				fmt.Sprintf("Recovery failed: %v", err), apply.State, state.Apply.Failed)
 			return err
 		}
-		if startRequested {
-			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
-				return err
-			}
-		}
 	} else {
 		// Sequential mode: process each task one at a time
 		now := time.Now()
@@ -612,11 +612,6 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
-		}
-		if startRequested {
-			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
-				return err
-			}
 		}
 
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
