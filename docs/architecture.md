@@ -259,6 +259,95 @@ State authority is intentionally one-way: engine progress is an input, not the d
 
 Unknown raw engine states normalize to `running`. This keeps unfamiliar in-flight work visible and blocking without leaking engine-specific strings into SchemaBot state or UI. Once the engine state is understood, update `NormalizeTaskStatus()` and the state-policy tests so the new state has an explicit task-state mapping and ordering policy.
 
+#### Remote gRPC Progress Synchronization
+
+Remote gRPC progress is core Tern scheduler behavior. In gRPC mode, the
+SchemaBot API queues and tracks applies in control-plane storage, while a remote
+Tern deployment executes the schema change and reports progress for its own
+apply ID. The scheduler worker that claims the stored apply also owns the
+durable progress polling loop for that remote apply.
+
+```
+CLI / webhook apply request
+        |
+        v
+SchemaBot API creates stored apply + tasks
+        |
+        v
+Scheduler worker claims apply
+        |
+        v
+GRPCClient.ResumeApply()
+        |
+        +-- no external_id yet -> dispatch Apply to remote Tern
+        |                        and store remote apply_id as external_id
+        |
+        v
+Same scheduler worker polls Progress(apply_id=external_id, environment)
+        |
+        v
+Stored apply/task rows are updated for status, logs, recovery, and UI
+```
+
+HTTP progress endpoints and the CLI/TUI may also request progress, but those
+request-time reads are not the durable synchronization path. The scheduler
+worker's polling loop is what keeps SchemaBot storage reconciled with the remote
+data plane.
+
+Remote progress requests are scoped by apply ID and environment only:
+
+```
+ProgressRequest{
+  apply_id:     <remote external_id for gRPC, SchemaBot apply_id for local>
+  environment:  <environment>
+}
+```
+
+The public HTTP API continues to return SchemaBot's `apply_id`. In gRPC mode the
+API resolves that stored apply to `external_id` before calling remote Tern;
+local mode has no external ID and uses the SchemaBot apply ID directly.
+
+##### Repeated Remote Progress Errors
+
+Transient progress RPC errors do not cause SchemaBot to send a remote `Stop`
+request. A progress outage only proves the control plane cannot observe the
+remote apply; it does not prove the remote apply should be stopped.
+
+Instead, the scheduler worker counts consecutive progress polling errors:
+
+```
+Scheduler worker polls remote Progress
+        |
+        +-- NotFound / no active change
+        |       |
+        |       v
+        |   fail stored apply/tasks
+        |
+        +-- permanent progress RPC error
+        |       |
+        |       v
+        |   fail stored apply/tasks
+        |
+        +-- transient progress RPC error
+        |       |
+        |       v
+        |   increment consecutive error count
+        |       |
+        |       +-- below limit -> keep polling
+        |       |
+        |       +-- at limit -> mark stored apply/tasks failed_retryable
+        |
+        +-- successful progress response
+                |
+                v
+            reset consecutive error count and sync storage
+```
+
+`failed_retryable` pauses the current scheduler attempt and keeps the apply
+visible and blocking until recovery retries it. The remote data-plane apply may
+still be running; SchemaBot deliberately avoids issuing a stop command when the
+only problem is repeated inability to read progress.
+
 The `ProgressObserver` interface (`pkg/tern/observer.go`) enables external notifications from the apply progress poller. Observers see SchemaBot's derived apply/task state, not raw engine state.
 
 ```go
