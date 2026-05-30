@@ -97,22 +97,22 @@ not retry forever.
 
 ## Edge-case checklist
 
-| Scenario | Expected behavior | Status |
-| --- | --- | --- |
-| Duplicate `/start` while start is already pending | Return already-accepted semantics; preserve the original durable request and caller visibility | Covered for durable requests |
-| Failed `/start` followed by scheduler recovery | Do not claim or retry the failed request automatically | Covered by storage integration test |
-| Failed `/start` followed by a new operator retry | Reset the failed request to pending and make the apply claimable again | Covered by storage integration test |
-| Remote `Start` RPC fails or times out | Keep apply stopped, store error message, add warning apply log, fail the start request | Covered |
-| Remote `Start` RPC succeeds but progress remains stopped past grace | Keep apply stopped, store timeout reason, add warning apply log, fail the start request | Covered |
-| Remote reports stale stopped progress shortly after accepted `Start` | Ignore stopped samples only during the bounded grace window | Covered |
-| Remote reports running/completed during start grace | Adopt remote progress and complete the start request | Covered |
-| Concurrent stop and start requests | Stop intent wins unless the start is a later explicit retry after stopped state is established | Covered for stop priority; keep auditing new call paths |
-| Multiple operators request stop during an incident | Preserve caller visibility through durable request metadata and apply logs | Covered for stop logs; keep caller fields in future PR-comment path |
-| Scheduler owner dies after accepting a durable control request | Next owner claims stale work and processes the pending request before forward progress | Covered by durable request model |
-| Storage write fails after remote control RPC succeeds | Return/log error and avoid converting uncertainty into a passing or completed state | Audit when adding new control RPCs |
-| Cutover requested while stop is pending | Reject forward-progress control while stop intent is pending | Covered for current cutover path |
-| PR comment stop support | Same semantics as CLI stop: durable request first, caller visible, stop priority preserved | Follow-up |
-| PR comment cutover support | Same safety gate as CLI cutover, plus durable cutover intent if async ownership requires it | Follow-up |
+| # | Scenario | Expected behavior | Status |
+| --- | --- | --- | --- |
+| 1 | Duplicate `/start` while start is already pending | Return already-accepted semantics; preserve the original durable request and caller visibility | Covered for durable requests |
+| 2 | Failed `/start` followed by scheduler recovery | Do not claim or retry the failed request automatically | Covered by storage integration test |
+| 3 | Failed `/start` followed by a new operator retry | Reset the failed request to pending and make the apply claimable again | Covered by storage integration test |
+| 4 | Remote `Start` RPC fails or times out | Keep apply stopped, store error message, add warning apply log, fail the start request | Covered |
+| 5 | Remote `Start` RPC succeeds but progress remains stopped past grace | Keep apply stopped, store timeout reason, add warning apply log, fail the start request | Covered |
+| 6 | Remote reports stale stopped progress shortly after accepted `Start` | Ignore stopped samples only during the bounded grace window | Covered |
+| 7 | Remote reports running/completed during start grace | Adopt remote progress and complete the start request | Covered |
+| 8 | Concurrent stop and start requests | Stop intent wins unless the start is a later explicit retry after stopped state is established | Covered for stop priority; keep auditing new call paths |
+| 9 | Multiple operators request stop during an incident | Preserve caller visibility through durable request metadata and apply logs | Covered for stop logs; keep caller fields in future PR-comment path |
+| 10 | Scheduler owner dies after accepting a durable control request | Next owner claims stale work and processes the pending request before forward progress | Covered by durable request model |
+| 11 | Storage write fails after remote control RPC succeeds | Return/log error and avoid converting uncertainty into a passing or completed state | Audit when adding new control RPCs |
+| 12 | Cutover requested while stop is pending | Reject forward-progress control while stop intent is pending | Covered for current cutover path |
+| 13 | PR comment stop support | Same semantics as CLI stop: durable request first, caller visible, stop priority preserved | Follow-up |
+| 14 | PR comment cutover support | Same safety gate as CLI cutover, plus durable cutover intent if async ownership requires it | Follow-up |
 
 ## Review questions for new gRPC control changes
 
