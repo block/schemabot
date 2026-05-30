@@ -121,6 +121,8 @@ const (
 	maxGRPCProgressPollErrorStreak = 10
 )
 
+var grpcStoppedAfterStartGracePeriod = 30 * time.Second
+
 // GRPCClient implements Client using gRPC.
 // It delegates execution to a remote Tern service but SchemaBot still manages
 // the apply lifecycle (storage, heartbeats, progress tracking).
@@ -1421,6 +1423,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 
 	consecutiveProgressErrors := 0
 	loggedStoppedAfterStart := false
+	var stoppedAfterStartDeadline time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -1508,14 +1511,33 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 			remoteApplyState := newState
 			if allowStoppedAfterStart && state.IsState(remoteApplyState, state.Apply.Stopped) {
+				if stoppedAfterStartDeadline.IsZero() {
+					stoppedAfterStartDeadline = now.Add(grpcStoppedAfterStartGracePeriod)
+				}
 				if !loggedStoppedAfterStart {
 					slog.Info("remote gRPC apply still stopped after start accepted; scheduler will keep polling",
 						"apply_id", apply.ApplyIdentifier,
 						"external_id", apply.ExternalID,
 						"database", apply.Database,
 						"environment", apply.Environment,
-						"stored_state", apply.State)
+						"stored_state", apply.State,
+						"deadline", stoppedAfterStartDeadline)
 					loggedStoppedAfterStart = true
+				}
+				if !now.Before(stoppedAfterStartDeadline) {
+					slog.Warn("remote gRPC apply remained stopped after start grace period; storing stopped state",
+						"apply_id", apply.ApplyIdentifier,
+						"external_id", apply.ExternalID,
+						"database", apply.Database,
+						"environment", apply.Environment,
+						"stored_state", apply.State,
+						"grace_period", grpcStoppedAfterStartGracePeriod)
+					apply.State = state.Apply.Stopped
+					apply.ErrorMessage = ""
+					if err := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now); err != nil {
+						return fmt.Errorf("persist stopped gRPC apply %s after start grace period: %w", apply.ApplyIdentifier, err)
+					}
+					return nil
 				}
 				continue
 			}

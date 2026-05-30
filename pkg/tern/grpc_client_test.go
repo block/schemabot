@@ -905,6 +905,64 @@ func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) 
 	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply failed: remote progress polling failed after 10 consecutive errors"))
 }
 
+func TestGRPCClient_ProgressPollBoundsStoppedAfterStart(t *testing.T) {
+	// A scheduler-owned start may briefly see the remote stopped state from the
+	// preceding stop, but that grace period must end with a stored stopped result
+	// instead of an unbounded polling loop.
+	originalGracePeriod := grpcStoppedAfterStartGracePeriod
+	grpcStoppedAfterStartGracePeriod = 0
+	t.Cleanup(func() { grpcStoppedAfterStartGracePeriod = originalGracePeriod })
+
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Stopped,
+			PercentComplete: 40,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              26,
+		ApplyIdentifier: "apply-stopped-after-start",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Deployment:      "us-west",
+		Environment:     "staging",
+		ExternalID:      "remote-stopped-after-start",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             32,
+		TaskIdentifier: "task-stopped-after-start",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: &storedApply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    logs,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply, true)
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, 40, task.ProgressPercent)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply reached terminal state: stopped"))
+}
+
 func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *testing.T) {
 	// A freshly dispatched remote apply can report pending before the remote
 	// engine starts copying rows. SchemaBot has already claimed the queued apply
