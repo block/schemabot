@@ -1535,7 +1535,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 						"grace_period", grpcStoppedAfterStartGracePeriod)
 					c.logApplyWarning(ctx, apply, message)
 					apply.State = state.Apply.Stopped
-					apply.ErrorMessage = ""
+					apply.ErrorMessage = message
 					if err := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now); err != nil {
 						return fmt.Errorf("persist stopped gRPC apply %s after start grace period: %w", apply.ApplyIdentifier, err)
 					}
