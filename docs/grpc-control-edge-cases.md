@@ -15,18 +15,30 @@ The scheduler is responsible for reconciling these state sources. When they
 disagree, SchemaBot should fail closed: preserve operator intent, keep errors
 visible, and avoid unbounded retries without a new operator request.
 
-```text
-Control request path: durable operator intent
+## Control request path
 
+Control requests are operator intent. The API stores that intent durably, along
+with caller metadata, before the scheduler performs remote control work. The
+scheduler is the single owner that claims pending or stale work, executes the
+request against remote Tern, and records the result back in SchemaBot storage.
+
+```text
 ╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭─────────────╮
 │ Operator /  │   │ SchemaBot   │   │ SchemaBot   │   │ Scheduler   │   │ Remote Tern │
 │ automation  │──▶│ API         │──▶│ storage     │──▶│ worker      │──▶│ data plane  │
 ╰─────────────╯   ╰─────────────╯   ╰─────────────╯   ╰─────────────╯   ╰─────────────╯
      request        validate +       durable intent     claim +          Stop / Start /
                     accept           caller metadata    execute          Cutover RPC
+```
 
-Progress polling path: remote observation and stored reconciliation
+## Progress polling path
 
+Progress polling is observation, not a new operator request. A remote progress
+sample may confirm, complete, or fail a stored control request, but it should
+not erase newer durable intent. CLI watch, PR comments, and checks read stored
+state; they do not infer state directly from remote Tern.
+
+```text
 ╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭────────────────╮
 │ Scheduler   │   │ Remote Tern │   │ SchemaBot   │   │ User-visible   │
 │ worker      │──▶│ data plane  │──▶│ storage     │──▶│ observers      │
@@ -35,17 +47,6 @@ Progress polling path: remote observation and stored reconciliation
                     sample           state, errors,    PR comments,
                                      request result    checks
 ```
-
-- The API stores durable request intent and caller metadata before the
-  scheduler performs remote control work.
-- Progress polling is observation, not a new operator request. A remote progress
-  sample may confirm, complete, or fail a stored control request, but it should
-  not erase newer durable intent.
-- The scheduler is the single owner that claims pending or stale work, executes
-  control requests, polls remote Tern, and reconciles progress back into
-  SchemaBot storage.
-- CLI watch, PR comments, and checks read stored state; they do not infer state
-  directly from remote Tern.
 
 ## Current gRPC stop/start scenarios
 
