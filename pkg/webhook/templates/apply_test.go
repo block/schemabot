@@ -143,11 +143,12 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 
 func TestRenderApplyStatusComment_Stopped(t *testing.T) {
 	data := ApplyStatusCommentData{
-		Database:    "testapp",
-		Environment: "staging",
-		RequestedBy: "aparajon",
-		State:       "stopped",
-		Engine:      "Spirit",
+		Database:     "testapp",
+		Environment:  "staging",
+		RequestedBy:  "aparajon",
+		State:        "stopped",
+		Engine:       "Spirit",
+		ErrorMessage: "remote apply remote-123 remained stopped after start grace period 30s",
 		Tables: []TableProgressData{
 			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "completed"},
 			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "stopped", RowsCopied: 72000, RowsTotal: 100000, PercentComplete: 72},
@@ -163,6 +164,7 @@ func TestRenderApplyStatusComment_Stopped(t *testing.T) {
 	// Progress summary
 	assert.Contains(t, result, "📊 1/2 complete")
 	assert.Contains(t, result, "1 stopped")
+	assert.Contains(t, result, "remote apply remote-123 remained stopped after start grace period 30s")
 	assert.Contains(t, result, "schemabot start")
 }
 

@@ -63,8 +63,8 @@ func RenderApplyStatusComment(data ApplyStatusCommentData) string {
 		writeTableProgressSection(&sb, data)
 	}
 
-	// Error message for failed applies
-	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
+	// Error message for apply states that need operator triage.
+	if state.IsState(data.State, state.Apply.Failed, state.Apply.Stopped) && data.ErrorMessage != "" {
 		writeErrorBlock(&sb, data.ErrorMessage)
 	}
 

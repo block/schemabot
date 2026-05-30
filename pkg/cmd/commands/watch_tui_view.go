@@ -159,6 +159,10 @@ func (m WatchModel) progressView() string {
 		}
 	case effectivelyStopped:
 		b.WriteString("\n\n")
+		if m.errorMsg != "" {
+			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+			b.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
+		}
 		b.WriteString(templates.FormatApplyStopped())
 		b.WriteString("\n")
 		if m.applyID != "" {

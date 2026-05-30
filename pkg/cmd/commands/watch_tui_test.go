@@ -155,6 +155,27 @@ func TestWatchModel_NoActiveChange_WithoutError(t *testing.T) {
 	assert.Contains(t, view, "No active schema change")
 }
 
+func TestWatchModel_StoppedWithErrorShowsReason(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+	m.applyID = "apply-stopped-start-timeout"
+
+	updated, _ := m.Update(progressMsg{
+		state:    state.Apply.Stopped,
+		errorMsg: "remote apply remote-123 remained stopped after start grace period 30s",
+		tables: []tableProgress{{
+			Name:    "users",
+			Status:  state.Task.Stopped,
+			Percent: 40,
+		}},
+	})
+	model := updated.(WatchModel)
+
+	view := model.View()
+	assert.Contains(t, view, "remote apply remote-123 remained stopped after start grace period 30s")
+	assert.Contains(t, view, "Apply stopped")
+	assert.Contains(t, view, "schemabot start")
+}
+
 func TestWatchModel_ConnectionError_CanEscape(t *testing.T) {
 	// User should be able to ESC out of the loading+error state.
 	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
