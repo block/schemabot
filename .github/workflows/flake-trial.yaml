@@ -1,0 +1,83 @@
+name: "Flake Trial"
+
+on:
+  push:
+    branches:
+      - armand/grouped-resume-final-check
+
+permissions: {}
+
+jobs:
+  grpc-stop-start:
+    name: "gRPC Stop/Start E2E (run ${{ matrix.run }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: "Test"
+        run: |
+          set -euo pipefail
+
+          export SCHEMABOT_PORT=15370
+          export SCHEMABOT_MYSQL_PORT=15371
+          export TERN_STAGING_MYSQL_PORT=15372
+          export TERN_PRODUCTION_MYSQL_PORT=15373
+          export TERN_STAGING_PORT=15380
+          export TERN_STAGING_GRPC_PORT=15390
+          export TERN_PRODUCTION_PORT=15382
+          export TERN_PRODUCTION_GRPC_PORT=15392
+
+          cleanup() {
+            docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v 2>/dev/null || true
+            rm -f deploy/local/schemabot-dev
+          }
+          dump_logs() {
+            docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --tail=300 2>/dev/null || true
+          }
+          trap 'status=$?; if [ "$status" -ne 0 ]; then dump_logs; fi; cleanup; exit "$status"' EXIT
+
+          make build
+          CGO_ENABLED=0 GOOS=linux go build -o bin/schemabot-linux ./pkg/cmd
+          cp bin/schemabot-linux deploy/local/schemabot-dev
+
+          docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v 2>/dev/null || true
+          docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml up --build -d
+          rm -f deploy/local/schemabot-dev
+
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:15370/health >/dev/null 2>&1; then
+              echo "SchemaBot gRPC e2e environment is healthy"
+              break
+            fi
+            if [ "$i" -eq 90 ]; then
+              echo "Timeout waiting for SchemaBot gRPC e2e environment"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          E2E_SCHEMABOT_URL=http://localhost:15370 \
+            E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:15371)/schemabot" \
+            E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:15372)/testapp" \
+            E2E_TERN_PRODUCTION_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
+            go test -count=1 -v -tags=e2e -timeout=10m ./e2e/grpc/... -run '^TestGRPC_StopStart$'
