@@ -55,13 +55,13 @@ the scheduler stops remote Tern, and stopped progress is stored. `/start` is a
 later, separate operator request. SchemaBot does not automatically start after a
 completed stop request.
 
-### Start succeeds
+### Start RPC succeeds
 
 | Step | Actor | What happens | User-visible result |
 | --- | --- | --- | --- |
 | 1 | Operator / CLI | Requests `/start` | CLI receives `start request accepted` |
 | 2 | API | Records a durable start request | Start work can be recovered by the scheduler |
-| 3 | Scheduler | Calls remote Tern `Start` | Remote Tern acknowledges the request |
+| 3 | Scheduler | Calls remote Tern `Start` | Remote Tern acknowledges the Start RPC |
 | 4 | Scheduler | Polls remote progress | Remote reports running or completed progress |
 | 5 | Storage / observer | Stores progress and completes the start request | CLI watch / PR comment / check show running or completed |
 
@@ -80,13 +80,13 @@ completed stop request.
 **End state:** apply remains stopped; the error is visible; the start request is
 failed, so the scheduler does not retry forever.
 
-### Start accepted, but remote still reports stopped
+### Start RPC succeeds, but remote progress remains stopped
 
 | Step | Actor | What happens | User-visible result |
 | --- | --- | --- | --- |
 | 1 | Operator / CLI | Requests `/start` | CLI receives `start request accepted` |
 | 2 | API | Records a durable start request | Start work can be recovered by the scheduler |
-| 3 | Scheduler | Calls remote Tern `Start` | Remote Tern acknowledges the request |
+| 3 | Scheduler | Calls remote Tern `Start` | Remote Tern acknowledges the Start RPC |
 | 4 | Scheduler | Polls remote progress during the bounded grace window | Previous stopped state does not cancel the start request |
 | 5a | Remote Tern | Reports running or completed before grace expires | Storage adopts progress and completes the start request |
 | 5b | Remote Tern | Still reports stopped when grace expires | Storage records stopped progress, warning apply log, and error message |
@@ -102,9 +102,9 @@ not retry forever.
 | 1 | Duplicate `/start` while start is already pending | Return already-accepted semantics; preserve the original durable request and caller visibility | Covered for durable requests |
 | 2 | Failed `/start` followed by scheduler recovery | Do not claim or retry the failed request automatically | Covered by storage integration test |
 | 3 | Failed `/start` followed by a new operator retry | Reset the failed request to pending and make the apply claimable again | Covered by storage integration test |
-| 4 | Remote `Start` RPC fails or times out | Keep apply stopped, store error message, add warning apply log, fail the start request | Covered |
-| 5 | Remote `Start` RPC succeeds but progress remains stopped past grace | Keep apply stopped, store timeout reason, add warning apply log, fail the start request | Covered |
-| 6 | Remote reports stale stopped progress shortly after accepted `Start` | Ignore stopped samples only during the bounded grace window | Covered |
+| 4 | Start RPC fails or times out | Keep apply stopped, store error message, add warning apply log, fail the start request | Covered |
+| 5 | Start RPC succeeds but progress remains stopped past grace | Keep apply stopped, store timeout reason, add warning apply log, fail the start request | Covered |
+| 6 | Remote reports stale stopped progress shortly after Start RPC succeeds | Ignore stopped samples only during the bounded grace window | Covered |
 | 7 | Remote reports running/completed during start grace | Adopt remote progress and complete the start request | Covered |
 | 8 | Concurrent stop and start requests | Stop intent wins unless the start is a later explicit retry after stopped state is established | Covered for stop priority; keep auditing new call paths |
 | 9 | Multiple operators request stop during an incident | Preserve caller visibility through durable request metadata and apply logs | Covered for stop logs; keep caller fields in future PR-comment path |
