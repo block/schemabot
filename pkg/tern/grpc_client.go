@@ -744,7 +744,20 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 				Environment: apply.Environment,
 			})
 			if err != nil {
-				return fmt.Errorf("start via gRPC: %w", err)
+				message := fmt.Sprintf("remote start failed for remote apply %s: %v", apply.ExternalID, err)
+				slog.Warn("remote gRPC start failed; storing stopped state for scheduler retry",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"error", err)
+				c.logApplyWarning(ctx, apply, message)
+				apply.State = state.Apply.Stopped
+				apply.ErrorMessage = message
+				if reconcileErr := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, time.Now()); reconcileErr != nil {
+					return fmt.Errorf("persist stopped gRPC apply %s after start failure: %w", apply.ApplyIdentifier, reconcileErr)
+				}
+				return fmt.Errorf("start gRPC apply %s: %w", apply.ApplyIdentifier, err)
 			}
 			now := time.Now()
 			apply.State = state.Apply.Running

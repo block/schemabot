@@ -355,6 +355,7 @@ type capturingTernServer struct {
 	progressTables   []*ternv1.TableProgress
 	progressError    string
 	progressErr      error
+	startErr         error
 	startCalled      bool // tracks whether Start was actually invoked
 }
 
@@ -377,6 +378,11 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 	s.mu.Lock()
 	s.startApplyID = req.ApplyId
 	s.startCalled = true
+	err := s.startErr
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
 	// After Start succeeds, transition to COMPLETED so the poller exits.
 	s.progressState = ternv1.State_STATE_COMPLETED
 	s.mu.Unlock()
@@ -1828,6 +1834,68 @@ func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
+}
+
+func TestGRPCClient_ResumeApplyStartErrorLeavesApplyStopped(t *testing.T) {
+	// When the scheduler accepts a stored start request but remote Tern rejects
+	// the Start RPC, keep the apply stopped with a visible reason and leave the
+	// start request pending for a later retry/reconciliation attempt.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Stopped,
+			PercentComplete: 35,
+		}},
+		startErr: status.Error(codes.Unavailable, "remote start unavailable"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-start-error",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		ExternalID:      "remote-start-error",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             2,
+		TaskIdentifier: "task-start-error",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Stopped,
+	}
+	logs := &mockApplyLogStore{}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote start unavailable")
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Contains(t, apply.ErrorMessage, "remote start failed")
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, 35, task.ProgressPercent)
+	assert.True(t, hasLogMessageContaining(logs.logs, "remote start failed for remote apply remote-start-error"))
+	pendingStart, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, pendingStart)
 }
 
 func TestGRPCClient_ResumeApplyProcessesQueuedStop(t *testing.T) {
