@@ -16,41 +16,25 @@ disagree, SchemaBot should fail closed: preserve operator intent, keep errors
 visible, and avoid unbounded retries without a new operator request.
 
 ```text
-╭──────────────────────────────╮      ╭──────────────────────────────╮
-│ Operator / automation         │      │ User-visible observers        │
-│ CLI today, PR comments later  │      │ CLI watch, PR comments, checks│
-╰───────────────┬──────────────╯      ╰───────────────▲──────────────╯
-                │ control request                      │ stored state,
-                ▼                                      │ errors, checks
-╭──────────────────────────────╮                      │
-│ SchemaBot API                 │                      │
-│ validates and stores intent   │                      │
-╰───────────────┬──────────────╯                      │
-                │ durable request + caller metadata    │
-                ▼                                      │
-╭──────────────────────────────╮                      │
-│ SchemaBot storage             │──────────────────────╯
-│ apply state                   │
-│ control requests              │◀──────────────╮
-│ apply logs + errors           │               │ reconciled progress,
-╰───────────────┬──────────────╯               │ request completion/failure
-                │ claim pending/stale work      │
-                ▼                               │
-╭──────────────────────────────╮               │
-│ Scheduler-owned worker        │               │
-│ one claimant per apply        │               │
-│ reconciles stored intent      │               │
-╰───────────────┬──────────────╯               │
-                │ Progress / Start / Stop /     │
-                │ Cutover RPCs                  │ remote progress samples
-                ▼                               │
-╭──────────────────────────────╮               │
-│ Remote Tern data plane        │───────────────╯
-│ remote worker state           │
-│ engine-side control signals   │
-│ target database state         │
-╰──────────────────────────────╯
+╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭─────────────╮
+│ Operator /  │   │ SchemaBot   │   │ SchemaBot   │   │ Scheduler   │   │ Remote Tern │
+│ automation  │──▶│ API         │──▶│ storage     │──▶│ worker      │──▶│ data plane  │
+╰─────────────╯   ╰─────────────╯   ╰──────┬──────╯   ╰──────┬──────╯   ╰──────┬──────╯
+                                           │                 ▲                 │
+                                           │                 │                 │
+                                           ▼                 ╰─────────────────╯
+                                  ╭────────────────╮       progress samples,
+                                  │ User-visible   │       request completion,
+                                  │ observers      │       and failure reasons
+                                  ╰────────────────╯
 ```
+
+- The API stores durable request intent and caller metadata before the
+  scheduler performs remote control work.
+- The scheduler is the single owner that claims pending or stale work, calls
+  remote Tern, and reconciles progress back into SchemaBot storage.
+- CLI watch, PR comments, and checks read stored state; they do not infer state
+  directly from remote Tern.
 
 ## Current gRPC stop/start scenarios
 
