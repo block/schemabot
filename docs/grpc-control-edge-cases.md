@@ -16,23 +16,34 @@ disagree, SchemaBot should fail closed: preserve operator intent, keep errors
 visible, and avoid unbounded retries without a new operator request.
 
 ```text
+Control request path: durable operator intent
+
 ╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭─────────────╮
 │ Operator /  │   │ SchemaBot   │   │ SchemaBot   │   │ Scheduler   │   │ Remote Tern │
 │ automation  │──▶│ API         │──▶│ storage     │──▶│ worker      │──▶│ data plane  │
-╰─────────────╯   ╰─────────────╯   ╰──────┬──────╯   ╰──────┬──────╯   ╰──────┬──────╯
-                                           │                 ▲                 │
-                                           │                 │                 │
-                                           ▼                 ╰─────────────────╯
-                                  ╭────────────────╮       progress samples,
-                                  │ User-visible   │       request completion,
-                                  │ observers      │       and failure reasons
-                                  ╰────────────────╯
+╰─────────────╯   ╰─────────────╯   ╰─────────────╯   ╰─────────────╯   ╰─────────────╯
+     request        validate +       durable intent     claim +          Stop / Start /
+                    accept           caller metadata    execute          Cutover RPC
+
+Progress polling path: remote observation and stored reconciliation
+
+╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭────────────────╮
+│ Scheduler   │   │ Remote Tern │   │ SchemaBot   │   │ User-visible   │
+│ worker      │──▶│ data plane  │──▶│ storage     │──▶│ observers      │
+╰─────────────╯   ╰─────────────╯   ╰─────────────╯   ╰────────────────╯
+     poll           progress         reconciled        CLI watch,
+                    sample           state, errors,    PR comments,
+                                     request result    checks
 ```
 
 - The API stores durable request intent and caller metadata before the
   scheduler performs remote control work.
-- The scheduler is the single owner that claims pending or stale work, calls
-  remote Tern, and reconciles progress back into SchemaBot storage.
+- Progress polling is observation, not a new operator request. A remote progress
+  sample may confirm, complete, or fail a stored control request, but it should
+  not erase newer durable intent.
+- The scheduler is the single owner that claims pending or stale work, executes
+  control requests, polls remote Tern, and reconciles progress back into
+  SchemaBot storage.
 - CLI watch, PR comments, and checks read stored state; they do not infer state
   directly from remote Tern.
 
