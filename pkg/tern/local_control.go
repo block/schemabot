@@ -112,6 +112,7 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 
 	creds := c.credentials()
 	eng := c.getEngine()
+	applyCancel := c.currentApplyCancel()
 
 	// Stop the engine first, THEN snapshot progress.
 	// eng.Stop() blocks until Spirit's goroutine exits, so by the time it
@@ -123,12 +124,7 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 	// Cancel the apply goroutine's context so it stops iterating over tasks.
 	// Without this, executeApplySequential would continue to the next table
 	// after Spirit's runner exits, racing with the resume goroutine.
-	c.cancelMu.Lock()
-	if c.cancelApply != nil {
-		c.cancelApply()
-		c.cancelApply = nil
-	}
-	c.cancelMu.Unlock()
+	c.cancelApplyHandle(applyCancel)
 
 	// For Vitess/PlanetScale, stopping means cancelling the deploy request —
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".

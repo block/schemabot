@@ -246,21 +246,43 @@ func (c *LocalClient) usesGroupedApply(apply *storage.Apply) bool {
 	return apply.DatabaseType == storage.DatabaseTypeMySQL && apply.GetOptions().DeferCutover
 }
 
-func (c *LocalClient) setApplyCancel(cancel context.CancelFunc) {
+func (c *LocalClient) setApplyCancel(cancel context.CancelFunc) uint64 {
 	c.cancelMu.Lock()
+	c.cancelApplyGeneration++
+	generation := c.cancelApplyGeneration
 	c.cancelApply = cancel
 	c.cancelMu.Unlock()
+	return generation
 }
 
-func (c *LocalClient) clearApplyCancel() {
+func (c *LocalClient) clearApplyCancel(generation uint64) {
 	c.cancelMu.Lock()
-	c.cancelApply = nil
+	if c.cancelApplyGeneration == generation {
+		c.cancelApply = nil
+	}
 	c.cancelMu.Unlock()
 }
 
-func (c *LocalClient) startApplyExecution(ctx context.Context, cancel context.CancelFunc, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+func (c *LocalClient) currentApplyCancel() applyCancelHandle {
+	c.cancelMu.Lock()
+	defer c.cancelMu.Unlock()
+	return applyCancelHandle{generation: c.cancelApplyGeneration, cancel: c.cancelApply}
+}
+
+func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
+	if handle.cancel != nil {
+		handle.cancel()
+	}
+	c.cancelMu.Lock()
+	if c.cancelApplyGeneration == handle.generation {
+		c.cancelApply = nil
+	}
+	c.cancelMu.Unlock()
+}
+
+func (c *LocalClient) startApplyExecution(ctx context.Context, cancelGeneration uint64, cancel context.CancelFunc, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
 	go func() {
-		defer c.clearApplyCancel()
+		defer c.clearApplyCancel(cancelGeneration)
 		defer cancel()
 		c.runApplyExecution(ctx, apply, tasks, plan, options)
 	}()

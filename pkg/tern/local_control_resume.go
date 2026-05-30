@@ -195,9 +195,9 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 			fmt.Sprintf("Resume requested (sequential): %d tasks to resume, %d already completed", len(resumeTasks), completedCount), oldApplyState, state.Apply.Running)
 
 		resumeCtx, cancelResume := context.WithCancel(context.Background())
-		c.setApplyCancel(cancelResume)
+		cancelGeneration := c.setApplyCancel(cancelResume)
 		go func() {
-			defer c.clearApplyCancel()
+			defer c.clearApplyCancel(cancelGeneration)
 			defer cancelResume()
 			c.resumeApplySequential(resumeCtx, apply, resumeTasks, plan, options)
 		}()
@@ -654,8 +654,8 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 
 	if apply.GetOptions().DeferCutover {
 		resumeCtx, cancelResume := context.WithCancel(ctx)
-		c.setApplyCancel(cancelResume)
-		defer c.clearApplyCancel()
+		cancelGeneration := c.setApplyCancel(cancelResume)
+		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
 		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply)), true, startRequested); err != nil {
 			if c.shouldRetryEngineError(err) {
@@ -685,8 +685,8 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 			"Apply resumed from checkpoint (sequential)", "", state.Apply.Running)
 
 		resumeCtx, cancelResume := context.WithCancel(ctx)
-		c.setApplyCancel(cancelResume)
-		defer c.clearApplyCancel()
+		cancelGeneration := c.setApplyCancel(cancelResume)
+		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
 		c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options)
 	}
@@ -697,8 +697,8 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) {
 	options := buildApplyOptions(apply)
 	applyCtx, cancelApply := context.WithCancel(ctx)
-	c.setApplyCancel(cancelApply)
-	defer c.clearApplyCancel()
+	cancelGeneration := c.setApplyCancel(cancelApply)
+	defer c.clearApplyCancel(cancelGeneration)
 	defer cancelApply()
 
 	c.logger.Info("dispatching queued apply",

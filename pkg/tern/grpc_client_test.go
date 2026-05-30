@@ -845,7 +845,7 @@ func TestGRPCClient_ProgressPollTerminalErrorFailsApply(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid apply_id")
 
@@ -892,7 +892,7 @@ func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "remote service unavailable")
 
@@ -997,6 +997,12 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 			expected:    state.Apply.Completed,
 		},
 		{
+			name:        "stored stopped state is final without start ownership",
+			storedState: state.Apply.Stopped,
+			remoteState: state.Apply.Running,
+			expected:    state.Apply.Stopped,
+		},
+		{
 			name:        "stored retryable failure blocks active progress",
 			storedState: state.Apply.FailedRetryable,
 			remoteState: state.Apply.Running,
@@ -1018,9 +1024,13 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.expected, applyStateFromRemoteProgress(tc.storedState, tc.remoteState))
+			assert.Equal(t, tc.expected, applyStateFromRemoteProgress(tc.storedState, tc.remoteState, false))
 		})
 	}
+
+	assert.Equal(t, state.Apply.Running,
+		applyStateFromRemoteProgress(state.Apply.Stopped, state.Apply.Running, true),
+		"a scheduler-owned start may adopt active remote progress after a stale stopped write")
 }
 
 func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing.T) {
@@ -1259,7 +1269,7 @@ func TestGRPCClient_PollSetsTerminalTaskMetadataFromRemoteTaskProgress(t *testin
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Task.Completed, task.State)
@@ -1301,7 +1311,7 @@ func TestGRPCClient_PollReturnsErrorWhenTerminalRemoteApplyLeavesStoredTaskActiv
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "stored task task-terminal-missing-state is still running")
 	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
@@ -1346,7 +1356,7 @@ func TestGRPCClient_PollReturnsTerminalStorageUpdateError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "update terminal remote gRPC apply")
 	assert.Contains(t, err.Error(), "storage unavailable")
@@ -1382,7 +1392,7 @@ func TestGRPCClient_PollKeepsApplyActiveWhenTerminalTaskLoadFails(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "load tasks to sync terminal gRPC progress")
 	assert.Contains(t, err.Error(), "task storage unavailable")
@@ -1425,7 +1435,7 @@ func TestGRPCClient_PollSkipsTaskFinalizationWhenStoredApplyAlreadyTerminal(t *t
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Apply.Failed, apply.State)
@@ -2158,7 +2168,7 @@ func TestGRPCClient_PollFailsWhenRemoteApplyIsNotFound(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "remote-not-found")
 
@@ -2199,7 +2209,7 @@ func TestGRPCClient_PollFailsWhenExactRemoteApplyHasNoActiveProgress(t *testing.
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no active schema change")
 
@@ -2237,7 +2247,7 @@ func TestGRPCClient_PollFailsWhenRemoteApplyStateIsUnmapped(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unmapped remote state")
 	assert.Equal(t, state.Apply.Running, apply.State)
@@ -2281,7 +2291,7 @@ func TestGRPCClient_RemoteProgressLossDoesNotOverwriteTerminalApply(t *testing.T
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply)
+	err := client.pollForCompletion(ctx, apply, false)
 	require.Error(t, err)
 
 	assert.Equal(t, state.Apply.Completed, apply.State)

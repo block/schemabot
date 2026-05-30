@@ -468,7 +468,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
 	apply.UpdatedAt = now
 	if isTerminalProtoState(progress.State) {
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now); err != nil {
@@ -527,7 +527,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
 	apply.UpdatedAt = now
 	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now); err != nil {
 		return false, err
@@ -767,7 +767,7 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 		}
 	}
 
-	return c.pollForCompletion(ctx, apply)
+	return c.pollForCompletion(ctx, apply, startRequested)
 }
 
 func shouldDispatchQueuedRemoteApply(apply *storage.Apply) bool {
@@ -890,7 +890,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		fmt.Sprintf("Apply dispatched to remote Tern: target=%s deployment=%s remote_apply_id=%s", target, apply.Deployment, apply.ExternalID),
 		oldApplyState)
 
-	return c.pollForCompletion(ctx, apply)
+	return c.pollForCompletion(ctx, apply, false)
 }
 
 func isAmbiguousRemoteApplyDispatchError(err error) bool {
@@ -1359,11 +1359,14 @@ func storedTaskResolvedForTerminalRemoteApply(remoteApplyState, storedTaskState 
 // progress into task state first, then derives apply state from stored tasks.
 // gRPC mode receives an apply state directly from the remote data plane, so the
 // control plane needs the same no-backward policy at the apply row boundary.
-func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string) string {
+func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, allowStoppedStoredApply bool) string {
 	if remoteApplyState == "" {
 		return storedApplyState
 	}
 	if state.IsTerminalApplyState(remoteApplyState) {
+		return remoteApplyState
+	}
+	if allowStoppedStoredApply && state.IsState(storedApplyState, state.Apply.Stopped) {
 		return remoteApplyState
 	}
 	if state.IsTerminalApplyState(storedApplyState) {
@@ -1409,7 +1412,7 @@ func applyProgressRank(applyState string) int {
 
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
 // Also maintains heartbeat to keep the lease on the apply.
-func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply) error {
+func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply, allowStoppedAfterStart bool) error {
 	ticker := time.NewTicker(grpcProgressPollInterval)
 	defer ticker.Stop()
 
@@ -1417,6 +1420,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 	defer heartbeatTicker.Stop()
 
 	consecutiveProgressErrors := 0
+	loggedStoppedAfterStart := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -1503,7 +1507,19 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				apply.StartedAt = &now
 			}
 			remoteApplyState := newState
-			newState = applyStateFromRemoteProgress(apply.State, remoteApplyState)
+			if allowStoppedAfterStart && state.IsState(remoteApplyState, state.Apply.Stopped) {
+				if !loggedStoppedAfterStart {
+					slog.Info("remote gRPC apply still stopped after start accepted; scheduler will keep polling",
+						"apply_id", apply.ApplyIdentifier,
+						"external_id", apply.ExternalID,
+						"database", apply.Database,
+						"environment", apply.Environment,
+						"stored_state", apply.State)
+					loggedStoppedAfterStart = true
+				}
+				continue
+			}
+			newState = applyStateFromRemoteProgress(apply.State, remoteApplyState, allowStoppedAfterStart)
 			if !state.IsState(newState, remoteApplyState) {
 				slog.Debug("keeping stored gRPC apply state because remote progress reported earlier state",
 					"apply_id", apply.ApplyIdentifier,

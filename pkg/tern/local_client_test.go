@@ -132,6 +132,32 @@ func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
 	return s.controlRequests
 }
 
+func TestApplyCancelHandleDoesNotCancelNewerOwner(t *testing.T) {
+	client := &LocalClient{}
+	oldCtx, oldCancel := context.WithCancel(t.Context())
+	oldGeneration := client.setApplyCancel(oldCancel)
+	oldHandle := client.currentApplyCancel()
+
+	newCtx, newCancel := context.WithCancel(t.Context())
+	defer newCancel()
+	newGeneration := client.setApplyCancel(newCancel)
+
+	client.cancelApplyHandle(oldHandle)
+	assert.Equal(t, oldGeneration, oldHandle.generation)
+	require.Eventually(t, func() bool {
+		return oldCtx.Err() != nil
+	}, time.Second, 10*time.Millisecond)
+	assert.NoError(t, newCtx.Err())
+
+	client.clearApplyCancel(oldGeneration)
+	currentHandle := client.currentApplyCancel()
+	assert.Equal(t, newGeneration, currentHandle.generation)
+	assert.NotNil(t, currentHandle.cancel)
+
+	client.clearApplyCancel(newGeneration)
+	assert.Nil(t, client.currentApplyCancel().cancel)
+}
+
 type testControlRequestStore struct {
 	storage.ControlRequestStore
 	requests []*storage.ApplyControlRequest

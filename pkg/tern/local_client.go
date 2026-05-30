@@ -142,8 +142,9 @@ type LocalClient struct {
 	// cancelApply cancels the background goroutine running executeApplySequential
 	// or executeGroupedApply. Set when an apply starts, called by Stop().
 	// Protected by cancelMu since Apply and Stop run on different goroutines.
-	cancelMu    sync.Mutex
-	cancelApply context.CancelFunc
+	cancelMu              sync.Mutex
+	cancelApply           context.CancelFunc
+	cancelApplyGeneration uint64
 
 	// observers holds per-apply progress observers. The progress poller notifies
 	// the observer on state changes and terminal state. Cleared on terminal state.
@@ -155,6 +156,11 @@ type LocalClient struct {
 	// before Spirit starts.
 	// Protected by observerMu.
 	pendingObserver ProgressObserver
+}
+
+type applyCancelHandle struct {
+	generation uint64
+	cancel     context.CancelFunc
 }
 
 // Compile-time check that LocalClient implements Client.
@@ -603,8 +609,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	// Start apply in background with cancellable context (Stop() cancels this)
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	c.setApplyCancel(cancelApply)
-	c.startApplyExecution(applyCtx, cancelApply, apply, tasks, plan, options)
+	cancelGeneration := c.setApplyCancel(cancelApply)
+	c.startApplyExecution(applyCtx, cancelGeneration, cancelApply, apply, tasks, plan, options)
 
 	return &ternv1.ApplyResponse{
 		Accepted: true,

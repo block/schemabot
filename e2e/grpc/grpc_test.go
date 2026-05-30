@@ -227,7 +227,7 @@ func TestGRPC_StopStart(t *testing.T) {
 
 	// Seed enough rows that Spirit's copy phase takes a noticeable amount of time
 	grpcSeedRows(t, "staging", tableName, "name, data",
-		"CONCAT('user_', seq), REPEAT('x', 500)", 100000)
+		"CONCAT('user_', seq), REPEAT('x', 500)", 500000)
 
 	grpcEnsureNoActiveChange(t, "testapp", "staging")
 
