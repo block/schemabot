@@ -125,6 +125,8 @@ not retry forever.
 - If the remote RPC succeeds but storage fails, what does the operator see?
 - If the remote RPC fails but storage succeeds, what does the operator see?
 - Does a failed durable request require a new operator request before retrying?
+- Are `apply_logs` stored for accepted, completed, failed, skipped, and
+  already-accepted control requests, including caller metadata when available?
 - Are CLI watch, PR comments, check runs, apply logs, and stored error messages
   consistent for terminal or blocked outcomes?
 - Are polling windows bounded, and do timeout branches fail visibly instead of
