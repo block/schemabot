@@ -15,6 +15,43 @@ The scheduler is responsible for reconciling these state sources. When they
 disagree, SchemaBot should fail closed: preserve operator intent, keep errors
 visible, and avoid unbounded retries without a new operator request.
 
+```text
+╭──────────────────────────────╮      ╭──────────────────────────────╮
+│ Operator / automation         │      │ User-visible observers        │
+│ CLI today, PR comments later  │      │ CLI watch, PR comments, checks│
+╰───────────────┬──────────────╯      ╰───────────────▲──────────────╯
+                │ control request                      │ stored state,
+                ▼                                      │ errors, checks
+╭──────────────────────────────╮                      │
+│ SchemaBot API                 │                      │
+│ validates and stores intent   │                      │
+╰───────────────┬──────────────╯                      │
+                │ durable request + caller metadata    │
+                ▼                                      │
+╭──────────────────────────────╮                      │
+│ SchemaBot storage             │──────────────────────╯
+│ apply state                   │
+│ control requests              │◀──────────────╮
+│ apply logs + errors           │               │ reconciled progress,
+╰───────────────┬──────────────╯               │ request completion/failure
+                │ claim pending/stale work      │
+                ▼                               │
+╭──────────────────────────────╮               │
+│ Scheduler-owned worker        │               │
+│ one claimant per apply        │               │
+│ reconciles stored intent      │               │
+╰───────────────┬──────────────╯               │
+                │ Progress / Start / Stop /     │
+                │ Cutover RPCs                  │ remote progress samples
+                ▼                               │
+╭──────────────────────────────╮               │
+│ Remote Tern data plane        │───────────────╯
+│ remote worker state           │
+│ engine-side control signals   │
+│ target database state         │
+╰──────────────────────────────╯
+```
+
 ## Current gRPC stop/start scenarios
 
 Common setup: an operator requests `/stop`; SchemaBot records the stop request,
