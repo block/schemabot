@@ -1525,6 +1525,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					loggedStoppedAfterStart = true
 				}
 				if !now.Before(stoppedAfterStartDeadline) {
+					message := fmt.Sprintf("remote apply %s remained stopped after start grace period %s", apply.ExternalID, grpcStoppedAfterStartGracePeriod)
 					slog.Warn("remote gRPC apply remained stopped after start grace period; storing stopped state",
 						"apply_id", apply.ApplyIdentifier,
 						"external_id", apply.ExternalID,
@@ -1532,12 +1533,13 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 						"environment", apply.Environment,
 						"stored_state", apply.State,
 						"grace_period", grpcStoppedAfterStartGracePeriod)
+					c.logApplyWarning(ctx, apply, message)
 					apply.State = state.Apply.Stopped
 					apply.ErrorMessage = ""
 					if err := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now); err != nil {
 						return fmt.Errorf("persist stopped gRPC apply %s after start grace period: %w", apply.ApplyIdentifier, err)
 					}
-					return nil
+					return fmt.Errorf("start accepted for gRPC apply %s but %s", apply.ApplyIdentifier, message)
 				}
 				continue
 			}

@@ -955,11 +955,14 @@ func TestGRPCClient_ProgressPollBoundsStoppedAfterStart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	err := client.pollForCompletion(ctx, apply, true)
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "start accepted")
+	assert.Contains(t, err.Error(), "remained stopped after start grace period")
 
 	assert.Equal(t, state.Apply.Stopped, apply.State)
 	assert.Equal(t, state.Task.Stopped, task.State)
 	assert.Equal(t, 40, task.ProgressPercent)
+	assert.True(t, hasLogMessageContaining(logs.logs, "remote apply remote-stopped-after-start remained stopped after start grace period"))
 	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply reached terminal state: stopped"))
 }
 
