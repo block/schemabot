@@ -183,6 +183,11 @@ stale heartbeat makes the apply claimable through the normal scheduler recovery
 path, and the next worker processes the pending control request before resuming
 or dispatching more work.
 
+The gRPC Tern path has additional remote-vs-stored reconciliation cases because
+control RPC acknowledgements and subsequent progress samples can arrive at
+different times. [`grpc-control-edge-cases.md`](grpc-control-edge-cases.md)
+tracks those scenario tables and the review checklist for future control work.
+
 ## Tern Layer (Orchestrator)
 
 Tern is the orchestration layer. It manages the schema change lifecycle: creating records, calling the engine, polling for progress, and tracking state. It defines a proto interface (`Plan`, `Apply`, `Progress`, `Cutover`, `Stop`, `Start`, `Volume`, `Revert`, `SkipRevert`).
