@@ -760,6 +760,45 @@ func TestApplyStore_FindNextApplyClaimsStoppedStartControlRequest(t *testing.T) 
 	assert.Nil(t, claimedAgain, "claim transition should prevent another worker from taking the same stopped start request")
 }
 
+func TestApplyStore_FindNextApplySkipsFailedStoppedStartControlRequest(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_failed_start_request", 505, state.Apply.Stopped, "staging")
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+	require.NoError(t, store.ControlRequests().FailPending(ctx, apply.ID, storage.ControlOperationStart, "remote start failed"))
+
+	claimed, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "failed start requests should not be retried automatically by scheduler claims")
+
+	reset, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator-retry",
+		Metadata:    []byte(`{"started_count":1}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+	assert.Equal(t, storage.ControlRequestPending, reset.Status)
+	assert.Equal(t, "operator-retry", reset.RequestedBy)
+
+	claimedAfterRetry, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimedAfterRetry)
+	assert.Equal(t, apply.ApplyIdentifier, claimedAfterRetry.ApplyIdentifier)
+}
+
 func TestApplyStore_FindNextApplyDoesNotClaimFreshRunningStopControlRequest(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
