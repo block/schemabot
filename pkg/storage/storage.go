@@ -350,4 +350,8 @@ type ControlRequestStore interface {
 
 	// CompletePending marks the pending request for an apply operation completed.
 	CompletePending(ctx context.Context, applyID int64, operation ControlOperation) error
+
+	// FailPending marks the pending request for an apply operation failed with an
+	// operator-visible reason.
+	FailPending(ctx context.Context, applyID int64, operation ControlOperation, errorMessage string) error
 }

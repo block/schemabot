@@ -202,6 +202,16 @@ func (s *testControlRequestStore) CompletePending(_ context.Context, applyID int
 	return nil
 }
 
+func (s *testControlRequestStore) FailPending(_ context.Context, applyID int64, operation storage.ControlOperation, errorMessage string) error {
+	for _, req := range s.requests {
+		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
+			req.Status = storage.ControlRequestFailed
+			req.ErrorMessage = errorMessage
+		}
+	}
+	return nil
+}
+
 func cloneTestControlRequest(req *storage.ApplyControlRequest) *storage.ApplyControlRequest {
 	if req == nil {
 		return nil

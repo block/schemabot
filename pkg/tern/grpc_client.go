@@ -757,6 +757,11 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 				if reconcileErr := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, time.Now()); reconcileErr != nil {
 					return fmt.Errorf("persist stopped gRPC apply %s after start failure: %w", apply.ApplyIdentifier, reconcileErr)
 				}
+				if startRequested {
+					if failErr := failPendingStartControlRequests(ctx, c.storage, apply, message); failErr != nil {
+						return failErr
+					}
+				}
 				return fmt.Errorf("start gRPC apply %s: %w", apply.ApplyIdentifier, err)
 			}
 			now := time.Now()
@@ -1551,6 +1556,9 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					apply.ErrorMessage = message
 					if err := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now); err != nil {
 						return fmt.Errorf("persist stopped gRPC apply %s after start grace period: %w", apply.ApplyIdentifier, err)
+					}
+					if err := failPendingStartControlRequests(ctx, c.storage, apply, message); err != nil {
+						return err
 					}
 					return fmt.Errorf("start accepted for gRPC apply %s but %s", apply.ApplyIdentifier, message)
 				}

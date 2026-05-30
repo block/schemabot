@@ -37,6 +37,20 @@ func completePendingStartControlRequests(ctx context.Context, store storage.Stor
 	return nil
 }
 
+func failPendingStartControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, errorMessage string) error {
+	if store == nil {
+		return fmt.Errorf("storage is not available")
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return fmt.Errorf("control request store is not available")
+	}
+	if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationStart, errorMessage); err != nil {
+		return fmt.Errorf("fail pending start control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
 func pendingStopControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (*storage.ApplyControlRequest, error) {
 	if store == nil {
 		return nil, fmt.Errorf("storage is not available")

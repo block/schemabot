@@ -173,6 +173,34 @@ func TestControlRequestStore_CompletePending(t *testing.T) {
 	assert.NotNil(t, completed.CompletedAt)
 }
 
+func TestControlRequestStore_FailPending(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	applyID := createControlRequestTestApply(t, store, "apply_control_request_fail")
+	created, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   applyID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	require.NoError(t, store.ControlRequests().FailPending(ctx, applyID, storage.ControlOperationStart, "remote start failed"))
+
+	pending, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pending)
+
+	failed := getControlRequestByID(t, store, created.ID)
+	require.NotNil(t, failed)
+	assert.Equal(t, storage.ControlRequestFailed, failed.Status)
+	assert.Equal(t, "remote start failed", failed.ErrorMessage)
+	assert.NotNil(t, failed.CompletedAt)
+}
+
 func getControlRequestByID(t *testing.T, store *Storage, id int64) *storage.ApplyControlRequest {
 	t.Helper()
 	row := store.db.QueryRowContext(t.Context(), `

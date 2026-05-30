@@ -1895,7 +1895,10 @@ func TestGRPCClient_ResumeApplyStartErrorLeavesApplyStopped(t *testing.T) {
 	assert.True(t, hasLogMessageContaining(logs.logs, "remote start failed for remote apply remote-start-error"))
 	pendingStart, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 	require.NoError(t, err)
-	assert.NotNil(t, pendingStart)
+	assert.Nil(t, pendingStart)
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+	assert.Contains(t, controlRequests.requests[0].ErrorMessage, "remote start failed")
 }
 
 func TestGRPCClient_ResumeApplyProcessesQueuedStop(t *testing.T) {

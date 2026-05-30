@@ -218,6 +218,18 @@ func (s *memoryControlRequestStore) CompletePending(_ context.Context, applyID i
 	return nil
 }
 
+func (s *memoryControlRequestStore) FailPending(_ context.Context, applyID int64, operation storage.ControlOperation, errorMessage string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, req := range s.requests {
+		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
+			req.Status = storage.ControlRequestFailed
+			req.ErrorMessage = errorMessage
+		}
+	}
+	return nil
+}
+
 func cloneControlRequest(req *storage.ApplyControlRequest) *storage.ApplyControlRequest {
 	if req == nil {
 		return nil

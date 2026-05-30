@@ -124,6 +124,18 @@ func (s *controlRequestStore) CompletePending(ctx context.Context, applyID int64
 	return nil
 }
 
+func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, operation storage.ControlOperation, errorMessage string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE apply_control_requests
+		SET status = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE apply_id = ? AND operation = ? AND status = ?
+	`, storage.ControlRequestFailed, nullString(errorMessage), applyID, operation, storage.ControlRequestPending)
+	if err != nil {
+		return fmt.Errorf("fail pending control requests for apply %d operation %s: %w", applyID, operation, err)
+	}
+	return nil
+}
+
 func (s *controlRequestStore) getByIDForUpdate(ctx context.Context, tx *sql.Tx, id int64) (*storage.ApplyControlRequest, error) {
 	row := tx.QueryRowContext(ctx, `
 		SELECT `+controlRequestColumns+`
