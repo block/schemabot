@@ -317,6 +317,42 @@ func (e *leaseInspectingEngine) Progress(context.Context, *engine.ProgressReques
 	}, nil
 }
 
+type stagedGroupedResumeEngine struct {
+	engine.Engine
+
+	planResults []*engine.PlanResult
+	planCalls   int
+	applyCount  int
+	drainCount  int
+}
+
+func (e *stagedGroupedResumeEngine) Name() string { return "staged-grouped-resume" }
+
+func (e *stagedGroupedResumeEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	if len(e.planResults) == 0 {
+		return &engine.PlanResult{}, nil
+	}
+	idx := e.planCalls
+	if idx >= len(e.planResults) {
+		idx = len(e.planResults) - 1
+	}
+	e.planCalls++
+	return e.planResults[idx], nil
+}
+
+func (e *stagedGroupedResumeEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	e.applyCount++
+	return &engine.ApplyResult{Accepted: true}, nil
+}
+
+func (e *stagedGroupedResumeEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{State: engine.StateCompleted}, nil
+}
+
+func (e *stagedGroupedResumeEngine) Drain() {
+	e.drainCount++
+}
+
 func TestLocalClient_NewLocalClient(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -753,6 +789,159 @@ func TestLocalClient_GroupedApplyKeepsClaimLeaseRunning(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, completed)
 	assert.Equal(t, state.Apply.Completed, completed.State)
+}
+
+// This scenario covers a scheduler-owned grouped start where the target schema
+// advances between the recovery re-plan and the final pre-dispatch schema check.
+// The scheduler should complete durable state without reissuing engine apply work.
+func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	ddl := "ALTER TABLE `users` ADD COLUMN email varchar(255)"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-grouped-final-check-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{
+					{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"},
+				},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-grouped-final-check-%d", time.Now().UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Stopped,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	task := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-grouped-final-check-users-%d", time.Now().UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         planID,
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		State:          state.Task.Stopped,
+		TableName:      "users",
+		Namespace:      "testdb",
+		DDL:            ddl,
+		DDLAction:      "alter",
+		Options:        storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	taskID, err := stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	_, alreadyPending, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
+	require.NoError(t, err)
+	assert.False(t, alreadyPending)
+
+	resumeEngine := &stagedGroupedResumeEngine{planResults: []*engine.PlanResult{
+		{
+			Changes: []engine.SchemaChange{{
+				Namespace: "testdb",
+				TableChanges: []engine.TableChange{{
+					Table: "users",
+					DDL:   ddl,
+				}},
+			}},
+		},
+		{NoChanges: true},
+	}}
+	client.spiritEngine = resumeEngine
+
+	claimed, err := stor.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, state.Apply.Stopped, claimed.State)
+
+	require.NoError(t, client.ResumeApply(ctx, claimed))
+	assert.Equal(t, 2, resumeEngine.planCalls)
+	assert.Equal(t, 1, resumeEngine.drainCount)
+	assert.Equal(t, 0, resumeEngine.applyCount)
+
+	storedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Completed, storedApply.State)
+	assert.NotNil(t, storedApply.CompletedAt)
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Completed, storedTask.State)
+	assert.Equal(t, 100, storedTask.ProgressPercent)
+	assert.NotNil(t, storedTask.CompletedAt)
+
+	pendingStart, err := stor.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStart)
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(ctx))
+	var controlStatus string
+	err = db.QueryRowContext(ctx, `
+		SELECT status
+		FROM apply_control_requests
+		WHERE apply_id = ? AND operation = ?
+	`, applyID, storage.ControlOperationStart).Scan(&controlStatus)
+	require.NoError(t, err)
+	assert.Equal(t, string(storage.ControlRequestCompleted), controlStatus)
+
+	logs, err := stor.ApplyLogs().GetByApply(ctx, applyID)
+	require.NoError(t, err)
+	assert.True(t, hasLogMessageContaining(logs, "All tasks already completed on resume (final schema check shows no remaining changes)"))
 }
 
 func TestLocalClient_Cutover_NoActiveMigration(t *testing.T) {

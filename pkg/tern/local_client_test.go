@@ -76,11 +76,11 @@ type fakeControlEngine struct {
 func (e *fakeControlEngine) Name() string { return "fake" }
 
 func (e *fakeControlEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
-	return nil, nil
+	return &engine.PlanResult{}, nil
 }
 
 func (e *fakeControlEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
-	return nil, nil
+	return &engine.ApplyResult{Accepted: true}, nil
 }
 
 func (e *fakeControlEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {

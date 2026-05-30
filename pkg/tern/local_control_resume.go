@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -173,7 +174,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 
 	if apply.GetOptions().DeferCutover {
 		logMsg := fmt.Sprintf("Resume requested: %d tasks resumed, %d already completed", len(resumeTasks), completedCount)
-		if err := c.launchAtomicResume(ctx, apply, resumeTasks, plan, options, logMsg, false); err != nil {
+		if err := c.launchAtomicResume(ctx, apply, resumeTasks, plan, options, logMsg, false, false); err != nil {
 			return nil, err
 		}
 	} else {
@@ -436,15 +437,57 @@ func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *s
 // retry-waiting state; user start calls poll in the background and returns
 // after the engine accepts the resume.
 func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.Apply,
-	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string, block bool) error {
+	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string, block bool, startRequested bool) error {
+
+	allTasks := tasks
+	creds := c.credentials()
+	eng := c.getEngine()
+	if eng == nil {
+		return fmt.Errorf("no engine available for grouped resume apply %s", apply.ApplyIdentifier)
+	}
+
+	if drainer, ok := eng.(engine.Drainer); ok {
+		drainer.Drain()
+	}
+
+	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)
+	if err != nil {
+		return fmt.Errorf("final schema check before grouped resume for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	tasks = rp.ActiveTasks
+	if len(tasks) == 0 {
+		c.logger.Info("final schema check found no remaining grouped resume work; completing apply",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType,
+			"task_count", len(allTasks))
+		oldApplyState := apply.State
+		now := time.Now()
+		apply.State = state.Apply.Completed
+		apply.CompletedAt = &now
+		apply.UpdatedAt = now
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
+			return fmt.Errorf("mark grouped resume apply %s completed after final schema check: %w", apply.ApplyIdentifier, err)
+		}
+		if startRequested {
+			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+				return err
+			}
+		}
+		if !state.IsTerminalApplyState(oldApplyState) {
+			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			"All tasks already completed on resume (final schema check shows no remaining changes)", oldApplyState, state.Apply.Completed)
+		c.notifyTerminalObserver(apply, allTasks)
+		return nil
+	}
 
 	var ddls []string
 	for _, t := range tasks {
 		ddls = append(ddls, t.DDL)
 	}
-
-	creds := c.credentials()
-	eng := c.getEngine()
 
 	// Build table changes from the DDL list
 	var tableChanges []engine.TableChange
@@ -614,7 +657,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel()
 		defer cancelResume()
-		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply)), true); err != nil {
+		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply)), true, startRequested); err != nil {
 			if c.shouldRetryEngineError(err) {
 				c.logger.Warn("engine apply failed during recovery, pausing apply for scheduler retry",
 					"apply_id", apply.ApplyIdentifier,

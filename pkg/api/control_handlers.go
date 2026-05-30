@@ -632,6 +632,15 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		s.writeControlError(w, "start", apply, err)
 		return
 	}
+	if err := s.completeResolvedStopBeforeStart(r.Context(), client, apply, req.Caller); err != nil {
+		status := "error"
+		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
+			status = "rejected"
+		}
+		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, status)
+		s.writeControlError(w, "start", apply, err)
+		return
+	}
 	if err := s.rejectControlIfStopPending(r.Context(), "start", apply); err != nil {
 		status := "error"
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
@@ -712,6 +721,77 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		httpStatus = http.StatusAccepted
 	}
 	s.writeJSON(w, httpStatus, httpResp)
+}
+
+func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) error {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return fmt.Errorf("control request store is not available")
+	}
+	controlReq, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	if err != nil {
+		return fmt.Errorf("load pending stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
+	}
+	if controlReq == nil {
+		return nil
+	}
+	stopCaller := controlReq.RequestedBy
+	if stopCaller == "" {
+		stopCaller = "unknown"
+	}
+
+	if stopRequestCompletedByApplyState(apply.State) {
+		if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
+			return fmt.Errorf("complete pending stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
+		}
+		s.logger.Info("completed resolved stop request before start",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", stopCaller,
+			"start_requested_by", caller,
+			"state", apply.State)
+		return nil
+	}
+
+	if !client.IsRemote() || apply.ExternalID == "" {
+		return nil
+	}
+	progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ExternalID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		return fmt.Errorf("check remote apply %s before completing pending stop for start: %w", apply.ApplyIdentifier, err)
+	}
+	remoteState := tern.ProtoStateToStorage(progress.State)
+	if !state.IsState(remoteState, state.Apply.Stopped) {
+		return nil
+	}
+
+	now := time.Now()
+	oldState := apply.State
+	apply.State = state.Apply.Stopped
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := s.storage.Applies().Update(ctx, apply); err != nil {
+		return fmt.Errorf("sync remote stopped apply %s before start: %w", apply.ApplyIdentifier, err)
+	}
+	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
+		return fmt.Errorf("complete pending remote stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
+	}
+	s.logger.Info("completed remote stop request before start after remote state check",
+		"apply_id", apply.ApplyIdentifier,
+		"external_apply_id", apply.ExternalID,
+		"database", apply.Database,
+		"environment", apply.Environment,
+		"requested_by", stopCaller,
+		"start_requested_by", caller,
+		"old_state", oldState,
+		"new_state", apply.State)
+	s.logControlOperationForApply(ctx, apply, stopCaller, storage.LogEventStopRequested,
+		fmt.Sprintf("Pending remote stop request completed before start (caller: %s)", stopCaller))
+	return nil
 }
 
 // queueStoppedApplyForScheduler makes a user start request claimable by a

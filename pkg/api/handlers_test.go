@@ -2243,6 +2243,56 @@ func TestStartHandler(t *testing.T) {
 		assert.Equal(t, int64(1), resp.StartedCount)
 	})
 
+	t.Run("queues remote stopped apply after completing resolved pending stop", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			progressResp: &ternv1.ProgressResponse{
+				State: ternv1.State_STATE_STOPPED,
+				Tables: []*ternv1.TableProgress{{
+					TableName: "users",
+					Status:    state.Task.Stopped,
+				}},
+			},
+		}
+		apply := activeTestApply("apply-remote-stop-pending-resolved")
+		apply.ExternalID = "remote-apply-stop-pending-resolved"
+		svc := newControlTestServiceWithTasks(mock, apply, nil)
+		_, alreadyPending, err := svc.storage.ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:stopper",
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-remote-stop-pending-resolved", "caller": "cli:starter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		require.NotNil(t, mock.progressReq)
+		assert.Equal(t, "remote-apply-stop-pending-resolved", mock.progressReq.ApplyId)
+		assert.Equal(t, state.Apply.Stopped, apply.State)
+		pendingStop, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		assert.Nil(t, pendingStop)
+		pendingStart, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, pendingStart)
+
+		var resp apitypes.StartResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.True(t, resp.Accepted, "expected accepted=true")
+		assert.Equal(t, int64(1), resp.StartedCount)
+	})
+
 	t.Run("returns already requested for remote duplicate after scheduler claim", func(t *testing.T) {
 		mock := &mockTernClient{
 			isRemote: true,
