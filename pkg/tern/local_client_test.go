@@ -70,7 +70,10 @@ func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
 
 type fakeControlEngine struct {
 	engine.Engine
-	stopCount int
+	stopCount     int
+	cutoverCount  int
+	cutoverResult *engine.ControlResult
+	cutoverErr    error
 }
 
 func (e *fakeControlEngine) Name() string { return "fake" }
@@ -97,6 +100,10 @@ func (e *fakeControlEngine) Start(context.Context, *engine.ControlRequest) (*eng
 }
 
 func (e *fakeControlEngine) Cutover(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.cutoverCount++
+	if e.cutoverResult != nil || e.cutoverErr != nil {
+		return e.cutoverResult, e.cutoverErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -334,6 +341,203 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
+}
+
+func TestLocalClient_ProcessPendingCutoverControlRequest(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              125,
+		ApplyIdentifier: "apply-cutover-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             458,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-local",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.Equal(t, 1, fakeEngine.cutoverCount)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Cutover triggered (caller: cli:alice)"))
+}
+
+func TestLocalClient_ProcessPendingCutoverControlRequestUsesCompletedTaskForCutoverReadyApply(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              127,
+		ApplyIdentifier: "apply-cutover-completed-task-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             460,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-completed-task-local",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Completed,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.Equal(t, 1, fakeEngine.cutoverCount)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq)
+}
+
+func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhenNotReady(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              128,
+		ApplyIdentifier: "apply-cutover-wait-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             461,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-wait-local",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.Equal(t, 0, fakeEngine.cutoverCount)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	assert.Equal(t, storage.ControlRequestPending, pending.Status)
+}
+
+func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              126,
+		ApplyIdentifier: "apply-cutover-rejected-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             459,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-rejected-local",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: &fakeControlEngine{cutoverResult: &engine.ControlResult{Accepted: false, Message: "not ready for cutover"}},
+		logger:       slog.Default(),
+	}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not ready for cutover")
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	assert.Nil(t, pending)
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+	assert.Equal(t, "not ready for cutover", controlRequests.requests[0].ErrorMessage)
 }
 
 func TestLocalClient_StopPreservesTerminalCancelledApply(t *testing.T) {

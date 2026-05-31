@@ -2557,27 +2557,136 @@ func TestStartHandler(t *testing.T) {
 }
 
 func TestCutoverHandler(t *testing.T) {
-	t.Run("passes apply_id to tern client", func(t *testing.T) {
-		mock := &mockTernClient{
-			cutoverResp: &ternv1.CutoverResponse{
-				Accepted: true,
-			},
-		}
-		svc := newControlTestService(mock, activeTestApply("apply-cut123"))
+	t.Run("queues cutover for scheduler by apply_id", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := activeTestApply("apply-cut123")
+		apply.State = state.Apply.WaitingForCutover
+		logs := &capturingApplyLogStore{}
+		svc := newControlTestService(mock, apply)
+		require.IsType(t, &mockStorageWithApplyStores{}, svc.storage)
+		store := svc.storage.(*mockStorageWithApplyStores)
+		store.applyLogs = logs
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"environment": "staging", "apply_id": "apply-cut123"}`
+		body := `{"environment": "staging", "apply_id": "apply-cut123", "caller": "cli:cutter"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		assert.Nil(t, mock.cutoverReq, "request path should queue scheduler work without calling Tern cutover")
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, controlReq)
+		assert.Equal(t, "cli:cutter", controlReq.RequestedBy)
+		assert.True(t, hasApplyLogMessageContaining(logs.logs, "Cutover requested by user (caller: cli:cutter)"))
 
-		require.NotNil(t, mock.cutoverReq, "expected cutover request to be captured")
-		assert.Equal(t, "apply-cut123", mock.cutoverReq.ApplyId)
-		assert.Equal(t, "staging", mock.cutoverReq.Environment)
+		var resp apitypes.ControlResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+	})
+
+	t.Run("returns accepted for duplicate queued cutover", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := activeTestApply("apply-cutover-already-requested")
+		apply.State = state.Apply.WaitingForCutover
+		svc := newControlTestService(mock, apply)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-cutover-already-requested", "caller": "cli:cutter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		retryReq := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+		retryReq.Header.Set("Content-Type", "application/json")
+		retryW := httptest.NewRecorder()
+		mux.ServeHTTP(retryW, retryReq)
+
+		assert.Equal(t, http.StatusAccepted, retryW.Code, retryW.Body.String())
+		assert.Nil(t, mock.cutoverReq)
+		var resp apitypes.ControlResponse
+		err := json.NewDecoder(retryW.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+	})
+
+	t.Run("returns accepted without queuing when cutover already in progress", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := activeTestApply("apply-cutover-in-progress")
+		apply.State = state.Apply.CuttingOver
+		logs := &capturingApplyLogStore{}
+		svc := newControlTestService(mock, apply)
+		require.IsType(t, &mockStorageWithApplyStores{}, svc.storage)
+		store := svc.storage.(*mockStorageWithApplyStores)
+		store.applyLogs = logs
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-cutover-in-progress", "caller": "cli:cutter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+		assert.Nil(t, mock.cutoverReq)
+		assert.Nil(t, mock.progressReq)
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		assert.Nil(t, controlReq)
+		assert.True(t, hasApplyLogMessageContaining(logs.logs, "Cutover requested by user while cutover already in progress (caller: cli:cutter)"))
+
+		var resp apitypes.ControlResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, apitypes.ControlStatusAlreadyInProgress, resp.Status)
+	})
+
+	t.Run("queues cutover when remote progress reaches cutting over before stored state", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			progressResp: &ternv1.ProgressResponse{
+				State: ternv1.State_STATE_CUTTING_OVER,
+			},
+		}
+		apply := activeTestApply("apply-remote-cutover-in-progress")
+		apply.ExternalID = "remote-cutover-in-progress"
+		logs := &capturingApplyLogStore{}
+		svc := newControlTestService(mock, apply)
+		require.IsType(t, &mockStorageWithApplyStores{}, svc.storage)
+		store := svc.storage.(*mockStorageWithApplyStores)
+		store.applyLogs = logs
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-remote-cutover-in-progress", "caller": "cli:cutter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.NotNil(t, mock.progressReq)
+		assert.Equal(t, "remote-cutover-in-progress", mock.progressReq.ApplyId)
+		assert.Nil(t, mock.cutoverReq)
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, controlReq)
+		assert.Equal(t, "cli:cutter", controlReq.RequestedBy)
+		assert.True(t, hasApplyLogMessageContaining(logs.logs, "Cutover requested by user (caller: cli:cutter)"))
+
+		var resp apitypes.ControlResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
 	})
 
 	t.Run("rejects cutover while stop request is pending", func(t *testing.T) {

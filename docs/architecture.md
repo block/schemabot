@@ -150,12 +150,33 @@ These signals are durable and accessible from any instance — the engine runnin
 the background detects the signal regardless of which SchemaBot instance triggered it.
 
 SchemaBot also stores durable control requests for operations whose accepted
-intent must survive API handler exits or process restarts. For example, `stop`
-and stopped-state `start` requests are recorded in `apply_control_requests`
-before the engine side effect is performed. The active scheduler-owned apply
-worker consumes the request, performs or forwards the engine control operation,
-syncs SchemaBot storage to the resulting state, and only then marks the control
-request completed.
+intent must survive API handler exits or process restarts. `stop`, stopped-state
+`start`, and cutover requests are recorded in
+`apply_control_requests` before the engine side effect is performed. The active
+scheduler-owned apply worker consumes the request, performs or forwards the
+engine control operation, syncs SchemaBot storage to the resulting state, and
+only then marks the control request completed.
+
+```
+┌──────────────┐     ┌────────────────────────┐     ┌──────────────┐
+│ CLI / API    │────▶│ apply_control_requests │────▶│ Scheduler    │
+│ accepts user │     │ pending intent         │     │ apply owner  │
+│ control op   │     └────────────────────────┘     └──────┬───────┘
+└──────────────┘                                           │
+                                                           ▼
+                                                    ┌──────────────┐
+                                                    │ Engine /     │
+                                                    │ remote Tern  │
+                                                    │ control RPC  │
+                                                    └──────┬───────┘
+                                                           │
+                                                           ▼
+                                                    ┌──────────────┐
+                                                    │ mark request │
+                                                    │ completed or │
+                                                    │ failed       │
+                                                    └──────────────┘
+```
 
 `stop` is the highest-priority control intent. Once SchemaBot accepts a stop
 request, no actor should knowingly advance that apply toward deploy, cutover, or
@@ -175,6 +196,14 @@ pollers check for pending stops before continuing progress work. This avoids the
 unsafe interleaving where `/api/stop` returns accepted while another path moves
 the same apply from `waiting_for_cutover` into cutover or completion before the
 stop can be applied.
+
+Cutover requests follow the same durable-owner model. The API accepts cutover
+when the apply is ready for cutover, records a pending cutover request, and wakes
+the scheduler instead of depending on the API handler to reach the active engine
+process. The scheduler owner then sends the local engine request or remote gRPC
+`Cutover` request. If the engine accepts, the cutover request is completed; if
+the request fails or is rejected, the request is marked failed with the
+operator-visible reason so a later retry requires a new operator request.
 
 This preserves single-owner semantics for running applies: a fresh running apply
 with a pending stop request is still owned by its current worker, not claimed by

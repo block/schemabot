@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
@@ -53,7 +54,11 @@ func (cmd *CutoverCmd) Run(g *Globals) error {
 		return err
 	}
 
-	fmt.Println("✓ Cutover requested successfully.")
+	if cutoverResult.Status == apitypes.ControlStatusAlreadyInProgress {
+		fmt.Println("✓ Cutover already in progress.")
+	} else {
+		fmt.Println("✓ Cutover requested successfully.")
+	}
 	fmt.Println("🔄 Cutting over...")
 
 	if !cmd.Watch {

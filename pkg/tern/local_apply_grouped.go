@@ -316,6 +316,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	} else if handled {
 		return true
 	}
+	if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
+		c.logger.Warn("pending cutover request processing failed after progress sync; current apply owner will exit for scheduler retry",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return true
+	}
 
 	opts := apply.GetOptions()
 	controlReq := &engine.ControlRequest{

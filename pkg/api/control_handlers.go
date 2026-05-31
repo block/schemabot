@@ -304,7 +304,7 @@ type CutoverRequest struct {
 // handleCutover handles POST /api/cutover requests.
 func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 	var req CutoverRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, ternApplyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
@@ -318,34 +318,152 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 		s.writeControlError(w, "cutover", apply, err)
 		return
 	}
-	if err := s.rejectControlIfStopPending(r.Context(), "cutover dispatch", apply); err != nil {
-		status := "error"
-		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
-			status = "rejected"
-		}
-		metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Deployment, apply.Environment, status)
+
+	resp, httpStatus, err := s.executeCutoverForApply(r.Context(), client, apply, ternApplyID, req.Caller)
+	if err != nil {
 		s.writeControlError(w, "cutover", apply, err)
 		return
 	}
+	s.writeJSON(w, httpStatus, resp)
+}
 
-	resp, err := client.Cutover(r.Context(), &ternv1.CutoverRequest{
-		ApplyId:     applyID,
-		Environment: apply.Environment,
+func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		err := fmt.Errorf("control request store is not available")
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, http.StatusOK, err
+	}
+	controlReq, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationCutover)
+	if err != nil {
+		err := fmt.Errorf("load pending cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, http.StatusOK, err
+	}
+	if controlReq != nil {
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered,
+			"Cutover requested by user while cutover request already pending")
+		s.logger.Info("cutover request already pending",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"deployment", apply.Deployment,
+			"environment", apply.Environment,
+			"requested_by", caller,
+			"original_requested_by", controlReq.RequestedBy)
+		s.wakeScheduler(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
+	readiness, err := s.cutoverRequestReadiness(ctx, client, apply, ternApplyID)
+	if err != nil {
+		err := fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, http.StatusOK, err
+	}
+	if readiness == cutoverRequestAlreadyInProgress {
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered,
+			"Cutover requested by user while cutover already in progress")
+		s.logger.Info("cutover request accepted because cutover is already in progress",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"deployment", apply.Deployment,
+			"environment", apply.Environment,
+			"requested_by", caller,
+			"state", apply.State)
+		return &apitypes.ControlResponse{Accepted: true, Status: apitypes.ControlStatusAlreadyInProgress}, http.StatusAccepted, nil
+	}
+	if readiness == cutoverRequestNotReady {
+		err := controlConflictf("schema change is not waiting for cutover (current state: %s)", apply.State)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, http.StatusOK, err
+	}
+	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
 	})
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
-		s.writeControlError(w, "cutover", apply, err)
-		return
+		err := fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, http.StatusOK, err
 	}
-	metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
-	if resp.Accepted {
-		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventCutoverTriggered, "Cutover triggered by user")
+	metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
+	message := "Cutover requested by user"
+	if alreadyPending {
+		message = "Cutover requested by user while cutover request already pending"
 	}
+	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered, message)
+	s.logger.Info("cutover request queued for scheduler",
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"deployment", apply.Deployment,
+		"environment", apply.Environment,
+		"requested_by", caller)
+	s.wakeScheduler(apply.ApplyIdentifier, apply.Database, apply.Environment)
+	if alreadyPending {
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
+	return &apitypes.ControlResponse{Accepted: true}, http.StatusOK, nil
+}
 
-	s.writeJSON(w, http.StatusOK, &apitypes.ControlResponse{
-		Accepted:     resp.Accepted,
-		ErrorMessage: resp.ErrorMessage,
-	})
+type cutoverRequestReadiness int
+
+const (
+	cutoverRequestNotReady cutoverRequestReadiness = iota
+	cutoverRequestReady
+	cutoverRequestAlreadyInProgress
+)
+
+func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID string) (cutoverRequestReadiness, error) {
+	if state.IsState(apply.State, state.Apply.WaitingForCutover) {
+		return cutoverRequestReady, nil
+	}
+	if state.IsState(apply.State, state.Apply.CuttingOver) {
+		return cutoverRequestAlreadyInProgress, nil
+	}
+	if client != nil && client.IsRemote() && ternApplyID != "" {
+		progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
+			ApplyId:     ternApplyID,
+			Environment: apply.Environment,
+		})
+		if err != nil {
+			return cutoverRequestNotReady, fmt.Errorf("check remote apply %s before cutover: %w", apply.ApplyIdentifier, err)
+		}
+		remoteState := tern.ProtoStateToStorage(progress.State)
+		if state.IsState(remoteState, state.Apply.WaitingForCutover) {
+			return cutoverRequestReady, nil
+		}
+		if state.IsState(remoteState, state.Apply.CuttingOver) {
+			return cutoverRequestReady, nil
+		}
+		return cutoverRequestNotReady, nil
+	}
+	if !state.IsState(apply.State, state.Apply.Running) {
+		return cutoverRequestNotReady, nil
+	}
+	taskStore := s.storage.Tasks()
+	if taskStore == nil {
+		return cutoverRequestNotReady, fmt.Errorf("task store is not available")
+	}
+	tasks, err := taskStore.GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return cutoverRequestNotReady, fmt.Errorf("load tasks for apply %s before cutover: %w", apply.ApplyIdentifier, err)
+	}
+	readyForCutover := false
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.CuttingOver) {
+			return cutoverRequestAlreadyInProgress, nil
+		}
+		if state.IsState(task.State, state.Task.WaitingForCutover) {
+			readyForCutover = true
+		}
+	}
+	if readyForCutover {
+		return cutoverRequestReady, nil
+	}
+	return cutoverRequestNotReady, nil
 }
 
 // StopRequest is the HTTP request body for POST /api/stop.

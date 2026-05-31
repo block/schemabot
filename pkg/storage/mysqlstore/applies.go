@@ -653,9 +653,9 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 	}
 
 	// Refresh the heartbeat as part of the claim before releasing the row lock.
-	// Pending, stopped-start, and retryable applies become running while the
-	// scheduler acts, so the leased row remains in the stale-recovery state
-	// family if the worker crashes before the engine starts.
+	// Pending, stopped-start, and retryable applies move into an active owner
+	// state while the scheduler acts, so another worker cannot immediately claim
+	// the same durable request after this transaction releases its lock.
 	if apply.State == state.Apply.Pending || apply.State == state.Apply.Stopped || apply.State == state.Apply.FailedRetryable {
 		var result sql.Result
 		nextState := state.Apply.Running

@@ -347,6 +347,7 @@ type capturingTernServer struct {
 	remoteApplyID    string
 	stopApplyID      string
 	startApplyID     string
+	cutoverApplyID   string
 	progressApplyID  string
 	progressReq      *ternv1.ProgressRequest
 	progressState    ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
@@ -356,6 +357,9 @@ type capturingTernServer struct {
 	progressError    string
 	progressErr      error
 	startErr         error
+	cutoverErr       error
+	cutoverAccepted  bool
+	cutoverMessage   string
 	startCalled      bool // tracks whether Start was actually invoked
 }
 
@@ -396,6 +400,19 @@ func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
+func (s *capturingTernServer) Cutover(_ context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
+	s.mu.Lock()
+	s.cutoverApplyID = req.ApplyId
+	err := s.cutoverErr
+	accepted := s.cutoverAccepted
+	message := s.cutoverMessage
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return &ternv1.CutoverResponse{Accepted: accepted, ErrorMessage: message}, nil
+}
+
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
 	s.progressReq = &ternv1.ProgressRequest{
@@ -433,6 +450,12 @@ func (s *capturingTernServer) getStopApplyID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stopApplyID
+}
+
+func (s *capturingTernServer) getCutoverApplyID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cutoverApplyID
 }
 
 func (s *capturingTernServer) getProgressApplyID() string {
@@ -1958,6 +1981,162 @@ func TestGRPCClient_ResumeApplyProcessesQueuedStop(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Remote stop accepted for apply remote-stop-claimed (caller: cli:alice)"))
+}
+
+func TestGRPCClient_ResumeApplyProcessesQueuedCutover(t *testing.T) {
+	// A pending durable cutover is processed by the scheduler-owned worker using
+	// the remote apply ID, then completed once remote Tern accepts the request.
+	server := &capturingTernServer{
+		cutoverAccepted:  true,
+		progressState:    ternv1.State_STATE_COMPLETED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-cutover-claimed",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		ExternalID:      "remote-cutover-claimed",
+		State:           state.Apply.WaitingForCutover,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-claimed",
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.NoError(t, err)
+
+	assert.Equal(t, "remote-cutover-claimed", server.getCutoverApplyID())
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote cutover accepted for apply remote-cutover-claimed (caller: cli:alice)"))
+}
+
+func TestGRPCClient_ProcessPendingCutoverWaitsWhenNotReady(t *testing.T) {
+	// A transient running sample after cutover was requested should not fail the
+	// durable request. The scheduler will retry after the next progress sync.
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-cutover-wait-grpc",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		ExternalID:      "remote-cutover-wait-grpc",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-wait-grpc",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.Empty(t, server.getCutoverApplyID())
+	pendingCutover, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pendingCutover)
+	assert.Equal(t, storage.ControlRequestPending, pendingCutover.Status)
+}
+
+func TestGRPCClient_ResumeApplyCutoverErrorFailsPendingRequest(t *testing.T) {
+	// A cutover RPC failure leaves a visible failed control request so the
+	// scheduler does not retry indefinitely without a new operator request.
+	server := &capturingTernServer{
+		cutoverErr: status.Error(codes.Unavailable, "remote cutover unavailable"),
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-cutover-error",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		ExternalID:      "remote-cutover-error",
+		State:           state.Apply.WaitingForCutover,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-error",
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "remote cutover unavailable")
+	assert.Equal(t, "remote-cutover-error", server.getCutoverApplyID())
+	pendingCutover, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	assert.Nil(t, pendingCutover)
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+	assert.Contains(t, controlRequests.requests[0].ErrorMessage, "remote cutover failed")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote cutover failed for apply remote-cutover-error (caller: cli:alice)"))
 }
 
 func TestGRPCClient_ResumeApplyCompletesQueuedStartWhenRemoteAlreadyActive(t *testing.T) {
