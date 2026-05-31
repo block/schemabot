@@ -760,7 +760,7 @@ func TestExecutePlanUnavailableRemoteErrorIncludesDeployment(t *testing.T) {
 		Repository: "example/app",
 	})
 
-	var remoteErr *RemoteSchemaServiceUnavailableError
+	var remoteErr *RemoteDeploymentUnavailableError
 	require.ErrorAs(t, err, &remoteErr)
 	assert.Equal(t, "pie", remoteErr.Deployment)
 	assert.Equal(t, "orders-staging", remoteErr.Target)

@@ -41,7 +41,7 @@ func (h *Handler) postCommandError(
 }
 
 func userFacingError(err error) string {
-	var remoteErr *api.RemoteSchemaServiceUnavailableError
+	var remoteErr *api.RemoteDeploymentUnavailableError
 	if errors.As(err, &remoteErr) {
 		return userFacingRemoteUnavailableError(remoteErr.Deployment, remoteErr.Target, err.Error())
 	}
@@ -53,19 +53,20 @@ func userFacingError(err error) string {
 
 func userFacingErrorDetail(errorDetail string) string {
 	lowerDetail := strings.ToLower(errorDetail)
+	if isUserFacingRemoteUnavailableError(lowerDetail) {
+		return errorDetail
+	}
 	if strings.Contains(lowerDetail, strings.ToLower(remoteSchemaServiceUnavailableMessage)) {
-		return errorDetail
-	}
-	if strings.Contains(lowerDetail, "schemabot could not reach the remote deployment") {
-		return errorDetail
-	}
-	if strings.Contains(lowerDetail, "schemabot could not reach the remote schema change service") {
 		return errorDetail
 	}
 	if strings.Contains(lowerDetail, "rpc error: code = unavailable") {
 		return userFacingRemoteUnavailableError("", "", errorDetail)
 	}
 	return errorDetail
+}
+
+func isUserFacingRemoteUnavailableError(lowerDetail string) bool {
+	return strings.Contains(lowerDetail, "schemabot could not reach the remote ") && strings.Contains(lowerDetail, "raw error:")
 }
 
 func userFacingRemoteUnavailableError(deployment, target, rawError string) string {

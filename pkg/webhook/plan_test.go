@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -215,7 +216,7 @@ func TestRenderMultiEnvPlanComment_ShowsPRHeadSHA(t *testing.T) {
 }
 
 func TestUserFacingErrorExplainsNoHealthyUpstream(t *testing.T) {
-	err := &api.RemoteSchemaServiceUnavailableError{
+	err := &api.RemoteDeploymentUnavailableError{
 		Deployment: "pie",
 		Target:     "orders-staging",
 		Err:        status.Error(codes.Unavailable, "no healthy upstream"),
@@ -238,11 +239,13 @@ func TestUserFacingErrorPreservesNonGRPCErrors(t *testing.T) {
 }
 
 func TestUserFacingErrorDetailDoesNotWrapFormattedRemoteErrors(t *testing.T) {
-	formatted := "SchemaBot could not reach the remote deployment `pie`. Raw error: rpc error: code = Unavailable desc = no healthy upstream"
+	formatted := "SchemaBot could not reach the remote deployment `pie` for target `orders-staging`. No healthy upstream is available. Raw error: rpc error: code = Unavailable desc = no healthy upstream"
 
 	got := userFacingErrorDetail(formatted)
 
 	assert.Equal(t, formatted, got)
+	assert.Equal(t, 1, strings.Count(got, "SchemaBot could not reach"))
+	assert.Equal(t, 1, strings.Count(got, "Raw error:"))
 }
 
 func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {

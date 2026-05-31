@@ -46,23 +46,23 @@ type PlanRequest struct {
 	SourceTrusted bool `json:"-"`
 }
 
-// RemoteSchemaServiceUnavailableError carries routing metadata for remote
+// RemoteDeploymentUnavailableError carries routing metadata for remote
 // schema change service availability failures so callers can render actionable
 // operator-facing errors without parsing strings.
-type RemoteSchemaServiceUnavailableError struct {
+type RemoteDeploymentUnavailableError struct {
 	Deployment string
 	Target     string
 	Err        error
 }
 
-func (e *RemoteSchemaServiceUnavailableError) Error() string {
+func (e *RemoteDeploymentUnavailableError) Error() string {
 	if e.Target == "" {
 		return fmt.Sprintf("remote deployment %q unavailable: %v", e.Deployment, e.Err)
 	}
 	return fmt.Sprintf("remote deployment %q target %q unavailable: %v", e.Deployment, e.Target, e.Err)
 }
 
-func (e *RemoteSchemaServiceUnavailableError) Unwrap() error {
+func (e *RemoteDeploymentUnavailableError) Unwrap() error {
 	return e.Err
 }
 
@@ -244,7 +244,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
-			return nil, &RemoteSchemaServiceUnavailableError{
+			return nil, &RemoteDeploymentUnavailableError{
 				Deployment: deployment,
 				Target:     resolvedTarget.Target,
 				Err:        err,
