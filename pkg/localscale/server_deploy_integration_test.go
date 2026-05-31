@@ -74,6 +74,52 @@ func TestDeployRequestDiffCreateTable(t *testing.T) {
 	require.Greater(t, len(result.Rows), 0, "expected 'diff_new_table' in vtgate after deploy")
 }
 
+// TestResetStateCanRunImmediatelyAfterDeploySubmit verifies reset-state cancels
+// in-flight LocalScale work before clearing metadata, so the next deploy request
+// starts from a clean state and can apply successfully.
+func TestResetStateCanRunImmediatelyAfterDeploySubmit(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	ctx := t.Context()
+
+	indexName := fmt.Sprintf("idx_reset_%d", time.Now().UnixNano())
+	branchName := createBranchWithDDL(t, ctx, "reset-submit",
+		map[string][]string{
+			"testapp_sharded": {
+				fmt.Sprintf("ALTER TABLE `users` ADD INDEX `%s` (`full_name`)", indexName),
+			},
+		},
+		nil,
+	)
+
+	dr := createDeploy(t, ctx, branchName, false)
+	require.Equal(t, drState.Ready, dr.DeploymentState, "expected changes")
+
+	deploy(t, ctx, dr.Number, false)
+	require.NoError(t, testContainer.ResetState(ctx), "reset LocalScale state after deploy submit")
+	_, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+		Organization: testOrg,
+		Database:     testDB,
+		Number:       dr.Number,
+	})
+	require.Error(t, err, "reset-state should clear deploy request metadata")
+
+	nextCol := fmt.Sprintf("reset_next_%d", time.Now().UnixNano())
+	nextBranch := createBranchWithDDL(t, ctx, "reset-next",
+		map[string][]string{
+			"testapp_sharded": {
+				fmt.Sprintf("ALTER TABLE `users` ADD COLUMN `%s` varchar(50)", nextCol),
+			},
+		},
+		nil,
+	)
+	nextDR := createDeploy(t, ctx, nextBranch, true)
+	require.Equal(t, drState.Ready, nextDR.DeploymentState, "expected changes after reset")
+
+	deploy(t, ctx, nextDR.Number, true)
+	waitForDeployState(t, ctx, nextDR.Number, drState.CompletePendingRevert, drState.Complete)
+}
+
 // TestBranchDatabaseCleanupOnSkipRevert verifies that branch databases are dropped
 // after skip-revert closes the revert window.
 func TestBranchDatabaseCleanupOnSkipRevert(t *testing.T) {

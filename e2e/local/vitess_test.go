@@ -197,7 +197,7 @@ func vitessRestoreBaseSchema(t *testing.T, _ string) {
 		t.Logf("vitessRestoreBaseSchema: reset-state failed (non-fatal): %v", err)
 	}
 	t.Logf("vitessRestoreBaseSchema: resetState done (elapsed=%s)", time.Since(start))
-	clearSchemaBotState(t)
+	clearSchemaBotStorage(t)
 	t.Logf("vitessRestoreBaseSchema: clearState done (elapsed=%s)", time.Since(start))
 	vitessCleanupSchema(t)
 	t.Logf("vitessRestoreBaseSchema: cleanup done (elapsed=%s)", time.Since(start))
@@ -1654,7 +1654,7 @@ func TestVitess_Apply_BranchReuse(t *testing.T) {
 	assert.True(t, foundRefresh, "expected 'Refreshing schema for branch' in apply logs")
 
 	// Second apply on the same branch: add another column
-	clearSchemaBotState(t)
+	clearSchemaBotStorage(t)
 	col2 := fmt.Sprintf("reuse_col2_%d", time.Now().UnixMilli()%100000)
 	schemaDir2 := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": fmt.Sprintf(`CREATE TABLE `+"`users`"+` (
