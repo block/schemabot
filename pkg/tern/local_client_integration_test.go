@@ -324,6 +324,7 @@ type stagedGroupedResumeEngine struct {
 	planCalls   int
 	applyCount  int
 	drainCount  int
+	applyErr    error
 }
 
 func (e *stagedGroupedResumeEngine) Name() string { return "staged-grouped-resume" }
@@ -342,6 +343,9 @@ func (e *stagedGroupedResumeEngine) Plan(context.Context, *engine.PlanRequest) (
 
 func (e *stagedGroupedResumeEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
 	e.applyCount++
+	if e.applyErr != nil {
+		return nil, e.applyErr
+	}
 	return &engine.ApplyResult{Accepted: true}, nil
 }
 
@@ -942,6 +946,162 @@ func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t
 	logs, err := stor.ApplyLogs().GetByApply(ctx, applyID)
 	require.NoError(t, err)
 	assert.True(t, hasLogMessageContaining(logs, "All tasks already completed on resume (final schema check shows no remaining changes)"))
+}
+
+// This scenario covers a scheduler-owned grouped start where remote execution is
+// rejected after the durable start request was claimed. The start request should
+// fail visibly instead of being marked completed before engine acceptance.
+func TestLocalClient_ResumeApplyGroupedStartRequestFailsWhenEngineRejects(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	ddl := "ALTER TABLE `users` ADD COLUMN phone varchar(32)"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-grouped-start-fails-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{
+					{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"},
+				},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-grouped-start-fails-%d", time.Now().UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Stopped,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	task := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-grouped-start-fails-users-%d", time.Now().UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         planID,
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		State:          state.Task.Stopped,
+		TableName:      "users",
+		Namespace:      "testdb",
+		DDL:            ddl,
+		DDLAction:      "alter",
+		Options:        storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	taskID, err := stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	_, alreadyPending, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
+	require.NoError(t, err)
+	assert.False(t, alreadyPending)
+
+	resumeEngine := &stagedGroupedResumeEngine{
+		planResults: []*engine.PlanResult{{
+			Changes: []engine.SchemaChange{{
+				Namespace: "testdb",
+				TableChanges: []engine.TableChange{{
+					Table: "users",
+					DDL:   ddl,
+				}},
+			}},
+		}},
+		applyErr: engine.NewPermanentError("engine refused grouped resume"),
+	}
+	client.spiritEngine = resumeEngine
+
+	claimed, err := stor.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, state.Apply.Stopped, claimed.State)
+
+	err = client.ResumeApply(ctx, claimed)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "engine refused grouped resume")
+	assert.Equal(t, 2, resumeEngine.planCalls)
+	assert.Equal(t, 1, resumeEngine.drainCount)
+	assert.Equal(t, 1, resumeEngine.applyCount)
+
+	storedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Failed, storedApply.State)
+	assert.Contains(t, storedApply.ErrorMessage, "engine refused grouped resume")
+	assert.NotNil(t, storedApply.CompletedAt)
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Failed, storedTask.State)
+	assert.Contains(t, storedTask.ErrorMessage, "engine refused grouped resume")
+
+	pendingStart, err := stor.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStart)
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(ctx))
+	var controlStatus, controlError string
+	err = db.QueryRowContext(ctx, `
+		SELECT status, error_message
+		FROM apply_control_requests
+		WHERE apply_id = ? AND operation = ?
+	`, applyID, storage.ControlOperationStart).Scan(&controlStatus, &controlError)
+	require.NoError(t, err)
+	assert.Equal(t, string(storage.ControlRequestFailed), controlStatus)
+	assert.Contains(t, controlError, "engine refused grouped resume")
+
+	logs, err := stor.ApplyLogs().GetByApply(ctx, applyID)
+	require.NoError(t, err)
+	assert.True(t, hasLogMessageContaining(logs, "Recovery failed: engine apply failed: engine refused grouped resume"))
 }
 
 func TestLocalClient_Cutover_NoActiveMigration(t *testing.T) {

@@ -526,6 +526,12 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+		return fmt.Errorf("mark grouped resume apply %s running: %w", apply.ApplyIdentifier, err)
+	}
+	if startRequested {
+		if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+			return err
+		}
 	}
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
@@ -644,11 +650,6 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 
 	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
 	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
-	if startRequested {
-		if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
-			return err
-		}
-	}
 
 	options := buildApplyOptions(apply)
 
@@ -670,6 +671,13 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 				"error", err)
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
 				fmt.Sprintf("Recovery failed: %v", err), apply.State, state.Apply.Failed)
+			c.failApplyWithTasks(ctx, apply, activeTasks, err.Error())
+			if startRequested {
+				if failErr := failPendingStartControlRequests(ctx, c.storage, apply, err.Error()); failErr != nil {
+					return failErr
+				}
+			}
+			c.notifyTerminalObserver(apply, activeTasks)
 			return err
 		}
 	} else {
@@ -679,6 +687,12 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
+			return fmt.Errorf("mark sequential resume apply %s running: %w", apply.ApplyIdentifier, err)
+		}
+		if startRequested {
+			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+				return err
+			}
 		}
 
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
