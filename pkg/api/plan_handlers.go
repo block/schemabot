@@ -243,6 +243,18 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		span.SetStatus(otelcodes.Error, "plan failed")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
+		s.logger.Error("ExecutePlan: client.Plan failed",
+			"database", req.Database,
+			"type", resolvedTarget.DatabaseType,
+			"deployment", deployment,
+			"target", resolvedTarget.Target,
+			"environment", req.Environment,
+			"repository", req.Repository,
+			"pull_request", prInt,
+			"endpoint", client.Endpoint(),
+			"is_remote", client.IsRemote(),
+			"error", err,
+		)
 		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
 			return nil, &RemoteDeploymentUnavailableError{
 				Deployment: deployment,
