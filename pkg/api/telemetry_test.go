@@ -58,7 +58,7 @@ func TestSetupTelemetryWithOTLP(t *testing.T) {
 	assert.NotNil(t, tel.tracerProvider, "tracerProvider should be set with OTLP endpoint")
 
 	// Record a metric so there's data to push.
-	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "staging", "success")
+	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "pie", "staging", "success")
 
 	// Create a trace span so there's trace data to push.
 	tracer := otel.Tracer("test")
@@ -110,10 +110,10 @@ func TestRecordPlanMetric(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "staging", "success")
-	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "staging", "success")
-	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "staging", "error")
-	metrics.RecordPlan(t.Context(), "testrepo", "other", "production", "success")
+	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "pie", "staging", "success")
+	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "pie", "staging", "success")
+	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "pie", "staging", "error")
+	metrics.RecordPlan(t.Context(), "testrepo", "other", "bakery", "production", "success")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
@@ -141,15 +141,15 @@ func TestRecordPlanMetric(t *testing.T) {
 			DataPoints: []metricdata.DataPoint[int64]{
 				{
 					Value:      2,
-					Attributes: attribute.NewSet(attribute.String("repository", "testrepo"), attribute.String("database", "testdb"), attribute.String("environment", "staging"), attribute.String("status", "success")),
+					Attributes: attribute.NewSet(attribute.String("repository", "testrepo"), attribute.String("database", "testdb"), attribute.String("deployment", "pie"), attribute.String("environment", "staging"), attribute.String("status", "success")),
 				},
 				{
 					Value:      1,
-					Attributes: attribute.NewSet(attribute.String("repository", "testrepo"), attribute.String("database", "testdb"), attribute.String("environment", "staging"), attribute.String("status", "error")),
+					Attributes: attribute.NewSet(attribute.String("repository", "testrepo"), attribute.String("database", "testdb"), attribute.String("deployment", "pie"), attribute.String("environment", "staging"), attribute.String("status", "error")),
 				},
 				{
 					Value:      1,
-					Attributes: attribute.NewSet(attribute.String("repository", "testrepo"), attribute.String("database", "other"), attribute.String("environment", "production"), attribute.String("status", "success")),
+					Attributes: attribute.NewSet(attribute.String("repository", "testrepo"), attribute.String("database", "other"), attribute.String("deployment", "bakery"), attribute.String("environment", "production"), attribute.String("status", "success")),
 				},
 			},
 		},
@@ -244,8 +244,8 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordPlan(t.Context(), "org/repo", "mydb", "staging", "success")
-	metrics.RecordPlanDuration(t.Context(), time.Second, "org/repo", "mydb", "staging", "success")
+	metrics.RecordPlan(t.Context(), "org/repo", "mydb", "pie", "staging", "success")
+	metrics.RecordPlanDuration(t.Context(), time.Second, "org/repo", "mydb", "pie", "staging", "success")
 	metrics.RecordApply(t.Context(), "org/repo", "mydb", "staging", "success")
 	metrics.RecordApplyDuration(t.Context(), time.Second, "org/repo", "mydb", "staging", "success")
 	metrics.RecordSchemaFreshnessRejected(t.Context(), "apply", "staging")
@@ -546,7 +546,7 @@ func TestRecordPlanDurationMetric(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordPlanDuration(t.Context(), 500*time.Millisecond, "testrepo", "mydb", "staging", "success")
+	metrics.RecordPlanDuration(t.Context(), 500*time.Millisecond, "testrepo", "mydb", "pie", "staging", "success")
 
 	names := collectMetricNames(t, reader)
 	assert.True(t, names["schemabot.plan.duration_seconds"], "expected schemabot.plan.duration_seconds")
