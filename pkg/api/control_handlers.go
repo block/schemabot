@@ -754,7 +754,24 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 		return nil
 	}
 
-	if !client.IsRemote() || apply.ExternalID == "" {
+	if !client.IsRemote() {
+		s.logger.Info("pending stop request not completed before start because local apply is not stopped yet",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", stopCaller,
+			"start_requested_by", caller,
+			"state", apply.State)
+		return nil
+	}
+	if apply.ExternalID == "" {
+		s.logger.Warn("pending stop request not completed before start because remote apply has no external id",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", stopCaller,
+			"start_requested_by", caller,
+			"state", apply.State)
 		return nil
 	}
 	progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
