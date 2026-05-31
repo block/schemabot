@@ -227,8 +227,13 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 			h.handleRollbackConfirmCommand(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "rollback-confirm started"})
+	case action.Stop:
+		h.goSafe(repo, pr, installationID, func() {
+			h.handleStopCommand(repo, pr, installationID, requestedBy, result)
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "stop started"})
 	// Phase 2 commands — acknowledge but not yet implemented
-	case action.Stop, action.Revert, action.SkipRevert, action.Cutover:
+	case action.Revert, action.SkipRevert, action.Cutover:
 		h.postComment(repo, pr, installationID,
 			templates.RenderCommandNotYetAvailable(result.Action, result.Environment))
 		h.writeJSON(w, http.StatusOK, map[string]string{

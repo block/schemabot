@@ -32,6 +32,45 @@ func RenderUnsupportedAutoConfirm(action string) string {
 	return fmt.Sprintf("The `-y` flag is not supported for `%s`.", action)
 }
 
+// StopCommandAcceptedData contains data for a PR comment stop acknowledgement.
+type StopCommandAcceptedData struct {
+	ApplyID      string
+	Environment  string
+	RequestedBy  string
+	Status       string
+	StoppedCount int64
+	SkippedCount int64
+}
+
+// RenderControlMissingApplyID renders the message posted when an apply-scoped
+// control command is invoked without the required apply ID.
+func RenderControlMissingApplyID(action string) string {
+	return fmt.Sprintf("## Missing Apply ID\n\n"+
+		"Usage: `schemabot %s <apply-id> -e <environment>`\n\n"+
+		"Use `schemabot status -e <environment>` to find the apply ID.", action)
+}
+
+// RenderStopCommandAccepted renders the acknowledgement posted when a PR
+// comment stop command records durable stop intent.
+func RenderStopCommandAccepted(data StopCommandAcceptedData) string {
+	statusLine := "Stop request accepted. SchemaBot will stop this schema change; status remains available from the PR progress comment or CLI."
+	if data.Status == "already_requested" {
+		statusLine = "Stop was already requested. SchemaBot will keep the existing stop request pending until the scheduler owner finishes it."
+	}
+
+	body := "## Stop Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += "\n" + statusLine + "\n"
+	if data.StoppedCount > 0 || data.SkippedCount > 0 {
+		body += fmt.Sprintf("\n**Tasks selected for stop**: %d stopped, %d skipped.\n", data.StoppedCount, data.SkippedCount)
+	}
+	return body
+}
+
 // RenderCommandNotYetAvailable renders the acknowledgement posted when a
 // recognised but not-yet-implemented PR comment command is invoked. It points
 // the user at the CLI fallback for the same action.

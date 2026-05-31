@@ -54,6 +54,13 @@ func controlOperationHTTPStatus(err error) int {
 	return http.StatusInternalServerError
 }
 
+func controlHTTPErrorf(status int, format string, args ...any) error {
+	return &controlOperationHTTPError{
+		status: status,
+		err:    fmt.Errorf(format, args...),
+	}
+}
+
 func controlOperationCaller(caller string) string {
 	if caller == "" {
 		return "unknown"
@@ -219,6 +226,58 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, d
 	return client, apply, resolvedApplyID, true
 }
 
+func (s *Service) controlTarget(ctx context.Context, operation, applyIdentifier, environment string) (tern.Client, *storage.Apply, string, error) {
+	if applyIdentifier == "" {
+		return nil, nil, "", controlHTTPErrorf(http.StatusBadRequest, "apply_id is required")
+	}
+	if environment == "" {
+		return nil, nil, "", controlHTTPErrorf(http.StatusBadRequest, "environment is required")
+	}
+	if s.storage == nil {
+		s.logger.Error("storage not available for control request", "operation", operation, "apply_id", applyIdentifier, "environment", environment)
+		return nil, nil, "", fmt.Errorf("storage is not available")
+	}
+	applyStore := s.storage.Applies()
+	if applyStore == nil {
+		s.logger.Error("apply store not available for control request", "operation", operation, "apply_id", applyIdentifier, "environment", environment)
+		return nil, nil, "", fmt.Errorf("apply store is not available")
+	}
+	apply, err := applyStore.GetByApplyIdentifier(ctx, applyIdentifier)
+	if err != nil {
+		s.logger.Error("failed to load apply for control request", "operation", operation, "apply_id", applyIdentifier, "environment", environment, "error", err)
+		return nil, nil, "", fmt.Errorf("failed to look up apply %q: %w", applyIdentifier, err)
+	}
+	if apply == nil {
+		return nil, nil, "", controlHTTPErrorf(http.StatusNotFound, "apply not found: %s", applyIdentifier)
+	}
+	if apply.Environment != environment {
+		return nil, apply, "", controlHTTPErrorf(http.StatusBadRequest,
+			"apply %q belongs to environment %q, not %q", applyIdentifier, apply.Environment, environment)
+	}
+	deployment, err := storedDeploymentForApply(apply)
+	if err != nil {
+		s.logger.Error("control request apply is missing stored deployment metadata",
+			"operation", operation,
+			"apply_id", applyIdentifier,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType,
+			"environment", apply.Environment,
+			"error", err)
+		return nil, apply, "", err
+	}
+	client, err := s.TernClient(deployment, apply.Environment)
+	if err != nil {
+		s.logger.Error("failed to create Tern client",
+			"operation", operation,
+			"deployment", deployment,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"error", err)
+		return nil, apply, "", controlHTTPErrorf(http.StatusNotFound, "%s", err.Error())
+	}
+	return client, apply, ternApplyIDForStoredApply(apply), nil
+}
+
 // ternApplyIDForStoredApply returns the identifier that a Tern RPC expects for
 // an apply-scoped control or progress request.
 //
@@ -311,33 +370,51 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	stopResp, httpStatus, err := s.executeStopForApply(r.Context(), client, apply, ternApplyID, req.Environment, req.Caller)
+	if err != nil {
+		s.writeControlError(w, "stop", apply, err)
+		return
+	}
+	s.writeJSON(w, httpStatus, stopResp)
+}
 
-	resp, responseStatus, err := s.queueStopForApplyOwner(r.Context(), apply, req.Caller)
+// ExecuteStop records durable stop intent for an apply. The scheduler owner is
+// responsible for completing the stop if the immediate local attempt cannot.
+func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) (*apitypes.StopResponse, error) {
+	client, apply, ternApplyID, err := s.controlTarget(ctx, "stop", req.ApplyID, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	resp, _, err := s.executeStopForApply(ctx, client, apply, ternApplyID, req.Environment, req.Caller)
+	return resp, err
+}
+
+func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
+	resp, responseStatus, err := s.queueStopForApplyOwner(ctx, apply, caller)
 	if err != nil {
 		status := "error"
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 			status = "rejected"
 		}
-		metrics.RecordControlOperation(r.Context(), "stop", apply.Database, apply.Deployment, apply.Environment, status)
-		s.writeControlError(w, "stop", apply, err)
-		return
+		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, status)
+		return nil, http.StatusOK, err
 	}
-	metrics.RecordControlOperation(r.Context(), "stop", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+	metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		logMessage := "Stop requested by user"
 		if responseStatus == stopResponseStatusAlreadyRequested {
 			logMessage = "Stop requested by user while stop request already pending"
 		}
-		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventStopRequested, logMessage)
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested, logMessage)
 		if responseStatus == stopResponseStatusAlreadyRequested {
 			s.logger.Info("immediate stop skipped because stop request is already pending",
 				"apply_id", apply.ApplyIdentifier,
 				"database", apply.Database,
 				"deployment", apply.Deployment,
 				"environment", apply.Environment,
-				"requested_by", req.Caller)
+				"requested_by", caller)
 		} else {
-			s.tryImmediateStopAfterQueue(r.Context(), client, apply, ternApplyID, req.Environment, req.Caller)
+			s.tryImmediateStopAfterQueue(ctx, client, apply, ternApplyID, environment, caller)
 		}
 		s.wakeScheduler(apply.ApplyIdentifier, apply.Database, apply.Environment)
 	}
@@ -346,13 +423,13 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	if responseStatus == stopResponseStatusAlreadyRequested {
 		httpStatus = http.StatusAccepted
 	}
-	s.writeJSON(w, httpStatus, &apitypes.StopResponse{
+	return &apitypes.StopResponse{
 		Accepted:     resp.Accepted,
 		ErrorMessage: resp.ErrorMessage,
 		StoppedCount: resp.StoppedCount,
 		SkippedCount: resp.SkippedCount,
 		Status:       responseStatus,
-	})
+	}, httpStatus, nil
 }
 
 func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) {
@@ -647,7 +724,7 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 			status = "rejected"
 		}
-		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, status)
+		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, status)
 		s.writeControlError(w, "start", apply, err)
 		return
 	}

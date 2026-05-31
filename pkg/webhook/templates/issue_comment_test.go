@@ -34,6 +34,37 @@ func TestRenderUnsupportedAutoConfirm(t *testing.T) {
 	assert.Equal(t, "The `-y` flag is not supported for `plan`.", rendered)
 }
 
+func TestRenderControlMissingApplyID(t *testing.T) {
+	rendered := RenderControlMissingApplyID("stop")
+	assert.Contains(t, rendered, "Missing Apply ID")
+	assert.Contains(t, rendered, "schemabot stop <apply-id> -e <environment>")
+	assert.Contains(t, rendered, "schemabot status")
+}
+
+func TestRenderStopCommandAccepted(t *testing.T) {
+	rendered := RenderStopCommandAccepted(StopCommandAcceptedData{
+		ApplyID:      "apply_abc123",
+		Environment:  "staging",
+		RequestedBy:  "alice",
+		StoppedCount: 1,
+		SkippedCount: 2,
+	})
+	assert.Contains(t, rendered, "Stop Request Accepted")
+	assert.Contains(t, rendered, "`apply_abc123`")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "@alice")
+	assert.Contains(t, rendered, "1 stopped, 2 skipped")
+}
+
+func TestRenderStopCommandAcceptedAlreadyRequested(t *testing.T) {
+	rendered := RenderStopCommandAccepted(StopCommandAcceptedData{
+		ApplyID:     "apply_abc123",
+		Environment: "staging",
+		Status:      "already_requested",
+	})
+	assert.Contains(t, rendered, "Stop was already requested")
+}
+
 func TestRenderCommandNotYetAvailable(t *testing.T) {
 	rendered := RenderCommandNotYetAvailable("stop", "staging")
 	assert.Contains(t, rendered, "`stop` command is not yet available")

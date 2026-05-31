@@ -226,6 +226,29 @@ func TestWebhookYesFlagRejectedOnNonApply(t *testing.T) {
 	}
 }
 
+func TestWebhookStopMissingApplyID(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot stop -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "stop started")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Missing Apply ID")
+		assert.Contains(t, body, "schemabot stop <apply-id> -e <environment>")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for missing apply ID comment")
+	}
+}
+
 func TestWebhookBotCommentIgnored(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
@@ -345,13 +368,13 @@ func TestWebhookEyesReaction(t *testing.T) {
 func TestWebhookPhase2CommandNotYetAvailable(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
-	// Test remaining Phase 2 commands (apply, apply-confirm, unlock are now implemented)
+	// Test remaining Phase 2 commands (apply, apply-confirm, unlock, and stop are now implemented)
 	cmds := []struct {
 		comment string
 		action  string
 	}{
-		{"schemabot stop -e staging", "stop"},
 		{"schemabot revert -e staging", "revert"},
+		{"schemabot skip-revert -e staging", "skip-revert"},
 		{"schemabot cutover -e staging", "cutover"},
 	}
 

@@ -476,7 +476,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			}
 		}
 		if !state.IsTerminalApplyState(oldApplyState) {
-			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"All tasks already completed on resume (final schema check shows no remaining changes)", oldApplyState, state.Apply.Completed)

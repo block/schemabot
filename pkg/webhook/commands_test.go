@@ -55,7 +55,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 			supportsSkipRevert: true, supportsDefer: true, supportsAllowUnsafe: true},
 		{name: action.Unlock},
 		{name: action.FixLint, supportsDB: true},
-		{name: action.Stop, requiresEnv: true},
+		{name: action.Stop, requiresEnv: true, hasApplyID: true},
 		{name: action.Revert, requiresEnv: true},
 		{name: action.SkipRevert, requiresEnv: true},
 		{name: action.Cutover, requiresEnv: true},
@@ -282,9 +282,10 @@ func TestParseCommand(t *testing.T) {
 		},
 		{
 			name: "stop",
-			body: "schemabot stop -e production",
+			body: "schemabot stop apply_abc123 -e production",
 			expected: CommandResult{
 				Action:      "stop",
+				ApplyID:     "apply_abc123",
 				Environment: "production",
 				Found:       true,
 				IsMention:   true,

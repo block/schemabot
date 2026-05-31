@@ -61,7 +61,7 @@ var commandSpecs = []CommandSpec{
 		SupportsSkipRevert: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
 	{Name: action.Unlock},
 	{Name: action.FixLint, SupportsDB: true},
-	{Name: action.Stop, RequiresEnv: true},
+	{Name: action.Stop, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Revert, RequiresEnv: true},
 	{Name: action.SkipRevert, RequiresEnv: true},
 	{Name: action.Cutover, RequiresEnv: true},

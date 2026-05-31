@@ -1,10 +1,12 @@
 package webhook
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -344,6 +346,99 @@ func TestHandleApplyCommandBlocksUnauthorizedActorBeforePlanning(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "timed out waiting for unauthorized apply comment")
 	}
+}
+
+// Stop is a mutating PR comment command, so the full webhook path uses the same
+// configured admin/operator authorization as apply before recording durable stop intent.
+func TestWebhookStopCommandBlocksUnauthorizedActor(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	reactions := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 99}))
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1}))
+	})
+
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply_abcd1234",
+		Database:        "orders",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		Environment:     "staging",
+		Deployment:      "orders",
+	}
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	service := api.New(&stopActorAuthStorage{apply: apply}, cfg, nil, testLogger())
+	h := &Handler{
+		service:  service,
+		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
+		logger:   testLogger(),
+	}
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment:   "schemabot stop " + apply.ApplyIdentifier + " -e staging",
+		userLogin: "mona",
+		isPR:      true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "stop started")
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for stop acknowledgement reaction")
+	}
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "SchemaBot Command Not Authorized")
+		assert.Contains(t, body, "@mona is not authorized")
+		assert.Contains(t, body, "`schemabot stop`")
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for unauthorized stop comment")
+	}
+}
+
+type stopActorAuthStorage struct {
+	emptyStorage
+	apply *storage.Apply
+}
+
+func (s *stopActorAuthStorage) Applies() storage.ApplyStore {
+	return &stopActorAuthApplyStore{apply: s.apply}
+}
+
+type stopActorAuthApplyStore struct {
+	storage.ApplyStore
+	apply *storage.Apply
+}
+
+func (s *stopActorAuthApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
+	if s.apply == nil || s.apply.ApplyIdentifier != applyIdentifier {
+		return nil, nil
+	}
+	return s.apply, nil
 }
 
 func actorAuthTestConfig(enabled bool, opts ...func(*api.ServerConfig)) *api.ServerConfig {
