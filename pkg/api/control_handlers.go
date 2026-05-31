@@ -112,6 +112,7 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 			"external_apply_id", apply.ExternalID,
 			"database", apply.Database,
 			"database_type", apply.DatabaseType,
+			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 		)
 	}
@@ -332,6 +333,7 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 			s.logger.Info("immediate stop skipped because stop request is already pending",
 				"apply_id", apply.ApplyIdentifier,
 				"database", apply.Database,
+				"deployment", apply.Deployment,
 				"environment", apply.Environment,
 				"requested_by", req.Caller)
 		} else {
@@ -358,6 +360,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 		s.logger.Warn("immediate stop not attempted because Tern client is unavailable; durable stop request remains pending for apply owner retry",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
+			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 			"requested_by", caller)
 		return
@@ -367,6 +370,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"apply_id", apply.ApplyIdentifier,
 			"tern_apply_id", ternApplyID,
 			"database", apply.Database,
+			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 			"requested_by", caller)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
@@ -382,6 +386,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"apply_id", apply.ApplyIdentifier,
 			"tern_apply_id", ternApplyID,
 			"database", apply.Database,
+			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 			"requested_by", caller,
 			"error", err)
@@ -394,6 +399,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"apply_id", apply.ApplyIdentifier,
 			"tern_apply_id", ternApplyID,
 			"database", apply.Database,
+			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 			"requested_by", caller)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
@@ -405,6 +411,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"apply_id", apply.ApplyIdentifier,
 			"tern_apply_id", ternApplyID,
 			"database", apply.Database,
+			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 			"requested_by", caller,
 			"error_message", resp.ErrorMessage,
@@ -420,6 +427,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"apply_id", apply.ApplyIdentifier,
 			"tern_apply_id", ternApplyID,
 			"database", apply.Database,
+			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 			"requested_by", caller,
 			"stopped_count", resp.StoppedCount,
@@ -434,6 +442,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"apply_id", apply.ApplyIdentifier,
 			"tern_apply_id", ternApplyID,
 			"database", apply.Database,
+			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 			"requested_by", caller,
 			"stopped_count", resp.StoppedCount,
@@ -446,6 +455,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 		"apply_id", apply.ApplyIdentifier,
 		"tern_apply_id", ternApplyID,
 		"database", apply.Database,
+		"deployment", apply.Deployment,
 		"environment", apply.Environment,
 		"requested_by", caller,
 		"stopped_count", resp.StoppedCount,
@@ -746,6 +756,7 @@ func (s *Service) queueStoppedApplyForScheduler(ctx context.Context, apply *stor
 		s.logger.Info("queueing start for stopped tasks while stored apply is still running",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
+			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 			"stopped_count", startedCount,
 			"terminal_count", skippedCount)
@@ -787,6 +798,7 @@ func (s *Service) queueRemoteStoppedApplyForScheduler(ctx context.Context, clien
 			"apply_id", apply.ApplyIdentifier,
 			"external_id", apply.ExternalID,
 			"database", apply.Database,
+			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 			"remote_state", remoteState,
 			"stopped_count", startedCount,

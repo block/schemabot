@@ -181,6 +181,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		"worker", workerID,
 		"apply_id", apply.ApplyIdentifier,
 		"database", apply.Database,
+		"deployment", apply.Deployment,
 		"environment", apply.Environment,
 		"state", apply.State,
 		"last_heartbeat", apply.UpdatedAt)
@@ -204,6 +205,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 			"worker", workerID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
+			"deployment", deployment,
 			"environment", apply.Environment,
 			"error", err)
 		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, deployment, apply.Environment, "no_client")
@@ -224,6 +226,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 				"worker", workerID,
 				"apply_id", apply.ApplyIdentifier,
 				"database", apply.Database,
+				"deployment", deployment,
 				"environment", apply.Environment,
 				"error", err)
 			if retryableClaim {
@@ -235,6 +238,8 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 			"worker", workerID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
+			"deployment", deployment,
+			"environment", apply.Environment,
 			"error", err)
 		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, deployment, apply.Environment, "resume_error")
 		if retryableClaim {
@@ -248,6 +253,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		"worker", workerID,
 		"apply_id", apply.ApplyIdentifier,
 		"database", apply.Database,
+		"deployment", deployment,
 		"environment", apply.Environment,
 		"previous_state", previousState,
 		"duration", duration)

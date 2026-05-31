@@ -418,6 +418,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		s.logger.Debug("skipping source policy for apply because stored plan has no trusted schema path",
 			"plan_id", req.PlanID,
 			"database", plan.Database,
+			"deployment", plan.Deployment,
 			"environment", req.Environment,
 			"repository", plan.Repository,
 			"pull_request", plan.PullRequest)
@@ -436,6 +437,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 			s.logger.Warn("apply blocked by source policy",
 				"plan_id", req.PlanID,
 				"database", plan.Database,
+				"deployment", plan.Deployment,
 				"environment", req.Environment,
 				"repository", plan.Repository,
 				"pull_request", plan.PullRequest,
