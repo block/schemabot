@@ -313,7 +313,7 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
 	}
 	if !updated {
-		metrics.RecordCheckOwnershipMiss(ctx, "apply_finished", repo, apply.Database, apply.DatabaseType, apply.Environment)
+		metrics.RecordCheckOwnershipMiss(ctx, "apply_finished", repo, apply.Database, apply.DatabaseType, apply.Deployment, apply.Environment)
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "apply_finished",
 			Repository:   repo,
@@ -411,7 +411,7 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 		return
 	}
 	if !updated {
-		metrics.RecordCheckOwnershipMiss(ctx, "rollback_finished", repo, apply.Database, apply.DatabaseType, apply.Environment)
+		metrics.RecordCheckOwnershipMiss(ctx, "rollback_finished", repo, apply.Database, apply.DatabaseType, apply.Deployment, apply.Environment)
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "rollback_finished",
 			Repository:   repo,

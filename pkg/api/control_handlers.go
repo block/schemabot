@@ -254,7 +254,7 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 			status = "rejected"
 		}
-		metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Environment, status)
+		metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Deployment, apply.Environment, status)
 		s.writeControlError(w, "cutover", apply, err)
 		return
 	}
@@ -263,7 +263,7 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 			status = "rejected"
 		}
-		metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Environment, status)
+		metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Deployment, apply.Environment, status)
 		s.writeControlError(w, "cutover", apply, err)
 		return
 	}
@@ -273,11 +273,11 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 		Environment: apply.Environment,
 	})
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Environment, "error")
+		metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "cutover", apply, err)
 		return
 	}
-	metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Environment, controlStatus(resp.Accepted))
+	metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventCutoverTriggered, "Cutover triggered by user")
 	}
@@ -317,11 +317,11 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 			status = "rejected"
 		}
-		metrics.RecordControlOperation(r.Context(), "stop", apply.Database, apply.Environment, status)
+		metrics.RecordControlOperation(r.Context(), "stop", apply.Database, apply.Deployment, apply.Environment, status)
 		s.writeControlError(w, "stop", apply, err)
 		return
 	}
-	metrics.RecordControlOperation(r.Context(), "stop", apply.Database, apply.Environment, controlStatus(resp.Accepted))
+	metrics.RecordControlOperation(r.Context(), "stop", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		logMessage := "Stop requested by user"
 		if responseStatus == stopResponseStatusAlreadyRequested {
@@ -628,7 +628,7 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := validateStartRequestState(apply); err != nil {
-		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, "rejected")
+		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		s.writeControlError(w, "start", apply, err)
 		return
 	}
@@ -637,7 +637,7 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 			status = "rejected"
 		}
-		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, status)
+		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, status)
 		s.writeControlError(w, "start", apply, err)
 		return
 	}
@@ -653,7 +653,7 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 			if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 				status = "rejected"
 			}
-			metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, status)
+			metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, status)
 			s.writeControlError(w, "start", apply, err)
 			return
 		}
@@ -686,12 +686,12 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 			status = "rejected"
 		}
-		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, status)
+		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, status)
 		s.writeControlError(w, "start", apply, err)
 		return
 	}
 
-	metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Environment, controlStatus(resp.Accepted))
+	metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventStartRequested, "Start requested by user")
 		if queuedForScheduler {
@@ -1030,11 +1030,11 @@ func (s *Service) handleVolume(w http.ResponseWriter, r *http.Request) {
 		Volume:      req.Volume,
 	})
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Environment, "error")
+		metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "volume", apply, err)
 		return
 	}
-	metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Environment, controlStatus(resp.Accepted))
+	metrics.RecordControlOperation(r.Context(), "volume", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 
 	s.writeJSON(w, http.StatusOK, &apitypes.VolumeResponse{
 		Accepted:       resp.Accepted,
@@ -1064,11 +1064,11 @@ func (s *Service) handleRevert(w http.ResponseWriter, r *http.Request) {
 		Environment: apply.Environment,
 	})
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "revert", apply.Database, apply.Environment, "error")
+		metrics.RecordControlOperation(r.Context(), "revert", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "revert", apply, err)
 		return
 	}
-	metrics.RecordControlOperation(r.Context(), "revert", apply.Database, apply.Environment, controlStatus(resp.Accepted))
+	metrics.RecordControlOperation(r.Context(), "revert", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventRevertTriggered, "Revert triggered by user")
 	}
@@ -1099,11 +1099,11 @@ func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 		Environment: apply.Environment,
 	})
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "skip_revert", apply.Database, apply.Environment, "error")
+		metrics.RecordControlOperation(r.Context(), "skip_revert", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "skip-revert", apply, err)
 		return
 	}
-	metrics.RecordControlOperation(r.Context(), "skip_revert", apply.Database, apply.Environment, controlStatus(resp.Accepted))
+	metrics.RecordControlOperation(r.Context(), "skip_revert", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 
 	// Record skip-revert on VitessApplyData for progress visibility
 	if resp.Accepted && apply.Engine == storage.EnginePlanetScale {
@@ -1170,11 +1170,11 @@ func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.ExecuteRollbackPlan(r.Context(), apply.Database, apply.Environment, apply.Deployment)
 	if err != nil {
-		metrics.RecordControlOperation(r.Context(), "rollback_plan", apply.Database, apply.Environment, "error")
+		metrics.RecordControlOperation(r.Context(), "rollback_plan", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "rollback plan", apply, err)
 		return
 	}
-	metrics.RecordControlOperation(r.Context(), "rollback_plan", apply.Database, apply.Environment, "success")
+	metrics.RecordControlOperation(r.Context(), "rollback_plan", apply.Database, apply.Deployment, apply.Environment, "success")
 
 	// Include database metadata so the caller doesn't need to look it up separately
 	resp.Database = apply.Database

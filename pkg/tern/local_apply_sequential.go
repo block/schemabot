@@ -422,7 +422,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 			return
 		}
 	}
-	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 
 	if apply.State == state.Apply.FailedRetryable {
 		if obs := c.getObserver(apply.ID); obs != nil {

@@ -1118,7 +1118,7 @@ func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remot
 	}
 	c.logApplyStateTransition(ctx, storedApply, storage.LogLevelError, fmt.Sprintf("Remote apply failed: %s", message), oldState)
 	*remoteApply = *storedApply
-	metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Environment)
+	metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Deployment, storedApply.Environment)
 	return nil
 }
 
@@ -1216,7 +1216,7 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	}
 	c.logApplyStateTransition(ctx, storedApply, remoteTerminalApplyLogLevel(storedApply), remoteTerminalApplyLogMessage(storedApply), oldState)
 	*remoteApply = *storedApply
-	metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Environment)
+	metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Deployment, storedApply.Environment)
 	return nil
 }
 

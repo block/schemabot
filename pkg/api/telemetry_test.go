@@ -246,20 +246,20 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 
 	metrics.RecordPlan(t.Context(), "org/repo", "mydb", "pie", "staging", "success")
 	metrics.RecordPlanDuration(t.Context(), time.Second, "org/repo", "mydb", "pie", "staging", "success")
-	metrics.RecordApply(t.Context(), "org/repo", "mydb", "staging", "success")
-	metrics.RecordApplyDuration(t.Context(), time.Second, "org/repo", "mydb", "staging", "success")
+	metrics.RecordApply(t.Context(), "org/repo", "mydb", "pie", "staging", "success")
+	metrics.RecordApplyDuration(t.Context(), time.Second, "org/repo", "mydb", "pie", "staging", "success")
 	metrics.RecordSchemaFreshnessRejected(t.Context(), "apply", "staging")
 	metrics.RecordStalePlanRejected(t.Context(), "staging")
 	metrics.RecordSourcePolicyBlock(t.Context(), "plan", "mydb", "staging", "unauthorized_repo")
 	metrics.RecordPRCommandActorAuthorization(t.Context(), "apply", "mydb", "staging", "org/repo", "allowed", "allowed_admin_user")
-	metrics.RecordCheckOwnershipMiss(t.Context(), "apply_finished", "org/repo", "mydb", "mysql", "staging")
-	metrics.AdjustActiveApplies(t.Context(), 1, "mydb", "staging")
-	metrics.RecordControlOperation(t.Context(), "stop", "mydb", "staging", "success")
+	metrics.RecordCheckOwnershipMiss(t.Context(), "apply_finished", "org/repo", "mydb", "mysql", "pie", "staging")
+	metrics.AdjustActiveApplies(t.Context(), 1, "mydb", "pie", "staging")
+	metrics.RecordControlOperation(t.Context(), "stop", "mydb", "pie", "staging", "success")
 	metrics.RecordLockOperation(t.Context(), "acquire", "mydb", "success")
-	metrics.RecordSchedulerResume(t.Context(), "mydb", "staging", "running")
-	metrics.RecordSchedulerResumeFailure(t.Context(), "mydb", "staging", "no_client")
+	metrics.RecordSchedulerResume(t.Context(), "mydb", "pie", "staging", "running")
+	metrics.RecordSchedulerResumeFailure(t.Context(), "mydb", "pie", "staging", "no_client")
 	metrics.RecordSchedulerClaimFailure(t.Context(), "storage_error")
-	metrics.RecordSchedulerClaimDuration(t.Context(), time.Second, "mydb", "staging", "running")
+	metrics.RecordSchedulerClaimDuration(t.Context(), time.Second, "mydb", "pie", "staging", "running")
 	metrics.RecordSchemaRequestError(t.Context(), "org/repo", "apply", "mydb", "staging", "invalid_config")
 	metrics.RecordGitHubRequest(t.Context(), metrics.GitHubRequestSample{
 		Operation:  metrics.GitHubOperationFetchPullRequest,
@@ -294,9 +294,30 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 			}
 			checked++
 			assertMetricDataPointsHaveEnvironment(t, m)
+			if metricHasDeploymentAttribute(m.Name) {
+				assertMetricDataPointsHaveDeployment(t, m)
+			}
 		}
 	}
 	require.NotZero(t, checked, "expected SchemaBot metrics to be collected")
+}
+
+func metricHasDeploymentAttribute(metricName string) bool {
+	switch metricName {
+	case "schemabot.plans.total",
+		"schemabot.plan.duration_seconds",
+		"schemabot.applies.total",
+		"schemabot.apply.duration_seconds",
+		"schemabot.check_ownership_misses_total",
+		"schemabot.active_applies",
+		"schemabot.control_operations_total",
+		"schemabot.scheduler.resumed_total",
+		"schemabot.scheduler.resume_failures_total",
+		"schemabot.scheduler.claim_duration_seconds":
+		return true
+	default:
+		return false
+	}
 }
 
 func assertMetricDataPointsHaveEnvironment(t *testing.T, m metricdata.Metrics) {
@@ -330,6 +351,37 @@ func assertMetricAttributesHaveEnvironment(t *testing.T, metricName string, attr
 	assert.NotEmpty(t, environment.AsString(), "%s metric environment attribute must be non-empty", metricName)
 }
 
+func assertMetricDataPointsHaveDeployment(t *testing.T, m metricdata.Metrics) {
+	t.Helper()
+	switch data := m.Data.(type) {
+	case metricdata.Sum[int64]:
+		for _, dp := range data.DataPoints {
+			assertMetricAttributesHaveDeployment(t, m.Name, dp.Attributes)
+		}
+	case metricdata.Gauge[int64]:
+		for _, dp := range data.DataPoints {
+			assertMetricAttributesHaveDeployment(t, m.Name, dp.Attributes)
+		}
+	case metricdata.Histogram[float64]:
+		for _, dp := range data.DataPoints {
+			assertMetricAttributesHaveDeployment(t, m.Name, dp.Attributes)
+		}
+	case metricdata.Histogram[int64]:
+		for _, dp := range data.DataPoints {
+			assertMetricAttributesHaveDeployment(t, m.Name, dp.Attributes)
+		}
+	default:
+		t.Fatalf("unsupported metric data type %T for %s", m.Data, m.Name)
+	}
+}
+
+func assertMetricAttributesHaveDeployment(t *testing.T, metricName string, attrs attribute.Set) {
+	t.Helper()
+	deployment, ok := attrs.Value(attribute.Key("deployment"))
+	require.True(t, ok, "%s metric data point missing deployment attribute: %v", metricName, attrs)
+	assert.NotEmpty(t, deployment.AsString(), "%s metric deployment attribute must be non-empty", metricName)
+}
+
 func TestRecordApplyMetrics(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
@@ -340,10 +392,10 @@ func TestRecordApplyMetrics(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordApply(t.Context(), "testrepo", "mydb", "staging", "success")
-	metrics.RecordApply(t.Context(), "testrepo", "mydb", "staging", "error")
-	metrics.RecordApply(t.Context(), "testrepo", "mydb", "staging", "conflict")
-	metrics.RecordApplyDuration(t.Context(), 2*time.Second, "testrepo", "mydb", "staging", "success")
+	metrics.RecordApply(t.Context(), "testrepo", "mydb", "pie", "staging", "success")
+	metrics.RecordApply(t.Context(), "testrepo", "mydb", "pie", "staging", "error")
+	metrics.RecordApply(t.Context(), "testrepo", "mydb", "pie", "staging", "conflict")
+	metrics.RecordApplyDuration(t.Context(), 2*time.Second, "testrepo", "mydb", "pie", "staging", "success")
 
 	names := collectMetricNames(t, reader)
 	assert.True(t, names["schemabot.applies.total"], "expected schemabot.applies.total")
@@ -360,8 +412,8 @@ func TestRecordCheckOwnershipMissMetric(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordCheckOwnershipMiss(t.Context(), "apply_finished", "org/repo", "mydb", "mysql", "staging")
-	metrics.RecordCheckOwnershipMiss(t.Context(), "rollback_finished", "org/repo", "mydb", "mysql", "staging")
+	metrics.RecordCheckOwnershipMiss(t.Context(), "apply_finished", "org/repo", "mydb", "mysql", "pie", "staging")
+	metrics.RecordCheckOwnershipMiss(t.Context(), "rollback_finished", "org/repo", "mydb", "mysql", "pie", "staging")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
@@ -594,9 +646,9 @@ func TestRecordControlOperationMetric(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordControlOperation(t.Context(), "cutover", "mydb", "staging", "success")
-	metrics.RecordControlOperation(t.Context(), "stop", "mydb", "staging", "success")
-	metrics.RecordControlOperation(t.Context(), "start", "mydb", "staging", "error")
+	metrics.RecordControlOperation(t.Context(), "cutover", "mydb", "pie", "staging", "success")
+	metrics.RecordControlOperation(t.Context(), "stop", "mydb", "pie", "staging", "success")
+	metrics.RecordControlOperation(t.Context(), "start", "mydb", "pie", "staging", "error")
 
 	names := collectMetricNames(t, reader)
 	assert.True(t, names["schemabot.control_operations_total"], "expected schemabot.control_operations_total")
@@ -630,11 +682,11 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordSchedulerResume(t.Context(), "testdb", "staging", "running")
-	metrics.RecordSchedulerResumeFailure(t.Context(), "testdb", "staging", "no_client")
+	metrics.RecordSchedulerResume(t.Context(), "testdb", "pie", "staging", "running")
+	metrics.RecordSchedulerResumeFailure(t.Context(), "testdb", "pie", "staging", "no_client")
 	metrics.RecordSchedulerClaimFailure(t.Context(), "storage_error")
 	metrics.RecordSchedulerClaimFailure(t.Context(), "expire_retryable_error")
-	metrics.RecordSchedulerClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "staging", "running")
+	metrics.RecordSchedulerClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "pie", "staging", "running")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))

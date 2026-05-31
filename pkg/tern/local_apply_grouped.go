@@ -454,7 +454,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return true
 		}
-		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 		switch {
 		case retryableFailure:
 			c.logger.Warn("apply paused for scheduler retry",

@@ -161,7 +161,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 			"environment", apply.Environment,
 			"attempt", apply.Attempt,
 			"reason", expiration.Reason)
-		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, string(expiration.Reason))
+		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
 	}
 
 	apply, err := s.storage.Applies().FindNextApply(ctx)
@@ -195,7 +195,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"error", err)
-		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, "missing_deployment")
+		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, "", apply.Environment, "missing_deployment")
 		return
 	}
 	client, err := s.TernClient(deployment, apply.Environment)
@@ -206,7 +206,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"error", err)
-		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, "no_client")
+		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, deployment, apply.Environment, "no_client")
 		return
 	}
 
@@ -216,7 +216,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 
 	retryableClaim := previousState == state.Apply.FailedRetryable
 	if retryableClaim {
-		metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Environment)
+		metrics.AdjustActiveApplies(ctx, 1, apply.Database, deployment, apply.Environment)
 	}
 	if err := client.ResumeApply(ctx, apply); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
@@ -227,7 +227,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 				"environment", apply.Environment,
 				"error", err)
 			if retryableClaim {
-				metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}
 			return
 		}
@@ -236,9 +236,9 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"error", err)
-		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Environment, "resume_error")
+		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, deployment, apply.Environment, "resume_error")
 		if retryableClaim {
-			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Environment)
+			metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 		}
 		return
 	}
@@ -251,6 +251,6 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		"environment", apply.Environment,
 		"previous_state", previousState,
 		"duration", duration)
-	metrics.RecordSchedulerResume(ctx, apply.Database, apply.Environment, previousState)
-	metrics.RecordSchedulerClaimDuration(ctx, duration, apply.Database, apply.Environment, previousState)
+	metrics.RecordSchedulerResume(ctx, apply.Database, deployment, apply.Environment, previousState)
+	metrics.RecordSchedulerClaimDuration(ctx, duration, apply.Database, deployment, apply.Environment, previousState)
 }
