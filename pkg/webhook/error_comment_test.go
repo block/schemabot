@@ -60,3 +60,37 @@ func TestPostCommandError_RendersTimestamp(t *testing.T) {
 		t.Fatal("timed out waiting for posted comment")
 	}
 }
+
+func TestPostCommandErrorExplainsRemoteUnavailable(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	bodies := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		bodies <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	h := &Handler{
+		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
+		logger:   testLogger(),
+	}
+
+	h.postCommandError(
+		"octocat/hello-world", 1, 12345,
+		"plan", "staging", "alice",
+		"rpc error: code = Unavailable desc = no healthy upstream",
+	)
+
+	select {
+	case body := <-bodies:
+		assert.Contains(t, body, "SchemaBot could not reach the remote schema change service")
+		assert.Contains(t, body, "No healthy upstream is available")
+		assert.Contains(t, body, "Raw error: rpc error: code = Unavailable desc = no healthy upstream")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for posted comment")
+	}
+}

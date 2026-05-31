@@ -76,10 +76,11 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
 		metrics.RecordPlan(ctx, repo, schemaResult.Database, environment, "error")
+		userError := userFacingError(err)
 		h.postFailingAggregates(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{
-			environment: userFacingError(err),
+			environment: userError,
 		})
-		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, err.Error())
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userError)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan failed"})
 		return
 	}
@@ -403,10 +404,4 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 	data.Errors = planResp.Errors
 
 	return data
-}
-
-// userFacingError returns the error message as-is. Detailed errors are logged
-// server-side; the PR comment shows the full chain so users can report issues.
-func userFacingError(err error) string {
-	return err.Error()
 }

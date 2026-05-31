@@ -1,11 +1,15 @@
 package webhook
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -208,6 +212,37 @@ func TestRenderMultiEnvPlanComment_ShowsPRHeadSHA(t *testing.T) {
 
 	assert.Contains(t, rendered, "planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890)")
 	assert.NotContains(t, rendered, "**PR head SHA**")
+}
+
+func TestUserFacingErrorExplainsNoHealthyUpstream(t *testing.T) {
+	err := &api.RemoteSchemaServiceUnavailableError{
+		Deployment: "pie",
+		Target:     "orders-staging",
+		Err:        status.Error(codes.Unavailable, "no healthy upstream"),
+	}
+
+	got := userFacingError(err)
+
+	assert.Contains(t, got, "SchemaBot could not reach the remote deployment `pie`")
+	assert.Contains(t, got, "target `orders-staging`")
+	assert.Contains(t, got, "service or network path is unavailable")
+	assert.Contains(t, got, "Raw error: remote deployment \"pie\" target \"orders-staging\" unavailable: rpc error: code = Unavailable desc = no healthy upstream")
+}
+
+func TestUserFacingErrorPreservesNonGRPCErrors(t *testing.T) {
+	err := errors.New("invalid DDL")
+
+	got := userFacingError(err)
+
+	assert.Equal(t, "invalid DDL", got)
+}
+
+func TestUserFacingErrorDetailDoesNotWrapFormattedRemoteErrors(t *testing.T) {
+	formatted := "SchemaBot could not reach the remote deployment `pie`. Raw error: rpc error: code = Unavailable desc = no healthy upstream"
+
+	got := userFacingErrorDetail(formatted)
+
+	assert.Equal(t, formatted, got)
 }
 
 func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {

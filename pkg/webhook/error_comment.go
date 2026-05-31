@@ -1,8 +1,16 @@
 package webhook
 
 import (
+	"errors"
+	"strings"
+
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/webhook/templates"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+const remoteSchemaServiceUnavailableMessage = "SchemaBot could not reach the remote schema change service for this environment."
 
 // postCommandError posts a generic command-failure comment to the PR with a
 // consistent UTC timestamp.
@@ -28,6 +36,47 @@ func (h *Handler) postCommandError(
 		Timestamp:   templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
 		Environment: environment,
 		CommandName: commandName,
-		ErrorDetail: errorDetail,
+		ErrorDetail: userFacingErrorDetail(errorDetail),
 	}))
+}
+
+func userFacingError(err error) string {
+	var remoteErr *api.RemoteSchemaServiceUnavailableError
+	if errors.As(err, &remoteErr) {
+		return userFacingRemoteUnavailableError(remoteErr.Deployment, remoteErr.Target, err.Error())
+	}
+	if status.Code(err) == codes.Unavailable {
+		return userFacingRemoteUnavailableError("", "", err.Error())
+	}
+	return err.Error()
+}
+
+func userFacingErrorDetail(errorDetail string) string {
+	lowerDetail := strings.ToLower(errorDetail)
+	if strings.Contains(lowerDetail, strings.ToLower(remoteSchemaServiceUnavailableMessage)) {
+		return errorDetail
+	}
+	if strings.Contains(lowerDetail, "schemabot could not reach the remote deployment") {
+		return errorDetail
+	}
+	if strings.Contains(lowerDetail, "schemabot could not reach the remote schema change service") {
+		return errorDetail
+	}
+	if strings.Contains(lowerDetail, "rpc error: code = unavailable") {
+		return userFacingRemoteUnavailableError("", "", errorDetail)
+	}
+	return errorDetail
+}
+
+func userFacingRemoteUnavailableError(deployment, target, rawError string) string {
+	service := "remote schema change service"
+	if deployment != "" && target != "" {
+		service = "remote deployment `" + deployment + "` for target `" + target + "`"
+	} else if deployment != "" {
+		service = "remote deployment `" + deployment + "`"
+	}
+	if strings.Contains(strings.ToLower(rawError), "no healthy upstream") {
+		return "SchemaBot could not reach the " + service + ". No healthy upstream is available. The service or network path is unavailable; retry after the upstream is healthy. Raw error: " + rawError
+	}
+	return "SchemaBot could not reach the " + service + ". Retry after the service is healthy. Raw error: " + rawError
 }

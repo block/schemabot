@@ -13,8 +13,10 @@ import (
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
+	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
@@ -42,6 +44,26 @@ type PlanRequest struct {
 	// discovered the PR source itself. It is deliberately not JSON-decodable:
 	// direct API clients cannot attest repo/path ownership.
 	SourceTrusted bool `json:"-"`
+}
+
+// RemoteSchemaServiceUnavailableError carries routing metadata for remote
+// schema change service availability failures so callers can render actionable
+// operator-facing errors without parsing strings.
+type RemoteSchemaServiceUnavailableError struct {
+	Deployment string
+	Target     string
+	Err        error
+}
+
+func (e *RemoteSchemaServiceUnavailableError) Error() string {
+	if e.Target == "" {
+		return fmt.Sprintf("remote deployment %q unavailable: %v", e.Deployment, e.Err)
+	}
+	return fmt.Sprintf("remote deployment %q target %q unavailable: %v", e.Deployment, e.Target, e.Err)
+}
+
+func (e *RemoteSchemaServiceUnavailableError) Unwrap() error {
+	return e.Err
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
@@ -112,7 +134,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {
 		span.RecordError(err)
-		span.SetStatus(codes.Error, "invalid schema files")
+		span.SetStatus(otelcodes.Error, "invalid schema files")
 		return nil, err
 	} else if warning != "" {
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
@@ -123,7 +145,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	resolvedTarget, err := s.config.ResolveDatabaseTarget(req.Database, req.Environment)
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(codes.Error, "resolve target")
+		span.SetStatus(otelcodes.Error, "resolve target")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "error")
 		return nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
@@ -131,7 +153,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	if req.Type != resolvedTarget.DatabaseType {
 		typeErr := fmt.Errorf("database %q type %q does not match server config type %q", req.Database, req.Type, resolvedTarget.DatabaseType)
 		span.RecordError(typeErr)
-		span.SetStatus(codes.Error, "type mismatch")
+		span.SetStatus(otelcodes.Error, "type mismatch")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "error")
 		return nil, typeErr
@@ -164,7 +186,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		}); err != nil {
 			reason := sourcePolicyReason(err)
 			span.RecordError(err)
-			span.SetStatus(codes.Error, "source policy")
+			span.SetStatus(otelcodes.Error, "source policy")
 			metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "error")
 			metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "error")
 			metrics.RecordSourcePolicyBlock(ctx, "plan", req.Database, req.Environment, reason)
@@ -183,7 +205,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(codes.Error, "tern client")
+		span.SetStatus(otelcodes.Error, "tern client")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "error")
 		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
@@ -217,9 +239,16 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	resp, err := client.Plan(ctx, ternReq)
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(codes.Error, "plan failed")
+		span.SetStatus(otelcodes.Error, "plan failed")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, req.Environment, "error")
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, req.Environment, "error")
+		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
+			return nil, &RemoteSchemaServiceUnavailableError{
+				Deployment: deployment,
+				Target:     resolvedTarget.Target,
+				Err:        err,
+			}
+		}
 		return nil, err
 	}
 	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
@@ -337,34 +366,34 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	plan, err := s.storage.Plans().Get(ctx, req.PlanID)
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(codes.Error, "get plan")
+		span.SetStatus(otelcodes.Error, "get plan")
 		return nil, 0, fmt.Errorf("get plan: %w", err)
 	}
 	if plan == nil {
 		planErr := fmt.Errorf("plan not found: %s", req.PlanID)
 		span.RecordError(planErr)
-		span.SetStatus(codes.Error, "plan not found")
+		span.SetStatus(otelcodes.Error, "plan not found")
 		return nil, 0, planErr
 	}
 	span.SetAttributes(attribute.String("database", plan.Database))
 	if plan.Environment != req.Environment {
 		applyErr := fmt.Errorf("plan %s was created for environment %q, not %q", req.PlanID, plan.Environment, req.Environment)
 		span.RecordError(applyErr)
-		span.SetStatus(codes.Error, "environment mismatch")
+		span.SetStatus(otelcodes.Error, "environment mismatch")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, "error")
 		return nil, 0, applyErr
 	}
 	if plan.Deployment == "" {
 		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "deployment")
 		span.RecordError(applyErr)
-		span.SetStatus(codes.Error, "missing stored deployment")
+		span.SetStatus(otelcodes.Error, "missing stored deployment")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, "error")
 		return nil, 0, applyErr
 	}
 	if plan.Target == "" {
 		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "target")
 		span.RecordError(applyErr)
-		span.SetStatus(codes.Error, "missing stored target")
+		span.SetStatus(otelcodes.Error, "missing stored target")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, "error")
 		return nil, 0, applyErr
 	}
@@ -388,7 +417,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		}); err != nil {
 			reason := sourcePolicyReason(err)
 			span.RecordError(err)
-			span.SetStatus(codes.Error, "source policy")
+			span.SetStatus(otelcodes.Error, "source policy")
 			metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, "error")
 			metrics.RecordSourcePolicyBlock(ctx, "apply", plan.Database, req.Environment, reason)
 			s.logger.Warn("apply blocked by source policy",
@@ -409,7 +438,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(codes.Error, "tern client")
+		span.SetStatus(otelcodes.Error, "tern client")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, req.Environment, "error")
 		return nil, 0, fmt.Errorf("database %q (%s): %w", plan.Database, req.Environment, err)
 	}
@@ -427,7 +456,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	}
 	recordApplyError := func(status string, err error) {
 		span.RecordError(err)
-		span.SetStatus(codes.Error, status)
+		span.SetStatus(otelcodes.Error, status)
 		recordApplyResult(applyMetricStatusForError(err))
 	}
 

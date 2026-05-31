@@ -16,6 +16,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -722,6 +724,47 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		require.NotNil(t, plans.created)
 		assert.Equal(t, "schema/payments", plans.created.SchemaPath)
 	})
+}
+
+func TestExecutePlanUnavailableRemoteErrorIncludesDeployment(t *testing.T) {
+	plans := &capturingPlanStore{}
+	mockClient := &mockTernClient{
+		planErr:  status.Error(codes.Unavailable, "no healthy upstream"),
+		isRemote: true,
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {Target: "orders-staging", Deployment: "pie"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"pie": {"staging": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+		"pie/staging": mockClient,
+	}, logger)
+
+	_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+		Database:    "orders",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"orders": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		Repository: "example/app",
+	})
+
+	var remoteErr *RemoteSchemaServiceUnavailableError
+	require.ErrorAs(t, err, &remoteErr)
+	assert.Equal(t, "pie", remoteErr.Deployment)
+	assert.Equal(t, "orders-staging", remoteErr.Target)
+	assert.Equal(t, codes.Unavailable, status.Code(err))
 }
 
 func TestExecuteApplySourcePolicyAllowsDirectPlan(t *testing.T) {
