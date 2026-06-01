@@ -560,6 +560,7 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 	mysqlCfg.Passwd = password.PlainText
 	mysqlCfg.Net = "tcp"
 	mysqlCfg.Addr = password.Hostname
+	mysqlCfg.DBName = sc.Namespace
 	mysqlCfg.InterpolateParams = true
 	if mtlsRegistered.Load() {
 		mysqlCfg.TLSConfig = mtlsConfigName
@@ -574,11 +575,6 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 
 	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping branch for %s: %w", sc.Namespace, err)
-	}
-
-	// USE the keyspace — vtgate branch proxy routes based on the database name.
-	if _, err := db.ExecContext(ctx, "USE `"+sc.Namespace+"`"); err != nil {
-		return fmt.Errorf("use keyspace %s: %w", sc.Namespace, err)
 	}
 
 	for _, tc := range sc.TableChanges {

@@ -1,10 +1,12 @@
 package planetscale
 
 import (
+	"database/sql/driver"
 	"fmt"
 	"testing"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -237,6 +239,15 @@ func TestIsRetryableEngineError(t *testing.T) {
 
 	t.Run("wrapped network error is retryable", func(t *testing.T) {
 		err := fmt.Errorf("apply failed: %w", fmt.Errorf("i/o timeout"))
+		assert.True(t, isRetryableEngineError(err))
+	})
+
+	t.Run("MySQL invalid connection is retryable", func(t *testing.T) {
+		assert.True(t, isRetryableEngineError(mysql.ErrInvalidConn))
+	})
+
+	t.Run("wrapped bad connection is retryable", func(t *testing.T) {
+		err := fmt.Errorf("execute DDL: %w", driver.ErrBadConn)
 		assert.True(t, isRetryableEngineError(err))
 	})
 

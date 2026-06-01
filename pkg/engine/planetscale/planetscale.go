@@ -387,6 +387,7 @@ package planetscale
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -660,7 +661,11 @@ func mainBranch(creds *engine.Credentials) string {
 // isRetryableEngineError returns true if the error is a transient condition
 // that may succeed on a future attempt.
 func isRetryableEngineError(err error) bool {
-	return isRetryablePSError(err) || engine.IsTransientTransportError(err)
+	return isRetryablePSError(err) || isRetryableMySQLConnectionError(err) || engine.IsTransientTransportError(err)
+}
+
+func isRetryableMySQLConnectionError(err error) bool {
+	return errors.Is(err, mysql.ErrInvalidConn) || errors.Is(err, driver.ErrBadConn)
 }
 
 // isSnapshotInProgress returns true if the error indicates PlanetScale is
