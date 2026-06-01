@@ -46,9 +46,9 @@ databases:
           username: "mydb_user"
           password_ref: "file:/run/secrets/mydb-password"
           config_paths:
-            host: connection.host
-            port: connection.port
-            database: connection.database
+            host: databases.mydb.host
+            port: databases.mydb.port
+            database: databases.mydb.database
 ```
 
 By default, the referenced database config is expected to contain top-level
@@ -66,12 +66,18 @@ contain the connection fields. SchemaBot does not assign meaning to path names;
 it only reads the configured values and builds one DSN.
 
 ```yaml
-connection:
-  primary:
+databases:
+  mydb:
     host: db.example.com
     port: 3307
     database: appdb
 ```
+
+With the `config_paths` example above, SchemaBot reads:
+
+- `databases.mydb.host` for the hostname
+- `databases.mydb.port` for the optional port
+- `databases.mydb.database` for the database name
 
 `dsn` and `dsn_from` are mutually exclusive for each storage or database
 environment entry.
