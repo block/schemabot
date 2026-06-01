@@ -729,7 +729,9 @@ func (c *DSNFromConfig) Resolve() (string, error) {
 	}
 
 	var config externalDatabaseConfig
-	if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
+	dec := yaml.NewDecoder(strings.NewReader(configYAML))
+	dec.KnownFields(true)
+	if err := dec.Decode(&config); err != nil {
 		return "", fmt.Errorf("parse database config: %w", err)
 	}
 
@@ -789,7 +791,7 @@ func (c externalDatabaseConfig) endpoint(clusterName, endpointName string) (exte
 
 	endpoint := externalDatabaseEndpoint{Host: c.Host, Port: c.Port, Database: c.Database}
 	if err := endpoint.validate(endpointName); err != nil {
-		return externalDatabaseEndpoint{}, fmt.Errorf("database config does not contain %s endpoint", endpointName)
+		return externalDatabaseEndpoint{}, err
 	}
 	return endpoint, nil
 }

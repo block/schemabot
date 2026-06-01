@@ -1074,6 +1074,28 @@ writer:
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "missing host")
 	})
+
+	t.Run("database config rejects unknown fields", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "database.yaml")
+		passwordPath := filepath.Join(dir, "password")
+		require.NoError(t, os.WriteFile(configPath, []byte(`
+writer:
+  host: writer.example.com
+  database: appdb
+  datbase: typo
+`), 0644))
+		require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
+
+		_, err := (&DSNFromConfig{
+			ConfigRef:   "file:" + configPath,
+			Username:    "app_user",
+			PasswordRef: "file:" + passwordPath,
+		}).Resolve()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "field datbase not found")
+	})
 }
 
 func TestServerConfig_StorageDSNFromConfig(t *testing.T) {
