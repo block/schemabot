@@ -373,6 +373,53 @@ type Apply struct {
 	UpdatedAt time.Time
 }
 
+// ApplyDeployment represents one child row in the apply_deployments table:
+// the per-deployment slice of a multi-deployment apply.
+//
+// In the multi-deployment data model, one applies row owns 1..N
+// apply_deployments rows — one per target deployment. Each child carries its
+// own state machine, lock identity, and progress so the scheduler can claim,
+// execute, and report on each deployment independently while keeping
+// `apply_id` as the user-facing handle for the whole rollout.
+//
+// Created in MD-1 (DDL) + MD-2 (this struct / CRUD). No caller writes these
+// rows yet — MD-5 introduces the dual-write at apply-create time.
+type ApplyDeployment struct {
+	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
+	ID int64
+
+	// ApplyID points to applies.id. Unique together with Deployment.
+	ApplyID int64
+
+	// Deployment is the Tern deployment name this child row targets
+	// (e.g. "region-a", "payments-eu"). Drawn from the resolved
+	// environment-level deployments map in server config.
+	Deployment string
+
+	// Target is the Tern-facing target selected by server config at apply
+	// time for this deployment. Mirrors plans.target / applies.target
+	// semantics. Empty for legacy / single-deployment shapes.
+	Target string
+
+	// State is the per-deployment state machine value. See state.ApplyDeployment.
+	State string
+
+	// ErrorMessage contains error details if state is failed.
+	ErrorMessage string
+
+	// StartedAt is when the scheduler claimed this child row and execution began.
+	StartedAt *time.Time
+
+	// CompletedAt is when this child row reached a terminal state.
+	CompletedAt *time.Time
+
+	// CreatedAt is when the child row was inserted (typically at apply create).
+	CreatedAt time.Time
+
+	// UpdatedAt is when the child row was last updated.
+	UpdatedAt time.Time
+}
+
 // ApplyOptions contains durable user and engine options for an apply.
 // Stored as JSON in the database for flexibility across engine types.
 type ApplyOptions struct {

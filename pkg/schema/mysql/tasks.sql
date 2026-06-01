@@ -2,6 +2,7 @@ CREATE TABLE `tasks` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `task_identifier` varchar(255) NOT NULL,
   `apply_id` bigint unsigned NOT NULL,
+  `apply_deployment_id` bigint unsigned DEFAULT NULL,
   `plan_id` bigint unsigned NOT NULL,
   `database_name` varchar(255) NOT NULL,
   `database_type` varchar(50) NOT NULL,
@@ -31,6 +32,7 @@ CREATE TABLE `tasks` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `idx_task_identifier` (`task_identifier`),
   KEY `idx_apply_id` (`apply_id`),
+  KEY `idx_apply_deployment_id` (`apply_deployment_id`),
   KEY `idx_database` (`database_name`),
   KEY `idx_repo_pr` (`repository`,`pull_request`),
   KEY `idx_state` (`state`)

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -31,18 +32,19 @@ type mockStorage struct {
 	pingErr error
 }
 
-func (m *mockStorage) Locks() storage.LockStore                      { return nil }
-func (m *mockStorage) Plans() storage.PlanStore                      { return nil }
-func (m *mockStorage) Applies() storage.ApplyStore                   { return nil }
-func (m *mockStorage) Tasks() storage.TaskStore                      { return nil }
-func (m *mockStorage) ApplyLogs() storage.ApplyLogStore              { return nil }
-func (m *mockStorage) ControlRequests() storage.ControlRequestStore  { return nil }
-func (m *mockStorage) ApplyComments() storage.ApplyCommentStore      { return nil }
-func (m *mockStorage) VitessApplyData() storage.VitessApplyDataStore { return nil }
-func (m *mockStorage) Checks() storage.CheckStore                    { return nil }
-func (m *mockStorage) Settings() storage.SettingsStore               { return nil }
-func (m *mockStorage) Ping(ctx context.Context) error                { return m.pingErr }
-func (m *mockStorage) Close() error                                  { return nil }
+func (m *mockStorage) Locks() storage.LockStore                       { return nil }
+func (m *mockStorage) Plans() storage.PlanStore                       { return nil }
+func (m *mockStorage) Applies() storage.ApplyStore                    { return nil }
+func (m *mockStorage) Tasks() storage.TaskStore                       { return nil }
+func (m *mockStorage) ApplyLogs() storage.ApplyLogStore               { return nil }
+func (m *mockStorage) ControlRequests() storage.ControlRequestStore   { return nil }
+func (m *mockStorage) ApplyComments() storage.ApplyCommentStore       { return nil }
+func (m *mockStorage) ApplyDeployments() storage.ApplyDeploymentStore { return nil }
+func (m *mockStorage) VitessApplyData() storage.VitessApplyDataStore  { return nil }
+func (m *mockStorage) Checks() storage.CheckStore                     { return nil }
+func (m *mockStorage) Settings() storage.SettingsStore                { return nil }
+func (m *mockStorage) Ping(ctx context.Context) error                 { return m.pingErr }
+func (m *mockStorage) Close() error                                   { return nil }
 
 type mockPlanLookupStore struct {
 	plan *storage.Plan
@@ -200,8 +202,8 @@ func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *stora
 func (s *memoryControlRequestStore) GetPending(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := len(s.requests) - 1; i >= 0; i-- {
-		req := s.requests[i]
+	for _, v := range slices.Backward(s.requests) {
+		req := v
 		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
 			return cloneControlRequest(req), nil
 		}

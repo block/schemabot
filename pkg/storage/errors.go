@@ -41,6 +41,14 @@ var (
 	// ErrApplyCommentNotFound is returned when an apply comment does not exist.
 	ErrApplyCommentNotFound = errors.New("apply comment not found")
 
+	// ErrApplyDeploymentNotFound is returned when an apply_deployments child
+	// row does not exist for the given lookup key.
+	ErrApplyDeploymentNotFound = errors.New("apply deployment not found")
+
+	// ErrApplyDeploymentExists is returned when an apply_deployments row for
+	// (apply_id, deployment) is being inserted but already exists.
+	ErrApplyDeploymentExists = errors.New("apply deployment already exists")
+
 	// ErrVitessApplyDataNotFound is returned when no vitess apply data exists for an apply.
 	ErrVitessApplyDataNotFound = errors.New("vitess apply data not found")
 )

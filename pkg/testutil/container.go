@@ -70,6 +70,20 @@ func TableExists(t *testing.T, db *sql.DB, schemaName, tableName string) bool {
 	return count > 0
 }
 
+// ColumnExists reports whether columnName exists on schemaName.tableName.
+func ColumnExists(t *testing.T, db *sql.DB, schemaName, tableName, columnName string) bool {
+	t.Helper()
+
+	var count int
+	err := db.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM information_schema.columns
+		 WHERE table_schema = ? AND table_name = ? AND column_name = ?`,
+		schemaName, tableName, columnName,
+	).Scan(&count)
+	require.NoError(t, err)
+	return count > 0
+}
+
 func retryContainerOp(ctx context.Context, opName string, op func() (string, error)) (string, error) {
 	var lastErr error
 	delay := initialDelay
