@@ -255,11 +255,64 @@ func TestApplyDeploymentStore_UpdateState(t *testing.T) {
 	require.ErrorIs(t, err, storage.ErrApplyDeploymentNotFound)
 }
 
+// TestApplyDeploymentStore_UpdateState_Idempotent guards against the regression
+// where re-applying the same state to an existing row would surface
+// ErrApplyDeploymentNotFound because MySQL's default RowsAffected counts
+// changed (not matched) rows.
+func TestApplyDeploymentStore_UpdateState_Idempotent(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_md_update_idem", 1)
+
+	id, err := store.ApplyDeployments().Insert(ctx, &storage.ApplyDeployment{
+		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.ApplyDeployments().UpdateState(ctx, id, state.ApplyDeployment.InProgress))
+	// Repeat with the same state — must be a no-op, not a not-found error.
+	require.NoError(t, store.ApplyDeployments().UpdateState(ctx, id, state.ApplyDeployment.InProgress))
+}
+
 func TestApplyDeploymentStore_MarkStarted_NotFound(t *testing.T) {
 	clearTables(t)
 	store := New(testDB)
 	err := store.ApplyDeployments().MarkStarted(t.Context(), 999999)
 	require.ErrorIs(t, err, storage.ErrApplyDeploymentNotFound)
+}
+
+// TestApplyDeploymentStore_MarkStarted_Idempotent guards against the regression
+// where re-issuing MarkStarted on an already-started row would surface
+// ErrApplyDeploymentNotFound. The query uses COALESCE on started_at, so the
+// repeat is a true no-op on row contents.
+func TestApplyDeploymentStore_MarkStarted_Idempotent(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_md_started_idem", 1)
+
+	id, err := store.ApplyDeployments().Insert(ctx, &storage.ApplyDeployment{
+		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.ApplyDeployments().MarkStarted(ctx, id))
+	first, err := store.ApplyDeployments().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, first.StartedAt)
+
+	// Repeat call must not error and must preserve the original started_at.
+	require.NoError(t, store.ApplyDeployments().MarkStarted(ctx, id))
+	second, err := store.ApplyDeployments().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, second.StartedAt)
+	assert.Equal(t, first.StartedAt.UnixNano(), second.StartedAt.UnixNano(),
+		"COALESCE should preserve original started_at across repeat MarkStarted calls")
 }
 
 func TestApplyDeploymentStore_MarkCompleted_NotFound(t *testing.T) {

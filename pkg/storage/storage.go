@@ -337,8 +337,9 @@ type ApplyDeploymentStore interface {
 	// ListByApply returns all child rows for an apply, ordered by id ascending.
 	ListByApply(ctx context.Context, applyID int64) ([]*ApplyDeployment, error)
 
-	// UpdateState transitions a child row to a new state.
-	// Optional started_at / completed_at writes are paired with the transition.
+	// UpdateState transitions a child row to a new state. Updates the state
+	// column only; for transitions that should also stamp started_at or
+	// completed_at, use MarkStarted / MarkCompleted / MarkFailed instead.
 	UpdateState(ctx context.Context, id int64, newState string) error
 
 	// MarkStarted sets state=in_progress and started_at on a child row.

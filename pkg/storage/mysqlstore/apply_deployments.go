@@ -106,6 +106,10 @@ func (s *applyDeploymentStore) ListByApply(ctx context.Context, applyID int64) (
 
 // UpdateState transitions a child row to the given state.
 // Returns storage.ErrApplyDeploymentNotFound if no row matches the ID.
+//
+// Idempotent: re-applying the same state to a row is a no-op and returns nil.
+// MySQL's RowsAffected reports rows *changed* (not matched) by default, so a
+// repeat call would report 0; we disambiguate with an existence check.
 func (s *applyDeploymentStore) UpdateState(ctx context.Context, id int64, newState string) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_deployments SET state = ? WHERE id = ?
@@ -113,11 +117,14 @@ func (s *applyDeploymentStore) UpdateState(ctx context.Context, id int64, newSta
 	if err != nil {
 		return fmt.Errorf("update apply_deployments state (id=%d): %w", id, err)
 	}
-	return checkRowsAffected(result, storage.ErrApplyDeploymentNotFound)
+	return s.checkUpdatedOrExists(ctx, result, id)
 }
 
 // MarkStarted sets state=in_progress and stamps started_at=NOW().
 // Returns storage.ErrApplyDeploymentNotFound if no row matches the ID.
+//
+// Idempotent: COALESCE preserves started_at on repeat calls, so a re-issue
+// against an already-started row is a no-op and returns nil.
 func (s *applyDeploymentStore) MarkStarted(ctx context.Context, id int64) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_deployments
@@ -127,7 +134,29 @@ func (s *applyDeploymentStore) MarkStarted(ctx context.Context, id int64) error 
 	if err != nil {
 		return fmt.Errorf("mark apply_deployment started (id=%d): %w", id, err)
 	}
-	return checkRowsAffected(result, storage.ErrApplyDeploymentNotFound)
+	return s.checkUpdatedOrExists(ctx, result, id)
+}
+
+// checkUpdatedOrExists returns nil if the UPDATE affected at least one row,
+// nil if it affected zero rows but the row exists (idempotent no-op), or
+// ErrApplyDeploymentNotFound if the row truly does not exist.
+//
+// Needed for idempotent UPDATEs where MySQL's default RowsAffected ("changed"
+// rather than "matched") can return 0 for a successful no-op write.
+func (s *applyDeploymentStore) checkUpdatedOrExists(ctx context.Context, result sql.Result, id int64) error {
+	if rows, _ := result.RowsAffected(); rows > 0 {
+		return nil
+	}
+	var exists bool
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM apply_deployments WHERE id = ?)`, id,
+	).Scan(&exists); err != nil {
+		return fmt.Errorf("verify apply_deployment exists (id=%d): %w", id, err)
+	}
+	if !exists {
+		return storage.ErrApplyDeploymentNotFound
+	}
+	return nil
 }
 
 // MarkCompleted sets state=completed and stamps completed_at=NOW().
