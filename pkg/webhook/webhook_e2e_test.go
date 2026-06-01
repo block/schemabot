@@ -3657,6 +3657,70 @@ func TestE2EAggregateUpdateSkipsStaleHeadSHA(t *testing.T) {
 	assert.Nil(t, aggregate)
 }
 
+// TestE2EDisabledRepoChecksSkipAggregatePublishing verifies that a server-side
+// repository safety hatch suppresses GitHub Check Runs while preserving stored
+// per-database check state for SchemaBot's own safety decisions.
+func TestE2EDisabledRepoChecksSkipAggregatePublishing(t *testing.T) {
+	dbName := "webhook_disabled_repo_checks"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	enableChecks := false
+	svc.Config().Repos = map[string]api.RepoConfig{
+		"octocat/hello-world": {EnableChecks: &enableChecks},
+	}
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		HasChanges:   true,
+		Status:       checkStatusCompleted,
+		Conclusion:   checkConclusionActionRequired,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	var githubCalls atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		githubCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		githubCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "abc123")
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123",
+		"No managed schema changes",
+		"This PR does not contain schema changes managed by SchemaBot.")
+	h.postFailingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", map[string]string{
+		"staging": "Plan failed",
+	})
+
+	assert.Equal(t, int64(0), githubCalls.Load(), "disabled check publishing should not call GitHub")
+
+	storedCheck, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, storedCheck, "per-database check state should remain available")
+	assert.Equal(t, checkConclusionActionRequired, storedCheck.Conclusion)
+
+	aggregate, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	assert.Nil(t, aggregate, "disabled check publishing should not store aggregate check state")
+}
+
 // TestE2EPassingAggregateRequiresGitHubHeadVerification verifies that passing
 // aggregate paths still verify the current PR commit before publishing a check.
 func TestE2EPassingAggregateRequiresGitHubHeadVerification(t *testing.T) {

@@ -8,6 +8,19 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+func (h *Handler) shouldPublishChecks(ctx context.Context, repo string, operation string) bool {
+	if h.service == nil || h.service.Config().AreChecksEnabled(repo) {
+		return true
+	}
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:  operation,
+		Repository: repo,
+		Status:     "skipped",
+	})
+	h.logger.Info("status check publishing disabled for repository", "repo", repo, "operation", operation)
+	return false
+}
+
 // verifyHeadSHAStillCurrentForPR returns false when writing status check state
 // for headSHA would be unsafe because the PR now points at a different commit
 // SHA. It records a metric and logs the reason before every false return so
@@ -66,6 +79,10 @@ func (h *Handler) verifyHeadSHAStillCurrentForPR(ctx context.Context, client *gh
 //   - ALL checks "success"        → aggregate "success"
 //   - NO per-database checks      → no aggregate (PR doesn't touch schema)
 func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) {
+	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
+		return
+	}
+
 	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
 		return
 	}
@@ -252,6 +269,10 @@ func (h *Handler) upsertAggregateCheckRun(
 // check that would never come. It does not publish success over existing
 // per-database state that still needs operator attention.
 func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, title, summary string) {
+	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
+		return
+	}
+
 	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
 		return
 	}
@@ -423,6 +444,10 @@ func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.In
 // postFailingAggregatesWithBlock stores a blocking reason only for callers with
 // a stable failure class. Generic plan errors should use postFailingAggregates.
 func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string, block checkBlockReason) {
+	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
+		return
+	}
+
 	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
 		return
 	}

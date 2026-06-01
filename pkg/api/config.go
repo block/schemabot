@@ -285,7 +285,12 @@ type TLSConfig struct {
 }
 
 // RepoConfig holds configuration for a specific repository.
-type RepoConfig struct{}
+type RepoConfig struct {
+	// EnableChecks controls whether SchemaBot publishes GitHub Check Runs for
+	// this repository. Stored check state is still maintained for SchemaBot's
+	// own safety gates. Defaults to true when not configured.
+	EnableChecks *bool `yaml:"enable_checks,omitempty"`
+}
 
 // ResolvedDatabaseTarget is the server-owned routing decision for plan/apply.
 type ResolvedDatabaseTarget struct {
@@ -518,6 +523,20 @@ func (c *ServerConfig) IsRepoAllowed(repo string) bool {
 	}
 	_, ok := c.Repos[repo]
 	return ok
+}
+
+// AreChecksEnabled returns whether SchemaBot should publish GitHub Check Runs
+// for the given repository. Repositories not present in the server-side repo
+// config use the default enabled behavior.
+func (c *ServerConfig) AreChecksEnabled(repo string) bool {
+	if c == nil || len(c.Repos) == 0 {
+		return true
+	}
+	repoConfig, ok := c.Repos[repo]
+	if !ok || repoConfig.EnableChecks == nil {
+		return true
+	}
+	return *repoConfig.EnableChecks
 }
 
 // IsEnvironmentAllowed returns whether the given environment is handled by this
