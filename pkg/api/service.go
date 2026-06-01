@@ -272,7 +272,7 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 		case !ok:
 			s.logger.Debug("database config does not contain this environment, using remote tern deployment",
 				"database", deployment, "environment", environment)
-		case envConfig.DSN == "":
+		case !envConfig.HasLocalDSN():
 			s.logger.Debug("database config does not contain a local DSN, using remote tern deployment",
 				"database", deployment, "environment", environment)
 		default:
@@ -323,8 +323,8 @@ func (s *Service) RegisterTernClient(deployment, environment string, client tern
 }
 
 func (s *Service) newLocalTernClient(key, database, dbType string, envConfig EnvironmentConfig) (tern.Client, error) {
-	// Resolve target DSN (handles env:, file: prefixes)
-	targetDSN, err := secrets.Resolve(envConfig.DSN, "")
+	// Resolve target DSN (handles env:, file: prefixes and structured DSN sources)
+	targetDSN, err := envConfig.ResolveDSN()
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s: %w", key, err)
 	}

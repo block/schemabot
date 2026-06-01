@@ -21,7 +21,6 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
-	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook"
@@ -254,7 +253,10 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 		if !ok {
 			continue
 		}
-		targetDSN, err := secrets.Resolve(envConfig.DSN, "")
+		if !envConfig.HasLocalDSN() {
+			continue
+		}
+		targetDSN, err := envConfig.ResolveDSN()
 		if err != nil {
 			return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 		}

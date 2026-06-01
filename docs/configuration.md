@@ -20,6 +20,64 @@ databases:
         dsn: "file:/run/secrets/prod-dsn"
 ```
 
+### Building DSNs from separate secrets
+
+If your deployment stores database connection metadata separately from passwords,
+use `dsn_from` instead of a raw `dsn`. `config_ref` and `password_ref` support
+the same secret reference formats as `dsn`, including `env:`, `file:`, and
+`secretsmanager:`.
+
+```yaml
+storage:
+  dsn_from:
+    config_ref: "file:/run/secrets/storage-config.yaml"
+    username: "schemabot_user"
+    password_ref: "file:/run/secrets/storage-password"
+    endpoint: writer
+    params:
+      parseTime: "true"
+
+databases:
+  mydb:
+    type: mysql
+    environments:
+      staging:
+        dsn_from:
+          config_ref: "file:/run/secrets/mydb-config.yaml"
+          username: "mydb_user"
+          password_ref: "file:/run/secrets/mydb-password"
+          endpoint: writer
+```
+
+The referenced database config can be a simple endpoint document:
+
+```yaml
+writer:
+  host: writer.example.com
+  database: appdb
+reader:
+  host: reader.example.com
+  port: 3307
+  database: appdb
+```
+
+It can also contain named clusters. If there is more than one cluster, set
+`dsn_from.cluster` to choose one.
+
+```yaml
+data_source_clusters:
+  primary:
+    writer:
+      host: writer.example.com
+      database: appdb
+    reader:
+      host: reader.example.com
+      database: appdb
+```
+
+`dsn` and `dsn_from` are mutually exclusive for each storage or database
+environment entry.
+
 ## gRPC Mode
 
 SchemaBot delegates to remote services that implement the Tern proto. This is useful for distributed deployments where schema changes need to run in separate isolated environments.

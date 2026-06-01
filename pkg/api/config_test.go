@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	gomysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -88,6 +89,40 @@ repos:
 	assert.Contains(t, cfg.Repos, "org/repo")
 }
 
+func TestLoadServerConfigFromFile_DSNFrom(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := `
+storage:
+  dsn_from:
+    config_ref: file:/run/secrets/storage-config.yaml
+    username: schemabot_user
+    password_ref: file:/run/secrets/storage-password
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn_from:
+          config_ref: file:/run/secrets/testapp-config.yaml
+          username: testapp_user
+          password_ref: file:/run/secrets/testapp-password
+          endpoint: reader
+          params:
+            parseTime: "true"
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	require.NotNil(t, cfg.Storage.DSNFrom)
+	assert.Equal(t, "schemabot_user", cfg.Storage.DSNFrom.Username)
+	require.NotNil(t, cfg.Databases["testapp"].Environments["staging"].DSNFrom)
+	targetDSNFrom := cfg.Databases["testapp"].Environments["staging"].DSNFrom
+	assert.Equal(t, "reader", targetDSNFrom.Endpoint)
+	assert.Equal(t, map[string]string{"parseTime": "true"}, targetDSNFrom.Params)
+}
+
 func TestLoadServerConfigFromFile_NotFound(t *testing.T) {
 	_, err := LoadServerConfigFromFile("/nonexistent/config.yaml")
 	assert.Error(t, err, "expected error for nonexistent file")
@@ -138,6 +173,21 @@ databases:
       staging:
         dsn: "root@tcp(localhost:3306)/testdb"
         extra_field: ignored
+`,
+		},
+		{
+			name: "dsn_from field",
+			content: `
+databases:
+  testdb:
+    type: mysql
+    environments:
+      staging:
+        dsn_from:
+          config_ref: file:/run/secrets/database.yaml
+          username: test_user
+          password_ref: file:/run/secrets/password
+          extra_field: ignored
 `,
 		},
 	}
@@ -726,6 +776,18 @@ func TestServerConfig_ResolveDatabaseTarget(t *testing.T) {
 					"staging": {DSN: "root@tcp(localhost)/localdb"},
 				},
 			},
+			"structuredlocaldb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {
+						DSNFrom: &DSNFromConfig{
+							ConfigRef:   "file:/run/secrets/database.yaml",
+							Username:    "test_user",
+							PasswordRef: "file:/run/secrets/password",
+						},
+					},
+				},
+			},
 			"remotedb": {
 				Type: "vitess",
 				Environments: map[string]EnvironmentConfig{
@@ -743,6 +805,12 @@ func TestServerConfig_ResolveDatabaseTarget(t *testing.T) {
 	assert.Equal(t, "mysql", local.DatabaseType)
 	assert.Equal(t, "localdb", local.Deployment)
 	assert.Equal(t, "localdb", local.Target)
+
+	structuredLocal, err := cfg.ResolveDatabaseTarget("structuredlocaldb", "staging")
+	require.NoError(t, err)
+	assert.Equal(t, "mysql", structuredLocal.DatabaseType)
+	assert.Equal(t, "structuredlocaldb", structuredLocal.Deployment)
+	assert.Equal(t, "structuredlocaldb", structuredLocal.Target)
 
 	remote, err := cfg.ResolveDatabaseTarget("remotedb", "production")
 	require.NoError(t, err)
@@ -861,6 +929,259 @@ repos:
 
 	_, err = LoadServerConfigFromFile(configPath)
 	assert.Error(t, err, "expected error for invalid config")
+}
+
+func TestDSNFromConfig_Resolve(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "database.yaml")
+	passwordPath := filepath.Join(dir, "password")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+data_source_clusters:
+  primary:
+    writer:
+      host: writer.example.com
+      database: appdb
+    reader:
+      host: reader.example.com
+      port: 3307
+      database: appdb
+`), 0644))
+	require.NoError(t, os.WriteFile(passwordPath, []byte("p@ss/word\n"), 0600))
+
+	dsn, err := (&DSNFromConfig{
+		ConfigRef:   "file:" + configPath,
+		Username:    "app_ddl",
+		PasswordRef: "file:" + passwordPath,
+		Endpoint:    "reader",
+		Params: map[string]string{
+			"parseTime": "true",
+		},
+	}).Resolve()
+	require.NoError(t, err)
+
+	cfg, err := gomysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	assert.Equal(t, "tcp", cfg.Net)
+	assert.Equal(t, "reader.example.com:3307", cfg.Addr)
+	assert.Equal(t, "app_ddl", cfg.User)
+	assert.Equal(t, "p@ss/word", cfg.Passwd)
+	assert.Equal(t, "appdb", cfg.DBName)
+	assert.True(t, cfg.ParseTime)
+}
+
+func TestDSNFromConfig_ResolveSimpleEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "database.yaml")
+	passwordPath := filepath.Join(dir, "password")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+writer:
+  host: 127.0.0.1:3307
+  database: appdb
+`), 0644))
+	require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
+
+	dsn, err := (&DSNFromConfig{
+		ConfigRef:   "file:" + configPath,
+		Username:    "app_user",
+		PasswordRef: "file:" + passwordPath,
+	}).Resolve()
+	require.NoError(t, err)
+
+	cfg, err := gomysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	assert.Equal(t, "127.0.0.1:3307", cfg.Addr)
+	assert.Equal(t, "appdb", cfg.DBName)
+	assert.Equal(t, "app_user", cfg.User)
+	assert.Equal(t, "secret", cfg.Passwd)
+}
+
+func TestDSNFromConfig_ResolveNamedCluster(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "database.yaml")
+	passwordPath := filepath.Join(dir, "password")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+data_source_clusters:
+  primary:
+    writer:
+      host: primary.example.com
+      database: primarydb
+  secondary:
+    writer:
+      host: secondary.example.com
+      database: secondarydb
+`), 0644))
+	require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
+
+	dsn, err := (&DSNFromConfig{
+		ConfigRef:   "file:" + configPath,
+		Username:    "app_user",
+		PasswordRef: "file:" + passwordPath,
+		Cluster:     "secondary",
+	}).Resolve()
+	require.NoError(t, err)
+
+	cfg, err := gomysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	assert.Equal(t, "secondary.example.com:3306", cfg.Addr)
+	assert.Equal(t, "secondarydb", cfg.DBName)
+	assert.Equal(t, "app_user", cfg.User)
+}
+
+func TestDSNFromConfig_ResolveErrors(t *testing.T) {
+	t.Run("multiple clusters require cluster", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "database.yaml")
+		passwordPath := filepath.Join(dir, "password")
+		require.NoError(t, os.WriteFile(configPath, []byte(`
+data_source_clusters:
+  primary:
+    writer:
+      host: primary.example.com
+      database: primarydb
+  secondary:
+    writer:
+      host: secondary.example.com
+      database: secondarydb
+`), 0644))
+		require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
+
+		_, err := (&DSNFromConfig{
+			ConfigRef:   "file:" + configPath,
+			Username:    "app_user",
+			PasswordRef: "file:" + passwordPath,
+		}).Resolve()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "set dsn_from.cluster")
+	})
+
+	t.Run("selected endpoint requires host", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "database.yaml")
+		passwordPath := filepath.Join(dir, "password")
+		require.NoError(t, os.WriteFile(configPath, []byte(`
+writer:
+  database: appdb
+`), 0644))
+		require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
+
+		_, err := (&DSNFromConfig{
+			ConfigRef:   "file:" + configPath,
+			Username:    "app_user",
+			PasswordRef: "file:" + passwordPath,
+		}).Resolve()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "missing host")
+	})
+}
+
+func TestServerConfig_StorageDSNFromConfig(t *testing.T) {
+	dir := t.TempDir()
+	databaseConfigPath := filepath.Join(dir, "storage.yaml")
+	passwordPath := filepath.Join(dir, "password")
+	require.NoError(t, os.WriteFile(databaseConfigPath, []byte(`
+writer:
+  host: storage.example.com
+  database: schemabot
+`), 0644))
+	require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
+
+	cfg := ServerConfig{
+		Storage: StorageConfig{
+			DSNFrom: &DSNFromConfig{
+				ConfigRef:   "file:" + databaseConfigPath,
+				Username:    "schemabot_user",
+				PasswordRef: "file:" + passwordPath,
+			},
+		},
+	}
+
+	dsn, err := cfg.StorageDSN()
+	require.NoError(t, err)
+
+	mysqlCfg, err := gomysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	assert.Equal(t, "storage.example.com:3306", mysqlCfg.Addr)
+	assert.Equal(t, "schemabot", mysqlCfg.DBName)
+	assert.Equal(t, "schemabot_user", mysqlCfg.User)
+	assert.Equal(t, "secret", mysqlCfg.Passwd)
+}
+
+func TestServerConfig_ValidateDSNFrom(t *testing.T) {
+	t.Run("database cannot set both dsn and dsn_from", func(t *testing.T) {
+		cfg := ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"testapp": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {
+							DSN: "root@tcp(localhost:3306)/testapp",
+							DSNFrom: &DSNFromConfig{
+								ConfigRef:   "file:/secrets/database.yaml",
+								Username:    "testapp_user",
+								PasswordRef: "file:/secrets/password",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot configure both dsn and dsn_from")
+	})
+
+	t.Run("database dsn_from requires config ref", func(t *testing.T) {
+		cfg := ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"testapp": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {
+							DSNFrom: &DSNFromConfig{
+								Username:    "testapp_user",
+								PasswordRef: "file:/secrets/password",
+							},
+						},
+					},
+				},
+			},
+		}
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "missing config_ref")
+	})
+
+	t.Run("storage cannot set both dsn and dsn_from", func(t *testing.T) {
+		cfg := ServerConfig{
+			Storage: StorageConfig{
+				DSN: "root@tcp(localhost:3306)/schemabot",
+				DSNFrom: &DSNFromConfig{
+					ConfigRef:   "file:/secrets/database.yaml",
+					Username:    "schemabot_user",
+					PasswordRef: "file:/secrets/password",
+				},
+			},
+			Databases: map[string]DatabaseConfig{
+				"testapp": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root@tcp(localhost:3306)/testapp"},
+					},
+				},
+			},
+		}
+
+		err := cfg.Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "storage cannot configure both dsn and dsn_from")
+	})
 }
 
 func TestGitHubConfig_YAMLKeys(t *testing.T) {

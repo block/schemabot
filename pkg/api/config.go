@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"slices"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
+	gomysql "github.com/go-sql-driver/mysql"
 	"gopkg.in/yaml.v3"
 )
 
@@ -172,6 +174,31 @@ type StorageConfig struct {
 	// DSN is the MySQL connection string for SchemaBot's internal database.
 	// Can be a direct DSN or a reference (e.g., "env:MYSQL_DSN" to read from env var).
 	DSN string `yaml:"dsn"`
+
+	// DSNFrom builds the MySQL connection string from separate database config
+	// and password references. It is mutually exclusive with DSN.
+	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
+}
+
+// DSNFromConfig configures a MySQL DSN assembled from separate secret values.
+type DSNFromConfig struct {
+	// ConfigRef is a secret reference containing database connection metadata.
+	ConfigRef string `yaml:"config_ref"`
+
+	// Username is the database user to include in the generated DSN.
+	Username string `yaml:"username"`
+
+	// PasswordRef is a secret reference containing the database user's password.
+	PasswordRef string `yaml:"password_ref"`
+
+	// Endpoint selects which configured endpoint to use. Defaults to writer.
+	Endpoint string `yaml:"endpoint,omitempty"`
+
+	// Cluster selects a named cluster when ConfigRef contains more than one.
+	Cluster string `yaml:"cluster,omitempty"`
+
+	// Params are appended as MySQL DSN query parameters.
+	Params map[string]string `yaml:"params,omitempty"`
 }
 
 // DatabaseConfig holds configuration for a registered database.
@@ -245,6 +272,10 @@ type EnvironmentConfig struct {
 	// Can be a direct DSN or a reference to a secret (e.g., "env:MYSQL_DSN").
 	DSN string `yaml:"dsn"`
 
+	// DSNFrom builds the database connection string for local mode from separate
+	// database config and password references. It is mutually exclusive with DSN.
+	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
+
 	// Target is the opaque Tern-facing target identifier for gRPC mode.
 	Target string `yaml:"target,omitempty"`
 
@@ -270,6 +301,26 @@ type EnvironmentConfig struct {
 	// When set, registers a named TLS config with the Go MySQL driver.
 	// Omit for LocalScale (no TLS) or set for real PlanetScale (mTLS with CA bundle).
 	TLS *TLSConfig `yaml:"tls,omitempty"`
+}
+
+type externalDatabaseConfig struct {
+	DataSourceClusters map[string]externalDataSourceCluster `yaml:"data_source_clusters"`
+	Writer             externalDatabaseEndpoint             `yaml:"writer"`
+	Reader             externalDatabaseEndpoint             `yaml:"reader"`
+	Host               string                               `yaml:"host"`
+	Port               int                                  `yaml:"port"`
+	Database           string                               `yaml:"database"`
+}
+
+type externalDataSourceCluster struct {
+	Writer externalDatabaseEndpoint `yaml:"writer"`
+	Reader externalDatabaseEndpoint `yaml:"reader"`
+}
+
+type externalDatabaseEndpoint struct {
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	Database string `yaml:"database"`
 }
 
 // TLSConfig holds TLS certificate paths for MySQL connections to PlanetScale branches.
@@ -369,15 +420,18 @@ func (c *ServerConfig) Validate() error {
 			return fmt.Errorf("database %q has no environments configured", name)
 		}
 		for env, envConfig := range dbConfig.Environments {
-			hasDSN := envConfig.DSN != ""
+			hasDSN := envConfig.HasLocalDSN()
 			hasRemoteRouting := envConfig.Target != "" || envConfig.Deployment != ""
 			switch {
 			case hasDSN && hasRemoteRouting:
-				return fmt.Errorf("database %q environment %q cannot configure both dsn and target/deployment", name, env)
+				return fmt.Errorf("database %q environment %q cannot configure both local DSN and target/deployment", name, env)
 			case hasDSN:
+				if err := envConfig.validateLocalDSNConfig(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
+					return err
+				}
 				continue
 			case !hasRemoteRouting:
-				return fmt.Errorf("database %q environment %q missing dsn or target/deployment", name, env)
+				return fmt.Errorf("database %q environment %q missing local DSN or target/deployment", name, env)
 			case envConfig.Target == "":
 				return fmt.Errorf("database %q environment %q missing target", name, env)
 			case envConfig.Deployment == "":
@@ -409,6 +463,10 @@ func (c *ServerConfig) Validate() error {
 		}
 	}
 
+	if err := c.Storage.validateLocalDSNConfig("storage"); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -422,7 +480,7 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 			continue
 		}
 		for environment, envConfig := range dbConfig.Environments {
-			if envConfig.DSN == "" {
+			if !envConfig.HasLocalDSN() {
 				continue
 			}
 			if remoteEnvironments[environment] == "" {
@@ -489,7 +547,7 @@ func (c *ServerConfig) ResolveDatabaseTarget(database, environment string) (Reso
 		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q environment %q is not configured on this server", database, environment)
 	}
 
-	if envConfig.DSN != "" {
+	if envConfig.HasLocalDSN() {
 		return ResolvedDatabaseTarget{
 			DatabaseType: dbConfig.Type,
 			Deployment:   database,
@@ -601,8 +659,199 @@ func (c *ServerConfig) IsCheckRequired(name string) bool {
 }
 
 // StorageDSN returns the resolved storage DSN.
-// It handles special prefixes (env:, file:) to read from various sources.
+// It handles special prefixes (env:, file:) to read from various sources and
+// can build a DSN from separate config/password references.
 // Falls back to MYSQL_DSN environment variable if not configured.
 func (c *ServerConfig) StorageDSN() (string, error) {
+	if c.Storage.DSNFrom != nil {
+		return c.Storage.DSNFrom.Resolve()
+	}
 	return secrets.Resolve(c.Storage.DSN, "MYSQL_DSN")
+}
+
+func (c StorageConfig) validateLocalDSNConfig(context string) error {
+	if c.DSN != "" && c.DSNFrom != nil {
+		return fmt.Errorf("%s cannot configure both dsn and dsn_from", context)
+	}
+	if c.DSNFrom != nil {
+		return c.DSNFrom.Validate(context)
+	}
+	return nil
+}
+
+// HasLocalDSN returns true when the environment should use a local database connection.
+func (c EnvironmentConfig) HasLocalDSN() bool {
+	return c.DSN != "" || c.DSNFrom != nil
+}
+
+func (c EnvironmentConfig) validateLocalDSNConfig(context string) error {
+	if c.DSN != "" && c.DSNFrom != nil {
+		return fmt.Errorf("%s cannot configure both dsn and dsn_from", context)
+	}
+	if c.DSNFrom != nil {
+		return c.DSNFrom.Validate(context)
+	}
+	return nil
+}
+
+func (c EnvironmentConfig) ResolveDSN() (string, error) {
+	if c.DSNFrom != nil {
+		return c.DSNFrom.Resolve()
+	}
+	return secrets.Resolve(c.DSN, "")
+}
+
+func (c *DSNFromConfig) Validate(context string) error {
+	if c.ConfigRef == "" {
+		return fmt.Errorf("%s dsn_from missing config_ref", context)
+	}
+	if c.Username == "" {
+		return fmt.Errorf("%s dsn_from missing username", context)
+	}
+	if c.PasswordRef == "" {
+		return fmt.Errorf("%s dsn_from missing password_ref", context)
+	}
+	endpoint := c.endpoint()
+	if endpoint != "writer" && endpoint != "reader" {
+		return fmt.Errorf("%s dsn_from endpoint must be writer or reader", context)
+	}
+	return nil
+}
+
+func (c *DSNFromConfig) Resolve() (string, error) {
+	if err := c.Validate("database connection"); err != nil {
+		return "", err
+	}
+
+	configYAML, err := secrets.Resolve(c.ConfigRef, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve database config reference: %w", err)
+	}
+
+	var config externalDatabaseConfig
+	if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
+		return "", fmt.Errorf("parse database config: %w", err)
+	}
+
+	endpoint, err := config.endpoint(c.Cluster, c.endpoint())
+	if err != nil {
+		return "", err
+	}
+
+	password, err := secrets.Resolve(c.PasswordRef, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve database password reference: %w", err)
+	}
+
+	mysqlConfig := gomysql.NewConfig()
+	mysqlConfig.Net = "tcp"
+	mysqlConfig.Addr = endpoint.address()
+	mysqlConfig.User = c.Username
+	mysqlConfig.Passwd = password
+	mysqlConfig.DBName = endpoint.Database
+	mysqlConfig.Params = c.Params
+
+	return mysqlConfig.FormatDSN(), nil
+}
+
+func (c *DSNFromConfig) endpoint() string {
+	if c.Endpoint == "" {
+		return "writer"
+	}
+	return c.Endpoint
+}
+
+func (c externalDatabaseConfig) endpoint(clusterName, endpointName string) (externalDatabaseEndpoint, error) {
+	if len(c.DataSourceClusters) > 0 {
+		cluster, err := c.cluster(clusterName)
+		if err != nil {
+			return externalDatabaseEndpoint{}, err
+		}
+		return cluster.endpoint(endpointName)
+	}
+
+	switch endpointName {
+	case "writer":
+		if !c.Writer.empty() {
+			if err := c.Writer.validate("writer"); err != nil {
+				return externalDatabaseEndpoint{}, err
+			}
+			return c.Writer, nil
+		}
+	case "reader":
+		if !c.Reader.empty() {
+			if err := c.Reader.validate("reader"); err != nil {
+				return externalDatabaseEndpoint{}, err
+			}
+			return c.Reader, nil
+		}
+	}
+
+	endpoint := externalDatabaseEndpoint{Host: c.Host, Port: c.Port, Database: c.Database}
+	if err := endpoint.validate(endpointName); err != nil {
+		return externalDatabaseEndpoint{}, fmt.Errorf("database config does not contain %s endpoint", endpointName)
+	}
+	return endpoint, nil
+}
+
+func (c externalDatabaseConfig) cluster(clusterName string) (externalDataSourceCluster, error) {
+	if clusterName != "" {
+		cluster, ok := c.DataSourceClusters[clusterName]
+		if !ok {
+			return externalDataSourceCluster{}, fmt.Errorf("database config does not contain cluster %q", clusterName)
+		}
+		return cluster, nil
+	}
+
+	if len(c.DataSourceClusters) != 1 {
+		return externalDataSourceCluster{}, fmt.Errorf("database config contains multiple clusters; set dsn_from.cluster")
+	}
+	for _, cluster := range c.DataSourceClusters {
+		return cluster, nil
+	}
+	return externalDataSourceCluster{}, fmt.Errorf("database config does not contain clusters")
+}
+
+func (c externalDataSourceCluster) endpoint(endpointName string) (externalDatabaseEndpoint, error) {
+	switch endpointName {
+	case "writer":
+		if err := c.Writer.validate("writer"); err != nil {
+			return externalDatabaseEndpoint{}, err
+		}
+		return c.Writer, nil
+	case "reader":
+		if err := c.Reader.validate("reader"); err != nil {
+			return externalDatabaseEndpoint{}, err
+		}
+		return c.Reader, nil
+	default:
+		return externalDatabaseEndpoint{}, fmt.Errorf("database config endpoint must be writer or reader")
+	}
+}
+
+func (e externalDatabaseEndpoint) empty() bool {
+	return e.Host == "" && e.Database == ""
+}
+
+func (e externalDatabaseEndpoint) validate(endpointName string) error {
+	if e.empty() {
+		return fmt.Errorf("database config %s endpoint is empty", endpointName)
+	}
+	if e.Host == "" {
+		return fmt.Errorf("database config %s endpoint missing host", endpointName)
+	}
+	if e.Database == "" {
+		return fmt.Errorf("database config %s endpoint missing database", endpointName)
+	}
+	return nil
+}
+
+func (e externalDatabaseEndpoint) address() string {
+	if _, _, err := net.SplitHostPort(e.Host); err == nil {
+		return e.Host
+	}
+	if e.Port == 0 {
+		return net.JoinHostPort(e.Host, "3306")
+	}
+	return net.JoinHostPort(e.Host, strconv.Itoa(e.Port))
 }
