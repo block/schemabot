@@ -255,6 +255,8 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 	metrics.RecordCheckOwnershipMiss(t.Context(), "apply_finished", "org/repo", "mydb", "mysql", "pie", "staging")
 	metrics.AdjustActiveApplies(t.Context(), 1, "mydb", "pie", "staging")
 	metrics.RecordControlOperation(t.Context(), "stop", "mydb", "pie", "staging", "success")
+	metrics.RecordRemoteDeploymentHealth(t.Context(), "pie", "staging", true)
+	metrics.RecordRemoteDeploymentHealthCheck(t.Context(), "pie", "staging", "success", "healthy")
 	metrics.RecordLockOperation(t.Context(), "acquire", "mydb", "success")
 	metrics.RecordSchedulerResume(t.Context(), "mydb", "pie", "staging", "running")
 	metrics.RecordSchedulerResumeFailure(t.Context(), "mydb", "pie", "staging", "no_client")
@@ -311,6 +313,8 @@ func metricHasDeploymentAttribute(metricName string) bool {
 		"schemabot.check_ownership_misses_total",
 		"schemabot.active_applies",
 		"schemabot.control_operations_total",
+		"schemabot.remote_deployment.health",
+		"schemabot.remote_deployment.health_checks_total",
 		"schemabot.scheduler.resumed_total",
 		"schemabot.scheduler.resume_failures_total",
 		"schemabot.scheduler.claim_duration_seconds":
@@ -715,6 +719,59 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 	assert.True(t, names["schemabot.scheduler.claim_failures_total"], "expected schemabot.scheduler.claim_failures_total")
 	assert.True(t, names["schemabot.scheduler.claim_duration_seconds"], "expected schemabot.scheduler.claim_duration_seconds")
 	assert.True(t, sawExpireRetryableError, "expected expire_retryable_error claim failure reason to be preserved")
+}
+
+func TestRecordRemoteDeploymentHealthMetrics(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	metrics.RecordRemoteDeploymentHealth(t.Context(), "pie", "staging", true)
+	metrics.RecordRemoteDeploymentHealth(t.Context(), "sled", "staging", false)
+	metrics.RecordRemoteDeploymentHealthCheck(t.Context(), "pie", "staging", "success", "healthy")
+	metrics.RecordRemoteDeploymentHealthCheck(t.Context(), "sled", "staging", "error", "unavailable")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	var sawHealthyGauge, sawUnhealthyGauge, sawHealthCheckCounter bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch m.Name {
+			case "schemabot.remote_deployment.health":
+				gauge, ok := m.Data.(metricdata.Gauge[int64])
+				require.True(t, ok)
+				for _, dp := range gauge.DataPoints {
+					deployment, hasDeployment := dp.Attributes.Value(attribute.Key("deployment"))
+					require.True(t, hasDeployment)
+					environment, hasEnvironment := dp.Attributes.Value(attribute.Key("environment"))
+					require.True(t, hasEnvironment)
+					assert.Equal(t, "staging", environment.AsString())
+					switch deployment.AsString() {
+					case "pie":
+						assert.Equal(t, int64(1), dp.Value)
+						sawHealthyGauge = true
+					case "sled":
+						assert.Equal(t, int64(0), dp.Value)
+						sawUnhealthyGauge = true
+					}
+				}
+			case "schemabot.remote_deployment.health_checks_total":
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				require.True(t, ok)
+				assert.Len(t, sum.DataPoints, 2)
+				sawHealthCheckCounter = true
+			}
+		}
+	}
+	assert.True(t, sawHealthyGauge, "expected healthy deployment gauge")
+	assert.True(t, sawUnhealthyGauge, "expected unhealthy deployment gauge")
+	assert.True(t, sawHealthCheckCounter, "expected health check counter")
 }
 
 // setupTraceTest creates an in-memory trace exporter and configures the global

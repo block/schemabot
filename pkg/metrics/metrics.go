@@ -134,6 +134,75 @@ func RecordApplyDuration(ctx context.Context, duration time.Duration, repo, data
 	)
 }
 
+// RecordRemoteDeploymentHealth records the latest observed health for a remote
+// deployment/environment pair. A value of 1 means the latest health check
+// succeeded; 0 means SchemaBot could not reach or validate the remote
+// deployment.
+func RecordRemoteDeploymentHealth(ctx context.Context, deployment, environment string, healthy bool) {
+	value := int64(0)
+	if healthy {
+		value = 1
+	}
+
+	meter := otel.Meter(meterName)
+	gauge, err := meter.Int64Gauge("schemabot.remote_deployment.health",
+		otelmetric.WithDescription("Latest remote deployment health check result"),
+		otelmetric.WithUnit("1"),
+	)
+	if err != nil {
+		slog.Warn("failed to create remote deployment health gauge", "error", err)
+		return
+	}
+	gauge.Record(ctx, value,
+		otelmetric.WithAttributes(
+			DeploymentAttribute(deployment),
+			EnvironmentAttribute(environment),
+		),
+	)
+}
+
+var knownRemoteDeploymentHealthCheckStatuses = map[string]bool{
+	"success": true,
+	"error":   true,
+}
+
+var knownRemoteDeploymentHealthCheckReasons = map[string]bool{
+	"healthy":             true,
+	"client_config_error": true,
+	"timeout":             true,
+	"unavailable":         true,
+}
+
+// RecordRemoteDeploymentHealthCheck increments health check attempts for remote
+// deployments. Status and reason are allowlisted to keep metric cardinality
+// bounded.
+func RecordRemoteDeploymentHealthCheck(ctx context.Context, deployment, environment, status, reason string) {
+	if !knownRemoteDeploymentHealthCheckStatuses[status] {
+		status = "error"
+	}
+	if !knownRemoteDeploymentHealthCheckReasons[reason] {
+		reason = "unavailable"
+	}
+
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.remote_deployment.health_checks_total",
+		otelmetric.WithDescription("Total number of remote deployment health checks"),
+		otelmetric.WithUnit("{check}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create remote deployment health check counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			DeploymentAttribute(deployment),
+			EnvironmentAttribute(environment),
+			attribute.String("status", status),
+			attribute.String("reason", reason),
+		),
+	)
+}
+
 // knownSchemaFreshnessActions limits metric cardinality on the
 // schemabot.schema_freshness.rejected counter to the three handlers that
 // load a schema snapshot at discovery and reuse it at execution.

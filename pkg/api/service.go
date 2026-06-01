@@ -119,6 +119,10 @@ type Service struct {
 	schedulerWake         chan struct{}
 	recoveryWg            sync.WaitGroup
 	schedulerPollInterval time.Duration
+	remoteHealthMu        sync.Mutex
+	remoteHealthCancel    context.CancelFunc
+	remoteHealthWg        sync.WaitGroup
+	remoteHealthInterval  time.Duration
 
 	// OnApplyRecovered is called after the scheduler claims an apply and before
 	// ResumeApply starts the engine/poller. Set by the webhook handler to attach
@@ -199,6 +203,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		logger:                logger,
 		clock:                 clock.Real{},
 		schedulerPollInterval: SchedulerPollInterval,
+		remoteHealthInterval:  RemoteDeploymentHealthCheckInterval,
 		pendingObservers:      make(map[pendingObserverKey]tern.ProgressObserver),
 	}
 }
@@ -515,8 +520,9 @@ func (s *Service) Storage() storage.Storage {
 
 // Close closes the service and releases resources.
 func (s *Service) Close() error {
-	// Stop the scheduler first
+	// Stop background workers first.
 	s.StopScheduler()
+	s.StopRemoteDeploymentHealthMonitor()
 
 	s.ternMu.Lock()
 	var errs []error

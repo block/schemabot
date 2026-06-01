@@ -179,6 +179,12 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 		}
 	}()
 
+	// Emit steady-state availability metrics for every configured remote Tern
+	// deployment so dashboards can show deployment-specific health even when no
+	// schema changes are running.
+	svc.StartRemoteDeploymentHealthMonitor(ctx)
+	defer svc.StopRemoteDeploymentHealthMonitor()
+
 	// Configure routes
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
