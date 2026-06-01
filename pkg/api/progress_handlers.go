@@ -119,8 +119,8 @@ func storedDeploymentForApply(apply *storage.Apply) (string, error) {
 }
 
 // deploymentForDatabaseEnvironment resolves the Tern deployment that owns a
-// database/environment. Stored apply deployment is authoritative for existing
-// work because it records the route used when the apply started.
+// database/environment. The apply's stored deployment is authoritative for
+// existing work because it records the route used when the apply started.
 func (s *Service) deploymentForDatabaseEnvironment(database, deployment, environment string) (string, error) {
 	if deployment != "" {
 		return deployment, nil
