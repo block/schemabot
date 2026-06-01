@@ -33,7 +33,6 @@ storage:
     config_ref: "file:/run/secrets/storage-config.yaml"
     username: "schemabot_user"
     password_ref: "file:/run/secrets/storage-password"
-    endpoint: writer
     params:
       parseTime: "true"
 
@@ -46,33 +45,32 @@ databases:
           config_ref: "file:/run/secrets/mydb-config.yaml"
           username: "mydb_user"
           password_ref: "file:/run/secrets/mydb-password"
-          endpoint: writer
+          config_paths:
+            host: connection.host
+            port: connection.port
+            database: connection.database
 ```
 
-The referenced database config can be a simple endpoint document:
+By default, the referenced database config is expected to contain top-level
+`host`, `port`, and `database` fields. `port` is optional and defaults to 3306
+when omitted.
 
 ```yaml
-writer:
-  host: writer.example.com
-  database: appdb
-reader:
-  host: reader.example.com
-  port: 3307
-  database: appdb
+host: db.example.com
+port: 3307
+database: appdb
 ```
 
-It can also contain named clusters. If there is more than one cluster, set
-`dsn_from.cluster` to choose one.
+For other config shapes, set `config_paths` to the dot-separated YAML paths that
+contain the connection fields. SchemaBot does not assign meaning to path names;
+it only reads the configured values and builds one DSN.
 
 ```yaml
-data_source_clusters:
+connection:
   primary:
-    writer:
-      host: writer.example.com
-      database: appdb
-    reader:
-      host: reader.example.com
-      database: appdb
+    host: db.example.com
+    port: 3307
+    database: appdb
 ```
 
 `dsn` and `dsn_from` are mutually exclusive for each storage or database

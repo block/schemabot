@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -185,20 +186,25 @@ type DSNFromConfig struct {
 	// ConfigRef is a secret reference containing database connection metadata.
 	ConfigRef string `yaml:"config_ref"`
 
+	// ConfigPaths selects fields from the referenced config document. Paths are
+	// dot-separated YAML map keys and default to host, port, and database.
+	ConfigPaths DSNFromConfigPaths `yaml:"config_paths,omitempty"`
+
 	// Username is the database user to include in the generated DSN.
 	Username string `yaml:"username"`
 
 	// PasswordRef is a secret reference containing the database user's password.
 	PasswordRef string `yaml:"password_ref"`
 
-	// Endpoint selects which configured endpoint to use. Defaults to writer.
-	Endpoint string `yaml:"endpoint,omitempty"`
-
-	// Cluster selects a named cluster when ConfigRef contains more than one.
-	Cluster string `yaml:"cluster,omitempty"`
-
 	// Params are appended as MySQL DSN query parameters.
 	Params map[string]string `yaml:"params,omitempty"`
+}
+
+// DSNFromConfigPaths configures where to find connection fields in ConfigRef.
+type DSNFromConfigPaths struct {
+	Host     string `yaml:"host,omitempty"`
+	Port     string `yaml:"port,omitempty"`
+	Database string `yaml:"database,omitempty"`
 }
 
 // DatabaseConfig holds configuration for a registered database.
@@ -301,20 +307,6 @@ type EnvironmentConfig struct {
 	// When set, registers a named TLS config with the Go MySQL driver.
 	// Omit for LocalScale (no TLS) or set for real PlanetScale (mTLS with CA bundle).
 	TLS *TLSConfig `yaml:"tls,omitempty"`
-}
-
-type externalDatabaseConfig struct {
-	DataSourceClusters map[string]externalDataSourceCluster `yaml:"data_source_clusters"`
-	Writer             externalDatabaseEndpoint             `yaml:"writer"`
-	Reader             externalDatabaseEndpoint             `yaml:"reader"`
-	Host               string                               `yaml:"host"`
-	Port               int                                  `yaml:"port"`
-	Database           string                               `yaml:"database"`
-}
-
-type externalDataSourceCluster struct {
-	Writer externalDatabaseEndpoint `yaml:"writer"`
-	Reader externalDatabaseEndpoint `yaml:"reader"`
 }
 
 type externalDatabaseEndpoint struct {
@@ -705,15 +697,18 @@ func (c *DSNFromConfig) Validate(context string) error {
 	if c.ConfigRef == "" {
 		return fmt.Errorf("%s dsn_from missing config_ref", context)
 	}
+	paths := c.configPaths()
+	if paths.Host == "" {
+		return fmt.Errorf("%s dsn_from missing config_paths.host", context)
+	}
+	if paths.Database == "" {
+		return fmt.Errorf("%s dsn_from missing config_paths.database", context)
+	}
 	if c.Username == "" {
 		return fmt.Errorf("%s dsn_from missing username", context)
 	}
 	if c.PasswordRef == "" {
 		return fmt.Errorf("%s dsn_from missing password_ref", context)
-	}
-	endpoint := c.endpoint()
-	if endpoint != "writer" && endpoint != "reader" {
-		return fmt.Errorf("%s dsn_from endpoint must be writer or reader", context)
 	}
 	return nil
 }
@@ -728,15 +723,26 @@ func (c *DSNFromConfig) Resolve() (string, error) {
 		return "", fmt.Errorf("resolve database config reference: %w", err)
 	}
 
-	var config externalDatabaseConfig
-	dec := yaml.NewDecoder(strings.NewReader(configYAML))
-	dec.KnownFields(true)
-	if err := dec.Decode(&config); err != nil {
+	var config any
+	if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
 		return "", fmt.Errorf("parse database config: %w", err)
 	}
 
-	endpoint, err := config.endpoint(c.Cluster, c.endpoint())
+	paths := c.configPaths()
+	host, err := stringAtPath(config, paths.Host)
 	if err != nil {
+		return "", fmt.Errorf("read database config host: %w", err)
+	}
+	database, err := stringAtPath(config, paths.Database)
+	if err != nil {
+		return "", fmt.Errorf("read database config database: %w", err)
+	}
+	port, err := optionalIntAtPath(config, paths.Port)
+	if err != nil {
+		return "", fmt.Errorf("read database config port: %w", err)
+	}
+	endpoint := externalDatabaseEndpoint{Host: host, Port: port, Database: database}
+	if err := endpoint.validate(); err != nil {
 		return "", err
 	}
 
@@ -756,94 +762,94 @@ func (c *DSNFromConfig) Resolve() (string, error) {
 	return mysqlConfig.FormatDSN(), nil
 }
 
-func (c *DSNFromConfig) endpoint() string {
-	if c.Endpoint == "" {
-		return "writer"
+func (c *DSNFromConfig) configPaths() DSNFromConfigPaths {
+	paths := c.ConfigPaths
+	if paths.Host == "" {
+		paths.Host = "host"
 	}
-	return c.Endpoint
+	if paths.Port == "" {
+		paths.Port = "port"
+	}
+	if paths.Database == "" {
+		paths.Database = "database"
+	}
+	return paths
 }
 
-func (c externalDatabaseConfig) endpoint(clusterName, endpointName string) (externalDatabaseEndpoint, error) {
-	if len(c.DataSourceClusters) > 0 {
-		cluster, err := c.cluster(clusterName)
+func stringAtPath(document any, path string) (string, error) {
+	value, err := valueAtPath(document, path)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("path %q must contain a string", path)
+	}
+	return text, nil
+}
+
+func optionalIntAtPath(document any, path string) (int, error) {
+	if path == "" {
+		return 0, nil
+	}
+	value, err := valueAtPath(document, path)
+	if err != nil {
+		if errors.Is(err, errPathNotFound) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	switch v := value.(type) {
+	case int:
+		return v, nil
+	case int64:
+		return int(v), nil
+	case float64:
+		if v != float64(int(v)) {
+			return 0, fmt.Errorf("path %q must contain an integer", path)
+		}
+		return int(v), nil
+	case string:
+		if v == "" {
+			return 0, nil
+		}
+		port, err := strconv.Atoi(v)
 		if err != nil {
-			return externalDatabaseEndpoint{}, err
+			return 0, fmt.Errorf("path %q must contain an integer: %w", path, err)
 		}
-		return cluster.endpoint(endpointName)
-	}
-
-	switch endpointName {
-	case "writer":
-		if !c.Writer.empty() {
-			if err := c.Writer.validate("writer"); err != nil {
-				return externalDatabaseEndpoint{}, err
-			}
-			return c.Writer, nil
-		}
-	case "reader":
-		if !c.Reader.empty() {
-			if err := c.Reader.validate("reader"); err != nil {
-				return externalDatabaseEndpoint{}, err
-			}
-			return c.Reader, nil
-		}
-	}
-
-	endpoint := externalDatabaseEndpoint{Host: c.Host, Port: c.Port, Database: c.Database}
-	if err := endpoint.validate(endpointName); err != nil {
-		return externalDatabaseEndpoint{}, err
-	}
-	return endpoint, nil
-}
-
-func (c externalDatabaseConfig) cluster(clusterName string) (externalDataSourceCluster, error) {
-	if clusterName != "" {
-		cluster, ok := c.DataSourceClusters[clusterName]
-		if !ok {
-			return externalDataSourceCluster{}, fmt.Errorf("database config does not contain cluster %q", clusterName)
-		}
-		return cluster, nil
-	}
-
-	if len(c.DataSourceClusters) != 1 {
-		return externalDataSourceCluster{}, fmt.Errorf("database config contains multiple clusters; set dsn_from.cluster")
-	}
-	for _, cluster := range c.DataSourceClusters {
-		return cluster, nil
-	}
-	return externalDataSourceCluster{}, fmt.Errorf("database config does not contain clusters")
-}
-
-func (c externalDataSourceCluster) endpoint(endpointName string) (externalDatabaseEndpoint, error) {
-	switch endpointName {
-	case "writer":
-		if err := c.Writer.validate("writer"); err != nil {
-			return externalDatabaseEndpoint{}, err
-		}
-		return c.Writer, nil
-	case "reader":
-		if err := c.Reader.validate("reader"); err != nil {
-			return externalDatabaseEndpoint{}, err
-		}
-		return c.Reader, nil
+		return port, nil
 	default:
-		return externalDatabaseEndpoint{}, fmt.Errorf("database config endpoint must be writer or reader")
+		return 0, fmt.Errorf("path %q must contain an integer", path)
 	}
 }
 
-func (e externalDatabaseEndpoint) empty() bool {
-	return e.Host == "" && e.Database == ""
+var errPathNotFound = errors.New("path not found")
+
+func valueAtPath(document any, path string) (any, error) {
+	current := document
+	for segment := range strings.SplitSeq(path, ".") {
+		if segment == "" {
+			return nil, fmt.Errorf("path %q contains an empty segment", path)
+		}
+		m, ok := current.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("path %q segment %q does not select a map", path, segment)
+		}
+		next, ok := m[segment]
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", errPathNotFound, path)
+		}
+		current = next
+	}
+	return current, nil
 }
 
-func (e externalDatabaseEndpoint) validate(endpointName string) error {
-	if e.empty() {
-		return fmt.Errorf("database config %s endpoint is empty", endpointName)
-	}
+func (e externalDatabaseEndpoint) validate() error {
 	if e.Host == "" {
-		return fmt.Errorf("database config %s endpoint missing host", endpointName)
+		return fmt.Errorf("database config missing host")
 	}
 	if e.Database == "" {
-		return fmt.Errorf("database config %s endpoint missing database", endpointName)
+		return fmt.Errorf("database config missing database")
 	}
 	return nil
 }

@@ -107,7 +107,10 @@ databases:
           config_ref: file:/run/secrets/testapp-config.yaml
           username: testapp_user
           password_ref: file:/run/secrets/testapp-password
-          endpoint: reader
+          config_paths:
+            host: endpoints.primary.host
+            port: endpoints.primary.port
+            database: endpoints.primary.database
           params:
             parseTime: "true"
 `
@@ -119,7 +122,9 @@ databases:
 	assert.Equal(t, "schemabot_user", cfg.Storage.DSNFrom.Username)
 	require.NotNil(t, cfg.Databases["testapp"].Environments["staging"].DSNFrom)
 	targetDSNFrom := cfg.Databases["testapp"].Environments["staging"].DSNFrom
-	assert.Equal(t, "reader", targetDSNFrom.Endpoint)
+	assert.Equal(t, "endpoints.primary.host", targetDSNFrom.ConfigPaths.Host)
+	assert.Equal(t, "endpoints.primary.port", targetDSNFrom.ConfigPaths.Port)
+	assert.Equal(t, "endpoints.primary.database", targetDSNFrom.ConfigPaths.Database)
 	assert.Equal(t, map[string]string{"parseTime": "true"}, targetDSNFrom.Params)
 }
 
@@ -936,15 +941,11 @@ func TestDSNFromConfig_Resolve(t *testing.T) {
 	configPath := filepath.Join(dir, "database.yaml")
 	passwordPath := filepath.Join(dir, "password")
 	require.NoError(t, os.WriteFile(configPath, []byte(`
-data_source_clusters:
+connections:
   primary:
-    writer:
-      host: writer.example.com
-      database: appdb
-    reader:
-      host: reader.example.com
-      port: 3307
-      database: appdb
+    host: db.example.com
+    port: 3307
+    database: appdb
 `), 0644))
 	require.NoError(t, os.WriteFile(passwordPath, []byte("p@ss/word\n"), 0600))
 
@@ -952,7 +953,11 @@ data_source_clusters:
 		ConfigRef:   "file:" + configPath,
 		Username:    "app_ddl",
 		PasswordRef: "file:" + passwordPath,
-		Endpoint:    "reader",
+		ConfigPaths: DSNFromConfigPaths{
+			Host:     "connections.primary.host",
+			Port:     "connections.primary.port",
+			Database: "connections.primary.database",
+		},
 		Params: map[string]string{
 			"parseTime": "true",
 		},
@@ -962,21 +967,20 @@ data_source_clusters:
 	cfg, err := gomysql.ParseDSN(dsn)
 	require.NoError(t, err)
 	assert.Equal(t, "tcp", cfg.Net)
-	assert.Equal(t, "reader.example.com:3307", cfg.Addr)
+	assert.Equal(t, "db.example.com:3307", cfg.Addr)
 	assert.Equal(t, "app_ddl", cfg.User)
 	assert.Equal(t, "p@ss/word", cfg.Passwd)
 	assert.Equal(t, "appdb", cfg.DBName)
 	assert.True(t, cfg.ParseTime)
 }
 
-func TestDSNFromConfig_ResolveSimpleEndpoint(t *testing.T) {
+func TestDSNFromConfig_ResolveDefaultPaths(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "database.yaml")
 	passwordPath := filepath.Join(dir, "password")
 	require.NoError(t, os.WriteFile(configPath, []byte(`
-writer:
-  host: 127.0.0.1:3307
-  database: appdb
+host: 127.0.0.1:3307
+database: appdb
 `), 0644))
 	require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
 
@@ -995,72 +999,13 @@ writer:
 	assert.Equal(t, "secret", cfg.Passwd)
 }
 
-func TestDSNFromConfig_ResolveNamedCluster(t *testing.T) {
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "database.yaml")
-	passwordPath := filepath.Join(dir, "password")
-	require.NoError(t, os.WriteFile(configPath, []byte(`
-data_source_clusters:
-  primary:
-    writer:
-      host: primary.example.com
-      database: primarydb
-  secondary:
-    writer:
-      host: secondary.example.com
-      database: secondarydb
-`), 0644))
-	require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
-
-	dsn, err := (&DSNFromConfig{
-		ConfigRef:   "file:" + configPath,
-		Username:    "app_user",
-		PasswordRef: "file:" + passwordPath,
-		Cluster:     "secondary",
-	}).Resolve()
-	require.NoError(t, err)
-
-	cfg, err := gomysql.ParseDSN(dsn)
-	require.NoError(t, err)
-	assert.Equal(t, "secondary.example.com:3306", cfg.Addr)
-	assert.Equal(t, "secondarydb", cfg.DBName)
-	assert.Equal(t, "app_user", cfg.User)
-}
-
 func TestDSNFromConfig_ResolveErrors(t *testing.T) {
-	t.Run("multiple clusters require cluster", func(t *testing.T) {
+	t.Run("missing configured host path", func(t *testing.T) {
 		dir := t.TempDir()
 		configPath := filepath.Join(dir, "database.yaml")
 		passwordPath := filepath.Join(dir, "password")
 		require.NoError(t, os.WriteFile(configPath, []byte(`
-data_source_clusters:
-  primary:
-    writer:
-      host: primary.example.com
-      database: primarydb
-  secondary:
-    writer:
-      host: secondary.example.com
-      database: secondarydb
-`), 0644))
-		require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
-
-		_, err := (&DSNFromConfig{
-			ConfigRef:   "file:" + configPath,
-			Username:    "app_user",
-			PasswordRef: "file:" + passwordPath,
-		}).Resolve()
-
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "set dsn_from.cluster")
-	})
-
-	t.Run("selected endpoint requires host", func(t *testing.T) {
-		dir := t.TempDir()
-		configPath := filepath.Join(dir, "database.yaml")
-		passwordPath := filepath.Join(dir, "password")
-		require.NoError(t, os.WriteFile(configPath, []byte(`
-writer:
+connection:
   database: appdb
 `), 0644))
 		require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
@@ -1069,21 +1014,24 @@ writer:
 			ConfigRef:   "file:" + configPath,
 			Username:    "app_user",
 			PasswordRef: "file:" + passwordPath,
+			ConfigPaths: DSNFromConfigPaths{
+				Host:     "connection.host",
+				Database: "connection.database",
+			},
 		}).Resolve()
 
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "missing host")
+		assert.Contains(t, err.Error(), "read database config host")
+		assert.Contains(t, err.Error(), "path not found")
 	})
 
-	t.Run("database config rejects unknown fields", func(t *testing.T) {
+	t.Run("host path must contain string", func(t *testing.T) {
 		dir := t.TempDir()
 		configPath := filepath.Join(dir, "database.yaml")
 		passwordPath := filepath.Join(dir, "password")
 		require.NoError(t, os.WriteFile(configPath, []byte(`
-writer:
-  host: writer.example.com
-  database: appdb
-  datbase: typo
+host: 1234
+database: appdb
 `), 0644))
 		require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
 
@@ -1094,7 +1042,28 @@ writer:
 		}).Resolve()
 
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "field datbase not found")
+		assert.Contains(t, err.Error(), "must contain a string")
+	})
+
+	t.Run("port path must contain integer", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "database.yaml")
+		passwordPath := filepath.Join(dir, "password")
+		require.NoError(t, os.WriteFile(configPath, []byte(`
+host: db.example.com
+port: not-a-port
+database: appdb
+`), 0644))
+		require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
+
+		_, err := (&DSNFromConfig{
+			ConfigRef:   "file:" + configPath,
+			Username:    "app_user",
+			PasswordRef: "file:" + passwordPath,
+		}).Resolve()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must contain an integer")
 	})
 }
 
@@ -1103,9 +1072,8 @@ func TestServerConfig_StorageDSNFromConfig(t *testing.T) {
 	databaseConfigPath := filepath.Join(dir, "storage.yaml")
 	passwordPath := filepath.Join(dir, "password")
 	require.NoError(t, os.WriteFile(databaseConfigPath, []byte(`
-writer:
-  host: storage.example.com
-  database: schemabot
+host: storage.example.com
+database: schemabot
 `), 0644))
 	require.NoError(t, os.WriteFile(passwordPath, []byte("secret\n"), 0600))
 
