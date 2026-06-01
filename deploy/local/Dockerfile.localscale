@@ -7,7 +7,7 @@
 #   CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux ./cmd/localscale
 #   docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
 
-FROM ghcr.io/block/vitess/vttestserver:mysql84@sha256:b78b1f2234fdb57c7528ae89a67fa0de7a6cc0b313d220524491b8bbb3ee13cc
+FROM ghcr.io/block/vitess/vttestserver:v24.0.0-block.1-mysql84
 
 COPY --chown=vitess:vitess bin/localscale-linux /vt/bin/localscale
 COPY --chmod=755 deploy/local/localscale-entrypoint.sh /vt/entrypoint.sh
