@@ -29,8 +29,8 @@ type Storage interface {
 	// ApplyComments returns the apply comment store.
 	ApplyComments() ApplyCommentStore
 
-	// ApplyDeployments returns the apply-deployments store.
-	ApplyDeployments() ApplyDeploymentStore
+	// ApplyOperations returns the apply-operations store.
+	ApplyOperations() ApplyOperationStore
 
 	// Checks returns the check store.
 	Checks() CheckStore
@@ -316,33 +316,34 @@ type ApplyCommentStore interface {
 	DeleteByApply(ctx context.Context, applyID int64) error
 }
 
-// ApplyDeploymentStore manages per-(apply, deployment) child rows for
-// multi-deployment applies. One apply owns 1..N apply_deployments rows.
+// ApplyOperationStore manages per-(apply, deployment) child rows for
+// multi-deployment applies. One apply owns 1..N apply_operations rows.
 //
-// Introduced in MD-2 alongside the storage primitive. No orchestration code
-// reads or writes these rows yet — MD-5 begins the dual-write at apply-create
-// time, and MD-6 moves scheduler claim + locking down to this granularity.
-type ApplyDeploymentStore interface {
-	// Insert stores a new apply_deployments row and returns its ID.
+// Pure storage primitive: no orchestration code reads or writes these rows
+// yet — the apply-create dual-write and the operator's per-row claim + lock
+// relocation arrive in subsequent PRs in the multi-deployment apply
+// workstream.
+type ApplyOperationStore interface {
+	// Insert stores a new apply_operations row and returns its ID.
 	// Fails with a uniqueness error if (apply_id, deployment) already exists.
-	Insert(ctx context.Context, ad *ApplyDeployment) (int64, error)
+	Insert(ctx context.Context, ad *ApplyOperation) (int64, error)
 
 	// Get returns a child row by ID, or nil if not found.
-	Get(ctx context.Context, id int64) (*ApplyDeployment, error)
+	Get(ctx context.Context, id int64) (*ApplyOperation, error)
 
-	// GetByApplyDeployment returns the child row for (apply_id, deployment),
+	// GetByApplyAndDeployment returns the child row for (apply_id, deployment),
 	// or nil if not found.
-	GetByApplyDeployment(ctx context.Context, applyID int64, deployment string) (*ApplyDeployment, error)
+	GetByApplyAndDeployment(ctx context.Context, applyID int64, deployment string) (*ApplyOperation, error)
 
 	// ListByApply returns all child rows for an apply, ordered by id ascending.
-	ListByApply(ctx context.Context, applyID int64) ([]*ApplyDeployment, error)
+	ListByApply(ctx context.Context, applyID int64) ([]*ApplyOperation, error)
 
 	// UpdateState transitions a child row to a new state. Updates the state
 	// column only; for transitions that should also stamp started_at or
 	// completed_at, use MarkStarted / MarkCompleted / MarkFailed instead.
 	UpdateState(ctx context.Context, id int64, newState string) error
 
-	// MarkStarted sets state=in_progress and started_at on a child row.
+	// MarkStarted sets state=running and started_at on a child row.
 	MarkStarted(ctx context.Context, id int64) error
 
 	// MarkCompleted sets state=completed and completed_at on a child row.

@@ -1,4 +1,4 @@
-CREATE TABLE `apply_deployments` (
+CREATE TABLE `apply_operations` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `apply_id` bigint unsigned NOT NULL,
   `deployment` varchar(255) NOT NULL,
@@ -10,6 +10,6 @@ CREATE TABLE `apply_deployments` (
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `idx_apply_deployment` (`apply_id`,`deployment`),
+  UNIQUE KEY `idx_apply_operation` (`apply_id`,`deployment`),
   KEY `idx_deployment_state` (`deployment`,`state`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

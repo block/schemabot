@@ -33,16 +33,16 @@ func TestEnsureSchema(t *testing.T) {
 	require.NoError(t, EnsureSchema(dsn, logger), "First EnsureSchema failed")
 
 	// Verify tables exist
-	tables := []string{"tasks", "plans", "locks", "checks", "settings", "apply_deployments", "vitess_apply_data", "vitess_tasks"}
+	tables := []string{"tasks", "plans", "locks", "checks", "settings", "apply_operations", "vitess_apply_data", "vitess_tasks"}
 	for _, table := range tables {
 		assert.True(t, testutil.TableExists(t, db, "schemabot", table), "Table %s not found", table)
 	}
 
-	// MD-4: tasks gains a nullable apply_deployment_id column that is not
+	// tasks gains a nullable apply_operation_id column that is not
 	// written by any caller yet. Verify the column landed so future PRs can
 	// rely on it.
-	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", "apply_deployment_id"),
-		"tasks.apply_deployment_id column not found")
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", "apply_operation_id"),
+		"tasks.apply_operation_id column not found")
 }
 
 func TestEnsureSchema_Idempotent(t *testing.T) {

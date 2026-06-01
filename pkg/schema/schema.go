@@ -7,7 +7,7 @@
 //   - settings: Runtime settings
 //   - plans: Schema change plans
 //   - tasks: Schema change tasks
-//   - apply_deployments: Per-(apply, deployment) child rows for multi-deployment applies
+//   - apply_operations: Per-(apply, deployment) child rows for multi-deployment applies
 //   - vitess_apply_data: Vitess-specific per-apply deploy metadata
 //   - vitess_tasks: Vitess-specific non-DDL tasks (VSchema, routing rules)
 package schema

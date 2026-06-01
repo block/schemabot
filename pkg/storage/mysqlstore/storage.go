@@ -10,35 +10,35 @@ import (
 
 // Storage implements the storage.Storage interface using MySQL.
 type Storage struct {
-	db               *sql.DB
-	locks            *lockStore
-	plans            *planStore
-	applies          *applyStore
-	tasks            *taskStore
-	applyLogs        *applyLogStore
-	controlRequests  *controlRequestStore
-	applyComments    *applyCommentStore
-	applyDeployments *applyDeploymentStore
-	checks           *checkStore
-	settings         *settingsStore
-	vitessApplyData  *vitessApplyDataStore
+	db              *sql.DB
+	locks           *lockStore
+	plans           *planStore
+	applies         *applyStore
+	tasks           *taskStore
+	applyLogs       *applyLogStore
+	controlRequests *controlRequestStore
+	applyComments   *applyCommentStore
+	applyOperations *applyOperationStore
+	checks          *checkStore
+	settings        *settingsStore
+	vitessApplyData *vitessApplyDataStore
 }
 
 // New creates a new MySQL storage instance.
 func New(db *sql.DB) *Storage {
 	return &Storage{
-		db:               db,
-		locks:            &lockStore{db: db},
-		plans:            &planStore{db: db},
-		applies:          &applyStore{db: db},
-		tasks:            &taskStore{db: db},
-		applyLogs:        &applyLogStore{db: db},
-		controlRequests:  &controlRequestStore{db: db},
-		applyComments:    &applyCommentStore{db: db},
-		applyDeployments: &applyDeploymentStore{db: db},
-		checks:           &checkStore{db: db},
-		settings:         &settingsStore{db: db},
-		vitessApplyData:  &vitessApplyDataStore{db: db},
+		db:              db,
+		locks:           &lockStore{db: db},
+		plans:           &planStore{db: db},
+		applies:         &applyStore{db: db},
+		tasks:           &taskStore{db: db},
+		applyLogs:       &applyLogStore{db: db},
+		controlRequests: &controlRequestStore{db: db},
+		applyComments:   &applyCommentStore{db: db},
+		applyOperations: &applyOperationStore{db: db},
+		checks:          &checkStore{db: db},
+		settings:        &settingsStore{db: db},
+		vitessApplyData: &vitessApplyDataStore{db: db},
 	}
 }
 
@@ -77,9 +77,9 @@ func (s *Storage) ApplyComments() storage.ApplyCommentStore {
 	return s.applyComments
 }
 
-// ApplyDeployments returns the apply-deployments store.
-func (s *Storage) ApplyDeployments() storage.ApplyDeploymentStore {
-	return s.applyDeployments
+// ApplyOperations returns the apply-operations store.
+func (s *Storage) ApplyOperations() storage.ApplyOperationStore {
+	return s.applyOperations
 }
 
 // Checks returns the check store.

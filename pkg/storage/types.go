@@ -373,18 +373,22 @@ type Apply struct {
 	UpdatedAt time.Time
 }
 
-// ApplyDeployment represents one child row in the apply_deployments table:
-// the per-deployment slice of a multi-deployment apply.
+// ApplyOperation represents one child row in the apply_operations table:
+// the per-(deployment, target) slice of a multi-deployment apply, and the
+// unit of work the operator (claim loop) reconciles.
 //
 // In the multi-deployment data model, one applies row owns 1..N
-// apply_deployments rows — one per target deployment. Each child carries its
-// own state machine, lock identity, and progress so the scheduler can claim,
-// execute, and report on each deployment independently while keeping
-// `apply_id` as the user-facing handle for the whole rollout.
+// apply_operations rows — one per target deployment. Each row carries its
+// own state machine (mirroring state.Apply, so cutover/stop/revert/triage
+// work per-row), its own lock identity, and its own progress; the operator
+// can act on each deployment independently while keeping `apply_id` as the
+// user-facing handle for the whole rollout. applies.state is derived from
+// the child rows' states via the existing state.DeriveApplyState().
 //
-// Created in MD-1 (DDL) + MD-2 (this struct / CRUD). No caller writes these
-// rows yet — MD-5 introduces the dual-write at apply-create time.
-type ApplyDeployment struct {
+// Pure storage primitive: no caller writes these rows yet — the apply-create
+// dual-write arrives in a subsequent PR in the multi-deployment apply
+// workstream.
+type ApplyOperation struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
 
@@ -401,7 +405,7 @@ type ApplyDeployment struct {
 	// semantics. Empty for legacy / single-deployment shapes.
 	Target string
 
-	// State is the per-deployment state machine value. See state.ApplyDeployment.
+	// State is the per-deployment state machine value. See state.ApplyOperation.
 	State string
 
 	// ErrorMessage contains error details if state is failed.
