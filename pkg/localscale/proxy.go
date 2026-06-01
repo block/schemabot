@@ -48,8 +48,9 @@ func defaultMySQLServer() *server.Server {
 // portAllocator manages a pool of ports from a fixed range.
 // Used to give branch proxies predictable ports that can be exposed in Docker.
 type portAllocator struct {
-	mu   sync.Mutex
-	free []int
+	mu    sync.Mutex
+	free  []int
+	inUse map[int]struct{}
 }
 
 func newPortAllocator(start, end int) *portAllocator {
@@ -57,23 +58,34 @@ func newPortAllocator(start, end int) *portAllocator {
 	for p := start; p <= end; p++ {
 		ports = append(ports, p)
 	}
-	return &portAllocator{free: ports}
+	return &portAllocator{free: ports, inUse: make(map[int]struct{}, len(ports))}
 }
 
 func (a *portAllocator) acquire() (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.inUse == nil {
+		a.inUse = make(map[int]struct{}, len(a.free))
+	}
 	if len(a.free) == 0 {
 		return 0, fmt.Errorf("proxy port range exhausted")
 	}
 	port := a.free[0]
 	a.free = a.free[1:]
+	a.inUse[port] = struct{}{}
 	return port, nil
 }
 
 func (a *portAllocator) release(port int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.inUse == nil {
+		return
+	}
+	if _, ok := a.inUse[port]; !ok {
+		return
+	}
+	delete(a.inUse, port)
 	a.free = append(a.free, port)
 }
 
@@ -91,6 +103,9 @@ type branchProxy struct {
 	logger      *slog.Logger
 	done        chan struct{}
 	connWg      sync.WaitGroup // tracks in-flight connections
+	connMu      sync.Mutex
+	conns       map[net.Conn]struct{}
+	closing     bool
 }
 
 func newBranchProxy(ctx context.Context, listenAddr, upstreamDSN string, branchName string, keyspaces []string, logger *slog.Logger, tlsCfg *tls.Config) (*branchProxy, error) {
@@ -135,6 +150,7 @@ func newBranchProxy(ctx context.Context, listenAddr, upstreamDSN string, branchN
 		mysqlServer: mysqlSrv,
 		logger:      logger,
 		done:        make(chan struct{}),
+		conns:       make(map[net.Conn]struct{}),
 	}
 	go p.serve()
 	return p, nil
@@ -148,7 +164,9 @@ func (p *branchProxy) Addr() string {
 // Close shuts down the proxy listener, waits for serve to exit, and drains
 // in-flight connections.
 func (p *branchProxy) Close() error {
+	p.beginClose()
 	err := p.listener.Close()
+	p.closeClientConns()
 	<-p.done
 	p.connWg.Wait()
 	return err
@@ -161,9 +179,51 @@ func (p *branchProxy) serve() {
 		if err != nil {
 			return
 		}
+		untrack, ok := p.trackClientConn(client)
+		if !ok {
+			p.logger.Debug("proxy: closing accepted connection during shutdown")
+			utils.CloseAndLog(client)
+			continue
+		}
 		p.connWg.Go(func() {
+			defer untrack()
 			p.handleConn(client)
 		})
+	}
+}
+
+func (p *branchProxy) beginClose() {
+	p.connMu.Lock()
+	p.closing = true
+	p.connMu.Unlock()
+}
+
+func (p *branchProxy) trackClientConn(conn net.Conn) (func(), bool) {
+	p.connMu.Lock()
+	if p.closing {
+		p.connMu.Unlock()
+		return func() {}, false
+	}
+	p.conns[conn] = struct{}{}
+	p.connMu.Unlock()
+
+	return func() {
+		p.connMu.Lock()
+		delete(p.conns, conn)
+		p.connMu.Unlock()
+	}, true
+}
+
+func (p *branchProxy) closeClientConns() {
+	p.connMu.Lock()
+	conns := make([]net.Conn, 0, len(p.conns))
+	for conn := range p.conns {
+		conns = append(conns, conn)
+	}
+	p.connMu.Unlock()
+
+	for _, conn := range conns {
+		utils.CloseAndLog(conn)
 	}
 }
 

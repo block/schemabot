@@ -16,8 +16,10 @@ package localscale
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -28,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/block/spirit/pkg/table"
@@ -386,14 +389,9 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	})
 	for _, key := range sortedKeys {
 		backend := backends[key]
-		listenAddr, err := s.proxyListenAddr()
-		if err != nil {
-			s.Close()
-			return nil, fmt.Errorf("allocate edge port for %s/%s: %w", key.org, key.database, err)
-		}
 		// Empty branch name + nil keyspaces = pure passthrough (no DB name rewriting).
 		edgeDSN := fmt.Sprintf("root@tcp(%s)/", backend.vtgateMySQLAddr)
-		proxy, err := newBranchProxy(ctx, listenAddr, edgeDSN, "", nil, cfg.Logger, nil)
+		proxy, err := s.newBranchProxyWithRetry(ctx, edgeDSN, "", nil, nil)
 		if err != nil {
 			s.Close()
 			return nil, fmt.Errorf("start edge proxy for %s/%s: %w", key.org, key.database, err)
@@ -821,6 +819,31 @@ func (s *Server) proxyListenAddr() (string, error) {
 	return net.JoinHostPort(s.proxyHost, "0"), nil
 }
 
+func (s *Server) newBranchProxyWithRetry(ctx context.Context, upstreamDSN string, branchName string, keyspaces []string, tlsCfg *tls.Config) (*branchProxy, error) {
+	var lastAddrInUseErr error
+	for {
+		listenAddr, err := s.proxyListenAddr()
+		if err != nil {
+			if lastAddrInUseErr != nil {
+				return nil, fmt.Errorf("%w after skipping ports already in use: %w", err, lastAddrInUseErr)
+			}
+			return nil, err
+		}
+
+		proxy, err := newBranchProxy(ctx, listenAddr, upstreamDSN, branchName, keyspaces, s.logger, tlsCfg)
+		if err == nil {
+			return proxy, nil
+		}
+		if errors.Is(err, syscall.EADDRINUSE) {
+			lastAddrInUseErr = err
+			s.logger.Warn("proxy port already in use, trying next port", "listen_addr", listenAddr, "error", err)
+			continue
+		}
+		s.releaseProxyPortByAddr(listenAddr)
+		return nil, err
+	}
+}
+
 // proxyAdvertiseAddr returns the address clients should use to connect to a proxy.
 // When proxyAdvertiseHost is set explicitly, it uses that. Otherwise, it derives
 // the host from the HTTP request's Host header — so if a client reaches the API at
@@ -869,10 +892,14 @@ func (s *Server) proxyAdvertiseAddr(proxy *branchProxy, r *http.Request) string 
 
 // releaseProxyPort returns a proxy's port to the allocator pool, if applicable.
 func (s *Server) releaseProxyPort(proxy *branchProxy) {
+	s.releaseProxyPortByAddr(proxy.Addr())
+}
+
+func (s *Server) releaseProxyPortByAddr(addr string) {
 	if s.portAlloc == nil {
 		return
 	}
-	_, portStr, err := net.SplitHostPort(proxy.Addr())
+	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return
 	}
@@ -889,25 +916,29 @@ func (s *Server) releaseProxyPort(proxy *branchProxy) {
 func (s *Server) trackProxy(branch string, proxy *branchProxy) {
 	s.proxyMu.Lock()
 	old := s.proxies[branch]
-	if old != nil {
-		s.releaseProxyPort(old)
-	}
 	s.proxies[branch] = proxy
 	s.proxyMu.Unlock()
 
 	if old != nil {
-		s.wg.Go(func() { utils.CloseAndLog(old) })
+		s.wg.Go(func() {
+			utils.CloseAndLog(old)
+			s.releaseProxyPort(old)
+		})
 	}
 }
 
 // closeProxy shuts down and removes the TCP proxy for a branch.
 func (s *Server) closeProxy(branch string) {
 	s.proxyMu.Lock()
-	defer s.proxyMu.Unlock()
-	if p, ok := s.proxies[branch]; ok {
-		s.releaseProxyPort(p)
-		utils.CloseAndLog(p)
+	p, ok := s.proxies[branch]
+	if ok {
 		delete(s.proxies, branch)
+	}
+	s.proxyMu.Unlock()
+
+	if ok {
+		utils.CloseAndLog(p)
+		s.releaseProxyPort(p)
 	}
 }
 
@@ -926,8 +957,8 @@ func (s *Server) closeBranchProxies() {
 	s.proxyMu.Unlock()
 
 	for _, p := range old {
-		s.releaseProxyPort(p)
 		utils.CloseAndLog(p)
+		s.releaseProxyPort(p)
 	}
 	if len(old) > 0 {
 		s.logger.Info("closed branch proxies for reset", "count", len(old))
@@ -949,8 +980,8 @@ func (s *Server) closeAllProxies() {
 	s.proxyMu.Unlock()
 
 	for _, p := range old {
-		s.releaseProxyPort(p)
 		utils.CloseAndLog(p)
+		s.releaseProxyPort(p)
 	}
 }
 

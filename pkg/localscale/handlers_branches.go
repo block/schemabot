@@ -7,9 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
-	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -442,10 +440,6 @@ func (s *Server) handleCreateBranchPassword(w http.ResponseWriter, r *http.Reque
 	for ks := range backend.vtgateDBs {
 		keyspaces = append(keyspaces, ks)
 	}
-	listenAddr, err := s.proxyListenAddr()
-	if err != nil {
-		return newHTTPError(http.StatusInternalServerError, "allocate proxy port: %v", err)
-	}
 
 	var upstreamDSN string
 	var proxyBranch string
@@ -461,16 +455,8 @@ func (s *Server) handleCreateBranchPassword(w http.ResponseWriter, r *http.Reque
 	if s.tlsBundle != nil {
 		branchTLS = s.tlsBundle.TLSConfig
 	}
-	proxy, err := newBranchProxy(r.Context(), listenAddr, upstreamDSN, proxyBranch, keyspaces, s.logger, branchTLS)
+	proxy, err := s.newBranchProxyWithRetry(r.Context(), upstreamDSN, proxyBranch, keyspaces, branchTLS)
 	if err != nil {
-		if s.portAlloc != nil {
-			// Return port to pool on failure.
-			if _, portStr, splitErr := net.SplitHostPort(listenAddr); splitErr == nil {
-				if port, convErr := strconv.Atoi(portStr); convErr == nil {
-					s.portAlloc.release(port)
-				}
-			}
-		}
 		return newHTTPError(http.StatusInternalServerError, "create branch proxy: %v", err)
 	}
 	s.trackProxy(branch, proxy)
