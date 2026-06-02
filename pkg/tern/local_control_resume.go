@@ -433,6 +433,42 @@ func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *s
 	}
 }
 
+func shouldRecoverMySQLDeferredCutover(databaseType string, apply *storage.Apply) bool {
+	return databaseType == storage.DatabaseTypeMySQL &&
+		apply != nil &&
+		apply.GetOptions().DeferCutover &&
+		state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.RecoveringCutover)
+}
+
+func (c *LocalClient) markApplyRecoveringCutover(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
+	c.logger.Info("entering deferred cutover recovery state",
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"database_type", apply.DatabaseType,
+		"task_count", len(tasks))
+	oldApplyState := apply.State
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			c.logger.Debug("leaving terminal task unchanged during deferred cutover recovery",
+				"apply_id", apply.ApplyIdentifier,
+				"task_id", task.TaskIdentifier,
+				"task_state", task.State)
+			continue
+		}
+		c.transitionTaskState(ctx, task, apply.ID, state.Task.RecoveringCutover,
+			fmt.Sprintf("Task %s is recovering deferred cutover state", task.TaskIdentifier))
+	}
+	apply.State = state.Apply.RecoveringCutover
+	apply.CompletedAt = nil
+	apply.UpdatedAt = time.Now()
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return fmt.Errorf("mark apply %s recovering deferred cutover: %w", apply.ApplyIdentifier, err)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		"Recovering deferred cutover state before accepting cutover requests", oldApplyState, state.Apply.RecoveringCutover)
+	return nil
+}
+
 // launchAtomicResume sends all DDLs to the engine in one call, marks tasks and
 // apply as RUNNING, logs the provided message, and then polls for completion.
 // Scheduler-owned calls block so the worker owns the apply until terminal or
@@ -519,16 +555,24 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 
 	now := time.Now()
 	oldApplyState := apply.State
+	recoveringCutover := state.IsState(oldApplyState, state.Apply.RecoveringCutover)
 
 	for _, task := range tasks {
-		c.transitionTaskState(ctx, task, 0, state.Task.Running, "")
+		taskState := state.Task.Running
+		if recoveringCutover {
+			taskState = state.Task.RecoveringCutover
+		}
+		c.transitionTaskState(ctx, task, 0, taskState, "")
 	}
 
 	apply.State = state.Apply.Running
+	if recoveringCutover {
+		apply.State = state.Apply.RecoveringCutover
+	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
-		return fmt.Errorf("mark grouped resume apply %s running: %w", apply.ApplyIdentifier, err)
+		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+		return fmt.Errorf("mark grouped resume apply %s %s: %w", apply.ApplyIdentifier, apply.State, err)
 	}
 	if startRequested {
 		if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
@@ -537,7 +581,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	}
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-		logMessage, oldApplyState, state.Apply.Running)
+		logMessage, oldApplyState, apply.State)
 
 	if block {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
@@ -621,6 +665,36 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	// Log recovery event
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Recovering apply (heartbeat expired, was in %s state)", apply.State), "", "")
+
+	if shouldRecoverMySQLDeferredCutover(c.config.Type, apply) {
+		sentinelExists, err := c.spiritSentinelTableExists(ctx, apply)
+		if err != nil {
+			c.logger.Warn("deferred cutover recovery could not verify Spirit sentinel; scheduler will retry",
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"database_type", apply.DatabaseType,
+				"error", err)
+			return fmt.Errorf("verify Spirit sentinel before recovering deferred cutover apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		if sentinelExists {
+			if err := c.markApplyRecoveringCutover(ctx, apply, tasks); err != nil {
+				return err
+			}
+			options := buildApplyOptions(apply)
+			resumeCtx, cancelResume := context.WithCancel(ctx)
+			cancelGeneration := c.setApplyCancel(cancelResume)
+			defer c.clearApplyCancel(cancelGeneration)
+			defer cancelResume()
+			if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering deferred cutover from checkpoint", true, false); err != nil {
+				return fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err)
+			}
+			return ctx.Err()
+		}
+		c.logger.Info("Spirit sentinel is absent during deferred cutover recovery; re-plan will reconcile completed work",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType)
+	}
 
 	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)
 	if err != nil {

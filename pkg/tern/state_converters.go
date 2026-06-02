@@ -27,6 +27,8 @@ func taskStateToApplyState(ts string) string {
 		return state.Apply.WaitingForDeploy
 	case state.Task.WaitingForCutover:
 		return state.Apply.WaitingForCutover
+	case state.Task.RecoveringCutover:
+		return state.Apply.RecoveringCutover
 	case state.Task.CuttingOver:
 		return state.Apply.CuttingOver
 	case state.Task.RevertWindow:
@@ -46,6 +48,14 @@ func taskStateToApplyState(ts string) string {
 	default:
 		return state.Apply.Pending
 	}
+}
+
+func taskStates(tasks []*storage.Task) []string {
+	states := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		states = append(states, task.State)
+	}
+	return states
 }
 
 // engineStateToStorage converts engine State to a canonical task state string.
@@ -112,6 +122,8 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_WAITING_FOR_DEPLOY
 	case state.Task.WaitingForCutover:
 		return ternv1.State_STATE_WAITING_FOR_CUTOVER
+	case state.Task.RecoveringCutover, state.Apply.RecoveringCutover:
+		return ternv1.State_STATE_RECOVERING_CUTOVER
 	case state.Task.CuttingOver:
 		return ternv1.State_STATE_CUTTING_OVER
 	case state.Task.RevertWindow:
@@ -199,6 +211,8 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.WaitingForDeploy
 	case ternv1.State_STATE_WAITING_FOR_CUTOVER:
 		return state.Apply.WaitingForCutover
+	case ternv1.State_STATE_RECOVERING_CUTOVER:
+		return state.Apply.RecoveringCutover
 	case ternv1.State_STATE_CUTTING_OVER:
 		return state.Apply.CuttingOver
 	case ternv1.State_STATE_REVERT_WINDOW:

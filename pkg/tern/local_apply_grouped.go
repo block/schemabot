@@ -413,8 +413,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
-	// Update apply state
-	apply.State = taskStateToApplyState(newState)
+	// Update apply state from persisted task state so recovery guards can keep
+	// storage ahead of stale engine progress until Spirit reaches the cutover wait again.
+	apply.State = state.DeriveApplyState(taskStates(tasks))
 	apply.UpdatedAt = now
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
 		c.logger.Error("failed to reload apply before progress state update", "apply_id", apply.ApplyIdentifier, "error", err)
@@ -626,7 +627,7 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 		if result.State == engine.StateCompleted {
 			task.ProgressPercent = 100
 		}
-		c.transitionTaskState(ctx, task, 0, newState, "")
+		c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, newState), "")
 	}
 }
 

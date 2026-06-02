@@ -14,6 +14,7 @@ var Task = struct {
 	Running           string
 	WaitingForDeploy  string
 	WaitingForCutover string
+	RecoveringCutover string
 	CuttingOver       string
 	RevertWindow      string
 	Completed         string
@@ -27,6 +28,7 @@ var Task = struct {
 	Running:           "running",
 	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
+	RecoveringCutover: "recovering_cutover",
 	CuttingOver:       "cutting_over",
 	RevertWindow:      "revert_window",
 	Completed:         "completed",
@@ -114,7 +116,8 @@ func NormalizeTaskStatus(raw string) string {
 	// Pass-through for already-normalized values
 	case Task.Pending, Task.Running, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
-		Task.WaitingForDeploy, Task.WaitingForCutover, Task.CuttingOver, Task.Cancelled:
+		Task.WaitingForDeploy, Task.WaitingForCutover, Task.RecoveringCutover,
+		Task.CuttingOver, Task.Cancelled:
 		return s
 	}
 
@@ -123,7 +126,8 @@ func NormalizeTaskStatus(raw string) string {
 		return Task.Completed
 	case Task.Pending, Task.Running, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
-		Task.WaitingForDeploy, Task.WaitingForCutover, Task.CuttingOver, Task.Cancelled:
+		Task.WaitingForDeploy, Task.WaitingForCutover, Task.RecoveringCutover,
+		Task.CuttingOver, Task.Cancelled:
 		return normalized
 	default:
 		// Unknown engine states represent in-flight work until proven otherwise.

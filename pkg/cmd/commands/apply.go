@@ -684,6 +684,8 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 				log.emit("msg", "Deploy request ready — waiting for deploy")
 			case state.IsState(curState, state.Apply.WaitingForCutover) && lastGlobalState != "":
 				log.emit("msg", "Waiting for cutover")
+			case state.IsState(curState, state.Apply.RecoveringCutover) && lastGlobalState != "":
+				log.emit("msg", "Recovering cutover state")
 			case state.IsState(curState, state.Apply.CuttingOver):
 				log.emit("msg", "Cutting over")
 			case state.IsState(curState, state.Apply.RevertWindow):
@@ -817,6 +819,10 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 		e.emit(append(kvs, "duration", dur)...)
 	case state.Apply.WaitingForCutover:
 		kvs := tableKVs("Waiting for cutover", tbl, ts)
+		kvs = appendShardSummary(kvs, tbl.Shards)
+		e.emit(kvs...)
+	case state.Apply.RecoveringCutover:
+		kvs := tableKVs("Recovering cutover state", tbl, ts)
 		kvs = appendShardSummary(kvs, tbl.Shards)
 		e.emit(kvs...)
 	case state.Apply.CuttingOver:

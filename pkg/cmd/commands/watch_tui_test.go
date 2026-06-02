@@ -197,6 +197,26 @@ func TestWatchModel_StoppedWithErrorShowsReason(t *testing.T) {
 	assert.Contains(t, view, "schemabot start")
 }
 
+func TestWatchModel_RecoveringCutoverShowsBlockedCutoverMessage(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
+	m.applyID = "apply-recovering-cutover"
+
+	updated, _ := m.Update(progressMsg{
+		state: state.Apply.RecoveringCutover,
+		tables: []tableProgress{{
+			Name:    "users",
+			Status:  state.Task.RecoveringCutover,
+			Percent: 100,
+		}},
+	})
+	model := updated.(WatchModel)
+
+	view := model.View()
+	assert.Contains(t, view, "Recovering cutover state")
+	assert.Contains(t, view, "Cutover will be available once recovery completes")
+	assert.NotContains(t, view, "Press Enter to proceed with cutover")
+}
+
 func TestWatchModel_ConnectionError_CanEscape(t *testing.T) {
 	// User should be able to ESC out of the loading+error state.
 	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)

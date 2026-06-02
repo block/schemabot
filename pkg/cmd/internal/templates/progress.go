@@ -347,7 +347,7 @@ func vschemaStatusLabel(status string) string {
 		return "Applying..."
 	case state.Apply.WaitingForDeploy:
 		return "Pending"
-	case state.Apply.WaitingForCutover, state.Apply.CuttingOver:
+	case state.Apply.WaitingForCutover, state.Apply.RecoveringCutover, state.Apply.CuttingOver:
 		return "Applying..."
 	case state.Apply.Completed:
 		return "Applied"
@@ -394,6 +394,8 @@ func FormatProgressState(s string) string {
 		return ANSIYellow + "🟨 Waiting for deploy" + ANSIReset
 	case state.Apply.WaitingForCutover:
 		return ANSIYellow + "🟨 Waiting for cutover" + ANSIReset
+	case state.Apply.RecoveringCutover:
+		return ANSIYellow + "🟨 Recovering cutover" + ANSIReset
 	case state.Apply.CuttingOver:
 		return ANSICyan + "🔄 Cutting over..." + ANSIReset
 	case state.Apply.Completed:
@@ -457,6 +459,15 @@ func FormatTableProgress(t TableProgress) string {
 	case state.Apply.WaitingForCutover:
 		bar := ui.ProgressBarRowCopy(100) // blue — in progress, row copy done
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Waiting for cutover\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
+	case state.Apply.RecoveringCutover:
+		bar := ui.ProgressBarRowCopy(100) // blue — in progress, row copy done
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovering cutover state...\n", t.TableName, bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
@@ -1016,7 +1027,7 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIYellow)
 	case state.Apply.Running:
 		return colorWrap(ANSICyan)
-	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.CuttingOver:
+	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.RecoveringCutover, state.Apply.CuttingOver:
 		return colorWrap(ANSIYellow)
 	case state.Apply.Stopped:
 		return colorWrap(ANSIOrange)

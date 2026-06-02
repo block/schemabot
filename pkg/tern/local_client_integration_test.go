@@ -325,6 +325,7 @@ type stagedGroupedResumeEngine struct {
 	applyCount  int
 	drainCount  int
 	applyErr    error
+	progress    *engine.ProgressResult
 }
 
 func (e *stagedGroupedResumeEngine) Name() string { return "staged-grouped-resume" }
@@ -350,6 +351,9 @@ func (e *stagedGroupedResumeEngine) Apply(context.Context, *engine.ApplyRequest)
 }
 
 func (e *stagedGroupedResumeEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	if e.progress != nil {
+		return e.progress, nil
+	}
 	return &engine.ProgressResult{State: engine.StateCompleted}, nil
 }
 
@@ -946,6 +950,290 @@ func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t
 	logs, err := stor.ApplyLogs().GetByApply(ctx, applyID)
 	require.NoError(t, err)
 	assert.True(t, hasLogMessageContaining(logs, "All tasks already completed on resume (final schema check shows no remaining changes)"))
+}
+
+// This scenario covers a scheduler-owned deferred-cutover recovery where
+// storage was waiting for cutover before restart and Spirit's durable sentinel
+// still exists. Cutover must stay blocked until the engine reattaches and
+// reports that it is waiting for cutover again.
+func TestLocalClient_ResumeApplyDeferredCutoverEntersRecoveringState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(ctx))
+	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (`id` INT PRIMARY KEY)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE TABLE `_spirit_sentinel` (id int NOT NULL PRIMARY KEY)")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupCtx := context.WithoutCancel(t.Context())
+		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		require.NoError(t, cleanupErr)
+		defer utils.CloseAndLog(cleanupDB)
+		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `_spirit_sentinel`")
+		assert.NoError(t, cleanupErr)
+	})
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	ddl := "ALTER TABLE `users` ADD COLUMN `recovery_note` varchar(255)"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-cutover-recovery-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"}},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-cutover-recovery-%d", time.Now().UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.WaitingForCutover,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	task := &storage.Task{
+		TaskIdentifier:  fmt.Sprintf("task-cutover-recovery-users-%d", time.Now().UnixNano()),
+		ApplyID:         applyID,
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Task.WaitingForCutover,
+		TableName:       "users",
+		Namespace:       "testdb",
+		DDL:             ddl,
+		DDLAction:       "alter",
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		ProgressPercent: 100,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	taskID, err := stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	recoveryEngine := &stagedGroupedResumeEngine{
+		planResults: []*engine.PlanResult{{
+			Changes: []engine.SchemaChange{{
+				Namespace:    "testdb",
+				TableChanges: []engine.TableChange{{Table: "users", DDL: ddl}},
+			}},
+		}},
+		progress: &engine.ProgressResult{
+			State: engine.StateRunning,
+			Tables: []engine.TableProgress{{
+				Namespace: "testdb",
+				Table:     "users",
+				State:     state.Task.Running,
+			}},
+		},
+	}
+	client.spiritEngine = recoveryEngine
+
+	recoverCtx, cancel := context.WithTimeout(ctx, 1200*time.Millisecond)
+	defer cancel()
+	err = client.ResumeApply(recoverCtx, apply)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	storedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.RecoveringCutover, storedApply.State)
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.RecoveringCutover, storedTask.State)
+
+	progressResp, err := client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.State_STATE_RECOVERING_CUTOVER, progressResp.State)
+
+	cutoverResp, err := client.Cutover(ctx, &ternv1.CutoverRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, cutoverResp)
+	assert.False(t, cutoverResp.Accepted)
+	assert.Contains(t, cutoverResp.ErrorMessage, "recovering deferred cutover")
+
+	recoveryEngine.progress = &engine.ProgressResult{
+		State: engine.StateWaitingForCutover,
+		Tables: []engine.TableProgress{{
+			Namespace: "testdb",
+			Table:     "users",
+			State:     state.Task.WaitingForCutover,
+			Progress:  100,
+		}},
+	}
+	progressResp, err = client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.State_STATE_WAITING_FOR_CUTOVER, progressResp.State)
+
+	storedApply, err = stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.WaitingForCutover, storedApply.State)
+
+	storedTask, err = stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.WaitingForCutover, storedTask.State)
+}
+
+// This scenario covers a deferred-cutover recovery where the Spirit sentinel is
+// already absent when SchemaBot restarts. The scheduler should reconcile against
+// the live schema instead of blocking forever in cutover recovery.
+func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelReconcilesCompletedSchema(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(ctx))
+	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (`id` INT PRIMARY KEY, `recovery_note` varchar(255))")
+	require.NoError(t, err)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	ddl := "ALTER TABLE `users` ADD COLUMN `recovery_note` varchar(255)"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-cutover-no-sentinel-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"}},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-cutover-no-sentinel-%d", time.Now().UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.WaitingForCutover,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	task := &storage.Task{
+		TaskIdentifier:  fmt.Sprintf("task-cutover-no-sentinel-users-%d", time.Now().UnixNano()),
+		ApplyID:         applyID,
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Task.WaitingForCutover,
+		TableName:       "users",
+		Namespace:       "testdb",
+		DDL:             ddl,
+		DDLAction:       "alter",
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		ProgressPercent: 100,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	taskID, err := stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	recoveryEngine := &stagedGroupedResumeEngine{planResults: []*engine.PlanResult{{}}}
+	client.spiritEngine = recoveryEngine
+
+	require.NoError(t, client.ResumeApply(ctx, apply))
+	assert.Equal(t, 0, recoveryEngine.applyCount)
+
+	storedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Completed, storedApply.State)
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Completed, storedTask.State)
 }
 
 // This scenario covers a scheduler-owned grouped start where remote execution is

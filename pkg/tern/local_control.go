@@ -59,6 +59,16 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 	if task == nil {
 		return nil, fmt.Errorf("no active schema change")
 	}
+	if state.IsState(task.State, state.Task.RecoveringCutover) || (apply != nil && state.IsState(apply.State, state.Apply.RecoveringCutover)) {
+		c.logger.Info("cutover blocked while apply is recovering cutover state",
+			"apply_id", applyIdentifierForLog(apply, req.ApplyId),
+			"task_id", task.TaskIdentifier,
+			"task_state", task.State)
+		return &ternv1.CutoverResponse{
+			Accepted:     false,
+			ErrorMessage: "Schema change is recovering deferred cutover state after restart; cutover will be available once recovery completes.",
+		}, nil
+	}
 	if apply == nil {
 		apply, err = c.storage.Applies().Get(ctx, task.ApplyID)
 		if err != nil {
@@ -67,6 +77,17 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 		if apply == nil {
 			return nil, fmt.Errorf("load apply %d before cutover: %w", task.ApplyID, storage.ErrApplyNotFound)
 		}
+	}
+	if state.IsState(apply.State, state.Apply.RecoveringCutover) {
+		c.logger.Info("cutover blocked while apply is recovering cutover state",
+			"apply_id", apply.ApplyIdentifier,
+			"task_id", task.TaskIdentifier,
+			"task_state", task.State,
+			"apply_state", apply.State)
+		return &ternv1.CutoverResponse{
+			Accepted:     false,
+			ErrorMessage: "Schema change is recovering deferred cutover state after restart; cutover will be available once recovery completes.",
+		}, nil
 	}
 	if controlReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
 		return nil, fmt.Errorf("check pending stop request before cutover for apply %s: %w", apply.ApplyIdentifier, err)
@@ -117,6 +138,13 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 	}
 
 	return &ternv1.CutoverResponse{Accepted: true}, nil
+}
+
+func applyIdentifierForLog(apply *storage.Apply, fallback string) string {
+	if apply != nil {
+		return apply.ApplyIdentifier
+	}
+	return fallback
 }
 
 func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply) error {

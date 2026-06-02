@@ -201,6 +201,28 @@ func TestRenderApplyStatusComment_WaitingForCutover(t *testing.T) {
 	assert.Contains(t, result, "schemabot cutover")
 }
 
+func TestRenderApplyStatusComment_RecoveringCutover(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.RecoveringCutover,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", Status: state.Task.Completed},
+			{TableName: "users", Status: state.Task.RecoveringCutover},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "Recovering Cutover")
+	assert.Contains(t, result, "1 recovering cutover")
+	assert.Contains(t, result, "Recovering cutover state...")
+	assert.Contains(t, result, "Cutover will be available once recovery completes")
+	assert.NotContains(t, result, "schemabot cutover")
+}
+
 func TestRenderApplyStatusComment_CuttingOver(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",

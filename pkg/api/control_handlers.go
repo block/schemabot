@@ -388,6 +388,18 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 			"state", apply.State)
 		return &apitypes.ControlResponse{Accepted: true, Status: apitypes.ControlStatusAlreadyInProgress}, http.StatusAccepted, nil
 	}
+	if readiness == cutoverRequestRecovering {
+		s.logger.Info("cutover request rejected while deferred cutover state is recovering",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"deployment", apply.Deployment,
+			"environment", apply.Environment,
+			"requested_by", caller,
+			"state", apply.State)
+		err := controlConflictf("schema change is recovering deferred cutover state after restart; cutover will be available once recovery completes")
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, http.StatusOK, err
+	}
 	if readiness == cutoverRequestNotReady {
 		err := controlConflictf("schema change is not waiting for cutover (current state: %s)", apply.State)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
@@ -429,6 +441,7 @@ const (
 	cutoverRequestNotReady cutoverRequestReadiness = iota
 	cutoverRequestReady
 	cutoverRequestAlreadyInProgress
+	cutoverRequestRecovering
 )
 
 func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID string) (cutoverRequestReadiness, error) {
@@ -437,6 +450,9 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 	}
 	if state.IsState(apply.State, state.Apply.CuttingOver) {
 		return cutoverRequestAlreadyInProgress, nil
+	}
+	if state.IsState(apply.State, state.Apply.RecoveringCutover) {
+		return cutoverRequestRecovering, nil
 	}
 	if client != nil && client.IsRemote() && ternApplyID != "" {
 		progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
@@ -449,6 +465,9 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 		remoteState := tern.ProtoStateToStorage(progress.State)
 		if state.IsState(remoteState, state.Apply.WaitingForCutover) {
 			return cutoverRequestReady, nil
+		}
+		if state.IsState(remoteState, state.Apply.RecoveringCutover) {
+			return cutoverRequestRecovering, nil
 		}
 		if state.IsState(remoteState, state.Apply.CuttingOver) {
 			return cutoverRequestReady, nil

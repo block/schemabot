@@ -81,6 +81,8 @@ func (m WatchModel) progressView() string {
 		if m.cutoverTriggered {
 			b.WriteString(m.spinner.View() + "Cutover triggered, waiting for completion...\n")
 		}
+	case state.IsState(m.state, state.Apply.RecoveringCutover):
+		b.WriteString(m.spinner.View() + "Recovering cutover state...\n")
 	case state.IsState(m.state, state.Apply.CuttingOver):
 		b.WriteString(m.spinner.View() + "Cutting over...\n")
 	case state.IsState(m.state, state.Apply.Completed):
@@ -214,6 +216,10 @@ func (m WatchModel) progressView() string {
 			}
 			b.WriteString("Watching for cutover... (ESC to detach)\n")
 		}
+	case state.IsState(m.state, state.Apply.RecoveringCutover):
+		b.WriteString("\n\n")
+		b.WriteString("SchemaBot is recovering deferred cutover state after restart.\n")
+		b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
 	case state.IsState(m.state, state.Apply.Running):
 		b.WriteString("\n\n")
 		if m.volumeMode {

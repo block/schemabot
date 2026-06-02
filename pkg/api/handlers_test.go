@@ -2671,6 +2671,66 @@ func TestCutoverHandler(t *testing.T) {
 		assert.Equal(t, apitypes.ControlStatusAlreadyInProgress, resp.Status)
 	})
 
+	t.Run("rejects cutover while deferred cutover state is recovering", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := activeTestApply("apply-recovering-cutover")
+		apply.State = state.Apply.RecoveringCutover
+		svc := newControlTestService(mock, apply)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-recovering-cutover", "caller": "cli:cutter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		assert.Nil(t, mock.cutoverReq)
+		assert.Nil(t, mock.progressReq)
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		assert.Nil(t, controlReq)
+
+		var resp apitypes.ErrorResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.Contains(t, resp.Error, "recovering deferred cutover state")
+	})
+
+	t.Run("rejects cutover while remote deferred cutover state is recovering", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			progressResp: &ternv1.ProgressResponse{
+				State: ternv1.State_STATE_RECOVERING_CUTOVER,
+			},
+		}
+		apply := activeTestApply("apply-remote-recovering-cutover")
+		apply.ExternalID = "remote-recovering-cutover"
+		svc := newControlTestService(mock, apply)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-remote-recovering-cutover", "caller": "cli:cutter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		require.NotNil(t, mock.progressReq)
+		assert.Equal(t, "remote-recovering-cutover", mock.progressReq.ApplyId)
+		assert.Nil(t, mock.cutoverReq)
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		assert.Nil(t, controlReq)
+
+		var resp apitypes.ErrorResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err)
+		assert.Contains(t, resp.Error, "recovering deferred cutover state")
+	})
+
 	t.Run("queues cutover when remote progress reaches cutting over before stored state", func(t *testing.T) {
 		mock := &mockTernClient{
 			isRemote: true,

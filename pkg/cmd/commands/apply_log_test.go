@@ -151,6 +151,12 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 			wantFields: []string{"table=users"},
 		},
 		{
+			name:       "recovering cutover",
+			status:     state.Apply.RecoveringCutover,
+			wantMsg:    "Recovering cutover state",
+			wantFields: []string{"table=users"},
+		},
+		{
 			name:       "cutting over",
 			status:     state.Apply.CuttingOver,
 			wantMsg:    "Cutting over",
@@ -345,6 +351,7 @@ func TestIsActiveStatus(t *testing.T) {
 	assert.True(t, isActiveStatus(state.Apply.Running))
 	assert.True(t, isActiveStatus(state.Apply.Pending))
 	assert.True(t, isActiveStatus(state.Apply.WaitingForCutover))
+	assert.True(t, isActiveStatus(state.Apply.RecoveringCutover))
 	assert.True(t, isActiveStatus(state.Apply.CuttingOver))
 }
 

@@ -85,6 +85,8 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("## Schema Change — Waiting for Deploy\n\n")
 	case state.Apply.WaitingForCutover:
 		sb.WriteString("## Schema Change — Waiting for Cutover\n\n")
+	case state.Apply.RecoveringCutover:
+		sb.WriteString("## Schema Change — Recovering Cutover\n\n")
 	case state.Apply.CuttingOver:
 		sb.WriteString("## Schema Change — Cutting Over\n\n")
 	case state.Apply.RevertWindow:
@@ -184,7 +186,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, queued, failed, stopped, waiting, cutting, cancelled int
+	var completed, running, queued, failed, stopped, waiting, recovering, cutting, cancelled int
 	var runningPct int
 
 	for _, t := range tables {
@@ -198,6 +200,8 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			queued++
 		case state.Task.WaitingForCutover:
 			waiting++
+		case state.Task.RecoveringCutover:
+			recovering++
 		case state.Task.CuttingOver:
 			cutting++
 		case state.Task.Failed:
@@ -235,6 +239,13 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			parts = append(parts, fmt.Sprintf("%d waiting for cutover", waiting))
 		} else {
 			parts = append(parts, "waiting for cutover")
+		}
+	}
+	if recovering > 0 {
+		if multi {
+			parts = append(parts, fmt.Sprintf("%d recovering cutover", recovering))
+		} else {
+			parts = append(parts, "recovering cutover")
 		}
 	}
 	if cutting > 0 {
@@ -312,6 +323,11 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 		} else {
 			fmt.Fprintf(sb, "**`%s`**: %s Waiting for cutover\n", table.TableName, bar)
 		}
+		writeDDLLine(sb, table.DDL)
+
+	case state.Task.RecoveringCutover:
+		bar := ui.ProgressBarWaitingCutover()
+		fmt.Fprintf(sb, "**`%s`**: %s Recovering cutover state...\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.CuttingOver:
@@ -416,6 +432,9 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeFooterAction(sb, "To deploy:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
 	case state.Apply.WaitingForCutover:
 		writeFooterAction(sb, "To proceed with cutover:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
+	case state.Apply.RecoveringCutover:
+		sb.WriteString("\n---\n\n")
+		sb.WriteString("Recovering deferred cutover state after restart. Cutover will be available once recovery completes.\n")
 	case state.Apply.CuttingOver:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")

@@ -87,7 +87,9 @@ package tern
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -104,6 +106,7 @@ import (
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // LocalConfig holds configuration for the local Tern client.
@@ -236,6 +239,34 @@ func (c *LocalClient) credentials() *engine.Credentials {
 		DSN:      c.config.TargetDSN,
 		Metadata: c.config.Metadata,
 	}
+}
+
+func (c *LocalClient) spiritSentinelTableExists(ctx context.Context, apply *storage.Apply) (bool, error) {
+	if apply == nil {
+		return false, fmt.Errorf("apply is required for Spirit sentinel lookup")
+	}
+	db, err := sql.Open("mysql", c.config.TargetDSN)
+	if err != nil {
+		return false, fmt.Errorf("open target database for apply %s sentinel lookup: %w", apply.ApplyIdentifier, err)
+	}
+	defer utils.CloseAndLog(db)
+
+	if err := db.PingContext(ctx); err != nil {
+		return false, fmt.Errorf("ping target database for apply %s sentinel lookup: %w", apply.ApplyIdentifier, err)
+	}
+
+	var exists int
+	err = db.QueryRowContext(ctx,
+		"SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_spirit_sentinel'",
+		apply.Database,
+	).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("query Spirit sentinel table for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
+	}
+	return true, nil
 }
 
 // Health checks the service health.
@@ -672,6 +703,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		switch {
 		case t.State == state.Task.Running ||
 			t.State == state.Task.WaitingForCutover ||
+			t.State == state.Task.RecoveringCutover ||
 			t.State == state.Task.CuttingOver ||
 			t.State == state.Task.RevertWindow:
 			// Prefer actively running/waiting tasks
@@ -782,6 +814,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			// can stay ahead of a stale engine poll; apply state is derived after
 			// task rows are coherent.
 			if !state.IsTerminalTaskState(activeTask.State) {
+				oldTaskState := activeTask.State
 				activeTask.State = taskState
 				now := time.Now()
 				activeTask.UpdatedAt = now
@@ -793,6 +826,17 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				}
 				if err := c.storage.Tasks().Update(ctx, activeTask); err != nil {
 					c.logger.Warn("failed to update task state from progress poll", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "error", err)
+				}
+				if !state.IsState(oldTaskState, taskState) && !state.IsTerminalTaskState(taskState) {
+					if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err != nil {
+						c.logger.Warn("failed to load apply after progress task state update", "apply_id", activeTask.ApplyID, "error", err)
+					} else if apply != nil && !state.IsTerminalApplyState(apply.State) {
+						apply.State = state.DeriveApplyState(taskStates(currentApplyTasks))
+						apply.UpdatedAt = now
+						if err := c.storage.Applies().Update(ctx, apply); err != nil {
+							c.logger.Warn("failed to update apply after progress task state update", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+						}
+					}
 				}
 			}
 
@@ -1070,6 +1114,9 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 		state.IsState(engineTaskState, state.Task.Stopped, state.Task.FailedRetryable) {
 		return engineTaskState
 	}
+	if state.IsState(storedTaskState, state.Task.RecoveringCutover) && state.IsState(engineTaskState, state.Task.WaitingForCutover) {
+		return engineTaskState
+	}
 
 	// Scheduler/control-owned states block stale active engine progress.
 	if blocksActiveEngineProgress(storedTaskState) {
@@ -1096,7 +1143,7 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 // can stop a task while the engine still reports running for a short window, or
 // the scheduler can mark a task failed_retryable before a retry claims it.
 func blocksActiveEngineProgress(taskState string) bool {
-	return state.IsState(taskState, state.Task.Stopped, state.Task.FailedRetryable)
+	return state.IsState(taskState, state.Task.Stopped, state.Task.FailedRetryable, state.Task.RecoveringCutover)
 }
 
 // activeTaskProgressRank orders ordinary active task phases. Terminal states

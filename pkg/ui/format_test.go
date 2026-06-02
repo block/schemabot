@@ -15,6 +15,7 @@ func TestTableStatePriority(t *testing.T) {
 		{state.Task.Running, 0},
 		{state.Task.CuttingOver, 0},
 		{state.Task.WaitingForCutover, 1},
+		{state.Task.RecoveringCutover, 1},
 		{state.Task.Pending, 2},
 		{state.Task.Failed, 3},
 		{state.Task.Stopped, 3},

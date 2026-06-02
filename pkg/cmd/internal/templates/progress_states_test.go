@@ -30,6 +30,7 @@ func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
 	assert.Contains(t, FormatProgressState(state.Apply.ValidatingDeployRequest), "Validating deploy request")
 	assert.Contains(t, FormatProgressState(state.Apply.Cancelled), "Cancelled")
 	assert.Contains(t, FormatProgressState(state.Apply.FailedRetryable), "Retrying")
+	assert.Contains(t, FormatProgressState(state.Apply.RecoveringCutover), "Recovering cutover")
 }
 
 func TestWriteStatusListHasMoreFooter(t *testing.T) {
@@ -224,6 +225,10 @@ func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	}
 	output := FormatTableProgress(tp)
 	assert.Contains(t, output, "Cutting over...")
+
+	tp.Status = state.Apply.RecoveringCutover
+	output = FormatTableProgress(tp)
+	assert.Contains(t, output, "Recovering cutover state...")
 }
 
 func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
@@ -257,6 +262,7 @@ func TestVSchemaStatusLabel(t *testing.T) {
 	assert.Equal(t, "Pending", vschemaStatusLabel(state.Apply.WaitingForDeploy))
 	assert.Contains(t, vschemaStatusLabel(state.Apply.Running), "Applying")
 	assert.Contains(t, vschemaStatusLabel(state.Apply.WaitingForCutover), "Applying")
+	assert.Contains(t, vschemaStatusLabel(state.Apply.RecoveringCutover), "Applying")
 	assert.Contains(t, vschemaStatusLabel(state.Apply.CuttingOver), "Applying")
 	assert.Contains(t, vschemaStatusLabel(state.Apply.Completed), "Applied")
 	assert.Contains(t, vschemaStatusLabel(state.Apply.Failed), "Failed")
@@ -290,6 +296,7 @@ func TestStateColorFunc_PlanetScalePhases(t *testing.T) {
 		state.Apply.ValidatingBranch,
 		state.Apply.CreatingDeployRequest,
 		state.Apply.ValidatingDeployRequest,
+		state.Apply.RecoveringCutover,
 		state.Apply.Cancelled,
 	} {
 		fn := stateColorFunc(s)

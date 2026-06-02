@@ -17,6 +17,7 @@ var Apply = struct {
 	Running           string
 	WaitingForDeploy  string
 	WaitingForCutover string
+	RecoveringCutover string
 	CuttingOver       string
 	RevertWindow      string
 	Completed         string
@@ -39,6 +40,7 @@ var Apply = struct {
 	Running:           "running",
 	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
+	RecoveringCutover: "recovering_cutover",
 	CuttingOver:       "cutting_over",
 	RevertWindow:      "revert_window",
 	Completed:         "completed",
@@ -63,12 +65,13 @@ var Apply = struct {
 //  3. Any task STOPPED → Apply STOPPED
 //  4. Any task REVERTED → Apply REVERTED
 //  5. All tasks COMPLETED → Apply COMPLETED
-//  6. Any task CUTTING_OVER → Apply CUTTING_OVER
-//  7. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
-//  8. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
-//  9. Any task REVERT_WINDOW → Apply REVERT_WINDOW
-//  10. Any task RUNNING → Apply RUNNING
-//  11. Otherwise → Apply PENDING
+//  6. Any task RECOVERING_CUTOVER → Apply RECOVERING_CUTOVER
+//  7. Any task CUTTING_OVER → Apply CUTTING_OVER
+//  8. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
+//  9. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
+//  10. Any task REVERT_WINDOW → Apply REVERT_WINDOW
+//  11. Any task RUNNING → Apply RUNNING
+//  12. Otherwise → Apply PENDING
 //
 // taskStates should be the State field from each Task. Empty slice returns PENDING.
 func DeriveApplyState(taskStates []string) string {
@@ -101,6 +104,9 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.Completed] == total {
 		return Apply.Completed
 	}
+	if counts[Apply.RecoveringCutover] > 0 {
+		return Apply.RecoveringCutover
+	}
 	if counts[Apply.CuttingOver] > 0 {
 		return Apply.CuttingOver
 	}
@@ -132,6 +138,8 @@ func normalizeApplyState(raw string) string {
 		return Apply.WaitingForDeploy
 	case "WAITING_FOR_CUTOVER":
 		return Apply.WaitingForCutover
+	case "RECOVERING_CUTOVER":
+		return Apply.RecoveringCutover
 	case "CUTTING_OVER":
 		return Apply.CuttingOver
 	case "REVERT_WINDOW":

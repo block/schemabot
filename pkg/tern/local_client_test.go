@@ -785,3 +785,9 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 		})
 	}
 }
+
+func TestRecoveringCutoverProtoConversion(t *testing.T) {
+	assert.Equal(t, ternv1.State_STATE_RECOVERING_CUTOVER, storageStateToProto(state.Apply.RecoveringCutover))
+	assert.Equal(t, ternv1.State_STATE_RECOVERING_CUTOVER, storageStateToProto(state.Task.RecoveringCutover))
+	assert.Equal(t, state.Apply.RecoveringCutover, ProtoStateToStorage(ternv1.State_STATE_RECOVERING_CUTOVER))
+}
