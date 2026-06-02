@@ -617,9 +617,19 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]R
 		}}, nil
 	}
 
-	if len(envConfig.Deployments) > 0 {
+	// A non-nil deployments map is authoritative — fall through to scalar
+	// routing only when the map was not configured at all. This mirrors the
+	// validation in Validate() so an explicitly empty `deployments: {}` (or
+	// one with an empty key) returns the same clear error here.
+	if envConfig.Deployments != nil {
+		if len(envConfig.Deployments) == 0 {
+			return nil, fmt.Errorf("database %q environment %q deployments map is empty", database, environment)
+		}
 		deployments := make([]string, 0, len(envConfig.Deployments))
 		for deployment := range envConfig.Deployments {
+			if deployment == "" {
+				return nil, fmt.Errorf("database %q environment %q has a deployments map entry with an empty key", database, environment)
+			}
 			deployments = append(deployments, deployment)
 		}
 		slices.Sort(deployments)

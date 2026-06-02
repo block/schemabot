@@ -917,6 +917,49 @@ func TestServerConfig_ResolveDatabaseTargets(t *testing.T) {
 	})
 }
 
+// TestServerConfig_ResolveDatabaseTargets_BypassValidate covers the cases
+// where a caller constructs a ServerConfig directly without going through
+// Validate() (tests, hot-reload paths, etc.). The resolver must still return
+// a clear error rather than falling through to scalar routing with a
+// misleading "missing server-side target" message.
+func TestServerConfig_ResolveDatabaseTargets_BypassValidate(t *testing.T) {
+	makeCfg := func(env EnvironmentConfig) *ServerConfig {
+		return &ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type:         "mysql",
+					Environments: map[string]EnvironmentConfig{"production": env},
+				},
+			},
+		}
+	}
+
+	t.Run("explicitly empty deployments map errors clearly", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{Deployments: map[string]DeploymentTarget{}})
+		_, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "deployments map is empty")
+	})
+
+	t.Run("empty map key errors clearly", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+			"": {Target: "payments"},
+		}})
+		_, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "empty key")
+	})
+
+	t.Run("entry with empty target errors clearly", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+			"payments-a": {Target: ""},
+		}})
+		_, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `deployment "payments-a" missing target`)
+	})
+}
+
 func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 	baseTern := TernConfig{
 		"payments-a": {"production": "tern-a:9090"},
