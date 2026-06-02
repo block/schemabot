@@ -101,14 +101,16 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
 
-	// Post plan comment
-	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
-
 	// Store per-database check record and update aggregate
-	headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+	headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 	if checkErr != nil {
 		h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", checkErr)
 	}
+	commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
+
+	// Post plan comment
+	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
@@ -263,17 +265,25 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 			continue
 		}
 
-		commentData := buildPlanCommentData(schemaResult, planResp, env, requestedBy)
-		multiEnvData.Plans[env] = &commentData
-
 		// Store per-database check record per environment
-		sha, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env)
+		var recoveredApplyOwnedCheckState bool
+		var sha string
+		var checkErr error
+		if isAutoPlan {
+			sha, checkErr = h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env)
+		} else {
+			sha, recoveredApplyOwnedCheckState, checkErr = h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, env)
+		}
 		if checkErr != nil {
 			h.logger.Error("failed to store plan check record", "repo", repo, "pr", pr, "env", env, "error", checkErr)
 		}
 		if sha != "" {
 			headSHA = sha
 		}
+
+		commentData := buildPlanCommentData(schemaResult, planResp, env, requestedBy)
+		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
+		multiEnvData.Plans[env] = &commentData
 	}
 
 	// Update aggregate check once after all environments are planned.

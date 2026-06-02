@@ -107,6 +107,51 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check)
 	return err
 }
 
+// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check
+// state when a successful no-op plan proves the target already matches the PR schema.
+func (s *checkStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *storage.Check) (bool, error) {
+	if !successfulNoOpPlanResult(check) {
+		return false, nil
+	}
+
+	var checkRunID any
+	if check.CheckRunID != 0 {
+		checkRunID = check.CheckRunID
+	}
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET head_sha = ?,
+		    check_run_id = ?,
+		    apply_id = NULL,
+		    has_changes = ?,
+		    status = ?,
+		    conclusion = ?,
+		    blocking_reason = ?,
+		    error_message = ?
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND status = ? AND head_sha = ? AND apply_id IS NOT NULL
+	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		checkStatusInProgress, check.HeadSHA)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func successfulNoOpPlanResult(check *storage.Check) bool {
+	return check != nil &&
+		check.Status == "completed" &&
+		check.Conclusion == "success" &&
+		!check.HasChanges
+}
+
 // CompleteForApply updates stored check state to a terminal state only if it
 // still belongs to the apply being completed.
 func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {

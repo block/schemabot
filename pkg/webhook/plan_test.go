@@ -192,6 +192,22 @@ func TestRenderPlanComment_ShowsPRHeadSHA(t *testing.T) {
 	assert.NotContains(t, rendered, "**PR head SHA**")
 }
 
+func TestRenderPlanComment_ShowsRecoveredApplyOwnedCheckState(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:                      "testdb",
+		Environment:                   "staging",
+		IsMySQL:                       true,
+		RecoveredApplyOwnedCheckState: true,
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "✅ **No schema changes detected**")
+	assert.Contains(t, rendered, "SchemaBot found stored PR check state")
+	assert.Contains(t, rendered, "still marked as an apply in progress")
+	assert.Contains(t, rendered, "SchemaBot updated the PR check to passing")
+}
+
 func TestRenderMultiEnvPlanComment_ShowsPRHeadSHA(t *testing.T) {
 	data := templates.MultiEnvPlanCommentData{
 		Database:     "testdb",

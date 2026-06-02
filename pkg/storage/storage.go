@@ -89,6 +89,10 @@ type CheckStore interface {
 	// but preserves in-progress apply state for the same PR/environment/database/head SHA.
 	UpsertPlanResult(ctx context.Context, check *Check) error
 
+	// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check state
+	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
+	RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *Check) (bool, error)
+
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
 	// same PR/environment/database. Returns false when another worker changed

@@ -17,6 +17,45 @@ import (
 // No per-database GitHub Check Run is created — only the aggregate is visible on the PR.
 // Returns the commit SHA used for the plan. Failures are non-fatal.
 func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
+	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment)
+	return headSHA, err
+}
+
+// storeManualPlanCheckRecord stores per-database check state after a manual
+// plan and then reconciles same-head apply-owned stored check state when the manual
+// plan proves the target already matches the PR schema.
+func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, bool, error) {
+	headSHA, check, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment)
+	if err != nil {
+		return headSHA, false, err
+	}
+
+	recoveredApplyOwnedCheckState, err := h.service.Storage().Checks().RecoverApplyOwnedCheckWithNoOpPlan(ctx, check)
+	if err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
+		return headSHA, false, fmt.Errorf("recover apply-owned check state with no-op plan repo %s pr %d environment %s database_type %s database %s head_sha %s: %w",
+			repo, pr, environment, schema.Type, schema.Database, headSHA, err)
+	}
+	if recoveredApplyOwnedCheckState {
+		h.logger.Info("no-op plan recovered apply-owned check state",
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"environment", environment,
+			"database_type", schema.Type,
+			"database", schema.Database)
+	}
+	return headSHA, recoveredApplyOwnedCheckState, nil
+}
+
+func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, *storage.Check, error) {
 	headSHA := schema.HeadSHA
 	if headSHA == "" {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -27,7 +66,7 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 			Environment:  environment,
 			Status:       "error",
 		})
-		return "", fmt.Errorf("schema request missing head SHA for stored check state repo %s pr %d environment %s database_type %s database %s",
+		return "", nil, fmt.Errorf("schema request missing head SHA for stored check state repo %s pr %d environment %s database_type %s database %s",
 			repo, pr, environment, schema.Type, schema.Database)
 	}
 
@@ -41,7 +80,7 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 			Environment:  environment,
 			Status:       "error",
 		})
-		return "", fmt.Errorf("fetch PR for stored check state: %w", err)
+		return "", nil, fmt.Errorf("fetch PR for stored check state: %w", err)
 	}
 	if prInfo.HeadSHA != headSHA {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -52,7 +91,7 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 			Environment:  environment,
 			Status:       "stale",
 		})
-		return headSHA, fmt.Errorf("skip stale plan check record for repo %s pr %d environment %s database_type %s database %s: plan head SHA %s no longer matches current head SHA for PR %s",
+		return headSHA, nil, fmt.Errorf("skip stale plan check record for repo %s pr %d environment %s database_type %s database %s: plan head SHA %s no longer matches current head SHA for PR %s",
 			repo, pr, environment, schema.Type, schema.Database, headSHA, prInfo.HeadSHA)
 	}
 
@@ -89,7 +128,7 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 			Environment:  environment,
 			Status:       "error",
 		})
-		return headSHA, fmt.Errorf("store check state: %w", err)
+		return headSHA, nil, fmt.Errorf("store check state: %w", err)
 	}
 
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -100,7 +139,7 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 		Environment:  environment,
 		Status:       "success",
 	})
-	return headSHA, nil
+	return headSHA, check, nil
 }
 
 type applyCheckKey struct {

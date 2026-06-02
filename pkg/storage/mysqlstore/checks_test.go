@@ -353,7 +353,7 @@ func TestCheckStore_UpsertPlanResultPreservesInProgressApply(t *testing.T) {
 		Conclusion:   "",
 	}))
 
-	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
 		Repository:   "org/repo",
 		PullRequest:  123,
 		HeadSHA:      "same-sha",
@@ -363,7 +363,8 @@ func TestCheckStore_UpsertPlanResultPreservesInProgressApply(t *testing.T) {
 		HasChanges:   true,
 		Status:       "completed",
 		Conclusion:   "action_required",
-	}))
+	})
+	require.NoError(t, err)
 
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
 	require.NoError(t, err)
@@ -372,6 +373,194 @@ func TestCheckStore_UpsertPlanResultPreservesInProgressApply(t *testing.T) {
 	require.Equal(t, "in_progress", retrieved.Status)
 	require.Empty(t, retrieved.Conclusion)
 	require.Equal(t, apply.ID, retrieved.ApplyID)
+}
+
+func TestCheckStore_RecoverApplyOwnedCheckWithNoOpPlanRecoversStoredCheckState(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-noop-success", state.Apply.Running)
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:     "org/repo",
+		PullRequest:    123,
+		HeadSHA:        "same-sha",
+		Environment:    "staging",
+		DatabaseType:   "mysql",
+		DatabaseName:   "testdb",
+		ApplyID:        apply.ID,
+		HasChanges:     true,
+		Status:         "in_progress",
+		Conclusion:     "",
+		BlockingReason: "schema_change_running",
+		ErrorMessage:   "schema change is still running",
+	}))
+
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "same-sha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	})
+	require.NoError(t, err)
+
+	recovered, err := store.Checks().RecoverApplyOwnedCheckWithNoOpPlan(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "same-sha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	})
+	require.NoError(t, err)
+	require.True(t, recovered)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "same-sha", retrieved.HeadSHA)
+	require.Equal(t, "completed", retrieved.Status)
+	require.Equal(t, "success", retrieved.Conclusion)
+	require.False(t, retrieved.HasChanges)
+	require.Equal(t, int64(0), retrieved.ApplyID)
+	require.Empty(t, retrieved.BlockingReason)
+	require.Empty(t, retrieved.ErrorMessage)
+}
+
+func TestCheckStore_UpsertPlanResultPreservesApplyOwnedCheckStateOnNoOpSuccess(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-noop-recovery-disabled", state.Apply.Running)
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "same-sha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       "in_progress",
+		Conclusion:   "",
+	}))
+
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "same-sha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	})
+	require.NoError(t, err)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "same-sha", retrieved.HeadSHA)
+	require.Equal(t, "in_progress", retrieved.Status)
+	require.Empty(t, retrieved.Conclusion)
+	require.Equal(t, apply.ID, retrieved.ApplyID)
+}
+
+func TestCheckStore_RecoverApplyOwnedCheckWithNoOpPlanRequiresNoOpSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		applyID    string
+		hasChanges bool
+		status     string
+		conclusion string
+	}{
+		{
+			name:       "plan has changes",
+			applyID:    "apply-plan-has-changes",
+			hasChanges: true,
+			status:     "completed",
+			conclusion: "action_required",
+		},
+		{
+			name:       "plan failed without changes",
+			applyID:    "apply-plan-failed-without-changes",
+			hasChanges: false,
+			status:     "completed",
+			conclusion: "failure",
+		},
+		{
+			name:       "plan failed with changes",
+			applyID:    "apply-plan-failed-with-changes",
+			hasChanges: true,
+			status:     "completed",
+			conclusion: "failure",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			apply := createCheckStoreApply(t, store, tc.applyID, state.Apply.Running)
+			require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+				Repository:   "org/repo",
+				PullRequest:  123,
+				HeadSHA:      "same-sha",
+				Environment:  "staging",
+				DatabaseType: "mysql",
+				DatabaseName: "testdb",
+				ApplyID:      apply.ID,
+				HasChanges:   true,
+				Status:       "in_progress",
+				Conclusion:   "",
+			}))
+
+			err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
+				Repository:   "org/repo",
+				PullRequest:  123,
+				HeadSHA:      "same-sha",
+				Environment:  "staging",
+				DatabaseType: "mysql",
+				DatabaseName: "testdb",
+				HasChanges:   tc.hasChanges,
+				Status:       tc.status,
+				Conclusion:   tc.conclusion,
+			})
+			require.NoError(t, err)
+
+			recovered, err := store.Checks().RecoverApplyOwnedCheckWithNoOpPlan(ctx, &storage.Check{
+				Repository:   "org/repo",
+				PullRequest:  123,
+				HeadSHA:      "same-sha",
+				Environment:  "staging",
+				DatabaseType: "mysql",
+				DatabaseName: "testdb",
+				HasChanges:   tc.hasChanges,
+				Status:       tc.status,
+				Conclusion:   tc.conclusion,
+			})
+			require.NoError(t, err)
+			require.False(t, recovered)
+
+			retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+			require.NoError(t, err)
+			require.NotNil(t, retrieved)
+			require.Equal(t, "same-sha", retrieved.HeadSHA)
+			require.Equal(t, "in_progress", retrieved.Status)
+			require.Empty(t, retrieved.Conclusion)
+			require.Equal(t, apply.ID, retrieved.ApplyID)
+		})
+	}
 }
 
 func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheck(t *testing.T) {
@@ -391,7 +580,7 @@ func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheck(t *testing.T)
 		Conclusion:   "",
 	}))
 
-	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
 		Repository:   "org/repo",
 		PullRequest:  123,
 		HeadSHA:      "same-sha",
@@ -401,7 +590,8 @@ func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheck(t *testing.T)
 		HasChanges:   true,
 		Status:       "completed",
 		Conclusion:   "action_required",
-	}))
+	})
+	require.NoError(t, err)
 
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
 	require.NoError(t, err)
@@ -431,7 +621,7 @@ func TestCheckStore_UpsertPlanResultReplacesInProgressApplyOnNewHead(t *testing.
 		Conclusion:   "",
 	}))
 
-	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
 		Repository:   "org/repo",
 		PullRequest:  123,
 		HeadSHA:      "newsha",
@@ -441,7 +631,8 @@ func TestCheckStore_UpsertPlanResultReplacesInProgressApplyOnNewHead(t *testing.
 		HasChanges:   true,
 		Status:       "completed",
 		Conclusion:   "action_required",
-	}))
+	})
+	require.NoError(t, err)
 
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
 	require.NoError(t, err)
@@ -471,7 +662,7 @@ func TestCheckStore_UpsertPlanResultClearsApplyIDWhenNotInProgress(t *testing.T)
 		Conclusion:   "success",
 	}))
 
-	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
 		Repository:   "org/repo",
 		PullRequest:  123,
 		HeadSHA:      "newsha",
@@ -481,7 +672,8 @@ func TestCheckStore_UpsertPlanResultClearsApplyIDWhenNotInProgress(t *testing.T)
 		HasChanges:   true,
 		Status:       "completed",
 		Conclusion:   "action_required",
-	}))
+	})
+	require.NoError(t, err)
 
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
 	require.NoError(t, err)

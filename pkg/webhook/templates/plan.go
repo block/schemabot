@@ -55,6 +55,8 @@ type PlanCommentData struct {
 	// Auto-confirm state
 	AutoConfirm                bool   // -y flag was used, will auto-execute
 	AutoConfirmDowngradeReason string // Non-empty: -y was downgraded to manual, this is the reason
+
+	RecoveredApplyOwnedCheckState bool
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -99,7 +101,7 @@ func RenderPlanComment(data PlanCommentData) string {
 
 	// No changes — short-circuit with a single clean message
 	if totalChanges == 0 {
-		sb.WriteString("✅ **No schema changes detected**\n")
+		writeNoChangesDetected(&sb, data)
 		return sb.String()
 	}
 
@@ -241,7 +243,8 @@ func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithD
 func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspacesWithDDL, keyspacesWithVSchema int) {
 	totalChanges := totalStatements + keyspacesWithVSchema
 	if totalChanges == 0 {
-		sb.WriteString("✅ **No schema changes detected**\n\n")
+		writeNoChangesDetected(sb, data)
+		sb.WriteString("\n")
 		return
 	}
 
@@ -267,6 +270,13 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	} else {
 		// Fallback for unrecognized statement types
 		fmt.Fprintf(sb, "📋 **Plan**: %d DDL %s\n\n", totalStatements, pluralize("statement", totalStatements))
+	}
+}
+
+func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
+	sb.WriteString("✅ **No schema changes detected**\n")
+	if data.RecoveredApplyOwnedCheckState {
+		sb.WriteString("\nℹ️ SchemaBot found stored PR check state for this database/environment that was still marked as an apply in progress. Because this fresh plan shows the target schema already matches this PR, SchemaBot updated the PR check to passing.\n")
 	}
 }
 
