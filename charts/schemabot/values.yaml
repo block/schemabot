@@ -48,6 +48,27 @@ grpc:
 #       default:
 #         staging: "tern-staging:9090"
 #         production: "tern-production:9090"
+#
+# Example (gRPC mode, multi-deployment environment):
+#   config:
+#     storage:
+#       dsn: "secretsmanager:schemabot-db#dsn"
+#     databases:
+#       payments:
+#         type: mysql
+#         environments:
+#           production:
+#             deployments:
+#               payments-a: { target: "payments" }
+#               payments-b: { target: "payments" }
+#               payments-c: { target: "payments" }
+#     tern_deployments:
+#       payments-a:
+#         production: "tern-payments-a:9090"
+#       payments-b:
+#         production: "tern-payments-b:9090"
+#       payments-c:
+#         production: "tern-payments-c:9090"
 # config is required — helm install will fail without it.
 config: null
 
