@@ -865,7 +865,10 @@ func TestServerConfig_ResolveDatabaseTargets(t *testing.T) {
 			"payments-c": {"production": "tern-c:9090"},
 		},
 	}
-	require.NoError(t, cfg.Validate())
+	// This test exercises the resolver directly on a hand-built config so
+	// it can cover multi-deployment resolution; the Validate() gate on
+	// multi-deployment maps is covered separately by
+	// TestServerConfig_DeploymentsMapValidation.
 
 	t.Run("local DSN returns single element", func(t *testing.T) {
 		got, err := cfg.ResolveDatabaseTargets("localdb", "staging")
@@ -973,14 +976,24 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 		wantErrSub string
 	}{
 		{
-			name: "valid deployments map",
+			name: "valid single-entry deployments map",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+			},
+			tern: baseTern,
+		},
+		{
+			name: "multi-entry deployments map is rejected until orchestration is wired",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
 					"payments-a": {Target: "payments"},
 					"payments-b": {Target: "payments"},
 				},
 			},
-			tern: baseTern,
+			tern:       baseTern,
+			wantErrSub: "multi-deployment (>1 entries) is not yet supported",
 		},
 		{
 			name: "mixing scalar and map is rejected",

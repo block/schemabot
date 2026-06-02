@@ -49,7 +49,11 @@ grpc:
 #         staging: "tern-staging:9090"
 #         production: "tern-production:9090"
 #
-# Example (gRPC mode, multi-deployment environment):
+# Example (gRPC mode, multi-deployment environment — PREVIEW):
+# NOTE: multi-entry deployments maps are rejected at config load until the
+# plan/apply orchestration path is wired through ResolveDatabaseTargets.
+# A single-entry deployments map is accepted and behaves identically to the
+# scalar target / deployment shape.
 #   config:
 #     storage:
 #       dsn: "secretsmanager:schemabot-db#dsn"

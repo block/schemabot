@@ -111,9 +111,11 @@ In gRPC mode, `target` is an opaque identifier understood by the remote Tern ser
 
 The example above is a single SchemaBot deployment that owns both environments. In environment-isolated deployments, each SchemaBot config should contain only the targets for the environments that instance owns. Use `allowed_environments` to scope each instance.
 
-## Multi-Deployment Environment
+## Multi-Deployment Environment (preview)
 
-A single environment can be fanned out to multiple Tern deployments by replacing the scalar `target` / `deployment` pair with a `deployments` map. Each entry's key is a Tern deployment name (which MUST also exist as a key in `tern_deployments`), and each value carries the per-deployment `target`.
+A single environment will eventually be able to fan out to multiple Tern deployments by replacing the scalar `target` / `deployment` pair with a `deployments` map. Each entry's key is a Tern deployment name (which MUST also exist as a key in `tern_deployments`), and each value carries the per-deployment `target`.
+
+> **Not yet enabled in this release.** The config shape and resolver API are landed, but the plan/apply orchestration path still consumes a single deployment per `(database, environment)`. To prevent silent failures, `Validate()` currently rejects any `deployments` map with more than one entry. A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape.
 
 ```yaml
 storage:
@@ -145,7 +147,8 @@ Rules:
 
 - `deployments` is mutually exclusive with the scalar `target` / `deployment` fields and with a local `dsn` / `dsn_from`.
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
-- Single-deployment environments continue to use the scalar `target` / `deployment` shape.
+- Until the orchestration path is wired, the map MUST contain exactly one entry; multi-entry maps are rejected at config load.
+- Single-deployment environments should continue to use the scalar `target` / `deployment` shape.
 
 Resolution order from the config layer is deterministic and sorted by deployment key. Server-owned cross-deployment ordering (e.g. rolling deploys across regions) is a forthcoming addition that will live alongside `environment_order`.
 
