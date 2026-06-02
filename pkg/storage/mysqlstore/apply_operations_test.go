@@ -4,6 +4,7 @@ package mysqlstore
 
 import (
 	"database/sql"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -492,7 +493,10 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleRunning(t *testin
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_SkipsTerminal verifies that
-// terminal rows (completed/failed) are never re-claimed by recovery.
+// every terminal state listed in state.IsApplyOperationTerminal is excluded
+// from the claim. ApplyOperation shares the full Apply state vocabulary, so
+// the contract has to hold for completed, failed, stopped, cancelled, and
+// reverted — not just the two that show up most often.
 func TestApplyOperationStore_FindNextApplyOperation_SkipsTerminal(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -501,27 +505,41 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsTerminal(t *testing.T) 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_op_skip_terminal", 1)
 
-	completedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-a",
-	})
-	require.NoError(t, err)
-	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, completedID))
+	terminalStates := []string{
+		state.ApplyOperation.Completed,
+		state.ApplyOperation.Failed,
+		state.ApplyOperation.Stopped,
+		state.ApplyOperation.Cancelled,
+		state.ApplyOperation.Reverted,
+	}
 
-	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-b",
-	})
-	require.NoError(t, err)
-	require.NoError(t, store.ApplyOperations().MarkFailed(ctx, failedID, "boom"))
+	var ids []int64
+	for i, terminalState := range terminalStates {
+		require.True(t, state.IsApplyOperationTerminal(terminalState),
+			"terminalStates[%d]=%q is not actually terminal — fix the test fixture", i, terminalState)
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID:    apply.ID,
+			Deployment: fmt.Sprintf("region-%d", i),
+			State:      terminalState,
+		})
+		require.NoError(t, err)
+		ids = append(ids, id)
+	}
 
-	// Backdate both so staleness can't be the reason they're skipped.
-	_, err = testDB.ExecContext(ctx, `
-		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id IN (?, ?)
-	`, completedID, failedID)
+	// Backdate every row so staleness can't be the reason they're skipped;
+	// the only thing keeping them off the claim list must be their state.
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	_, err := testDB.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id IN (%s)
+	`, placeholders(len(ids))), args...)
 	require.NoError(t, err)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
 	require.NoError(t, err)
-	assert.Nil(t, claimed, "terminal rows must never be re-claimed")
+	assert.Nil(t, claimed, "terminal rows must never be re-claimed (full vocabulary)")
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims verifies
