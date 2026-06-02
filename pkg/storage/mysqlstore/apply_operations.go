@@ -213,6 +213,109 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 	return s.checkUpdatedOrExists(ctx, result, id)
 }
 
+// applyOperationHeartbeatStaleness is the lease window after which a claimed
+// apply_operations row may be re-claimed by another worker. Mirrors the apply
+// heartbeat staleness in applies.go.
+const applyOperationHeartbeatStaleness = "1 MINUTE"
+
+// FindNextApplyOperation atomically claims the next apply_operations row that
+// needs attention and refreshes its heartbeat in the same transaction.
+//
+// Pending rows are transitioned to running and stamped with started_at;
+// already-active rows with a stale heartbeat (updated_at older than the
+// staleness window) are re-leased without changing their state. Terminal
+// rows are never claimed.
+//
+// Mirrors ApplyStore.FindNextApply: SELECT ... FOR UPDATE SKIP LOCKED to
+// avoid worker races, READ COMMITTED isolation to prevent next-key range
+// locks from serializing claims across otherwise independent rows.
+//
+// Pure storage primitive: no caller wires this in yet. The per-deployment
+// claim loop arrives in a subsequent PR in the multi-deployment apply
+// workstream.
+func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*storage.ApplyOperation, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin claim apply_operation transaction: %w", err)
+	}
+	defer rollbackApplyTx(ctx, tx, "claim apply_operation")
+
+	activeStates := claimableApplyStates()
+	activeStatePlaceholders := placeholders(len(activeStates))
+
+	queryArgs := []any{state.ApplyOperation.Pending}
+	queryArgs = append(queryArgs, stringArgs(activeStates)...)
+
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM apply_operations
+		WHERE (
+			state = ?
+			OR (state IN (%s) AND updated_at < NOW() - INTERVAL %s)
+		)
+		ORDER BY created_at, id
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED
+	`, applyOperationColumns, activeStatePlaceholders, applyOperationHeartbeatStaleness), queryArgs...)
+
+	ad, err := scanApplyOperationInto(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // nothing to claim
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query next claimable apply_operation: %w", err)
+	}
+
+	if ad.State == state.ApplyOperation.Pending {
+		// Pending → running: stamp started_at and update the heartbeat in the
+		// same write. WHERE state = ? guards against a concurrent transition
+		// landing between the SELECT and this UPDATE; RowsAffected == 0 means
+		// another writer already moved the row, so we back off cleanly.
+		result, err := tx.ExecContext(ctx, `
+			UPDATE apply_operations
+			SET state = ?, started_at = COALESCE(started_at, NOW()), updated_at = NOW()
+			WHERE id = ? AND state = ?
+		`, state.ApplyOperation.Running, ad.ID, state.ApplyOperation.Pending)
+		if err != nil {
+			return nil, fmt.Errorf("claim pending apply_operation %d: %w", ad.ID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("read claim rows affected for apply_operation %d: %w", ad.ID, err)
+		}
+		if rows == 0 {
+			return nil, nil
+		}
+	} else {
+		// Already-active stale row: just refresh the heartbeat as our lease.
+		_, err = tx.ExecContext(ctx, `
+			UPDATE apply_operations SET updated_at = NOW() WHERE id = ?
+		`, ad.ID)
+		if err != nil {
+			return nil, fmt.Errorf("refresh heartbeat for claimed apply_operation %d: %w", ad.ID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claim apply_operation %d: %w", ad.ID, err)
+	}
+
+	return ad, nil
+}
+
+// Heartbeat refreshes updated_at to maintain the claim's lease. Should be
+// called periodically by a worker holding the lease. Silent no-op when the
+// row no longer exists (mirrors ApplyStore.Heartbeat).
+func (s *applyOperationStore) Heartbeat(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() WHERE id = ?
+	`, id)
+	if err != nil {
+		return fmt.Errorf("heartbeat apply_operation %d: %w", id, err)
+	}
+	return nil
+}
+
 // DeleteByApply removes all child rows for an apply.
 func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM apply_operations WHERE apply_id = ?`, applyID)

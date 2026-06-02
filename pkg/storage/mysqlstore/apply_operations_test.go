@@ -4,7 +4,9 @@ package mysqlstore
 
 import (
 	"database/sql"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -391,6 +393,260 @@ func TestApplyOperationStore_MarkFailed_Idempotent(t *testing.T) {
 	require.NotNil(t, second.CompletedAt)
 	assert.Equal(t, first.CompletedAt.UnixNano(), second.CompletedAt.UnixNano(),
 		"COALESCE should preserve original completed_at across repeat MarkFailed calls")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_ClaimsPending verifies that
+// a freshly inserted pending child row is claimable: returned to the caller,
+// transitioned to running, and stamped with started_at + heartbeat in one
+// transaction. A second immediate claim returns nil because no other row
+// needs work.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsPending(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_claim_pending", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, "region-a", claimed.Deployment)
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.Running, persisted.State, "pending claim must transition to running")
+	require.NotNil(t, persisted.StartedAt, "pending claim must stamp started_at")
+
+	// No other claimable rows → second call returns nil cleanly.
+	again, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, again)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SkipsFreshRunning verifies
+// that a running row whose heartbeat is fresh is *not* re-claimed: the active
+// worker still owns it.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsFreshRunning(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_skip_fresh", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApplyOperations().MarkStarted(ctx, id))
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "fresh running rows must not be re-claimed")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleRunning verifies
+// the recovery path: an active row whose heartbeat is older than the staleness
+// window is re-claimed without changing its state, and the heartbeat is
+// refreshed.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleRunning(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_claim_stale", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApplyOperations().MarkStarted(ctx, id))
+
+	// Backdate the heartbeat past the staleness window.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Running, claimed.State, "stale running row must keep its state on re-claim")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.Running, persisted.State)
+	// Heartbeat refreshed inside the claim transaction.
+	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SkipsTerminal verifies that
+// terminal rows (completed/failed) are never re-claimed by recovery.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsTerminal(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_skip_terminal", 1)
+
+	completedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, completedID))
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b",
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.ApplyOperations().MarkFailed(ctx, failedID, "boom"))
+
+	// Backdate both so staleness can't be the reason they're skipped.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id IN (?, ?)
+	`, completedID, failedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "terminal rows must never be re-claimed")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims verifies
+// the SKIP LOCKED contract on a contended row: N workers race to claim a
+// single pending child row, and exactly one wins. Mirrors the apply-level
+// TestApplyStore_FindNextApplyConcurrentPendingClaims.
+func TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_concurrent", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+
+	const workers = 16
+	stores := make([]*Storage, workers)
+	for i := range workers {
+		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		require.NoError(t, openErr)
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		t.Cleanup(func() {
+			require.NoError(t, db.Close())
+		})
+		stores[i] = New(db)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var claimed []*storage.ApplyOperation
+	var claimErrors []error
+
+	for i := range workers {
+		workerStore := stores[i]
+		wg.Go(func() {
+			<-start
+			got, claimErr := workerStore.ApplyOperations().FindNextApplyOperation(ctx)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if claimErr != nil {
+				claimErrors = append(claimErrors, claimErr)
+				return
+			}
+			if got != nil {
+				claimed = append(claimed, got)
+			}
+		})
+	}
+
+	close(start)
+	wg.Wait()
+
+	require.Empty(t, claimErrors)
+	require.Len(t, claimed, 1, "only one worker should claim a single pending apply_operation")
+	assert.Equal(t, "region-a", claimed[0].Deployment)
+	assert.Equal(t, state.ApplyOperation.Pending, claimed[0].State, "caller sees the pre-claim state")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.Running, persisted.State)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_DBError covers the error
+// surface when the underlying connection is gone.
+func TestApplyOperationStore_FindNextApplyOperation_DBError(t *testing.T) {
+	db, err := sql.Open("mysql", testDSN)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	store := New(db)
+	_, err = store.ApplyOperations().FindNextApplyOperation(t.Context())
+	require.Error(t, err)
+}
+
+// TestApplyOperationStore_Heartbeat verifies that Heartbeat moves updated_at
+// forward for an existing row and is a silent no-op for an unknown id.
+func TestApplyOperationStore_Heartbeat(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_heartbeat", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+
+	// Backdate updated_at so the heartbeat refresh is observable.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 5 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	before, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+
+	require.NoError(t, store.ApplyOperations().Heartbeat(ctx, id))
+
+	after, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	assert.True(t, after.UpdatedAt.After(before.UpdatedAt), "Heartbeat must move updated_at forward")
+	assert.WithinDuration(t, time.Now(), after.UpdatedAt, 5*time.Second)
+
+	// Silent no-op on unknown id (matches ApplyStore.Heartbeat semantics).
+	require.NoError(t, store.ApplyOperations().Heartbeat(ctx, 999999))
+}
+
+func TestApplyOperationStore_Heartbeat_DBError(t *testing.T) {
+	db, err := sql.Open("mysql", testDSN)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	store := New(db)
+	err = store.ApplyOperations().Heartbeat(t.Context(), 1)
+	require.Error(t, err)
 }
 
 func TestApplyOperationStore_DeleteByApply(t *testing.T) {

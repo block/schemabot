@@ -359,6 +359,26 @@ type ApplyOperationStore interface {
 	// MarkFailed sets state=failed, error_message, and completed_at on a child row.
 	MarkFailed(ctx context.Context, id int64, errMsg string) error
 
+	// FindNextApplyOperation atomically claims the next child row that needs
+	// attention and refreshes its heartbeat in the same transaction.
+	//
+	// Pending rows are transitioned to running and stamped with started_at;
+	// already-active rows whose heartbeat has been stale for more than one
+	// minute are re-leased without changing their state. Terminal rows
+	// (completed/failed/cancelled/stopped/reverted) are never claimed.
+	//
+	// Returns the claimed row, or nil if nothing needs work.
+	//
+	// Pure storage primitive: no scheduler/operator loop calls this yet —
+	// the per-deployment claim loop arrives in a subsequent PR in the
+	// multi-deployment apply workstream.
+	FindNextApplyOperation(ctx context.Context) (*ApplyOperation, error)
+
+	// Heartbeat refreshes the child row's updated_at timestamp to extend the
+	// claim's lease while a worker is acting on it. Mirrors ApplyStore.Heartbeat
+	// semantics: silent no-op when the row no longer exists.
+	Heartbeat(ctx context.Context, id int64) error
+
 	// DeleteByApply removes all child rows for an apply (cleanup on apply delete).
 	DeleteByApply(ctx context.Context, applyID int64) error
 }
