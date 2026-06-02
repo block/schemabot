@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	gomysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -1909,7 +1911,12 @@ func TestServerConfig_AppsValidation(t *testing.T) {
 			repos:  map[string]RepoConfig{"org/repo": {}},
 		},
 		{
-			name: "multi-app happy path",
+			// apps: is the new config shape but the webhook runtime is not
+			// yet wired to consult it (buildWebhookRuntime only checks the
+			// legacy github: block). Accepting apps: here would start a
+			// server with a silently-disabled webhook endpoint, so the
+			// validator fails closed until the runtime is wired.
+			name: "well-formed multi-app config is rejected until runtime is wired",
 			apps: map[string]GitHubAppConfig{
 				"app-a": validApp,
 				"app-b": validApp,
@@ -1918,13 +1925,16 @@ func TestServerConfig_AppsValidation(t *testing.T) {
 				"org-a/repo-x": {GitHubApp: "app-a"},
 				"org-b/repo-y": {GitHubApp: "app-b"},
 			},
+			wantErrSub: "apps: is configured but the webhook runtime does not yet route to it",
 		},
 		{
-			name: "single-entry apps: requires github_app on repos",
-			apps: map[string]GitHubAppConfig{"only": validApp},
-			repos: map[string]RepoConfig{
-				"org/repo": {GitHubApp: "only"},
-			},
+			// Same fail-closed rule applies even to a single-entry apps: map.
+			// It would otherwise be behaviourally equivalent to the legacy
+			// github: block, but the runtime can't dispatch to it yet.
+			name:       "single-entry apps: is rejected until runtime is wired",
+			apps:       map[string]GitHubAppConfig{"only": validApp},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "only"}},
+			wantErrSub: "apps: is configured but the webhook runtime does not yet route to it",
 		},
 		{
 			name:       "github: and apps: together is rejected",
@@ -2100,7 +2110,9 @@ func TestServerConfig_ResolveGitHubAppForRepo(t *testing.T) {
 
 // TestLoadServerConfigFromFile_MultiApp end-to-end-parses the new YAML shape
 // to confirm the apps: map and per-repo github_app: field round-trip through
-// LoadServerConfigFromFile (including KnownFields(true)).
+// the YAML decoder (including KnownFields(true)), then asserts that
+// LoadServerConfigFromFile still fails closed on multi-app configs because
+// the webhook runtime is not yet wired to dispatch to them.
 func TestLoadServerConfigFromFile_MultiApp(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
@@ -2131,11 +2143,23 @@ repos:
 	err := os.WriteFile(configPath, []byte(content), 0644)
 	require.NoError(t, err)
 
-	cfg, err := LoadServerConfigFromFile(configPath)
+	// Parse-only round-trip: confirm the YAML field tags decode correctly,
+	// independent of the Validate() hard-block.
+	raw, err := os.ReadFile(configPath)
 	require.NoError(t, err)
-	require.Contains(t, cfg.Apps, "app-a")
-	require.Contains(t, cfg.Apps, "app-b")
-	assert.Equal(t, "env:APP_A_ID", cfg.Apps["app-a"].AppID)
-	assert.Equal(t, "app-a", cfg.Repos["org-a/repo-x"].GitHubApp)
-	assert.Equal(t, "app-b", cfg.Repos["org-b/repo-y"].GitHubApp)
+	var parsed ServerConfig
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	require.NoError(t, dec.Decode(&parsed))
+	require.Contains(t, parsed.Apps, "app-a")
+	require.Contains(t, parsed.Apps, "app-b")
+	assert.Equal(t, "env:APP_A_ID", parsed.Apps["app-a"].AppID)
+	assert.Equal(t, "app-a", parsed.Repos["org-a/repo-x"].GitHubApp)
+	assert.Equal(t, "app-b", parsed.Repos["org-b/repo-y"].GitHubApp)
+
+	// Full load goes through Validate() which fails closed on multi-app
+	// configs until the webhook runtime is wired to dispatch to them.
+	_, err = LoadServerConfigFromFile(configPath)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apps: is configured but the webhook runtime does not yet route to it")
 }

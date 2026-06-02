@@ -464,9 +464,11 @@ safe. This usually means the repo config and server config disagree. Align the
 `schemabot.yaml` environments with the deployment's `allowed_environments`, then
 run `schemabot plan -e <environment>` or push a new commit to refresh checks.
 
-## Multi-App Routing
+## Multi-App Routing (PREVIEW — config rejected at load)
 
-A single SchemaBot process can serve webhooks for repositories owned by multiple GitHub Apps — for example, one App per GitHub org, or one App per tenant within a single org. Each App has its own credentials and webhook secret, and each repository declares which App owns it.
+A single SchemaBot process will be able to serve webhooks for repositories owned by multiple GitHub Apps — for example, one App per GitHub org, or one App per tenant within a single org. Each App has its own credentials and webhook secret, and each repository declares which App owns it.
+
+> **Status:** This release lands the config shape, validation, and resolver API only. The webhook runtime is not yet wired to dispatch by App, so accepting an `apps:` config would start a server with a silently-disabled webhook endpoint. To fail closed, **`Validate()` rejects any config that sets `apps:`** until the webhook dispatch wiring (per-App HMAC verification, per-App installation token minting) lands in the follow-up PR. The block below documents the intended shape so downstream chart authors can prepare values without surprises when the gate lifts.
 
 ```yaml
 apps:
@@ -486,7 +488,7 @@ repos:
     github_app: app-b
 ```
 
-Rules:
+Rules (enforced once the runtime is wired; today's hard-block fires before these):
 
 - `github:` and `apps:` are mutually exclusive — configure one or the other, not both.
 - When `apps:` is configured, every entry in `repos:` MUST set `github_app:` to one of the configured app names. Unknown names are rejected at config load.
@@ -494,8 +496,6 @@ Rules:
 - The legacy single-App `github:` shape continues to work unchanged.
 
 The map key under `apps:` is the App's stable logical name and the value that flows into log lines and metrics. Each entry MUST provide a non-empty `app-id`, `private-key`, and `webhook-secret`; all three accept the same secret-resolution prefixes as the legacy `github:` block (see [Secret Resolution](#secret-resolution)).
-
-> **Note:** This release lands the config shape, validation, and resolver API. Webhook dispatch wiring (per-App HMAC verification, per-App installation token minting) is wired in a follow-up PR. Until then, configuring `apps:` is accepted by `Validate()` but the webhook handler still consumes the legacy `github:` field.
 
 ## Secret Resolution
 

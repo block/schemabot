@@ -612,7 +612,12 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 				return fmt.Errorf("repository %q references unknown github_app %q", repo, repoConfig.GitHubApp)
 			}
 		}
-		return nil
+		// The webhook runtime is not yet wired to consult apps: — it only
+		// installs a webhook handler when the legacy github: block is set,
+		// otherwise it returns 503. Accepting apps: here would start a
+		// server with a silently-disabled webhook endpoint. Fail closed at
+		// config load until the runtime is wired to use Apps.
+		return fmt.Errorf("apps: is configured but the webhook runtime does not yet route to it; remove apps: and use the legacy github: block until multi-app webhook support lands")
 	}
 
 	// Apps not configured — github_app on a repo would be silently ignored,

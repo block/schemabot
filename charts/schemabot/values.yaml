@@ -74,8 +74,11 @@ grpc:
 #       payments-c:
 #         production: "tern-payments-c:9090"
 #
-# Example (multi-App routing — one SchemaBot process serving multiple GitHub
-# Apps; webhook dispatch wiring lands in a follow-up PR):
+# Example (multi-App routing — PREVIEW):
+# NOTE: configs that set apps: are rejected at config load until the
+# webhook runtime is wired to dispatch by App. The shape below is the
+# intended one so chart authors can prepare values without surprises
+# when the hard-block lifts in the follow-up PR.
 #   config:
 #     storage:
 #       dsn: "env:MYSQL_DSN"
