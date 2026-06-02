@@ -1617,3 +1617,271 @@ func TestGitHubConfig_ResolveWebhookSecret(t *testing.T) {
 		assert.Equal(t, "env-webhook-secret", secret)
 	})
 }
+
+// validMultiAppDB returns a minimal valid Databases map for tests focused on
+// the apps:/github_app: surface — every Validate() call needs a non-empty
+// Databases registry.
+func validMultiAppDB() map[string]DatabaseConfig {
+	return map[string]DatabaseConfig{
+		"app": {
+			Type: storage.DatabaseTypeMySQL,
+			Environments: map[string]EnvironmentConfig{
+				"staging": {DSN: "root@tcp(localhost)/app"},
+			},
+		},
+	}
+}
+
+// TestServerConfig_AppsValidation covers the back-compat matrix that gates
+// the multi-App config shape and its interaction with the legacy single-App
+// GitHub field and per-repo github_app routing.
+func TestServerConfig_AppsValidation(t *testing.T) {
+	validApp := GitHubAppConfig{
+		AppID:         "12345",
+		PrivateKey:    "env:DOES_NOT_MATTER_FOR_PARSE",
+		WebhookSecret: "env:DOES_NOT_MATTER_FOR_PARSE",
+	}
+
+	cases := []struct {
+		name       string
+		github     GitHubConfig
+		apps       map[string]GitHubAppConfig
+		repos      map[string]RepoConfig
+		wantErrSub string
+	}{
+		{
+			name:   "legacy single-app github: still works",
+			github: GitHubConfig{AppID: "42", PrivateKey: "env:PK", WebhookSecret: "env:WS"},
+			repos:  map[string]RepoConfig{"org/repo": {}},
+		},
+		{
+			name: "multi-app happy path",
+			apps: map[string]GitHubAppConfig{
+				"app-a": validApp,
+				"app-b": validApp,
+			},
+			repos: map[string]RepoConfig{
+				"org-a/repo-x": {GitHubApp: "app-a"},
+				"org-b/repo-y": {GitHubApp: "app-b"},
+			},
+		},
+		{
+			name: "single-entry apps: requires github_app on repos",
+			apps: map[string]GitHubAppConfig{"only": validApp},
+			repos: map[string]RepoConfig{
+				"org/repo": {GitHubApp: "only"},
+			},
+		},
+		{
+			name:       "github: and apps: together is rejected",
+			github:     GitHubConfig{AppID: "42", PrivateKey: "env:PK", WebhookSecret: "env:WS"},
+			apps:       map[string]GitHubAppConfig{"app-a": validApp},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+			wantErrSub: "github: and apps: are mutually exclusive",
+		},
+		{
+			name:       "apps: present but empty is rejected",
+			apps:       map[string]GitHubAppConfig{},
+			wantErrSub: "apps: is configured but contains no entries",
+		},
+		{
+			name: "app missing app-id is rejected",
+			apps: map[string]GitHubAppConfig{
+				"app-a": {PrivateKey: "env:PK", WebhookSecret: "env:WS"},
+			},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+			wantErrSub: `app "app-a" missing app-id`,
+		},
+		{
+			name: "app missing private-key is rejected",
+			apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "42", WebhookSecret: "env:WS"},
+			},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+			wantErrSub: `app "app-a" missing private-key`,
+		},
+		{
+			name: "app missing webhook-secret is rejected",
+			apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "42", PrivateKey: "env:PK"},
+			},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+			wantErrSub: `app "app-a" missing webhook-secret`,
+		},
+		{
+			name: "repo without github_app under apps: is rejected",
+			apps: map[string]GitHubAppConfig{"app-a": validApp},
+			repos: map[string]RepoConfig{
+				"org/repo": {},
+			},
+			wantErrSub: `repository "org/repo" is missing github_app`,
+		},
+		{
+			name: "repo with unknown github_app is rejected",
+			apps: map[string]GitHubAppConfig{"app-a": validApp},
+			repos: map[string]RepoConfig{
+				"org/repo": {GitHubApp: "app-z"},
+			},
+			wantErrSub: `references unknown github_app "app-z"`,
+		},
+		{
+			name: "github_app on repo without apps: is rejected",
+			repos: map[string]RepoConfig{
+				"org/repo": {GitHubApp: "app-a"},
+			},
+			wantErrSub: `sets github_app "app-a" but apps: is not configured`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := ServerConfig{
+				GitHub:    tc.github,
+				Apps:      tc.apps,
+				Repos:     tc.repos,
+				Databases: validMultiAppDB(),
+			}
+			err := cfg.Validate()
+			if tc.wantErrSub == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErrSub)
+		})
+	}
+}
+
+func TestServerConfig_ResolveGitHubAppForRepo(t *testing.T) {
+	validApp := GitHubAppConfig{
+		AppID:         "42",
+		PrivateKey:    "env:PK",
+		WebhookSecret: "env:WS",
+	}
+
+	t.Run("multi-app resolves to named app", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": validApp,
+				"app-b": {AppID: "99", PrivateKey: "env:PK2", WebhookSecret: "env:WS2"},
+			},
+			Repos: map[string]RepoConfig{
+				"org-a/repo-x": {GitHubApp: "app-a"},
+				"org-b/repo-y": {GitHubApp: "app-b"},
+			},
+		}
+		got, err := cfg.ResolveGitHubAppForRepo("org-a/repo-x")
+		require.NoError(t, err)
+		assert.Equal(t, "app-a", got.Name)
+		assert.Equal(t, "42", got.Config.AppID)
+
+		got, err = cfg.ResolveGitHubAppForRepo("org-b/repo-y")
+		require.NoError(t, err)
+		assert.Equal(t, "app-b", got.Name)
+		assert.Equal(t, "99", got.Config.AppID)
+	})
+
+	t.Run("multi-app errors for repo not in repos", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{"app-a": validApp},
+			Repos: map[string]RepoConfig{
+				"org-a/repo-x": {GitHubApp: "app-a"},
+			},
+		}
+		_, err := cfg.ResolveGitHubAppForRepo("org-z/unknown")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not declared in the repos config")
+	})
+
+	t.Run("multi-app errors when repo missing github_app", func(t *testing.T) {
+		// Construct directly (bypassing Validate) to exercise the resolver's
+		// defensive path.
+		cfg := &ServerConfig{
+			Apps:  map[string]GitHubAppConfig{"app-a": validApp},
+			Repos: map[string]RepoConfig{"org/repo": {}},
+		}
+		_, err := cfg.ResolveGitHubAppForRepo("org/repo")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "missing github_app")
+	})
+
+	t.Run("multi-app errors when github_app references unknown app", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps:  map[string]GitHubAppConfig{"app-a": validApp},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-z"}},
+		}
+		_, err := cfg.ResolveGitHubAppForRepo("org/repo")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `unknown github_app "app-z"`)
+	})
+
+	t.Run("legacy single-app resolves to default name", func(t *testing.T) {
+		t.Setenv("PK", "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----")
+		cfg := &ServerConfig{
+			GitHub: GitHubConfig{
+				AppID:         "42",
+				PrivateKey:    "env:PK",
+				WebhookSecret: "env:WS",
+			},
+		}
+		got, err := cfg.ResolveGitHubAppForRepo("any/repo")
+		require.NoError(t, err)
+		assert.Equal(t, "default", got.Name)
+		assert.Equal(t, "42", got.Config.AppID)
+	})
+
+	t.Run("legacy single-app errors when not configured", func(t *testing.T) {
+		cfg := &ServerConfig{}
+		_, err := cfg.ResolveGitHubAppForRepo("any/repo")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no GitHub App is configured")
+	})
+
+	t.Run("nil receiver errors", func(t *testing.T) {
+		var cfg *ServerConfig
+		_, err := cfg.ResolveGitHubAppForRepo("any/repo")
+		require.Error(t, err)
+	})
+}
+
+// TestLoadServerConfigFromFile_MultiApp end-to-end-parses the new YAML shape
+// to confirm the apps: map and per-repo github_app: field round-trip through
+// LoadServerConfigFromFile (including KnownFields(true)).
+func TestLoadServerConfigFromFile_MultiApp(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := `
+apps:
+  app-a:
+    app-id: "env:APP_A_ID"
+    private-key: "env:APP_A_PK"
+    webhook-secret: "env:APP_A_WS"
+  app-b:
+    app-id: "env:APP_B_ID"
+    private-key: "env:APP_B_PK"
+    webhook-secret: "env:APP_B_WS"
+
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost)/testapp"
+
+repos:
+  org-a/repo-x:
+    github_app: app-a
+  org-b/repo-y:
+    github_app: app-b
+`
+	err := os.WriteFile(configPath, []byte(content), 0644)
+	require.NoError(t, err)
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	require.Contains(t, cfg.Apps, "app-a")
+	require.Contains(t, cfg.Apps, "app-b")
+	assert.Equal(t, "env:APP_A_ID", cfg.Apps["app-a"].AppID)
+	assert.Equal(t, "app-a", cfg.Repos["org-a/repo-x"].GitHubApp)
+	assert.Equal(t, "app-b", cfg.Repos["org-b/repo-y"].GitHubApp)
+}

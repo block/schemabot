@@ -48,6 +48,26 @@ grpc:
 #       default:
 #         staging: "tern-staging:9090"
 #         production: "tern-production:9090"
+#
+# Example (multi-App routing — one SchemaBot process serving multiple GitHub
+# Apps; webhook dispatch wiring lands in a follow-up PR):
+#   config:
+#     storage:
+#       dsn: "env:MYSQL_DSN"
+#     apps:
+#       app-a:
+#         app-id: "env:APP_A_ID"
+#         private-key: "file:/secrets/app-a/private-key"
+#         webhook-secret: "file:/secrets/app-a/webhook-secret"
+#       app-b:
+#         app-id: "env:APP_B_ID"
+#         private-key: "file:/secrets/app-b/private-key"
+#         webhook-secret: "file:/secrets/app-b/webhook-secret"
+#     repos:
+#       org-a/repo-x:
+#         github_app: app-a
+#       org-b/repo-y:
+#         github_app: app-b
 # config is required — helm install will fail without it.
 config: null
 

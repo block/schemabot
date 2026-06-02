@@ -423,6 +423,39 @@ safe. This usually means the repo config and server config disagree. Align the
 `schemabot.yaml` environments with the deployment's `allowed_environments`, then
 run `schemabot plan -e <environment>` or push a new commit to refresh checks.
 
+## Multi-App Routing
+
+A single SchemaBot process can serve webhooks for repositories owned by multiple GitHub Apps — for example, one App per GitHub org, or one App per tenant within a single org. Each App has its own credentials and webhook secret, and each repository declares which App owns it.
+
+```yaml
+apps:
+  app-a:
+    app-id: "env:APP_A_ID"
+    private-key: "file:/secrets/app-a/private-key"
+    webhook-secret: "file:/secrets/app-a/webhook-secret"
+  app-b:
+    app-id: "env:APP_B_ID"
+    private-key: "file:/secrets/app-b/private-key"
+    webhook-secret: "file:/secrets/app-b/webhook-secret"
+
+repos:
+  org-a/repo-x:
+    github_app: app-a
+  org-b/repo-y:
+    github_app: app-b
+```
+
+Rules:
+
+- `github:` and `apps:` are mutually exclusive — configure one or the other, not both.
+- When `apps:` is configured, every entry in `repos:` MUST set `github_app:` to one of the configured app names. Unknown names are rejected at config load.
+- When `apps:` is NOT configured, repositories must not set `github_app:` — it would be silently ignored, so it is rejected at config load to surface misconfiguration early.
+- The legacy single-App `github:` shape continues to work unchanged.
+
+The map key under `apps:` is the App's stable logical name and the value that flows into log lines and metrics. Each entry MUST provide a non-empty `app-id`, `private-key`, and `webhook-secret`; all three accept the same secret-resolution prefixes as the legacy `github:` block (see [Secret Resolution](#secret-resolution)).
+
+> **Note:** This release lands the config shape, validation, and resolver API. Webhook dispatch wiring (per-App HMAC verification, per-App installation token minting) is wired in a follow-up PR. Until then, configuring `apps:` is accepted by `Validate()` but the webhook handler still consumes the legacy `github:` field.
+
 ## Secret Resolution
 
 DSN values support secret resolution prefixes:

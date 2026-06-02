@@ -24,9 +24,18 @@ type ServerConfig struct {
 	// If not specified, falls back to MYSQL_DSN environment variable.
 	Storage StorageConfig `yaml:"storage"`
 
-	// GitHub configures the GitHub App integration for webhook-driven schema changes.
-	// If not set, the webhook endpoint is not registered.
+	// GitHub configures a single GitHub App for webhook-driven schema changes.
+	// Mutually exclusive with Apps. If neither is set, the webhook endpoint
+	// is not registered.
 	GitHub GitHubConfig `yaml:"github"`
+
+	// Apps configures multiple GitHub Apps for webhook-driven schema changes
+	// in multi-tenant deployments (e.g. one App per GitHub org). The map key
+	// is a stable logical name for the App; per-repo routing references this
+	// name via RepoConfig.GitHubApp. Mutually exclusive with GitHub.
+	//
+	// Every entry in Repos MUST set GitHubApp to one of the keys in this map.
+	Apps map[string]GitHubAppConfig `yaml:"apps,omitempty"`
 
 	// TernDeployments maps deployment names to Tern gRPC endpoints per environment.
 	// Use "default" for single-deployment setups.
@@ -169,6 +178,12 @@ func (g *GitHubConfig) ResolvePrivateKey() (string, error) {
 func (g *GitHubConfig) ResolveWebhookSecret() (string, error) {
 	return secrets.Resolve(g.WebhookSecret, "")
 }
+
+// GitHubAppConfig is one entry in ServerConfig.Apps. It carries the same
+// credentials as the single-App GitHubConfig and shares its resolution
+// helpers. The enclosing map key is the App's stable logical name used by
+// per-repo routing via RepoConfig.GitHubApp.
+type GitHubAppConfig = GitHubConfig
 
 // StorageConfig configures SchemaBot's internal storage database.
 type StorageConfig struct {
@@ -333,6 +348,12 @@ type RepoConfig struct {
 	// this repository. Stored check state is still maintained for SchemaBot's
 	// own safety gates. Defaults to true when not configured.
 	EnableChecks *bool `yaml:"enable_checks,omitempty"`
+
+	// GitHubApp names the App in ServerConfig.Apps that owns webhooks and
+	// outbound GitHub API calls for this repository. Required when Apps is
+	// configured; ignored when only the legacy single-App GitHub field is
+	// set. Must match a key in ServerConfig.Apps.
+	GitHubApp string `yaml:"github_app,omitempty"`
 }
 
 // ResolvedDatabaseTarget is the server-owned routing decision for plan/apply.
@@ -395,6 +416,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := validateReviewPolicy(c.ReviewPolicy); err != nil {
+		return err
+	}
+	if err := c.validateGitHubAppsConfig(); err != nil {
 		return err
 	}
 
@@ -484,6 +508,64 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 				continue
 			}
 			return fmt.Errorf("database %q environment %q uses a local dsn but tern_deployments also defines deployment %q for that environment; rename the database or deployment to avoid ambiguous routing", database, environment, database)
+		}
+	}
+	return nil
+}
+
+// validateGitHubAppsConfig validates the multi-App config shape and its
+// interaction with the legacy single-App GitHub field and per-repo routing.
+//
+// Rules (mirroring the documented back-compat matrix):
+//   - github: and apps: are mutually exclusive.
+//   - If apps: is set, each entry must declare a non-empty app-id, private-key,
+//     and webhook-secret, and the map key must be non-empty.
+//   - If apps: is set, every entry in repos: MUST set github_app to one of
+//     the configured app names.
+//   - If apps: is NOT set, repos must not declare github_app (it would be a
+//     silently ignored field, which we want to fail closed on).
+func (c *ServerConfig) validateGitHubAppsConfig() error {
+	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != ""
+	hasApps := c.Apps != nil
+
+	if hasGitHub && hasApps {
+		return fmt.Errorf("github: and apps: are mutually exclusive; configure one or the other")
+	}
+
+	if hasApps {
+		if len(c.Apps) == 0 {
+			return fmt.Errorf("apps: is configured but contains no entries")
+		}
+		for name, app := range c.Apps {
+			if name == "" {
+				return fmt.Errorf("apps: contains an entry with an empty name")
+			}
+			if app.AppID == "" {
+				return fmt.Errorf("app %q missing app-id", name)
+			}
+			if app.PrivateKey == "" {
+				return fmt.Errorf("app %q missing private-key", name)
+			}
+			if app.WebhookSecret == "" {
+				return fmt.Errorf("app %q missing webhook-secret", name)
+			}
+		}
+		for repo, repoConfig := range c.Repos {
+			if repoConfig.GitHubApp == "" {
+				return fmt.Errorf("repository %q is missing github_app (required when apps: is configured)", repo)
+			}
+			if _, ok := c.Apps[repoConfig.GitHubApp]; !ok {
+				return fmt.Errorf("repository %q references unknown github_app %q", repo, repoConfig.GitHubApp)
+			}
+		}
+		return nil
+	}
+
+	// Apps not configured — github_app on a repo would be silently ignored,
+	// so reject it explicitly to avoid surprising operators.
+	for repo, repoConfig := range c.Repos {
+		if repoConfig.GitHubApp != "" {
+			return fmt.Errorf("repository %q sets github_app %q but apps: is not configured", repo, repoConfig.GitHubApp)
 		}
 	}
 	return nil
@@ -587,6 +669,48 @@ func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 		return true
 	}
 	return *repoConfig.EnableChecks
+}
+
+// ResolvedGitHubApp identifies which configured GitHub App owns a repository.
+// Name is the logical key under ServerConfig.Apps ("default" for the legacy
+// single-App shape). Config is a copy of the resolved credentials.
+type ResolvedGitHubApp struct {
+	Name   string
+	Config GitHubAppConfig
+}
+
+// ResolveGitHubAppForRepo returns the GitHub App that owns webhooks and
+// outbound GitHub API calls for the given repository.
+//
+// Resolution rules:
+//   - If ServerConfig.Apps is configured, the repo MUST be declared in
+//     ServerConfig.Repos with a non-empty GitHubApp that names an entry in
+//     ServerConfig.Apps. Unknown repos or unknown app names return an error.
+//   - Otherwise the legacy single-App ServerConfig.GitHub is returned under
+//     the synthetic name "default" so callers can treat both shapes uniformly.
+//   - If neither Apps nor a configured GitHub is present, an error is returned.
+func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, error) {
+	if c == nil {
+		return ResolvedGitHubApp{}, fmt.Errorf("server config is nil")
+	}
+	if len(c.Apps) > 0 {
+		repoConfig, ok := c.Repos[repo]
+		if !ok {
+			return ResolvedGitHubApp{}, fmt.Errorf("repository %q is not declared in the repos config", repo)
+		}
+		if repoConfig.GitHubApp == "" {
+			return ResolvedGitHubApp{}, fmt.Errorf("repository %q is missing github_app", repo)
+		}
+		appCfg, ok := c.Apps[repoConfig.GitHubApp]
+		if !ok {
+			return ResolvedGitHubApp{}, fmt.Errorf("repository %q references unknown github_app %q", repo, repoConfig.GitHubApp)
+		}
+		return ResolvedGitHubApp{Name: repoConfig.GitHubApp, Config: appCfg}, nil
+	}
+	if !c.GitHub.Configured() {
+		return ResolvedGitHubApp{}, fmt.Errorf("no GitHub App is configured")
+	}
+	return ResolvedGitHubApp{Name: "default", Config: c.GitHub}, nil
 }
 
 // IsEnvironmentAllowed returns whether the given environment is handled by this
