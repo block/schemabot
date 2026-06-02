@@ -2217,6 +2217,63 @@ func applyEmbeddedSchema(db *sql.DB, schemaFS embed.FS) error {
 	return nil
 }
 
+// TestE2EApplyCreateDualWritesApplyOperationRow verifies the service-level
+// apply create path writes exactly one apply_operations row in the same
+// transaction as the applies row, mirroring the apply's (deployment, target)
+// routing. The operator claim loop is not yet wired to these rows, so the
+// row stays in pending — that's the contract until a subsequent PR lifts
+// the deployments-map gate and introduces the per-row claim loop.
+func TestE2EApplyCreateDualWritesApplyOperationRow(t *testing.T) {
+	dbName := "webhook_apply_dual_write"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Seed the target so the plan produces a real DDL change.
+	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1) + "&multiStatements=true"
+	db, err := sql.Open("mysql", appDSN)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	_ = db.Close()
+
+	schemaWithIndex := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
+		Database:    dbName,
+		Environment: "staging",
+		Type:        "mysql",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			dbName: {Files: map[string]string{"users.sql": schemaWithIndex}},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, planResp.Changes, "expected DDL changes")
+
+	applyResp, applyID, err := svc.ExecuteApply(ctx, api.ApplyRequest{
+		PlanID:      planResp.PlanID,
+		Environment: "staging",
+		Options:     map[string]string{"allow_unsafe": "true"},
+	})
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted)
+	require.Greater(t, applyID, int64(0))
+
+	apply, err := svc.Storage().Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	plan, err := svc.Storage().Plans().Get(ctx, planResp.PlanID)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	ops, err := svc.Storage().ApplyOperations().ListByApply(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, ops, 1, "apply create must dual-write exactly one apply_operations row")
+	op := ops[0]
+	assert.Equal(t, applyID, op.ApplyID)
+	assert.Equal(t, apply.Deployment, op.Deployment, "operation deployment must match apply deployment")
+	assert.Equal(t, plan.Target, op.Target, "operation target must mirror the plan-time target")
+	assert.Equal(t, state.ApplyOperation.Pending, op.State, "operation row stays pending — no consumer is wired yet")
+}
+
 // TestE2ERollbackPlanViaWebhook tests the full rollback flow:
 // 1. Plan + apply a schema change via the service (simulating a prior apply)
 // 2. Run "schemabot rollback <apply-id> -e staging" via webhook
