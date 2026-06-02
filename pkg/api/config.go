@@ -351,8 +351,9 @@ type RepoConfig struct {
 
 	// GitHubApp names the App in ServerConfig.Apps that owns webhooks and
 	// outbound GitHub API calls for this repository. Required when Apps is
-	// configured; ignored when only the legacy single-App GitHub field is
-	// set. Must match a key in ServerConfig.Apps.
+	// configured and must match a key in ServerConfig.Apps. Setting it
+	// while only the legacy single-App GitHub field is configured is
+	// rejected at config load to fail closed on misconfiguration.
 	GitHubApp string `yaml:"github_app,omitempty"`
 }
 
