@@ -92,7 +92,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyActive,
 		templates.PreviewCommentApplyNoLock, templates.PreviewCommentApplyAllType,
 		templates.PreviewCommentChecksGateFailing, templates.PreviewCommentChecksGateInProgress,
-		templates.PreviewCommentActorNotAuthorized, templates.PreviewCommentActorAuthUnavailable:
+		templates.PreviewCommentActorNotAuthorized, templates.PreviewCommentActorAuthUnavailable,
+		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive:
 		templates.PreviewCLIOutput(previewType)
 	// Paired aggregate types (PR + CLI subsections)
 	case templates.PreviewCommentPlanAll, templates.PreviewCommentLockingAll,
@@ -251,6 +252,8 @@ Apply Command Comments (GitHub PR apply commands):
   comment_apply_no_lock         No lock found (need apply first)
   comment_actor_not_authorized  Actor authorization denied
   comment_actor_auth_unavailable Actor authorization fail-closed error
+  comment_cutover_accepted      Cutover request accepted
+  comment_cutover_active        Cutover already in progress
   comment_apply_all             Show all apply command previews
 
 Aggregate Types (grouped PR + CLI pairs):

@@ -231,6 +231,168 @@ func TestE2EStopCommandStopsDeferredCutoverLocalApply(t *testing.T) {
 	assertReactionEventually(t, reactions)
 }
 
+// TestE2ECutoverCommandRecordsDurableRequest verifies that a PR comment
+// cutover command records durable operator intent for the exact apply and
+// environment, then leaves the scheduler owner to perform the data-plane action.
+func TestE2ECutoverCommandRecordsDurableRequest(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier := "apply_cdef3456"
+	database := "cutover_pr_comments_db"
+	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+	t.Cleanup(func() {
+		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+		utils.CloseAndLog(schemabotDB)
+	})
+
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	storedApply.State = state.Apply.WaitingForCutover
+	storedApply.SetOptions(storage.ApplyOptions{DeferCutover: true})
+	require.NoError(t, store.Applies().Update(ctx, storedApply))
+	storedTasks, err := store.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, storedTasks, 1)
+	storedTasks[0].State = state.Task.WaitingForCutover
+	storedTasks[0].UpdatedAt = time.Now().UTC()
+	require.NoError(t, store.Tasks().Update(ctx, storedTasks[0]))
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	reactions := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
+	h := &Handler{
+		service:  service,
+		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
+		logger:   testLogger(),
+	}
+
+	postCutoverCommand(t, h, applyIdentifier, "alice")
+	comment := readComment(t, comments)
+	assert.Contains(t, comment, "Cutover Request Accepted")
+	assert.Contains(t, comment, "`"+applyIdentifier+"`")
+	assert.Contains(t, comment, "@alice")
+
+	controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq)
+	assert.Equal(t, "github:alice@octocat/hello-world#1", controlReq.RequestedBy)
+	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
+
+	logs, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: applyID, Limit: 20})
+	require.NoError(t, err)
+	assert.True(t, applyLogContains(logs, "Cutover requested by user (caller: github:alice@octocat/hello-world#1)"))
+	assertReactionEventually(t, reactions)
+}
+
+// TestE2ECutoverCommandRejectsPendingStop verifies that a PR comment cutover
+// command honors an outstanding stop request for the same apply, preserving the
+// operator's stop intent and surfacing the rejection back to the PR.
+func TestE2ECutoverCommandRejectsPendingStop(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier := "apply_defa4567"
+	database := "cutover_pr_comments_stop_pending_db"
+	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+	t.Cleanup(func() {
+		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+		utils.CloseAndLog(schemabotDB)
+	})
+
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	storedApply.State = state.Apply.WaitingForCutover
+	storedApply.SetOptions(storage.ApplyOptions{DeferCutover: true})
+	require.NoError(t, store.Applies().Update(ctx, storedApply))
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationStop,
+		RequestedBy: "github:stopper@octocat/hello-world#1",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	reactions := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	ternClient := &stopCommandTernClient{remote: true}
+	service.RegisterTernClient(database, "staging", ternClient)
+	h := &Handler{
+		service:  service,
+		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
+		logger:   testLogger(),
+	}
+
+	postCutoverCommand(t, h, applyIdentifier, "cutter")
+	comment := readComment(t, comments)
+	assert.Contains(t, comment, "pending stop request")
+	assert.Contains(t, comment, "cutover")
+
+	pendingStop, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, pendingStop)
+	assert.Equal(t, "github:stopper@octocat/hello-world#1", pendingStop.RequestedBy)
+	pendingCutover, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	assert.Nil(t, pendingCutover)
+	logs, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: applyID, Limit: 20})
+	require.NoError(t, err)
+	assert.True(t, applyLogContains(logs, "Pending stop request blocked cutover (caller: github:stopper@octocat/hello-world#1)"))
+	assertReactionEventually(t, reactions)
+}
+
 func apiServiceForStopCommandTest(t *testing.T, store storage.Storage, database string) *api.Service {
 	t.Helper()
 	return api.New(store, &api.ServerConfig{
@@ -318,13 +480,26 @@ func postStopCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
 	assert.Contains(t, rr.Body.String(), "stop started")
 }
 
+func postCutoverCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
+	t.Helper()
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment:   "schemabot cutover " + applyIdentifier + " -e staging",
+		userLogin: user,
+		isPR:      true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "cutover started")
+}
+
 func readComment(t *testing.T, comments chan string) string {
 	t.Helper()
 	select {
 	case body := <-comments:
 		return body
 	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for stop command comment")
+		t.Fatal("timed out waiting for control command comment")
 		return ""
 	}
 }

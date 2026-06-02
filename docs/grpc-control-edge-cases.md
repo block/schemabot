@@ -230,7 +230,7 @@ follows the remote-readiness scenario above.
 | 17 | Cutover requested while stored apply is already `cutting_over` | Return accepted/idempotent with `status=already_in_progress`, log the caller, and do not queue another durable request | Covered for current cutover path |
 | 18 | MySQL/Spirit cutover RPC lands on a non-owner data-plane replica | After durable readiness checks, any replica can drop the sentinel table; the owner runner observes the DB-side signal | Covered by K8s e2e |
 | 19 | PR comment stop support | Same semantics as CLI stop: durable request first, caller visible, stop priority preserved | Covered |
-| 20 | PR comment cutover support | Same safety gate as CLI cutover, plus durable cutover intent if async ownership requires it | Follow-up |
+| 20 | PR comment cutover support | Same safety gate as CLI/API cutover, including pending-stop rejection, plus durable cutover intent if async ownership requires it | Covered |
 | 21 | Spirit checkpoint resume loses prior copy progress after restart | Surface lost-progress reason through Spirit resume status APIs instead of inferring from sentinel tables | Follow-up after Spirit dependency exposes the API |
 
 ## Review questions for new gRPC control changes

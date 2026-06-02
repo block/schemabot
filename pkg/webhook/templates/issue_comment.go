@@ -1,6 +1,10 @@
 package templates
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/block/schemabot/pkg/apitypes"
+)
 
 // RenderRepositoryNotRegistered renders the message posted when a SchemaBot
 // command arrives from a repository that is not in the configured allowlist.
@@ -42,6 +46,14 @@ type StopCommandAcceptedData struct {
 	SkippedCount int64
 }
 
+// CutoverCommandAcceptedData contains data for a PR comment cutover acknowledgement.
+type CutoverCommandAcceptedData struct {
+	ApplyID     string
+	Environment string
+	RequestedBy string
+	Status      string
+}
+
 // RenderControlMissingApplyID renders the message posted when an apply-scoped
 // control command is invoked without the required apply ID.
 func RenderControlMissingApplyID(action string) string {
@@ -69,6 +81,44 @@ func RenderStopCommandAccepted(data StopCommandAcceptedData) string {
 		body += fmt.Sprintf("\n**Tasks selected for stop**: %d stopped, %d skipped.\n", data.StoppedCount, data.SkippedCount)
 	}
 	return body
+}
+
+// RenderCutoverCommandAccepted renders the acknowledgement posted when a PR
+// comment cutover command records durable cutover intent.
+func RenderCutoverCommandAccepted(data CutoverCommandAcceptedData) string {
+	statusLine := "Cutover request accepted. SchemaBot will complete this schema change; status remains available from the PR progress comment or CLI."
+	if data.Status == apitypes.ControlStatusAlreadyInProgress {
+		statusLine = "Cutover is already in progress. SchemaBot will keep reporting progress from the existing apply."
+	}
+
+	body := "## Cutover Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	return body + "\n" + statusLine + "\n"
+}
+
+// PreviewCommentCutoverCommandAccepted renders a sample cutover command
+// acknowledgement comment.
+func PreviewCommentCutoverCommandAccepted() string {
+	return RenderCutoverCommandAccepted(CutoverCommandAcceptedData{
+		ApplyID:     "apply-a1b2c3d4e5f67890",
+		Environment: "staging",
+		RequestedBy: "alice",
+	})
+}
+
+// PreviewCommentCutoverCommandAlreadyInProgress renders a sample cutover
+// acknowledgement when cutover is already in progress.
+func PreviewCommentCutoverCommandAlreadyInProgress() string {
+	return RenderCutoverCommandAccepted(CutoverCommandAcceptedData{
+		ApplyID:     "apply-a1b2c3d4e5f67890",
+		Environment: "staging",
+		RequestedBy: "alice",
+		Status:      apitypes.ControlStatusAlreadyInProgress,
+	})
 }
 
 // RenderCommandNotYetAvailable renders the acknowledgement posted when a

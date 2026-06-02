@@ -3,6 +3,7 @@ package templates
 import (
 	"testing"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -63,6 +64,28 @@ func TestRenderStopCommandAcceptedAlreadyRequested(t *testing.T) {
 		Status:      "already_requested",
 	})
 	assert.Contains(t, rendered, "Stop was already requested")
+}
+
+func TestRenderCutoverCommandAccepted(t *testing.T) {
+	rendered := RenderCutoverCommandAccepted(CutoverCommandAcceptedData{
+		ApplyID:     "apply_abc123",
+		Environment: "staging",
+		RequestedBy: "alice",
+	})
+	assert.Contains(t, rendered, "Cutover Request Accepted")
+	assert.Contains(t, rendered, "`apply_abc123`")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "@alice")
+	assert.Contains(t, rendered, "Cutover request accepted")
+}
+
+func TestRenderCutoverCommandAcceptedAlreadyInProgress(t *testing.T) {
+	rendered := RenderCutoverCommandAccepted(CutoverCommandAcceptedData{
+		ApplyID:     "apply_abc123",
+		Environment: "staging",
+		Status:      apitypes.ControlStatusAlreadyInProgress,
+	})
+	assert.Contains(t, rendered, "Cutover is already in progress")
 }
 
 func TestRenderCommandNotYetAvailable(t *testing.T) {

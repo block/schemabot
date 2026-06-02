@@ -212,6 +212,10 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized())
 	case PreviewCommentActorAuthUnavailable:
 		fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable())
+	case PreviewCommentCutoverAccepted:
+		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted())
+	case PreviewCommentCutoverActive:
+		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress())
 	case PreviewCommentApplyAllType:
 		previewApplyCommandAllOutput()
 	// Paired aggregate previews (PR + CLI subsections)

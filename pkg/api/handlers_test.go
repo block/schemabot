@@ -2723,6 +2723,37 @@ func TestCutoverHandler(t *testing.T) {
 		assert.True(t, hasApplyLogMessageContaining(logs.logs, "Pending stop request blocked cutover (caller: cli:stopper)"))
 	})
 
+	t.Run("ExecuteCutover rejects while stop request is pending", func(t *testing.T) {
+		mock := &mockTernClient{
+			cutoverResp: &ternv1.CutoverResponse{Accepted: true},
+		}
+		apply := activeTestApply("apply-execute-cutover-stop-pending")
+		logs := &capturingApplyLogStore{}
+		controlRequests := &memoryControlRequestStore{requests: []*storage.ApplyControlRequest{{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:stopper",
+		}}}
+		svc := newControlTestService(mock, apply)
+		require.IsType(t, &mockStorageWithApplyStores{}, svc.storage)
+		store := svc.storage.(*mockStorageWithApplyStores)
+		store.controls = controlRequests
+		store.applyLogs = logs
+
+		resp, err := svc.ExecuteCutover(t.Context(), apitypes.ControlRequest{
+			ApplyID:     "apply-execute-cutover-stop-pending",
+			Environment: "staging",
+			Caller:      "github:cutter@octocat/hello-world#1",
+		})
+
+		require.Error(t, err)
+		assert.Nil(t, resp)
+		assert.Nil(t, mock.cutoverReq)
+		assert.Contains(t, err.Error(), "pending stop request")
+		assert.True(t, hasApplyLogMessageContaining(logs.logs, "Pending stop request blocked cutover (caller: cli:stopper)"))
+	})
+
 	t.Run("requires apply_id", func(t *testing.T) {
 		mock := &mockTernClient{}
 		svc := newControlTestService(mock, activeTestApply("apply-active-cutover"))

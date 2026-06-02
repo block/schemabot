@@ -191,11 +191,12 @@ skip the API fast path because the scheduler owner must both stop the remote
 data plane and reconcile SchemaBot's local storage in one owner-controlled flow.
 
 Forward-progress controls must fail closed while a stop is pending. User-driven
-cutover is rejected when a pending stop request exists, and scheduler-owned
-pollers check for pending stops before continuing progress work. This avoids the
-unsafe interleaving where `/api/stop` returns accepted while another path moves
-the same apply from `waiting_for_cutover` into cutover or completion before the
-stop can be applied.
+cutover is rejected when a pending stop request exists, whether the request came
+from the CLI/API path or a PR comment, and scheduler-owned pollers check for
+pending stops before continuing progress work. This avoids the unsafe
+interleaving where `/api/stop` returns accepted while another path moves the
+same apply from `waiting_for_cutover` into cutover or completion before the stop
+can be applied.
 
 Cutover requests follow the same durable-owner model. The API accepts cutover
 when the apply is ready for cutover, records a pending cutover request, and wakes

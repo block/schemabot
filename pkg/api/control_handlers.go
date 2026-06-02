@@ -327,6 +327,21 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, httpStatus, resp)
 }
 
+// ExecuteCutover records durable cutover intent for an apply. The scheduler
+// owner is responsible for completing cutover against the data plane.
+func (s *Service) ExecuteCutover(ctx context.Context, req apitypes.ControlRequest) (*apitypes.ControlResponse, error) {
+	client, apply, ternApplyID, err := s.controlTarget(ctx, "cutover", req.ApplyID, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.rejectControlIfStopPending(ctx, "cutover", apply); err != nil {
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, err
+	}
+	resp, _, err := s.executeCutoverForApply(ctx, client, apply, ternApplyID, req.Caller)
+	return resp, err
+}
+
 func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {

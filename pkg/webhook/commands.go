@@ -64,7 +64,7 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Stop, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Revert, RequiresEnv: true},
 	{Name: action.SkipRevert, RequiresEnv: true},
-	{Name: action.Cutover, RequiresEnv: true},
+	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true, SupportsDB: true,
 		SupportsDeferCutover: true},
 	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDB: true},
