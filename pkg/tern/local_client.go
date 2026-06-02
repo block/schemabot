@@ -1117,6 +1117,9 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 	if state.IsState(storedTaskState, state.Task.RecoveringCutover) && state.IsState(engineTaskState, state.Task.WaitingForCutover) {
 		return engineTaskState
 	}
+	if state.IsState(storedTaskState, state.Task.Running) && state.IsState(engineTaskState, state.Task.WaitingForDeploy) {
+		return engineTaskState
+	}
 
 	// Scheduler/control-owned states block stale active engine progress.
 	if blocksActiveEngineProgress(storedTaskState) {

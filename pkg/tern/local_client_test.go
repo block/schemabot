@@ -754,6 +754,12 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 			expected:         state.Task.Running,
 		},
 		{
+			name:             "Vitess defer deploy can pause after deploy request validation",
+			storedTaskState:  state.Task.Running,
+			engineTableState: state.Task.WaitingForDeploy,
+			expected:         state.Task.WaitingForDeploy,
+		},
+		{
 			name:             "terminal engine state can advance active stored state",
 			storedTaskState:  state.Task.Running,
 			engineTableState: "complete",
