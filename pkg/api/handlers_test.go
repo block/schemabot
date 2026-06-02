@@ -247,12 +247,13 @@ func cloneControlRequest(req *storage.ApplyControlRequest) *storage.ApplyControl
 
 type capturingApplyStore struct {
 	storage.ApplyStore
-	mu        sync.Mutex
-	apply     *storage.Apply
-	taskStore *capturingTaskStore
-	claimed   bool
-	findCh    chan struct{}
-	err       error
+	mu         sync.Mutex
+	apply      *storage.Apply
+	operations []*storage.ApplyOperation
+	taskStore  *capturingTaskStore
+	claimed    bool
+	findCh     chan struct{}
+	err        error
 }
 
 func (s *capturingApplyStore) Create(_ context.Context, apply *storage.Apply) (int64, error) {
@@ -266,6 +267,10 @@ func (s *capturingApplyStore) Create(_ context.Context, apply *storage.Apply) (i
 }
 
 func (s *capturingApplyStore) CreateWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (int64, error) {
+	return s.CreateWithTasksAndOperations(ctx, apply, tasks, nil)
+}
+
+func (s *capturingApplyStore) CreateWithTasksAndOperations(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, operations []*storage.ApplyOperation) (int64, error) {
 	s.mu.Lock()
 	if s.err != nil {
 		err := s.err
@@ -296,6 +301,7 @@ func (s *capturingApplyStore) CreateWithTasks(ctx context.Context, apply *storag
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.apply = apply
+	s.operations = append(s.operations, operations...)
 	return applyID, nil
 }
 
@@ -1040,6 +1046,13 @@ func TestExecuteApplyQueuesRemoteApplyForScheduler(t *testing.T) {
 	assert.Nil(t, mock.applyReq, "request path should not call remote Tern before scheduler claim")
 	require.Len(t, tasks.tasks, 1)
 	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
+	// Apply create dual-writes one apply_operations row mirroring the apply's
+	// (deployment, target). Today's hard-block keeps this at one row; the
+	// operator claim-loop PR is what consumes them.
+	require.Len(t, applies.operations, 1)
+	assert.Equal(t, DefaultDeployment, applies.operations[0].Deployment)
+	assert.Equal(t, "testdb", applies.operations[0].Target)
+	assert.Equal(t, state.ApplyOperation.Pending, applies.operations[0].State)
 }
 
 func TestProgressByApplyIDServesQueuedRemoteApplyFromStorage(t *testing.T) {

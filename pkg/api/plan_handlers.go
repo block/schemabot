@@ -593,7 +593,22 @@ func (s *Service) createStoredApply(
 		tasks = append(tasks, task)
 	}
 
-	storedApplyID, err := s.storage.Applies().CreateWithTasks(ctx, apply, tasks)
+	// Dual-write one apply_operations row alongside the applies row in the
+	// same transaction. Today the plan already carries the resolved
+	// (deployment, target) pair from plan-time `ResolveDatabaseTarget`, and
+	// the config layer hard-blocks multi-entry deployments maps, so we
+	// always write exactly one operation row that mirrors the apply's own
+	// routing. The data shape is what the operator claim-loop PR consumes
+	// once that gate is lifted and plans become deployment-agnostic.
+	operations := []*storage.ApplyOperation{{
+		Deployment: apply.Deployment,
+		Target:     plan.Target,
+		State:      state.ApplyOperation.Pending,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}}
+
+	storedApplyID, err := s.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
 	}

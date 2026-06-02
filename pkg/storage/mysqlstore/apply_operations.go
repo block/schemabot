@@ -38,12 +38,27 @@ type applyOperationStore struct {
 // Translates a unique-key conflict on (apply_id, deployment) into
 // storage.ErrApplyOperationExists so callers can branch cleanly.
 func (s *applyOperationStore) Insert(ctx context.Context, ad *storage.ApplyOperation) (int64, error) {
+	return insertApplyOperation(ctx, s.db, ad)
+}
+
+// sqlExecer is the subset of *sql.DB / *sql.Tx used by insertApplyOperation.
+// Defined locally so the helper can run against either the pool or an
+// in-flight transaction (for atomic apply-create dual-writes).
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// insertApplyOperation inserts one apply_operations row using the supplied
+// executer (pool or transaction). On success the row's ID and State fields
+// are set. A duplicate-key violation on (apply_id, deployment) is translated
+// to storage.ErrApplyOperationExists for callers to branch on.
+func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.ApplyOperation) (int64, error) {
 	stateVal := ad.State
 	if stateVal == "" {
 		stateVal = state.ApplyOperation.Pending
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	result, err := exec.ExecContext(ctx, `
 		INSERT INTO apply_operations (
 			apply_id, deployment, target, state, error_message,
 			started_at, completed_at

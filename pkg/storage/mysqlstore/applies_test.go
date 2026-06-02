@@ -139,6 +139,116 @@ func TestApplyStore_CreateWithTasksCommitsQueueAtomically(t *testing.T) {
 	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
 }
 
+func TestApplyStore_CreateWithTasksAndOperationsCommitsAtomically(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_create_with_ops",
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "production",
+		Deployment:      "payments-a",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	tasks := []*storage.Task{
+		{
+			TaskIdentifier: "task_create_with_ops_users",
+			PlanID:         1,
+			Database:       "payments",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Engine:         storage.EngineSpirit,
+			Environment:    "production",
+			State:          state.Task.Pending,
+			TableName:      "users",
+			DDL:            "ALTER TABLE users ADD COLUMN email VARCHAR(255)",
+			DDLAction:      "alter",
+			Options:        []byte("{}"),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+	}
+	operations := []*storage.ApplyOperation{
+		{
+			Deployment: "payments-a",
+			Target:     "payments",
+			State:      state.ApplyOperation.Pending,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		},
+	}
+
+	applyID, err := store.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+	require.NoError(t, err)
+	require.NotZero(t, applyID)
+
+	storedTasks, err := store.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, storedTasks, 1)
+	assert.Equal(t, applyID, tasks[0].ApplyID)
+
+	storedOps, err := store.ApplyOperations().ListByApply(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, storedOps, 1)
+	assert.Equal(t, applyID, storedOps[0].ApplyID)
+	assert.Equal(t, "payments-a", storedOps[0].Deployment)
+	assert.Equal(t, "payments", storedOps[0].Target)
+	assert.Equal(t, state.ApplyOperation.Pending, storedOps[0].State)
+	// CreateWithTasksAndOperations also back-fills the operation's ApplyID
+	// onto the caller-supplied struct (same contract as CreateWithTasks).
+	assert.Equal(t, applyID, operations[0].ApplyID)
+}
+
+func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnOperationFailure(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_rollback_on_op_failure",
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "production",
+		Deployment:      "payments-a",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	// Two operations sharing the same deployment violates the
+	// UNIQUE KEY (apply_id, deployment) constraint on the second insert and
+	// must roll back the whole transaction — no orphan apply or tasks rows.
+	operations := []*storage.ApplyOperation{
+		{Deployment: "payments-a", Target: "payments", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
+		{Deployment: "payments-a", Target: "payments", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
+	}
+
+	_, err := store.Applies().CreateWithTasksAndOperations(ctx, apply, nil, operations)
+	require.Error(t, err)
+
+	got, err := store.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, got, "apply row must not exist after rollback")
+}
+
 func TestApplyStore_CreateBlocksActiveApplyForSameTarget(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

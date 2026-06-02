@@ -179,6 +179,13 @@ type ApplyStore interface {
 	// task rows are committed.
 	CreateWithTasks(ctx context.Context, apply *Apply, tasks []*Task) (int64, error)
 
+	// CreateWithTasksAndOperations stores a new apply, its initial tasks, and
+	// its per-deployment apply_operations rows in a single transaction. Each
+	// operation row's ApplyID is set to the new apply ID before insert.
+	// Pending applies become scheduler-claimable only after every row is
+	// committed, so the operator never observes a partially-populated apply.
+	CreateWithTasksAndOperations(ctx context.Context, apply *Apply, tasks []*Task, operations []*ApplyOperation) (int64, error)
+
 	// Get returns an apply by ID, or nil if not found.
 	Get(ctx context.Context, id int64) (*Apply, error)
 

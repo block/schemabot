@@ -355,6 +355,17 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 
 // CreateWithTasks stores an apply and its initial tasks in one transaction.
 func (s *applyStore) CreateWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (int64, error) {
+	return s.CreateWithTasksAndOperations(ctx, apply, tasks, nil)
+}
+
+// CreateWithTasksAndOperations is the unified atomic apply-create path: it
+// inserts the applies row, the initial tasks, and (optionally) the
+// per-deployment apply_operations rows in a single transaction. Pending
+// applies become operator-claimable only after every row commits, so no
+// reader observes a partially-populated apply.
+func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, operations []*storage.ApplyOperation) (int64, error) {
+	const opName = "create apply with tasks"
+
 	// Ensure options has valid JSON (empty object if nil)
 	options := apply.Options
 	if len(options) == 0 {
@@ -365,17 +376,17 @@ func (s *applyStore) CreateWithTasks(ctx context.Context, apply *storage.Apply, 
 	var writeTx *applyWriteTx
 	var err error
 	if lockTarget {
-		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, "create apply with tasks", apply.Database, apply.DatabaseType, apply.Environment)
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, opName, apply.Database, apply.DatabaseType, apply.Environment)
 		if err != nil {
 			return 0, err
 		}
 	} else {
-		writeTx, err = beginApplyWriteTx(ctx, s.db, "create apply with tasks")
+		writeTx, err = beginApplyWriteTx(ctx, s.db, opName)
 		if err != nil {
 			return 0, err
 		}
 	}
-	defer writeTx.close(ctx, "create apply with tasks")
+	defer writeTx.close(ctx, opName)
 
 	if lockTarget {
 		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, 0); err != nil {
@@ -415,8 +426,15 @@ func (s *applyStore) CreateWithTasks(ctx context.Context, apply *storage.Apply, 
 		task.ID = taskID
 	}
 
+	for _, op := range operations {
+		op.ApplyID = id
+		if _, err := insertApplyOperation(ctx, writeTx.tx, op); err != nil {
+			return 0, fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", op.Deployment, apply.ApplyIdentifier, err)
+		}
+	}
+
 	if err := writeTx.commit(); err != nil {
-		return 0, fmt.Errorf("commit create apply with tasks: %w", err)
+		return 0, fmt.Errorf("commit %s: %w", opName, err)
 	}
 
 	return id, nil
