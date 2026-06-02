@@ -496,7 +496,77 @@ func TestK8s_StopStartThroughScheduler(t *testing.T) {
 	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
 }
 
+// TestK8s_DeferCutoverThroughScheduler verifies that a deferred gRPC apply is
+// cut over through durable control-plane scheduler state. The API accepts the
+// cutover request before the data plane performs cutover, then the scheduler
+// completes the request and the target database reaches the planned schema.
+func TestK8s_DeferCutoverThroughScheduler(t *testing.T) {
+	fixture := startIndexAddApplyWithOptions(t, "k8s_cutover", false, map[string]string{"defer_cutover": "true"}, 10000)
+
+	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.WaitingForCutover, 3*time.Minute)
+
+	cutoverResp, err := client.CallCutoverAPI(fixture.Endpoint, "staging", fixture.ApplyID)
+	require.NoError(t, err, "cutover API call")
+	require.True(t, cutoverResp.Accepted, "cutover not accepted: %s", cutoverResp.ErrorMessage)
+
+	waitForControlPlaneControlRequestCompleted(t, fixture.ApplyID, storage.ControlOperationCutover)
+	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
+	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
+}
+
+// TestK8s_ManualDataPlaneCutoverReconcilesControlPlane verifies that an
+// operator-side cutover performed directly against the data plane is reconciled
+// by the control plane through remote progress polling.
+func TestK8s_ManualDataPlaneCutoverReconcilesControlPlane(t *testing.T) {
+	fixture := startIndexAddApplyWithOptions(t, "k8s_manual_cutover", false, map[string]string{"defer_cutover": "true"}, 10000)
+
+	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.WaitingForCutover, 3*time.Minute)
+
+	conn, err := grpc.NewClient(startDataPlaneServiceGRPCPortForward(t), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(conn)
+
+	dataPlaneClient := ternv1.NewTernClient(conn)
+	waitForDataPlaneProgress(t, dataPlaneClient, fixture.DataPlaneApplyID)
+
+	ctx, cancel := context.WithTimeout(t.Context(), testutil.ProgressTimeout)
+	defer cancel()
+	cutoverResp, err := dataPlaneClient.Cutover(ctx, &ternv1.CutoverRequest{
+		ApplyId:     fixture.DataPlaneApplyID,
+		Environment: "staging",
+	})
+	require.NoError(t, err, "manual data-plane cutover")
+	require.True(t, cutoverResp.Accepted, "manual data-plane cutover not accepted: %s", cutoverResp.ErrorMessage)
+
+	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
+	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
+}
+
+func waitForDataPlaneProgress(t *testing.T, client ternv1.TernClient, applyID string) {
+	t.Helper()
+
+	var lastErr error
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			ctx, cancel := context.WithTimeout(t.Context(), testutil.ProgressTimeout)
+			_, lastErr = client.Progress(ctx, &ternv1.ProgressRequest{
+				ApplyId:     applyID,
+				Environment: "staging",
+			})
+			cancel()
+			return lastErr == nil
+		},
+		func() string {
+			return fmt.Sprintf("timeout waiting for data-plane progress for %s: last_err=%v", applyID, lastErr)
+		})
+}
+
 func waitForControlPlaneStartControlRequestCompleted(t *testing.T, applyID string) {
+	t.Helper()
+	waitForControlPlaneControlRequestCompleted(t, applyID, storage.ControlOperationStart)
+}
+
+func waitForControlPlaneControlRequestCompleted(t *testing.T, applyID string, operation storage.ControlOperation) {
 	t.Helper()
 
 	db, err := sql.Open("mysql", testutil.SchemabotDSN(t))
@@ -504,21 +574,24 @@ func waitForControlPlaneStartControlRequestCompleted(t *testing.T, applyID strin
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()))
 
-	var status string
+	var (
+		status       string
+		errorMessage sql.NullString
+	)
 	var lastErr error
 	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
 		func() bool {
 			lastErr = db.QueryRowContext(t.Context(), `
-				SELECT cr.status
+				SELECT cr.status, cr.error_message
 				FROM apply_control_requests cr
 				JOIN applies a ON a.id = cr.apply_id
 				WHERE a.apply_identifier = ? AND cr.operation = ?
-			`, applyID, storage.ControlOperationStart).Scan(&status)
+			`, applyID, operation).Scan(&status, &errorMessage)
 			return lastErr == nil && status == string(storage.ControlRequestCompleted)
 		},
 		func() string {
-			return fmt.Sprintf("start control request was not completed for %s: status=%q last_err=%v",
-				applyID, status, lastErr)
+			return fmt.Sprintf("%s control request was not completed for %s: status=%q error_message=%q last_err=%v",
+				operation, applyID, status, errorMessage.String, lastErr)
 		})
 }
 

@@ -462,6 +462,8 @@ const (
 	ControlOperationStart ControlOperation = "start"
 	// ControlOperationStop stops an active apply.
 	ControlOperationStop ControlOperation = "stop"
+	// ControlOperationCutover triggers deferred cutover.
+	ControlOperationCutover ControlOperation = "cutover"
 )
 
 // ControlRequestStatus is the durable processing status for a control request.

@@ -232,8 +232,13 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 			h.handleStopCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "stop started"})
+	case action.Cutover:
+		h.goSafe(repo, pr, installationID, func() {
+			h.handleCutoverCommand(repo, pr, installationID, requestedBy, result)
+		})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cutover started"})
 	// Phase 2 commands — acknowledge but not yet implemented
-	case action.Revert, action.SkipRevert, action.Cutover:
+	case action.Revert, action.SkipRevert:
 		h.postComment(repo, pr, installationID,
 			templates.RenderCommandNotYetAvailable(result.Action, result.Environment))
 		h.writeJSON(w, http.StatusOK, map[string]string{

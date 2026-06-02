@@ -160,5 +160,7 @@ const (
 	PreviewCommentChecksGateInProgress PreviewType = "comment_checks_gate_in_progress"      // Checks gate: CI still running
 	PreviewCommentActorNotAuthorized   PreviewType = "comment_actor_not_authorized"         // Actor authorization: user is not allowed
 	PreviewCommentActorAuthUnavailable PreviewType = "comment_actor_auth_unavailable"       // Actor authorization: fail-closed error
+	PreviewCommentCutoverAccepted      PreviewType = "comment_cutover_accepted"             // Cutover command accepted
+	PreviewCommentCutoverActive        PreviewType = "comment_cutover_active"               // Cutover command when cutover is already in progress
 	PreviewCommentApplyAllType         PreviewType = "comment_apply_all"                    // Show all apply comment previews
 )

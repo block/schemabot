@@ -298,10 +298,23 @@ type EnvironmentConfig struct {
 	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
 
 	// Target is the opaque Tern-facing target identifier for gRPC mode.
+	// Mutually exclusive with Deployments.
 	Target string `yaml:"target,omitempty"`
 
 	// Deployment is the Tern deployment key for gRPC mode.
+	// Mutually exclusive with Deployments.
 	Deployment string `yaml:"deployment,omitempty"`
+
+	// Deployments maps a Tern deployment key to its per-deployment target
+	// for multi-deployment environments. Each key MUST also appear in the
+	// top-level tern_deployments map. Mutually exclusive with the scalar
+	// Target/Deployment fields above.
+	//
+	// Example:
+	//   deployments:
+	//     payments-a: { target: payments }
+	//     payments-b: { target: payments }
+	Deployments map[string]DeploymentTarget `yaml:"deployments,omitempty"`
 
 	// For PlanetScale/Vitess:
 	// Organization is the PlanetScale organization name.
@@ -362,6 +375,15 @@ type ResolvedDatabaseTarget struct {
 	DatabaseType string
 	Deployment   string
 	Target       string
+}
+
+// DeploymentTarget is one entry in EnvironmentConfig.Deployments. It carries
+// the per-deployment override values for a multi-deployment environment. The
+// enclosing map key identifies the Tern deployment (and must also appear in
+// the top-level tern_deployments map).
+type DeploymentTarget struct {
+	// Target is the opaque Tern-facing target identifier for this deployment.
+	Target string `yaml:"target"`
 }
 
 var defaultEnvironmentOrder = []string{"staging", "production"}
@@ -443,17 +465,48 @@ func (c *ServerConfig) Validate() error {
 		}
 		for env, envConfig := range dbConfig.Environments {
 			hasDSN := envConfig.HasLocalDSN()
-			hasRemoteRouting := envConfig.Target != "" || envConfig.Deployment != ""
+			hasScalarRouting := envConfig.Target != "" || envConfig.Deployment != ""
+			hasMapRouting := envConfig.Deployments != nil
 			switch {
-			case hasDSN && hasRemoteRouting:
-				return fmt.Errorf("database %q environment %q cannot configure both local DSN and target/deployment", name, env)
+			case hasDSN && (hasScalarRouting || hasMapRouting):
+				return fmt.Errorf("database %q environment %q cannot configure both local DSN and target/deployment(s)", name, env)
+			case hasScalarRouting && hasMapRouting:
+				return fmt.Errorf("database %q environment %q cannot configure both scalar target/deployment and a deployments map", name, env)
 			case hasDSN:
 				if err := envConfig.validateLocalDSNConfig(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
 					return err
 				}
 				continue
-			case !hasRemoteRouting:
-				return fmt.Errorf("database %q environment %q missing local DSN or target/deployment", name, env)
+			case hasMapRouting:
+				if len(envConfig.Deployments) == 0 {
+					return fmt.Errorf("database %q environment %q deployments map is empty", name, env)
+				}
+				// The multi-deployment apply path (plan, progress, webhook)
+				// is not yet wired to ResolveDatabaseTargets, so accepting a
+				// >1-entry deployments map here would silently break every
+				// plan/apply with a confusing internal resolver error. Gate
+				// it at config load until the orchestration path lands.
+				if len(envConfig.Deployments) > 1 {
+					return fmt.Errorf("database %q environment %q multi-deployment (>1 entries) is not yet supported by this server; got %d deployments", name, env, len(envConfig.Deployments))
+				}
+				for deployment, dt := range envConfig.Deployments {
+					if deployment == "" {
+						return fmt.Errorf("database %q environment %q has a deployments map entry with an empty key", name, env)
+					}
+					if dt.Target == "" {
+						return fmt.Errorf("database %q environment %q deployment %q missing target", name, env, deployment)
+					}
+					endpoints, ok := c.TernDeployments[deployment]
+					if !ok {
+						return fmt.Errorf("database %q environment %q references unknown deployment %q", name, env, deployment)
+					}
+					if endpoints[env] == "" {
+						return fmt.Errorf("database %q environment %q deployment %q has no endpoint", name, env, deployment)
+					}
+				}
+				continue
+			case !hasScalarRouting:
+				return fmt.Errorf("database %q environment %q missing local DSN or target/deployment(s)", name, env)
 			case envConfig.Target == "":
 				return fmt.Errorf("database %q environment %q missing target", name, env)
 			case envConfig.Deployment == "":
@@ -614,37 +667,89 @@ func (c *ServerConfig) DatabaseEnvironment(database, environment string) *Enviro
 // ResolveDatabaseTarget returns the complete routing metadata for a configured
 // database/environment. Local targets use the database name for deployment and
 // target; remote targets use the configured Tern deployment and opaque target.
+//
+// For environments configured with a deployments map (multi-deployment), this
+// returns the single deployment when exactly one is configured and otherwise
+// errors. Callers that need the full set MUST use ResolveDatabaseTargets.
 func (c *ServerConfig) ResolveDatabaseTarget(database, environment string) (ResolvedDatabaseTarget, error) {
+	targets, err := c.ResolveDatabaseTargets(database, environment)
+	if err != nil {
+		return ResolvedDatabaseTarget{}, err
+	}
+	if len(targets) != 1 {
+		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q environment %q resolves to %d deployments; use ResolveDatabaseTargets", database, environment, len(targets))
+	}
+	return targets[0], nil
+}
+
+// ResolveDatabaseTargets returns the complete routing metadata for a configured
+// database/environment as one or more deployment slices. Single-deployment
+// configurations (scalar target/deployment or local DSN) return a one-element
+// slice; multi-deployment environments return one element per entry in the
+// deployments map, ordered deterministically by deployment key.
+func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]ResolvedDatabaseTarget, error) {
 	if c == nil {
-		return ResolvedDatabaseTarget{}, fmt.Errorf("server config is nil")
+		return nil, fmt.Errorf("server config is nil")
 	}
 	dbConfig := c.Database(database)
 	if dbConfig == nil {
-		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q is not configured on this server", database)
+		return nil, fmt.Errorf("database %q is not configured on this server", database)
 	}
 	envConfig, ok := dbConfig.Environments[environment]
 	if !ok {
-		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q environment %q is not configured on this server", database, environment)
+		return nil, fmt.Errorf("database %q environment %q is not configured on this server", database, environment)
 	}
 
 	if envConfig.HasLocalDSN() {
-		return ResolvedDatabaseTarget{
+		return []ResolvedDatabaseTarget{{
 			DatabaseType: dbConfig.Type,
 			Deployment:   database,
 			Target:       database,
-		}, nil
+		}}, nil
 	}
+
+	// A non-nil deployments map is authoritative — fall through to scalar
+	// routing only when the map was not configured at all. This mirrors the
+	// validation in Validate() so an explicitly empty `deployments: {}` (or
+	// one with an empty key) returns the same clear error here.
+	if envConfig.Deployments != nil {
+		if len(envConfig.Deployments) == 0 {
+			return nil, fmt.Errorf("database %q environment %q deployments map is empty", database, environment)
+		}
+		deployments := make([]string, 0, len(envConfig.Deployments))
+		for deployment := range envConfig.Deployments {
+			if deployment == "" {
+				return nil, fmt.Errorf("database %q environment %q has a deployments map entry with an empty key", database, environment)
+			}
+			deployments = append(deployments, deployment)
+		}
+		slices.Sort(deployments)
+		out := make([]ResolvedDatabaseTarget, 0, len(deployments))
+		for _, deployment := range deployments {
+			dt := envConfig.Deployments[deployment]
+			if dt.Target == "" {
+				return nil, fmt.Errorf("database %q environment %q deployment %q missing target", database, environment, deployment)
+			}
+			out = append(out, ResolvedDatabaseTarget{
+				DatabaseType: dbConfig.Type,
+				Deployment:   deployment,
+				Target:       dt.Target,
+			})
+		}
+		return out, nil
+	}
+
 	if envConfig.Target == "" {
-		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q environment %q missing server-side target", database, environment)
+		return nil, fmt.Errorf("database %q environment %q missing server-side target", database, environment)
 	}
 	if envConfig.Deployment == "" {
-		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q environment %q missing server-side deployment", database, environment)
+		return nil, fmt.Errorf("database %q environment %q missing server-side deployment", database, environment)
 	}
-	return ResolvedDatabaseTarget{
+	return []ResolvedDatabaseTarget{{
 		DatabaseType: dbConfig.Type,
 		Deployment:   envConfig.Deployment,
 		Target:       envConfig.Target,
-	}, nil
+	}}, nil
 }
 
 // IsRepoAllowed returns whether the given repository is permitted to use SchemaBot.

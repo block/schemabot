@@ -226,26 +226,39 @@ func TestWebhookYesFlagRejectedOnNonApply(t *testing.T) {
 	}
 }
 
-func TestWebhookStopMissingApplyID(t *testing.T) {
-	h, comments, _ := newTestHandler(t)
+func TestWebhookControlCommandMissingApplyID(t *testing.T) {
+	tests := []struct {
+		name    string
+		comment string
+		action  string
+	}{
+		{name: "stop", comment: "schemabot stop -e staging", action: "stop"},
+		{name: "cutover", comment: "schemabot cutover -e staging", action: "cutover"},
+	}
 
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot stop -e staging",
-		isPR:    true,
-	}, nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, comments, _ := newTestHandler(t)
 
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment: tt.comment,
+				isPR:    true,
+			}, nil)
 
-	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "stop started")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
 
-	select {
-	case body := <-comments:
-		assert.Contains(t, body, "Missing Apply ID")
-		assert.Contains(t, body, "schemabot stop <apply-id> -e <environment>")
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for missing apply ID comment")
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), tt.action+" started")
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, "Missing Apply ID")
+				assert.Contains(t, body, "schemabot "+tt.action+" <apply-id> -e <environment>")
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for missing apply ID comment")
+			}
+		})
 	}
 }
 
@@ -368,14 +381,13 @@ func TestWebhookEyesReaction(t *testing.T) {
 func TestWebhookPhase2CommandNotYetAvailable(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
-	// Test remaining Phase 2 commands (apply, apply-confirm, unlock, and stop are now implemented)
+	// Test remaining Phase 2 commands (apply, apply-confirm, unlock, stop, and cutover are now implemented)
 	cmds := []struct {
 		comment string
 		action  string
 	}{
 		{"schemabot revert -e staging", "revert"},
 		{"schemabot skip-revert -e staging", "skip-revert"},
-		{"schemabot cutover -e staging", "cutover"},
 	}
 
 	for _, cmd := range cmds {

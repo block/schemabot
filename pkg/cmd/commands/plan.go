@@ -2,6 +2,7 @@ package commands
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -60,6 +61,9 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 			if cmd.JSON {
 				return client.ExitWithJSON("api_error", err.Error())
 			}
+			if outputPlanRequestError(cfg.Database, "", err) {
+				return ErrSilent
+			}
 			return err
 		}
 		environments = envs
@@ -75,6 +79,9 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 			if cmd.JSON {
 				return client.ExitWithJSON("api_error", err.Error())
 			}
+			if outputPlanRequestError(cfg.Database, env, err) {
+				return ErrSilent
+			}
 			return err
 		}
 		allResults[env] = result
@@ -87,6 +94,28 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 	// Human-readable output for all environments
 	outputMultiEnvPlanResult(allResults, cfg.Database, cfg.SchemaDir)
 	return nil
+}
+
+func outputPlanRequestError(database, environment string, err error) bool {
+	var apiErr *client.APIError
+	var connectionErr *client.ConnectionError
+	if !errors.As(err, &apiErr) && !errors.As(err, &connectionErr) {
+		return false
+	}
+
+	fmt.Printf("%sPlan failed%s\n", templates.ANSIRed, templates.ANSIReset)
+	fmt.Printf("  Database: %s\n", database)
+	if environment != "" {
+		fmt.Printf("  Environment: %s\n", environment)
+	}
+	if apiErr != nil {
+		fmt.Printf("  API status: HTTP %d\n", apiErr.Status)
+		if apiErr.ErrorCode != "" {
+			fmt.Printf("  Error code: %s\n", apiErr.ErrorCode)
+		}
+	}
+	fmt.Printf("  Error: %s\n", err.Error())
+	return true
 }
 
 // outputMultiEnvPlanResult prints plan results for multiple environments.

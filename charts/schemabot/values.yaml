@@ -49,6 +49,31 @@ grpc:
 #         staging: "tern-staging:9090"
 #         production: "tern-production:9090"
 #
+# Example (gRPC mode, multi-deployment environment — PREVIEW):
+# NOTE: multi-entry deployments maps are rejected at config load until the
+# plan/apply orchestration path is wired through ResolveDatabaseTargets.
+# A single-entry deployments map is accepted and behaves identically to the
+# scalar target / deployment shape.
+#   config:
+#     storage:
+#       dsn: "secretsmanager:schemabot-db#dsn"
+#     databases:
+#       payments:
+#         type: mysql
+#         environments:
+#           production:
+#             deployments:
+#               payments-a: { target: "payments" }
+#               payments-b: { target: "payments" }
+#               payments-c: { target: "payments" }
+#     tern_deployments:
+#       payments-a:
+#         production: "tern-payments-a:9090"
+#       payments-b:
+#         production: "tern-payments-b:9090"
+#       payments-c:
+#         production: "tern-payments-c:9090"
+#
 # Example (multi-App routing — one SchemaBot process serving multiple GitHub
 # Apps; webhook dispatch wiring lands in a follow-up PR):
 #   config:

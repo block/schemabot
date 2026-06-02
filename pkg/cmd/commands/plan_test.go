@@ -2,9 +2,13 @@ package commands
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -12,8 +16,10 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -65,6 +71,84 @@ func planWithTablesAndEngine(engine string, tables ...*apitypes.TableChangeRespo
 			{Namespace: "default", TableChanges: tables},
 		},
 	}
+}
+
+func writeTestSchemaDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte("database: testdb\ntype: mysql\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "users.sql"), []byte("CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"), 0o644))
+	return dir
+}
+
+func TestPlanCmd_ServerErrorHumanOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/plan", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, err := w.Write([]byte(`{"error":"plan failed: read secret file /secrets/db-passwords/test-password: no such file or directory","error_code":"plan_failed"}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := PlanCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging"}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(&Globals{Endpoint: server.URL})
+	})
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	plainOutput := stripAnsi(output)
+	assert.Contains(t, plainOutput, "Plan failed")
+	assert.Contains(t, plainOutput, "Database: testdb")
+	assert.Contains(t, plainOutput, "Environment: staging")
+	assert.Contains(t, plainOutput, "API status: HTTP 500")
+	assert.Contains(t, plainOutput, "Error code: plan_failed")
+	assert.Contains(t, plainOutput, "read secret file /secrets/db-passwords/test-password")
+}
+
+func TestPlanCmd_EnvironmentDiscoveryServerErrorHumanOutput(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/api/databases/testdb/environments", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, err := w.Write([]byte(`{"error":"database target unavailable","error_code":"target_unavailable"}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := PlanCmd{SchemaDir: writeTestSchemaDir(t)}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(&Globals{Endpoint: server.URL})
+	})
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	plainOutput := stripAnsi(output)
+	assert.Contains(t, plainOutput, "Plan failed")
+	assert.Contains(t, plainOutput, "Database: testdb")
+	assert.NotContains(t, plainOutput, "Environment:")
+	assert.Contains(t, plainOutput, "API status: HTTP 503")
+	assert.Contains(t, plainOutput, "Error code: target_unavailable")
+	assert.Contains(t, plainOutput, "database target unavailable")
+}
+
+func TestOutputPlanRequestError_ConnectionErrorHumanOutput(t *testing.T) {
+	err := client.FormatConnectionError("http://127.0.0.1:65535", errors.New("dial tcp 127.0.0.1:65535: connect: connection refused"))
+
+	var rendered bool
+	output := captureStdout(func() {
+		rendered = outputPlanRequestError("testdb", "staging", err)
+	})
+
+	require.True(t, rendered)
+	plainOutput := stripAnsi(output)
+	assert.Contains(t, plainOutput, "Plan failed")
+	assert.Contains(t, plainOutput, "Database: testdb")
+	assert.Contains(t, plainOutput, "Environment: staging")
+	assert.Contains(t, plainOutput, "Error: cannot connect to http://127.0.0.1:65535")
+	assert.NotContains(t, plainOutput, "API status:")
+	assert.NotContains(t, plainOutput, "Error code:")
 }
 
 func TestPlanFingerprint_IdenticalPlans(t *testing.T) {

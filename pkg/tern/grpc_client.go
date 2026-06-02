@@ -379,6 +379,112 @@ func (c *GRPCClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*
 	return c.client.Cutover(ctx, req)
 }
 
+func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply) error {
+	controlReq, err := pendingCutoverControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	if cutoverRequestResolvedByApplyState(apply.State) {
+		slog.Info("completing pending gRPC cutover request for resolved apply",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Pending remote cutover request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		return completePendingCutoverControlRequests(ctx, c.storage, apply)
+	}
+	if cutoverRequestFailedByApplyState(apply.State) {
+		message := fmt.Sprintf("cutover request was not applied because apply is %s", apply.State)
+		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, message); err != nil {
+			return err
+		}
+		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
+	}
+	readyForCutover, err := applyReadyForCutoverRequest(ctx, c.storage, apply)
+	if err != nil {
+		return fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if !readyForCutover {
+		slog.Info("pending gRPC cutover request is waiting for cutover-ready state",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		return nil
+	}
+	if apply.ExternalID == "" {
+		message := "remote apply id is not available"
+		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, message); err != nil {
+			return err
+		}
+		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
+	}
+	if stopReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+		return fmt.Errorf("check pending stop request before pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	} else if stopReq != nil {
+		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
+		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
+	}
+	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply); err != nil {
+		return err
+	}
+	resp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
+		ApplyId:     apply.ExternalID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		errorMessage := fmt.Sprintf("remote cutover failed: %v", err)
+		if failErr := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); failErr != nil {
+			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, apply.ExternalID, err, failErr)
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Remote cutover failed for apply %s%s: %v", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq)), err), "", "")
+		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w", apply.ApplyIdentifier, apply.ExternalID, err)
+	}
+	if resp == nil {
+		errorMessage := "not accepted"
+		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+			return err
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Remote cutover returned no response for apply %s%s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s", apply.ApplyIdentifier, apply.ExternalID, errorMessage)
+	}
+	if !resp.Accepted {
+		errorMessage := "not accepted"
+		if resp.ErrorMessage != "" {
+			errorMessage = resp.ErrorMessage
+		}
+		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+			return err
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Remote cutover was not accepted for apply %s%s: %s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq)), errorMessage), "", "")
+		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s", apply.ApplyIdentifier, apply.ExternalID, errorMessage)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Remote cutover accepted for apply %s%s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+	if err := completePendingCutoverControlRequests(ctx, c.storage, apply); err != nil {
+		return err
+	}
+	slog.Info("pending gRPC cutover request accepted and completed",
+		"apply_id", apply.ApplyIdentifier,
+		"external_id", apply.ExternalID,
+		"database", apply.Database,
+		"environment", apply.Environment,
+		"requested_by", controlRequestCaller(controlReq),
+		"state", apply.State)
+	return nil
+}
+
 func (c *GRPCClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
 	return c.client.Stop(ctx, req)
 }
@@ -626,6 +732,9 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 		return fmt.Errorf("apply is required")
 	}
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+		return err
+	}
+	if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
 		return err
 	}
 
@@ -1462,6 +1571,15 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				return err
 			} else if handled {
 				return nil
+			}
+			if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
+				slog.Warn("pending gRPC cutover request processing failed; current apply owner will exit for scheduler retry",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"error", err)
+				return err
 			}
 
 			// Poll progress from remote Tern

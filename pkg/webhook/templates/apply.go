@@ -665,6 +665,7 @@ func writeSummaryTableList(sb *strings.Builder, data ApplyStatusCommentData) {
 	singleGroup := len(groups) == 1
 	for _, g := range groups {
 		skipHeader := singleGroup && (g.namespace == "" || g.namespace == "default" || g.namespace == data.Database)
+		groupCollapsed := collapsed && !skipHeader
 
 		if !skipHeader {
 			header := g.namespace
@@ -674,7 +675,7 @@ func writeSummaryTableList(sb *strings.Builder, data ApplyStatusCommentData) {
 
 			groupEmoji := groupStateEmoji(g.tables)
 
-			if collapsed {
+			if groupCollapsed {
 				sb.WriteString("\n<details><summary>")
 				fmt.Fprintf(sb, "%s <strong>%s</strong> (%d tables)</summary>\n\n", groupEmoji, header, len(g.tables))
 			} else {
@@ -688,7 +689,7 @@ func writeSummaryTableList(sb *strings.Builder, data ApplyStatusCommentData) {
 			writeSummaryTableEntry(sb, t)
 		}
 
-		if collapsed {
+		if groupCollapsed {
 			sb.WriteString("</details>\n")
 		}
 	}

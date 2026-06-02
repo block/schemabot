@@ -14,6 +14,10 @@ import (
 
 // Cutover triggers the cutover phase when defer_cutover was used.
 func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
+	return c.cutover(ctx, req, "")
+}
+
+func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, caller string) (*ternv1.CutoverResponse, error) {
 	var task *storage.Task
 	var apply *storage.Apply
 	var err error
@@ -21,8 +25,11 @@ func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (
 	if req.ApplyId != "" {
 		var lookupErr error
 		apply, lookupErr = c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-		if lookupErr != nil || apply == nil {
-			return nil, fmt.Errorf("apply %s not found", req.ApplyId)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("load apply %s before cutover: %w", req.ApplyId, lookupErr)
+		}
+		if apply == nil {
+			return nil, fmt.Errorf("load apply %s before cutover: %w", req.ApplyId, storage.ErrApplyNotFound)
 		}
 		tasks, lookupErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 		if lookupErr != nil {
@@ -33,6 +40,14 @@ func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (
 				task = t
 				break
 			}
+		}
+		if task == nil && len(tasks) > 0 && state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.CuttingOver) {
+			c.logger.Info("cutover using completed task from cutover-ready apply",
+				"apply_id", apply.ApplyIdentifier,
+				"state", apply.State,
+				"task_id", tasks[0].TaskIdentifier,
+				"task_state", tasks[0].State)
+			task = tasks[0]
 		}
 	} else {
 		task, err = c.getActiveTaskForDatabase(ctx, c.config.Database)
@@ -73,17 +88,117 @@ func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (
 		return nil, fmt.Errorf("build cutover request for apply %d: %w", task.ApplyID, err)
 	}
 
+	logMessage := "Cutover triggered"
+	if caller != "" {
+		logMessage += callerApplyLogSuffix(caller)
+	}
 	c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
-		"Cutover triggered", "", "")
+		logMessage, "", "")
 
-	_, err = eng.Cutover(ctx, controlReq)
+	result, err := eng.Cutover(ctx, controlReq)
 	if err != nil {
 		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cutover failed: %v", err), "", "")
 		return nil, fmt.Errorf("cutover failed: %w", err)
 	}
+	if result == nil {
+		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			"Cutover was not accepted: no response from engine", "", "")
+		return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: "not accepted"}, nil
+	}
+	if !result.Accepted {
+		errorMessage := "not accepted"
+		if result.Message != "" {
+			errorMessage = result.Message
+		}
+		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Cutover was not accepted: %s", errorMessage), "", "")
+		return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: errorMessage}, nil
+	}
 
 	return &ternv1.CutoverResponse{Accepted: true}, nil
+}
+
+func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply) error {
+	controlReq, err := pendingCutoverControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	if cutoverRequestResolvedByApplyState(apply.State) {
+		c.logger.Info("completing pending cutover request for resolved apply",
+			"apply_id", apply.ApplyIdentifier,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Pending cutover request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		return completePendingCutoverControlRequests(ctx, c.storage, apply)
+	}
+	if cutoverRequestFailedByApplyState(apply.State) {
+		message := fmt.Sprintf("cutover request was not applied because apply is %s", apply.State)
+		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, message); err != nil {
+			return err
+		}
+		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
+	}
+	readyForCutover, err := applyReadyForCutoverRequest(ctx, c.storage, apply)
+	if err != nil {
+		return fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if !readyForCutover {
+		c.logger.Info("pending cutover request is waiting for cutover-ready state",
+			"apply_id", apply.ApplyIdentifier,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		return nil
+	}
+	if stopReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+		return fmt.Errorf("check pending stop request before pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	} else if stopReq != nil {
+		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
+		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
+	}
+	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply); err != nil {
+		return err
+	}
+	resp, err := c.cutover(ctx, &ternv1.CutoverRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: apply.Environment,
+	}, controlRequestCaller(controlReq))
+	if err != nil {
+		errorMessage := err.Error()
+		if failErr := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); failErr != nil {
+			return fmt.Errorf("process pending cutover for apply %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, err, failErr)
+		}
+		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if resp == nil {
+		errorMessage := "not accepted"
+		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+			return err
+		}
+		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+	}
+	if !resp.Accepted {
+		errorMessage := "not accepted"
+		if resp.ErrorMessage != "" {
+			errorMessage = resp.ErrorMessage
+		}
+		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+			return err
+		}
+		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+	}
+	if err := completePendingCutoverControlRequests(ctx, c.storage, apply); err != nil {
+		return err
+	}
+	c.logger.Info("pending cutover request accepted and completed",
+		"apply_id", apply.ApplyIdentifier,
+		"requested_by", controlRequestCaller(controlReq),
+		"state", apply.State)
+	return nil
 }
 
 // Stop pauses an in-progress schema change.

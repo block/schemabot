@@ -266,6 +266,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				task.State = state.Task.Stopped
 				return taskStopped
 			}
+			if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
+				c.logger.Warn("pending cutover request processing failed; current apply owner will exit for scheduler retry",
+					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
+				return taskAbort
+			}
 
 			// Re-fetch task state from storage to detect external changes (e.g., Stop).
 			// This also guards against a race where a new apply starts and the engine's

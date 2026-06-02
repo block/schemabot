@@ -13,7 +13,10 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"strings"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 
 	"github.com/block/spirit/pkg/utils"
 
@@ -163,25 +166,39 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 // When DeferCutOver was used, this triggers the deferred cutover by dropping
 // Spirit's sentinel table (_spirit_sentinel).
 func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	e.mu.Lock()
-	rm := e.runningMigration
-	e.mu.Unlock()
-
-	if rm == nil {
-		return nil, fmt.Errorf("no active schema change to cutover")
+	if req == nil {
+		return nil, fmt.Errorf("cutover request is required")
 	}
-
-	if !rm.deferCutover {
-		return &engine.ControlResult{
-			Accepted: false,
-			Message:  "schema change was not started with defer_cutover",
-		}, nil
-	}
-
-	// Drop the sentinel table to trigger cutover
-	// Spirit waits for _spirit_sentinel to be dropped before proceeding
 	if req.Credentials == nil || req.Credentials.DSN == "" {
 		return nil, fmt.Errorf("DSN credentials required for cutover")
+	}
+
+	e.mu.Lock()
+	rm := e.runningMigration
+	database := req.Database
+	if rm != nil {
+		if !rm.deferCutover {
+			e.mu.Unlock()
+			return &engine.ControlResult{
+				Accepted: false,
+				Message:  "schema change was not started with defer_cutover",
+			}, nil
+		}
+		if rm.database != "" {
+			database = rm.database
+		}
+	}
+	e.mu.Unlock()
+
+	if database == "" {
+		cfg, err := mysql.ParseDSN(req.Credentials.DSN)
+		if err != nil {
+			return nil, fmt.Errorf("parse DSN for cutover database: %w", err)
+		}
+		database = cfg.DBName
+	}
+	if database == "" {
+		return nil, fmt.Errorf("database is required for cutover")
 	}
 
 	db, err := sql.Open("mysql", req.Credentials.DSN)
@@ -197,18 +214,22 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	// Drop the sentinel table - Spirit will detect this and proceed with cutover.
 	// Cutover is asynchronous — Spirit performs the table swap in its goroutine.
 	// The caller should poll Progress() for state transitions.
-	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS `%s`._spirit_sentinel", rm.database))
+	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s._spirit_sentinel", quoteIdentifier(database)))
 	if err != nil {
 		return nil, fmt.Errorf("drop sentinel table: %w", err)
 	}
 
-	e.logger.Info("sentinel table dropped, cutover will proceed", "database", rm.database)
+	e.logger.Info("sentinel table dropped, cutover will proceed", "database", database, "stateless", rm == nil)
 
 	return &engine.ControlResult{
 		Accepted:    true,
 		Message:     "Cutover triggered - schema change will complete shortly",
 		ResumeState: req.ResumeState,
 	}, nil
+}
+
+func quoteIdentifier(name string) string {
+	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
 // Revert rolls back a completed schema change.

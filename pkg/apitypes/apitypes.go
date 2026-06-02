@@ -234,7 +234,10 @@ type ApplyResponse struct {
 type ControlResponse struct {
 	Accepted     bool   `json:"accepted"`
 	ErrorMessage string `json:"error_message,omitempty"`
+	Status       string `json:"status,omitempty"`
 }
+
+const ControlStatusAlreadyInProgress = "already_in_progress"
 
 // StopResponse is the HTTP response for POST /api/stop.
 type StopResponse struct {

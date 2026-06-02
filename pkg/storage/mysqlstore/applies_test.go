@@ -760,6 +760,49 @@ func TestApplyStore_FindNextApplyClaimsStoppedStartControlRequest(t *testing.T) 
 	assert.Nil(t, claimedAgain, "claim transition should prevent another worker from taking the same stopped start request")
 }
 
+func TestApplyStore_FindNextApplyClaimsStaleWaitingForCutoverControlRequest(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_cutover_request", 506, state.Apply.WaitingForCutover, "staging")
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationCutover,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	freshClaim, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, freshClaim, "fresh waiting-for-cutover applies are owned by their active worker")
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = NOW() - INTERVAL 2 MINUTE
+		WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.WaitingForCutover, claimed.State)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.WaitingForCutover, persisted.State)
+
+	claimedAgain, err := store.Applies().FindNextApply(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimedAgain, "claim heartbeat should prevent another worker from immediately taking the same stale cutover request")
+}
+
 func TestApplyStore_FindNextApplySkipsFailedStoppedStartControlRequest(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

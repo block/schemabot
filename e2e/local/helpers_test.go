@@ -382,8 +382,12 @@ func resetLocalScaleStateWithContext(ctx context.Context) error {
 	return nil
 }
 
-func uniqueTableName(prefix string) string {
+func uniqueSchemaIdentifier(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+}
+
+func uniqueTableName(prefix string) string {
+	return uniqueSchemaIdentifier(prefix)
 }
 
 func createTestTable(t *testing.T, tableName, ddlStmt string) {

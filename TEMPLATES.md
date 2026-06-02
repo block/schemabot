@@ -2009,6 +2009,34 @@ Cutover in progress — typically completes within seconds.
 </details>
 
 <details>
+<summary><a name="cutover-command-accepted"></a><strong>Cutover Command Accepted</strong></summary>
+
+
+## Cutover Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Cutover request accepted. SchemaBot will complete this schema change; status remains available from the PR progress comment or CLI.
+
+</details>
+
+<details>
+<summary><a name="cutover-command-already-in-progress"></a><strong>Cutover Command Already In Progress</strong></summary>
+
+
+## Cutover Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Cutover is already in progress. SchemaBot will keep reporting progress from the existing apply.
+
+</details>
+
+<details>
 <summary><a name="summary-completed"></a><strong>Summary: Completed</strong></summary>
 
 
@@ -2168,7 +2196,6 @@ ALTER TABLE `audit_logs` ADD INDEX `idx_created_at`(`created_at`);
 ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 ```
 
-</details>
 _Apply ID: apply-a1b2c3d4e5f6_
 
 </details>
@@ -2227,7 +2254,6 @@ ALTER TABLE `audit_logs` ADD INDEX `idx_created_at`(`created_at`);
 ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 ```
 
-</details>
 
 ---
 
@@ -4156,6 +4182,36 @@ SchemaBot could not verify authorization for `schemabot apply-confirm`. No schem
 If access is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 
 A configured SchemaBot admin/database operator should inspect SchemaBot authorization logs before retrying.
+
+
+</details>
+
+<details>
+<summary><a name="cutover-command-accepted"></a><strong>Cutover Command Accepted</strong></summary>
+
+
+## Cutover Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Cutover request accepted. SchemaBot will complete this schema change; status remains available from the PR progress comment or CLI.
+
+
+</details>
+
+<details>
+<summary><a name="cutover-command-already-in-progress"></a><strong>Cutover Command Already In Progress</strong></summary>
+
+
+## Cutover Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Cutover is already in progress. SchemaBot will keep reporting progress from the existing apply.
 
 
 </details>

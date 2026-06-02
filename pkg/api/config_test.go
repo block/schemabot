@@ -830,6 +830,260 @@ func TestServerConfig_ResolveDatabaseTarget(t *testing.T) {
 	assert.Contains(t, err.Error(), "not configured")
 }
 
+func TestServerConfig_ResolveDatabaseTargets(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"localdb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/localdb"},
+				},
+			},
+			"scalardb": {
+				Type: "vitess",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "cluster-production-001", Deployment: "tenant-a"},
+				},
+			},
+			"multidb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Deployments: map[string]DeploymentTarget{
+							"payments-c": {Target: "payments"},
+							"payments-a": {Target: "payments"},
+							"payments-b": {Target: "payments"},
+						},
+					},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"tenant-a":   {"production": "localhost:9090"},
+			"payments-a": {"production": "tern-a:9090"},
+			"payments-b": {"production": "tern-b:9090"},
+			"payments-c": {"production": "tern-c:9090"},
+		},
+	}
+	// This test exercises the resolver directly on a hand-built config so
+	// it can cover multi-deployment resolution; the Validate() gate on
+	// multi-deployment maps is covered separately by
+	// TestServerConfig_DeploymentsMapValidation.
+
+	t.Run("local DSN returns single element", func(t *testing.T) {
+		got, err := cfg.ResolveDatabaseTargets("localdb", "staging")
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, ResolvedDatabaseTarget{DatabaseType: "mysql", Deployment: "localdb", Target: "localdb"}, got[0])
+	})
+
+	t.Run("scalar remote returns single element", func(t *testing.T) {
+		got, err := cfg.ResolveDatabaseTargets("scalardb", "production")
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, ResolvedDatabaseTarget{DatabaseType: "vitess", Deployment: "tenant-a", Target: "cluster-production-001"}, got[0])
+	})
+
+	t.Run("deployments map returns sorted slice", func(t *testing.T) {
+		got, err := cfg.ResolveDatabaseTargets("multidb", "production")
+		require.NoError(t, err)
+		assert.Equal(t, []ResolvedDatabaseTarget{
+			{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments"},
+			{DatabaseType: "mysql", Deployment: "payments-b", Target: "payments"},
+			{DatabaseType: "mysql", Deployment: "payments-c", Target: "payments"},
+		}, got)
+	})
+
+	t.Run("unknown database errors", func(t *testing.T) {
+		_, err := cfg.ResolveDatabaseTargets("missing", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not configured")
+	})
+
+	t.Run("unknown environment errors", func(t *testing.T) {
+		_, err := cfg.ResolveDatabaseTargets("multidb", "staging")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "staging")
+	})
+
+	t.Run("ResolveDatabaseTarget errors on multi-deployment", func(t *testing.T) {
+		_, err := cfg.ResolveDatabaseTarget("multidb", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ResolveDatabaseTargets")
+	})
+
+	t.Run("ResolveDatabaseTarget works for scalar remote", func(t *testing.T) {
+		got, err := cfg.ResolveDatabaseTarget("scalardb", "production")
+		require.NoError(t, err)
+		assert.Equal(t, "tenant-a", got.Deployment)
+		assert.Equal(t, "cluster-production-001", got.Target)
+	})
+}
+
+// TestServerConfig_ResolveDatabaseTargets_BypassValidate covers the cases
+// where a caller constructs a ServerConfig directly without going through
+// Validate() (tests, hot-reload paths, etc.). The resolver must still return
+// a clear error rather than falling through to scalar routing with a
+// misleading "missing server-side target" message.
+func TestServerConfig_ResolveDatabaseTargets_BypassValidate(t *testing.T) {
+	makeCfg := func(env EnvironmentConfig) *ServerConfig {
+		return &ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type:         "mysql",
+					Environments: map[string]EnvironmentConfig{"production": env},
+				},
+			},
+		}
+	}
+
+	t.Run("explicitly empty deployments map errors clearly", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{Deployments: map[string]DeploymentTarget{}})
+		_, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "deployments map is empty")
+	})
+
+	t.Run("empty map key errors clearly", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+			"": {Target: "payments"},
+		}})
+		_, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "empty key")
+	})
+
+	t.Run("entry with empty target errors clearly", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+			"payments-a": {Target: ""},
+		}})
+		_, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `deployment "payments-a" missing target`)
+	})
+}
+
+func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
+	baseTern := TernConfig{
+		"payments-a": {"production": "tern-a:9090"},
+		"payments-b": {"production": "tern-b:9090"},
+	}
+
+	cases := []struct {
+		name       string
+		envConfig  EnvironmentConfig
+		tern       TernConfig
+		wantErrSub string
+	}{
+		{
+			name: "valid single-entry deployments map",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+			},
+			tern: baseTern,
+		},
+		{
+			name: "multi-entry deployments map is rejected until orchestration is wired",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+					"payments-b": {Target: "payments"},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: "multi-deployment (>1 entries) is not yet supported",
+		},
+		{
+			name: "mixing scalar and map is rejected",
+			envConfig: EnvironmentConfig{
+				Target:     "payments",
+				Deployment: "payments-a",
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: "cannot configure both scalar target/deployment and a deployments map",
+		},
+		{
+			name: "empty deployments map is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{},
+			},
+			tern:       baseTern,
+			wantErrSub: "deployments map is empty",
+		},
+		{
+			name: "entry with empty target is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: ""},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: `deployment "payments-a" missing target`,
+		},
+		{
+			name: "unknown deployment is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"unknown-deployment": {Target: "payments"},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: `references unknown deployment "unknown-deployment"`,
+		},
+		{
+			name: "deployment without endpoint for env is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+			},
+			tern: TernConfig{
+				"payments-a": {"staging": "tern-a:9090"},
+			},
+			wantErrSub: `deployment "payments-a" has no endpoint`,
+		},
+		{
+			name: "local DSN together with deployments map is rejected",
+			envConfig: EnvironmentConfig{
+				DSN: "root@tcp(localhost)/payments",
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: "cannot configure both local DSN and target/deployment(s)",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"payments": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"production": tc.envConfig,
+						},
+					},
+				},
+				TernDeployments: tc.tern,
+			}
+			err := cfg.Validate()
+			if tc.wantErrSub == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErrSub)
+		})
+	}
+}
+
 func TestServerConfig_EnvironmentIsolatedConfigMaps(t *testing.T) {
 	stagingConfig := ServerConfig{
 		AllowedEnvironments: []string{"staging"},

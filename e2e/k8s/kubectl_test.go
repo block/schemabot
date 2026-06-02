@@ -220,3 +220,20 @@ func startDataPlanePodGRPCPortForward(t *testing.T, pod string) string {
 
 	return fmt.Sprintf("127.0.0.1:%d", port)
 }
+
+func startDataPlaneServiceGRPCPortForward(t *testing.T) string {
+	t.Helper()
+	port := freeLocalPort(t)
+	ctx, cancel := context.WithCancel(context.WithoutCancel(t.Context()))
+	cmd := exec.CommandContext(ctx, "kubectl", "port-forward", "-n", k8sNamespace, "svc/data-plane-schemabot", fmt.Sprintf("%d:13370", port))
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		cancel()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+
+	return fmt.Sprintf("127.0.0.1:%d", port)
+}

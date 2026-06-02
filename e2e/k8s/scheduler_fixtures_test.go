@@ -108,6 +108,11 @@ func startRunningIndexAddApply(t *testing.T, tablePrefix string) runningIndexApp
 
 func startIndexAddApply(t *testing.T, tablePrefix string, waitForRunning bool) runningIndexApply {
 	t.Helper()
+	return startIndexAddApplyWithOptions(t, tablePrefix, waitForRunning, nil, 500000)
+}
+
+func startIndexAddApplyWithOptions(t *testing.T, tablePrefix string, waitForRunning bool, applyOpts map[string]string, rowCount int) runningIndexApply {
+	t.Helper()
 	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName(tablePrefix)
 
@@ -116,14 +121,14 @@ func startIndexAddApply(t *testing.T, tablePrefix string, waitForRunning bool) r
 		storageDSNs(t)...)
 
 	testutil.SeedRows(t, dsn, tableName, "account_id, event_type",
-		"FLOOR(1 + RAND() * 100000), ELT(FLOOR(1 + RAND() * 5), 'type_a', 'type_b', 'type_c', 'type_d', 'type_e')", 500000)
+		"FLOOR(1 + RAND() * 100000), ELT(FLOOR(1 + RAND() * 5), 'type_a', 'type_b', 'type_c', 'type_d', 'type_e')", rowCount)
 
 	schemaFiles := map[string]string{
 		tableName + ".sql": fmt.Sprintf(
 			`CREATE TABLE %s (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, account_id BIGINT NOT NULL, event_type VARCHAR(100) NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY idx_account_created (account_id, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;`, tableName),
 	}
 
-	_, applyID := testutil.PlanAndApply(t, ep, "testapp", "mysql", "staging", schemaFiles, nil)
+	_, applyID := testutil.PlanAndApply(t, ep, "testapp", "mysql", "staging", schemaFiles, applyOpts)
 	dataPlaneApplyID := waitForApplyExternalID(t, applyID, testutil.PollDeadline)
 
 	if waitForRunning {

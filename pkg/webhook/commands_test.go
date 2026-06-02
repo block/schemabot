@@ -58,7 +58,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		{name: action.Stop, requiresEnv: true, hasApplyID: true},
 		{name: action.Revert, requiresEnv: true},
 		{name: action.SkipRevert, requiresEnv: true},
-		{name: action.Cutover, requiresEnv: true},
+		{name: action.Cutover, requiresEnv: true, hasApplyID: true},
 		{name: action.Rollback, requiresEnv: true, hasApplyID: true,
 			supportsDB: true, supportsDefer: true},
 		{name: action.RollbackConfirm, requiresEnv: true, supportsDB: true},
@@ -293,9 +293,10 @@ func TestParseCommand(t *testing.T) {
 		},
 		{
 			name: "cutover",
-			body: "schemabot cutover -e staging",
+			body: "schemabot cutover apply_abc123 -e staging",
 			expected: CommandResult{
 				Action:      "cutover",
+				ApplyID:     "apply_abc123",
 				Environment: "staging",
 				Found:       true,
 				IsMention:   true,

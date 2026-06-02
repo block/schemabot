@@ -388,6 +388,14 @@ func TestPreviewCommentSummaryStopped(t *testing.T) {
 	assert.Contains(t, result, "**`orders`**")
 }
 
+func TestPreviewCommentSummaryCompletedLargeSingleNamespaceKeepsApplyIDInsideSection(t *testing.T) {
+	result := PreviewCommentSummaryCompletedLarge()
+
+	assert.Contains(t, result, "All 8 tables applied successfully")
+	assert.Contains(t, result, "_Apply ID: apply-a1b2c3d4e5f6_")
+	assert.Equal(t, 0, strings.Count(result, "</details>"))
+}
+
 func TestRenderApplyBlockedByFailingChecks(t *testing.T) {
 	failing := []BlockingCheck{
 		{Name: "CI / unit-tests", State: "failure"},

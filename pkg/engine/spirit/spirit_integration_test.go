@@ -446,6 +446,21 @@ func TestEngine_Cutover_NoActiveMigration(t *testing.T) {
 		ResumeState: &engine.ResumeState{MigrationContext: "test"},
 	})
 	require.Error(t, err, "expected error for cutover without active schema change")
+	assert.Contains(t, err.Error(), "DSN credentials required")
+}
+
+func TestEngine_Cutover_NoActiveChangeWithCredentialsAttemptsStatelessSignal(t *testing.T) {
+	eng := New(Config{})
+
+	_, err := eng.Cutover(t.Context(), &engine.ControlRequest{
+		Database: "testdb",
+		Credentials: &engine.Credentials{
+			DSN: "root@tcp(127.0.0.1:1)/testdb",
+		},
+		ResumeState: &engine.ResumeState{MigrationContext: "test"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ping database for cutover")
 }
 
 func TestEngine_Revert_NotSupported(t *testing.T) {
