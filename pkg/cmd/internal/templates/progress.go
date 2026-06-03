@@ -466,7 +466,7 @@ func FormatTableProgress(t TableProgress) string {
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
 	case state.Apply.RecoveringCutover:
-		bar := ui.ProgressBarRowCopy(100) // blue — in progress, row copy done
+		bar := ui.ProgressBarRowCopy(t.PercentComplete)
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovering cutover state...\n", t.TableName, bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
