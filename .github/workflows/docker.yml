@@ -50,14 +50,18 @@ jobs:
       - name: "Resolve code-change flag"
         id: out
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FILTER_OUTCOME: ${{ steps.filter.outcome }}
+          FILTER_CODE: ${{ steps.filter.outputs.code }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "$EVENT_NAME" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
-          elif [ "${{ steps.filter.outcome }}" != "success" ]; then
+          elif [ "$FILTER_OUTCOME" != "success" ]; then
             echo "::warning::paths-filter failed; running CI instead of skipping"
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
-            echo "code=${{ steps.filter.outputs.code }}" >> "$GITHUB_OUTPUT"
+            echo "code=$FILTER_CODE" >> "$GITHUB_OUTPUT"
           fi
 
   lint-chart:

@@ -36,14 +36,18 @@ jobs:
       - name: "Resolve code-change flag"
         id: out
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FILTER_OUTCOME: ${{ steps.filter.outcome }}
+          FILTER_CODE: ${{ steps.filter.outputs.code }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "$EVENT_NAME" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
-          elif [ "${{ steps.filter.outcome }}" != "success" ]; then
+          elif [ "$FILTER_OUTCOME" != "success" ]; then
             echo "::warning::paths-filter failed; running CI instead of skipping"
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
-            echo "code=${{ steps.filter.outputs.code }}" >> "$GITHUB_OUTPUT"
+            echo "code=$FILTER_CODE" >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -329,22 +333,27 @@ jobs:
     if: always()
     steps:
       - shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          E2E_MYSQL_RESULT: ${{ needs.e2e-mysql.result }}
+          E2E_VITESS_RESULT: ${{ needs.e2e-vitess.result }}
         run: |
           set -euo pipefail
-          if [ "${{ needs.changes.result }}" != "success" ]; then
+          if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::changes job failed"
             exit 1
           fi
-          if [ "${{ needs.changes.outputs.code }}" != "true" ]; then
+          if [ "$CHANGES_CODE" != "true" ]; then
             echo "Docs-only PR; E2E intentionally skipped."
             exit 0
           fi
-          if [ "${{ needs.e2e-mysql.result }}" != "success" ]; then
-            echo "::error::e2e-mysql result=${{ needs.e2e-mysql.result }}"
+          if [ "$E2E_MYSQL_RESULT" != "success" ]; then
+            echo "::error::e2e-mysql result=$E2E_MYSQL_RESULT"
             exit 1
           fi
-          if [ "${{ needs.e2e-vitess.result }}" != "success" ]; then
-            echo "::error::e2e-vitess result=${{ needs.e2e-vitess.result }}"
+          if [ "$E2E_VITESS_RESULT" != "success" ]; then
+            echo "::error::e2e-vitess result=$E2E_VITESS_RESULT"
             exit 1
           fi
 
@@ -355,17 +364,21 @@ jobs:
     if: always()
     steps:
       - shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          LOCALSCALE_RESULT: ${{ needs.localscale.result }}
         run: |
           set -euo pipefail
-          if [ "${{ needs.changes.result }}" != "success" ]; then
+          if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::changes job failed"
             exit 1
           fi
-          if [ "${{ needs.changes.outputs.code }}" != "true" ]; then
+          if [ "$CHANGES_CODE" != "true" ]; then
             echo "Docs-only PR; LocalScale intentionally skipped."
             exit 0
           fi
-          if [ "${{ needs.localscale.result }}" != "success" ]; then
-            echo "::error::localscale result=${{ needs.localscale.result }}"
+          if [ "$LOCALSCALE_RESULT" != "success" ]; then
+            echo "::error::localscale result=$LOCALSCALE_RESULT"
             exit 1
           fi
