@@ -521,6 +521,144 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	assert.Len(t, allComments, 2, "upsert should not create duplicate entries")
 }
 
+// This scenario covers a recovered PR observer whose scheduler worker has lost
+// ownership before it reaches terminal notification. The stale observer must not
+// edit progress, post a summary, mark summary state, or run terminal hooks.
+func TestE2ECommentObserverSkipsTerminalSideEffectsAfterLeaseLoss(t *testing.T) {
+	ctx := t.Context()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+
+	st := mysqlstore.New(schemabotDB)
+
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM apply_comments")
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM tasks WHERE repository = 'org/stale-lease'")
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'org/stale-lease'")
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'org/stale-lease'")
+	require.NoError(t, err)
+
+	lock := &storage.Lock{
+		DatabaseName: "e2e_stale_lease_db",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Repository:   "org/stale-lease",
+		PullRequest:  45,
+		Owner:        "org/stale-lease#45",
+	}
+	require.NoError(t, st.Locks().Acquire(ctx, lock))
+	lock, err = st.Locks().Get(ctx, "e2e_stale_lease_db", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply_stale_lease_%d", now.UnixNano()),
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "e2e_stale_lease_db",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/stale-lease",
+		PullRequest:     45,
+		Environment:     "staging",
+		Caller:          "org/stale-lease#45",
+		InstallationID:  12345,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := st.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	task := &storage.Task{
+		TaskIdentifier:  fmt.Sprintf("task_stale_lease_%d", now.UnixNano()),
+		ApplyID:         applyID,
+		PlanID:          apply.PlanID,
+		Database:        apply.Database,
+		DatabaseType:    apply.DatabaseType,
+		Engine:          storage.EngineSpirit,
+		Repository:      apply.Repository,
+		PullRequest:     apply.PullRequest,
+		Environment:     apply.Environment,
+		State:           state.Task.Completed,
+		TableName:       "users",
+		DDL:             "ALTER TABLE `users` ADD COLUMN `stale_lease_note` varchar(255)",
+		DDLAction:       "alter",
+		Options:         []byte("{}"),
+		ProgressPercent: 100,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	taskID, err := st.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	_, err = schemabotDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, "current-worker", "current-token", applyID)
+	require.NoError(t, err)
+
+	progressCommentID := int64(4242)
+	require.NoError(t, st.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         applyID,
+		CommentState:    state.Comment.Progress,
+		GitHubCommentID: progressCommentID,
+	}))
+
+	installClient, capture := setupFakeGitHubForComments(t)
+	factory := &fakeClientFactory{client: installClient}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	terminalHookCalled := atomic.Bool{}
+	observer := NewCommentObserver(CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        st,
+		Repo:           "org/stale-lease",
+		PR:             45,
+		InstallationID: 12345,
+		ApplyID:        applyID,
+		ApplyLease: storage.ApplyLease{
+			ApplyID: applyID,
+			Owner:   "stale-worker",
+			Token:   "stale-token",
+		},
+		Logger: logger,
+		OnTerminalHook: func(*storage.Apply) {
+			terminalHookCalled.Store(true)
+		},
+	})
+
+	terminalApply := *apply
+	terminalApply.State = state.Apply.Failed
+	terminalApply.ErrorMessage = "stale worker terminal state"
+	terminalApply.CompletedAt = &now
+	observer.OnTerminal(&terminalApply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("expected no edit call after lease loss, got comment %d: %s", edited.CommentID, edited.Body)
+	case created := <-capture.creates:
+		t.Fatalf("expected no create call after lease loss, got comment %d: %s", created.ID, created.Body)
+	case <-time.After(500 * time.Millisecond):
+		// expected: no GitHub side effects
+	}
+	assert.False(t, terminalHookCalled.Load())
+
+	summary, err := st.ApplyComments().Get(ctx, applyID, state.Comment.Summary)
+	require.NoError(t, err)
+	assert.Nil(t, summary)
+	progress, err := st.ApplyComments().Get(ctx, applyID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, progress)
+	assert.Equal(t, progressCommentID, progress.GitHubCommentID)
+}
+
 // TestE2EEditTrackedCommentNotFound tests that editing a non-existent comment is handled gracefully.
 func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)

@@ -255,13 +255,13 @@ func TestScheduler_ClaimOrdering(t *testing.T) {
 	require.NoError(t, err)
 
 	// The scheduler claim path should pick the oldest stale apply first.
-	claimed, err := stor.Applies().FindNextApply(ctx)
+	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, "apply-order-older", claimed.ApplyIdentifier)
 
 	// After the first target is claimed, the scheduler can claim the next stale target.
-	claimed2, err := stor.Applies().FindNextApply(ctx)
+	claimed2, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed2)
 	assert.Equal(t, "apply-order-newer", claimed2.ApplyIdentifier)
@@ -343,7 +343,7 @@ func TestScheduler_ClaimableStates(t *testing.T) {
 			require.NoError(t, err)
 
 			// The scheduler should claim only queued or stale applies in states it can resume safely.
-			claimed, err := stor.Applies().FindNextApply(ctx)
+			claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 			require.NoError(t, err)
 			if tc.wantClaim {
 				require.NotNil(t, claimed)
@@ -382,7 +382,7 @@ func TestScheduler_ClaimRefreshesHeartbeat(t *testing.T) {
 	require.NotNil(t, beforeClaim)
 
 	// Claiming is also the scheduler's lease renewal; it keeps another worker from immediately reclaiming the same apply.
-	claimed, err := stor.Applies().FindNextApply(ctx)
+	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, "apply-claim-refreshes-heartbeat", claimed.ApplyIdentifier)
@@ -392,7 +392,7 @@ func TestScheduler_ClaimRefreshesHeartbeat(t *testing.T) {
 	require.NotNil(t, afterClaim)
 	assert.True(t, afterClaim.UpdatedAt.After(beforeClaim.UpdatedAt), "claim should refresh the apply heartbeat")
 
-	reclaimed, err := stor.Applies().FindNextApply(ctx)
+	reclaimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Nil(t, reclaimed, "freshly claimed apply should not be claimable again")
 }
@@ -709,7 +709,7 @@ func TestScheduler_DatabaseExclusionScopedByEnvironment(t *testing.T) {
 	require.NoError(t, err)
 
 	// The scheduler should allow a stale apply when the active apply is for another environment.
-	claimed, err := stor.Applies().FindNextApply(ctx)
+	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, "apply-env-stale-production", claimed.ApplyIdentifier)
@@ -751,7 +751,7 @@ func TestScheduler_PlanetScaleSetupStatesNotClaimed(t *testing.T) {
 		require.NoError(t, err)
 
 		// The scheduler should leave PlanetScale setup states unclaimed until resume metadata can be hydrated.
-		claimed, err := stor.Applies().FindNextApply(ctx)
+		claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 		require.NoError(t, err)
 		assert.Nil(t, claimed, "stale %s should not be claimed without persisted resume metadata", ps)
 	}

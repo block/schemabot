@@ -551,7 +551,50 @@ In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each sche
 
 The storage arrows represent scheduler coordination. The GitHub arrows represent optional observer notifications; CLI applies simply run without an observer.
 
-A **claim** is an atomic storage operation: it selects one apply that needs work and refreshes its `updated_at` heartbeat in the same transaction. That heartbeat refresh is the scheduler's lease while it reloads state and calls `ResumeApply()`. Claims use `FOR UPDATE SKIP LOCKED` so multiple scheduler workers can run concurrently without taking the same apply.
+A **claim** is an atomic storage operation: it selects one apply that needs work,
+refreshes its `updated_at` heartbeat, and rotates an apply lease token in the
+same transaction. The heartbeat timestamp decides when another worker may try to
+recover the apply; the lease token decides which worker may write. Lease-owned
+apply updates, task updates, heartbeats, apply logs, and recovered PR-comment
+observer side effects must match the current token. If another worker claims the
+apply and rotates the token, the old worker's writes fail with an ownership error
+and the old worker exits instead of posting stale comments or overwriting newer
+state.
+
+```diagram
+1. worker A claims the apply
+
+   ╭──────────╮        claim         ╭──────────────────────────╮
+   │ worker A │─────────────────────▶│ applies row              │
+   │ token A  │                      │ updated_at = fresh       │
+   ╰──────────╯                      │ lease_token = token A    │
+                                     ╰──────────────────────────╯
+
+2. worker A stops heartbeating long enough for recovery
+
+   ╭──────────╮                      ╭──────────────────────────╮
+   │ worker A │                      │ applies row              │
+   │ token A  │                      │ updated_at = stale       │
+   ╰──────────╯                      │ lease_token = token A    │
+                                     ╰──────────────────────────╯
+
+3. worker B claims the stale apply and rotates the token
+
+   ╭──────────╮        claim         ╭──────────────────────────╮
+   │ worker B │─────────────────────▶│ applies row              │
+   │ token B  │                      │ updated_at = fresh       │
+   ╰──────────╯                      │ lease_token = token B    │
+                                     ╰──────────────────────────╯
+
+4. worker A wakes up and tries to write with token A
+
+   ╭──────────╮   write WHERE token=A ╭──────────────────────────╮
+   │ worker A │──────────────────────▶│ applies row              │
+   │ token A  │       rejected        │ lease_token = token B    │
+   ╰──────────╯                       ╰──────────────────────────╯
+```
+
+Claims use `FOR UPDATE SKIP LOCKED` so multiple scheduler workers can run concurrently without taking the same apply.
 
 A running apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
 

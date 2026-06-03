@@ -25,6 +25,7 @@ type CommentObserver struct {
 	pr             int
 	installationID int64
 	applyID        int64
+	applyLease     storage.ApplyLease
 	deferCutover   bool
 	logger         interface {
 		Info(msg string, args ...any)
@@ -64,6 +65,7 @@ type CommentObserverConfig struct {
 	PR             int
 	InstallationID int64
 	ApplyID        int64
+	ApplyLease     storage.ApplyLease
 	DeferCutover   bool
 	Logger         interface {
 		Info(msg string, args ...any)
@@ -97,6 +99,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		pr:             cfg.PR,
 		installationID: cfg.InstallationID,
 		applyID:        cfg.ApplyID,
+		applyLease:     cfg.ApplyLease,
 		deferCutover:   cfg.DeferCutover,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
@@ -110,6 +113,9 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if !o.leaseStillOwnsObserver(apply, "progress") {
+		return
+	}
 
 	now := o.clock.Now()
 	currentState := apply.State
@@ -184,6 +190,9 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 // Edits the active comment to final state, posts summary comment,
 // and updates check runs.
 func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task) {
+	if !o.leaseStillOwnsObserver(apply, "terminal") {
+		return
+	}
 	// Determine which comment to edit to final state.
 	// If a cutover comment exists, edit that and leave the progress comment
 	// frozen at its last state. Otherwise edit the progress comment.
@@ -226,6 +235,27 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
 	return o.deferCutover || apply.GetOptions().DeferCutover
+}
+
+func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation string) bool {
+	lease := o.applyLease
+	if !lease.Valid() && apply != nil {
+		lease = apply.Lease()
+	}
+	if !lease.Valid() {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := o.stor.Applies().CheckLease(ctx, lease); err != nil {
+		o.logger.Error("observer: apply lease no longer owns apply; skipping GitHub side effect",
+			"operation", operation,
+			"apply_id", lease.ApplyID,
+			"lease_owner", lease.Owner,
+			"error", err)
+		return false
+	}
+	return true
 }
 
 // editTrackedComment looks up a stored comment ID and edits it.

@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -237,6 +238,15 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 				return
 			case <-ticker.C:
 				if err := c.storage.Applies().Heartbeat(hbCtx, apply.ID); err != nil {
+					if errors.Is(err, storage.ErrApplyLeaseLost) {
+						c.logger.Warn("heartbeat failed because apply lease was lost; local worker will stop writing apply state",
+							"apply_id", apply.ApplyIdentifier,
+							"database", apply.Database,
+							"environment", apply.Environment,
+							"error", err)
+						cancel()
+						return
+					}
 					c.logger.Warn("heartbeat failed", "apply_id", apply.ApplyIdentifier, "error", err)
 				}
 			}

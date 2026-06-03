@@ -17,17 +17,20 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/google/uuid"
 )
 
 // applyColumns lists all columns for SELECT queries.
 const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, database_type,
 	repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
 	state, error_message, options, attempt,
+	lease_owner, lease_token, lease_acquired_at,
 	created_at, started_at, completed_at, updated_at`
 
 const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_id, a.database_name, a.database_type,
 	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.engine,
 	a.state, a.error_message, a.options, a.attempt,
+	a.lease_owner, a.lease_token, a.lease_acquired_at,
 	a.created_at, a.started_at, a.completed_at, a.updated_at`
 
 const (
@@ -269,6 +272,44 @@ func checkNoActiveApplyForTarget(ctx context.Context, tx *sql.Tx, database, dbTy
 	}
 	if activeCount > 0 {
 		return fmt.Errorf("active apply exists for %s/%s/%s: %w", database, dbType, environment, storage.ErrActiveApplyExists)
+	}
+	return nil
+}
+
+func applyLeaseFromContext(ctx context.Context, applyID int64) (storage.ApplyLease, bool, error) {
+	lease, ok := storage.ApplyLeaseFromContext(ctx)
+	if !ok {
+		return storage.ApplyLease{}, false, nil
+	}
+	if !lease.Valid() || lease.ApplyID != applyID {
+		return storage.ApplyLease{}, true, fmt.Errorf("invalid apply lease for apply %d: %w", applyID, storage.ErrApplyLeaseLost)
+	}
+	return lease, true, nil
+}
+
+func applyLeaseMatches(ctx context.Context, db queryRower, lease storage.ApplyLease) (bool, error) {
+	var match int
+	err := db.QueryRowContext(ctx, `
+		SELECT 1
+		FROM applies
+		WHERE id = ? AND lease_token = ?
+	`, lease.ApplyID, lease.Token).Scan(&match)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("verify apply lease for apply %d: %w", lease.ApplyID, err)
+	}
+	return true, nil
+}
+
+func ensureApplyLeaseStillOwned(ctx context.Context, db queryRower, lease storage.ApplyLease) error {
+	matches, err := applyLeaseMatches(ctx, db, lease)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		return fmt.Errorf("apply lease for apply %d is no longer current: %w", lease.ApplyID, storage.ErrApplyLeaseLost)
 	}
 	return nil
 }
@@ -548,9 +589,12 @@ func (s *applyStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Ap
 
 // Update updates apply state and fields.
 func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
+	lease, hasLease, err := applyLeaseFromContext(ctx, apply.ID)
+	if err != nil {
+		return err
+	}
 	lockTarget := isActiveApplyState(apply.State)
 	database, dbType, environment := apply.Database, apply.DatabaseType, apply.Environment
-	var err error
 	if lockTarget && !hasApplyTarget(database, dbType, environment) {
 		database, dbType, environment, err = applyTargetForUpdate(ctx, s.db, apply)
 		if err != nil {
@@ -589,15 +633,31 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 		args = append(args, string(apply.Options))
 	}
 	args = append(args, apply.StartedAt, apply.CompletedAt, apply.ID)
+	leasePredicate := ""
+	if hasLease {
+		leasePredicate = " AND lease_token = ?"
+		args = append(args, lease.Token)
+	}
 
-	_, err = writeTx.tx.ExecContext(ctx, fmt.Sprintf(`
+	result, err := writeTx.tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE applies
 		SET state = ?, error_message = ?, attempt = ?,
 		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
-		WHERE id = ?
-	`, optionsUpdate), args...)
+		WHERE id = ?%s
+	`, optionsUpdate, leasePredicate), args...)
 	if err != nil {
 		return fmt.Errorf("update apply %d: %w", apply.ID, err)
+	}
+	if hasLease {
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read apply update rows affected for apply %d: %w", apply.ID, err)
+		}
+		if rows == 0 {
+			if err := ensureApplyLeaseStillOwned(ctx, writeTx.tx, lease); err != nil {
+				return err
+			}
+		}
 	}
 	if err := writeTx.commit(); err != nil {
 		return fmt.Errorf("commit update apply %d: %w", apply.ID, err)
@@ -666,7 +726,10 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 // budget.
 // Apply creation/update enforces one active apply per database/type/environment,
 // so claims only need to lease one row and avoid worker races on that row.
-func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) {
+func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.Apply, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("scheduler owner is required to claim apply: %w", storage.ErrApplyLeaseLost)
+	}
 	// Read committed keeps concurrent SKIP LOCKED claims from taking next-key
 	// range locks that can serialize workers across otherwise independent targets.
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -727,6 +790,12 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 		return nil, fmt.Errorf("query next claimable apply: %w", err)
 	}
 
+	leaseToken := uuid.NewString()
+	leaseAcquiredAt := time.Now()
+	apply.LeaseOwner = owner
+	apply.LeaseToken = leaseToken
+	apply.LeaseAcquiredAt = &leaseAcquiredAt
+
 	// Refresh the heartbeat as part of the claim before releasing the row lock.
 	// Pending, stopped-start, and retryable applies move into an active owner
 	// state while the scheduler acts, so another worker cannot immediately claim
@@ -737,11 +806,12 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 		result, err = tx.ExecContext(ctx, `
 			UPDATE applies
 			SET state = ?, updated_at = NOW(),
+			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW(),
 			    attempt = CASE WHEN ? = ? THEN attempt + 1 ELSE attempt END,
 			    completed_at = NULL,
 			    error_message = CASE WHEN ? = ? THEN '' ELSE error_message END
 			WHERE id = ? AND state = ?
-		`, nextState, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.ID, apply.State)
+		`, nextState, owner, leaseToken, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.ID, apply.State)
 		if err != nil {
 			return nil, fmt.Errorf("claim apply %d in state %s: %w", apply.ID, apply.State, err)
 		}
@@ -758,8 +828,11 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 		}
 	} else {
 		_, err = tx.ExecContext(ctx, `
-			UPDATE applies SET updated_at = NOW() WHERE id = ?
-		`, apply.ID)
+			UPDATE applies
+			SET updated_at = NOW(),
+			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+			WHERE id = ?
+		`, owner, leaseToken, apply.ID)
 		if err != nil {
 			return nil, fmt.Errorf("refresh heartbeat for claimed apply %d: %w", apply.ID, err)
 		}
@@ -775,16 +848,44 @@ func (s *applyStore) FindNextApply(ctx context.Context) (*storage.Apply, error) 
 // Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 // Should be called every 10 seconds while working on an apply.
 // If not called for > 1 minute, another worker can claim the apply via FindNextApply.
-// Does not check RowsAffected — if the apply was deleted, the UPDATE matches 0 rows
-// and returns nil.
+// When ctx has an apply lease, a stale token returns ErrApplyLeaseLost so the
+// old scheduler owner stops before writing state or external side effects.
 func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE applies SET updated_at = NOW() WHERE id = ?
-	`, applyID)
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return err
+	}
+	args := []any{applyID}
+	leasePredicate := ""
+	if hasLease {
+		leasePredicate = " AND lease_token = ?"
+		args = append(args, lease.Token)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE applies SET updated_at = NOW() WHERE id = ?`+leasePredicate+`
+	`, args...)
 	if err != nil {
 		return fmt.Errorf("heartbeat apply %d: %w", applyID, err)
 	}
+	if hasLease {
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read heartbeat rows affected for apply %d: %w", applyID, err)
+		}
+		if rows == 0 {
+			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+func (s *applyStore) CheckLease(ctx context.Context, lease storage.ApplyLease) error {
+	if !lease.Valid() {
+		return fmt.Errorf("invalid apply lease for apply %d: %w", lease.ApplyID, storage.ErrApplyLeaseLost)
+	}
+	return ensureApplyLeaseStillOwned(ctx, s.db, lease)
 }
 
 // ExpireRetryable transitions failed_retryable applies that exhausted their
@@ -993,7 +1094,7 @@ func scanApplies(rows *sql.Rows) ([]*storage.Apply, error) {
 // scanApplyInto scans apply data from any scanner (Row or Rows).
 func scanApplyInto(s scanner) (*storage.Apply, error) {
 	var apply storage.Apply
-	var startedAt, completedAt sql.NullTime
+	var leaseAcquiredAt, startedAt, completedAt sql.NullTime
 	var options []byte
 
 	err := s.Scan(
@@ -1002,6 +1103,7 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 		&apply.Repository, &apply.PullRequest, &apply.Environment, &apply.Deployment,
 		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &apply.Engine,
 		&apply.State, &apply.ErrorMessage, &options, &apply.Attempt,
+		&apply.LeaseOwner, &apply.LeaseToken, &leaseAcquiredAt,
 		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt,
 	)
 	if err != nil {
@@ -1009,6 +1111,10 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 	}
 
 	apply.Options = options
+
+	if leaseAcquiredAt.Valid {
+		apply.LeaseAcquiredAt = &leaseAcquiredAt.Time
+	}
 
 	if startedAt.Valid {
 		apply.StartedAt = &startedAt.Time

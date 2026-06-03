@@ -133,7 +133,7 @@ func TestApplyStore_CreateWithTasksCommitsQueueAtomically(t *testing.T) {
 
 	// A pending apply created with its full task set is immediately ready for
 	// scheduler dispatch; workers never see a partially populated task list.
-	claimed, err := store.Applies().FindNextApply(ctx)
+	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
@@ -908,7 +908,7 @@ func TestApplyStore_FindNextApplyClaimsRetryable(t *testing.T) {
 	apply.ErrorMessage = "transient engine failure"
 	require.NoError(t, store.Applies().Update(ctx, apply))
 
-	claimed, err := store.Applies().FindNextApply(ctx)
+	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
@@ -923,9 +923,89 @@ func TestApplyStore_FindNextApplyClaimsRetryable(t *testing.T) {
 	assert.Equal(t, 1, persisted.Attempt)
 	assert.Empty(t, persisted.ErrorMessage)
 
-	claimedAgain, err := store.Applies().FindNextApply(ctx)
+	claimedAgain, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Nil(t, claimedAgain)
+}
+
+func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_lease", 507, state.Apply.Pending, "staging")
+	task := &storage.Task{
+		TaskIdentifier: "task_lease_users",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Pending,
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `lease_note` varchar(255)",
+		DDLAction:      "alter",
+		Options:        []byte("{}"),
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	taskID, err := store.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	claimed, err := store.Applies().FindNextApply(ctx, "worker-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, "worker-a", claimed.LeaseOwner)
+	require.NotEmpty(t, claimed.LeaseToken)
+	require.NotNil(t, claimed.LeaseAcquiredAt)
+
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "worker-old", Token: "stale-token"})
+	claimed.State = state.Apply.Failed
+	claimed.ErrorMessage = "stale worker failure"
+	require.ErrorIs(t, store.Applies().Update(staleCtx, claimed), storage.ErrApplyLeaseLost)
+	require.ErrorIs(t, store.Applies().Heartbeat(staleCtx, apply.ID), storage.ErrApplyLeaseLost)
+
+	task.State = state.Task.Completed
+	require.ErrorIs(t, store.Tasks().Update(staleCtx, task), storage.ErrApplyLeaseLost)
+	require.ErrorIs(t, store.ApplyLogs().Append(staleCtx, &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelInfo,
+		EventType: storage.LogEventStateTransition,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   "stale worker log",
+	}), storage.ErrApplyLeaseLost)
+
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, state.Apply.Running, persistedApply.State)
+	assert.Empty(t, persistedApply.ErrorMessage)
+
+	persistedTask, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, persistedTask)
+	assert.Equal(t, state.Task.Pending, persistedTask.State)
+
+	logs, err := store.ApplyLogs().GetByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Empty(t, logs)
+
+	ownedCtx := storage.WithApplyLease(ctx, claimed.Lease())
+	claimed.State = state.Apply.Completed
+	claimed.ErrorMessage = ""
+	require.NoError(t, store.Applies().Update(ownedCtx, claimed))
+	task.State = state.Task.Completed
+	require.NoError(t, store.Tasks().Update(ownedCtx, task))
+	require.NoError(t, store.ApplyLogs().Append(ownedCtx, &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelInfo,
+		EventType: storage.LogEventStateTransition,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   "owned worker log",
+	}))
 }
 
 // TestApplyStore_FindNextApplySkipsOldRetryable verifies that automatic
@@ -946,7 +1026,7 @@ func TestApplyStore_FindNextApplySkipsOldRetryable(t *testing.T) {
 	`, apply.ID)
 	require.NoError(t, err)
 
-	claimed, err := store.Applies().FindNextApply(ctx)
+	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Nil(t, claimed)
 
@@ -968,7 +1048,7 @@ func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 	// A pending apply record can be visible before its task rows are written.
 	// The scheduler must wait for the task list so dispatch has concrete table
 	// work to run.
-	claimedBeforeTasks, err := store.Applies().FindNextApply(ctx)
+	claimedBeforeTasks, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Nil(t, claimedBeforeTasks, "pending applies are not ready for scheduler dispatch until their tasks are persisted")
 
@@ -992,7 +1072,7 @@ func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 
 	// Once at least one task exists, the pending apply is ready to claim. The
 	// caller sees the state it claimed, and the stored row is leased as running.
-	claimed, err := store.Applies().FindNextApply(ctx)
+	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
@@ -1020,7 +1100,7 @@ func TestApplyStore_FindNextApplyClaimsPendingControlRequestWithoutTasks(t *test
 	require.NoError(t, err)
 	require.False(t, alreadyPending)
 
-	claimed, err := store.Applies().FindNextApply(ctx)
+	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
@@ -1031,7 +1111,7 @@ func TestApplyStore_FindNextApplyClaimsPendingControlRequestWithoutTasks(t *test
 	require.NotNil(t, persisted)
 	assert.Equal(t, state.Apply.Running, persisted.State)
 
-	claimedAgain, err := store.Applies().FindNextApply(ctx)
+	claimedAgain, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Nil(t, claimedAgain, "claim heartbeat should prevent another worker from immediately taking the same start request")
 }
@@ -1052,7 +1132,7 @@ func TestApplyStore_FindNextApplyClaimsStoppedStartControlRequest(t *testing.T) 
 	require.NoError(t, err)
 	require.False(t, alreadyPending)
 
-	claimed, err := store.Applies().FindNextApply(ctx)
+	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
@@ -1063,7 +1143,7 @@ func TestApplyStore_FindNextApplyClaimsStoppedStartControlRequest(t *testing.T) 
 	require.NotNil(t, persisted)
 	assert.Equal(t, state.Apply.Running, persisted.State)
 
-	claimedAgain, err := store.Applies().FindNextApply(ctx)
+	claimedAgain, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Nil(t, claimedAgain, "claim transition should prevent another worker from taking the same stopped start request")
 }
@@ -1084,7 +1164,7 @@ func TestApplyStore_FindNextApplyClaimsStaleWaitingForCutoverControlRequest(t *t
 	require.NoError(t, err)
 	require.False(t, alreadyPending)
 
-	freshClaim, err := store.Applies().FindNextApply(ctx)
+	freshClaim, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Nil(t, freshClaim, "fresh waiting-for-cutover applies are owned by their active worker")
 
@@ -1095,7 +1175,7 @@ func TestApplyStore_FindNextApplyClaimsStaleWaitingForCutoverControlRequest(t *t
 	`, apply.ID)
 	require.NoError(t, err)
 
-	claimed, err := store.Applies().FindNextApply(ctx)
+	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
@@ -1106,7 +1186,7 @@ func TestApplyStore_FindNextApplyClaimsStaleWaitingForCutoverControlRequest(t *t
 	require.NotNil(t, persisted)
 	assert.Equal(t, state.Apply.WaitingForCutover, persisted.State)
 
-	claimedAgain, err := store.Applies().FindNextApply(ctx)
+	claimedAgain, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Nil(t, claimedAgain, "claim heartbeat should prevent another worker from immediately taking the same stale cutover request")
 }
@@ -1128,7 +1208,7 @@ func TestApplyStore_FindNextApplySkipsFailedStoppedStartControlRequest(t *testin
 	require.False(t, alreadyPending)
 	require.NoError(t, store.ControlRequests().FailPending(ctx, apply.ID, storage.ControlOperationStart, "remote start failed"))
 
-	claimed, err := store.Applies().FindNextApply(ctx)
+	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "failed start requests should not be retried automatically by scheduler claims")
 
@@ -1144,7 +1224,7 @@ func TestApplyStore_FindNextApplySkipsFailedStoppedStartControlRequest(t *testin
 	assert.Equal(t, storage.ControlRequestPending, reset.Status)
 	assert.Equal(t, "operator-retry", reset.RequestedBy)
 
-	claimedAfterRetry, err := store.Applies().FindNextApply(ctx)
+	claimedAfterRetry, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimedAfterRetry)
 	assert.Equal(t, apply.ApplyIdentifier, claimedAfterRetry.ApplyIdentifier)
@@ -1166,7 +1246,7 @@ func TestApplyStore_FindNextApplyDoesNotClaimFreshRunningStopControlRequest(t *t
 	require.NoError(t, err)
 	require.False(t, alreadyPending)
 
-	claimed, err := store.Applies().FindNextApply(ctx)
+	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "fresh running applies are owned by their active worker; pending stop must not create a second owner")
 }
@@ -1237,7 +1317,7 @@ func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 		workerStore := stores[i]
 		wg.Go(func() {
 			<-start
-			got, claimErr := workerStore.Applies().FindNextApply(ctx)
+			got, claimErr := workerStore.Applies().FindNextApply(ctx, "test-owner")
 
 			mu.Lock()
 			defer mu.Unlock()

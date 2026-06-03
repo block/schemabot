@@ -360,6 +360,18 @@ type Apply struct {
 	// Once the retry budget is exhausted, the apply becomes failed.
 	Attempt int
 
+	// LeaseOwner identifies the worker that last claimed this apply. It is
+	// operator-facing context; LeaseToken is the ownership capability used for
+	// correctness.
+	LeaseOwner string
+
+	// LeaseToken is rotated on each claim. Owned writes must include the current
+	// token to avoid stale workers overwriting a newer owner.
+	LeaseToken string
+
+	// LeaseAcquiredAt records when the current lease was acquired.
+	LeaseAcquiredAt *time.Time
+
 	// CreatedAt is when the apply was created.
 	CreatedAt time.Time
 
@@ -371,6 +383,18 @@ type Apply struct {
 
 	// UpdatedAt is when the apply was last updated.
 	UpdatedAt time.Time
+}
+
+// Lease returns the ownership token for this apply.
+func (a *Apply) Lease() ApplyLease {
+	if a == nil {
+		return ApplyLease{}
+	}
+	return ApplyLease{
+		ApplyID: a.ID,
+		Owner:   a.LeaseOwner,
+		Token:   a.LeaseToken,
+	}
 }
 
 // ApplyOperation represents one child row in the apply_operations table:

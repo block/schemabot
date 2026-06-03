@@ -773,7 +773,7 @@ func TestLocalClient_GroupedApplyKeepsClaimLeaseRunning(t *testing.T) {
 	require.NoError(t, err)
 	task.ID = taskID
 
-	claimed, err := stor.Applies().FindNextApply(ctx)
+	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, state.Apply.Pending, claimed.State)
@@ -903,7 +903,7 @@ func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t
 	}}
 	client.spiritEngine = resumeEngine
 
-	claimed, err := stor.Applies().FindNextApply(ctx)
+	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, state.Apply.Stopped, claimed.State)
@@ -1056,7 +1056,7 @@ func TestLocalClient_ResumeApplyGroupedStartRequestFailsWhenEngineRejects(t *tes
 	}
 	client.spiritEngine = resumeEngine
 
-	claimed, err := stor.Applies().FindNextApply(ctx)
+	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, state.Apply.Stopped, claimed.State)

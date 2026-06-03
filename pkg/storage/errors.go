@@ -29,6 +29,10 @@ var (
 	// for the same database, type, and environment.
 	ErrActiveApplyExists = errors.New("active apply already exists")
 
+	// ErrApplyLeaseLost is returned when a scheduler-owned write no longer
+	// matches the apply lease token stored by the latest scheduler claimant.
+	ErrApplyLeaseLost = errors.New("apply lease lost")
+
 	// ErrPlanNotFound is returned when a plan does not exist.
 	ErrPlanNotFound = errors.New("plan not found")
 

@@ -95,19 +95,49 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 
 // Update updates an existing task.
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
-	_, err := s.db.ExecContext(ctx, `
+	lease, hasLease, err := applyLeaseFromContext(ctx, task.ApplyID)
+	if err != nil {
+		return err
+	}
+	args := []any{
+		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
+		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds,
+		task.IsInstant, task.ReadyToComplete, nullString(task.EngineMigrationID),
+		task.StartedAt, task.CompletedAt,
+		task.ID,
+	}
+	leasePredicate := ""
+	if hasLease {
+		leasePredicate = `
+			AND EXISTS (
+				SELECT 1 FROM applies a
+				WHERE a.id = tasks.apply_id AND a.lease_token = ?
+			)`
+		args = append(args, lease.Token)
+	}
+	result, err := s.db.ExecContext(ctx, `
 		UPDATE tasks SET
 			state = ?, error_message = ?, options = ?, attempt = ?,
 			rows_copied = ?, rows_total = ?, progress_percent = ?, eta_seconds = ?,
 			is_instant = ?, ready_to_complete = ?, engine_migration_id = ?,
 			started_at = ?, completed_at = ?, updated_at = NOW()
-		WHERE id = ?
-	`, task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
-		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds,
-		task.IsInstant, task.ReadyToComplete, nullString(task.EngineMigrationID),
-		task.StartedAt, task.CompletedAt,
-		task.ID)
-	return err
+		WHERE id = ?`+leasePredicate+`
+	`, args...)
+	if err != nil {
+		return err
+	}
+	if hasLease {
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read task update rows affected for task %d: %w", task.ID, err)
+		}
+		if rows == 0 {
+			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // GetByApplyID returns all tasks for an apply.

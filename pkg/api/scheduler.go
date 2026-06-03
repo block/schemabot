@@ -3,10 +3,13 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Scheduler constants.
@@ -164,9 +167,10 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
 	}
 
-	apply, err := s.storage.Applies().FindNextApply(ctx)
+	owner := schedulerLeaseOwner(workerID)
+	apply, err := s.storage.Applies().FindNextApply(ctx, owner)
 	if err != nil {
-		s.logger.Error("scheduler: failed to claim apply", "worker", workerID, "error", err)
+		s.logger.Error("scheduler: failed to claim apply", "worker", workerID, "lease_owner", owner, "error", err)
 		metrics.RecordSchedulerClaimFailure(ctx, "storage_error")
 		return
 	}
@@ -175,10 +179,23 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		s.logger.Debug("scheduler: no apply to claim", "worker", workerID)
 		return
 	}
+	lease := apply.Lease()
+	if !lease.Valid() {
+		s.logger.Error("scheduler: claimed apply without a valid lease token; scheduler will not resume it",
+			"worker", workerID,
+			"lease_owner", owner,
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment)
+		metrics.RecordSchedulerClaimFailure(ctx, "missing_lease_token")
+		return
+	}
+	ctx = storage.WithApplyLease(ctx, lease)
 
 	start := s.clock.Now()
 	s.logger.Info("scheduler: claimed apply",
 		"worker", workerID,
+		"lease_owner", lease.Owner,
 		"apply_id", apply.ApplyIdentifier,
 		"database", apply.Database,
 		"deployment", apply.Deployment,
@@ -221,6 +238,20 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		metrics.AdjustActiveApplies(ctx, 1, apply.Database, deployment, apply.Environment)
 	}
 	if err := client.ResumeApply(ctx, apply); err != nil {
+		if errors.Is(err, storage.ErrApplyLeaseLost) {
+			s.logger.Warn("scheduler: apply lease was lost; worker will stop writing this apply",
+				"worker", workerID,
+				"lease_owner", lease.Owner,
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"deployment", deployment,
+				"environment", apply.Environment,
+				"error", err)
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			s.logger.Debug("scheduler: stopped while running claimed apply",
 				"worker", workerID,
@@ -259,4 +290,12 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		"duration", duration)
 	metrics.RecordSchedulerResume(ctx, apply.Database, deployment, apply.Environment, previousState)
 	metrics.RecordSchedulerClaimDuration(ctx, duration, apply.Database, deployment, apply.Environment, previousState)
+}
+
+func schedulerLeaseOwner(workerID int) string {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "unknown-host"
+	}
+	return fmt.Sprintf("%s/%d/worker-%d", hostname, os.Getpid(), workerID)
 }

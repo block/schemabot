@@ -506,7 +506,8 @@ func (m *mockApplyStore) Update(_ context.Context, apply *storage.Apply) error {
 	m.updates = append(m.updates, &stored)
 	return nil
 }
-func (m *mockApplyStore) Heartbeat(context.Context, int64) error { return nil }
+func (m *mockApplyStore) Heartbeat(context.Context, int64) error               { return nil }
+func (m *mockApplyStore) CheckLease(context.Context, storage.ApplyLease) error { return nil }
 
 // mockTaskStore is a minimal TaskStore for testing pollForCompletion.
 type mockTaskStore struct {

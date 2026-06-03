@@ -28,6 +28,9 @@ func completePendingStartControlRequests(ctx context.Context, store storage.Stor
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationStart); err != nil {
+		return err
+	}
 	controlStore := store.ControlRequests()
 	if controlStore == nil {
 		return fmt.Errorf("control request store is not available")
@@ -41,6 +44,9 @@ func completePendingStartControlRequests(ctx context.Context, store storage.Stor
 func failPendingStartControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, errorMessage string) error {
 	if store == nil {
 		return fmt.Errorf("storage is not available")
+	}
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationStart); err != nil {
+		return err
 	}
 	controlStore := store.ControlRequests()
 	if controlStore == nil {
@@ -71,6 +77,9 @@ func completePendingCutoverControlRequests(ctx context.Context, store storage.St
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationCutover); err != nil {
+		return err
+	}
 	controlStore := store.ControlRequests()
 	if controlStore == nil {
 		return fmt.Errorf("control request store is not available")
@@ -84,6 +93,9 @@ func completePendingCutoverControlRequests(ctx context.Context, store storage.St
 func failPendingCutoverControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, errorMessage string) error {
 	if store == nil {
 		return fmt.Errorf("storage is not available")
+	}
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationCutover); err != nil {
+		return err
 	}
 	controlStore := store.ControlRequests()
 	if controlStore == nil {
@@ -170,12 +182,35 @@ func completePendingStopControlRequests(ctx context.Context, store storage.Stora
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationStop); err != nil {
+		return err
+	}
 	controlStore := store.ControlRequests()
 	if controlStore == nil {
 		return fmt.Errorf("control request store is not available")
 	}
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("complete pending stop control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
+func ensureApplyLeaseForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) error {
+	lease, ok := storage.ApplyLeaseFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	if !lease.Valid() || apply == nil || lease.ApplyID != apply.ID {
+		applyID := int64(0)
+		applyIdentifier := ""
+		if apply != nil {
+			applyID = apply.ID
+			applyIdentifier = apply.ApplyIdentifier
+		}
+		return fmt.Errorf("invalid apply lease before completing %s control request for apply %s (%d): %w", operation, applyIdentifier, applyID, storage.ErrApplyLeaseLost)
+	}
+	if err := store.Applies().CheckLease(ctx, lease); err != nil {
+		return fmt.Errorf("check apply lease before completing %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)
 	}
 	return nil
 }

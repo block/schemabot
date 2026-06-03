@@ -223,15 +223,19 @@ type ApplyStore interface {
 
 	// FindNextApply atomically claims the next apply that needs attention.
 	// A claim selects one apply that needs work and refreshes its heartbeat in
-	// the same transaction. That heartbeat is the scheduler's lease while it
-	// reloads state and starts or resumes the apply.
+	// the same transaction. The owner is stored with a freshly generated lease
+	// token so scheduler-owned writes can fail closed after ownership changes.
 	// Returns the claimed apply, or nil if nothing needs work.
-	FindNextApply(ctx context.Context) (*Apply, error)
+	FindNextApply(ctx context.Context, owner string) (*Apply, error)
 
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 	// Should be called every 10 seconds while working on an apply.
 	// If not called for > 1 minute, another worker can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
+
+	// CheckLease verifies that a scheduler apply lease is still current without
+	// mutating the apply row.
+	CheckLease(ctx context.Context, lease ApplyLease) error
 
 	// ExpireRetryable transitions failed_retryable applies that exhausted their
 	// retry budget or recovery freshness window to permanent failed. Returns the

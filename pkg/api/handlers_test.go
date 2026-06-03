@@ -312,7 +312,7 @@ func (s *capturingApplyStore) Update(_ context.Context, apply *storage.Apply) er
 	return nil
 }
 
-func (s *capturingApplyStore) FindNextApply(context.Context) (*storage.Apply, error) {
+func (s *capturingApplyStore) FindNextApply(_ context.Context, owner string) (*storage.Apply, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.findCh != nil {
@@ -327,7 +327,13 @@ func (s *capturingApplyStore) FindNextApply(context.Context) (*storage.Apply, er
 	s.claimed = true
 	apply := *s.apply
 	apply.ID = 123
+	apply.LeaseOwner = owner
+	apply.LeaseToken = "test-lease-token"
 	return &apply, nil
+}
+
+func (s *capturingApplyStore) CheckLease(context.Context, storage.ApplyLease) error {
+	return nil
 }
 
 func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {

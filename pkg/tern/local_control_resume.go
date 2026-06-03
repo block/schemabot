@@ -194,7 +194,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Resume requested (sequential): %d tasks to resume, %d already completed", len(resumeTasks), completedCount), oldApplyState, state.Apply.Running)
 
-		resumeCtx, cancelResume := context.WithCancel(context.Background())
+		resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		go func() {
 			defer c.clearApplyCancel(cancelGeneration)
@@ -544,10 +544,11 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		return nil
 	}
 
-	stopHeartbeat := c.startApplyHeartbeat(context.Background(), apply)
+	resumeCtx := context.WithoutCancel(ctx)
+	stopHeartbeat := c.startApplyHeartbeat(resumeCtx, apply)
 	go func() {
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(context.Background(), apply, tasks, creds, nil)
+		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, nil)
 	}()
 	return nil
 }

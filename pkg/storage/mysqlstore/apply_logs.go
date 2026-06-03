@@ -5,6 +5,7 @@ package mysqlstore
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -21,10 +22,48 @@ type applyLogStore struct {
 
 // Append adds a new log entry.
 func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error {
+	lease, hasLease, err := applyLeaseFromContext(ctx, log.ApplyID)
+	if err != nil {
+		return err
+	}
 	// Default source to schemabot if not set
 	source := log.Source
 	if source == "" {
 		source = storage.LogSourceSchemaBot
+	}
+
+	if hasLease {
+		result, err := s.db.ExecContext(ctx, `
+			INSERT INTO apply_logs (
+				apply_id, task_id, level, event_type, source, message,
+				old_state, new_state, metadata
+			)
+			SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+			FROM applies
+			WHERE id = ? AND lease_token = ?
+		`,
+			log.ApplyID, nullInt64Ptr(log.TaskID), log.Level, log.EventType, source, log.Message,
+			nullString(log.OldState), nullString(log.NewState), nullJSON(log.Metadata),
+			lease.ApplyID, lease.Token,
+		)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read apply log append rows affected for apply %d: %w", log.ApplyID, err)
+		}
+		if rows == 0 {
+			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+				return err
+			}
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			return err
+		}
+		log.ID = id
+		return nil
 	}
 
 	result, err := s.db.ExecContext(ctx, `
