@@ -35,15 +35,21 @@ func NewSingleClientSet(name string, c GitHubClientFactory) ClientSet {
 
 // For returns the factory registered under appName, or an error if no such
 // factory exists. The error includes the configured names so misconfiguration
-// at startup or in tests fails closed with a useful message.
+// at startup or in tests fails closed with a useful message. A registered
+// but nil factory is also treated as a fail-closed misconfiguration so
+// callers never get a nil factory back and panic on a later ForInstallation.
 func (cs ClientSet) For(appName string) (GitHubClientFactory, error) {
 	if cs.clients == nil {
 		return nil, fmt.Errorf("no GitHub App clients configured")
 	}
-	if c, ok := cs.clients[appName]; ok {
-		return c, nil
+	c, ok := cs.clients[appName]
+	if !ok {
+		return nil, fmt.Errorf("no GitHub App client for %q (configured: %v)", appName, cs.Names())
 	}
-	return nil, fmt.Errorf("no GitHub App client for %q (configured: %v)", appName, cs.Names())
+	if c == nil {
+		return nil, fmt.Errorf("GitHub App client for %q is nil (misconfigured)", appName)
+	}
+	return c, nil
 }
 
 // Names returns the configured App names in sorted order. Used in error
