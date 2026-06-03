@@ -371,6 +371,9 @@ func (ic *InstallationClient) FindAllConfigsForPR(ctx context.Context, repo stri
 		if !isConfigFile(file.Filename) {
 			continue
 		}
+		if isRemovedPRFile(file.Status) {
+			continue
+		}
 		configDir := path.Dir(file.Filename)
 		config, err := ic.FetchConfig(ctx, repo, file.Filename, prInfo.HeadSHA)
 		if err != nil {
@@ -439,6 +442,10 @@ func isConfigFile(filename string) bool {
 	return path.Base(filename) == ConfigFileName
 }
 
+func isRemovedPRFile(status string) bool {
+	return strings.EqualFold(status, "removed")
+}
+
 func filterSchemaFiles(files []string) []string {
 	var result []string
 	for _, file := range files {
@@ -503,6 +510,9 @@ func (ic *InstallationClient) findConfigsChangedInPR(ctx context.Context, repo s
 	configsByPath := make(map[string]DiscoveredConfig)
 	for _, file := range files {
 		if !isConfigFile(file.Filename) {
+			continue
+		}
+		if isRemovedPRFile(file.Status) {
 			continue
 		}
 		configDir := path.Dir(file.Filename)

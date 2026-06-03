@@ -182,6 +182,35 @@ func TestFindConfigByDatabaseNameUsesChangedConfigFileBeforeRepoScan(t *testing.
 	assert.Equal(t, "apps/widgets/schema", schemaDir)
 }
 
+func TestFindAllConfigsForPRSkipsRemovedConfigFile(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("apps/widgets/schema/schemabot.yaml"),
+		Status:   new("removed"),
+	}})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	configs, err := ic.FindAllConfigsForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.NoError(t, err)
+	assert.Empty(t, configs)
+}
+
+func TestFindConfigForPRSkipsRemovedConfigFile(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("apps/widgets/schema/schemabot.yaml"),
+		Status:   new("removed"),
+	}})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, _, err := ic.FindConfigForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.ErrorIs(t, err, ErrNoConfig)
+}
+
 func TestFindAllConfigsFailsClosedOnTruncatedGitTree(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
