@@ -143,7 +143,7 @@ ExecutePlan(ctx, PlanRequest)
 
 ## Check Runs
 
-Check Runs are GitHub pre-merge status checks that appear on the PR's "Checks" tab. SchemaBot publishes an aggregate check (`SchemaBot`, or `SchemaBot (<environment>)` when `allowed_environments` is configured) and stores per-database state internally.
+Check Runs are GitHub pre-merge status checks that appear on the PR's "Checks" tab. SchemaBot publishes an aggregate check (`SchemaBot`, or `SchemaBot (<environment>)` when `allowed_environments` is configured) and stores per-database state internally. Deployments can override the visible base name with `github.check-name`.
 
 After a plan, the aggregate reflects the rolled-up internal state:
 

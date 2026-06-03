@@ -6,6 +6,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/spirit/pkg/utils"
+
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -145,9 +148,23 @@ func TestConclusionEmoji(t *testing.T) {
 }
 
 func TestAggregateCheckNameForEnv(t *testing.T) {
-	assert.Equal(t, "SchemaBot (staging)", aggregateCheckNameForEnv("staging"))
-	assert.Equal(t, "SchemaBot (production)", aggregateCheckNameForEnv("production"))
-	assert.Equal(t, "SchemaBot (sandbox)", aggregateCheckNameForEnv("sandbox"))
+	assert.Equal(t, "SchemaBot (staging)", aggregateCheckNameForEnv(aggregateCheckName, "staging"))
+	assert.Equal(t, "SchemaBot (production)", aggregateCheckNameForEnv(aggregateCheckName, "production"))
+	assert.Equal(t, "SchemaBot X (sandbox)", aggregateCheckNameForEnv("SchemaBot X", "sandbox"))
+}
+
+func TestAggregateCheckNameForRepo(t *testing.T) {
+	t.Run("defaults without service config", func(t *testing.T) {
+		h := &Handler{}
+		assert.Equal(t, aggregateCheckName, h.aggregateCheckNameForRepo("octocat/hello-world"))
+	})
+
+	t.Run("uses single app custom name", func(t *testing.T) {
+		service := api.New(&emptyStorage{}, &api.ServerConfig{GitHub: api.GitHubConfig{CheckName: "SchemaBot X"}}, nil, testLogger())
+		t.Cleanup(func() { utils.CloseAndLog(service) })
+		h := &Handler{service: service}
+		assert.Equal(t, "SchemaBot X", h.aggregateCheckNameForRepo("octocat/hello-world"))
+	})
 }
 
 func TestFilterChecksByEnvironment(t *testing.T) {

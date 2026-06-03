@@ -168,7 +168,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 	// setupCheckRunServer creates a mock GitHub server with PR fetch and optional
 	// comment capture, plus a check-runs endpoint that returns the given check runs.
-	setupCheckRunServer := func(t *testing.T, checkRuns []map[string]any) (*Handler, chan string) {
+	setupCheckRunServer := func(t *testing.T, checkRuns []map[string]any, configs ...*api.ServerConfig) (*Handler, chan string) {
 		t.Helper()
 
 		client, mux := setupGitHubServer(t)
@@ -201,8 +201,15 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 		installClient := ghclient.NewInstallationClient(client, testLogger())
 		factory := &fakeClientFactory{client: installClient}
+		config := &api.ServerConfig{}
+		if len(configs) > 0 {
+			config = configs[0]
+		}
+		service := api.New(&emptyStorage{}, config, nil, testLogger())
+		t.Cleanup(func() { utils.CloseAndLog(service) })
 
 		h := &Handler{
+			service:                    service,
 			ghClients:                  ghclient.NewSingleClientSet(defaultAppName, factory),
 			logger:                     testLogger(),
 			priorEnvCheckMaxAttempts:   1,
@@ -216,6 +223,21 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		h, comments := setupCheckRunServer(t, []map[string]any{
 			{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success"},
 		})
+
+		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		assert.False(t, blocked)
+
+		select {
+		case body := <-comments:
+			t.Fatalf("unexpected comment posted: %s", body)
+		default:
+		}
+	})
+
+	t.Run("custom check name success allows proceed", func(t *testing.T) {
+		h, comments := setupCheckRunServer(t, []map[string]any{
+			{"id": 1, "name": "SchemaBot X (staging)", "status": "completed", "conclusion": "success"},
+		}, &api.ServerConfig{GitHub: api.GitHubConfig{CheckName: "SchemaBot X"}})
 
 		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
 		assert.False(t, blocked)

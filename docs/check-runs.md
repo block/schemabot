@@ -68,7 +68,9 @@ There are two main ways external systems report status to GitHub:
 A check suite is GitHub's grouping of check runs created by one GitHub App for a
 commit. SchemaBot mostly cares about the individual check run because that is the
 named object shown in branch protection, such as `SchemaBot` or
-`SchemaBot (staging)`.
+`SchemaBot (staging)`. Deployments can configure a custom base name, such as
+`SchemaBot X`, when multiple independent SchemaBot gates appear on the same
+repository.
 
 Why SchemaBot uses check runs:
 
@@ -128,6 +130,11 @@ owned environment. Require each environment check that applies to the repository
 SchemaBot (staging)
 SchemaBot (production)
 ```
+
+If the GitHub App config sets `check-name`, require that configured base name
+instead. For example, `check-name: SchemaBot X` publishes `SchemaBot X` for a
+single aggregate, or `SchemaBot X (staging)` and `SchemaBot X (production)`
+when `allowed_environments` is configured.
 
 Per-database state is stored internally and shown in the aggregate check summary.
 
@@ -810,7 +817,8 @@ environment:
   check storage for the same PR, database type, database, and prior
   environment.
 - If another deployment owns the prior environment, SchemaBot reads the
-  environment aggregate check run from GitHub, such as `SchemaBot (staging)`.
+  environment aggregate check run from GitHub, such as `SchemaBot (staging)` or
+  the deployment's configured check name.
 
 Remote prior-environment checks use the aggregate because the current deployment
 does not have access to the other deployment's per-database storage. That makes
@@ -904,6 +912,10 @@ SchemaBot (staging)
 SchemaBot (production)
 ```
 
+If `github.check-name` is configured, require the matching custom check names.
+All deployments in the same promotion chain should use the same base name so
+later environments can find prior-environment aggregate checks.
+
 GitHub UI setup:
 
 1. Open repository settings.
@@ -912,6 +924,9 @@ GitHub UI setup:
 4. Select the SchemaBot aggregate check names used by the deployment.
 
 GitHub API example for a single aggregate:
+
+Replace `SchemaBot` with the configured check name when `github.check-name` is
+set.
 
 ```bash
 gh api repos/{owner}/{repo}/branches/{branch}/protection \

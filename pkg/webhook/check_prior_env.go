@@ -175,12 +175,12 @@ func storedPriorEnvCheckStatus(check *storage.Check) string {
 // GitHub Checks API for the per-environment aggregate check run created by the
 // other SchemaBot instance that owns that environment.
 //
-// The remote check uses the aggregate "SchemaBot (staging)" which rolls up ALL
-// databases in the prior environment. This is stricter than per-database checking:
-// production apply for any database is blocked until ALL databases in staging are
-// applied. This is the correct behavior for the remote case — we cannot query
-// per-database check state from another instance, and it is safer to require the
-// entire environment to be healthy before promoting.
+// The remote check uses the prior environment's aggregate Check Run, which rolls
+// up ALL databases in the prior environment. This is stricter than per-database
+// checking: production apply for any database is blocked until ALL databases in
+// staging are applied. This is the correct behavior for the remote case — we
+// cannot query per-database check state from another instance, and it is safer to
+// require the entire environment to be healthy before promoting.
 func (h *Handler) checkPriorEnvViaGitHub(
 	ctx context.Context, repo string, pr int,
 	database, environment, priorEnv string,
@@ -204,7 +204,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 		return true
 	}
 
-	checkName := aggregateCheckNameForEnv(priorEnv)
+	checkName := aggregateCheckNameForEnv(h.aggregateCheckNameForRepo(repo), priorEnv)
 	checkResult, err := h.waitForGitHubPriorEnvCheck(ctx, client, repo, pr, database, environment, priorEnv, prInfo.HeadSHA, checkName)
 	if err != nil {
 		h.logger.Error("failed to query GitHub check for prior environment, blocking apply",

@@ -2,6 +2,8 @@ package webhook
 
 import (
 	"time"
+
+	"github.com/block/schemabot/pkg/api"
 )
 
 // maxCheckRunTextLength is the GitHub API limit for check run output text.
@@ -22,11 +24,11 @@ const (
 	checkConclusionNeutral        = "neutral"
 )
 
-// aggregateCheckName is the GitHub Check Run name to require in branch protection.
+// aggregateCheckName is the default GitHub Check Run base name.
 // Per-database stored check state provides granular internal status per
 // environment and database; the aggregate rolls it into one visible conclusion so
-// branch protection only needs one stable name.
-const aggregateCheckName = "SchemaBot"
+// branch protection only needs one stable name per deployment.
+const aggregateCheckName = api.DefaultGitHubCheckName
 
 const (
 	// defaultPriorEnvCheckMaxAttempts bounds the apply gate wait for prior

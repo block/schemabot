@@ -392,6 +392,7 @@ github:
   app-id: "env:STAGING_GITHUB_APP_ID"
   private-key: "file:/run/secrets/staging-github-key.pem"
   webhook-secret: "env:STAGING_WEBHOOK_SECRET"
+  check-name: "SchemaBot X"
 ```
 
 ### Production Instance
@@ -414,6 +415,7 @@ github:
   app-id: "env:PROD_GITHUB_APP_ID"
   private-key: "file:/run/secrets/prod-github-key.pem"
   webhook-secret: "env:PROD_WEBHOOK_SECRET"
+  check-name: "SchemaBot X"
 ```
 
 ### Environment-local gRPC targets
@@ -468,9 +470,9 @@ Do not require the staging ConfigMap to contain production targets, or the produ
 
 - **Environment scoping:** When `allowed_environments` is set, the instance only processes commands targeting those environments. Commands for other environments (e.g., `schemabot apply -e production` sent to the staging instance) are accepted without a PR response by this deployment. A deployment that allows the requested environment must process its own webhook delivery.
 
-- **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates.
+- **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates. Set `github.check-name` when independent SchemaBot gates need distinct visible names; every instance in the same promotion chain should use the same base name.
 
-- **Cross-instance environment verification:** Environment ordering (e.g., staging must succeed before production) works across instances. The production instance queries the GitHub Checks API for the staging instance's `SchemaBot (staging)` aggregate check to verify the prior environment completed successfully. GitHub check runs are the shared authority for cross-environment state; the production instance does not need staging target configuration to enforce the staging gate.
+- **Cross-instance environment verification:** Environment ordering (e.g., staging must succeed before production) works across instances. The production instance queries the GitHub Checks API for the staging instance's aggregate check to verify the prior environment completed successfully. GitHub check runs are the shared authority for cross-environment state; the production instance does not need staging target configuration to enforce the staging gate.
 
 - **Separate GitHub Apps:** Each instance needs its own GitHub App installation. Both Apps must be installed on the same repositories and configured to receive the same webhook events. GitHub delivers webhooks to all installed Apps independently.
 
@@ -501,10 +503,12 @@ apps:
     app-id: "env:APP_A_ID"
     private-key: "file:/secrets/app-a/private-key"
     webhook-secret: "file:/secrets/app-a/webhook-secret"
+    check-name: "SchemaBot X"
   app-b:
     app-id: "env:APP_B_ID"
     private-key: "file:/secrets/app-b/private-key"
     webhook-secret: "file:/secrets/app-b/webhook-secret"
+    check-name: "SchemaBot Y"
 
 repos:
   org-a/repo-x:
@@ -520,7 +524,7 @@ Rules (enforced once the runtime is wired; today's hard-block fires before these
 - When `apps:` is NOT configured, repositories must not set `github_app:` — it would be silently ignored, so it is rejected at config load to surface misconfiguration early.
 - The legacy single-App `github:` shape continues to work unchanged.
 
-The map key under `apps:` is the App's stable logical name and the value that flows into log lines and metrics. Each entry MUST provide a non-empty `app-id`, `private-key`, and `webhook-secret`; all three accept the same secret-resolution prefixes as the legacy `github:` block (see [Secret Resolution](#secret-resolution)).
+The map key under `apps:` is the App's stable logical name and the value that flows into log lines and metrics. Each entry MUST provide a non-empty `app-id`, `private-key`, and `webhook-secret`; all three accept the same secret-resolution prefixes as the legacy `github:` block (see [Secret Resolution](#secret-resolution)). `check-name` is optional and defaults to `SchemaBot`.
 
 ## Secret Resolution
 

@@ -17,6 +17,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DefaultGitHubCheckName is the base GitHub Check Run name used when a
+// deployment does not configure a custom name.
+const DefaultGitHubCheckName = "SchemaBot"
+
 // ServerConfig holds the server-side SchemaBot configuration.
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
 type ServerConfig struct {
@@ -125,6 +129,20 @@ type GitHubConfig struct {
 	// WebhookSecret is the HMAC secret for validating webhook signatures.
 	// Supports secret references: env:VAR, file:/path, secretsmanager:name#key.
 	WebhookSecret string `yaml:"webhook-secret"`
+
+	// CheckName is the base name for aggregate GitHub Check Runs published by
+	// this App. Environment-scoped deployments append the environment in
+	// parentheses, for example "SchemaBot (staging)".
+	CheckName string `yaml:"check-name,omitempty"`
+}
+
+// CheckRunNameBase returns the configured aggregate GitHub Check Run base name.
+func (g GitHubConfig) CheckRunNameBase() string {
+	name := strings.TrimSpace(g.CheckName)
+	if name == "" {
+		return DefaultGitHubCheckName
+	}
+	return name
 }
 
 // Configured returns true if the GitHub App is configured (app ID and private key are set).
@@ -579,7 +597,7 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 //   - If apps: is NOT set, repos must not declare github_app (it would be a
 //     silently ignored field, which we want to fail closed on).
 func (c *ServerConfig) validateGitHubAppsConfig() error {
-	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != ""
+	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != ""
 	hasApps := c.Apps != nil
 
 	if hasGitHub && hasApps {
@@ -902,6 +920,26 @@ func (c *ServerConfig) IsCheckRequired(name string) bool {
 		return true
 	}
 	return slices.Contains(c.RequiredChecks, name)
+}
+
+// GitHubCheckNameBaseForRepo returns the aggregate GitHub Check Run base name
+// for the App that owns repo.
+func (c *ServerConfig) GitHubCheckNameBaseForRepo(repo string) string {
+	if c == nil {
+		return DefaultGitHubCheckName
+	}
+	if len(c.Apps) > 0 {
+		repoConfig, ok := c.Repos[repo]
+		if !ok {
+			return DefaultGitHubCheckName
+		}
+		appConfig, ok := c.Apps[repoConfig.GitHubApp]
+		if !ok {
+			return DefaultGitHubCheckName
+		}
+		return appConfig.CheckRunNameBase()
+	}
+	return c.GitHub.CheckRunNameBase()
 }
 
 // StorageDSN returns the resolved storage DSN.

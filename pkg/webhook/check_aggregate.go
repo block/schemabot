@@ -8,9 +8,16 @@ import (
 )
 
 // aggregateCheckNameForEnv returns the environment-scoped aggregate check name.
-// e.g., "SchemaBot (staging)" or "SchemaBot (production)".
-func aggregateCheckNameForEnv(env string) string {
-	return fmt.Sprintf("SchemaBot (%s)", env)
+// e.g., "SchemaBot (staging)" or "Custom SchemaBot (production)".
+func aggregateCheckNameForEnv(baseName, env string) string {
+	return fmt.Sprintf("%s (%s)", baseName, env)
+}
+
+func (h *Handler) aggregateCheckNameForRepo(repo string) string {
+	if h == nil || h.service == nil || h.service.Config() == nil {
+		return aggregateCheckName
+	}
+	return h.service.Config().GitHubCheckNameBaseForRepo(repo)
 }
 
 // filterChecksByEnvironment returns only stored check state for the given environment.

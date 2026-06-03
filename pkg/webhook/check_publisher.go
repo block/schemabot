@@ -65,12 +65,12 @@ func (h *Handler) verifyHeadSHAStillCurrentForPR(ctx context.Context, client *gh
 // up per-database checks for a PR.
 //
 // When allowed_environments is configured, per-environment aggregates are created
-// (e.g., "SchemaBot (staging)") that only roll up checks for that environment. This
-// allows separate SchemaBot instances to each publish their own aggregate without
-// conflicting with each other.
+// (e.g., "SchemaBot (staging)") that only roll up checks for that environment.
+// Deployments can customize the base name when independent SchemaBot gates share
+// a repository.
 //
-// When allowed_environments is NOT configured, a single "SchemaBot" aggregate is
-// created that rolls up all per-database checks.
+// When allowed_environments is NOT configured, a single aggregate is created
+// that rolls up all per-database checks.
 //
 // Aggregate logic (first match wins):
 //   - ANY check "in_progress"     → aggregate status "in_progress"
@@ -119,6 +119,7 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 	}
 
 	config := h.service.Config()
+	checkNameBase := h.aggregateCheckNameForRepo(repo)
 
 	if len(config.AllowedEnvironments) > 0 {
 		// Per-environment aggregates: create one aggregate per allowed environment.
@@ -129,13 +130,13 @@ func (h *Handler) updateAggregateCheck(ctx context.Context, client *ghclient.Ins
 			if len(envChecks) == 0 {
 				continue
 			}
-			checkName := aggregateCheckNameForEnv(env)
+			checkName := aggregateCheckNameForEnv(checkNameBase, env)
 			h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, envChecks, checkName, env)
 		}
 	} else {
 		// Single aggregate. Uses aggregateSentinel for the environment field
 		// since there is no per-environment scoping.
-		h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, aggregateCheckName, aggregateSentinel)
+		h.upsertAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, checkNameBase, aggregateSentinel)
 	}
 }
 
@@ -278,6 +279,7 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 	}
 
 	config := h.service.Config()
+	checkNameBase := h.aggregateCheckNameForRepo(repo)
 	storedChecks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -298,13 +300,13 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 	if len(config.AllowedEnvironments) > 0 {
 		for _, env := range config.AllowedEnvironments {
 			checks = append(checks, envCheck{
-				name:        aggregateCheckNameForEnv(env),
+				name:        aggregateCheckNameForEnv(checkNameBase, env),
 				environment: env,
 			})
 		}
 	} else {
 		checks = append(checks, envCheck{
-			name:        aggregateCheckName,
+			name:        checkNameBase,
 			environment: aggregateSentinel,
 		})
 	}
@@ -453,6 +455,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 	}
 
 	config := h.service.Config()
+	checkNameBase := h.aggregateCheckNameForRepo(repo)
 
 	type envCheck struct {
 		name        string
@@ -464,14 +467,14 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 		for _, env := range config.AllowedEnvironments {
 			if _, hasError := errors[env]; hasError {
 				checks = append(checks, envCheck{
-					name:        aggregateCheckNameForEnv(env),
+					name:        aggregateCheckNameForEnv(checkNameBase, env),
 					environment: env,
 				})
 			}
 		}
 	} else {
 		checks = append(checks, envCheck{
-			name:        aggregateCheckName,
+			name:        checkNameBase,
 			environment: aggregateSentinel,
 		})
 	}

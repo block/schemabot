@@ -113,6 +113,7 @@ github:
   app-id: "123456"                                 # From step 1
   private-key: "file:/path/to/private-key.pem"     # PEM file
   webhook-secret: "env:GITHUB_WEBHOOK_SECRET"      # From step 1
+  check-name: "SchemaBot X"                      # Optional Check Run base name
 
 databases:
   mydb:

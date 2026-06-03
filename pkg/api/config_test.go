@@ -2108,6 +2108,42 @@ func TestServerConfig_ResolveGitHubAppForRepo(t *testing.T) {
 	})
 }
 
+func TestServerConfig_GitHubCheckNameBaseForRepo(t *testing.T) {
+	t.Run("legacy single-app defaults", func(t *testing.T) {
+		cfg := &ServerConfig{}
+		assert.Equal(t, DefaultGitHubCheckName, cfg.GitHubCheckNameBaseForRepo("any/repo"))
+	})
+
+	t.Run("legacy single-app trims configured name", func(t *testing.T) {
+		cfg := &ServerConfig{GitHub: GitHubConfig{CheckName: "  SchemaBot X  "}}
+		assert.Equal(t, "SchemaBot X", cfg.GitHubCheckNameBaseForRepo("any/repo"))
+	})
+
+	t.Run("multi-app uses repository app name", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {CheckName: "SchemaBot X"},
+				"app-b": {CheckName: "SchemaBot Y"},
+			},
+			Repos: map[string]RepoConfig{
+				"org-a/repo-x": {GitHubApp: "app-a"},
+				"org-b/repo-y": {GitHubApp: "app-b"},
+			},
+		}
+
+		assert.Equal(t, "SchemaBot X", cfg.GitHubCheckNameBaseForRepo("org-a/repo-x"))
+		assert.Equal(t, "SchemaBot Y", cfg.GitHubCheckNameBaseForRepo("org-b/repo-y"))
+	})
+
+	t.Run("multi-app falls back for unknown repository", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps:  map[string]GitHubAppConfig{"app-a": {CheckName: "SchemaBot X"}},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+		}
+		assert.Equal(t, DefaultGitHubCheckName, cfg.GitHubCheckNameBaseForRepo("org/unknown"))
+	})
+}
+
 // TestLoadServerConfigFromFile_MultiApp end-to-end-parses the new YAML shape
 // to confirm the apps: map and per-repo github_app: field round-trip through
 // the YAML decoder (including KnownFields(true)), then asserts that
@@ -2122,6 +2158,7 @@ apps:
     app-id: "env:APP_A_ID"
     private-key: "env:APP_A_PK"
     webhook-secret: "env:APP_A_WS"
+    check-name: "SchemaBot X"
   app-b:
     app-id: "env:APP_B_ID"
     private-key: "env:APP_B_PK"
@@ -2154,6 +2191,7 @@ repos:
 	require.Contains(t, parsed.Apps, "app-a")
 	require.Contains(t, parsed.Apps, "app-b")
 	assert.Equal(t, "env:APP_A_ID", parsed.Apps["app-a"].AppID)
+	assert.Equal(t, "SchemaBot X", parsed.Apps["app-a"].CheckName)
 	assert.Equal(t, "app-a", parsed.Repos["org-a/repo-x"].GitHubApp)
 	assert.Equal(t, "app-b", parsed.Repos["org-b/repo-y"].GitHubApp)
 
