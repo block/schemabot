@@ -186,7 +186,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 	database, environment, priorEnv string,
 	installationID int64,
 ) bool {
-	client, err := h.ghClient.ForInstallation(installationID)
+	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to create GitHub client for prior env check, blocking apply",
 			"prior_env", priorEnv, "error", err)

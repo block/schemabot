@@ -388,9 +388,9 @@ func TestWebhookStopCommandBlocksUnauthorizedActor(t *testing.T) {
 	})
 	service := api.New(&stopActorAuthStorage{apply: apply}, cfg, nil, testLogger())
 	h := &Handler{
-		service:  service,
-		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
-		logger:   testLogger(),
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
 	}
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -462,9 +462,9 @@ func actorAuthTestConfig(enabled bool, opts ...func(*api.ServerConfig)) *api.Ser
 func actorAuthTestHandler(cfg *api.ServerConfig, installClient *ghclient.InstallationClient) *Handler {
 	service := api.New(nil, cfg, nil, testLogger())
 	return &Handler{
-		service:  service,
-		ghClient: &fakeClientFactory{client: installClient},
-		logger:   testLogger(),
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    testLogger(),
 	}
 }
 

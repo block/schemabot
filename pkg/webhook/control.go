@@ -98,9 +98,9 @@ func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, r
 		return
 	}
 	var client *ghclient.InstallationClient
-	if h.service.Config().PRCommandAuthorizationEnabled() && h.ghClient != nil {
+	if h.service.Config().PRCommandAuthorizationEnabled() && h.ghClients.Len() > 0 {
 		var clientErr error
-		client, clientErr = h.ghClient.ForInstallation(installationID)
+		client, clientErr = h.clientForRepo(repo, installationID)
 		if clientErr != nil {
 			h.logger.Warn("stop PR command blocked because actor authorization client could not be created",
 				"repo", repo,
@@ -275,9 +275,9 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 		return
 	}
 	var client *ghclient.InstallationClient
-	if h.service.Config().PRCommandAuthorizationEnabled() && h.ghClient != nil {
+	if h.service.Config().PRCommandAuthorizationEnabled() && h.ghClients.Len() > 0 {
 		var clientErr error
-		client, clientErr = h.ghClient.ForInstallation(installationID)
+		client, clientErr = h.clientForRepo(repo, installationID)
 		if clientErr != nil {
 			h.logger.Warn("cutover PR command blocked because actor authorization client could not be created",
 				"repo", repo,

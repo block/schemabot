@@ -309,9 +309,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 
 		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
 		h := &Handler{
-			service:  service,
-			ghClient: factory,
-			logger:   testLogger(),
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
 		}
 
 		ctx := t.Context()
@@ -351,9 +351,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 
 		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
 		h := &Handler{
-			service:  service,
-			ghClient: factory,
-			logger:   testLogger(),
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
 		}
 
 		ctx := t.Context()
@@ -393,9 +393,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 
 		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
 		h := &Handler{
-			service:  service,
-			ghClient: factory,
-			logger:   testLogger(),
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
 		}
 
 		ctx := t.Context()
@@ -424,9 +424,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 
 		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Required Review"}}, nil, testLogger())
 		h := &Handler{
-			service:  service,
-			ghClient: factory,
-			logger:   testLogger(),
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
 		}
 
 		ctx := t.Context()
@@ -457,9 +457,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 
 		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Required Review"}}, nil, testLogger())
 		h := &Handler{
-			service:  service,
-			ghClient: factory,
-			logger:   testLogger(),
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
 		}
 
 		ctx := t.Context()
@@ -488,9 +488,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 
 		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
 		h := &Handler{
-			service:  service,
-			ghClient: factory,
-			logger:   testLogger(),
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
 		}
 
 		ctx := t.Context()
@@ -521,9 +521,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 
 		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
 		h := &Handler{
-			service:  service,
-			ghClient: factory,
-			logger:   testLogger(),
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
 		}
 
 		ctx := t.Context()
@@ -551,9 +551,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 
 		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
 		h := &Handler{
-			service:  service,
-			ghClient: factory,
-			logger:   testLogger(),
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
 		}
 
 		ctx := t.Context()

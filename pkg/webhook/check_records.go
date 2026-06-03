@@ -444,7 +444,7 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 	})
 
 	// Update the aggregate check to reflect the rollback
-	if aggClient, err := h.ghClient.ForInstallation(installationID); err == nil {
+	if aggClient, err := h.clientForRepo(repo, installationID); err == nil {
 		h.updateAggregateCheck(ctx, aggClient, repo, pr, check.HeadSHA)
 	} else {
 		h.logger.Error("failed to create GitHub client for rollback aggregate update",

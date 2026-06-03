@@ -109,9 +109,9 @@ func TestE2EStopCommandRecordsDurableRequest(t *testing.T) {
 	service := apiServiceForStopCommandTest(t, store, database)
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
 	h := &Handler{
-		service:  service,
-		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
-		logger:   testLogger(),
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
 	}
 
 	postStopCommand(t, h, applyIdentifier, "alice")
@@ -206,9 +206,9 @@ func TestE2EStopCommandStopsDeferredCutoverLocalApply(t *testing.T) {
 	})
 	service.RegisterTernClient(database, "staging", localClient)
 	h := &Handler{
-		service:  service,
-		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
-		logger:   testLogger(),
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
 	}
 
 	postStopCommand(t, h, applyIdentifier, "alice")
@@ -288,9 +288,9 @@ func TestE2ECutoverCommandRecordsDurableRequest(t *testing.T) {
 	service := apiServiceForStopCommandTest(t, store, database)
 	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
 	h := &Handler{
-		service:  service,
-		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
-		logger:   testLogger(),
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
 	}
 
 	postCutoverCommand(t, h, applyIdentifier, "alice")
@@ -370,9 +370,9 @@ func TestE2ECutoverCommandRejectsPendingStop(t *testing.T) {
 	ternClient := &stopCommandTernClient{remote: true}
 	service.RegisterTernClient(database, "staging", ternClient)
 	h := &Handler{
-		service:  service,
-		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
-		logger:   testLogger(),
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
 	}
 
 	postCutoverCommand(t, h, applyIdentifier, "cutter")

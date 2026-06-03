@@ -141,7 +141,7 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 // handleRollbackConfirmCommand handles the "schemabot rollback-confirm -e <env>" PR comment command.
 // It verifies the lock, re-generates the rollback plan for drift detection, and executes the apply.
 func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel, client, err := h.commandBootstrap(installationID)
+	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("rollback-confirm: failed to bootstrap command", "error", err)
 		return
@@ -262,12 +262,21 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 	progressBody := formatProgressComment(apply, nil)
 	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
 
+	// Resolve the App factory for this repo once so the observer captures
+	// the correct App for all subsequent GitHub calls (comments, check runs).
+	factory, factoryErr := h.factoryForRepo(repo)
+	if factoryErr != nil {
+		h.logger.Error("rollback blocked: cannot resolve GitHub App client for repo",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "error", factoryErr)
+		return
+	}
+
 	// Set observer for rollback progress and check run updates.
 	// On successful rollback, set check to action_required because the PR
 	// changes need to be re-applied.
 	h.service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, applyID,
 		NewCommentObserver(CommentObserverConfig{
-			GHClient:       h.ghClient,
+			GHClient:       factory,
 			Storage:        h.service.Storage(),
 			Repo:           repo,
 			PR:             pr,
@@ -296,7 +305,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 					return
 				}
 
-				ghInstClient, err := h.ghClient.ForInstallation(installationID)
+				ghInstClient, err := factory.ForInstallation(installationID)
 				if err != nil {
 					h.logger.Error("observer: failed to create GitHub client for rollback aggregate update",
 						"repo", repo, "pr", pr, "database", a.Database,

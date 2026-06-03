@@ -28,21 +28,39 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+// defaultAppName is the synthetic App name used when SchemaBot runs against
+// the legacy single-App ServerConfig.GitHub field. It matches the name
+// returned by ServerConfig.ResolveGitHubAppForRepo for legacy configs, so
+// the per-repo client resolution path works uniformly across single-App and
+// multi-App deployments.
+const defaultAppName = "default"
+
 // Handler processes GitHub webhook events.
 type Handler struct {
 	service                    *api.Service
-	ghClient                   github.GitHubClientFactory
+	ghClients                  github.ClientSet
 	webhookSecret              []byte
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
 }
 
-// NewHandler creates a new webhook handler.
+// NewHandler creates a new webhook handler for the legacy single-App
+// configuration. The provided factory is registered in the internal
+// ClientSet under the "default" App name so per-repo client resolution
+// works uniformly with the multi-App path that lands in a follow-up PR.
 func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webhookSecret []byte, logger *slog.Logger) *Handler {
+	return NewHandlerWithClientSet(service, github.NewSingleClientSet(defaultAppName, ghClient), webhookSecret, logger)
+}
+
+// NewHandlerWithClientSet creates a new webhook handler from an
+// already-built ClientSet. Production wiring (serve.go) will switch to this
+// constructor when the multi-App config shape is wired in a follow-up PR;
+// tests continue to use NewHandler with a single factory.
+func NewHandlerWithClientSet(service *api.Service, ghClients github.ClientSet, webhookSecret []byte, logger *slog.Logger) *Handler {
 	h := &Handler{
 		service:                    service,
-		ghClient:                   ghClient,
+		ghClients:                  ghClients,
 		webhookSecret:              webhookSecret,
 		logger:                     logger,
 		priorEnvCheckMaxAttempts:   defaultPriorEnvCheckMaxAttempts,
@@ -56,13 +74,22 @@ func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webho
 			if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
 				return
 			}
+			factory, err := h.factoryForRepo(apply.Repository)
+			if err != nil {
+				logger.Error("recovered apply skipped: cannot resolve GitHub App client",
+					"apply_id", apply.ApplyIdentifier,
+					"repo", apply.Repository,
+					"pr", apply.PullRequest,
+					"error", err)
+				return
+			}
 			logger.Info("setting comment observer for recovered apply",
 				"apply_id", apply.ApplyIdentifier,
 				"repo", apply.Repository,
 				"pr", apply.PullRequest)
 			service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, apply.ID,
 				NewCommentObserver(CommentObserverConfig{
-					GHClient:       h.ghClient,
+					GHClient:       factory,
 					Storage:        service.Storage(),
 					Repo:           apply.Repository,
 					PR:             apply.PullRequest,
@@ -80,7 +107,7 @@ func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webho
 								"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
 							return
 						}
-						if ghInstClient, err := h.ghClient.ForInstallation(apply.InstallationID); err == nil {
+						if ghInstClient, err := h.clientForRepo(apply.Repository, apply.InstallationID); err == nil {
 							if checkRecord, err := service.Storage().Checks().Get(context.Background(), apply.Repository, apply.PullRequest, a.Environment, a.DatabaseType, a.Database); err == nil && checkRecord != nil {
 								h.updateAggregateCheck(context.Background(), ghInstClient, apply.Repository, apply.PullRequest, checkRecord.HeadSHA)
 							}
@@ -92,6 +119,37 @@ func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webho
 	}
 
 	return h
+}
+
+// factoryForRepo returns the GitHub App client factory that owns the given
+// repository.
+//
+// In the legacy single-App shape the ClientSet has exactly one entry under
+// defaultAppName and is used uniformly for every repo, matching the prior
+// behavior where there was only one App. Multi-App resolution via
+// ServerConfig.ResolveGitHubAppForRepo lands in the follow-up PR; this method
+// is the single seam that will be extended there.
+func (h *Handler) factoryForRepo(repo string) (github.GitHubClientFactory, error) {
+	if h.ghClients.Len() == 0 {
+		return nil, fmt.Errorf("no GitHub App clients configured")
+	}
+	factory, err := h.ghClients.For(defaultAppName)
+	if err != nil {
+		return nil, fmt.Errorf("lookup GitHub App client for repo %q: %w", repo, err)
+	}
+	return factory, nil
+}
+
+// clientForRepo returns an installation-scoped GitHub client for the App
+// that owns the given repository. Callers that already have a factory in
+// scope should use it directly; this is the convenience for the common
+// "I have a repo + installation_id" path.
+func (h *Handler) clientForRepo(repo string, installationID int64) (*github.InstallationClient, error) {
+	factory, err := h.factoryForRepo(repo)
+	if err != nil {
+		return nil, err
+	}
+	return factory.ForInstallation(installationID)
 }
 
 // ReconcileMissingSummaryComments repairs the apply_comments outbox on startup.

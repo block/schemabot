@@ -28,12 +28,12 @@ const commandTimeout = 2 * time.Minute
 // returned cancel func is a no-op. The caller is responsible for
 // handler-specific error reporting (HTTP response, PR comment, log line)
 // because that contract varies between handlers.
-func (h *Handler) commandBootstrap(installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
+func (h *Handler) commandBootstrap(repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
 	ctx, cancel := h.commandContext(commandTimeout)
-	client, err := h.ghClient.ForInstallation(installationID)
+	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		cancel()
-		return ctx, func() {}, nil, fmt.Errorf("create GitHub client for installation %d: %w", installationID, err)
+		return ctx, func() {}, nil, fmt.Errorf("create GitHub client for repo %q installation %d: %w", repo, installationID, err)
 	}
 	return ctx, cancel, client, nil
 }

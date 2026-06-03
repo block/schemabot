@@ -16,7 +16,7 @@ import (
 
 // handlePlanCommand handles the "schemabot plan -e <env>" command.
 func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string) {
-	ctx, cancel, client, err := h.commandBootstrap(installationID)
+	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("plan: failed to bootstrap command", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "failed to initialize GitHub client")
@@ -122,7 +122,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 // handleMultiEnvPlan runs plan for all configured environments and posts a single combined comment.
 // When isAutoPlan is true and no environments have changes or errors, the comment is skipped to reduce PR noise.
 func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, installationID int64, requestedBy string, isAutoPlan bool) {
-	ctx, cancel, client, err := h.commandBootstrap(installationID)
+	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
 		return

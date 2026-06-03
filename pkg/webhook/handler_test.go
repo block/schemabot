@@ -121,9 +121,9 @@ func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {
 	}, nil, testLogger())
 
 	h := &Handler{
-		service:  service,
-		ghClient: factory,
-		logger:   testLogger(),
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+		logger:    testLogger(),
 	}
 	return h, comments, reactions
 }
@@ -617,9 +617,9 @@ func TestWebhookRepoAllowlistRejectsUnregisteredRepo(t *testing.T) {
 	}, nil, testLogger())
 
 	h := &Handler{
-		service:  service,
-		ghClient: factory,
-		logger:   testLogger(),
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+		logger:    testLogger(),
 	}
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -663,9 +663,9 @@ func TestWebhookRepoAllowlistAllowsRegisteredRepo(t *testing.T) {
 	}, nil, testLogger())
 
 	h := &Handler{
-		service:  service,
-		ghClient: factory,
-		logger:   testLogger(),
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+		logger:    testLogger(),
 	}
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -699,9 +699,9 @@ func TestWebhookRepoAllowlistEmptyAllowsAll(t *testing.T) {
 	}, nil, testLogger())
 
 	h := &Handler{
-		service:  service,
-		ghClient: factory,
-		logger:   testLogger(),
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+		logger:    testLogger(),
 	}
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{

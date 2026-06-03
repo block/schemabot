@@ -127,7 +127,7 @@ func registerReviewsEndpoint(mux *http.ServeMux, reviews []*gh.PullRequestReview
 func TestCheckReviewGate_Disabled(t *testing.T) {
 	h, _ := setupReviewGateHandler(t, nil)
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
@@ -145,7 +145,7 @@ func TestCheckReviewGate_NoReviewsBlocks(t *testing.T) {
 	registerPREndpoint(mux, "alice")
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{})
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
@@ -171,7 +171,7 @@ func TestCheckReviewGate_OperatorUserApproval(t *testing.T) {
 		},
 	})
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
@@ -194,7 +194,7 @@ func TestCheckReviewGate_AdminUserApproval(t *testing.T) {
 		},
 	})
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
@@ -213,7 +213,7 @@ func TestCheckReviewGate_NotApproved(t *testing.T) {
 	registerPREndpoint(mux, "alice")
 	registerReviewsEndpoint(mux, []*gh.PullRequestReview{})
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
@@ -241,7 +241,7 @@ func TestCheckReviewGate_SelfApprovalBlocked(t *testing.T) {
 		},
 	})
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
@@ -274,7 +274,7 @@ func TestCheckReviewGate_OperatorTeamApproval(t *testing.T) {
 	})
 	mux.HandleFunc("GET /orgs/octocat/teams/db-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
@@ -300,7 +300,7 @@ func TestCheckReviewGate_OperatorTeamNotApproved(t *testing.T) {
 	})
 	mux.HandleFunc("GET /orgs/octocat/teams/db-admins/members", teamMembersHandler(t, http.StatusOK, "bob", "carol"))
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
@@ -326,7 +326,7 @@ func TestCheckReviewGate_CodeownersIgnoredByDefault(t *testing.T) {
 		},
 	})
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")
@@ -352,7 +352,7 @@ func TestCheckReviewGate_CodeownersOptIn(t *testing.T) {
 		},
 	})
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/payments")
@@ -376,7 +376,7 @@ func TestCheckReviewGate_NoConfiguredReviewersErrors(t *testing.T) {
 	registerPREndpoint(mux, "alice")
 	registerReviewsEndpoint(mux, nil)
 
-	client, err := h.ghClient.ForInstallation(12345)
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb")

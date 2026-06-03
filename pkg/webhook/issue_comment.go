@@ -167,11 +167,11 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 	// Add acknowledgment reaction now that we know this instance will handle
 	// the command. Placed after all skip/filter checks so only the owning
 	// instance reacts — avoids duplicate reactions in multi-instance setups.
-	if payload.Comment.ID > 0 && h.ghClient != nil {
+	if payload.Comment.ID > 0 && h.ghClients.Len() > 0 {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			client, err := h.ghClient.ForInstallation(installationID)
+			client, err := h.clientForRepo(repo, installationID)
 			if err != nil {
 				h.logger.Error("failed to create GitHub client for reaction", "error", err)
 				return
@@ -255,7 +255,7 @@ func (h *Handler) postComment(repo string, pr int, installationID int64, body st
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	client, err := h.ghClient.ForInstallation(installationID)
+	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to create GitHub client for comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
@@ -274,7 +274,7 @@ func (h *Handler) postAndTrackComment(
 	ctx context.Context, repo string, pr int, installationID int64,
 	applyID int64, commentState string, body string,
 ) int64 {
-	client, err := h.ghClient.ForInstallation(installationID)
+	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to create GitHub client for tracked comment", "error", err)
 		return 0

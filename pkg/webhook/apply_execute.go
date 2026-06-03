@@ -98,10 +98,21 @@ func (h *Handler) executeApply(
 
 	caller := fmt.Sprintf("github:%s@%s#%d", requestedBy, repo, pr)
 
+	// Resolve the App factory for this repo once so the observer captures
+	// the correct App for all subsequent GitHub calls (comments, check runs).
+	// Failure here is unrecoverable for outbound calls — the same error would
+	// also block postComment — so log and return without attempting a comment.
+	factory, factoryErr := h.factoryForRepo(repo)
+	if factoryErr != nil {
+		h.logger.Error("apply blocked: cannot resolve GitHub App client for repo",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "error", factoryErr)
+		return
+	}
+
 	// Set observer before queuing the apply so ExecuteApply can register it on
 	// the durable apply row before scheduler dispatch starts.
 	observer := NewCommentObserver(CommentObserverConfig{
-		GHClient:       h.ghClient,
+		GHClient:       factory,
 		Storage:        h.service.Storage(),
 		Repo:           repo,
 		PR:             pr,
@@ -121,7 +132,7 @@ func (h *Handler) executeApply(
 					"repo", repo, "pr", pr, "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
 				return
 			}
-			ghInstClient, err := h.ghClient.ForInstallation(installationID)
+			ghInstClient, err := factory.ForInstallation(installationID)
 			if err != nil {
 				h.logger.Error("observer: failed to create GitHub client",
 					"repo", repo, "pr", pr, "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,

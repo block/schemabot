@@ -90,7 +90,7 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 	// Dedupe FetchPullRequest calls within this webhook delivery.
 	ctx = ghclient.WithPRInfoCache(ctx)
 
-	client, err := h.ghClient.ForInstallation(installationID)
+	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to create GitHub client", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "failed to initialize GitHub client")
@@ -128,7 +128,7 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 		h.goSafe(repo, pr, installationID, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			c, err := h.ghClient.ForInstallation(installationID)
+			c, err := h.clientForRepo(repo, installationID)
 			if err != nil {
 				h.logger.Error("failed to create GitHub client for passing aggregate", "error", err)
 				return
@@ -244,7 +244,7 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 		return
 	}
 
-	client, clientErr := h.ghClient.ForInstallation(installationID)
+	client, clientErr := h.clientForRepo(repo, installationID)
 	if clientErr != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "stale_check_cleanup",

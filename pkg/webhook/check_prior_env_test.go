@@ -40,7 +40,7 @@ func TestCheckPriorEnvViaLocalFailsClosedOnStorageError(t *testing.T) {
 
 	h := &Handler{
 		service:                    service,
-		ghClient:                   &fakeClientFactory{client: installClient},
+		ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
 		logger:                     testLogger(),
 		priorEnvCheckMaxAttempts:   1,
 		priorEnvCheckRetryInterval: time.Nanosecond,
@@ -88,7 +88,7 @@ func TestCheckPriorEnvViaLocalMissingCheckBlocksWithActionableGuidance(t *testin
 
 	h := &Handler{
 		service:                    service,
-		ghClient:                   &fakeClientFactory{client: installClient},
+		ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
 		logger:                     testLogger(),
 		priorEnvCheckMaxAttempts:   1,
 		priorEnvCheckRetryInterval: time.Nanosecond,
@@ -142,7 +142,7 @@ func TestCheckPriorEnvViaLocalRetriesBeforeFailClosed(t *testing.T) {
 
 	h := &Handler{
 		service:                    service,
-		ghClient:                   &fakeClientFactory{client: installClient},
+		ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
 		logger:                     testLogger(),
 		priorEnvCheckMaxAttempts:   2,
 		priorEnvCheckRetryInterval: time.Nanosecond,
@@ -203,7 +203,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		factory := &fakeClientFactory{client: installClient}
 
 		h := &Handler{
-			ghClient:                   factory,
+			ghClients:                  ghclient.NewSingleClientSet(defaultAppName, factory),
 			logger:                     testLogger(),
 			priorEnvCheckMaxAttempts:   1,
 			priorEnvCheckRetryInterval: time.Nanosecond,
@@ -305,7 +305,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 		installClient := ghclient.NewInstallationClient(client, testLogger())
 		h := &Handler{
-			ghClient:                   &fakeClientFactory{client: installClient},
+			ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
 			logger:                     testLogger(),
 			priorEnvCheckMaxAttempts:   2,
 			priorEnvCheckRetryInterval: time.Nanosecond,
@@ -354,7 +354,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		factory := &fakeClientFactory{client: installClient}
 
 		h := &Handler{
-			ghClient:                   factory,
+			ghClients:                  ghclient.NewSingleClientSet(defaultAppName, factory),
 			logger:                     testLogger(),
 			priorEnvCheckMaxAttempts:   1,
 			priorEnvCheckRetryInterval: time.Nanosecond,

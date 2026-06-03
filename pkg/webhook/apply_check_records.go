@@ -99,7 +99,7 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 
 // updateCheckRunAfterUnlock updates a check run to neutral after lock release.
 func (h *Handler) updateCheckRunAfterUnlock(ctx context.Context, repo string, pr int, lock *storage.Lock, installationID int64) {
-	client, err := h.ghClient.ForInstallation(installationID)
+	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to create GitHub client for check run update", "error", err)
 		return

@@ -36,8 +36,8 @@ func TestPostCommandError_RendersTimestamp(t *testing.T) {
 	})
 
 	h := &Handler{
-		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
-		logger:   testLogger(),
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
 	}
 
 	h.postCommandError(
@@ -75,8 +75,8 @@ func TestPostCommandErrorExplainsRemoteUnavailable(t *testing.T) {
 	})
 
 	h := &Handler{
-		ghClient: &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())},
-		logger:   testLogger(),
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
 	}
 
 	h.postCommandError(

@@ -15,7 +15,7 @@ import (
 // handleApplyCommand handles the "schemabot apply -e <env>" PR comment command.
 // It generates a plan, acquires a lock, and posts a plan comment with a confirmation footer.
 func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel, client, err := h.commandBootstrap(installationID)
+	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("apply: failed to bootstrap command", "error", err)
 		return
@@ -324,7 +324,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 // handleApplyConfirmCommand handles the "schemabot apply-confirm -e <env>" PR comment command.
 // It verifies lock ownership, re-plans for drift detection, executes the apply, and watches progress.
 func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel, client, err := h.commandBootstrap(installationID)
+	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("apply-confirm: failed to bootstrap command", "error", err)
 		return
