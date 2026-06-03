@@ -417,6 +417,43 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 		return 0, fmt.Errorf("read inserted apply id for %s: %w", apply.ApplyIdentifier, err)
 	}
 
+	// Operations are inserted BEFORE tasks so each task can be persisted
+	// with the apply_operation_id of the operation it belongs to. Today
+	// the config layer hard-blocks multi-entry deployments so there is
+	// always exactly one operation per apply, and all tasks are linked
+	// to it. When the multi-entry block is lifted and apply-create fans
+	// tasks out per-operation, the per-task mapping needs to be encoded
+	// by the caller (see the multi-op guard below).
+	for _, op := range operations {
+		op.ApplyID = id
+		if _, err := insertApplyOperation(ctx, writeTx.tx, op); err != nil {
+			return 0, fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", op.Deployment, apply.ApplyIdentifier, err)
+		}
+	}
+
+	switch {
+	case len(tasks) == 0:
+		// no tasks; nothing to link.
+	case len(operations) == 1:
+		// Single-operation apply: link every task to the lone operation
+		// unless the caller already supplied an explicit value.
+		for _, task := range tasks {
+			if task.ApplyOperationID == nil {
+				task.ApplyOperationID = &operations[0].ID
+			}
+		}
+	case len(operations) > 1:
+		// Multi-operation apply: caller MUST decide which operation each
+		// task belongs to and pre-populate task.ApplyOperationID. Silently
+		// assigning every task to operations[0] would lock in a wrong
+		// mapping the moment multi-entry deployments are unblocked.
+		for _, task := range tasks {
+			if task.ApplyOperationID == nil {
+				return 0, fmt.Errorf("create apply %s: task %s missing apply_operation_id (apply has %d operations; caller must encode the per-task mapping)", apply.ApplyIdentifier, task.TaskIdentifier, len(operations))
+			}
+		}
+	}
+
 	for _, task := range tasks {
 		task.ApplyID = id
 		taskID, err := insertTask(ctx, writeTx.tx, task)
@@ -424,13 +461,6 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 			return 0, fmt.Errorf("insert task %s for apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 		task.ID = taskID
-	}
-
-	for _, op := range operations {
-		op.ApplyID = id
-		if _, err := insertApplyOperation(ctx, writeTx.tx, op); err != nil {
-			return 0, fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", op.Deployment, apply.ApplyIdentifier, err)
-		}
 	}
 
 	if err := writeTx.commit(); err != nil {

@@ -15,7 +15,7 @@ import (
 )
 
 // taskColumns lists all columns for SELECT queries.
-const taskColumns = `id, task_identifier, apply_id, plan_id, database_name, database_type,
+const taskColumns = `id, task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 	namespace, table_name, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
 	rows_copied, rows_total, progress_percent, eta_seconds,
@@ -54,15 +54,15 @@ func insertTask(ctx context.Context, execer taskInserter, task *storage.Task) (i
 
 	result, err := execer.ExecContext(ctx, `
 		INSERT INTO tasks (
-			task_identifier, apply_id, plan_id, database_name, database_type,
+			task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 			namespace, table_name, ddl, ddl_action,
 			engine, repository, pull_request, environment, state, error_message, options, attempt,
 			rows_copied, rows_total, progress_percent, eta_seconds,
 			is_instant, ready_to_complete, engine_migration_id,
 			started_at, completed_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		task.TaskIdentifier, task.ApplyID, task.PlanID, task.Database, task.DatabaseType,
+		task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 		task.Namespace, nullString(task.TableName), nullString(task.DDL), nullString(task.DDLAction),
 		task.Engine, task.Repository, task.PullRequest, task.Environment,
 		task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
@@ -242,13 +242,14 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 	var task storage.Task
 	var tableName, ddl, ddlAction, errorMsg, engineMigrationID sql.NullString
 	var options []byte
-	var etaSeconds sql.NullInt64
+	var applyOperationID, etaSeconds sql.NullInt64
 	var startedAt, completedAt sql.NullTime
 
 	err := s.Scan(
 		&task.ID,
 		&task.TaskIdentifier,
 		&task.ApplyID,
+		&applyOperationID,
 		&task.PlanID,
 		&task.Database,
 		&task.DatabaseType,
@@ -288,6 +289,10 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 	task.ETASeconds = int(etaSeconds.Int64)
 	task.EngineMigrationID = engineMigrationID.String
 	task.State = state.NormalizeTaskStatus(task.State)
+	if applyOperationID.Valid {
+		v := applyOperationID.Int64
+		task.ApplyOperationID = &v
+	}
 	if startedAt.Valid {
 		task.StartedAt = &startedAt.Time
 	}

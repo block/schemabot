@@ -205,9 +205,113 @@ func TestApplyStore_CreateWithTasksAndOperationsCommitsAtomically(t *testing.T) 
 	assert.Equal(t, "payments-a", storedOps[0].Deployment)
 	assert.Equal(t, "payments", storedOps[0].Target)
 	assert.Equal(t, state.ApplyOperation.Pending, storedOps[0].State)
-	// CreateWithTasksAndOperations also back-fills the operation's ApplyID
+	// CreateWithTasksAndOperations back-fills the operation's ApplyID
 	// onto the caller-supplied struct (same contract as CreateWithTasks).
 	assert.Equal(t, applyID, operations[0].ApplyID)
+	// It also back-fills the operation's ID onto every task so the row in
+	// MySQL carries the apply_operation_id link the operator claim loop
+	// will consume. The link must be present both in-memory (on the
+	// caller-supplied struct) and on the persisted row.
+	require.NotNil(t, tasks[0].ApplyOperationID, "task.ApplyOperationID must be back-filled in-memory")
+	assert.Equal(t, operations[0].ID, *tasks[0].ApplyOperationID)
+	require.NotNil(t, storedTasks[0].ApplyOperationID, "task.apply_operation_id must be persisted")
+	assert.Equal(t, operations[0].ID, *storedTasks[0].ApplyOperationID)
+}
+
+// TestApplyStore_CreateWithTasksAndOperationsRollsBackOnTaskFailure pins the
+// post-reorder invariant: operations are inserted before tasks, so a task
+// insert failure must roll back the already-inserted apply_operations rows
+// (and the apply row) — no orphan operations left behind.
+func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnTaskFailure(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_rollback_on_task_failure",
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "production",
+		Deployment:      "payments-a",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	// Two tasks sharing the same task_identifier violates the UNIQUE KEY
+	// idx_task_identifier on the second insert.
+	tasks := []*storage.Task{
+		{TaskIdentifier: "task_dup", PlanID: 1, Database: "payments", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineSpirit, Environment: "production", State: state.Task.Pending, TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", DDLAction: "alter", Options: []byte("{}"), CreatedAt: now, UpdatedAt: now},
+		{TaskIdentifier: "task_dup", PlanID: 1, Database: "payments", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineSpirit, Environment: "production", State: state.Task.Pending, TableName: "orders", DDL: "ALTER TABLE orders ADD COLUMN b INT", DDLAction: "alter", Options: []byte("{}"), CreatedAt: now, UpdatedAt: now},
+	}
+	operations := []*storage.ApplyOperation{
+		{Deployment: "payments-a", Target: "payments", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
+	}
+
+	_, err := store.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+	require.Error(t, err)
+
+	gotApply, err := store.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, gotApply, "apply row must not exist after rollback")
+
+	// The op insert succeeded before the task insert failed; the rollback
+	// must drop it too — no orphan apply_operations rows for this deployment.
+	var opCount int
+	require.NoError(t, testDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM apply_operations WHERE deployment = ?`, "payments-a").Scan(&opCount))
+	assert.Zero(t, opCount, "apply_operations row must be rolled back along with tasks and apply")
+}
+
+// TestApplyStore_CreateWithTasksAndOperationsRejectsMultiOpWithoutTaskMapping
+// pins the multi-op guard: when an apply has >1 operations, the caller MUST
+// pre-populate task.ApplyOperationID; the store will not silently link every
+// task to operations[0]. This guard prevents a wrong default from getting
+// locked in once the config-layer multi-entry-deployments block is lifted.
+func TestApplyStore_CreateWithTasksAndOperationsRejectsMultiOpWithoutTaskMapping(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_multi_op_no_mapping",
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "production",
+		Deployment:      "payments-a",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	tasks := []*storage.Task{
+		{TaskIdentifier: "task_unmapped", PlanID: 1, Database: "payments", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineSpirit, Environment: "production", State: state.Task.Pending, TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", DDLAction: "alter", Options: []byte("{}"), CreatedAt: now, UpdatedAt: now},
+	}
+	operations := []*storage.ApplyOperation{
+		{Deployment: "payments-a", Target: "payments", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
+		{Deployment: "payments-b", Target: "payments", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
+	}
+
+	_, err := store.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "missing apply_operation_id")
+
+	gotApply, err := store.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, gotApply, "apply row must not exist after rejected multi-op create")
 }
 
 func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnOperationFailure(t *testing.T) {

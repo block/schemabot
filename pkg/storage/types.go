@@ -584,6 +584,14 @@ type Task struct {
 	// ApplyID points to applies.id.
 	ApplyID int64
 
+	// ApplyOperationID points to apply_operations.id when the task is
+	// owned by a specific per-deployment operation row. Nullable for
+	// backwards compatibility with rows written before the apply-create
+	// path started populating this column; once the operator claim loop
+	// owns task creation in the multi-deployment world, every new task
+	// carries a value.
+	ApplyOperationID *int64
+
 	// PlanID points to plans.id.
 	PlanID int64
 
