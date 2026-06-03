@@ -112,7 +112,7 @@ func TestIsAggregateCheck(t *testing.T) {
 
 func TestAggregateSummary(t *testing.T) {
 	checks := []*storage.Check{
-		{DatabaseName: "orders", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+		{DatabaseName: "orders", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},
 		{DatabaseName: "orders", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired},
 	}
 
@@ -128,12 +128,25 @@ func TestAggregateSummary(t *testing.T) {
 
 func TestAggregateSummary_AllSuccess(t *testing.T) {
 	checks := []*storage.Check{
-		{DatabaseName: "orders", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
-		{DatabaseName: "orders", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+		{DatabaseName: "orders", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},
+		{DatabaseName: "orders", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},
 	}
 
 	title, _ := aggregateSummary(checks, checkConclusionSuccess)
 	assert.Equal(t, "All applies complete", title)
+}
+
+func TestAggregateSummary_AllUpToDate(t *testing.T) {
+	checks := []*storage.Check{
+		{DatabaseName: "orders", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+		{DatabaseName: "users", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+	}
+
+	title, summary := aggregateSummary(checks, checkConclusionSuccess)
+
+	assert.Equal(t, "Schema up to date", title)
+	assert.Contains(t, summary, "Up to date")
+	assert.NotContains(t, summary, "Applied")
 }
 
 func TestConclusionEmoji(t *testing.T) {

@@ -98,9 +98,10 @@ const ConfigFileName = "schemabot.yaml"
 
 // Config discovery errors.
 var (
-	ErrNoConfig        = fmt.Errorf("no schemabot.yaml config found")
-	ErrInvalidConfig   = fmt.Errorf("invalid schemabot.yaml config found")
-	ErrMultipleConfigs = fmt.Errorf("multiple schemabot.yaml configs found - use -d flag to specify database")
+	ErrNoConfig         = fmt.Errorf("no schemabot.yaml config found")
+	ErrInvalidConfig    = fmt.Errorf("invalid schemabot.yaml config found")
+	ErrMultipleConfigs  = fmt.Errorf("multiple schemabot.yaml configs found - use -d flag to specify database")
+	ErrGitTreeTruncated = fmt.Errorf("GitHub returned a truncated repository tree; config discovery is incomplete")
 )
 
 // DatabaseNotFoundError indicates the specified database was not found in any config.
@@ -165,9 +166,12 @@ type FindAllConfigsResult struct {
 
 // FindAllConfigs uses the Tree API to discover all schemabot.yaml config files in the repository.
 func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref string) (*FindAllConfigsResult, error) {
-	entries, _, err := ic.FetchGitTree(ctx, repo, ref)
+	entries, truncated, err := ic.FetchGitTree(ctx, repo, ref)
 	if err != nil {
 		return nil, fmt.Errorf("fetch git tree: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("discover schemabot configs in repo %s ref %s: %w", repo, ref, ErrGitTreeTruncated)
 	}
 
 	var configPaths []string
@@ -217,6 +221,16 @@ func (ic *InstallationClient) FindConfigByDatabaseName(ctx context.Context, repo
 		return nil, "", fmt.Errorf("fetch PR info: %w", err)
 	}
 
+	prConfigs, err := ic.findConfigsChangedInPR(ctx, repo, pr, prInfo.HeadSHA)
+	if err != nil {
+		return nil, "", fmt.Errorf("find configs changed in PR: %w", err)
+	}
+	if config, configDir, ok, err := selectConfigByDatabaseName(databaseName, prConfigs); err != nil {
+		return nil, "", err
+	} else if ok {
+		return config, configDir, nil
+	}
+
 	result, err := ic.FindAllConfigs(ctx, repo, prInfo.HeadSHA)
 	if err != nil {
 		return nil, "", fmt.Errorf("find configs: %w", err)
@@ -234,14 +248,11 @@ func (ic *InstallationClient) FindConfigByDatabaseName(ctx context.Context, repo
 		return nil, "", ErrNoConfig
 	}
 
-	var matches []DiscoveredConfig
-	for _, dc := range result.ValidConfigs {
-		if strings.EqualFold(dc.Config.Database, databaseName) {
-			matches = append(matches, dc)
-		}
+	config, configDir, ok, err := selectConfigByDatabaseName(databaseName, result.ValidConfigs)
+	if err != nil {
+		return nil, "", err
 	}
-
-	if len(matches) == 0 {
+	if !ok {
 		var available []string
 		for _, dc := range result.ValidConfigs {
 			available = append(available, dc.Config.Database)
@@ -249,25 +260,30 @@ func (ic *InstallationClient) FindConfigByDatabaseName(ctx context.Context, repo
 		return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName, AvailableDatabases: available}
 	}
 
-	if len(matches) > 1 {
-		var paths []string
-		for _, m := range matches {
-			paths = append(paths, m.SchemaDir)
-		}
-		return nil, "", fmt.Errorf("ambiguous: database '%s' matches multiple configs at: %s",
-			databaseName, strings.Join(paths, ", "))
-	}
-
-	match := matches[0]
-	ic.logger.Debug("found config for database", "database", databaseName, "path", match.SchemaDir)
-	return match.Config, match.SchemaDir, nil
+	ic.logger.Debug("found config for database", "database", databaseName, "path", configDir)
+	return config, configDir, nil
 }
 
-// FindConfigForPR finds the schemabot.yaml config by searching directories of changed schema files.
+// FindConfigForPR finds the schemabot.yaml config by searching changed config files and directories of changed schema files.
 func (ic *InstallationClient) FindConfigForPR(ctx context.Context, repo string, pr int) (*SchemabotConfig, string, error) {
 	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch PR info: %w", err)
+	}
+
+	configs, err := ic.findConfigsChangedInPR(ctx, repo, pr, prInfo.HeadSHA)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(configs) == 1 {
+		return configs[0].Config, configs[0].SchemaDir, nil
+	}
+	if len(configs) > 1 {
+		var databases []string
+		for _, dc := range configs {
+			databases = append(databases, fmt.Sprintf("`%s` (%s)", dc.Config.Database, dc.SchemaDir))
+		}
+		return nil, "", fmt.Errorf("%w: %s", ErrMultipleConfigs, strings.Join(databases, ", "))
 	}
 
 	files, err := ic.FetchPRFiles(ctx, repo, pr)
@@ -350,16 +366,24 @@ func (ic *InstallationClient) FindAllConfigsForPR(ctx context.Context, repo stri
 		return nil, fmt.Errorf("fetch PR files: %w", err)
 	}
 
+	configsByPath := make(map[string]DiscoveredConfig)
+	for _, file := range files {
+		if !isConfigFile(file.Filename) {
+			continue
+		}
+		configDir := path.Dir(file.Filename)
+		config, err := ic.FetchConfig(ctx, repo, file.Filename, prInfo.HeadSHA)
+		if err != nil {
+			return nil, fmt.Errorf("fetch changed config %s: %w", file.Filename, err)
+		}
+		configsByPath[configDir] = newDiscoveredConfig(config, configDir)
+	}
+
 	var filenames []string
 	for _, f := range files {
 		filenames = append(filenames, f.Filename)
 	}
 	schemaFiles := filterSchemaFiles(filenames)
-	if len(schemaFiles) == 0 {
-		return nil, nil
-	}
-
-	configsByPath := make(map[string]DiscoveredConfig)
 	for _, schemaFile := range schemaFiles {
 		config, configDir, err := ic.findNearestConfig(ctx, repo, prInfo.HeadSHA, schemaFile)
 		if err != nil {
@@ -409,6 +433,10 @@ func (ic *InstallationClient) FindConfigInRepo(ctx context.Context, repo string,
 
 func isSchemaFile(filename string) bool {
 	return strings.HasSuffix(filename, ".sql") || strings.HasSuffix(filename, "vschema.json")
+}
+
+func isConfigFile(filename string) bool {
+	return path.Base(filename) == ConfigFileName
 }
 
 func filterSchemaFiles(files []string) []string {
@@ -464,6 +492,51 @@ func newDiscoveredConfig(config *SchemabotConfig, dir string) DiscoveredConfig {
 		SchemaDir:    dir,
 		Environments: config.GetEnvironments(),
 	}
+}
+
+func (ic *InstallationClient) findConfigsChangedInPR(ctx context.Context, repo string, pr int, ref string) ([]DiscoveredConfig, error) {
+	files, err := ic.FetchPRFiles(ctx, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("fetch PR files: %w", err)
+	}
+
+	configsByPath := make(map[string]DiscoveredConfig)
+	for _, file := range files {
+		if !isConfigFile(file.Filename) {
+			continue
+		}
+		configDir := path.Dir(file.Filename)
+		config, err := ic.FetchConfig(ctx, repo, file.Filename, ref)
+		if err != nil {
+			return nil, fmt.Errorf("fetch changed config %s: %w", file.Filename, err)
+		}
+		configsByPath[configDir] = newDiscoveredConfig(config, configDir)
+	}
+
+	return sortedConfigs(configsByPath), nil
+}
+
+func selectConfigByDatabaseName(databaseName string, configs []DiscoveredConfig) (*SchemabotConfig, string, bool, error) {
+	var matches []DiscoveredConfig
+	for _, dc := range configs {
+		if strings.EqualFold(dc.Config.Database, databaseName) {
+			matches = append(matches, dc)
+		}
+	}
+	if len(matches) == 0 {
+		return nil, "", false, nil
+	}
+	if len(matches) > 1 {
+		var paths []string
+		for _, m := range matches {
+			paths = append(paths, m.SchemaDir)
+		}
+		return nil, "", false, fmt.Errorf("ambiguous: database '%s' matches multiple configs at: %s",
+			databaseName, strings.Join(paths, ", "))
+	}
+
+	match := matches[0]
+	return match.Config, match.SchemaDir, true, nil
 }
 
 func sortedConfigs(configsByPath map[string]DiscoveredConfig) []DiscoveredConfig {

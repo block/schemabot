@@ -98,7 +98,11 @@ func computeAggregate(checks []*storage.Check) (conclusion, status string) {
 func aggregateSummary(checks []*storage.Check, conclusion string) (title, summary string) {
 	switch conclusion {
 	case checkConclusionSuccess:
-		title = "All applies complete"
+		if allChecksAreUpToDate(checks) {
+			title = "Schema up to date"
+		} else {
+			title = "All applies complete"
+		}
 		summary = buildAggregateTable(checks)
 	case checkConclusionFailure:
 		title = "Apply failed"
@@ -132,7 +136,7 @@ func buildAggregateTable(checks []*storage.Check) string {
 	sb.WriteString("|----------|-------------|--------|\n")
 
 	for i, c := range checks {
-		row := fmt.Sprintf("| `%s` | %s | %s |\n", c.DatabaseName, c.Environment, conclusionEmoji(c.Status, c.Conclusion))
+		row := fmt.Sprintf("| `%s` | %s | %s |\n", c.DatabaseName, c.Environment, checkStatusLabel(c))
 		if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
 			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(checks)-i)
 			break
@@ -141,6 +145,25 @@ func buildAggregateTable(checks []*storage.Check) string {
 	}
 
 	return sb.String()
+}
+
+func allChecksAreUpToDate(checks []*storage.Check) bool {
+	if len(checks) == 0 {
+		return false
+	}
+	for _, c := range checks {
+		if c.Status != checkStatusCompleted || c.Conclusion != checkConclusionSuccess || c.HasChanges {
+			return false
+		}
+	}
+	return true
+}
+
+func checkStatusLabel(c *storage.Check) string {
+	if c.Status == checkStatusCompleted && c.Conclusion == checkConclusionSuccess && !c.HasChanges {
+		return "Up to date"
+	}
+	return conclusionEmoji(c.Status, c.Conclusion)
 }
 
 // conclusionEmoji returns a short status label for a check.

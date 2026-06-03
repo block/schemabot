@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -871,6 +872,19 @@ func (ic *InstallationClient) FetchFileContent(ctx context.Context, repo, filePa
 	return content, nil
 }
 
+func (ic *InstallationClient) fetchDirectoryContents(ctx context.Context, repo, dirPath, ref string) ([]*gh.RepositoryContent, error) {
+	owner, repoName := splitRepo(repo)
+	opts := &gh.RepositoryContentGetOptions{Ref: ref}
+	fileContent, directoryContent, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, dirPath, opts)
+	if err != nil {
+		return nil, fmt.Errorf("fetch directory content at %s: %w", dirPath, classifyGitHubAPIError(err))
+	}
+	if fileContent != nil {
+		return nil, fmt.Errorf("expected directory at %s, found file", dirPath)
+	}
+	return directoryContent, nil
+}
+
 // GitHubFile represents a file fetched from GitHub API.
 type GitHubFile struct {
 	Name    string
@@ -884,7 +898,7 @@ type fileResult struct {
 	err  error
 }
 
-// FetchSchemaFilesOptimized fetches schema files using Tree API + parallel blob fetching.
+// FetchSchemaFilesOptimized fetches schema files by walking the configured schema directory.
 // Accepts both flat files (single namespace) and namespace subdirectories (multiple namespaces).
 //
 // Supported layouts (see docs/namespaces.md):
@@ -903,34 +917,23 @@ type fileResult struct {
 //	  schema/commerce/orders.sql
 //	  schema/customers/users.sql
 func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, repo string, headSHA, schemaPath, dbType string) ([]GitHubFile, error) {
-	entries, _, err := ic.FetchGitTree(ctx, repo, headSHA)
+	entries, err := ic.schemaDirectoryEntries(ctx, repo, headSHA, schemaPath)
 	if err != nil {
-		return nil, fmt.Errorf("fetch git tree: %w", err)
+		if IsNotFoundError(err) {
+			return ic.fetchSchemaFilesFromTree(ctx, repo, headSHA, schemaPath)
+		}
+		return nil, err
 	}
 
-	// Filter tree entries to find schema files under schemaPath
-	var filesToFetch []TreeEntry
-	schemaPathPrefix := schemaPath + "/"
-
+	var filesToFetch []*gh.RepositoryContent
 	for _, entry := range entries {
-		if entry.Type != "blob" {
+		if entry.GetType() != "file" {
 			continue
 		}
-		if !strings.HasPrefix(entry.Path, schemaPathPrefix) {
+		if !isManagedSchemaFile(entry.GetPath()) {
 			continue
 		}
-		if !strings.HasSuffix(entry.Path, ".sql") && !strings.HasSuffix(entry.Path, "vschema.json") {
-			continue
-		}
-
-		relativePath := strings.TrimPrefix(entry.Path, schemaPathPrefix)
-		hasNamespaceDir := strings.Contains(relativePath, "/")
-
-		// Accept both flat files (single namespace) and namespace subdirs (multiple namespaces).
-		// Only allow one level of nesting (schema/namespace/table.sql, not schema/a/b/table.sql).
-		if !hasNamespaceDir || strings.Count(relativePath, "/") == 1 {
-			filesToFetch = append(filesToFetch, entry)
-		}
+		filesToFetch = append(filesToFetch, entry)
 	}
 
 	if len(filesToFetch) == 0 {
@@ -942,6 +945,82 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, 10)
 
+	for _, entry := range filesToFetch {
+		wg.Go(func() {
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			content, err := ic.FetchFileContent(ctx, repo, entry.GetPath(), headSHA)
+			if err != nil {
+				results <- fileResult{err: fmt.Errorf("fetch %s: %w", entry.GetPath(), err)}
+				return
+			}
+			results <- fileResult{
+				file: GitHubFile{
+					Name:    path.Base(entry.GetPath()),
+					Content: content,
+					Path:    entry.GetPath(),
+				},
+			}
+		})
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var files []GitHubFile
+	var fetchErr error
+	for result := range results {
+		if result.err != nil {
+			fetchErr = result.err
+			continue
+		}
+		files = append(files, result.file)
+	}
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Path < files[j].Path
+	})
+	return files, nil
+}
+
+func (ic *InstallationClient) fetchSchemaFilesFromTree(ctx context.Context, repo string, headSHA, schemaPath string) ([]GitHubFile, error) {
+	entries, truncated, err := ic.FetchGitTree(ctx, repo, headSHA)
+	if err != nil {
+		return nil, fmt.Errorf("fetch git tree: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("fetch schema files from %s in repo %s ref %s: %w", schemaPath, repo, headSHA, ErrGitTreeTruncated)
+	}
+
+	var filesToFetch []TreeEntry
+	schemaPathPrefix := schemaPath + "/"
+	for _, entry := range entries {
+		if entry.Type != "blob" {
+			continue
+		}
+		if !strings.HasPrefix(entry.Path, schemaPathPrefix) {
+			continue
+		}
+		if !isManagedSchemaFile(entry.Path) {
+			continue
+		}
+
+		relativePath := strings.TrimPrefix(entry.Path, schemaPathPrefix)
+		hasNamespaceDir := strings.Contains(relativePath, "/")
+		if !hasNamespaceDir || strings.Count(relativePath, "/") == 1 {
+			filesToFetch = append(filesToFetch, entry)
+		}
+	}
+
+	results := make(chan fileResult, len(filesToFetch))
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 10)
 	for _, entry := range filesToFetch {
 		wg.Go(func() {
 			semaphore <- struct{}{}
@@ -980,5 +1059,38 @@ func (ic *InstallationClient) FetchSchemaFilesOptimized(ctx context.Context, rep
 		return nil, fetchErr
 	}
 
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Path < files[j].Path
+	})
 	return files, nil
+}
+
+func (ic *InstallationClient) schemaDirectoryEntries(ctx context.Context, repo, ref, schemaPath string) ([]*gh.RepositoryContent, error) {
+	rootEntries, err := ic.fetchDirectoryContents(ctx, repo, schemaPath, ref)
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make([]*gh.RepositoryContent, 0, len(rootEntries))
+	entries = append(entries, rootEntries...)
+	for _, entry := range rootEntries {
+		if entry.GetType() != "dir" {
+			continue
+		}
+
+		subEntries, err := ic.fetchDirectoryContents(ctx, repo, entry.GetPath(), ref)
+		if err != nil {
+			return nil, fmt.Errorf("fetch schema namespace directory %s: %w", entry.GetPath(), err)
+		}
+		entries = append(entries, subEntries...)
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].GetPath() < entries[j].GetPath()
+	})
+	return entries, nil
+}
+
+func isManagedSchemaFile(filePath string) bool {
+	return strings.HasSuffix(filePath, ".sql") || path.Base(filePath) == "vschema.json"
 }
