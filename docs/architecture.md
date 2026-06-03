@@ -1,5 +1,29 @@
 # Architecture
 
+<!-- BEGIN TOC (auto-generated) -->
+
+## Table of Contents
+
+- [Declarative Schema](#declarative-schema)
+- [Layers](#layers)
+- [User Layer (CLI / PR Comments / API)](#user-layer-cli-pr-comments-api)
+  - [Apply Options](#apply-options)
+  - [Unsafe Changes](#unsafe-changes)
+  - [Control Operations](#control-operations)
+- [Tern Layer (Orchestrator)](#tern-layer-orchestrator)
+  - [Plan](#plan)
+  - [Apply](#apply)
+  - [Apply vs Task](#apply-vs-task)
+  - [Progress Flow And Observers](#progress-flow-and-observers)
+  - [Scheduler](#scheduler)
+  - [Execution Modes](#execution-modes)
+  - [Integration Modes](#integration-modes)
+- [Engine Layer (Executor)](#engine-layer-executor)
+  - [Engine Differences](#engine-differences)
+- [State Machine](#state-machine)
+
+<!-- END TOC (auto-generated) -->
+
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
 │                             SchemaBot                                 │

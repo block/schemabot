@@ -1,5 +1,30 @@
 # Configuration
 
+<!-- BEGIN TOC (auto-generated) -->
+
+## Table of Contents
+
+- [Local Mode](#local-mode)
+  - [Building DSNs from separate secrets](#building-dsns-from-separate-secrets)
+- [gRPC Mode](#grpc-mode)
+- [Multi-Deployment Environment (preview)](#multi-deployment-environment-preview)
+- [Environment Order](#environment-order)
+- [Hybrid Mode](#hybrid-mode)
+- [Scheduler Workers](#scheduler-workers)
+- [Repository Allowlist](#repository-allowlist)
+- [PR Checks Gate](#pr-checks-gate)
+- [Review Gate](#review-gate)
+- [Multi-Environment Deployment](#multi-environment-deployment)
+  - [Staging Instance](#staging-instance)
+  - [Production Instance](#production-instance)
+  - [Environment-local gRPC targets](#environment-local-grpc-targets)
+  - [How it works](#how-it-works)
+  - [Auto-plan behavior](#auto-plan-behavior)
+- [Multi-App Routing (PREVIEW — config rejected at load)](#multi-app-routing-preview-config-rejected-at-load)
+- [Secret Resolution](#secret-resolution)
+
+<!-- END TOC (auto-generated) -->
+
 SchemaBot loads config from the `SCHEMABOT_CONFIG_FILE` environment variable.
 
 ## Local Mode

@@ -1,5 +1,27 @@
 # gRPC Control Edge Cases
 
+<!-- BEGIN TOC (auto-generated) -->
+
+## Table of Contents
+
+- [Remote apply ID invariant](#remote-apply-id-invariant)
+- [Control request path](#control-request-path)
+- [Progress polling path](#progress-polling-path)
+- [Current gRPC stop/start scenarios](#current-grpc-stopstart-scenarios)
+  - [Start RPC succeeds](#start-rpc-succeeds)
+  - [Start RPC fails or times out](#start-rpc-fails-or-times-out)
+  - [Start RPC succeeds, but remote progress remains stopped](#start-rpc-succeeds-but-remote-progress-remains-stopped)
+- [Current gRPC cutover scenarios](#current-grpc-cutover-scenarios)
+  - [Cutover request accepted and remote Cutover succeeds](#cutover-request-accepted-and-remote-cutover-succeeds)
+  - [Apply was not started with deferred cutover](#apply-was-not-started-with-deferred-cutover)
+  - [Cutover readiness is visible remotely before stored state catches up](#cutover-readiness-is-visible-remotely-before-stored-state-catches-up)
+  - [Cutover RPC fails or times out](#cutover-rpc-fails-or-times-out)
+  - [Stored cutover is already in progress](#stored-cutover-is-already-in-progress)
+- [Edge-case checklist](#edge-case-checklist)
+- [Review questions for new gRPC control changes](#review-questions-for-new-grpc-control-changes)
+
+<!-- END TOC (auto-generated) -->
+
 This document tracks gRPC Tern control-operation edge cases so reliability work
 can stay explicit as `stop`, `start`, and `cutover` evolve across CLI and PR
 comment workflows.

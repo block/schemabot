@@ -1,5 +1,23 @@
 # Schema Namespaces
 
+<!-- BEGIN TOC (auto-generated) -->
+
+## Table of Contents
+
+- [Schema Directory Structure](#schema-directory-structure)
+  - [MySQL — Single schema name](#mysql-single-schema-name)
+  - [MySQL — Multiple schema names on the same database](#mysql-multiple-schema-names-on-the-same-database)
+  - [MySQL — Different databases entirely](#mysql-different-databases-entirely)
+  - [Vitess — Multiple keyspaces](#vitess-multiple-keyspaces)
+  - [Vitess — VSchema changes](#vitess-vschema-changes)
+- [`$ENV` Substitution in Namespace Names](#env-substitution-in-namespace-names)
+  - [Example](#example)
+  - [Rules](#rules)
+- [Summary](#summary)
+- [How Namespaces Flow Through the System](#how-namespaces-flow-through-the-system)
+
+<!-- END TOC (auto-generated) -->
+
 SchemaBot uses **namespaces** to organize declarative schema files. A namespace maps to the database-specific grouping concept:
 
 | Database | Namespace maps to | How to list |

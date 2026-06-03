@@ -1,5 +1,50 @@
 # Check Runs
 
+<!-- BEGIN TOC (auto-generated) -->
+
+## Table of Contents
+
+- [GitHub Check Concepts](#github-check-concepts)
+- [Safety Philosophy](#safety-philosophy)
+- [Published Checks](#published-checks)
+- [Managed Schema Configs](#managed-schema-configs)
+- [Internal Records](#internal-records)
+- [Lifecycle](#lifecycle)
+  - [Pull Request Events](#pull-request-events)
+  - [Auto-Plan](#auto-plan)
+  - [Apply](#apply)
+  - [Rollback](#rollback)
+  - [Unlock And Close](#unlock-and-close)
+- [Check States](#check-states)
+- [Blocking Reasons](#blocking-reasons)
+- [Operator Guidance](#operator-guidance)
+- [SHA Handling](#sha-handling)
+- [Edge Cases](#edge-cases)
+  - [PR opened](#pr-opened)
+  - [PR touches no managed schema files](#pr-touches-no-managed-schema-files)
+  - [Config discovery fails](#config-discovery-fails)
+  - [GitHub unavailable](#github-unavailable)
+  - [New commit pushed](#new-commit-pushed)
+  - [New commit pushed while an apply is in progress](#new-commit-pushed-while-an-apply-is-in-progress)
+  - [PR closed](#pr-closed)
+  - [PR reopened](#pr-reopened)
+  - [Manual plan](#manual-plan)
+  - [Apply requested](#apply-requested)
+  - [Apply confirmed](#apply-confirmed)
+  - [Auto-confirm apply](#auto-confirm-apply)
+  - [Rollback requested](#rollback-requested)
+  - [Rollback confirmed](#rollback-confirmed)
+  - [Unlock](#unlock)
+  - [Schema changes but no configured environments are allowed](#schema-changes-but-no-configured-environments-are-allowed)
+  - [Stale in-progress check](#stale-in-progress-check)
+- [Stale Check Reconciliation](#stale-check-reconciliation)
+- [Race Safety](#race-safety)
+- [Environment Ordering](#environment-ordering)
+- [Breakglass Operations](#breakglass-operations)
+- [Branch Protection Setup](#branch-protection-setup)
+
+<!-- END TOC (auto-generated) -->
+
 SchemaBot uses GitHub Check Runs as the PR safety gate for schema changes. A
 required SchemaBot check blocks merge until every schema change represented by
 the PR has either been applied successfully or resolved by a new plan.

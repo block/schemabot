@@ -1,5 +1,29 @@
 # Spirit Progress Architecture
 
+<!-- BEGIN TOC (auto-generated) -->
+
+## Table of Contents
+
+- [Data flow overview](#data-flow-overview)
+- [What Spirit exposes](#what-spirit-exposes)
+- [Engine layer](#engine-layer)
+- [Tern layer — live vs stored](#tern-layer-live-vs-stored)
+- [What gets persisted in storage](#what-gets-persisted-in-storage)
+- [Polling modes (atomic vs sequential)](#polling-modes-atomic-vs-sequential)
+  - [Atomic mode (`--defer-cutover`)](#atomic-mode---defer-cutover)
+  - [Sequential mode (default)](#sequential-mode-default)
+- [API and CLI layers](#api-and-cli-layers)
+  - [API (`pkg/api/progress_handlers.go`)](#api-pkgapiprogresshandlersgo)
+  - [CLI/TUI (`pkg/cmd/commands/watch_tui.go`)](#clitui-pkgcmdcommandswatchtuigo)
+- [TUI rendering reference](#tui-rendering-reference)
+  - [Progress bar colors](#progress-bar-colors)
+  - [Per-table display by state](#per-table-display-by-state)
+  - [Status line (above tables)](#status-line-above-tables)
+  - [Footer](#footer)
+- [Key behaviors](#key-behaviors)
+
+<!-- END TOC (auto-generated) -->
+
 How progress data flows from Spirit through SchemaBot to the CLI/TUI
 (Terminal User Interface — the interactive Bubbletea-based progress view).
 
