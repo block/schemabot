@@ -341,58 +341,58 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 }
 
 // buildMultiAppWebhookRuntime constructs a webhook handler that dispatches
-// inbound deliveries across multiple GitHub Apps. Each App's credentials
-// are resolved once at startup, an App ID → App name dispatch table is
-// built for HMAC routing, and a ClientSet is assembled for outbound
-// per-repo client resolution. Any resolution error or duplicate App ID
+// inbound deliveries across multiple GitHub Apps. App-ID resolution and
+// duplicate detection are delegated to ServerConfig.ResolveGitHubAppsByID
+// so app-id validation has a single source of truth; this function then
+// resolves the remaining per-App credentials (private key, webhook secret)
+// and assembles the dispatch tables and ClientSet. Any resolution error
 // fails startup so a misconfigured multi-App deployment never serves the
 // webhook endpoint.
 func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {
-	clients := make(map[string]ghclient.GitHubClientFactory, len(serverConfig.Apps))
-	secretsByApp := make(map[string][]byte, len(serverConfig.Apps))
-	appByID := make(map[int64]string, len(serverConfig.Apps))
-
-	// Iterate App names in sorted order so log output and any error
-	// message that names a "first" duplicate is deterministic across
-	// restarts.
-	names := make([]string, 0, len(serverConfig.Apps))
-	for name := range serverConfig.Apps {
-		names = append(names, name)
+	appsByID, err := serverConfig.ResolveGitHubAppsByID()
+	if err != nil {
+		return webhookRuntime{}, fmt.Errorf("resolve GitHub Apps: %w", err)
 	}
-	sort.Strings(names)
 
-	for _, name := range names {
-		app := serverConfig.Apps[name]
+	clients := make(map[string]ghclient.GitHubClientFactory, len(appsByID))
+	secretsByApp := make(map[string][]byte, len(appsByID))
+	appByID := make(map[int64]string, len(appsByID))
 
-		appID := app.ResolveAppID()
-		if appID == 0 {
-			return webhookRuntime{}, fmt.Errorf("app %q has empty or invalid app-id", name)
-		}
-		if existing, ok := appByID[appID]; ok {
-			return webhookRuntime{}, fmt.Errorf("apps %q and %q resolve to the same app-id %d", existing, name, appID)
-		}
+	// Iterate App names in sorted order so startup log output is
+	// deterministic across restarts.
+	type appEntry struct {
+		id   int64
+		name string
+		cfg  api.GitHubAppConfig
+	}
+	entries := make([]appEntry, 0, len(appsByID))
+	for id, app := range appsByID {
+		entries = append(entries, appEntry{id: id, name: app.Name, cfg: app.Config})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 
-		privateKey, err := app.ResolvePrivateKey()
+	for _, e := range entries {
+		privateKey, err := e.cfg.ResolvePrivateKey()
 		if err != nil {
-			return webhookRuntime{}, fmt.Errorf("resolve private key for app %q: %w", name, err)
+			return webhookRuntime{}, fmt.Errorf("resolve private key for app %q: %w", e.name, err)
 		}
 		if privateKey == "" {
-			return webhookRuntime{}, fmt.Errorf("app %q private key resolved to empty value", name)
+			return webhookRuntime{}, fmt.Errorf("app %q private key resolved to empty value", e.name)
 		}
 
-		secret, err := app.ResolveWebhookSecret()
+		secret, err := e.cfg.ResolveWebhookSecret()
 		if err != nil {
-			return webhookRuntime{}, fmt.Errorf("resolve webhook secret for app %q: %w", name, err)
+			return webhookRuntime{}, fmt.Errorf("resolve webhook secret for app %q: %w", e.name, err)
 		}
 		if secret == "" {
-			return webhookRuntime{}, fmt.Errorf("app %q webhook secret resolved to empty value", name)
+			return webhookRuntime{}, fmt.Errorf("app %q webhook secret resolved to empty value", e.name)
 		}
 
-		clients[name] = ghclient.NewClient(appID, []byte(privateKey), logger)
-		secretsByApp[name] = []byte(secret)
-		appByID[appID] = name
+		clients[e.name] = ghclient.NewClient(e.id, []byte(privateKey), logger)
+		secretsByApp[e.name] = []byte(secret)
+		appByID[e.id] = e.name
 
-		logger.Info("registered GitHub App", "app_name", name, "app_id", appID)
+		logger.Info("registered GitHub App", "app_name", e.name, "app_id", e.id)
 	}
 
 	handler := webhook.NewHandlerWithDispatch(
