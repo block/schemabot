@@ -433,9 +433,8 @@ func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *s
 	}
 }
 
-func shouldRecoverMySQLDeferredCutover(databaseType string, apply *storage.Apply) bool {
-	return databaseType == storage.DatabaseTypeMySQL &&
-		apply != nil &&
+func shouldInspectDeferredCutoverSignal(apply *storage.Apply) bool {
+	return apply != nil &&
 		apply.GetOptions().DeferCutover &&
 		state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.RecoveringCutover)
 }
@@ -666,8 +665,8 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Recovering apply (heartbeat expired, was in %s state)", apply.State), "", "")
 
-	if shouldRecoverMySQLDeferredCutover(c.config.Type, apply) {
-		signalExists, err := c.deferredCutoverSignalExists(ctx, apply)
+	if shouldInspectDeferredCutoverSignal(apply) {
+		signalExists, signalSupported, err := c.deferredCutoverSignalExists(ctx, apply)
 		if err != nil {
 			c.logger.Warn("deferred cutover recovery could not verify engine cutover signal; scheduler will retry",
 				"apply_id", apply.ApplyIdentifier,
@@ -676,24 +675,32 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 				"error", err)
 			return fmt.Errorf("verify engine cutover signal before recovering deferred cutover apply %s: %w", apply.ApplyIdentifier, err)
 		}
-		if signalExists {
-			if err := c.markApplyRecoveringCutover(ctx, apply, tasks); err != nil {
-				return err
+		if signalSupported {
+			if signalExists {
+				if err := c.markApplyRecoveringCutover(ctx, apply, tasks); err != nil {
+					return err
+				}
+				options := buildApplyOptions(apply)
+				resumeCtx, cancelResume := context.WithCancel(ctx)
+				cancelGeneration := c.setApplyCancel(cancelResume)
+				defer c.clearApplyCancel(cancelGeneration)
+				defer cancelResume()
+				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering deferred cutover from checkpoint", true, false); err != nil {
+					return fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err)
+				}
+				return ctx.Err()
 			}
-			options := buildApplyOptions(apply)
-			resumeCtx, cancelResume := context.WithCancel(ctx)
-			cancelGeneration := c.setApplyCancel(cancelResume)
-			defer c.clearApplyCancel(cancelGeneration)
-			defer cancelResume()
-			if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering deferred cutover from checkpoint", true, false); err != nil {
-				return fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err)
-			}
-			return ctx.Err()
+			c.logger.Info("engine cutover signal is absent during deferred cutover recovery; re-plan will reconcile completed work",
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"database_type", apply.DatabaseType)
+		} else {
+			c.logger.Info("engine does not support deferred cutover signal lookup; re-plan will reconcile deferred cutover recovery",
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"database_type", apply.DatabaseType,
+				"engine", c.getEngine().Name())
 		}
-		c.logger.Info("engine cutover signal is absent during deferred cutover recovery; re-plan will reconcile completed work",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"database_type", apply.DatabaseType)
 	}
 
 	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)

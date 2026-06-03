@@ -361,6 +361,14 @@ func (e *stagedGroupedResumeEngine) Drain() {
 	e.drainCount++
 }
 
+func (e *stagedGroupedResumeEngine) DeferredCutoverSignalExists(ctx context.Context, req *engine.DeferredCutoverSignalRequest) (bool, error) {
+	checker, ok := e.Engine.(engine.DeferredCutoverSignalChecker)
+	if !ok {
+		return false, fmt.Errorf("wrapped engine %T does not support deferred cutover signal lookup", e.Engine)
+	}
+	return checker.DeferredCutoverSignalExists(ctx, req)
+}
+
 func TestLocalClient_NewLocalClient(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -1054,6 +1062,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverEntersRecoveringState(t *testing.
 	task.ID = taskID
 
 	recoveryEngine := &stagedGroupedResumeEngine{
+		Engine: client.spiritEngine,
 		planResults: []*engine.PlanResult{{
 			Changes: []engine.SchemaChange{{
 				Namespace:    "testdb",
@@ -1219,7 +1228,10 @@ func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelReconcilesCompleted
 	require.NoError(t, err)
 	task.ID = taskID
 
-	recoveryEngine := &stagedGroupedResumeEngine{planResults: []*engine.PlanResult{{}}}
+	recoveryEngine := &stagedGroupedResumeEngine{
+		Engine:      client.spiritEngine,
+		planResults: []*engine.PlanResult{{}},
+	}
 	client.spiritEngine = recoveryEngine
 
 	require.NoError(t, client.ResumeApply(ctx, apply))

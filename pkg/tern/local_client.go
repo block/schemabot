@@ -238,23 +238,23 @@ func (c *LocalClient) credentials() *engine.Credentials {
 	}
 }
 
-func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *storage.Apply) (bool, error) {
+func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *storage.Apply) (bool, bool, error) {
 	if apply == nil {
-		return false, fmt.Errorf("apply is required for deferred cutover signal lookup")
+		return false, false, fmt.Errorf("apply is required for deferred cutover signal lookup")
 	}
 	eng := c.getEngine()
 	checker, ok := eng.(engine.DeferredCutoverSignalChecker)
 	if !ok {
-		return false, fmt.Errorf("engine %T does not support deferred cutover signal lookup for apply %s", eng, apply.ApplyIdentifier)
+		return false, false, nil
 	}
 	exists, err := checker.DeferredCutoverSignalExists(ctx, &engine.DeferredCutoverSignalRequest{
 		Database:    apply.Database,
 		Credentials: c.credentials(),
 	})
 	if err != nil {
-		return false, fmt.Errorf("check deferred cutover signal for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
+		return false, true, fmt.Errorf("check deferred cutover signal for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
 	}
-	return exists, nil
+	return exists, true, nil
 }
 
 // Health checks the service health.
