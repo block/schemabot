@@ -278,7 +278,7 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 		Remaining:  99,
 		Used:       1,
 	})
-	metrics.RecordWebhookEvent(t.Context(), "issue_comment", "created", "org/repo", "processed")
+	metrics.RecordWebhookEvent(t.Context(), "default", "issue_comment", "created", "org/repo", "processed")
 	metrics.RecordStatusCheckOperation(t.Context(), metrics.StatusCheckOperation{
 		Operation:  "aggregate_check_sync",
 		Repository: "org/repo",
@@ -618,10 +618,10 @@ func TestRecordWebhookEventMetric(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordWebhookEvent(t.Context(), "issue_comment", "created", "org/repo", "processed")
-	metrics.RecordWebhookEvent(t.Context(), "pull_request", "opened", "org/repo", "processed")
-	metrics.RecordWebhookEvent(t.Context(), "pull_request", "closed", "org/repo", "processed")
-	metrics.RecordWebhookEvent(t.Context(), "ping", "", "", "ignored")
+	metrics.RecordWebhookEvent(t.Context(), "default", "issue_comment", "created", "org/repo", "processed")
+	metrics.RecordWebhookEvent(t.Context(), "default", "pull_request", "opened", "org/repo", "processed")
+	metrics.RecordWebhookEvent(t.Context(), "default", "pull_request", "closed", "org/repo", "processed")
+	metrics.RecordWebhookEvent(t.Context(), "default", "ping", "", "", "ignored")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))

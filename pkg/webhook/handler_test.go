@@ -25,9 +25,8 @@ func testLogger() *slog.Logger {
 	return slog.Default()
 }
 
-func TestVerifySignature(t *testing.T) {
+func TestVerifyHMAC(t *testing.T) {
 	secret := []byte("test-secret")
-	h := &Handler{webhookSecret: secret}
 
 	body := []byte(`{"test": "payload"}`)
 
@@ -37,28 +36,31 @@ func TestVerifySignature(t *testing.T) {
 	validSig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 
 	t.Run("valid signature", func(t *testing.T) {
-		assert.True(t, h.verifySignature(validSig, body))
+		assert.True(t, verifyHMAC(validSig, body, secret))
 	})
 
 	t.Run("invalid signature", func(t *testing.T) {
-		assert.False(t, h.verifySignature("sha256=deadbeef", body))
+		assert.False(t, verifyHMAC("sha256=deadbeef", body, secret))
 	})
 
 	t.Run("empty signature", func(t *testing.T) {
-		assert.False(t, h.verifySignature("", body))
+		assert.False(t, verifyHMAC("", body, secret))
 	})
 
 	t.Run("wrong prefix", func(t *testing.T) {
-		assert.False(t, h.verifySignature("sha1=abc", body))
+		assert.False(t, verifyHMAC("sha1=abc", body, secret))
 	})
 
 	t.Run("invalid hex", func(t *testing.T) {
-		assert.False(t, h.verifySignature("sha256=not-hex!", body))
+		assert.False(t, verifyHMAC("sha256=not-hex!", body, secret))
 	})
 }
 
 func TestWebhookRejectsInvalidSignature(t *testing.T) {
-	h := &Handler{webhookSecret: []byte("secret"), logger: testLogger()}
+	h := &Handler{
+		webhookSecretsByApp: map[string][]byte{defaultAppName: []byte("secret")},
+		logger:              testLogger(),
+	}
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(`{}`))
 	req.Header.Set("X-Hub-Signature-256", "sha256=invalid")
@@ -415,7 +417,7 @@ func TestWebhookPhase2CommandNotYetAvailable(t *testing.T) {
 func TestWebhookSignatureValidation(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 	secret := []byte("webhook-secret")
-	h.webhookSecret = secret
+	h.webhookSecretsByApp = map[string][]byte{defaultAppName: secret}
 
 	t.Run("valid signature accepted", func(t *testing.T) {
 		req := buildWebhookRequest(t, webhookPayloadOpts{

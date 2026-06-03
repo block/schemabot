@@ -630,12 +630,7 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 				return fmt.Errorf("repository %q references unknown github_app %q", repo, repoConfig.GitHubApp)
 			}
 		}
-		// The webhook runtime is not yet wired to consult apps: — it only
-		// installs a webhook handler when the legacy github: block is set,
-		// otherwise it returns 503. Accepting apps: here would start a
-		// server with a silently-disabled webhook endpoint. Fail closed at
-		// config load until the runtime is wired to use Apps.
-		return fmt.Errorf("apps: is configured but the webhook runtime does not yet route to it; remove apps: and use the legacy github: block until multi-app webhook support lands")
+		return nil
 	}
 
 	// Apps not configured — github_app on a repo would be silently ignored,
@@ -840,6 +835,44 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 		return ResolvedGitHubApp{}, fmt.Errorf("no GitHub App is configured")
 	}
 	return ResolvedGitHubApp{Name: "default", Config: c.GitHub}, nil
+}
+
+// ResolveGitHubAppsByID resolves every configured App's app-id and returns
+// a map keyed by the resolved int64 ID. Used at startup by the webhook
+// runtime to build the inbound-dispatch table that maps the App ID carried
+// in the X-GitHub-Hook-Installation-Target-ID header to the configured App
+// name.
+//
+// Returns an error if any App has an empty or unparseable app-id, or if two
+// configured Apps resolve to the same ID — both are ambiguous misconfigurations
+// that would make header-keyed dispatch undefined.
+//
+// Legacy single-App configs (ServerConfig.GitHub set, ServerConfig.Apps empty)
+// are also resolved so callers can use a single uniform path; the resulting
+// map will contain a single entry under name "default".
+func (c *ServerConfig) ResolveGitHubAppsByID() (map[int64]ResolvedGitHubApp, error) {
+	if c == nil {
+		return nil, fmt.Errorf("server config is nil")
+	}
+	apps := c.Apps
+	if len(apps) == 0 {
+		if !c.GitHub.Configured() {
+			return nil, fmt.Errorf("no GitHub App is configured")
+		}
+		apps = map[string]GitHubAppConfig{"default": c.GitHub}
+	}
+	out := make(map[int64]ResolvedGitHubApp, len(apps))
+	for name, app := range apps {
+		id := app.ResolveAppID()
+		if id == 0 {
+			return nil, fmt.Errorf("app %q has empty or unparseable app-id", name)
+		}
+		if existing, ok := out[id]; ok {
+			return nil, fmt.Errorf("apps %q and %q resolve to the same app-id %d", existing.Name, name, id)
+		}
+		out[id] = ResolvedGitHubApp{Name: name, Config: app}
+	}
+	return out, nil
 }
 
 // IsEnvironmentAllowed returns whether the given environment is handled by this

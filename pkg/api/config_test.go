@@ -1911,12 +1911,7 @@ func TestServerConfig_AppsValidation(t *testing.T) {
 			repos:  map[string]RepoConfig{"org/repo": {}},
 		},
 		{
-			// apps: is the new config shape but the webhook runtime is not
-			// yet wired to consult it (buildWebhookRuntime only checks the
-			// legacy github: block). Accepting apps: here would start a
-			// server with a silently-disabled webhook endpoint, so the
-			// validator fails closed until the runtime is wired.
-			name: "well-formed multi-app config is rejected until runtime is wired",
+			name: "well-formed multi-app config is accepted",
 			apps: map[string]GitHubAppConfig{
 				"app-a": validApp,
 				"app-b": validApp,
@@ -1925,16 +1920,11 @@ func TestServerConfig_AppsValidation(t *testing.T) {
 				"org-a/repo-x": {GitHubApp: "app-a"},
 				"org-b/repo-y": {GitHubApp: "app-b"},
 			},
-			wantErrSub: "apps: is configured but the webhook runtime does not yet route to it",
 		},
 		{
-			// Same fail-closed rule applies even to a single-entry apps: map.
-			// It would otherwise be behaviourally equivalent to the legacy
-			// github: block, but the runtime can't dispatch to it yet.
-			name:       "single-entry apps: is rejected until runtime is wired",
-			apps:       map[string]GitHubAppConfig{"only": validApp},
-			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "only"}},
-			wantErrSub: "apps: is configured but the webhook runtime does not yet route to it",
+			name:  "single-entry apps: is accepted",
+			apps:  map[string]GitHubAppConfig{"only": validApp},
+			repos: map[string]RepoConfig{"org/repo": {GitHubApp: "only"}},
 		},
 		{
 			name:       "github: and apps: together is rejected",
@@ -2144,11 +2134,68 @@ func TestServerConfig_GitHubCheckNameBaseForRepo(t *testing.T) {
 	})
 }
 
+func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
+	t.Run("multi-app config resolves each entry's app-id", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "1001", PrivateKey: "x", WebhookSecret: "y"},
+				"app-b": {AppID: "1002", PrivateKey: "x", WebhookSecret: "y"},
+			},
+		}
+		got, err := cfg.ResolveGitHubAppsByID()
+		require.NoError(t, err)
+		assert.Len(t, got, 2)
+		assert.Equal(t, "app-a", got[1001].Name)
+		assert.Equal(t, "app-b", got[1002].Name)
+	})
+
+	t.Run("legacy single-app config resolves under default name", func(t *testing.T) {
+		// Configured() requires the private key to resolve non-empty, so
+		// inline the key material via env: so the test is hermetic.
+		t.Setenv("RESOLVE_BY_ID_LEGACY_PK", "private-key-bytes")
+		cfg := &ServerConfig{
+			GitHub: GitHubConfig{AppID: "42", PrivateKey: "env:RESOLVE_BY_ID_LEGACY_PK", WebhookSecret: "y"},
+		}
+		got, err := cfg.ResolveGitHubAppsByID()
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "default", got[42].Name)
+	})
+
+	t.Run("duplicate app-id across two Apps fails closed", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "1001", PrivateKey: "x", WebhookSecret: "y"},
+				"app-b": {AppID: "1001", PrivateKey: "x", WebhookSecret: "y"},
+			},
+		}
+		_, err := cfg.ResolveGitHubAppsByID()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "resolve to the same app-id 1001")
+	})
+
+	t.Run("empty app-id fails closed", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "", PrivateKey: "x", WebhookSecret: "y"},
+			},
+		}
+		_, err := cfg.ResolveGitHubAppsByID()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "empty or unparseable app-id")
+	})
+
+	t.Run("nil receiver errors", func(t *testing.T) {
+		var cfg *ServerConfig
+		_, err := cfg.ResolveGitHubAppsByID()
+		require.Error(t, err)
+	})
+}
+
 // TestLoadServerConfigFromFile_MultiApp end-to-end-parses the new YAML shape
 // to confirm the apps: map and per-repo github_app: field round-trip through
-// the YAML decoder (including KnownFields(true)), then asserts that
-// LoadServerConfigFromFile still fails closed on multi-app configs because
-// the webhook runtime is not yet wired to dispatch to them.
+// the YAML decoder (including KnownFields(true)) and that LoadServerConfigFromFile
+// accepts a well-formed multi-App configuration.
 func TestLoadServerConfigFromFile_MultiApp(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
@@ -2195,9 +2242,11 @@ repos:
 	assert.Equal(t, "app-a", parsed.Repos["org-a/repo-x"].GitHubApp)
 	assert.Equal(t, "app-b", parsed.Repos["org-b/repo-y"].GitHubApp)
 
-	// Full load goes through Validate() which fails closed on multi-app
-	// configs until the webhook runtime is wired to dispatch to them.
-	_, err = LoadServerConfigFromFile(configPath)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "apps: is configured but the webhook runtime does not yet route to it")
+	// Full load goes through Validate() and must accept the multi-App shape.
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	require.Contains(t, cfg.Apps, "app-a")
+	require.Contains(t, cfg.Apps, "app-b")
+	assert.Equal(t, "app-a", cfg.Repos["org-a/repo-x"].GitHubApp)
+	assert.Equal(t, "app-b", cfg.Repos["org-b/repo-y"].GitHubApp)
 }

@@ -911,12 +911,19 @@ func isKnownGitHubRateLimitResource(resource string) bool {
 // RecordWebhookEvent increments the webhook events counter.
 // Unknown event types and actions are normalized to "unknown" to prevent unbounded cardinality.
 // Repo is not allowlisted since it's bounded by the repos configured in SchemaBot.
-func RecordWebhookEvent(ctx context.Context, eventType, action, repo, status string) {
+// appName is the resolved GitHub App name (bounded by config), or "unknown" if
+// the request could not be attributed to a configured App (e.g. unknown App ID
+// header). Pass "" in legacy single-App mode and the metric will record
+// "default".
+func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, status string) {
 	if !knownWebhookEvents[eventType] {
 		eventType = "unknown"
 	}
 	if !knownWebhookActions[action] {
 		action = "unknown"
+	}
+	if appName == "" {
+		appName = "default"
 	}
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64Counter("schemabot.webhook.events_total",
@@ -929,6 +936,7 @@ func RecordWebhookEvent(ctx context.Context, eventType, action, repo, status str
 	}
 	attrs := []attribute.KeyValue{
 		EnvironmentAttribute(""),
+		attribute.String("app_name", appName),
 		attribute.String("event_type", eventType),
 		attribute.String("status", status),
 	}

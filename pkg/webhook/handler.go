@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,16 +32,41 @@ import (
 
 // defaultAppName is the synthetic App name used when SchemaBot runs against
 // the legacy single-App ServerConfig.GitHub field. It matches the name
-// returned by ServerConfig.ResolveGitHubAppForRepo for legacy configs, so
-// the per-repo client resolution path works uniformly across single-App and
+// ServerConfig.ResolveGitHubAppForRepo returns for legacy configs, so the
+// per-repo client resolution path works uniformly across single-App and
 // multi-App deployments.
 const defaultAppName = "default"
 
+// Webhook headers GitHub sends on every App-originated delivery. Used by
+// multi-App dispatch to identify which configured App signed the request
+// before HMAC verification.
+const (
+	headerHookTargetID   = "X-GitHub-Hook-Installation-Target-ID"
+	headerHookTargetType = "X-GitHub-Hook-Installation-Target-Type"
+	headerDeliveryID     = "X-GitHub-Delivery"
+	headerSignature256   = "X-Hub-Signature-256"
+	hookTargetTypeApp    = "integration"
+)
+
 // Handler processes GitHub webhook events.
 type Handler struct {
-	service                    *api.Service
-	ghClients                  github.ClientSet
-	webhookSecret              []byte
+	service   *api.Service
+	ghClients github.ClientSet
+
+	// webhookSecretsByApp maps each configured App's logical name to its
+	// HMAC webhook secret. In legacy single-App mode there is exactly one
+	// entry under defaultAppName. In multi-App mode there is one entry per
+	// configured App.
+	webhookSecretsByApp map[string][]byte
+
+	// webhookAppByID maps the App ID GitHub sends in the
+	// X-GitHub-Hook-Installation-Target-ID header to the configured App's
+	// logical name. Non-nil enables multi-App dispatch: the handler
+	// requires the header, looks up the App by ID, and verifies HMAC
+	// against that App's secret only. Nil/empty preserves legacy
+	// single-secret behavior.
+	webhookAppByID map[int64]string
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -48,20 +75,38 @@ type Handler struct {
 // NewHandler creates a new webhook handler for the legacy single-App
 // configuration. The provided factory is registered in the internal
 // ClientSet under the "default" App name so per-repo client resolution
-// works uniformly with the multi-App path that lands in a follow-up PR.
+// works uniformly with the multi-App path used by NewHandlerWithDispatch.
 func NewHandler(service *api.Service, ghClient github.GitHubClientFactory, webhookSecret []byte, logger *slog.Logger) *Handler {
 	return NewHandlerWithClientSet(service, github.NewSingleClientSet(defaultAppName, ghClient), webhookSecret, logger)
 }
 
 // NewHandlerWithClientSet creates a new webhook handler from an
-// already-built ClientSet. Production wiring (serve.go) will switch to this
-// constructor when the multi-App config shape is wired in a follow-up PR;
-// tests continue to use NewHandler with a single factory.
+// already-built single-App ClientSet. The provided webhook secret is
+// associated with the defaultAppName entry and verified directly on every
+// request (legacy single-secret mode).
 func NewHandlerWithClientSet(service *api.Service, ghClients github.ClientSet, webhookSecret []byte, logger *slog.Logger) *Handler {
+	secrets := map[string][]byte{}
+	if len(webhookSecret) > 0 {
+		secrets[defaultAppName] = webhookSecret
+	}
+	return NewHandlerWithDispatch(service, ghClients, secrets, nil, logger)
+}
+
+// NewHandlerWithDispatch creates a new webhook handler with header-keyed
+// multi-App dispatch. webhookSecretsByApp must contain an entry per
+// configured App keyed by logical name; webhookAppByID maps the App ID
+// carried in the X-GitHub-Hook-Installation-Target-ID header to that name.
+//
+// Pass a non-empty webhookAppByID to enable multi-App dispatch: the
+// handler will require the header, reject unknown App IDs, and HMAC-verify
+// against the resolved App's secret only. Pass an empty/nil webhookAppByID
+// for legacy single-secret behavior (used internally by NewHandler).
+func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, webhookSecretsByApp map[string][]byte, webhookAppByID map[int64]string, logger *slog.Logger) *Handler {
 	h := &Handler{
 		service:                    service,
 		ghClients:                  ghClients,
-		webhookSecret:              webhookSecret,
+		webhookSecretsByApp:        maps.Clone(webhookSecretsByApp),
+		webhookAppByID:             maps.Clone(webhookAppByID),
 		logger:                     logger,
 		priorEnvCheckMaxAttempts:   defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval: defaultPriorEnvCheckRetryInterval,
@@ -122,22 +167,38 @@ func NewHandlerWithClientSet(service *api.Service, ghClients github.ClientSet, w
 }
 
 // factoryForRepo returns the GitHub App client factory that owns the given
-// repository.
-//
-// In the legacy single-App shape the ClientSet has exactly one entry under
-// defaultAppName and is used uniformly for every repo, matching the prior
-// behavior where there was only one App. Multi-App resolution via
-// ServerConfig.ResolveGitHubAppForRepo lands in the follow-up PR; this method
-// is the single seam that will be extended there.
+// repository. In multi-App mode (ServerConfig.Apps is non-empty) the
+// resolution goes through ServerConfig.ResolveGitHubAppForRepo so unknown
+// repositories fail closed. In legacy single-App mode the ClientSet has
+// exactly one entry under defaultAppName and is used uniformly for every
+// repo.
 func (h *Handler) factoryForRepo(repo string) (github.GitHubClientFactory, error) {
 	if h.ghClients.Len() == 0 {
 		return nil, fmt.Errorf("no GitHub App clients configured")
 	}
-	factory, err := h.ghClients.For(defaultAppName)
+	appName := defaultAppName
+	if cfg := h.config(); cfg != nil && len(cfg.Apps) > 0 {
+		resolved, err := cfg.ResolveGitHubAppForRepo(repo)
+		if err != nil {
+			return nil, fmt.Errorf("resolve GitHub App for repo %q: %w", repo, err)
+		}
+		appName = resolved.Name
+	}
+	factory, err := h.ghClients.For(appName)
 	if err != nil {
-		return nil, fmt.Errorf("lookup GitHub App client for repo %q: %w", repo, err)
+		return nil, fmt.Errorf("lookup GitHub App client %q for repo %q: %w", appName, repo, err)
 	}
 	return factory, nil
+}
+
+// config returns the active ServerConfig if reachable, or nil. Centralized
+// so callers can short-circuit safely when the service is not wired (e.g.
+// some tests).
+func (h *Handler) config() *api.ServerConfig {
+	if h.service == nil {
+		return nil
+	}
+	return h.service.Config()
 }
 
 // clientForRepo returns an installation-scoped GitHub client for the App
@@ -201,22 +262,46 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate webhook signature
-	if len(h.webhookSecret) > 0 {
-		signature := r.Header.Get("X-Hub-Signature-256")
-		if !h.verifySignature(signature, body) {
-			eventType := r.Header.Get("X-GitHub-Event")
-			metrics.RecordWebhookEvent(r.Context(), eventType, "", "", "invalid_signature")
-			h.writeError(w, http.StatusUnauthorized, "invalid webhook signature")
-			return
-		}
+	// Resolve the signing App and verify HMAC. Failures here are recorded
+	// against an unattributed event so the rejection still shows up in the
+	// metrics counter with a clear status.
+	eventType := r.Header.Get("X-GitHub-Event")
+	appName, appID, authStatus, ok := h.authenticateWebhook(r, body)
+	if !ok {
+		h.logger.Warn("webhook rejected",
+			"status", authStatus,
+			"app_name", appName,
+			"app_id", appID,
+			"delivery_id", r.Header.Get(headerDeliveryID),
+			"event", eventType)
+		metrics.RecordWebhookEvent(r.Context(), metricAppName(appName), eventType, "", "", authStatus)
+		h.writeError(w, http.StatusUnauthorized, "invalid webhook dispatch")
+		return
 	}
 
-	eventType := r.Header.Get("X-GitHub-Event")
 	action, repo := webhookMetadata(body)
+
+	// Cross-check that the App that signed the webhook is the App that
+	// owns this repository in config. A signed delivery for a repo owned
+	// by a different App is a config drift or hostile install — fail
+	// closed before any handler runs.
+	if err := h.verifySignedAppOwnsRepo(repo, appName); err != nil {
+		h.logger.Warn("webhook rejected: signing App does not own repo",
+			"app_name", appName,
+			"app_id", appID,
+			"delivery_id", r.Header.Get(headerDeliveryID),
+			"event", eventType,
+			"action", action,
+			"repo", repo,
+			"error", err)
+		metrics.RecordWebhookEvent(r.Context(), metricAppName(appName), eventType, action, repo, "app_repo_mismatch")
+		h.writeError(w, http.StatusUnauthorized, "invalid webhook dispatch")
+		return
+	}
 
 	ctx, span := otel.Tracer("schemabot").Start(r.Context(), "webhook",
 		trace.WithAttributes(
+			attribute.String("app_name", appName),
 			attribute.String("event_type", eventType),
 			attribute.String("action", action),
 			attribute.String("repository", repo),
@@ -224,25 +309,120 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	defer span.End()
 
-	h.logger.Debug("webhook received", "event", eventType, "action", action, "repo", repo)
+	h.logger.Debug("webhook received",
+		"app_name", appName,
+		"event", eventType,
+		"action", action,
+		"repo", repo)
+
+	metricApp := metricAppName(appName)
 
 	switch eventType {
 	case "issue_comment":
 		h.handleIssueComment(w, body)
-		metrics.RecordWebhookEvent(ctx, eventType, action, repo, "processed")
+		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	case "check_run":
 		// Phase 2: h.handleCheckRun(w, body)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run events not yet implemented"})
-		metrics.RecordWebhookEvent(ctx, eventType, action, repo, "ignored")
+		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "ignored")
 	case "pull_request":
 		h.handlePullRequest(w, body)
-		metrics.RecordWebhookEvent(ctx, eventType, action, repo, "processed")
+		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	default:
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": fmt.Sprintf("event type '%s' ignored", eventType),
 		})
-		metrics.RecordWebhookEvent(ctx, eventType, action, repo, "ignored")
+		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "ignored")
 	}
+}
+
+// authenticateWebhook identifies which configured App a request was signed
+// by and verifies the HMAC against that App's secret. Returns the resolved
+// App name plus the parsed App ID (when present), a structured status for
+// metrics, and ok=true when the request is authentic.
+//
+// Multi-App mode (webhookAppByID non-empty) requires the GitHub-supplied
+// X-GitHub-Hook-Installation-Target-{ID,Type} headers and rejects unknown
+// or non-integration target IDs before HMAC verification.
+//
+// Legacy single-secret mode verifies the request against the single
+// configured secret (when set) and reports the App name as defaultAppName.
+func (h *Handler) authenticateWebhook(r *http.Request, body []byte) (appName string, appID int64, status string, ok bool) {
+	signature := r.Header.Get(headerSignature256)
+
+	if len(h.webhookAppByID) > 0 {
+		targetType := r.Header.Get(headerHookTargetType)
+		if !strings.EqualFold(targetType, hookTargetTypeApp) {
+			return "", 0, "invalid_target_type", false
+		}
+		rawID := r.Header.Get(headerHookTargetID)
+		if rawID == "" {
+			return "", 0, "missing_app_id", false
+		}
+		parsedID, err := strconv.ParseInt(rawID, 10, 64)
+		if err != nil || parsedID == 0 {
+			return "", 0, "invalid_app_id", false
+		}
+		name, found := h.webhookAppByID[parsedID]
+		if !found {
+			// Do NOT include the raw header value in the returned name —
+			// callers feed it into a bounded metric label.
+			return "", parsedID, "unknown_app_id", false
+		}
+		secret := h.webhookSecretsByApp[name]
+		if len(secret) == 0 {
+			return name, parsedID, "missing_webhook_secret", false
+		}
+		if !verifyHMAC(signature, body, secret) {
+			return name, parsedID, "invalid_signature", false
+		}
+		return name, parsedID, "", true
+	}
+
+	// Legacy single-App mode.
+	secret := h.webhookSecretsByApp[defaultAppName]
+	if len(secret) == 0 {
+		// No secret configured — preserve historical behaviour and skip
+		// signature verification entirely. Operators are nudged toward
+		// configuring a secret by serve.go's startup validation.
+		return defaultAppName, 0, "", true
+	}
+	if !verifyHMAC(signature, body, secret) {
+		return defaultAppName, 0, "invalid_signature", false
+	}
+	return defaultAppName, 0, "", true
+}
+
+// verifySignedAppOwnsRepo returns an error when the App that signed the
+// webhook is not the App configured to own the given repository. Returns
+// nil in legacy single-App mode (no per-repo App mapping exists) and when
+// no repo could be extracted from the payload.
+func (h *Handler) verifySignedAppOwnsRepo(repo, signedAppName string) error {
+	if repo == "" {
+		return nil
+	}
+	cfg := h.config()
+	if cfg == nil || len(cfg.Apps) == 0 {
+		return nil
+	}
+	expected, err := cfg.ResolveGitHubAppForRepo(repo)
+	if err != nil {
+		return err
+	}
+	if expected.Name != signedAppName {
+		return fmt.Errorf("repo %q is configured to be owned by app %q but webhook was signed by app %q", repo, expected.Name, signedAppName)
+	}
+	return nil
+}
+
+// metricAppName normalizes the App name for the webhook events counter so
+// rejected/unattributed deliveries surface under a bounded label rather
+// than the empty string.
+func metricAppName(appName string) string {
+	if appName == "" {
+		return "unknown"
+	}
+	return appName
 }
 
 // webhookMetadata extracts the "action" and repository name from a GitHub webhook payload.
@@ -259,29 +439,24 @@ func webhookMetadata(body []byte) (action, repo string) {
 	return payload.Action, payload.Repository.FullName
 }
 
-// verifySignature validates the HMAC-SHA256 webhook signature.
-func (h *Handler) verifySignature(signature string, body []byte) bool {
+// verifyHMAC validates a GitHub-style "sha256=<hex>" signature against the
+// given body and shared secret. Constant-time comparison; returns false for
+// any malformed input.
+func verifyHMAC(signature string, body, secret []byte) bool {
 	if signature == "" {
 		return false
 	}
-
-	// Signature format: "sha256=<hex>"
-	prefix := "sha256="
+	const prefix = "sha256="
 	if !strings.HasPrefix(signature, prefix) {
 		return false
 	}
-
-	sigHex := signature[len(prefix):]
-	sigBytes, err := hex.DecodeString(sigHex)
+	sigBytes, err := hex.DecodeString(signature[len(prefix):])
 	if err != nil {
 		return false
 	}
-
-	mac := hmac.New(sha256.New, h.webhookSecret)
+	mac := hmac.New(sha256.New, secret)
 	mac.Write(body)
-	expectedMAC := mac.Sum(nil)
-
-	return hmac.Equal(sigBytes, expectedMAC)
+	return hmac.Equal(sigBytes, mac.Sum(nil))
 }
 
 // recoverPanic recovers from panics in async goroutines, logs the stack trace,

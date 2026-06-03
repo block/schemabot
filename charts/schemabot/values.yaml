@@ -74,11 +74,9 @@ grpc:
 #       payments-c:
 #         production: "tern-payments-c:9090"
 #
-# Example (multi-App routing — PREVIEW):
-# NOTE: configs that set apps: are rejected at config load until the
-# webhook runtime is wired to dispatch by App. The shape below is the
-# intended one so chart authors can prepare values without surprises
-# when the hard-block lifts in the follow-up PR.
+# Example (multi-App routing — one process serves webhooks for repos owned
+# by multiple GitHub Apps; each App brings its own credentials and webhook
+# secret, and each repo declares which App owns it):
 #   config:
 #     storage:
 #       dsn: "env:MYSQL_DSN"
