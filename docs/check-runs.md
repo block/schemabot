@@ -8,6 +8,7 @@
 - [Safety Philosophy](#safety-philosophy)
 - [Published Checks](#published-checks)
 - [Managed Schema Configs](#managed-schema-configs)
+  - [Onboarding a schema directory](#onboarding-a-schema-directory)
 - [Internal Records](#internal-records)
 - [Lifecycle](#lifecycle)
   - [Pull Request Events](#pull-request-events)
@@ -147,6 +148,61 @@ that PR. In that case, SchemaBot publishes passing aggregate checks so branch
 protection is not left waiting for a check it cannot produce.
 
 See [namespaces](./namespaces.md) for the schema directory and namespace layout.
+
+### Onboarding a schema directory
+
+To onboard an existing declarative schema directory, add a `schemabot.yaml` file
+next to the SQL files or namespace subdirectories it owns:
+
+```yaml
+database: widgets
+type: mysql
+```
+
+For Vitess-backed databases, use `type: vitess`:
+
+```yaml
+database: commerce
+type: vitess
+```
+
+A PR that only adds or edits `schemabot.yaml` is still managed work. SchemaBot
+loads the changed config directly, plans the current schema files for each
+configured environment, and publishes the normal aggregate check for the
+discovered database.
+
+On the happy path, where the live database already matches the declarative
+schema files, the aggregate check completes successfully with a clear no-op
+summary:
+
+```text
+SchemaBot (staging) — Schema up to date
+```
+
+```markdown
+| Database | Environment | Status |
+|----------|-------------|--------|
+| `widgets` | staging | Up to date |
+```
+
+If onboarding discovers unapplied schema changes, SchemaBot does not treat the
+onboarding as clean. It publishes the same pending apply state used for any
+schema change, so branch protection remains blocked until the target environment
+is applied or otherwise reconciled:
+
+```text
+SchemaBot (staging) — 1 apply pending
+```
+
+```markdown
+| Database | Environment | Status |
+|----------|-------------|--------|
+| `widgets` | staging | Pending |
+```
+
+If the PR does not add or edit `schemabot.yaml` and does not touch managed SQL
+or `vschema.json` files, SchemaBot publishes `No managed schema changes` instead
+because the PR does not affect a managed schema directory.
 
 ## Internal Records
 
