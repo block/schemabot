@@ -336,7 +336,7 @@ func WatchApplyProgressAfterCutover(endpoint, applyID string) error {
 				bar := ui.ProgressBarComplete()
 				fmt.Printf("%*s: %s ✓ Complete\n", maxTableNameLen, tbl.TableName, bar)
 			}
-			fmt.Printf("\n\n%s\n", templates.FormatApplyComplete())
+			fmt.Printf("\n\n%s\n", templates.FormatApplyCompleteWithSummary(countProgressResponseChanges(tables).summary(), applyID))
 			return nil
 		}
 

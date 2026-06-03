@@ -165,6 +165,17 @@ func FormatApplyComplete() string {
 	return fmt.Sprintf("%s%s✓ Apply complete!%s", ANSIBold, ANSIGreen, ANSIReset)
 }
 
+func FormatApplyCompleteWithSummary(summary, applyID string) string {
+	msg := FormatApplyComplete()
+	if summary != "" {
+		msg = fmt.Sprintf("%s %s", msg, summary)
+	}
+	if applyID == "" {
+		return msg
+	}
+	return fmt.Sprintf("%s Apply ID: %s", msg, applyID)
+}
+
 // FormatApplyFailed returns the styled "Apply failed" message with recovery guidance.
 func FormatApplyFailed() string {
 	return fmt.Sprintf("%s%s✗ Apply failed%s\n\nFix the issue above, then run a new apply.\nThe new apply will only process tables that haven't completed.", ANSIBold, ANSIRed, ANSIReset)

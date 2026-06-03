@@ -83,6 +83,26 @@ func TestWatchModel_FirstPollRetryableError_ShowsLoadingWithError(t *testing.T) 
 	assert.Nil(t, retCmd, "retryable error should return nil cmd (tick loop handles retry)")
 }
 
+func TestWatchModel_CompletedViewShowsCompactSummary(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+	m.applyID = "apply-abc123"
+	m.state = state.Apply.Completed
+	m.initialized = true
+	m.tables = []tableProgress{
+		{Name: "users", ChangeType: "CREATE"},
+		{Name: "orders", ChangeType: "CREATE"},
+		{Name: "products", ChangeType: "CREATE"},
+		{Name: "audit_events", ChangeType: "CREATE"},
+		{Name: "legacy_orders", ChangeType: "DROP"},
+		{Name: "VSchema: commerce", ChangeType: "vschema_update"},
+	}
+
+	view := m.View()
+	assert.Contains(t, view, "✓ Apply complete!")
+	assert.Contains(t, view, "Changes: 4 created, 1 dropped, 1 VSchema update. Apply ID: apply-abc123")
+	assert.NotContains(t, view, "Resume:")
+}
+
 func TestWatchModel_FirstPollPermanentError_QuitsWithError(t *testing.T) {
 	// First poll fails with a permanent error (not found).
 	// TUI should show the error and quit.

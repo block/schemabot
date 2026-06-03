@@ -325,3 +325,63 @@ func printWatchInstructions(applyID, database, environment string) {
 		fmt.Printf("To watch and manage: schemabot status -d %s -e %s\n", database, environment)
 	}
 }
+
+type applyChangeCounts struct {
+	created        int
+	altered        int
+	dropped        int
+	vschemaUpdates int
+}
+
+func countTableProgressChanges(tables []tableProgress) applyChangeCounts {
+	var counts applyChangeCounts
+	for _, table := range tables {
+		counts.add(table.ChangeType)
+	}
+	return counts
+}
+
+func countProgressResponseChanges(tables []*apitypes.TableProgressResponse) applyChangeCounts {
+	var counts applyChangeCounts
+	for _, table := range tables {
+		counts.add(table.ChangeType)
+	}
+	return counts
+}
+
+func (c *applyChangeCounts) add(changeType string) {
+	switch strings.ToUpper(changeType) {
+	case "CREATE", "CHANGE_TYPE_CREATE":
+		c.created++
+	case "ALTER", "CHANGE_TYPE_ALTER":
+		c.altered++
+	case "DROP", "CHANGE_TYPE_DROP":
+		c.dropped++
+	case "VSCHEMA", "VSCHEMA_UPDATE", "CHANGE_TYPE_VSCHEMA":
+		c.vschemaUpdates++
+	}
+}
+
+func (c applyChangeCounts) summary() string {
+	var parts []string
+	if c.created > 0 {
+		parts = append(parts, fmt.Sprintf("%d created", c.created))
+	}
+	if c.altered > 0 {
+		parts = append(parts, fmt.Sprintf("%d altered", c.altered))
+	}
+	if c.dropped > 0 {
+		parts = append(parts, fmt.Sprintf("%d dropped", c.dropped))
+	}
+	if c.vschemaUpdates > 0 {
+		word := "updates"
+		if c.vschemaUpdates == 1 {
+			word = "update"
+		}
+		parts = append(parts, fmt.Sprintf("%d VSchema %s", c.vschemaUpdates, word))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("Changes: %s.", strings.Join(parts, ", "))
+}

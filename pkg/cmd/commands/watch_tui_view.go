@@ -131,7 +131,7 @@ func (m WatchModel) progressView() string {
 	switch {
 	case state.IsState(m.state, state.Apply.Completed):
 		b.WriteString("\n\n")
-		b.WriteString(templates.FormatApplyComplete())
+		b.WriteString(templates.FormatApplyCompleteWithSummary(countTableProgressChanges(m.tables).summary(), m.applyID))
 		b.WriteString("\n")
 	case state.IsState(m.state, state.Apply.Failed):
 		b.WriteString("\n\n")

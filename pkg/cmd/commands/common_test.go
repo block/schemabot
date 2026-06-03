@@ -49,3 +49,27 @@ func TestLoadCLIConfig_RejectsDeployment(t *testing.T) {
 	assert.Nil(t, cfg)
 	assert.Contains(t, err.Error(), "field deployment not found")
 }
+
+func TestApplyChangeCountsSummary(t *testing.T) {
+	tables := []tableProgress{
+		{ChangeType: "CREATE"},
+		{ChangeType: "CHANGE_TYPE_CREATE"},
+		{ChangeType: "ALTER"},
+		{ChangeType: "DROP"},
+		{ChangeType: "DROP"},
+		{ChangeType: "VSCHEMA_UPDATE"},
+		{ChangeType: "CHANGE_TYPE_VSCHEMA"},
+	}
+
+	assert.Equal(t, "Changes: 2 created, 1 altered, 2 dropped, 2 VSchema updates.", countTableProgressChanges(tables).summary())
+}
+
+func TestApplyChangeCountsSummaryVSchemaOnly(t *testing.T) {
+	tables := []tableProgress{{ChangeType: "vschema_update"}}
+
+	assert.Equal(t, "Changes: 1 VSchema update.", countTableProgressChanges(tables).summary())
+}
+
+func TestApplyChangeCountsSummaryEmpty(t *testing.T) {
+	assert.Empty(t, countTableProgressChanges(nil).summary())
+}

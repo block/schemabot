@@ -411,8 +411,11 @@ func runWatchModel(model WatchModel) (err error) {
 
 	m := finalModel.(WatchModel)
 
-	// Always print apply context on exit so operators can resume monitoring.
-	printExitContext(m.applyID, m.deployRequestURL, m.database, m.environment)
+	// Completed applies render their apply ID in the success line. Other exits
+	// need explicit context so operators can resume monitoring or investigate.
+	if !state.IsState(m.state, state.Apply.Completed) {
+		printExitContext(m.applyID, m.deployRequestURL, m.database, m.environment)
+	}
 
 	// The TUI view already displays errors inline, so return ErrSilent
 	// to exit with code 1 without printing the error again.
