@@ -151,6 +151,9 @@ clean: ## Clean build artifacts
 	@rm -rf bin/
 	@rm -f coverage.out
 
+docs-toc: ## Regenerate the Table of Contents in docs/*.md
+	@python3 scripts/gen-doc-toc.py
+
 # Generate protobuf code (only if .proto is newer than generated .pb.go)
 proto: ## Generate protobuf code
 	@if [ pkg/proto/tern.proto -nt pkg/proto/ternv1/tern.pb.go ]; then \

@@ -2,7 +2,8 @@
 """Insert or refresh a Table of Contents in each Markdown file under docs/.
 
 Usage:
-    python3 scripts/gen-doc-toc.py                # refresh all docs/*.md
+    make docs-toc                                 # refresh all docs/*.md
+    python3 scripts/gen-doc-toc.py                # same, invoked directly
     python3 scripts/gen-doc-toc.py docs/foo.md    # refresh specific files
 
 For each file, the TOC lists H2 and H3 headings (skipping headings inside
