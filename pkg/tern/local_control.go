@@ -154,6 +154,13 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
+	if state.IsState(apply.State, state.Apply.RecoveringCutover) {
+		c.logger.Info("pending cutover request is waiting for cutover recovery to complete",
+			"apply_id", apply.ApplyIdentifier,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		return nil
+	}
 	readyForCutover, err := applyReadyForCutoverRequest(ctx, c.storage, apply)
 	if err != nil {
 		return fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)

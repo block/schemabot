@@ -491,6 +491,55 @@ func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhenNotReady(t *tes
 	assert.Equal(t, storage.ControlRequestPending, pending.Status)
 }
 
+func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhileRecoveringCutover(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              129,
+		ApplyIdentifier: "apply-cutover-recovering-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.RecoveringCutover,
+	}
+	task := &storage.Task{
+		ID:             462,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-recovering-local",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.RecoveringCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.Equal(t, 0, fakeEngine.cutoverCount)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	assert.Equal(t, storage.ControlRequestPending, pending.Status)
+}
+
 func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              126,

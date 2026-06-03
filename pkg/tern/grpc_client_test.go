@@ -2087,6 +2087,50 @@ func TestGRPCClient_ProcessPendingCutoverWaitsWhenNotReady(t *testing.T) {
 	assert.Equal(t, storage.ControlRequestPending, pendingCutover.Status)
 }
 
+func TestGRPCClient_ProcessPendingCutoverWaitsWhileRecoveringCutover(t *testing.T) {
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-cutover-recovering-grpc",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		ExternalID:      "remote-cutover-recovering-grpc",
+		State:           state.Apply.RecoveringCutover,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-recovering-grpc",
+		TableName:      "users",
+		State:          state.Task.RecoveringCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.Empty(t, server.getCutoverApplyID())
+	pendingCutover, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pendingCutover)
+	assert.Equal(t, storage.ControlRequestPending, pendingCutover.Status)
+}
+
 func TestGRPCClient_ResumeApplyCutoverErrorFailsPendingRequest(t *testing.T) {
 	// A cutover RPC failure leaves a visible failed control request so the
 	// scheduler does not retry indefinitely without a new operator request.

@@ -406,6 +406,16 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		}
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
+	if state.IsState(apply.State, state.Apply.RecoveringCutover) {
+		slog.Info("pending gRPC cutover request is waiting for cutover recovery to complete",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		return nil
+	}
 	readyForCutover, err := applyReadyForCutoverRequest(ctx, c.storage, apply)
 	if err != nil {
 		return fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
