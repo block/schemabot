@@ -18,6 +18,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // Globals holds flags shared by all commands.
@@ -259,21 +260,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 		return "", fmt.Errorf("no plan_id in response")
 	}
 
-	options := make(map[string]string)
-	if deferCutover {
-		options["defer_cutover"] = "true"
-	}
-	// TUI mode: defer deploy so the user can review the deploy request diff
-	// on PlanetScale before triggering. Non-interactive modes auto-deploy.
-	if deferDeploy || (watch && format == OutputFormatInteractive) {
-		options["defer_deploy"] = "true"
-	}
-	if skipRevert {
-		options["skip_revert"] = "true"
-	}
-	if branch != "" {
-		options["branch"] = branch
-	}
+	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, branch, watch, format)
 
 	applyResult, err := client.CallApplyAPI(ep, planResult.PlanID, environment, caller, options)
 	if err != nil {
@@ -315,6 +302,26 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	}
 
 	return applyID, nil
+}
+
+func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert bool, branch string, watch bool, format OutputFormat) map[string]string {
+	options := make(map[string]string)
+	isPlanetScale := planResult != nil && state.IsPlanetScaleEngine(planResult.Engine)
+	if deferCutover {
+		options["defer_cutover"] = "true"
+	}
+	// TUI mode: defer deploy so the user can review the deploy request diff
+	// on PlanetScale before triggering. Non-interactive modes auto-deploy.
+	if isPlanetScale && (deferDeploy || (watch && format == OutputFormatInteractive)) {
+		options["defer_deploy"] = "true"
+	}
+	if skipRevert {
+		options["skip_revert"] = "true"
+	}
+	if branch != "" {
+		options["branch"] = branch
+	}
+	return options
 }
 
 // printWatchInstructions prints the "To watch and manage" hint.

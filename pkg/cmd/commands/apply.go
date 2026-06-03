@@ -104,6 +104,9 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	if cmd.SkipRevert && planResult.Engine != "" && !state.IsPlanetScaleEngine(planResult.Engine) {
 		return fmt.Errorf("--skip-revert is only supported for Vitess/PlanetScale databases")
 	}
+	if cmd.DeferDeploy && planResult.Engine != "" && !state.IsPlanetScaleEngine(planResult.Engine) {
+		return fmt.Errorf("--defer-deploy is only supported for Vitess/PlanetScale databases")
+	}
 	if cmd.Branch != "" && planResult.Engine != "" && !state.IsPlanetScaleEngine(planResult.Engine) {
 		return fmt.Errorf("--branch is only supported for Vitess/PlanetScale databases")
 	}
