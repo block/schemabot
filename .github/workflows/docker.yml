@@ -24,9 +24,46 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  lint-chart:
+  # See test.yaml for the rationale of this docs-only skip pattern.
+  # On PRs that touch only docs/**, the chart lint and Docker build are
+  # skipped. Pushes to main and tags always build (so latest/tagged images
+  # are published regardless of the diff content).
+  changes:
+    name: "Detect changes"
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.out.outputs.code }}
+    steps:
+      - name: "Detect non-docs changes"
+        if: github.event_name == 'pull_request'
+        id: filter
+        continue-on-error: true
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '!**/*.md'
+              - '!docs/**'
+      - name: "Resolve code-change flag"
+        id: out
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.filter.outcome }}" != "success" ]; then
+            echo "::warning::paths-filter failed; running CI instead of skipping"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=${{ steps.filter.outputs.code }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  lint-chart:
+    needs: changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
         with:
@@ -62,8 +99,13 @@ jobs:
           echo "Chart version bumped: ${BASE_VERSION} → ${HEAD_VERSION}"
 
   build-and-push:
+    needs: changes
     runs-on: ubuntu-latest
-    if: github.repository == 'block/schemabot'
+    # Skip on PRs that touch only docs/**. Pushes (main and tags) always run
+    # so latest and tagged images are published regardless of diff content.
+    if: >-
+      github.repository == 'block/schemabot' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
     permissions:
       contents: read
       packages: write
