@@ -431,15 +431,39 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 		}
 	}
 
+	// tasks.apply_operation_id is indexed but not a foreign key, so the
+	// store must validate the link itself: any non-nil ApplyOperationID
+	// MUST point at one of the apply_operations rows just inserted above.
+	// Without this check a caller could persist an arbitrary or zero id
+	// and silently break per-operation task scoping once the operator
+	// claim loop comes online.
+	insertedOpIDs := make(map[int64]struct{}, len(operations))
+	for _, op := range operations {
+		insertedOpIDs[op.ID] = struct{}{}
+	}
+
 	switch {
 	case len(tasks) == 0:
 		// no tasks; nothing to link.
+	case len(operations) == 0:
+		// No operations supplied; any pre-populated ApplyOperationID is
+		// invalid because there is no row it can reference for this apply.
+		for _, task := range tasks {
+			if task.ApplyOperationID != nil {
+				return 0, fmt.Errorf("create apply %s: task %s has apply_operation_id=%d but apply has no operations", apply.ApplyIdentifier, task.TaskIdentifier, *task.ApplyOperationID)
+			}
+		}
 	case len(operations) == 1:
 		// Single-operation apply: link every task to the lone operation
-		// unless the caller already supplied an explicit value.
+		// unless the caller already supplied an explicit value. An explicit
+		// value still has to match the inserted operation.
 		for _, task := range tasks {
 			if task.ApplyOperationID == nil {
 				task.ApplyOperationID = &operations[0].ID
+				continue
+			}
+			if _, ok := insertedOpIDs[*task.ApplyOperationID]; !ok {
+				return 0, fmt.Errorf("create apply %s: task %s apply_operation_id=%d does not match any inserted operation for this apply", apply.ApplyIdentifier, task.TaskIdentifier, *task.ApplyOperationID)
 			}
 		}
 	case len(operations) > 1:
@@ -450,6 +474,9 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 		for _, task := range tasks {
 			if task.ApplyOperationID == nil {
 				return 0, fmt.Errorf("create apply %s: task %s missing apply_operation_id (apply has %d operations; caller must encode the per-task mapping)", apply.ApplyIdentifier, task.TaskIdentifier, len(operations))
+			}
+			if _, ok := insertedOpIDs[*task.ApplyOperationID]; !ok {
+				return 0, fmt.Errorf("create apply %s: task %s apply_operation_id=%d does not match any inserted operation for this apply", apply.ApplyIdentifier, task.TaskIdentifier, *task.ApplyOperationID)
 			}
 		}
 	}

@@ -314,6 +314,100 @@ func TestApplyStore_CreateWithTasksAndOperationsRejectsMultiOpWithoutTaskMapping
 	assert.Nil(t, gotApply, "apply row must not exist after rejected multi-op create")
 }
 
+// TestApplyStore_CreateWithTasksAndOperationsRejectsTaskApplyOperationIDMismatch
+// pins the ID-membership check: every non-nil task.ApplyOperationID must
+// point at one of the apply_operations rows just inserted for this apply.
+// tasks.apply_operation_id is not a foreign key (only an index), so without
+// this check a caller could persist an arbitrary or zero id and silently
+// break per-operation task scoping once the operator claim loop comes
+// online.
+func TestApplyStore_CreateWithTasksAndOperationsRejectsTaskApplyOperationIDMismatch(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_op_id_mismatch",
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "production",
+		Deployment:      "payments-a",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	// Caller supplies an arbitrary id (9_999_999) that cannot possibly
+	// match an apply_operations row created in the same transaction.
+	bogusOpID := int64(9_999_999)
+	tasks := []*storage.Task{
+		{TaskIdentifier: "task_bogus_op_id", ApplyOperationID: &bogusOpID, PlanID: 1, Database: "payments", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineSpirit, Environment: "production", State: state.Task.Pending, TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", DDLAction: "alter", Options: []byte("{}"), CreatedAt: now, UpdatedAt: now},
+	}
+	operations := []*storage.ApplyOperation{
+		{Deployment: "payments-a", Target: "payments", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
+	}
+
+	_, err := store.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "does not match any inserted operation")
+
+	gotApply, err := store.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, gotApply, "apply row must not exist after rejected mismatched-op-id create")
+
+	var opCount int
+	require.NoError(t, testDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM apply_operations WHERE deployment = ?`, "payments-a").Scan(&opCount))
+	assert.Zero(t, opCount, "apply_operations row must be rolled back along with the rejected apply")
+}
+
+// TestApplyStore_CreateWithTasksAndOperationsRejectsTasksWithApplyOperationIDWhenNoOperations
+// pins the no-operations case explicitly: when an apply is created with
+// tasks but no apply_operations, every task.ApplyOperationID must be nil.
+// A non-nil value here cannot reference any row this apply owns.
+func TestApplyStore_CreateWithTasksAndOperationsRejectsTasksWithApplyOperationIDWhenNoOperations(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_tasks_no_ops",
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "production",
+		Deployment:      "payments-a",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	bogusOpID := int64(42)
+	tasks := []*storage.Task{
+		{TaskIdentifier: "task_no_ops", ApplyOperationID: &bogusOpID, PlanID: 1, Database: "payments", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineSpirit, Environment: "production", State: state.Task.Pending, TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", DDLAction: "alter", Options: []byte("{}"), CreatedAt: now, UpdatedAt: now},
+	}
+
+	_, err := store.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "apply has no operations")
+
+	gotApply, err := store.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
+	require.NoError(t, err)
+	assert.Nil(t, gotApply, "apply row must not exist after rejected no-ops create")
+}
+
 func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnOperationFailure(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
