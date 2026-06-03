@@ -244,6 +244,28 @@ follows the remote-readiness scenario above.
 request can proceed. Recovery must not silently accept cutover before Spirit has
 reattached to the sentinel wait.
 
+### Durable cutover request exists before deferred-cutover recovery
+
+This is different from a fresh `/cutover` request during recovery. The user has
+already been told the cutover request was accepted, so SchemaBot must preserve
+that durable intent and let the scheduler owner retry after recovery reaches a
+safe cutover-ready state.
+
+| Step | Actor | What happens | User-visible result |
+| --- | --- | --- | --- |
+| 1 | Operator / CLI | Requests `/cutover` while the apply is cutover-ready | CLI receives `cutover request accepted` |
+| 2 | API | Records a durable cutover request | Caller metadata and request intent are stored |
+| 3 | Scheduler / pod | Dies or loses ownership before sending cutover | Stored request remains pending |
+| 4 | New scheduler owner | Claims the stale apply and enters `recovering_cutover` because the Spirit sentinel still exists | CLI watch / PR comments show recovery |
+| 5 | Scheduler owner | Sees the pending durable cutover request while apply is `recovering_cutover` | Request stays pending; no Cutover RPC is sent yet |
+| 6 | Engine progress | Reports `waiting_for_cutover` after checkpoint reattach completes | Storage leaves `recovering_cutover` |
+| 7 | Scheduler owner | Processes the still-pending cutover request through the normal cutover path | Cutover is sent once the engine is cutover-ready again |
+
+**End state:** the original cutover request is either completed after cutover is
+accepted, or failed with a visible error if the later Cutover RPC fails. It must
+not be failed merely because recovery is in progress, and it must not be sent
+while the engine has not yet reattached to `waiting_for_cutover`.
+
 ### Deferred-cutover recovery finds Spirit sentinel absent
 
 | Step | Actor | What happens | User-visible result |
@@ -284,8 +306,9 @@ SchemaBot was down and the data plane finished cutover, storage converges to
 | 19 | PR comment stop support | Same semantics as CLI stop: durable request first, caller visible, stop priority preserved | Covered |
 | 20 | PR comment cutover support | Same safety gate as CLI/API cutover, including pending-stop rejection, plus durable cutover intent if async ownership requires it | Covered |
 | 21 | Spirit checkpoint resume loses prior copy progress after restart | Surface lost-progress reason through Spirit resume status APIs instead of inferring from sentinel tables | Follow-up after Spirit dependency exposes the API |
-| 22 | Deferred-cutover recovery with Spirit sentinel still present | Enter `recovering_cutover`, reject cutover until Spirit reports `waiting_for_cutover`, then allow a new durable cutover request | Covered by integration test |
-| 23 | Deferred-cutover recovery with Spirit sentinel absent | Re-plan against live schema; mark completed if desired schema is present, otherwise resume remaining checkpoint work | Covered by integration test |
+| 22 | Fresh cutover request during deferred-cutover recovery with Spirit sentinel still present | Enter `recovering_cutover`, reject cutover until Spirit reports `waiting_for_cutover`, then allow a new durable cutover request | Covered by integration test |
+| 23 | Durable cutover request already pending when deferred-cutover recovery starts | Keep the request pending, do not send Cutover while `recovering_cutover`, then process it after recovery reaches `waiting_for_cutover` | Covered by unit tests |
+| 24 | Deferred-cutover recovery with Spirit sentinel absent | Re-plan against live schema; mark completed if desired schema is present, otherwise resume remaining checkpoint work | Covered by integration test |
 
 ## Review questions for new gRPC control changes
 
