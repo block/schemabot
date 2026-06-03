@@ -42,9 +42,9 @@ jobs:
         continue-on-error: true
         uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
         with:
-          predicate-quantifier: 'every'
           filters: |
             code:
+              - '**'
               - '!**/*.md'
               - '!docs/**'
       - name: "Resolve code-change flag"
