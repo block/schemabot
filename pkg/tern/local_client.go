@@ -1102,9 +1102,17 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 		state.IsState(engineTaskState, state.Task.Stopped, state.Task.FailedRetryable) {
 		return engineTaskState
 	}
+
+	// Recovering cutover is a scheduler-owned pause while Spirit reattaches to
+	// the deferred-cutover checkpoint. Once the engine reports waiting for
+	// cutover again, recovery is complete and cutover requests can be processed.
 	if state.IsState(storedTaskState, state.Task.RecoveringCutover) && state.IsState(engineTaskState, state.Task.WaitingForCutover) {
 		return engineTaskState
 	}
+
+	// Vitess deferred deploy reports running during deploy-request setup, then
+	// waiting_for_deploy once the request is ready for an operator start. That is
+	// forward progress even though the generic rank order treats running as later.
 	if state.IsState(storedTaskState, state.Task.Running) && state.IsState(engineTaskState, state.Task.WaitingForDeploy) {
 		return engineTaskState
 	}
