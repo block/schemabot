@@ -93,6 +93,7 @@ type runningMigration struct {
 // Compile-time check that Engine implements the interface.
 var _ engine.Engine = (*Engine)(nil)
 var _ engine.Drainer = (*Engine)(nil)
+var _ engine.DeferredCutoverSignalChecker = (*Engine)(nil)
 
 // Config holds configuration for the Spirit engine.
 type Config struct {

@@ -667,16 +667,16 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		fmt.Sprintf("Recovering apply (heartbeat expired, was in %s state)", apply.State), "", "")
 
 	if shouldRecoverMySQLDeferredCutover(c.config.Type, apply) {
-		sentinelExists, err := c.spiritSentinelTableExists(ctx, apply)
+		signalExists, err := c.deferredCutoverSignalExists(ctx, apply)
 		if err != nil {
-			c.logger.Warn("deferred cutover recovery could not verify Spirit sentinel; scheduler will retry",
+			c.logger.Warn("deferred cutover recovery could not verify engine cutover signal; scheduler will retry",
 				"apply_id", apply.ApplyIdentifier,
 				"database", apply.Database,
 				"database_type", apply.DatabaseType,
 				"error", err)
-			return fmt.Errorf("verify Spirit sentinel before recovering deferred cutover apply %s: %w", apply.ApplyIdentifier, err)
+			return fmt.Errorf("verify engine cutover signal before recovering deferred cutover apply %s: %w", apply.ApplyIdentifier, err)
 		}
-		if sentinelExists {
+		if signalExists {
 			if err := c.markApplyRecoveringCutover(ctx, apply, tasks); err != nil {
 				return err
 			}
@@ -690,7 +690,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 			}
 			return ctx.Err()
 		}
-		c.logger.Info("Spirit sentinel is absent during deferred cutover recovery; re-plan will reconcile completed work",
+		c.logger.Info("engine cutover signal is absent during deferred cutover recovery; re-plan will reconcile completed work",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"database_type", apply.DatabaseType)

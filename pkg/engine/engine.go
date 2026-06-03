@@ -74,6 +74,23 @@ type Drainer interface {
 	Drain()
 }
 
+// DeferredCutoverSignalChecker is an optional capability for engines that can
+// persist deferred-cutover intent in the target data plane. SchemaBot uses this
+// during restart recovery to decide whether it must reattach to a deferred
+// cutover wait before accepting cutover requests.
+type DeferredCutoverSignalChecker interface {
+	// DeferredCutoverSignalExists reports whether the engine's durable cutover
+	// signal still exists for the target database.
+	DeferredCutoverSignalExists(ctx context.Context, req *DeferredCutoverSignalRequest) (bool, error)
+}
+
+// DeferredCutoverSignalRequest identifies the target database whose deferred
+// cutover signal should be inspected.
+type DeferredCutoverSignalRequest struct {
+	Database    string
+	Credentials *Credentials
+}
+
 // Credentials contains the resolved credentials for accessing a database.
 // These are populated by the service layer from discovery before calling the engine.
 type Credentials struct {

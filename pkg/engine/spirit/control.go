@@ -228,6 +228,48 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	}, nil
 }
 
+// DeferredCutoverSignalExists reports whether Spirit's deferred-cutover signal
+// is still present in the target database.
+func (e *Engine) DeferredCutoverSignalExists(ctx context.Context, req *engine.DeferredCutoverSignalRequest) (bool, error) {
+	if req == nil {
+		return false, fmt.Errorf("deferred cutover signal request is required")
+	}
+	if req.Credentials == nil || req.Credentials.DSN == "" {
+		return false, fmt.Errorf("DSN credentials required for deferred cutover signal lookup")
+	}
+
+	database := req.Database
+	if database == "" {
+		cfg, err := mysql.ParseDSN(req.Credentials.DSN)
+		if err != nil {
+			return false, fmt.Errorf("parse DSN for deferred cutover signal database: %w", err)
+		}
+		database = cfg.DBName
+	}
+	if database == "" {
+		return false, fmt.Errorf("database is required for deferred cutover signal lookup")
+	}
+
+	db, err := sql.Open("mysql", req.Credentials.DSN)
+	if err != nil {
+		return false, fmt.Errorf("open connection for deferred cutover signal lookup: %w", err)
+	}
+	defer utils.CloseAndLog(db)
+
+	if err := db.PingContext(ctx); err != nil {
+		return false, fmt.Errorf("ping database for deferred cutover signal lookup: %w", err)
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_spirit_sentinel'",
+		database,
+	).Scan(&count); err != nil {
+		return false, fmt.Errorf("query deferred cutover signal for database %s: %w", database, err)
+	}
+	return count > 0, nil
+}
+
 func quoteIdentifier(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }

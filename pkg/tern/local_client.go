@@ -87,9 +87,7 @@ package tern
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -106,7 +104,6 @@ import (
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/spirit/pkg/utils"
 )
 
 // LocalConfig holds configuration for the local Tern client.
@@ -241,32 +238,23 @@ func (c *LocalClient) credentials() *engine.Credentials {
 	}
 }
 
-func (c *LocalClient) spiritSentinelTableExists(ctx context.Context, apply *storage.Apply) (bool, error) {
+func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *storage.Apply) (bool, error) {
 	if apply == nil {
-		return false, fmt.Errorf("apply is required for Spirit sentinel lookup")
+		return false, fmt.Errorf("apply is required for deferred cutover signal lookup")
 	}
-	db, err := sql.Open("mysql", c.config.TargetDSN)
+	eng := c.getEngine()
+	checker, ok := eng.(engine.DeferredCutoverSignalChecker)
+	if !ok {
+		return false, fmt.Errorf("engine %T does not support deferred cutover signal lookup for apply %s", eng, apply.ApplyIdentifier)
+	}
+	exists, err := checker.DeferredCutoverSignalExists(ctx, &engine.DeferredCutoverSignalRequest{
+		Database:    apply.Database,
+		Credentials: c.credentials(),
+	})
 	if err != nil {
-		return false, fmt.Errorf("open target database for apply %s sentinel lookup: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("check deferred cutover signal for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
 	}
-	defer utils.CloseAndLog(db)
-
-	if err := db.PingContext(ctx); err != nil {
-		return false, fmt.Errorf("ping target database for apply %s sentinel lookup: %w", apply.ApplyIdentifier, err)
-	}
-
-	var exists int
-	err = db.QueryRowContext(ctx,
-		"SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_spirit_sentinel'",
-		apply.Database,
-	).Scan(&exists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("query Spirit sentinel table for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
-	}
-	return true, nil
+	return exists, nil
 }
 
 // Health checks the service health.
