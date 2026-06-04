@@ -229,23 +229,29 @@ another control request. This case is only idempotent when SchemaBot storage is
 already `cutting_over`; remote-only `cutting_over` with stale stored state
 follows the remote-readiness scenario above.
 
-### Deferred-cutover recovery finds Spirit sentinel still present
+### Start state: storage is `waiting_for_cutover`; Spirit sentinel still exists after restart
+
+SchemaBot has already stored the apply as cutover-ready, but the old owner died
+before cutover was safely completed. On restart, the new scheduler owner must
+prove the engine state before accepting cutover. A present Spirit sentinel means
+cutover has not been signaled yet, so SchemaBot enters temporary recovery.
 
 | Step | Actor | What happens | User-visible result |
 | --- | --- | --- | --- |
-| 1 | Scheduler | Claims a stale MySQL/Spirit apply stored as `waiting_for_cutover` | Recovery begins after the old owner stopped heartbeating |
-| 2 | Scheduler | Verifies `_spirit_sentinel` still exists in the target database | Sentinel presence means cutover has not been signaled safely yet |
-| 3 | Storage | Marks apply and non-terminal tasks `recovering` | CLI watch / PR comments show recovery rather than generic running |
-| 4 | Operator / CLI | Requests `/cutover` while recovery is in progress | Request is rejected with a recovering message; no durable cutover request is queued |
-| 5a | Remote/local Tern | Reattaches to Spirit checkpoint and reports row copy | Storage moves to `running`; cutover remains unavailable through the normal not-ready path |
-| 5b | Remote/local Tern | Reports `waiting_for_cutover` after row copy/checksum complete | Storage moves to `waiting_for_cutover` |
-| 6 | Operator / CLI | Issues a new `/cutover` after recovery completes | Normal durable cutover request path applies |
+| 1 | Storage before recovery | Apply is stored as `waiting_for_cutover` | The last known durable state says cutover had become ready |
+| 2 | Scheduler | Claims the stale MySQL/Spirit apply after the old owner stopped heartbeating | Recovery begins |
+| 3 | Scheduler | Verifies `_spirit_sentinel` still exists in the target database | Sentinel presence means cutover has not been signaled safely yet |
+| 4 | Storage | Marks apply and non-terminal tasks `recovering` | CLI watch / PR comments show recovery rather than generic running |
+| 5 | Operator / CLI | Requests `/cutover` while recovery is in progress | Request is rejected with a recovering message; no durable cutover request is queued |
+| 6a | Remote/local Tern | Reattaches to Spirit checkpoint and reports row copy | Storage moves to `running`; cutover remains unavailable through the normal not-ready path |
+| 6b | Remote/local Tern | Reports `waiting_for_cutover` after row copy/checksum complete | Storage moves to `waiting_for_cutover` |
+| 7 | Operator / CLI | Issues a new `/cutover` after recovery completes | Normal durable cutover request path applies |
 
 **End state:** apply is `waiting_for_cutover` again, and a fresh operator cutover
 request can proceed. Recovery must not silently accept cutover before Spirit has
 reattached to the sentinel wait.
 
-### Durable cutover request exists before deferred-cutover recovery
+### Start state: durable cutover request already exists before recovery starts
 
 This is different from a fresh `/cutover` request during recovery. The user has
 already been told the cutover request was accepted, so SchemaBot must preserve
@@ -268,15 +274,21 @@ accepted, or failed with a visible error if the later Cutover RPC fails. It must
 not be failed merely because recovery or row copy is in progress, and it must not
 be sent while the engine has not yet reached `waiting_for_cutover`.
 
-### Deferred-cutover recovery finds Spirit sentinel absent
+### Start state: storage is `waiting_for_cutover`; Spirit sentinel is absent after restart
+
+SchemaBot has already stored the apply as cutover-ready, but the old owner died.
+On restart, the new scheduler owner finds no sentinel. That means cutover may
+already have been signaled manually or by another recovered owner, so SchemaBot
+must reconcile from live schema instead of staying in recovery.
 
 | Step | Actor | What happens | User-visible result |
 | --- | --- | --- | --- |
-| 1 | Scheduler | Claims a stale MySQL/Spirit apply stored as `waiting_for_cutover` | Recovery begins after the old owner stopped heartbeating |
-| 2 | Scheduler | Verifies `_spirit_sentinel` is absent in the target database | Sentinel absence means cutover may already have been signaled manually or by another recovered owner |
-| 3 | Scheduler | Re-plans against the live schema | Live schema determines whether any DDL work remains |
-| 4a | Storage | Desired schema is already present | Apply/tasks are marked `completed`; observers show completion |
-| 4b | Storage / engine | Desired schema is not yet present | Remaining work resumes through normal checkpoint recovery |
+| 1 | Storage before recovery | Apply is stored as `waiting_for_cutover` | The last known durable state says cutover had become ready |
+| 2 | Scheduler | Claims the stale MySQL/Spirit apply after the old owner stopped heartbeating | Recovery begins |
+| 3 | Scheduler | Verifies `_spirit_sentinel` is absent in the target database | Sentinel absence means cutover may already have been signaled manually or by another recovered owner |
+| 4 | Scheduler | Re-plans against the live schema | Live schema determines whether any DDL work remains |
+| 5a | Storage | Desired schema is already present | Apply/tasks are marked `completed`; observers show completion |
+| 5b | Storage / engine | Desired schema is not yet present | Remaining work resumes through normal checkpoint recovery |
 
 **End state:** SchemaBot reconciles from live schema instead of entering
 `recovering` forever. If an operator manually dropped the sentinel while
