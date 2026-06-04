@@ -191,11 +191,8 @@ func (s *applyOperationStore) checkUpdatedOrExists(ctx context.Context, result s
 		if err != nil {
 			return err
 		}
-		if !exists && missingOK {
-			return nil
-		}
 		if !exists {
-			return storage.ErrApplyOperationNotFound
+			return applyOperationMissingResult(id, missingOK)
 		}
 		if !belongs {
 			return fmt.Errorf("apply_operation %d is not owned by apply lease %d: %w", id, lease.ApplyID, storage.ErrApplyLeaseLost)
@@ -208,13 +205,17 @@ func (s *applyOperationStore) checkUpdatedOrExists(ctx context.Context, result s
 	).Scan(&exists); err != nil {
 		return fmt.Errorf("verify apply_operation exists (id=%d): %w", id, err)
 	}
-	if !exists && missingOK {
-		return nil
-	}
 	if !exists {
-		return storage.ErrApplyOperationNotFound
+		return applyOperationMissingResult(id, missingOK)
 	}
 	return nil
+}
+
+func applyOperationMissingResult(id int64, missingOK bool) error {
+	if missingOK {
+		return nil
+	}
+	return fmt.Errorf("apply_operation %d not found: %w", id, storage.ErrApplyOperationNotFound)
 }
 
 func (s *applyOperationStore) applyOperationBelongsToLease(ctx context.Context, id int64, lease storage.ApplyLease) (bool, bool, error) {
