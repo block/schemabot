@@ -238,7 +238,8 @@ the sentinel wait. Cutover requests are rejected in this phase. Once progress
 reports `waiting_for_cutover` again, SchemaBot returns the apply to
 `waiting_for_cutover`, and a new cutover request can be processed by the normal
 durable-owner path. The sentinel is a narrow durable fallback until Spirit exposes
-an explicit resume outcome/status API.
+an explicit resume outcome/status API; sentinel presence is enough to block
+cutover safely, but it does not prove Spirit reused prior row-copy progress.
 
 If the sentinel is already absent when SchemaBot restarts, recovery does not
 enter `recovering_cutover`. The scheduler re-plans against the live schema; if
