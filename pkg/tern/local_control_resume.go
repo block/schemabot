@@ -436,11 +436,11 @@ func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *s
 func shouldInspectDeferredCutoverSignal(apply *storage.Apply) bool {
 	return apply != nil &&
 		apply.GetOptions().DeferCutover &&
-		state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.RecoveringCutover)
+		state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.Recovering)
 }
 
-func (c *LocalClient) markApplyRecoveringCutover(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
-	c.logger.Info("entering deferred cutover recovery state",
+func (c *LocalClient) markApplyRecovering(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
+	c.logger.Info("entering recovery state for deferred cutover checkpoint",
 		"apply_id", apply.ApplyIdentifier,
 		"database", apply.Database,
 		"database_type", apply.DatabaseType,
@@ -448,23 +448,23 @@ func (c *LocalClient) markApplyRecoveringCutover(ctx context.Context, apply *sto
 	oldApplyState := apply.State
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
-			c.logger.Debug("leaving terminal task unchanged during deferred cutover recovery",
+			c.logger.Debug("leaving terminal task unchanged during recovery",
 				"apply_id", apply.ApplyIdentifier,
 				"task_id", task.TaskIdentifier,
 				"task_state", task.State)
 			continue
 		}
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.RecoveringCutover,
-			fmt.Sprintf("Task %s is recovering deferred cutover state", task.TaskIdentifier))
+		c.transitionTaskState(ctx, task, apply.ID, state.Task.Recovering,
+			fmt.Sprintf("Task %s is recovering after restart", task.TaskIdentifier))
 	}
-	apply.State = state.Apply.RecoveringCutover
+	apply.State = state.Apply.Recovering
 	apply.CompletedAt = nil
 	apply.UpdatedAt = time.Now()
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("mark apply %s recovering deferred cutover: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("mark apply %s recovering after restart: %w", apply.ApplyIdentifier, err)
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-		"Recovering deferred cutover state before accepting cutover requests", oldApplyState, state.Apply.RecoveringCutover)
+		"Recovering after restart before accepting cutover requests", oldApplyState, state.Apply.Recovering)
 	return nil
 }
 
@@ -554,19 +554,19 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 
 	now := time.Now()
 	oldApplyState := apply.State
-	recoveringCutover := state.IsState(oldApplyState, state.Apply.RecoveringCutover)
+	recovering := state.IsState(oldApplyState, state.Apply.Recovering)
 
 	for _, task := range tasks {
 		taskState := state.Task.Running
-		if recoveringCutover {
-			taskState = state.Task.RecoveringCutover
+		if recovering {
+			taskState = state.Task.Recovering
 		}
 		c.transitionTaskState(ctx, task, 0, taskState, "")
 	}
 
 	apply.State = state.Apply.Running
-	if recoveringCutover {
-		apply.State = state.Apply.RecoveringCutover
+	if recovering {
+		apply.State = state.Apply.Recovering
 	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
@@ -677,7 +677,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		}
 		if signalSupported {
 			if signalExists {
-				if err := c.markApplyRecoveringCutover(ctx, apply, tasks); err != nil {
+				if err := c.markApplyRecovering(ctx, apply, tasks); err != nil {
 					return err
 				}
 				options := buildApplyOptions(apply)
@@ -685,7 +685,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 				cancelGeneration := c.setApplyCancel(cancelResume)
 				defer c.clearApplyCancel(cancelGeneration)
 				defer cancelResume()
-				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering deferred cutover from checkpoint", true, false); err != nil {
+				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering from checkpoint", true, false); err != nil {
 					return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err), false)
 				}
 				return ctx.Err()

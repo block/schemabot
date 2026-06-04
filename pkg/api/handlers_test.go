@@ -2671,10 +2671,10 @@ func TestCutoverHandler(t *testing.T) {
 		assert.Equal(t, apitypes.ControlStatusAlreadyInProgress, resp.Status)
 	})
 
-	t.Run("rejects cutover while deferred cutover state is recovering", func(t *testing.T) {
+	t.Run("rejects cutover while apply is recovering", func(t *testing.T) {
 		mock := &mockTernClient{}
 		apply := activeTestApply("apply-recovering-cutover")
-		apply.State = state.Apply.RecoveringCutover
+		apply.State = state.Apply.Recovering
 		svc := newControlTestService(mock, apply)
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
@@ -2695,14 +2695,14 @@ func TestCutoverHandler(t *testing.T) {
 		var resp apitypes.ErrorResponse
 		err = json.NewDecoder(w.Body).Decode(&resp)
 		require.NoError(t, err)
-		assert.Contains(t, resp.Error, "recovering deferred cutover state")
+		assert.Contains(t, resp.Error, "recovering after restart")
 	})
 
-	t.Run("rejects cutover while remote deferred cutover state is recovering", func(t *testing.T) {
+	t.Run("rejects cutover while remote apply is recovering", func(t *testing.T) {
 		mock := &mockTernClient{
 			isRemote: true,
 			progressResp: &ternv1.ProgressResponse{
-				State: ternv1.State_STATE_RECOVERING_CUTOVER,
+				State: ternv1.State_STATE_RECOVERING,
 			},
 		}
 		apply := activeTestApply("apply-remote-recovering-cutover")
@@ -2728,7 +2728,7 @@ func TestCutoverHandler(t *testing.T) {
 		var resp apitypes.ErrorResponse
 		err = json.NewDecoder(w.Body).Decode(&resp)
 		require.NoError(t, err)
-		assert.Contains(t, resp.Error, "recovering deferred cutover state")
+		assert.Contains(t, resp.Error, "recovering after restart")
 	})
 
 	t.Run("queues cutover when remote progress reaches cutting over before stored state", func(t *testing.T) {

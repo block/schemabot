@@ -406,8 +406,8 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		}
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
-	if state.IsState(apply.State, state.Apply.RecoveringCutover) {
-		slog.Info("pending gRPC cutover request is waiting for cutover recovery to complete",
+	if state.IsState(apply.State, state.Apply.Recovering) {
+		slog.Info("pending gRPC cutover request is waiting for recovery to complete",
 			"apply_id", apply.ApplyIdentifier,
 			"external_id", apply.ExternalID,
 			"database", apply.Database,

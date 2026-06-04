@@ -389,14 +389,14 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		return &apitypes.ControlResponse{Accepted: true, Status: apitypes.ControlStatusAlreadyInProgress}, http.StatusAccepted, nil
 	}
 	if readiness == cutoverRequestRecovering {
-		s.logger.Info("cutover request rejected while deferred cutover state is recovering",
+		s.logger.Info("cutover request rejected while apply is recovering",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"deployment", apply.Deployment,
 			"environment", apply.Environment,
 			"requested_by", caller,
 			"state", apply.State)
-		err := controlConflictf("schema change is recovering deferred cutover state after restart; cutover will be available once recovery completes")
+		err := controlConflictf("schema change is recovering after restart; cutover will be available once recovery completes")
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, http.StatusOK, err
 	}
@@ -451,7 +451,7 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 	if state.IsState(apply.State, state.Apply.CuttingOver) {
 		return cutoverRequestAlreadyInProgress, nil
 	}
-	if state.IsState(apply.State, state.Apply.RecoveringCutover) {
+	if state.IsState(apply.State, state.Apply.Recovering) {
 		return cutoverRequestRecovering, nil
 	}
 	if client != nil && client.IsRemote() && ternApplyID != "" {
@@ -466,7 +466,7 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 		if state.IsState(remoteState, state.Apply.WaitingForCutover) {
 			return cutoverRequestReady, nil
 		}
-		if state.IsState(remoteState, state.Apply.RecoveringCutover) {
+		if state.IsState(remoteState, state.Apply.Recovering) {
 			return cutoverRequestRecovering, nil
 		}
 		if state.IsState(remoteState, state.Apply.CuttingOver) {

@@ -960,11 +960,11 @@ func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t
 	assert.True(t, hasLogMessageContaining(logs, "All tasks already completed on resume (final schema check shows no remaining changes)"))
 }
 
-// This scenario covers a scheduler-owned deferred-cutover recovery where
-// storage was waiting for cutover before restart and Spirit's durable sentinel
-// still exists. Cutover must stay blocked until the engine reattaches and
-// reports that it is waiting for cutover again.
-func TestLocalClient_ResumeApplyDeferredCutoverEntersRecoveringState(t *testing.T) {
+// This scenario covers restart recovery where storage was waiting for cutover
+// and Spirit's durable sentinel still exists. Recovery stays visible until the
+// engine reports concrete work, then storage returns to the normal active state
+// and later reaches cutover readiness through the ordinary progress path.
+func TestLocalClient_ResumeApplyDeferredCutoverRecoveryReturnsToConcreteEngineState(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -1070,11 +1070,11 @@ func TestLocalClient_ResumeApplyDeferredCutoverEntersRecoveringState(t *testing.
 			}},
 		}},
 		progress: &engine.ProgressResult{
-			State: engine.StateRunning,
+			State: engine.StatePending,
 			Tables: []engine.TableProgress{{
 				Namespace: "testdb",
 				Table:     "users",
-				State:     state.Task.Running,
+				State:     state.Task.Pending,
 			}},
 		},
 	}
@@ -1088,19 +1088,19 @@ func TestLocalClient_ResumeApplyDeferredCutoverEntersRecoveringState(t *testing.
 	storedApply, err := stor.Applies().Get(ctx, applyID)
 	require.NoError(t, err)
 	require.NotNil(t, storedApply)
-	assert.Equal(t, state.Apply.RecoveringCutover, storedApply.State)
+	assert.Equal(t, state.Apply.Recovering, storedApply.State)
 
 	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
 	require.NoError(t, err)
 	require.NotNil(t, storedTask)
-	assert.Equal(t, state.Task.RecoveringCutover, storedTask.State)
+	assert.Equal(t, state.Task.Recovering, storedTask.State)
 
 	progressResp, err := client.Progress(ctx, &ternv1.ProgressRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, ternv1.State_STATE_RECOVERING_CUTOVER, progressResp.State)
+	assert.Equal(t, ternv1.State_STATE_RECOVERING, progressResp.State)
 
 	cutoverResp, err := client.Cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     apply.ApplyIdentifier,
@@ -1109,7 +1109,33 @@ func TestLocalClient_ResumeApplyDeferredCutoverEntersRecoveringState(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, cutoverResp)
 	assert.False(t, cutoverResp.Accepted)
-	assert.Contains(t, cutoverResp.ErrorMessage, "recovering deferred cutover")
+	assert.Contains(t, cutoverResp.ErrorMessage, "recovering")
+
+	recoveryEngine.progress = &engine.ProgressResult{
+		State: engine.StateRunning,
+		Tables: []engine.TableProgress{{
+			Namespace: "testdb",
+			Table:     "users",
+			State:     state.Task.Running,
+			Progress:  42,
+		}},
+	}
+	progressResp, err = client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.State_STATE_RUNNING, progressResp.State)
+
+	storedApply, err = stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Running, storedApply.State)
+
+	storedTask, err = stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Running, storedTask.State)
 
 	recoveryEngine.progress = &engine.ProgressResult{
 		State: engine.StateWaitingForCutover,

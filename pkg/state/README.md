@@ -24,7 +24,7 @@ the stored task rows.
 | ValidatingDeployRequest | `validating_deploy_request` | PlanetScale is validating the deploy request diff (PlanetScale only) |
 | WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only). Without `--defer-deploy`, auto-advances immediately. |
 | WaitingForCutover | `waiting_for_cutover` | All tasks ready, waiting for manual cutover (atomic mode only — in sequential mode each task cuts over independently) |
-| RecoveringCutover | `recovering_cutover` | Deferred cutover recovery is reattaching to engine checkpoint state. Cutover is blocked until the engine reports `waiting_for_cutover` again. |
+| Recovering | `recovering` | Restart recovery is reattaching to engine state. Control actions that require a later phase are blocked until the engine reports concrete progress again. |
 | CuttingOver | `cutting_over` | Cutover in progress (atomic mode only) |
 | Completed | `completed` | All tasks finished successfully |
 | Failed | `failed` | At least one task failed |
@@ -54,9 +54,9 @@ stateDiagram-v2
     failed_retryable --> running : scheduler retry
     failed_retryable --> failed : retry budget or recovery window exhausted
 
-    waiting_for_cutover --> recovering_cutover : restart before cutover
-    recovering_cutover --> waiting_for_cutover : engine reattached
-    recovering_cutover --> failed : recovery failed
+    waiting_for_cutover --> recovering : restart before cutover
+    recovering --> waiting_for_cutover : engine reattached
+    recovering --> failed : recovery failed
     waiting_for_cutover --> cutting_over
     cutting_over --> completed
 
@@ -66,7 +66,7 @@ stateDiagram-v2
 
 - `waiting_for_deploy`: PlanetScale only. The deploy request is created and ready, but not yet executed. With `--defer-deploy`, the user reviews the deploy request diff on PlanetScale and triggers via `schemabot cutover`. Without `--defer-deploy`, the system auto-advances through this state. For instant DDL, the deploy completes immediately after triggering. `--defer-deploy` and `--defer-cutover` compose: the first pauses before deploy, the second pauses before cutover.
 - `waiting_for_cutover`/`cutting_over`: Only with `--defer-cutover` or atomic mode (Spirit). Note: `--defer-cutover` is a no-op for instant DDL (no cutover exists).
-- `recovering_cutover`: MySQL/Spirit only. Storage previously reached `waiting_for_cutover`, but after restart the engine must resume from checkpoint and reattach to the sentinel wait before cutover is safe. Control operations that would advance cutover are blocked in this state.
+- `recovering`: Temporary restart recovery. Current MySQL/Spirit deferred-cutover recovery enters this state while reattaching to checkpoint state, then returns to `running` if row copy is active or `waiting_for_cutover` once cutover is safe again. Control operations that require a later phase are blocked while recovery is active.
 - `revert_window`: Only with `--enable-revert`. Spirit auto-advances through it; PlanetScale holds until expiry or user action. Maps from PlanetScale's `complete_pending_revert` deploy state
 - `stopped`: Spirit only — resumable via `schemabot start`. Spirit checkpoints progress for resume.
 - `failed_retryable`: transient engine failure. Scheduler workers retry while the retry budget remains, then move the apply to `failed`.
@@ -82,7 +82,7 @@ Per-table execution state. Mostly mirrors Apply state, with per-table scheduler/
 | Running | `running` | Engine is actively executing (row copy, checksum, etc.) |
 | WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only) |
 | WaitingForCutover | `waiting_for_cutover` | Row copy complete, waiting for cutover signal |
-| RecoveringCutover | `recovering_cutover` | Engine is reattaching to deferred cutover checkpoint state after restart |
+| Recovering | `recovering` | Engine is reattaching to state after restart |
 | CuttingOver | `cutting_over` | Table cutover in progress |
 | Completed | `completed` | Schema change applied successfully |
 | Failed | `failed` | Engine reported failure |
@@ -146,7 +146,7 @@ Next dispatch:
 4. Any task **stopped** → apply `stopped`
 5. Any task **reverted** → apply `reverted`
 6. All tasks **completed** → apply `completed`
-7. Any task **recovering_cutover** → apply `recovering_cutover`
+7. Any task **recovering** → apply `recovering`
 8. Any task **cutting_over** → apply `cutting_over`
 9. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
 10. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`

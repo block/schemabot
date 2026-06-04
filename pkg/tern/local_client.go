@@ -691,7 +691,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		switch {
 		case t.State == state.Task.Running ||
 			t.State == state.Task.WaitingForCutover ||
-			t.State == state.Task.RecoveringCutover ||
+			t.State == state.Task.Recovering ||
 			t.State == state.Task.CuttingOver ||
 			t.State == state.Task.RevertWindow:
 			// Prefer actively running/waiting tasks
@@ -1103,10 +1103,11 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 		return engineTaskState
 	}
 
-	// Recovering cutover is a scheduler-owned pause while Spirit reattaches to
-	// the deferred-cutover checkpoint. Once the engine reports waiting for
-	// cutover again, recovery is complete and cutover requests can be processed.
-	if state.IsState(storedTaskState, state.Task.RecoveringCutover) && state.IsState(engineTaskState, state.Task.WaitingForCutover) {
+	// Recovering is a temporary scheduler-owned wrapper while an engine reattaches
+	// after restart. Once the engine reports a concrete active state, storage
+	// returns to that normal state so the UI does not stay in recovery for the rest
+	// of a long row copy.
+	if state.IsState(storedTaskState, state.Task.Recovering) && recoveryCompleteWithEngineState(engineTaskState) {
 		return engineTaskState
 	}
 
@@ -1142,7 +1143,17 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 // can stop a task while the engine still reports running for a short window, or
 // the scheduler can mark a task failed_retryable before a retry claims it.
 func blocksActiveEngineProgress(taskState string) bool {
-	return state.IsState(taskState, state.Task.Stopped, state.Task.FailedRetryable, state.Task.RecoveringCutover)
+	return state.IsState(taskState, state.Task.Stopped, state.Task.FailedRetryable)
+}
+
+func recoveryCompleteWithEngineState(taskState string) bool {
+	return state.IsState(taskState,
+		state.Task.WaitingForDeploy,
+		state.Task.Running,
+		state.Task.WaitingForCutover,
+		state.Task.CuttingOver,
+		state.Task.RevertWindow,
+	)
 }
 
 // activeTaskProgressRank orders ordinary active task phases. Terminal states

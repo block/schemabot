@@ -162,7 +162,7 @@ func TableStatePriority(taskState string) int {
 	switch taskState {
 	case state.Task.Running, state.Task.CuttingOver:
 		return 0 // active — top
-	case state.Task.WaitingForCutover, state.Task.RecoveringCutover:
+	case state.Task.WaitingForCutover, state.Task.Recovering:
 		return 1
 	case state.Task.Pending:
 		return 2

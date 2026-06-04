@@ -151,14 +151,14 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 			wantFields: []string{"table=users"},
 		},
 		{
-			name:       "recovering cutover",
-			status:     state.Apply.RecoveringCutover,
-			wantMsg:    "Recovering cutover state",
+			name:       "recovering",
+			status:     state.Apply.Recovering,
+			wantMsg:    "Recovering state",
 			wantFields: []string{"table=users"},
 		},
 		{
-			name:       "recovering cutover copying rows",
-			status:     state.Apply.RecoveringCutover,
+			name:       "recovering copying rows",
+			status:     state.Apply.Recovering,
 			pct:        42,
 			wantMsg:    "Row copy in progress during restart recovery",
 			wantFields: []string{"table=users", "progress=42%", "rows=420/1,000", "eta=\"2m 0s\""},
@@ -193,7 +193,7 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 				TableName:       "users",
 				PercentComplete: tt.pct,
 			}
-			if tt.name == "recovering cutover copying rows" {
+			if tt.name == "recovering copying rows" {
 				tbl.RowsCopied = 420
 				tbl.RowsTotal = 1000
 				tbl.ETASeconds = 120
@@ -363,7 +363,7 @@ func TestIsActiveStatus(t *testing.T) {
 	assert.True(t, isActiveStatus(state.Apply.Running))
 	assert.True(t, isActiveStatus(state.Apply.Pending))
 	assert.True(t, isActiveStatus(state.Apply.WaitingForCutover))
-	assert.True(t, isActiveStatus(state.Apply.RecoveringCutover))
+	assert.True(t, isActiveStatus(state.Apply.Recovering))
 	assert.True(t, isActiveStatus(state.Apply.CuttingOver))
 }
 

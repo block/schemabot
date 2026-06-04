@@ -85,8 +85,8 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("## Schema Change — Waiting for Deploy\n\n")
 	case state.Apply.WaitingForCutover:
 		sb.WriteString("## Schema Change — Waiting for Cutover\n\n")
-	case state.Apply.RecoveringCutover:
-		sb.WriteString("## Schema Change — Recovering Cutover\n\n")
+	case state.Apply.Recovering:
+		sb.WriteString("## Schema Change — Recovering\n\n")
 	case state.Apply.CuttingOver:
 		sb.WriteString("## Schema Change — Cutting Over\n\n")
 	case state.Apply.RevertWindow:
@@ -200,7 +200,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			queued++
 		case state.Task.WaitingForCutover:
 			waiting++
-		case state.Task.RecoveringCutover:
+		case state.Task.Recovering:
 			recovering++
 		case state.Task.CuttingOver:
 			cutting++
@@ -243,9 +243,9 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 	if recovering > 0 {
 		if multi {
-			parts = append(parts, fmt.Sprintf("%d recovering cutover", recovering))
+			parts = append(parts, fmt.Sprintf("%d recovering", recovering))
 		} else {
-			parts = append(parts, "recovering cutover")
+			parts = append(parts, "recovering")
 		}
 	}
 	if cutting > 0 {
@@ -325,8 +325,8 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 		}
 		writeDDLLine(sb, table.DDL)
 
-	case state.Task.RecoveringCutover:
-		if recoveringCutoverIsCopyingRows(table) {
+	case state.Task.Recovering:
+		if recoveringIsCopyingRows(table) {
 			pct := ui.ClampPercent(table.PercentComplete)
 			bar := ui.ProgressBarRowCopy(pct)
 			fmt.Fprintf(sb, "**`%s`**: %s Row copy in progress (%d%%)\n", table.TableName, bar, pct)
@@ -335,7 +335,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 			break
 		}
 		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(sb, "**`%s`**: %s Recovering cutover state...\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s Recovering state...\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.CuttingOver:
@@ -383,15 +383,15 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 	}
 }
 
-func recoveringCutoverIsCopyingRows(table TableProgressData) bool {
+func recoveringIsCopyingRows(table TableProgressData) bool {
 	return table.RowsTotal > 0 && table.PercentComplete < 100
 }
 
-func recoveringCutoverCopyPercent(tables []TableProgressData) (int, bool) {
+func recoveringCopyPercent(tables []TableProgressData) (int, bool) {
 	percent := 100
 	found := false
 	for _, table := range tables {
-		if state.NormalizeTaskStatus(table.Status) != state.Task.RecoveringCutover || !recoveringCutoverIsCopyingRows(table) {
+		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || !recoveringIsCopyingRows(table) {
 			continue
 		}
 		percent = min(percent, ui.ClampPercent(table.PercentComplete))
@@ -457,12 +457,12 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeFooterAction(sb, "To deploy:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
 	case state.Apply.WaitingForCutover:
 		writeFooterAction(sb, "To proceed with cutover:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
-	case state.Apply.RecoveringCutover:
+	case state.Apply.Recovering:
 		sb.WriteString("\n---\n\n")
-		if pct, ok := recoveringCutoverCopyPercent(data.Tables); ok {
-			fmt.Fprintf(sb, "Recovering deferred cutover state after restart. Row copy is in progress (%d%%); when row copy and checksum reach cutover readiness, this returns to waiting for cutover.\n", pct)
+		if pct, ok := recoveringCopyPercent(data.Tables); ok {
+			fmt.Fprintf(sb, "Recovering after restart. Row copy is in progress (%d%%); once recovery completes, progress returns to the normal row-copy view.\n", pct)
 		} else {
-			sb.WriteString("Recovering deferred cutover state after restart. Cutover will be available once recovery completes.\n")
+			sb.WriteString("Recovering after restart. Cutover will be available once recovery completes.\n")
 		}
 	case state.Apply.CuttingOver:
 		sb.WriteString("\n---\n\n")

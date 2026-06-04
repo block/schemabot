@@ -82,8 +82,8 @@ func (m WatchModel) progressView() string {
 		if m.cutoverTriggered {
 			b.WriteString(m.spinner.View() + "Cutover triggered, waiting for completion...\n")
 		}
-	case state.IsState(m.state, state.Apply.RecoveringCutover):
-		b.WriteString(m.spinner.View() + "Recovering cutover state...\n")
+	case state.IsState(m.state, state.Apply.Recovering):
+		b.WriteString(m.spinner.View() + "Recovering state...\n")
 	case state.IsState(m.state, state.Apply.CuttingOver):
 		b.WriteString(m.spinner.View() + "Cutting over...\n")
 	case state.IsState(m.state, state.Apply.Completed):
@@ -217,12 +217,12 @@ func (m WatchModel) progressView() string {
 			}
 			b.WriteString("Watching for cutover... (ESC to detach)\n")
 		}
-	case state.IsState(m.state, state.Apply.RecoveringCutover):
+	case state.IsState(m.state, state.Apply.Recovering):
 		b.WriteString("\n\n")
-		if pct, ok := recoveringCutoverCopyPercent(m.tables); ok {
-			fmt.Fprintf(&b, "SchemaBot is recovering deferred cutover state after restart.\nRow copy is in progress (%d%%); when row copy and checksum reach cutover readiness, this returns to waiting for cutover. (ESC to detach)\n", pct)
+		if pct, ok := recoveringCopyPercent(m.tables); ok {
+			fmt.Fprintf(&b, "SchemaBot is recovering after restart.\nRow copy is in progress (%d%%); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
 		} else {
-			b.WriteString("SchemaBot is recovering deferred cutover state after restart.\n")
+			b.WriteString("SchemaBot is recovering after restart.\n")
 			b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
 		}
 	case state.IsState(m.state, state.Apply.Running):
@@ -263,11 +263,11 @@ func (m WatchModel) fetchErrorLine() string {
 	return errStyle.Render(label+": "+m.errorMsg) + "\n"
 }
 
-func recoveringCutoverCopyPercent(tables []tableProgress) (int, bool) {
+func recoveringCopyPercent(tables []tableProgress) (int, bool) {
 	percent := 100
 	found := false
 	for _, table := range tables {
-		if state.NormalizeTaskStatus(table.Status) != state.Task.RecoveringCutover || table.RowsTotal <= 0 || table.Percent >= 100 {
+		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || table.RowsTotal <= 0 || table.Percent >= 100 {
 			continue
 		}
 		percent = min(percent, ui.ClampPercent(table.Percent))

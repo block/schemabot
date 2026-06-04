@@ -491,14 +491,14 @@ func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhenNotReady(t *tes
 	assert.Equal(t, storage.ControlRequestPending, pending.Status)
 }
 
-func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhileRecoveringCutover(t *testing.T) {
+func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhileRecovering(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              129,
 		ApplyIdentifier: "apply-cutover-recovering-local",
 		Database:        "testdb",
 		DatabaseType:    storage.DatabaseTypeMySQL,
 		Environment:     "staging",
-		State:           state.Apply.RecoveringCutover,
+		State:           state.Apply.Recovering,
 	}
 	task := &storage.Task{
 		ID:             462,
@@ -507,7 +507,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhileRecoveringCuto
 		Database:       "testdb",
 		DatabaseType:   storage.DatabaseTypeMySQL,
 		TableName:      "users",
-		State:          state.Task.RecoveringCutover,
+		State:          state.Task.Recovering,
 	}
 	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
 		ApplyID:     apply.ID,
@@ -832,6 +832,18 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 			engineTableState: state.Task.Running,
 			expected:         state.Task.FailedRetryable,
 		},
+		{
+			name:             "recovery returns to normal row copy after engine reattaches",
+			storedTaskState:  state.Task.Recovering,
+			engineTableState: state.Task.Running,
+			expected:         state.Task.Running,
+		},
+		{
+			name:             "recovery stays visible until engine reports concrete work",
+			storedTaskState:  state.Task.Recovering,
+			engineTableState: state.Task.Pending,
+			expected:         state.Task.Recovering,
+		},
 	}
 
 	for _, tc := range tests {
@@ -841,8 +853,8 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 	}
 }
 
-func TestRecoveringCutoverProtoConversion(t *testing.T) {
-	assert.Equal(t, ternv1.State_STATE_RECOVERING_CUTOVER, storageStateToProto(state.Apply.RecoveringCutover))
-	assert.Equal(t, ternv1.State_STATE_RECOVERING_CUTOVER, storageStateToProto(state.Task.RecoveringCutover))
-	assert.Equal(t, state.Apply.RecoveringCutover, ProtoStateToStorage(ternv1.State_STATE_RECOVERING_CUTOVER))
+func TestRecoveringProtoConversion(t *testing.T) {
+	assert.Equal(t, ternv1.State_STATE_RECOVERING, storageStateToProto(state.Apply.Recovering))
+	assert.Equal(t, ternv1.State_STATE_RECOVERING, storageStateToProto(state.Task.Recovering))
+	assert.Equal(t, state.Apply.Recovering, ProtoStateToStorage(ternv1.State_STATE_RECOVERING))
 }

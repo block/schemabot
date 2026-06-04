@@ -90,7 +90,7 @@ const (
 	State_STATE_WAITING_FOR_DEPLOY        State = 14
 	State_STATE_VALIDATING_DEPLOY_REQUEST State = 15
 	State_STATE_VALIDATING_BRANCH         State = 16
-	State_STATE_RECOVERING_CUTOVER        State = 17
+	State_STATE_RECOVERING                State = 17
 )
 
 // Enum value maps for State.
@@ -113,7 +113,7 @@ var (
 		14: "STATE_WAITING_FOR_DEPLOY",
 		15: "STATE_VALIDATING_DEPLOY_REQUEST",
 		16: "STATE_VALIDATING_BRANCH",
-		17: "STATE_RECOVERING_CUTOVER",
+		17: "STATE_RECOVERING",
 	}
 	State_value = map[string]int32{
 		"STATE_NO_ACTIVE_CHANGE":          0,
@@ -133,7 +133,7 @@ var (
 		"STATE_WAITING_FOR_DEPLOY":        14,
 		"STATE_VALIDATING_DEPLOY_REQUEST": 15,
 		"STATE_VALIDATING_BRANCH":         16,
-		"STATE_RECOVERING_CUTOVER":        17,
+		"STATE_RECOVERING":                17,
 	}
 )
 
@@ -2276,7 +2276,7 @@ const file_tern_proto_rawDesc = "" +
 	"new_volume\x18\x04 \x01(\x05R\tnewVolume*3\n" +
 	"\x06Engine\x12\x11\n" +
 	"\rENGINE_SPIRIT\x10\x00\x12\x16\n" +
-	"\x12ENGINE_PLANETSCALE\x10\x01*\xdc\x03\n" +
+	"\x12ENGINE_PLANETSCALE\x10\x01*\xd4\x03\n" +
 	"\x05State\x12\x1a\n" +
 	"\x16STATE_NO_ACTIVE_CHANGE\x10\x00\x12\x11\n" +
 	"\rSTATE_PENDING\x10\x01\x12\x11\n" +
@@ -2295,8 +2295,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x1dSTATE_CREATING_DEPLOY_REQUEST\x10\r\x12\x1c\n" +
 	"\x18STATE_WAITING_FOR_DEPLOY\x10\x0e\x12#\n" +
 	"\x1fSTATE_VALIDATING_DEPLOY_REQUEST\x10\x0f\x12\x1b\n" +
-	"\x17STATE_VALIDATING_BRANCH\x10\x10\x12\x1c\n" +
-	"\x18STATE_RECOVERING_CUTOVER\x10\x11*\x81\x01\n" +
+	"\x17STATE_VALIDATING_BRANCH\x10\x10\x12\x14\n" +
+	"\x10STATE_RECOVERING\x10\x11*\x81\x01\n" +
 	"\n" +
 	"ChangeType\x12\x15\n" +
 	"\x11CHANGE_TYPE_OTHER\x10\x00\x12\x16\n" +

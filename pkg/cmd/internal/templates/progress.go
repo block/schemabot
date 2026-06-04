@@ -347,7 +347,7 @@ func vschemaStatusLabel(status string) string {
 		return "Applying..."
 	case state.Apply.WaitingForDeploy:
 		return "Pending"
-	case state.Apply.WaitingForCutover, state.Apply.RecoveringCutover, state.Apply.CuttingOver:
+	case state.Apply.WaitingForCutover, state.Apply.Recovering, state.Apply.CuttingOver:
 		return "Applying..."
 	case state.Apply.Completed:
 		return "Applied"
@@ -394,8 +394,8 @@ func FormatProgressState(s string) string {
 		return ANSIYellow + "🟨 Waiting for deploy" + ANSIReset
 	case state.Apply.WaitingForCutover:
 		return ANSIYellow + "🟨 Waiting for cutover" + ANSIReset
-	case state.Apply.RecoveringCutover:
-		return ANSIYellow + "🟨 Recovering cutover" + ANSIReset
+	case state.Apply.Recovering:
+		return ANSIYellow + "🟨 Recovering" + ANSIReset
 	case state.Apply.CuttingOver:
 		return ANSICyan + "🔄 Cutting over..." + ANSIReset
 	case state.Apply.Completed:
@@ -465,8 +465,8 @@ func FormatTableProgress(t TableProgress) string {
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
-	case state.Apply.RecoveringCutover:
-		if recoveringCutoverIsCopyingRows(t) {
+	case state.Apply.Recovering:
+		if recoveringIsCopyingRows(t) {
 			pct := ui.ClampPercent(t.PercentComplete)
 			bar := ui.ProgressBarRowCopy(pct)
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Row copy in progress (%d%%)\n", t.TableName, bar, pct)
@@ -479,7 +479,7 @@ func FormatTableProgress(t TableProgress) string {
 			return b.String()
 		}
 		bar := ui.ProgressBarRowCopy(t.PercentComplete)
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovering cutover state...\n", t.TableName, bar)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovering state...\n", t.TableName, bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
@@ -643,7 +643,7 @@ func FormatTableProgress(t TableProgress) string {
 	return b.String()
 }
 
-func recoveringCutoverIsCopyingRows(t TableProgress) bool {
+func recoveringIsCopyingRows(t TableProgress) bool {
 	return t.RowsTotal > 0 && t.PercentComplete < 100
 }
 
@@ -1046,7 +1046,7 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIYellow)
 	case state.Apply.Running:
 		return colorWrap(ANSICyan)
-	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.RecoveringCutover, state.Apply.CuttingOver:
+	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Recovering, state.Apply.CuttingOver:
 		return colorWrap(ANSIYellow)
 	case state.Apply.Stopped:
 		return colorWrap(ANSIOrange)

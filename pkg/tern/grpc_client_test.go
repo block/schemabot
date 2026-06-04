@@ -2087,7 +2087,7 @@ func TestGRPCClient_ProcessPendingCutoverWaitsWhenNotReady(t *testing.T) {
 	assert.Equal(t, storage.ControlRequestPending, pendingCutover.Status)
 }
 
-func TestGRPCClient_ProcessPendingCutoverWaitsWhileRecoveringCutover(t *testing.T) {
+func TestGRPCClient_ProcessPendingCutoverWaitsWhileRecovering(t *testing.T) {
 	server := &capturingTernServer{}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
@@ -2099,7 +2099,7 @@ func TestGRPCClient_ProcessPendingCutoverWaitsWhileRecoveringCutover(t *testing.
 		DatabaseType:    storage.DatabaseTypeVitess,
 		Environment:     "staging",
 		ExternalID:      "remote-cutover-recovering-grpc",
-		State:           state.Apply.RecoveringCutover,
+		State:           state.Apply.Recovering,
 	}
 	storedApply := *apply
 	task := &storage.Task{
@@ -2107,7 +2107,7 @@ func TestGRPCClient_ProcessPendingCutoverWaitsWhileRecoveringCutover(t *testing.
 		ApplyID:        apply.ID,
 		TaskIdentifier: "task-cutover-recovering-grpc",
 		TableName:      "users",
-		State:          state.Task.RecoveringCutover,
+		State:          state.Task.Recovering,
 	}
 	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
 		ApplyID:     apply.ID,

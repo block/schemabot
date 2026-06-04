@@ -17,7 +17,7 @@ var Apply = struct {
 	Running           string
 	WaitingForDeploy  string
 	WaitingForCutover string
-	RecoveringCutover string
+	Recovering        string
 	CuttingOver       string
 	RevertWindow      string
 	Completed         string
@@ -40,7 +40,7 @@ var Apply = struct {
 	Running:           "running",
 	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
-	RecoveringCutover: "recovering_cutover",
+	Recovering:        "recovering",
 	CuttingOver:       "cutting_over",
 	RevertWindow:      "revert_window",
 	Completed:         "completed",
@@ -65,7 +65,7 @@ var Apply = struct {
 //  3. Any task STOPPED → Apply STOPPED
 //  4. Any task REVERTED → Apply REVERTED
 //  5. All tasks COMPLETED → Apply COMPLETED
-//  6. Any task RECOVERING_CUTOVER → Apply RECOVERING_CUTOVER
+//  6. Any task RECOVERING → Apply RECOVERING
 //  7. Any task CUTTING_OVER → Apply CUTTING_OVER
 //  8. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
 //  9. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
@@ -104,8 +104,8 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.Completed] == total {
 		return Apply.Completed
 	}
-	if counts[Apply.RecoveringCutover] > 0 {
-		return Apply.RecoveringCutover
+	if counts[Apply.Recovering] > 0 {
+		return Apply.Recovering
 	}
 	if counts[Apply.CuttingOver] > 0 {
 		return Apply.CuttingOver
@@ -138,8 +138,8 @@ func normalizeApplyState(raw string) string {
 		return Apply.WaitingForDeploy
 	case "WAITING_FOR_CUTOVER":
 		return Apply.WaitingForCutover
-	case "RECOVERING_CUTOVER":
-		return Apply.RecoveringCutover
+	case "RECOVERING":
+		return Apply.Recovering
 	case "CUTTING_OVER":
 		return Apply.CuttingOver
 	case "REVERT_WINDOW":

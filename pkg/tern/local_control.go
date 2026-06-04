@@ -68,15 +68,15 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 			return nil, fmt.Errorf("load apply %d before cutover: %w", task.ApplyID, storage.ErrApplyNotFound)
 		}
 	}
-	if state.IsState(apply.State, state.Apply.RecoveringCutover) {
-		c.logger.Info("cutover blocked while apply is recovering cutover state",
+	if state.IsState(apply.State, state.Apply.Recovering) {
+		c.logger.Info("cutover blocked while apply is recovering state",
 			"apply_id", apply.ApplyIdentifier,
 			"task_id", task.TaskIdentifier,
 			"task_state", task.State,
 			"apply_state", apply.State)
 		return &ternv1.CutoverResponse{
 			Accepted:     false,
-			ErrorMessage: "Schema change is recovering deferred cutover state after restart; cutover will be available once recovery completes.",
+			ErrorMessage: "Schema change is recovering after restart; cutover will be available once recovery completes.",
 		}, nil
 	}
 	if controlReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
@@ -156,8 +156,8 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
-	if state.IsState(apply.State, state.Apply.RecoveringCutover) {
-		c.logger.Info("pending cutover request is waiting for cutover recovery to complete",
+	if state.IsState(apply.State, state.Apply.Recovering) {
+		c.logger.Info("pending cutover request is waiting for recovery to complete",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"environment", apply.Environment,

@@ -48,8 +48,8 @@ var applyMetadata = map[string]ApplyStateInfo{
 	Apply.WaitingForCutover: {
 		Label: "Waiting for cutover",
 	},
-	Apply.RecoveringCutover: {
-		Label: "Recovering cutover",
+	Apply.Recovering: {
+		Label: "Recovering",
 	},
 	Apply.CuttingOver: {
 		Label: "Cutting over",
