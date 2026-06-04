@@ -187,14 +187,14 @@ func (s *applyOperationStore) checkUpdatedOrExists(ctx context.Context, result s
 		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
 			return err
 		}
-		belongs, exists, err := s.applyOperationBelongsToLease(ctx, id, lease)
+		match, err := s.applyOperationLeaseMatch(ctx, id, lease)
 		if err != nil {
 			return err
 		}
-		if !exists {
+		if !match.Exists {
 			return applyOperationMissingResult(id, missingOK)
 		}
-		if !belongs {
+		if !match.BelongsToLease {
 			return fmt.Errorf("apply_operation %d is not owned by apply lease %d: %w", id, lease.ApplyID, storage.ErrApplyLeaseLost)
 		}
 		return nil
@@ -218,7 +218,12 @@ func applyOperationMissingResult(id int64, missingOK bool) error {
 	return fmt.Errorf("apply_operation %d not found: %w", id, storage.ErrApplyOperationNotFound)
 }
 
-func (s *applyOperationStore) applyOperationBelongsToLease(ctx context.Context, id int64, lease storage.ApplyLease) (bool, bool, error) {
+type applyOperationLeaseMatch struct {
+	Exists         bool
+	BelongsToLease bool
+}
+
+func (s *applyOperationStore) applyOperationLeaseMatch(ctx context.Context, id int64, lease storage.ApplyLease) (applyOperationLeaseMatch, error) {
 	var applyID int64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT apply_id
@@ -226,12 +231,15 @@ func (s *applyOperationStore) applyOperationBelongsToLease(ctx context.Context, 
 		WHERE id = ?
 	`, id).Scan(&applyID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, false, nil
+		return applyOperationLeaseMatch{}, nil
 	}
 	if err != nil {
-		return false, false, fmt.Errorf("verify apply_operation lease ownership (id=%d): %w", id, err)
+		return applyOperationLeaseMatch{}, fmt.Errorf("verify apply_operation lease ownership (id=%d): %w", id, err)
 	}
-	return applyID == lease.ApplyID, true, nil
+	return applyOperationLeaseMatch{
+		Exists:         true,
+		BelongsToLease: applyID == lease.ApplyID,
+	}, nil
 }
 
 func applyOperationLeaseFromContext(ctx context.Context) (storage.ApplyLease, bool, error) {
