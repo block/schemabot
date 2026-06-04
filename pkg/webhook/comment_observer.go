@@ -241,10 +241,10 @@ func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
 }
 
 func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation string) bool {
-	// Observers created before scheduler-owned execution do not carry a lease;
-	// those legacy paths keep their existing behavior. When a scheduler lease is
-	// present, it is the authority for whether this observer may make external
-	// GitHub writes on behalf of the apply.
+	// PR apply observers are created before the durable apply row is claimed, so
+	// they may not have a lease at construction time. Once progress callbacks pass
+	// the claimed apply, fall back to the apply's current lease and use it as the
+	// authority for external GitHub writes.
 	lease := o.applyLease
 	if !lease.Valid() && apply != nil {
 		lease = apply.Lease()
@@ -272,9 +272,8 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 
 func (o *CommentObserver) contextWithApplyLease(ctx context.Context, apply *storage.Apply) context.Context {
 	// Storage writes that record GitHub side effects must use the same lease as
-	// the observer-side lease checks above. Unleased legacy observers keep using
-	// the caller context so existing non-scheduler paths do not start failing
-	// lease validation.
+	// the observer-side lease checks above. If this observer has not yet been
+	// given a claimed apply, there is no scheduler lease to propagate.
 	lease := o.applyLease
 	if !lease.Valid() && apply != nil {
 		lease = apply.Lease()
