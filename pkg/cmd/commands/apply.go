@@ -854,7 +854,7 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 
 func recoveringCutoverLogMessage(tbl *apitypes.TableProgressResponse) string {
 	if tbl.RowsTotal > 0 && tbl.PercentComplete < 100 {
-		return "Recovering after restart with row copy in progress"
+		return "Row copy in progress during cutover recovery"
 	}
 	return "Recovering cutover state"
 }
