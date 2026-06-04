@@ -159,6 +159,20 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
 	}
+	leasePredicate := ""
+	args := []any{check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		checkStatusInProgress, apply.ID, apply.ID}
+	lease := apply.Lease()
+	if lease.Valid() {
+		leasePredicate = `
+		  AND EXISTS (
+		    SELECT 1
+		    FROM applies lease_apply
+		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
+		  )`
+		args = append(args, lease.ApplyID, lease.Token)
+	}
 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE checks
@@ -183,10 +197,8 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		      AND newer.database_type = checks.database_type
 		      AND newer.database_name = checks.database_name
 		      AND newer.id > ?
-		  )
-	`, check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
-		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-		checkStatusInProgress, apply.ID, apply.ID)
+		  )`+leasePredicate+`
+	`, args...)
 	if err != nil {
 		return false, err
 	}
@@ -194,6 +206,11 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	if rows == 0 && lease.Valid() {
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return false, err
+		}
 	}
 	return rows > 0, nil
 }
@@ -205,6 +222,20 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
+	}
+	leasePredicate := ""
+	args := []any{check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		apply.ID, apply.ID}
+	lease := apply.Lease()
+	if lease.Valid() {
+		leasePredicate = `
+		  AND EXISTS (
+		    SELECT 1
+		    FROM applies lease_apply
+		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
+		  )`
+		args = append(args, lease.ApplyID, lease.Token)
 	}
 
 	result, err := s.db.ExecContext(ctx, `
@@ -229,10 +260,8 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		      AND newer.database_type = checks.database_type
 		      AND newer.database_name = checks.database_name
 		      AND newer.id > ?
-		  )
-	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
-		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-		apply.ID, apply.ID)
+		  )`+leasePredicate+`
+	`, args...)
 	if err != nil {
 		return false, err
 	}
@@ -240,6 +269,11 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	if rows == 0 && lease.Valid() {
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return false, err
+		}
 	}
 	return rows > 0, nil
 }

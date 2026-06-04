@@ -201,6 +201,44 @@ func TestControlRequestStore_FailPending(t *testing.T) {
 	assert.NotNil(t, failed.CompletedAt)
 }
 
+func TestControlRequestStore_LeaseGuardsPendingResolution(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	applyID := createControlRequestTestApply(t, store, "apply_control_request_lease")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, "current-worker", "current-token", applyID)
+	require.NoError(t, err)
+
+	created, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   applyID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: applyID, Owner: "old-worker", Token: "stale-token"})
+	require.ErrorIs(t, store.ControlRequests().CompletePending(staleCtx, applyID, storage.ControlOperationStart), storage.ErrApplyLeaseLost)
+	require.ErrorIs(t, store.ControlRequests().FailPending(staleCtx, applyID, storage.ControlOperationStart, "stale failure"), storage.ErrApplyLeaseLost)
+
+	pending, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	assert.Equal(t, created.ID, pending.ID)
+
+	currentCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: applyID, Owner: "current-worker", Token: "current-token"})
+	require.NoError(t, store.ControlRequests().CompletePending(currentCtx, applyID, storage.ControlOperationStart))
+	completed := getControlRequestByID(t, store, created.ID)
+	require.NotNil(t, completed)
+	assert.Equal(t, storage.ControlRequestCompleted, completed.Status)
+}
+
 func getControlRequestByID(t *testing.T, store *Storage, id int64) *storage.ApplyControlRequest {
 	t.Helper()
 	row := store.db.QueryRowContext(t.Context(), `

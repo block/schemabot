@@ -15,7 +15,9 @@ import (
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
 // Each table copies and cuts over independently.
 func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
-	defer c.startApplyHeartbeat(ctx, apply)()
+	ctx, cancelApply := context.WithCancel(ctx)
+	defer cancelApply()
+	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
 	seqStart := time.Now()
 	creds := c.credentials()
 	defer c.setupSpiritLogging(ctx, apply, tasks)()
@@ -227,7 +229,7 @@ type atomicPollState struct {
 // startApplyHeartbeat starts a background goroutine that heartbeats the apply
 // every 10 seconds, preventing the scheduler from treating it as crashed.
 // Returns a cancel function that stops the heartbeat. Must be deferred by the caller.
-func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Apply) context.CancelFunc {
+func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Apply, cancelApply ...context.CancelFunc) context.CancelFunc {
 	hbCtx, cancel := context.WithCancel(ctx)
 	go func() {
 		ticker := time.NewTicker(c.heartbeatInterval)
@@ -239,11 +241,16 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 			case <-ticker.C:
 				if err := c.storage.Applies().Heartbeat(hbCtx, apply.ID); err != nil {
 					if errors.Is(err, storage.ErrApplyLeaseLost) {
-						c.logger.Warn("heartbeat failed because apply lease was lost; local worker will stop writing apply state",
+						c.logger.Warn("heartbeat failed because apply lease was lost; local worker will stop executing and writing apply state",
 							"apply_id", apply.ApplyIdentifier,
 							"database", apply.Database,
 							"environment", apply.Environment,
 							"error", err)
+						for _, cancel := range cancelApply {
+							if cancel != nil {
+								cancel()
+							}
+						}
 						cancel()
 						return
 					}

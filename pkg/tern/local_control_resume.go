@@ -214,7 +214,9 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 // This preserves the sequential behavior of the original apply when --defer-cutover
 // was NOT used. Each task gets its own eng.Apply + pollTaskToCompletion cycle.
 func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
-	defer c.startApplyHeartbeat(ctx, apply)()
+	ctx, cancelApply := context.WithCancel(ctx)
+	defer cancelApply()
+	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
 	creds := c.credentials()
 	eng := c.getEngine()
 
@@ -538,15 +540,18 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		logMessage, oldApplyState, state.Apply.Running)
 
 	if block {
-		stopHeartbeat := c.startApplyHeartbeat(ctx, apply)
+		pollCtx, cancelPoll := context.WithCancel(ctx)
+		defer cancelPoll()
+		stopHeartbeat := c.startApplyHeartbeat(pollCtx, apply, cancelPoll)
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(ctx, apply, tasks, creds, nil)
+		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, nil)
 		return nil
 	}
 
-	resumeCtx := context.WithoutCancel(ctx)
-	stopHeartbeat := c.startApplyHeartbeat(resumeCtx, apply)
+	resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
+	stopHeartbeat := c.startApplyHeartbeat(resumeCtx, apply, cancelResume)
 	go func() {
+		defer cancelResume()
 		defer stopHeartbeat()
 		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, nil)
 	}()

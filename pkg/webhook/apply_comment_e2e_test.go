@@ -223,7 +223,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 		ApplyID:        applyID,
 		Logger:         logger,
 	})
-	obs.editTrackedComment(state.Comment.Progress, "Updated progress: running 45%")
+	obs.editTrackedComment(nil, state.Comment.Progress, "Updated progress: running 45%")
 
 	select {
 	case edited := <-capture.edits:
@@ -263,7 +263,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	assert.Equal(t, cutoverCommentID, active.GitHubCommentID)
 
 	// Step 6: Edit cutover comment via observer
-	obs.editTrackedComment(state.Comment.Cutover, "Cutover in progress")
+	obs.editTrackedComment(nil, state.Comment.Cutover, "Cutover in progress")
 
 	select {
 	case edited := <-capture.edits:

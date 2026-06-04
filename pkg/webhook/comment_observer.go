@@ -138,7 +138,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	// but only if one hasn't been posted already.
 	if currentState == state.Apply.CuttingOver && o.shouldDeferCutover(apply) && !o.hasCutoverComment {
 		body := formatCutoverComment(apply, tasks)
-		o.postAndTrackComment(state.Comment.Cutover, body)
+		o.postAndTrackComment(apply, state.Comment.Cutover, body)
 		o.hasCutoverComment = true
 		o.lastState = currentState
 		return
@@ -183,7 +183,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 
 	// Edit the progress comment
 	body := formatProgressComment(apply, tasks)
-	o.editTrackedComment(state.Comment.Progress, body)
+	o.editTrackedComment(apply, state.Comment.Progress, body)
 }
 
 // OnTerminal is called when the apply reaches a terminal state.
@@ -210,24 +210,27 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// Cutover comment gets the summary format — Apply ID, DDL, success message.
 		// No separate summary needed since the cutover comment IS the completion comment.
 		finalBody := formatSummaryComment(apply, tasks)
-		o.editTrackedComment(activeCommentState, finalBody)
+		o.editTrackedComment(apply, activeCommentState, finalBody)
 
 		// Upsert a summary marker so FindMissingSummaryComment (outbox query)
 		// doesn't false-positive on restart for cutover applies.
-		o.markSummaryPosted(activeCommentState)
+		o.markSummaryPosted(apply, activeCommentState)
 	} else {
 		// Edit the progress comment to its final state (completed bars / error).
 		finalBody := formatProgressComment(apply, tasks)
-		o.editTrackedComment(activeCommentState, finalBody)
+		o.editTrackedComment(apply, activeCommentState, finalBody)
 
 		// Post a separate summary comment. A new comment is more reliable than
 		// an edit — GitHub renders edits with a delay, but new comments appear
 		// immediately and trigger notifications for PR subscribers.
 		summaryBody := formatSummaryComment(apply, tasks)
-		o.postAndTrackComment(state.Comment.Summary, summaryBody)
+		o.postAndTrackComment(apply, state.Comment.Summary, summaryBody)
 	}
 
 	// Run terminal hook (e.g., update check runs)
+	if !o.leaseStillOwnsObserver(apply, "terminal hook") {
+		return
+	}
 	if o.OnTerminalHook != nil {
 		o.OnTerminalHook(apply)
 	}
@@ -258,8 +261,22 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	return true
 }
 
+func (o *CommentObserver) contextWithApplyLease(ctx context.Context, apply *storage.Apply) context.Context {
+	lease := o.applyLease
+	if !lease.Valid() && apply != nil {
+		lease = apply.Lease()
+	}
+	if !lease.Valid() {
+		return ctx
+	}
+	return storage.WithApplyLease(ctx, lease)
+}
+
 // editTrackedComment looks up a stored comment ID and edits it.
-func (o *CommentObserver) editTrackedComment(commentState string, body string) {
+func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState string, body string) {
+	if !o.leaseStillOwnsObserver(apply, "lookup comment before edit") {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -274,10 +291,16 @@ func (o *CommentObserver) editTrackedComment(commentState string, body string) {
 		// (e.g., first OnProgress tick before the handler posts it).
 		return
 	}
+	if !o.leaseStillOwnsObserver(apply, "create GitHub client before edit") {
+		return
+	}
 
 	client, err := o.ghClient.ForInstallation(o.installationID)
 	if err != nil {
 		o.logger.Error("observer: failed to create GitHub client", "error", err)
+		return
+	}
+	if !o.leaseStillOwnsObserver(apply, "edit GitHub comment") {
 		return
 	}
 
@@ -285,15 +308,21 @@ func (o *CommentObserver) editTrackedComment(commentState string, body string) {
 		o.logger.Error("observer: failed to edit comment", "error", err, "comment_state", commentState)
 		return
 	}
+	if !o.leaseStillOwnsObserver(apply, "record edited GitHub comment") {
+		return
+	}
 
 	// Track the edit for audit/debugging
-	if err := o.stor.ApplyComments().IncrementEditCount(ctx, o.applyID, commentState); err != nil {
+	if err := o.stor.ApplyComments().IncrementEditCount(o.contextWithApplyLease(ctx, apply), o.applyID, commentState); err != nil {
 		o.logger.Error("observer: failed to increment edit count", "error", err)
 	}
 }
 
 // postAndTrackComment creates a comment and stores its ID.
-func (o *CommentObserver) postAndTrackComment(commentState string, body string) {
+func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState string, body string) {
+	if !o.leaseStillOwnsObserver(apply, "create GitHub client before post") {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -302,10 +331,16 @@ func (o *CommentObserver) postAndTrackComment(commentState string, body string) 
 		o.logger.Error("observer: failed to create GitHub client", "error", err)
 		return
 	}
+	if !o.leaseStillOwnsObserver(apply, "post GitHub comment") {
+		return
+	}
 
 	commentID, err := client.CreateIssueComment(ctx, o.repo, o.pr, body)
 	if err != nil {
 		o.logger.Error("observer: failed to post comment", "error", err, "comment_state", commentState)
+		return
+	}
+	if !o.leaseStillOwnsObserver(apply, "record posted GitHub comment") {
 		return
 	}
 
@@ -314,7 +349,7 @@ func (o *CommentObserver) postAndTrackComment(commentState string, body string) 
 		CommentState:    commentState,
 		GitHubCommentID: commentID,
 	}
-	if err := o.stor.ApplyComments().Upsert(ctx, comment); err != nil {
+	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), comment); err != nil {
 		o.logger.Error("observer: failed to store comment ID", "error", err)
 	}
 }
@@ -323,7 +358,10 @@ func (o *CommentObserver) postAndTrackComment(commentState string, body string) 
 // Used for cutover applies where the cutover comment serves as the summary —
 // no separate summary is posted, but the marker satisfies the
 // FindMissingSummaryComment outbox query.
-func (o *CommentObserver) markSummaryPosted(editedCommentState string) {
+func (o *CommentObserver) markSummaryPosted(apply *storage.Apply, editedCommentState string) {
+	if !o.leaseStillOwnsObserver(apply, "lookup comment before summary marker") {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -345,7 +383,10 @@ func (o *CommentObserver) markSummaryPosted(editedCommentState string) {
 		CommentState:    state.Comment.Summary,
 		GitHubCommentID: edited.GitHubCommentID,
 	}
-	if err := o.stor.ApplyComments().Upsert(ctx, marker); err != nil {
+	if !o.leaseStillOwnsObserver(apply, "record summary marker") {
+		return
+	}
+	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), marker); err != nil {
 		o.logger.Error("observer: failed to upsert summary marker", "error", err)
 	}
 }

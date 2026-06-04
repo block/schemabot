@@ -208,6 +208,49 @@ func TestApplyCommentStore_UniqueConstraint(t *testing.T) {
 	assert.Equal(t, int64(999), progress.GitHubCommentID)
 }
 
+func TestApplyCommentStore_LeaseGuardsWrites(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_lease", 1)
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, "current-worker", "current-token", apply.ID)
+	require.NoError(t, err)
+
+	comment := &storage.ApplyComment{
+		ApplyID:         apply.ID,
+		CommentState:    state.Comment.Progress,
+		GitHubCommentID: 100,
+	}
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "old-worker", Token: "stale-token"})
+	require.ErrorIs(t, store.ApplyComments().Upsert(staleCtx, comment), storage.ErrApplyLeaseLost)
+
+	missing, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	assert.Nil(t, missing)
+
+	currentCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "current-worker", Token: "current-token"})
+	require.NoError(t, store.ApplyComments().Upsert(currentCtx, comment))
+	require.ErrorIs(t, store.ApplyComments().IncrementEditCount(staleCtx, apply.ID, state.Comment.Progress), storage.ErrApplyLeaseLost)
+
+	retrieved, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, int64(100), retrieved.GitHubCommentID)
+	assert.Equal(t, 0, retrieved.EditCount)
+
+	require.NoError(t, store.ApplyComments().IncrementEditCount(currentCtx, apply.ID, state.Comment.Progress))
+	retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, 1, retrieved.EditCount)
+}
+
 // DB error tests
 
 func TestApplyCommentStore_Upsert_DBError(t *testing.T) {

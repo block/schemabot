@@ -16,7 +16,9 @@ import (
 // executeGroupedApply runs all DDLs in one engine operation. For Spirit with
 // defer_cutover, this is atomic cutover; for Vitess, this is one deploy request.
 func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
-	defer c.startApplyHeartbeat(ctx, apply)()
+	ctx, cancelApply := context.WithCancel(ctx)
+	defer cancelApply()
+	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
 	creds := c.credentials()
 	mode := groupedApplyMode(apply)
 	modeDescription := groupedApplyModeDescription(apply)

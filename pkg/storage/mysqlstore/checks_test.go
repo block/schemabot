@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/state"
@@ -719,6 +720,57 @@ func TestCheckStore_CompleteForApply(t *testing.T) {
 	require.Equal(t, apply.ID, retrieved.ApplyID)
 }
 
+func TestCheckStore_CompleteForApplyLeaseGuard(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-complete-lease", state.Apply.Completed)
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, "current-worker", "current-token", apply.ID)
+	require.NoError(t, err)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       "in_progress",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.Status = "completed"
+	check.Conclusion = "success"
+	check.HasChanges = false
+	staleApply := *apply
+	staleApply.LeaseOwner = "old-worker"
+	staleApply.LeaseToken = "stale-token"
+	updated, err := store.Checks().CompleteForApply(ctx, check, &staleApply)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.False(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "in_progress", retrieved.Status)
+	assert.Empty(t, retrieved.Conclusion)
+	assert.Equal(t, apply.ID, retrieved.ApplyID)
+
+	currentApply := *apply
+	currentApply.LeaseOwner = "current-worker"
+	currentApply.LeaseToken = "current-token"
+	updated, err = store.Checks().CompleteForApply(ctx, check, &currentApply)
+	require.NoError(t, err)
+	assert.True(t, updated)
+}
+
 func TestCheckStore_CompleteForApplySkipsNewerRunningApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -861,6 +913,58 @@ func TestCheckStore_MarkActionRequiredForApply(t *testing.T) {
 	require.Equal(t, "action_required", retrieved.Conclusion)
 	require.True(t, retrieved.HasChanges)
 	require.Equal(t, int64(0), retrieved.ApplyID)
+}
+
+func TestCheckStore_MarkActionRequiredForApplyLeaseGuard(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "rollback-complete-lease", state.Apply.Completed)
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, "current-worker", "current-token", apply.ID)
+	require.NoError(t, err)
+
+	check := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      apply.ID,
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.HasChanges = true
+	check.Conclusion = "action_required"
+	staleApply := *apply
+	staleApply.LeaseOwner = "old-worker"
+	staleApply.LeaseToken = "stale-token"
+	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, &staleApply)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.False(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "completed", retrieved.Status)
+	assert.Equal(t, "success", retrieved.Conclusion)
+	assert.False(t, retrieved.HasChanges)
+	assert.Equal(t, apply.ID, retrieved.ApplyID)
+
+	currentApply := *apply
+	currentApply.LeaseOwner = "current-worker"
+	currentApply.LeaseToken = "current-token"
+	updated, err = store.Checks().MarkActionRequiredForApply(ctx, check, &currentApply)
+	require.NoError(t, err)
+	assert.True(t, updated)
 }
 
 func TestCheckStore_MarkActionRequiredForApplySkipsNewerRunningApply(t *testing.T) {

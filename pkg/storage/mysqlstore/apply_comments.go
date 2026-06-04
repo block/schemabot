@@ -23,12 +23,39 @@ type applyCommentStore struct {
 // Upsert creates or updates a comment record.
 // On conflict (same apply_id + comment_state), updates the github_comment_id.
 func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyComment) error {
-	_, err := s.db.ExecContext(ctx, `
+	lease, hasLease, err := applyLeaseFromContext(ctx, comment.ApplyID)
+	if err != nil {
+		return err
+	}
+	if !hasLease {
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO apply_comments (apply_id, comment_state, github_comment_id)
+			VALUES (?, ?, ?)
+			ON DUPLICATE KEY UPDATE
+				github_comment_id = VALUES(github_comment_id)
+		`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID)
+		return err
+	}
+
+	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id)
-		VALUES (?, ?, ?)
+		SELECT ?, ?, ? FROM applies a
+		WHERE a.id = ? AND a.lease_token = ?
 		ON DUPLICATE KEY UPDATE
 			github_comment_id = VALUES(github_comment_id)
-	`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID)
+	`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.ApplyID, lease.Token)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read apply comment upsert rows affected for apply %d state %s: %w", comment.ApplyID, comment.CommentState, err)
+	}
+	if rows == 0 {
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return err
+		}
+	}
 	return err
 }
 
@@ -61,11 +88,38 @@ func (s *applyCommentStore) ListByApply(ctx context.Context, applyID int64) ([]*
 
 // IncrementEditCount atomically increments the edit count and updates last_edited_at.
 func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int64, commentState string) error {
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE apply_comments
-		SET edit_count = edit_count + 1, last_edited_at = NOW()
-		WHERE apply_id = ? AND comment_state = ?
-	`, applyID, commentState)
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return err
+	}
+	leaseJoin := ""
+	leasePredicate := ""
+	args := []any{applyID, commentState}
+	if hasLease {
+		leaseJoin = " JOIN applies a ON a.id = c.apply_id"
+		leasePredicate = " AND a.lease_token = ?"
+		args = append(args, lease.Token)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_comments c
+		`+leaseJoin+`
+		SET c.edit_count = c.edit_count + 1, c.last_edited_at = NOW()
+		WHERE c.apply_id = ? AND c.comment_state = ?`+leasePredicate+`
+	`, args...)
+	if err != nil {
+		return err
+	}
+	if hasLease {
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read apply comment edit rows affected for apply %d state %s: %w", applyID, commentState, err)
+		}
+		if rows == 0 {
+			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+				return err
+			}
+		}
+	}
 	return err
 }
 
