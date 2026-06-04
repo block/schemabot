@@ -200,14 +200,14 @@ func ensureApplyLeaseForControlRequest(ctx context.Context, store storage.Storag
 	if !ok {
 		return nil
 	}
-	if !lease.Valid() || apply == nil || lease.ApplyID != apply.ID {
-		applyID := int64(0)
-		applyIdentifier := ""
-		if apply != nil {
-			applyID = apply.ID
-			applyIdentifier = apply.ApplyIdentifier
-		}
-		return fmt.Errorf("invalid apply lease before completing %s control request for apply %s (%d): %w", operation, applyIdentifier, applyID, storage.ErrApplyLeaseLost)
+	if apply == nil {
+		return fmt.Errorf("cannot complete %s control request without apply: %w", operation, storage.ErrApplyLeaseLost)
+	}
+	if !lease.Valid() {
+		return fmt.Errorf("invalid apply lease before completing %s control request for apply %s (%d): %w", operation, apply.ApplyIdentifier, apply.ID, storage.ErrApplyLeaseLost)
+	}
+	if lease.ApplyID != apply.ID {
+		return fmt.Errorf("apply lease for apply %d cannot complete %s control request for apply %s (%d): %w", lease.ApplyID, operation, apply.ApplyIdentifier, apply.ID, storage.ErrApplyLeaseLost)
 	}
 	if err := store.Applies().CheckLease(ctx, lease); err != nil {
 		return fmt.Errorf("check apply lease before completing %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)

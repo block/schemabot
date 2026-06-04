@@ -281,8 +281,11 @@ func applyLeaseFromContext(ctx context.Context, applyID int64) (storage.ApplyLea
 	if !ok {
 		return storage.ApplyLease{}, false, nil
 	}
-	if !lease.Valid() || lease.ApplyID != applyID {
+	if !lease.Valid() {
 		return storage.ApplyLease{}, true, fmt.Errorf("invalid apply lease for apply %d: %w", applyID, storage.ErrApplyLeaseLost)
+	}
+	if lease.ApplyID != applyID {
+		return storage.ApplyLease{}, true, fmt.Errorf("apply lease for apply %d cannot write apply %d: %w", lease.ApplyID, applyID, storage.ErrApplyLeaseLost)
 	}
 	return lease, true, nil
 }
