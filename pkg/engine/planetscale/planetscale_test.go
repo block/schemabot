@@ -130,6 +130,13 @@ func TestPSMetadataEncodeDecode(t *testing.T) {
 		BranchName:       "schemabot-mydb-12345678",
 		DeployRequestID:  42,
 		DeployRequestURL: "https://app.planetscale.com/org/db/deploy-requests/42",
+		ExistingMigrationCtxs: map[string]MigrationContextTimestamps{
+			"ctx-1": {
+				RequestedTimestamp: "2026-06-04T20:00:00Z",
+				StartedTimestamp:   "2026-06-04T20:01:00Z",
+				CompletedTimestamp: "2026-06-04T20:02:00Z",
+			},
+		},
 	}
 
 	encoded, err := encodePSMetadata(original)
@@ -142,6 +149,7 @@ func TestPSMetadataEncodeDecode(t *testing.T) {
 	assert.Equal(t, original.BranchName, decoded.BranchName)
 	assert.Equal(t, original.DeployRequestID, decoded.DeployRequestID)
 	assert.Equal(t, original.DeployRequestURL, decoded.DeployRequestURL)
+	assert.Equal(t, original.ExistingMigrationCtxs, decoded.ExistingMigrationCtxs)
 }
 
 func TestPSMetadataEncodeDecode_DeferredDeploy(t *testing.T) {

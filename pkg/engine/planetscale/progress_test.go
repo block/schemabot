@@ -2,12 +2,29 @@ package planetscale
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/state"
 )
+
+func TestMigrationRowTimestamps(t *testing.T) {
+	requestedAt := time.Date(2026, 6, 4, 19, 0, 0, 0, time.UTC)
+	startedAt := time.Date(2026, 6, 4, 19, 1, 0, 0, time.UTC)
+	completedAt := time.Date(2026, 6, 4, 19, 2, 0, 0, time.UTC)
+
+	timestamps := migrationRowTimestamps(vitessMigrationRow{
+		RequestedAt: &requestedAt,
+		StartedAt:   &startedAt,
+		CompletedAt: &completedAt,
+	})
+	assert.Equal(t, requestedAt.Format(time.RFC3339), timestamps.RequestedTimestamp)
+	assert.Equal(t, startedAt.Format(time.RFC3339), timestamps.StartedTimestamp)
+	assert.Equal(t, completedAt.Format(time.RFC3339), timestamps.CompletedTimestamp)
+	assert.Empty(t, migrationRowTimestamps(vitessMigrationRow{}))
+}
 
 func TestAggregateShardProgress(t *testing.T) {
 	t.Run("two shards one table", func(t *testing.T) {

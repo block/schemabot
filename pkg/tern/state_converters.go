@@ -256,12 +256,13 @@ func protoToSchemaFiles(sf map[string]*ternv1.SchemaFiles) schema.SchemaFiles {
 // psMetadataForStorage is a subset of the PlanetScale engine's metadata
 // used for storing deploy request tracking data.
 type psMetadataForStorage struct {
-	BranchName       string     `json:"branch_name"`
-	DeployRequestID  uint64     `json:"deploy_request_id"`
-	DeployRequestURL string     `json:"deploy_request_url,omitempty"`
-	DeployedAt       *time.Time `json:"deployed_at,omitempty"`
-	IsInstant        bool       `json:"is_instant,omitempty"`
-	DeferredDeploy   bool       `json:"deferred_deploy,omitempty"`
+	BranchName            string                                              `json:"branch_name"`
+	DeployRequestID       uint64                                              `json:"deploy_request_id"`
+	DeployRequestURL      string                                              `json:"deploy_request_url,omitempty"`
+	ExistingMigrationCtxs map[string]storage.VitessMigrationContextTimestamps `json:"existing_migration_contexts,omitempty"`
+	DeployedAt            *time.Time                                          `json:"deployed_at,omitempty"`
+	IsInstant             bool                                                `json:"is_instant,omitempty"`
+	DeferredDeploy        bool                                                `json:"deferred_deploy,omitempty"`
 }
 
 func decodePSMetadataForStorage(s string) (*psMetadataForStorage, error) {

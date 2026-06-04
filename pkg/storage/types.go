@@ -769,17 +769,26 @@ type ApplyLogFilter struct {
 // VitessApplyData holds Vitess-specific data for deploy request tracking.
 // Stored in vitess_apply_data table, one row per apply when database_type = 'vitess'.
 type VitessApplyData struct {
-	ApplyID          int64
-	BranchName       string
-	DeployRequestID  uint64
-	MigrationContext string
-	DeployRequestURL string
-	IsInstant        bool // True when PlanetScale reported the deploy as instant-eligible
-	DeferredDeploy   bool // True when deploy was deferred (--defer-deploy flag)
+	ApplyID               int64
+	BranchName            string
+	DeployRequestID       uint64
+	MigrationContext      string
+	ExistingMigrationCtxs map[string]VitessMigrationContextTimestamps
+	DeployRequestURL      string
+	IsInstant             bool // True when PlanetScale reported the deploy as instant-eligible
+	DeferredDeploy        bool // True when deploy was deferred (--defer-deploy flag)
 
 	// RevertSkippedAt records when skip-revert was dispatched. Non-nil means
 	// finalization is in progress — the deploy request is transitioning across
 	// shards from complete_pending_revert to complete. On large keyspaces
 	// this can take longer as shards are processed in batches.
 	RevertSkippedAt *time.Time
+}
+
+// VitessMigrationContextTimestamps records Vitess timestamp fields for a
+// pre-existing migration context captured before a PlanetScale deploy starts.
+type VitessMigrationContextTimestamps struct {
+	RequestedTimestamp string `json:"requested_timestamp,omitempty"`
+	StartedTimestamp   string `json:"started_timestamp,omitempty"`
+	CompletedTimestamp string `json:"completed_timestamp,omitempty"`
 }

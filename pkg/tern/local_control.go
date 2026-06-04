@@ -578,13 +578,29 @@ func planetscaleResumeData(vad *storage.VitessApplyData) planetscale.ResumeData 
 		return planetscale.ResumeData{}
 	}
 	return planetscale.ResumeData{
-		BranchName:       vad.BranchName,
-		DeployRequestID:  vad.DeployRequestID,
-		DeployRequestURL: vad.DeployRequestURL,
-		MigrationContext: vad.MigrationContext,
-		IsInstant:        vad.IsInstant,
-		DeferredDeploy:   vad.DeferredDeploy,
+		BranchName:            vad.BranchName,
+		DeployRequestID:       vad.DeployRequestID,
+		DeployRequestURL:      vad.DeployRequestURL,
+		MigrationContext:      vad.MigrationContext,
+		ExistingMigrationCtxs: planetscaleMigrationContextTimestamps(vad.ExistingMigrationCtxs),
+		IsInstant:             vad.IsInstant,
+		DeferredDeploy:        vad.DeferredDeploy,
 	}
+}
+
+func planetscaleMigrationContextTimestamps(contexts map[string]storage.VitessMigrationContextTimestamps) map[string]planetscale.MigrationContextTimestamps {
+	if len(contexts) == 0 {
+		return nil
+	}
+	result := make(map[string]planetscale.MigrationContextTimestamps, len(contexts))
+	for context, timestamps := range contexts {
+		result[context] = planetscale.MigrationContextTimestamps{
+			RequestedTimestamp: timestamps.RequestedTimestamp,
+			StartedTimestamp:   timestamps.StartedTimestamp,
+			CompletedTimestamp: timestamps.CompletedTimestamp,
+		}
+	}
+	return result
 }
 
 // Volume modifies the schema change speed/concurrency in-flight.

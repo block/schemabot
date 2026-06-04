@@ -4,6 +4,7 @@ CREATE TABLE `vitess_apply_data` (
   `branch_name` varchar(255) NOT NULL,
   `deploy_request_id` bigint unsigned DEFAULT NULL,
   `migration_context` varchar(255) DEFAULT NULL,
+  `existing_migration_contexts` json DEFAULT NULL,
   `deploy_request_url` varchar(512) DEFAULT NULL,
   `is_instant` tinyint(1) NOT NULL DEFAULT '0',
   `deferred_deploy` tinyint(1) NOT NULL DEFAULT '0',

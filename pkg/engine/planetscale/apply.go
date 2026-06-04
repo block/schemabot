@@ -250,9 +250,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		NewState: state.Apply.ValidatingDeployRequest,
 	})
 	persistState(&psMetadata{
-		BranchName:       branchName,
-		DeployRequestID:  dr.Number,
-		DeployRequestURL: dr.HtmlURL,
+		BranchName:            branchName,
+		DeployRequestID:       dr.Number,
+		DeployRequestURL:      dr.HtmlURL,
+		ExistingMigrationCtxs: existingContexts,
 	})
 	for dr.DeploymentState == deployState.Pending {
 		select {
@@ -349,11 +350,12 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			"instant_eligible", useInstant,
 		)
 		meta, encErr := encodePSMetadata(&psMetadata{
-			BranchName:       branchName,
-			DeployRequestID:  dr.Number,
-			DeployRequestURL: dr.HtmlURL,
-			IsInstant:        useInstant,
-			DeferredDeploy:   true,
+			BranchName:            branchName,
+			DeployRequestID:       dr.Number,
+			DeployRequestURL:      dr.HtmlURL,
+			ExistingMigrationCtxs: existingContexts,
+			IsInstant:             useInstant,
+			DeferredDeploy:        true,
 		})
 		if encErr != nil {
 			return nil, fmt.Errorf("encode metadata for deferred deploy request #%d: %w", dr.Number, encErr)
@@ -430,10 +432,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	meta, err := encodePSMetadata(&psMetadata{
-		BranchName:       branchName,
-		DeployRequestID:  dr.Number,
-		DeployRequestURL: dr.HtmlURL,
-		IsInstant:        useInstant,
+		BranchName:            branchName,
+		DeployRequestID:       dr.Number,
+		DeployRequestURL:      dr.HtmlURL,
+		ExistingMigrationCtxs: existingContexts,
+		IsInstant:             useInstant,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata for deploy request #%d: %w", dr.Number, err)

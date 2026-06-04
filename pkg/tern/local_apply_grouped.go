@@ -121,13 +121,14 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 				return
 			}
 			if saveErr := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
-				ApplyID:          apply.ID,
-				BranchName:       meta.BranchName,
-				DeployRequestID:  meta.DeployRequestID,
-				MigrationContext: rs.MigrationContext,
-				DeployRequestURL: meta.DeployRequestURL,
-				IsInstant:        meta.IsInstant,
-				DeferredDeploy:   meta.DeferredDeploy,
+				ApplyID:               apply.ID,
+				BranchName:            meta.BranchName,
+				DeployRequestID:       meta.DeployRequestID,
+				MigrationContext:      rs.MigrationContext,
+				ExistingMigrationCtxs: meta.ExistingMigrationCtxs,
+				DeployRequestURL:      meta.DeployRequestURL,
+				IsInstant:             meta.IsInstant,
+				DeferredDeploy:        meta.DeferredDeploy,
 			}); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
@@ -177,13 +178,14 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 				"raw_metadata", resumeState.Metadata[:min(len(resumeState.Metadata), 200)],
 			)
 			if saveErr := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
-				ApplyID:          apply.ID,
-				BranchName:       meta.BranchName,
-				DeployRequestID:  meta.DeployRequestID,
-				MigrationContext: resumeState.MigrationContext,
-				DeployRequestURL: meta.DeployRequestURL,
-				IsInstant:        meta.IsInstant,
-				DeferredDeploy:   meta.DeferredDeploy,
+				ApplyID:               apply.ID,
+				BranchName:            meta.BranchName,
+				DeployRequestID:       meta.DeployRequestID,
+				MigrationContext:      resumeState.MigrationContext,
+				ExistingMigrationCtxs: meta.ExistingMigrationCtxs,
+				DeployRequestURL:      meta.DeployRequestURL,
+				IsInstant:             meta.IsInstant,
+				DeferredDeploy:        meta.DeferredDeploy,
 			}); saveErr != nil {
 				c.logger.Warn("failed to save vitess apply data", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}

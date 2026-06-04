@@ -80,6 +80,15 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 			}
 		}
 	}
+	if req.ResumeState.MigrationContext == "" && len(meta.ExistingMigrationCtxs) > 0 {
+		migrationContext := e.discoverMigrationContext(ctx, client, req.Database, req.Credentials, meta.ExistingMigrationCtxs)
+		if migrationContext != "" {
+			req.ResumeState = &engine.ResumeState{
+				MigrationContext: migrationContext,
+				Metadata:         req.ResumeState.Metadata,
+			}
+		}
+	}
 
 	e.logger.Debug("progress poll",
 		"database", req.Database,
@@ -142,8 +151,8 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // captureExistingContexts returns the set of migration_context values currently
 // in SHOW VITESS_MIGRATIONS. Used as a baseline before deploying so that new
 // contexts can be identified after deploy.
-func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials) map[string]bool {
-	existing := make(map[string]bool)
+func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials) map[string]MigrationContextTimestamps {
+	existing := make(map[string]MigrationContextTimestamps)
 	if creds.DSN == "" {
 		return existing
 	}
@@ -167,7 +176,7 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 		}
 		for _, r := range rows {
 			if r.MigrationContext != "" {
-				existing[r.MigrationContext] = true
+				existing[r.MigrationContext] = migrationRowTimestamps(r)
 			}
 		}
 	}
@@ -176,9 +185,24 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 	return existing
 }
 
+func migrationRowTimestamps(row vitessMigrationRow) MigrationContextTimestamps {
+	return MigrationContextTimestamps{
+		RequestedTimestamp: formatMigrationTimestamp(row.RequestedAt),
+		StartedTimestamp:   formatMigrationTimestamp(row.StartedAt),
+		CompletedTimestamp: formatMigrationTimestamp(row.CompletedAt),
+	}
+}
+
+func formatMigrationTimestamp(ts *time.Time) string {
+	if ts == nil {
+		return ""
+	}
+	return ts.UTC().Format(time.RFC3339)
+}
+
 // discoverMigrationContext finds the new migration_context that appeared after
 // deploying by comparing current contexts against the pre-deploy baseline.
-func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]bool) string {
+func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]MigrationContextTimestamps) string {
 	if creds.DSN == "" {
 		e.logger.Debug("skipping schema change context discovery, no DSN configured")
 		return ""
@@ -204,7 +228,8 @@ func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.P
 			continue
 		}
 		for _, r := range rows {
-			if r.MigrationContext != "" && !existingContexts[r.MigrationContext] {
+			_, exists := existingContexts[r.MigrationContext]
+			if r.MigrationContext != "" && !exists {
 				e.logger.Info("discovered schema change context", "context", r.MigrationContext)
 				return r.MigrationContext
 			}
@@ -231,6 +256,7 @@ type vitessMigrationRow struct {
 	TableRows        int64
 	IsImmediate      bool
 	CutoverAttempts  int
+	RequestedAt      *time.Time
 	StartedAt        *time.Time
 	CompletedAt      *time.Time
 }
@@ -358,7 +384,9 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 		if v, err := parseInt64(colMap["cutover_attempts"]); err == nil {
 			row.CutoverAttempts = int(v)
 		}
-
+		if ts, parseErr := time.Parse("2006-01-02 15:04:05", colMap["requested_timestamp"]); parseErr == nil {
+			row.RequestedAt = &ts
+		}
 		if ts, parseErr := time.Parse("2006-01-02 15:04:05", colMap["started_timestamp"]); parseErr == nil {
 			row.StartedAt = &ts
 		}
