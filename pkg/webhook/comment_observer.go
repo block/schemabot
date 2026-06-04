@@ -275,14 +275,11 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 
 func (o *CommentObserver) contextWithApplyLease(ctx context.Context, apply *storage.Apply) context.Context {
 	// Storage writes that record GitHub side effects must use the same lease as
-	// the observer-side lease checks above. If this observer has not yet been
-	// given a claimed apply, there is no scheduler lease to propagate.
+	// the observer-side lease checks above. Attach the resolved lease even if it
+	// is invalid so storage fails closed instead of performing an unleased write.
 	lease := o.applyLease
 	if !lease.Valid() && apply != nil {
 		lease = apply.Lease()
-	}
-	if !lease.Valid() {
-		return ctx
 	}
 	return storage.WithApplyLease(ctx, lease)
 }
