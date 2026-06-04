@@ -686,7 +686,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 				defer c.clearApplyCancel(cancelGeneration)
 				defer cancelResume()
 				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering deferred cutover from checkpoint", true, false); err != nil {
-					return fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err)
+					return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err), false)
 				}
 				return ctx.Err()
 			}
@@ -746,26 +746,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
 		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply)), true, startRequested); err != nil {
-			if c.shouldRetryEngineError(err) {
-				c.logger.Warn("engine apply failed during recovery, pausing apply for scheduler retry",
-					"apply_id", apply.ApplyIdentifier,
-					"error", err)
-				c.markApplyRetryableWithTasks(ctx, apply, activeTasks, err.Error())
-				return nil
-			}
-			c.logger.Error("engine apply failed during recovery",
-				"apply_id", apply.ApplyIdentifier,
-				"error", err)
-			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-				fmt.Sprintf("Recovery failed: %v", err), apply.State, state.Apply.Failed)
-			c.failApplyWithTasks(ctx, apply, activeTasks, err.Error())
-			if startRequested {
-				if failErr := failPendingStartControlRequests(ctx, c.storage, apply, err.Error()); failErr != nil {
-					return failErr
-				}
-			}
-			c.notifyTerminalObserver(apply, activeTasks)
-			return err
+			return c.handleGroupedResumeFailure(ctx, apply, activeTasks, err, startRequested)
 		}
 	} else {
 		// Sequential mode: process each task one at a time
@@ -793,6 +774,34 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	}
 
 	return ctx.Err()
+}
+
+func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error, startRequested bool) error {
+	if c.shouldRetryEngineError(err) {
+		c.logger.Warn("engine apply failed during recovery, pausing apply for scheduler retry",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType,
+			"error", err)
+		c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
+		return nil
+	}
+
+	c.logger.Error("engine apply failed during recovery",
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"database_type", apply.DatabaseType,
+		"error", err)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Recovery failed: %v", err), apply.State, state.Apply.Failed)
+	c.failApplyWithTasks(ctx, apply, tasks, err.Error())
+	if startRequested {
+		if failErr := failPendingStartControlRequests(ctx, c.storage, apply, err.Error()); failErr != nil {
+			return failErr
+		}
+	}
+	c.notifyTerminalObserver(apply, tasks)
+	return err
 }
 
 func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) {

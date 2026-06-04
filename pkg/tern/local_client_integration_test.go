@@ -1138,6 +1138,135 @@ func TestLocalClient_ResumeApplyDeferredCutoverEntersRecoveringState(t *testing.
 	assert.Equal(t, state.Task.WaitingForCutover, storedTask.State)
 }
 
+// This scenario covers a deferred-cutover recovery where Spirit's durable
+// sentinel is still present but engine reattach fails before progress polling
+// can prove cutover readiness. Storage should leave recovery through a visible
+// retry-waiting state instead of retrying forever without an operator-visible outcome.
+func TestLocalClient_ResumeApplyDeferredCutoverFailureMarksApplyRetryable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(ctx))
+	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (`id` INT PRIMARY KEY)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE TABLE `_spirit_sentinel` (id int NOT NULL PRIMARY KEY)")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupCtx := context.WithoutCancel(t.Context())
+		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		require.NoError(t, cleanupErr)
+		defer utils.CloseAndLog(cleanupDB)
+		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `_spirit_sentinel`")
+		assert.NoError(t, cleanupErr)
+	})
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	ddl := "ALTER TABLE `users` ADD COLUMN `recovery_failure_note` varchar(255)"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-cutover-recovery-failure-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"}},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-cutover-recovery-failure-%d", time.Now().UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.WaitingForCutover,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	task := &storage.Task{
+		TaskIdentifier:  fmt.Sprintf("task-cutover-recovery-failure-users-%d", time.Now().UnixNano()),
+		ApplyID:         applyID,
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Task.WaitingForCutover,
+		TableName:       "users",
+		Namespace:       "testdb",
+		DDL:             ddl,
+		DDLAction:       "alter",
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		ProgressPercent: 100,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	taskID, err := stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	recoveryEngine := &stagedGroupedResumeEngine{
+		Engine: client.spiritEngine,
+		planResults: []*engine.PlanResult{{
+			Changes: []engine.SchemaChange{{
+				Namespace:    "testdb",
+				TableChanges: []engine.TableChange{{Table: "users", DDL: ddl}},
+			}},
+		}},
+		applyErr: fmt.Errorf("synthetic deferred cutover recovery failure"),
+	}
+	client.spiritEngine = recoveryEngine
+
+	err = client.ResumeApply(ctx, apply)
+	require.NoError(t, err)
+
+	storedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.FailedRetryable, storedApply.State)
+	assert.Contains(t, storedApply.ErrorMessage, "synthetic deferred cutover recovery failure")
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.FailedRetryable, storedTask.State)
+	assert.Contains(t, storedTask.ErrorMessage, "synthetic deferred cutover recovery failure")
+}
+
 // This scenario covers a deferred-cutover recovery where the Spirit sentinel is
 // already absent when SchemaBot restarts. The scheduler should reconcile against
 // the live schema instead of blocking forever in cutover recovery.
