@@ -241,6 +241,10 @@ func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
 }
 
 func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation string) bool {
+	// Observers created before scheduler-owned execution do not carry a lease;
+	// those legacy paths keep their existing behavior. When a scheduler lease is
+	// present, it is the authority for whether this observer may make external
+	// GitHub writes on behalf of the apply.
 	lease := o.applyLease
 	if !lease.Valid() && apply != nil {
 		lease = apply.Lease()
@@ -248,6 +252,11 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	if !lease.Valid() {
 		return true
 	}
+
+	// GitHub comments and check updates are side effects outside MySQL's
+	// transaction boundary. Re-check the apply lease immediately before each
+	// side effect so a stale worker cannot publish progress, terminal comments,
+	// or check updates after a newer scheduler owner has claimed the apply.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := o.stor.Applies().CheckLease(ctx, lease); err != nil {
