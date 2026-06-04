@@ -234,9 +234,9 @@ func TestWatchModel_RecoveringCutoverShowsCopyingRows(t *testing.T) {
 	model := updated.(WatchModel)
 
 	view := model.View()
-	assert.Contains(t, view, "Recovery is copying rows (42%)")
+	assert.Contains(t, view, "Recovering after restart — row copy in progress (42%)")
 	assert.Contains(t, view, "Rows: 420 / 1,000")
-	assert.Contains(t, view, "The engine is still copying rows (42%)")
+	assert.Contains(t, view, "Row copy is still in progress (42%)")
 	assert.NotContains(t, view, "Cutover will be available once recovery completes")
 	assert.NotContains(t, view, "Press Enter to proceed with cutover")
 }

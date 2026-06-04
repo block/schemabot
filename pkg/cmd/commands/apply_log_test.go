@@ -160,7 +160,7 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 			name:       "recovering cutover copying rows",
 			status:     state.Apply.RecoveringCutover,
 			pct:        42,
-			wantMsg:    "Recovery is copying rows",
+			wantMsg:    "Recovering after restart with row copy in progress",
 			wantFields: []string{"table=users", "progress=42%", "rows=420/1,000", "eta=\"2m 0s\""},
 		},
 		{

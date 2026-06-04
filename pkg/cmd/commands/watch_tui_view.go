@@ -220,7 +220,7 @@ func (m WatchModel) progressView() string {
 	case state.IsState(m.state, state.Apply.RecoveringCutover):
 		b.WriteString("\n\n")
 		if pct, ok := recoveringCutoverCopyPercent(m.tables); ok {
-			fmt.Fprintf(&b, "SchemaBot is recovering deferred cutover state after restart.\nThe engine is still copying rows (%d%%), so cutover remains blocked until row copy and checksum reach cutover readiness. (ESC to detach)\n", pct)
+			fmt.Fprintf(&b, "SchemaBot is recovering deferred cutover state after restart.\nRow copy is still in progress (%d%%), so cutover remains blocked until row copy and checksum reach cutover readiness. (ESC to detach)\n", pct)
 		} else {
 			b.WriteString("SchemaBot is recovering deferred cutover state after restart.\n")
 			b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")

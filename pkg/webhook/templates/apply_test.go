@@ -237,9 +237,9 @@ func TestRenderApplyStatusComment_RecoveringCutoverCopyingRows(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "Recovery is copying rows (42%)")
+	assert.Contains(t, result, "Recovering after restart — row copy in progress (42%)")
 	assert.Contains(t, result, "Rows: 420 / 1,000 · ETA: 2m")
-	assert.Contains(t, result, "The engine is still copying rows (42%)")
+	assert.Contains(t, result, "Row copy is still in progress (42%)")
 	assert.NotContains(t, result, "Cutover will be available once recovery completes")
 	assert.NotContains(t, result, "schemabot cutover")
 }

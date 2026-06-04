@@ -241,8 +241,8 @@ durable-owner path. The sentinel is a narrow durable fallback until Spirit expos
 an explicit resume outcome/status API; sentinel presence is enough to block
 cutover safely, but it does not prove Spirit reused prior row-copy progress.
 While recovering, SchemaBot still renders Spirit's row-copy counters when they
-are below 100% so operators can tell that recovery is re-copying rows instead of
-only reattaching near cutover readiness.
+are below 100% so operators can tell that row copy is still in progress instead
+of only reattaching near cutover readiness.
 
 If the sentinel is already absent when SchemaBot restarts, recovery does not
 enter `recovering_cutover`. The scheduler re-plans against the live schema; if

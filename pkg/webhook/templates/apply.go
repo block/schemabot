@@ -329,7 +329,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 		if recoveringCutoverIsCopyingRows(table) {
 			pct := ui.ClampPercent(table.PercentComplete)
 			bar := ui.ProgressBarRowCopy(pct)
-			fmt.Fprintf(sb, "**`%s`**: %s Recovery is copying rows (%d%%)\n", table.TableName, bar, pct)
+			fmt.Fprintf(sb, "**`%s`**: %s Recovering after restart — row copy in progress (%d%%)\n", table.TableName, bar, pct)
 			writeDDLLine(sb, table.DDL)
 			writeRowsAndETA(sb, table)
 			break
@@ -460,7 +460,7 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.RecoveringCutover:
 		sb.WriteString("\n---\n\n")
 		if pct, ok := recoveringCutoverCopyPercent(data.Tables); ok {
-			fmt.Fprintf(sb, "Recovering deferred cutover state after restart. The engine is still copying rows (%d%%), so cutover remains blocked until row copy and checksum reach cutover readiness.\n", pct)
+			fmt.Fprintf(sb, "Recovering deferred cutover state after restart. Row copy is still in progress (%d%%), so cutover remains blocked until row copy and checksum reach cutover readiness.\n", pct)
 		} else {
 			sb.WriteString("Recovering deferred cutover state after restart. Cutover will be available once recovery completes.\n")
 		}

@@ -237,7 +237,7 @@ func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	tp.RowsTotal = 1000
 	tp.ETASeconds = 120
 	output = FormatTableProgress(tp)
-	assert.Contains(t, output, "Recovery is copying rows (45%)")
+	assert.Contains(t, output, "Recovering after restart — row copy in progress (45%)")
 	assert.Contains(t, output, "Rows: 420 / 1,000 · ETA: 2m")
 	assert.NotContains(t, output, "Recovering cutover state...")
 }

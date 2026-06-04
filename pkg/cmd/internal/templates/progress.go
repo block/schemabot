@@ -469,7 +469,7 @@ func FormatTableProgress(t TableProgress) string {
 		if recoveringCutoverIsCopyingRows(t) {
 			pct := ui.ClampPercent(t.PercentComplete)
 			bar := ui.ProgressBarRowCopy(pct)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovery is copying rows (%d%%)\n", t.TableName, bar, pct)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovering after restart — row copy in progress (%d%%)\n", t.TableName, bar, pct)
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDL(t.DDL))
 			}
