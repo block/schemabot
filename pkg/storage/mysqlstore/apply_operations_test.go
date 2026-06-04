@@ -657,6 +657,104 @@ func TestApplyOperationStore_Heartbeat(t *testing.T) {
 	require.NoError(t, store.ApplyOperations().Heartbeat(ctx, 999999))
 }
 
+func TestApplyOperationStore_LeaseGuardsWrites(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_lease", 1)
+	otherApply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_lease_other", 2, state.Apply.Completed, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, "current-worker", "current-token", apply.ID)
+	require.NoError(t, err)
+
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "old-worker", Token: "stale-token"})
+	currentCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "current-worker", Token: "current-token"})
+
+	updateID := createApplyOperationForLeaseTest(t, store, apply.ID, "region-update")
+	require.ErrorIs(t, store.ApplyOperations().UpdateState(staleCtx, updateID, state.ApplyOperation.Running), storage.ErrApplyLeaseLost)
+	assertApplyOperationState(t, store, updateID, state.ApplyOperation.Pending)
+	require.NoError(t, store.ApplyOperations().UpdateState(currentCtx, updateID, state.ApplyOperation.Running))
+	assertApplyOperationState(t, store, updateID, state.ApplyOperation.Running)
+
+	startedID := createApplyOperationForLeaseTest(t, store, apply.ID, "region-started")
+	require.ErrorIs(t, store.ApplyOperations().MarkStarted(staleCtx, startedID), storage.ErrApplyLeaseLost)
+	assertApplyOperationState(t, store, startedID, state.ApplyOperation.Pending)
+	require.NoError(t, store.ApplyOperations().MarkStarted(currentCtx, startedID))
+	assertApplyOperationState(t, store, startedID, state.ApplyOperation.Running)
+
+	completedID := createApplyOperationForLeaseTest(t, store, apply.ID, "region-completed")
+	require.ErrorIs(t, store.ApplyOperations().MarkCompleted(staleCtx, completedID), storage.ErrApplyLeaseLost)
+	assertApplyOperationState(t, store, completedID, state.ApplyOperation.Pending)
+	require.NoError(t, store.ApplyOperations().MarkCompleted(currentCtx, completedID))
+	assertApplyOperationState(t, store, completedID, state.ApplyOperation.Completed)
+
+	failedID := createApplyOperationForLeaseTest(t, store, apply.ID, "region-failed")
+	require.ErrorIs(t, store.ApplyOperations().MarkFailed(staleCtx, failedID, "stale failure"), storage.ErrApplyLeaseLost)
+	failed, err := store.ApplyOperations().Get(ctx, failedID)
+	require.NoError(t, err)
+	require.NotNil(t, failed)
+	assert.Equal(t, state.ApplyOperation.Pending, failed.State)
+	assert.Empty(t, failed.ErrorMessage)
+	require.NoError(t, store.ApplyOperations().MarkFailed(currentCtx, failedID, "current failure"))
+	failed, err = store.ApplyOperations().Get(ctx, failedID)
+	require.NoError(t, err)
+	require.NotNil(t, failed)
+	assert.Equal(t, state.ApplyOperation.Failed, failed.State)
+	assert.Equal(t, "current failure", failed.ErrorMessage)
+
+	heartbeatID := createApplyOperationForLeaseTest(t, store, apply.ID, "region-heartbeat")
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 5 MINUTE WHERE id = ?
+	`, heartbeatID)
+	require.NoError(t, err)
+	beforeHeartbeat, err := store.ApplyOperations().Get(ctx, heartbeatID)
+	require.NoError(t, err)
+	require.ErrorIs(t, store.ApplyOperations().Heartbeat(staleCtx, heartbeatID), storage.ErrApplyLeaseLost)
+	afterStaleHeartbeat, err := store.ApplyOperations().Get(ctx, heartbeatID)
+	require.NoError(t, err)
+	assert.Equal(t, beforeHeartbeat.UpdatedAt, afterStaleHeartbeat.UpdatedAt)
+	require.NoError(t, store.ApplyOperations().Heartbeat(currentCtx, heartbeatID))
+	afterCurrentHeartbeat, err := store.ApplyOperations().Get(ctx, heartbeatID)
+	require.NoError(t, err)
+	assert.True(t, afterCurrentHeartbeat.UpdatedAt.After(beforeHeartbeat.UpdatedAt))
+
+	otherID := createApplyOperationForLeaseTest(t, store, otherApply.ID, "region-other")
+	require.ErrorIs(t, store.ApplyOperations().UpdateState(currentCtx, otherID, state.ApplyOperation.Running), storage.ErrApplyLeaseLost)
+	assertApplyOperationState(t, store, otherID, state.ApplyOperation.Pending)
+
+	require.ErrorIs(t, store.ApplyOperations().DeleteByApply(staleCtx, apply.ID), storage.ErrApplyLeaseLost)
+	remaining, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.NotEmpty(t, remaining)
+	require.NoError(t, store.ApplyOperations().DeleteByApply(currentCtx, apply.ID))
+	remaining, err = store.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Empty(t, remaining)
+}
+
+func createApplyOperationForLeaseTest(t *testing.T, store *Storage, applyID int64, deployment string) int64 {
+	t.Helper()
+	id, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: deployment,
+	})
+	require.NoError(t, err)
+	return id
+}
+
+func assertApplyOperationState(t *testing.T, store *Storage, id int64, expected string) {
+	t.Helper()
+	got, err := store.ApplyOperations().Get(t.Context(), id)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, expected, got.State)
+}
+
 func TestApplyOperationStore_Heartbeat_DBError(t *testing.T) {
 	db, err := sql.Open("mysql", testDSN)
 	require.NoError(t, err)
