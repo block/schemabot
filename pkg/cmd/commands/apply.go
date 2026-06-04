@@ -822,7 +822,16 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 		kvs = appendShardSummary(kvs, tbl.Shards)
 		e.emit(kvs...)
 	case state.Apply.RecoveringCutover:
-		kvs := tableKVs("Recovering cutover state", tbl, ts)
+		kvs := tableKVs(recoveringCutoverLogMessage(tbl), tbl, ts)
+		if tbl.RowsTotal > 0 && tbl.PercentComplete < 100 {
+			kvs = append(kvs,
+				"progress", fmt.Sprintf("%d%%", min(int(tbl.PercentComplete), 100)),
+				"rows", fmt.Sprintf("%s/%s", ui.FormatNumber(ui.ClampRows(tbl.RowsCopied, tbl.RowsTotal)), ui.FormatNumber(tbl.RowsTotal)),
+			)
+			if tbl.ETASeconds > 0 {
+				kvs = append(kvs, "eta", ui.FormatETA(tbl.ETASeconds))
+			}
+		}
 		kvs = appendShardSummary(kvs, tbl.Shards)
 		e.emit(kvs...)
 	case state.Apply.CuttingOver:
@@ -841,6 +850,13 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 		kvs = appendShardSummary(kvs, tbl.Shards)
 		e.emit(kvs...)
 	}
+}
+
+func recoveringCutoverLogMessage(tbl *apitypes.TableProgressResponse) string {
+	if tbl.RowsTotal > 0 && tbl.PercentComplete < 100 {
+		return "Recovery is copying rows"
+	}
+	return "Recovering cutover state"
 }
 
 // emitProgressHeartbeat emits a progress line for a table actively copying rows.

@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // View implements tea.Model.
@@ -218,8 +219,12 @@ func (m WatchModel) progressView() string {
 		}
 	case state.IsState(m.state, state.Apply.RecoveringCutover):
 		b.WriteString("\n\n")
-		b.WriteString("SchemaBot is recovering deferred cutover state after restart.\n")
-		b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
+		if pct, ok := recoveringCutoverCopyPercent(m.tables); ok {
+			fmt.Fprintf(&b, "SchemaBot is recovering deferred cutover state after restart.\nThe engine is still copying rows (%d%%), so cutover remains blocked until row copy and checksum reach cutover readiness. (ESC to detach)\n", pct)
+		} else {
+			b.WriteString("SchemaBot is recovering deferred cutover state after restart.\n")
+			b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
+		}
 	case state.IsState(m.state, state.Apply.Running):
 		b.WriteString("\n\n")
 		if m.volumeMode {
@@ -256,6 +261,19 @@ func (m WatchModel) fetchErrorLine() string {
 		label = fmt.Sprintf("Error (attempt %d)", m.consecutiveErrors)
 	}
 	return errStyle.Render(label+": "+m.errorMsg) + "\n"
+}
+
+func recoveringCutoverCopyPercent(tables []tableProgress) (int, bool) {
+	percent := 100
+	found := false
+	for _, table := range tables {
+		if state.NormalizeTaskStatus(table.Status) != state.Task.RecoveringCutover || table.RowsTotal <= 0 || table.Percent >= 100 {
+			continue
+		}
+		percent = min(percent, ui.ClampPercent(table.Percent))
+		found = true
+	}
+	return percent, found
 }
 
 // toTemplateTables converts TUI tableProgress slices to template TableProgress

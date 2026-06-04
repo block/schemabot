@@ -466,6 +466,18 @@ func FormatTableProgress(t TableProgress) string {
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
 	case state.Apply.RecoveringCutover:
+		if recoveringCutoverIsCopyingRows(t) {
+			pct := ui.ClampPercent(t.PercentComplete)
+			bar := ui.ProgressBarRowCopy(pct)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovery is copying rows (%d%%)\n", t.TableName, bar, pct)
+			if t.DDL != "" {
+				b.WriteString(formatProgressDDL(t.DDL))
+			}
+			writeStructuredRowsAndETA(&b, t)
+			b.WriteString("\n")
+			b.WriteString(FormatShardProgress(t.Shards))
+			return b.String()
+		}
 		bar := ui.ProgressBarRowCopy(t.PercentComplete)
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovering cutover state...\n", t.TableName, bar)
 		if t.DDL != "" {
@@ -600,12 +612,7 @@ func FormatTableProgress(t TableProgress) string {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
 
-		// Rows and ETA on same line
-		if t.ETASeconds > 0 {
-			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatETA(t.ETASeconds))
-		} else {
-			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
-		}
+		writeStructuredRowsAndETA(&b, t)
 
 		statusLower := strings.ToLower(t.Status)
 		if statusLower != "" && statusLower != "running" && statusLower != "row_copy" {
@@ -634,6 +641,18 @@ func FormatTableProgress(t TableProgress) string {
 	}
 	b.WriteString(FormatShardProgress(t.Shards))
 	return b.String()
+}
+
+func recoveringCutoverIsCopyingRows(t TableProgress) bool {
+	return t.RowsTotal > 0 && t.PercentComplete < 100
+}
+
+func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
+	if t.ETASeconds > 0 {
+		fmt.Fprintf(b, indentDetail+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatETA(t.ETASeconds))
+		return
+	}
+	fmt.Fprintf(b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
 }
 
 // writeTableProgress writes progress for a single table to stdout.

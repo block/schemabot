@@ -217,6 +217,30 @@ func TestWatchModel_RecoveringCutoverShowsBlockedCutoverMessage(t *testing.T) {
 	assert.NotContains(t, view, "Press Enter to proceed with cutover")
 }
 
+func TestWatchModel_RecoveringCutoverShowsCopyingRows(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
+	m.applyID = "apply-recovering-cutover"
+
+	updated, _ := m.Update(progressMsg{
+		state: state.Apply.RecoveringCutover,
+		tables: []tableProgress{{
+			Name:       "users",
+			Status:     state.Task.RecoveringCutover,
+			RowsCopied: 420,
+			RowsTotal:  1000,
+			Percent:    42,
+		}},
+	})
+	model := updated.(WatchModel)
+
+	view := model.View()
+	assert.Contains(t, view, "Recovery is copying rows (42%)")
+	assert.Contains(t, view, "Rows: 420 / 1,000")
+	assert.Contains(t, view, "The engine is still copying rows (42%)")
+	assert.NotContains(t, view, "Cutover will be available once recovery completes")
+	assert.NotContains(t, view, "Press Enter to proceed with cutover")
+}
+
 func TestWatchModel_ConnectionError_CanEscape(t *testing.T) {
 	// User should be able to ESC out of the loading+error state.
 	m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)

@@ -326,6 +326,14 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.RecoveringCutover:
+		if recoveringCutoverIsCopyingRows(table) {
+			pct := ui.ClampPercent(table.PercentComplete)
+			bar := ui.ProgressBarRowCopy(pct)
+			fmt.Fprintf(sb, "**`%s`**: %s Recovery is copying rows (%d%%)\n", table.TableName, bar, pct)
+			writeDDLLine(sb, table.DDL)
+			writeRowsAndETA(sb, table)
+			break
+		}
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(sb, "**`%s`**: %s Recovering cutover state...\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
@@ -373,6 +381,23 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 		fmt.Fprintf(sb, "**`%s`**: Running...\n", table.TableName)
 		writeDDLLine(sb, table.DDL)
 	}
+}
+
+func recoveringCutoverIsCopyingRows(table TableProgressData) bool {
+	return table.RowsTotal > 0 && table.PercentComplete < 100
+}
+
+func recoveringCutoverCopyPercent(tables []TableProgressData) (int, bool) {
+	percent := 100
+	found := false
+	for _, table := range tables {
+		if state.NormalizeTaskStatus(table.Status) != state.Task.RecoveringCutover || !recoveringCutoverIsCopyingRows(table) {
+			continue
+		}
+		percent = min(percent, ui.ClampPercent(table.PercentComplete))
+		found = true
+	}
+	return percent, found
 }
 
 // renderStoppedTable renders a table in the stopped state.
@@ -434,7 +459,11 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeFooterAction(sb, "To proceed with cutover:", fmt.Sprintf("schemabot cutover %s", data.ApplyID))
 	case state.Apply.RecoveringCutover:
 		sb.WriteString("\n---\n\n")
-		sb.WriteString("Recovering deferred cutover state after restart. Cutover will be available once recovery completes.\n")
+		if pct, ok := recoveringCutoverCopyPercent(data.Tables); ok {
+			fmt.Fprintf(sb, "Recovering deferred cutover state after restart. The engine is still copying rows (%d%%), so cutover remains blocked until row copy and checksum reach cutover readiness.\n", pct)
+		} else {
+			sb.WriteString("Recovering deferred cutover state after restart. Cutover will be available once recovery completes.\n")
+		}
 	case state.Apply.CuttingOver:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")

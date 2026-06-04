@@ -157,6 +157,13 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 			wantFields: []string{"table=users"},
 		},
 		{
+			name:       "recovering cutover copying rows",
+			status:     state.Apply.RecoveringCutover,
+			pct:        42,
+			wantMsg:    "Recovery is copying rows",
+			wantFields: []string{"table=users", "progress=42%", "rows=420/1,000", "eta=\"2m 0s\""},
+		},
+		{
 			name:       "cutting over",
 			status:     state.Apply.CuttingOver,
 			wantMsg:    "Cutting over",
@@ -185,6 +192,11 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 			tbl := &apitypes.TableProgressResponse{
 				TableName:       "users",
 				PercentComplete: tt.pct,
+			}
+			if tt.name == "recovering cutover copying rows" {
+				tbl.RowsCopied = 420
+				tbl.RowsTotal = 1000
+				tbl.ETASeconds = 120
 			}
 
 			output := captureOutput(t, func() {
