@@ -645,10 +645,11 @@ func TestTaskStateWithNoBackwardProgressPolicyCoversTaskStates(t *testing.T) {
 		_, hasProgressRank := activeTaskProgressRank(taskState)
 		hasPolicy := state.IsTerminalTaskState(taskState) ||
 			blocksActiveEngineProgress(taskState) ||
+			isRecoveryState(taskState) ||
 			hasProgressRank
 
 		assert.Truef(t, hasPolicy,
-			"task state %s=%q must be terminal, scheduler/control-owned, or ranked as active progress",
+			"task state %s=%q must be terminal, scheduler/control-owned, recovery-owned, or ranked as active progress",
 			taskName, taskState)
 	}
 }
@@ -856,5 +857,6 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 func TestRecoveringProtoConversion(t *testing.T) {
 	assert.Equal(t, ternv1.State_STATE_RECOVERING, storageStateToProto(state.Apply.Recovering))
 	assert.Equal(t, ternv1.State_STATE_RECOVERING, storageStateToProto(state.Task.Recovering))
+	assert.Equal(t, ternv1.State_STATE_RECOVERING, storageStateToProto("recovering_cutover"))
 	assert.Equal(t, state.Apply.Recovering, ProtoStateToStorage(ternv1.State_STATE_RECOVERING))
 }

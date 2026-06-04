@@ -1107,7 +1107,7 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 	// after restart. Once the engine reports a concrete active state, storage
 	// returns to that normal state so the UI does not stay in recovery for the rest
 	// of a long row copy.
-	if state.IsState(storedTaskState, state.Task.Recovering) && recoveryCompleteWithEngineState(engineTaskState) {
+	if isRecoveryState(storedTaskState) && recoveryCompleteWithEngineState(engineTaskState) {
 		return engineTaskState
 	}
 
@@ -1144,6 +1144,10 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 // the scheduler can mark a task failed_retryable before a retry claims it.
 func blocksActiveEngineProgress(taskState string) bool {
 	return state.IsState(taskState, state.Task.Stopped, state.Task.FailedRetryable)
+}
+
+func isRecoveryState(taskState string) bool {
+	return state.IsState(taskState, state.Task.Recovering)
 }
 
 func recoveryCompleteWithEngineState(taskState string) bool {

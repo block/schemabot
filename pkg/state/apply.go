@@ -138,7 +138,7 @@ func normalizeApplyState(raw string) string {
 		return Apply.WaitingForDeploy
 	case "WAITING_FOR_CUTOVER":
 		return Apply.WaitingForCutover
-	case "RECOVERING":
+	case "RECOVERING", "RECOVERING_CUTOVER":
 		return Apply.Recovering
 	case "CUTTING_OVER":
 		return Apply.CuttingOver

@@ -18,6 +18,7 @@ import (
 
 // taskStateToApplyState maps a task state string to an Apply state string.
 func taskStateToApplyState(ts string) string {
+	ts = state.NormalizeTaskStatus(ts)
 	switch ts {
 	case state.Task.Pending:
 		return state.Apply.Pending
@@ -113,6 +114,7 @@ func progressFailureMessage(result *engine.ProgressResult) string {
 
 // storageStateToProto converts a task state string to proto State enum.
 func storageStateToProto(ts string) ternv1.State {
+	ts = state.NormalizeState(ts)
 	switch ts {
 	case state.Task.Pending:
 		return ternv1.State_STATE_PENDING

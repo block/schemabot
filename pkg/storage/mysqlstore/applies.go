@@ -82,6 +82,7 @@ func claimableApplyStates() []string {
 		state.Apply.WaitingForDeploy,
 		state.Apply.WaitingForCutover,
 		state.Apply.Recovering,
+		"recovering_cutover",
 		state.Apply.CuttingOver,
 		state.Apply.RevertWindow,
 	}

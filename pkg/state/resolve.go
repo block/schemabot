@@ -15,5 +15,8 @@ func NormalizeState(s string) string {
 	if s == "" {
 		return NoActiveChange
 	}
+	if s == "recovering_cutover" {
+		return Apply.Recovering
+	}
 	return s
 }
