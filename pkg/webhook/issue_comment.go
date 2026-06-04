@@ -214,7 +214,7 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "apply-confirm started"})
 	case action.Unlock:
 		h.goSafe(repo, pr, installationID, func() {
-			h.handleUnlockCommand(repo, pr, installationID, requestedBy)
+			h.handleUnlockCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unlock started"})
 	case action.Rollback:

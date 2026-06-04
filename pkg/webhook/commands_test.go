@@ -45,6 +45,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		supportsSkipRevert  bool
 		supportsDefer       bool
 		supportsAllowUnsafe bool
+		supportsForce       bool
 	}{
 		{name: action.Help},
 		{name: action.Plan, requiresEnv: true, supportsDB: true},
@@ -53,7 +54,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 			supportsDefer: true, supportsAllowUnsafe: true},
 		{name: action.ApplyConfirm, requiresEnv: true, supportsDB: true,
 			supportsSkipRevert: true, supportsDefer: true, supportsAllowUnsafe: true},
-		{name: action.Unlock},
+		{name: action.Unlock, supportsDB: true, supportsForce: true},
 		{name: action.FixLint, supportsDB: true},
 		{name: action.Stop, requiresEnv: true, hasApplyID: true},
 		{name: action.Revert, requiresEnv: true},
@@ -74,6 +75,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 			assert.Equal(t, tc.supportsSkipRevert, spec.SupportsSkipRevert, "SupportsSkipRevert")
 			assert.Equal(t, tc.supportsDefer, spec.SupportsDeferCutover, "SupportsDeferCutover")
 			assert.Equal(t, tc.supportsAllowUnsafe, spec.SupportsAllowUnsafe, "SupportsAllowUnsafe")
+			assert.Equal(t, tc.supportsForce, spec.SupportsForce, "SupportsForce")
 		})
 	}
 }
@@ -161,6 +163,17 @@ func TestParseCommand(t *testing.T) {
 			body: "schemabot unlock",
 			expected: CommandResult{
 				Action:    "unlock",
+				Found:     true,
+				IsMention: true,
+			},
+		},
+		{
+			name: "unlock with database and force",
+			body: "schemabot unlock -d example-db --force",
+			expected: CommandResult{
+				Action:    "unlock",
+				Database:  "example-db",
+				Force:     true,
 				Found:     true,
 				IsMention: true,
 			},

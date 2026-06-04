@@ -45,6 +45,9 @@ type CommandSpec struct {
 
 	// SupportsAllowUnsafe means `--allow-unsafe` is recognized.
 	SupportsAllowUnsafe bool
+
+	// SupportsForce means `--force` is recognized.
+	SupportsForce bool
 }
 
 // commandSpecs is the registry of all SchemaBot commands. Order does not
@@ -59,7 +62,7 @@ var commandSpecs = []CommandSpec{
 		SupportsAllowUnsafe: true, SupportsAutoConfirm: true},
 	{Name: action.ApplyConfirm, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
-	{Name: action.Unlock},
+	{Name: action.Unlock, SupportsDB: true, SupportsForce: true},
 	{Name: action.FixLint, SupportsDB: true},
 	{Name: action.Stop, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Revert, RequiresEnv: true},
@@ -102,6 +105,7 @@ type CommandParser struct {
 	skipRevertRegex   *regexp.Regexp
 	deferCutoverRegex *regexp.Regexp
 	allowUnsafeRegex  *regexp.Regexp
+	forceRegex        *regexp.Regexp
 	autoConfirmRegex  *regexp.Regexp
 }
 
@@ -117,6 +121,7 @@ func NewCommandParser() *CommandParser {
 		skipRevertRegex:   regexp.MustCompile(`(?i)--skip-revert\b`),
 		deferCutoverRegex: regexp.MustCompile(`(?i)--defer-cutover\b`),
 		allowUnsafeRegex:  regexp.MustCompile(`(?i)--allow-unsafe\b`),
+		forceRegex:        regexp.MustCompile(`(?i)--force\b`),
 		autoConfirmRegex:  regexp.MustCompile(`(?i)(?:--yes\b|-y\b)`),
 	}
 }
@@ -130,6 +135,7 @@ type CommandResult struct {
 	SkipRevert   bool
 	DeferCutover bool
 	AllowUnsafe  bool
+	Force        bool
 	AutoConfirm  bool
 	Found        bool
 	IsHelp       bool
@@ -221,6 +227,9 @@ func (p *CommandParser) applySpec(spec CommandSpec, body string) CommandResult {
 	}
 	if spec.SupportsAllowUnsafe {
 		result.AllowUnsafe = p.allowUnsafeRegex.MatchString(body)
+	}
+	if spec.SupportsForce {
+		result.Force = p.forceRegex.MatchString(body)
 	}
 	if spec.SupportsAutoConfirm {
 		result.AutoConfirm = p.autoConfirmRegex.MatchString(body)

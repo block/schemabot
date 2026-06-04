@@ -5,6 +5,7 @@ package webhook
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -361,6 +362,98 @@ func TestE2EUnlock(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for check run")
 	}
+}
+
+func TestE2EUnlockForceInfersDatabaseForCLILock(t *testing.T) {
+	dbName := "webhook_unlock_cli"
+	svc := setupE2EService(t, dbName)
+
+	// Seed the production symptom: a local CLI session owns the database lock, so
+	// the normal PR-scoped unlock lookup cannot find it by repository/PR.
+	err := svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName: dbName,
+		DatabaseType: "mysql",
+		Owner:        "cli:testuser@example.local",
+	})
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{
+				Ref: new("feature-branch"),
+				SHA: new("abc123"),
+			},
+			Base: &gh.PullRequestBranch{
+				Ref: new("main"),
+				SHA: new("def456"),
+			},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]string{{
+			"filename": "schemabot.yaml",
+			"status":   "modified",
+		}})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		content := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n", dbName)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"type":     "file",
+			"encoding": "base64",
+			"content":  base64.StdEncoding.EncodeToString([]byte(content)),
+		})
+	})
+
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot unlock --force",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unlock started")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Lock Released")
+		assert.Contains(t, body, dbName)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for unlock comment")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock, "expected CLI-owned lock to be force released")
 }
 
 // TestE2EUnlockDoesNotPassAggregateWithPendingChanges verifies that releasing

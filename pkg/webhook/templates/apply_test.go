@@ -4,12 +4,25 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
+	rendered := RenderApplyBlockedByOtherPR(ApplyLockConflictData{
+		Database:    "example-db",
+		Environment: "staging",
+		LockOwner:   "cli:testuser@example.local",
+		LockCreated: time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC),
+	})
+
+	assert.Contains(t, rendered, "schemabot unlock -d example-db --force")
+	assert.NotContains(t, rendered, "schemabot unlock -d example-db -e staging --force")
+}
 
 func TestRenderApplyStatusComment_Running(t *testing.T) {
 	data := ApplyStatusCommentData{

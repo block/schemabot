@@ -977,7 +977,7 @@ A CLI session currently holds the lock for this database.
 
 Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
 ```
-schemabot unlock -d testapp -e staging --force
+schemabot unlock -d testapp --force
 ```
 
 </details>
@@ -4022,7 +4022,7 @@ A CLI session currently holds the lock for this database.
 
 Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
 ```
-schemabot unlock -d testapp -e staging --force
+schemabot unlock -d testapp --force
 ```
 
 
@@ -4768,21 +4768,21 @@ The following changes will permanently delete data:
 === Exit Context: MySQL Detach ===
 
   Apply ID:  apply-8487c4ad
-  Resume:    schemabot progress --apply-id apply-8487c4ad -e staging
+  Resume:    schemabot progress apply-8487c4ad -e staging
 
 
 === Exit Context: Vitess Detach ===
 
   Apply ID:  apply-9849818a9cec4ba7
   Deploy Request:  https://app.planetscale.com/square-production/inventory2/deploy-requests/109
-  Resume:    schemabot progress --apply-id apply-9849818a9cec4ba7 -e production
+  Resume:    schemabot progress apply-9849818a9cec4ba7 -e production
 
 
 === Exit Context: MySQL Connection Lost ===
 Error: unexpected error: connection refused
 
   Apply ID:  apply-8487c4ad
-  Resume:    schemabot progress --apply-id apply-8487c4ad -e staging
+  Resume:    schemabot progress apply-8487c4ad -e staging
 
 
 === Exit Context: Vitess Connection Lost ===
@@ -4790,6 +4790,6 @@ Error: unexpected error: connection refused
 
   Apply ID:  apply-9849818a9cec4ba7
   Deploy Request:  https://app.planetscale.com/square-production/inventory2/deploy-requests/109
-  Resume:    schemabot progress --apply-id apply-9849818a9cec4ba7 -e production
+  Resume:    schemabot progress apply-9849818a9cec4ba7 -e production
 
 

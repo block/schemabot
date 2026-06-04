@@ -191,7 +191,7 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 
 	if isCLI {
 		sb.WriteString("Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:\n")
-		fmt.Fprintf(&sb, "```\nschemabot unlock -d %s -e %s --force\n```\n", data.Database, data.Environment)
+		fmt.Fprintf(&sb, "```\nschemabot unlock -d %s --force\n```\n", data.Database)
 	} else {
 		sb.WriteString("Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.\n")
 	}

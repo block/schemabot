@@ -1,11 +1,13 @@
 package webhook
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -457,15 +459,27 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command.
-// It finds all locks held by this PR and releases them.
-func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64, requestedBy string) {
+// By default it finds all locks held by this PR and releases them. With
+// `--force`, it can also release a CLI-owned lock for the database inferred
+// from this PR's SchemaBot config; `-d <database>` disambiguates multi-database
+// PRs. This lets a PR author clear a stale local-session lock from the PR
+// workflow that it is blocking.
+func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
 	ctx, cancel := h.commandContext(30 * time.Second)
 	defer cancel()
+	if result.Force && result.Database == "" {
+		database, err := h.inferUnlockDatabase(ctx, repo, pr, installationID)
+		if err != nil {
+			h.logger.Error("failed to infer database for force unlock", "repo", repo, "pr", pr, "error", err)
+			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
+			return
+		}
+		result.Database = database
+	}
 
-	// Find locks held by this PR
-	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
+	locks, err := h.locksForUnlock(ctx, repo, pr, result)
 	if err != nil {
-		h.logger.Error("failed to look up locks", "repo", repo, "pr", pr, "error", err)
+		h.logger.Error("failed to look up unlock targets", "repo", repo, "pr", pr, "database", result.Database, "force", result.Force, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to look up locks: "+err.Error())
 		return
 	}
@@ -476,11 +490,13 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 		return
 	}
 
-	// Check for active applies on any locked database
+	// Check for active applies on any locked database. Even force-unlock should
+	// not break a lock while SchemaBot still has a non-terminal apply recorded
+	// for the same database/type.
 	for _, lock := range locks {
-		applies, err := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
+		applies, err := h.service.Storage().Applies().GetByDatabase(ctx, lock.DatabaseName, lock.DatabaseType, "")
 		if err != nil {
-			h.logger.Error("failed to check active applies", "error", err)
+			h.logger.Error("failed to check active applies", "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
 			continue
 		}
 		for _, a := range applies {
@@ -494,7 +510,13 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 
 	// Release all locks
 	for _, lock := range locks {
-		if err := h.service.Storage().Locks().ForceRelease(ctx, lock.DatabaseName, lock.DatabaseType); err != nil {
+		var err error
+		if result.Force {
+			err = h.service.Storage().Locks().ForceRelease(ctx, lock.DatabaseName, lock.DatabaseType)
+		} else {
+			err = h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner)
+		}
+		if err != nil {
 			h.logger.Error("failed to release lock", "database", lock.DatabaseName, "error", err)
 			continue
 		}
@@ -502,7 +524,73 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 		h.postComment(repo, pr, installationID, templates.RenderUnlockSuccess(
 			lock.DatabaseName, "", requestedBy))
 
-		// Update check run to neutral
-		h.updateCheckRunAfterUnlock(ctx, repo, pr, lock, installationID)
+		// Update check run to neutral for PR-owned locks. CLI-owned locks have no
+		// associated PR check record to update.
+		if lock.Repository != "" && lock.PullRequest != 0 {
+			h.updateCheckRunAfterUnlock(ctx, repo, pr, lock, installationID)
+		}
 	}
+}
+
+func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, result CommandResult) ([]*storage.Lock, error) {
+	if result.Force {
+		if result.Database == "" {
+			return nil, fmt.Errorf("--force requires a database target")
+		}
+
+		locks, err := h.service.Storage().Locks().List(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		var matches []*storage.Lock
+		for _, lock := range locks {
+			if lock.DatabaseName != result.Database {
+				continue
+			}
+			if lock.PullRequest != 0 && (lock.Repository != repo || lock.PullRequest != pr) {
+				return nil, fmt.Errorf("lock for %s is held by %s#%d", result.Database, lock.Repository, lock.PullRequest)
+			}
+			matches = append(matches, lock)
+		}
+		return matches, nil
+	}
+
+	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		return nil, err
+	}
+	if result.Database == "" {
+		return locks, nil
+	}
+
+	filtered := locks[:0]
+	for _, lock := range locks {
+		if lock.DatabaseName == result.Database {
+			filtered = append(filtered, lock)
+		}
+	}
+	return filtered, nil
+}
+
+func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, installationID int64) (string, error) {
+	client, err := h.clientForRepo(repo, installationID)
+	if err != nil {
+		return "", err
+	}
+
+	config, _, err := client.FindConfigForPR(ctx, repo, pr)
+	if errors.Is(err, ghclient.ErrNoConfig) {
+		config, _, _, err = client.FindConfigInRepo(ctx, repo, pr)
+	}
+	if err != nil {
+		if errors.Is(err, ghclient.ErrMultipleConfigs) {
+			return "", fmt.Errorf("multiple SchemaBot configs match this PR; retry with `schemabot unlock -d <database> --force`: %w", err)
+		}
+		return "", err
+	}
+	if config == nil || config.Database == "" {
+		return "", fmt.Errorf("no database found in SchemaBot config")
+	}
+	return config.Database, nil
 }

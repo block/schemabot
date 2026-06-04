@@ -19,6 +19,7 @@ import (
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 )
 
 // prFetchCountingTransport counts GET /repos/octocat/hello-world/pulls/1
@@ -96,7 +97,7 @@ func TestUnlockHandlerDedupesPRFetchAcrossLocks(t *testing.T) {
 	// Call the handler entry point synchronously so every fan-out into
 	// updateCheckRunAfterUnlock resolves within the same WithPRInfoCache
 	// scope before the test asserts.
-	h.handleUnlockCommand("octocat/hello-world", 1, 12345, "testuser")
+	h.handleUnlockCommand("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 	for _, db := range []string{dbA, dbB} {
 		l, err := svc.Storage().Locks().Get(t.Context(), db, "mysql")
