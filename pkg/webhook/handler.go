@@ -40,6 +40,24 @@ const defaultAppName = "default"
 // Webhook headers GitHub sends on every App-originated delivery. Used by
 // multi-App dispatch to identify which configured App signed the request
 // before HMAC verification.
+//
+// For GitHub App webhook deliveries — including repository-scoped events
+// like pull_request, issue_comment, and check_run — GitHub sets:
+//
+//	X-GitHub-Hook-Installation-Target-Type: integration   (legacy "GitHub
+//	                                                       Integrations"
+//	                                                       naming for Apps)
+//	X-GitHub-Hook-Installation-Target-ID:   <app_id>
+//
+// The Target-Type value "repository" is only sent for repository-level
+// webhooks (registered directly on a repo, distinct from App-installed
+// webhooks); SchemaBot does not handle those. The single example in
+// https://docs.github.com/en/webhooks/webhook-events-and-payloads
+// happens to be a repository webhook, which is a known source of
+// confusion. Verified against a live SchemaBot App delivery: header
+// values were Target-Type "integration" and Target-ID equal to the
+// SchemaBot App ID — i.e., never the repository ID, regardless of the
+// underlying event type.
 const (
 	headerHookTargetID   = "X-GitHub-Hook-Installation-Target-ID"
 	headerHookTargetType = "X-GitHub-Hook-Installation-Target-Type"
