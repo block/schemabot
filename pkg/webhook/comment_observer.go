@@ -250,7 +250,10 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 		lease = apply.Lease()
 	}
 	if !lease.Valid() {
-		return true
+		o.logger.Error("observer: apply lease unavailable; skipping GitHub side effect",
+			"operation", operation,
+			"apply_id", o.applyID)
+		return false
 	}
 
 	// GitHub comments and check updates are side effects outside MySQL's

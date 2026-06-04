@@ -161,6 +161,16 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	applyID, err := st.Applies().Create(ctx, apply)
 	require.NoError(t, err)
 	apply.ID = applyID
+	apply.LeaseOwner = "comment-test-worker"
+	apply.LeaseToken = "comment-test-token"
+	leaseAcquiredAt := time.Now()
+	apply.LeaseAcquiredAt = &leaseAcquiredAt
+	_, err = schemabotDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = ?
+		WHERE id = ?
+	`, apply.LeaseOwner, apply.LeaseToken, leaseAcquiredAt, applyID)
+	require.NoError(t, err)
 
 	// Create tasks for the apply
 	now := time.Now()
@@ -223,7 +233,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 		ApplyID:        applyID,
 		Logger:         logger,
 	})
-	obs.editTrackedComment(nil, state.Comment.Progress, "Updated progress: running 45%")
+	obs.editTrackedComment(apply, state.Comment.Progress, "Updated progress: running 45%")
 
 	select {
 	case edited := <-capture.edits:
@@ -263,7 +273,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	assert.Equal(t, cutoverCommentID, active.GitHubCommentID)
 
 	// Step 6: Edit cutover comment via observer
-	obs.editTrackedComment(nil, state.Comment.Cutover, "Cutover in progress")
+	obs.editTrackedComment(apply, state.Comment.Cutover, "Cutover in progress")
 
 	select {
 	case edited := <-capture.edits:
