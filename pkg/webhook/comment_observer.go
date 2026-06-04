@@ -271,6 +271,10 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 }
 
 func (o *CommentObserver) contextWithApplyLease(ctx context.Context, apply *storage.Apply) context.Context {
+	// Storage writes that record GitHub side effects must use the same lease as
+	// the observer-side lease checks above. Unleased legacy observers keep using
+	// the caller context so existing non-scheduler paths do not start failing
+	// lease validation.
 	lease := o.applyLease
 	if !lease.Valid() && apply != nil {
 		lease = apply.Lease()
