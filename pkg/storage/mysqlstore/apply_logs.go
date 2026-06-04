@@ -57,6 +57,7 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
 				return err
 			}
+			return fmt.Errorf("append apply log for apply %d matched no rows despite current lease", log.ApplyID)
 		}
 		id, err := result.LastInsertId()
 		if err != nil {

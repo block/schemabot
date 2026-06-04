@@ -544,6 +544,7 @@ func RecordSchedulerResumeFailure(ctx context.Context, database, deployment, env
 
 var knownSchedulerClaimFailureReasons = map[string]bool{
 	"expire_retryable_error": true,
+	"missing_lease_token":    true,
 	"storage_error":          true,
 }
 

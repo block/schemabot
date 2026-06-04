@@ -247,6 +247,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 				"deployment", deployment,
 				"environment", apply.Environment,
 				"error", err)
+			metrics.RecordSchedulerResumeFailure(ctx, apply.Database, deployment, apply.Environment, "lease_lost")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}

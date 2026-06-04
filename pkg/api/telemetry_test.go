@@ -688,8 +688,10 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 
 	metrics.RecordSchedulerResume(t.Context(), "testdb", "pie", "staging", "running")
 	metrics.RecordSchedulerResumeFailure(t.Context(), "testdb", "pie", "staging", "no_client")
+	metrics.RecordSchedulerResumeFailure(t.Context(), "testdb", "pie", "staging", "lease_lost")
 	metrics.RecordSchedulerClaimFailure(t.Context(), "storage_error")
 	metrics.RecordSchedulerClaimFailure(t.Context(), "expire_retryable_error")
+	metrics.RecordSchedulerClaimFailure(t.Context(), "missing_lease_token")
 	metrics.RecordSchedulerClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "pie", "staging", "running")
 
 	var rm metricdata.ResourceMetrics
@@ -697,10 +699,12 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 
 	names := make(map[string]bool)
 	var sawExpireRetryableError bool
+	var sawMissingLeaseToken bool
+	var sawLeaseLost bool
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			names[m.Name] = true
-			if m.Name != "schemabot.scheduler.claim_failures_total" {
+			if m.Name != "schemabot.scheduler.claim_failures_total" && m.Name != "schemabot.scheduler.resume_failures_total" {
 				continue
 			}
 			sum, ok := m.Data.(metricdata.Sum[int64])
@@ -708,8 +712,13 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 			for _, dp := range sum.DataPoints {
 				reason, hasReason := dp.Attributes.Value(attribute.Key("reason"))
 				require.True(t, hasReason)
-				if reason.AsString() == "expire_retryable_error" {
+				switch reason.AsString() {
+				case "expire_retryable_error":
 					sawExpireRetryableError = true
+				case "missing_lease_token":
+					sawMissingLeaseToken = true
+				case "lease_lost":
+					sawLeaseLost = true
 				}
 			}
 		}
@@ -719,6 +728,8 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 	assert.True(t, names["schemabot.scheduler.claim_failures_total"], "expected schemabot.scheduler.claim_failures_total")
 	assert.True(t, names["schemabot.scheduler.claim_duration_seconds"], "expected schemabot.scheduler.claim_duration_seconds")
 	assert.True(t, sawExpireRetryableError, "expected expire_retryable_error claim failure reason to be preserved")
+	assert.True(t, sawMissingLeaseToken, "expected missing_lease_token claim failure reason to be preserved")
+	assert.True(t, sawLeaseLost, "expected lease_lost resume failure reason to be recorded")
 }
 
 func TestRecordRemoteDeploymentHealthMetrics(t *testing.T) {

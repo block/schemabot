@@ -83,9 +83,9 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (GitHub API): `success`, `error`, `unknown`
 
-**reason** (scheduler claim failures): `storage_error`, `expire_retryable_error`, `unknown`
+**reason** (scheduler claim failures): `storage_error`, `expire_retryable_error`, `missing_lease_token`, `unknown`
 
-**reason** (scheduler resume failures): `missing_deployment`, `no_client`, `resume_error`, `retry_budget_exhausted`, `recovery_window_expired`
+**reason** (scheduler resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
 
 ### Check Ownership Misses
 
