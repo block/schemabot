@@ -141,6 +141,8 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	if cutoverRequestResolvedByApplyState(apply.State) {
 		c.logger.Info("completing pending cutover request for resolved apply",
 			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
@@ -157,6 +159,8 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	if state.IsState(apply.State, state.Apply.RecoveringCutover) {
 		c.logger.Info("pending cutover request is waiting for cutover recovery to complete",
 			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		return nil
@@ -168,6 +172,8 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	if !readyForCutover {
 		c.logger.Info("pending cutover request is waiting for cutover-ready state",
 			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		return nil
@@ -214,6 +220,8 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	}
 	c.logger.Info("pending cutover request accepted and completed",
 		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"environment", apply.Environment,
 		"requested_by", controlRequestCaller(controlReq),
 		"state", apply.State)
 	return nil
