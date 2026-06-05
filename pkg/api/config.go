@@ -90,7 +90,7 @@ type ServerConfig struct {
 	RequirePassingChecks *bool `yaml:"require_passing_checks"`
 
 	// RequiredChecks narrows the PR checks gate to named checks when any of
-	// those checks are present in the GitHub status rollup. When empty, all
+	// those checks are present in the PR check statuses. When empty, all
 	// non-SchemaBot checks are evaluated.
 	RequiredChecks []string `yaml:"required_checks"`
 

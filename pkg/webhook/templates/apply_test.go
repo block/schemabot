@@ -460,14 +460,14 @@ func TestRenderApplyBlockedByFailingChecks_EmptyList(t *testing.T) {
 
 func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 	t.Run("generic error is shown verbatim with retry block", func(t *testing.T) {
-		err := errors.New("graphql query failed: 500 Internal Server Error")
+		err := errors.New("get combined commit status: 500 Internal Server Error")
 
 		result := RenderApplyBlockedByCheckStatusError("staging", err, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "**Environment**: `staging`")
 		assert.Contains(t, result, "Unable to verify PR check statuses")
-		assert.Contains(t, result, "graphql query failed: 500 Internal Server Error")
+		assert.Contains(t, result, "get combined commit status: 500 Internal Server Error")
 		assert.Contains(t, result, "Resolve the issue and retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
 	})
@@ -483,7 +483,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "**Environment**: `production`")
 		assert.Contains(t, result, "SchemaBot GitHub App `schemabot-prod`")
-		assert.Contains(t, result, "cannot read the combined check/status rollup")
+		assert.Contains(t, result, "cannot read PR check statuses")
 		assert.Contains(t, result, "**Checks: Read**")
 		assert.NotContains(t, result, "**Commit statuses: Read**")
 		assert.Contains(t, result, "then retry:\n```\nschemabot apply -e production\n```",
@@ -494,8 +494,8 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 			"permission branch should not also emit the generic-branch retry copy")
 	})
 
-	t.Run("permission error explains graphQL rollup when REST probes pass", func(t *testing.T) {
-		err := errors.New("graphql statusCheckRollup ref abc123: Resource not accessible by integration")
+	t.Run("permission error explains ambiguous check-status failure when REST probes pass", func(t *testing.T) {
+		err := errors.New("read check statuses for abc123: Resource not accessible by integration")
 
 		result := RenderApplyBlockedByCheckStatusError("production", err, &CheckStatusAccessDetails{
 			GitHubApp:              "schemabot-prod",
@@ -505,7 +505,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 
 		assert.Contains(t, result, "SchemaBot GitHub App `schemabot-prod`")
 		assert.Contains(t, result, "Diagnostic REST probes could read both **Checks** and **Commit statuses**")
-		assert.Contains(t, result, "GraphQL `statusCheckRollup`")
+		assert.Contains(t, result, "inspect the SchemaBot logs")
 		assert.NotContains(t, result, "Grant or accept those permissions")
 	})
 

@@ -317,7 +317,7 @@ required_checks:
   - "CI / required-tests"
 ```
 
-When any configured check appears in the PR status rollup, only configured checks are evaluated. A configured check that is absent does not block apply. If none of the configured checks appear, SchemaBot falls back to the default behavior and evaluates all non-SchemaBot checks.
+When any configured check appears in the PR check statuses, only configured checks are evaluated. A configured check that is absent does not block apply. If none of the configured checks appear, SchemaBot falls back to the default behavior and evaluates all non-SchemaBot checks.
 
 `required_checks` names must exactly match GitHub check run names or commit status contexts. Matching is case-sensitive, and config validation rejects names with leading or trailing whitespace.
 

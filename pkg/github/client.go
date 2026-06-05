@@ -23,7 +23,6 @@ import (
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit"
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit/github_secondary_ratelimit"
 	gh "github.com/google/go-github/v86/github"
-	"github.com/shurcooL/githubv4"
 )
 
 // GitHubClientFactory creates installation-scoped GitHub clients.
@@ -53,7 +52,7 @@ type Client struct {
 	lastSlugAttempt time.Time
 
 	// installations caches per-installation clients keyed by installationID
-	// so the underlying http.Client, gh.Client, githubv4.Client, and
+	// so the underlying http.Client, gh.Client, and
 	// ghinstallation transport (and its installation-token cache) are
 	// reused across webhook deliveries instead of being reconstructed on
 	// every call.
@@ -64,8 +63,8 @@ type Client struct {
 	// calls for the same (repo, sha) into a single upstream request via
 	// singleflight. Shared across every InstallationClient this factory
 	// produces so concurrent webhook deliveries and command bursts
-	// targeting the same commit collapse to a single GraphQL round
-	// trip even though each delivery may spawn a fresh InstallationClient.
+	// targeting the same commit collapse to one shared GitHub read even
+	// though each delivery may spawn a fresh InstallationClient.
 	// Deliberately not a TTL cache: check status is mutable for a SHA
 	// (reruns, late-arriving checks, branch-protection adding required
 	// checks), so any memoisation window would risk converting a
@@ -97,12 +96,12 @@ const slugFetchRetryCooldown = 5 * time.Second
 // since we can't identify our own checks.
 //
 // The returned Client memoises the *InstallationClient it produces by
-// installationID so the underlying http.Client, gh.Client, githubv4.Client, and
+// installationID so the underlying http.Client, gh.Client, and
 // ghinstallation transport (and its installation-token cache) are reused across
 // webhook deliveries. It also owns a CheckStatusSingleflight that is shared
 // across every InstallationClient it produces, so concurrent webhook
 // deliveries and command bursts targeting the same (repo, sha) collapse to a
-// single upstream GraphQL request.
+// single upstream GitHub read.
 func NewClient(appID int64, privateKey []byte, logger *slog.Logger) *Client {
 	c := &Client{
 		appID:                   appID,
@@ -115,7 +114,7 @@ func NewClient(appID int64, privateKey []byte, logger *slog.Logger) *Client {
 	// from a nil pointer.
 	c.storeAppSlug("")
 
-	// Fetch the app slug so we can identify our own check runs in statusCheckRollup.
+	// Fetch the app slug so we can identify our own check runs.
 	// Non-fatal: if GitHub is down, the server still starts but the check gate won't
 	// exclude own checks (PR applies may be blocked until the slug is fetched).
 	c.fetchAppSlug()
@@ -201,7 +200,6 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 	ghClient.DisableRateLimitCheck = true
 	ic := &InstallationClient{
 		client:                  ghClient,
-		gql:                     githubv4.NewEnterpriseClient(graphQLURLFor(ghClient), httpc),
 		logger:                  c.logger,
 		installationID:          installationID,
 		checkStatusSingleflight: c.checkStatusSingleflight,
@@ -215,8 +213,6 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 
 // NewInstallationClient creates an InstallationClient from a pre-configured go-github client.
 // Used in tests to point at httptest.Server; production uses Client.ForInstallation().
-// The GraphQL endpoint is derived from the go-github client's BaseURL so the same
-// httptest mux serves both REST and GraphQL.
 func NewInstallationClient(client *gh.Client, logger *slog.Logger) *InstallationClient {
 	return NewInstallationClientWithSlug(client, logger, "")
 }
@@ -228,23 +224,12 @@ func NewInstallationClientWithSlug(client *gh.Client, logger *slog.Logger, appSl
 		logger: logger,
 	}
 	ic.storeAppSlug(appSlug)
-	gqlHTTPClient := client.Client()
-	gqlHTTPClient.Transport = newGitHubMetricsTransport(gqlHTTPClient.Transport, 0, ic.loadAppSlug)
-	ic.gql = githubv4.NewEnterpriseClient(graphQLURLFor(client), gqlHTTPClient)
 	return ic
-}
-
-// graphQLURLFor returns the GraphQL endpoint for a given go-github client by
-// appending "graphql" to its REST BaseURL. Works for both api.github.com and
-// httptest servers used in tests.
-func graphQLURLFor(client *gh.Client) string {
-	return strings.TrimRight(client.BaseURL.String(), "/") + "/graphql"
 }
 
 // InstallationClient wraps a go-github client scoped to a specific GitHub App installation.
 type InstallationClient struct {
 	client *gh.Client
-	gql    *githubv4.Client
 	logger *slog.Logger
 
 	installationID int64
@@ -668,43 +653,6 @@ type PRCheckStatus struct {
 	IsSchemaBot bool   // true if this is a SchemaBot check
 }
 
-// statusCheckRollupQuery is the GraphQL query used by GetPRCheckStatuses.
-// statusCheckRollup returns check runs and commit statuses already deduped
-// and filtered to the latest run per check name.
-type statusCheckRollupQuery struct {
-	Repository struct {
-		Object struct {
-			Commit struct {
-				StatusCheckRollup struct {
-					Contexts struct {
-						PageInfo struct {
-							HasNextPage bool
-							EndCursor   githubv4.String
-						}
-						Nodes []struct {
-							Typename string `graphql:"__typename"`
-							CheckRun struct {
-								Name       string
-								Status     string
-								Conclusion string
-								CheckSuite struct {
-									App struct {
-										Slug string
-									}
-								}
-							} `graphql:"... on CheckRun"`
-							StatusContext struct {
-								Context string
-								State   string
-							} `graphql:"... on StatusContext"`
-						}
-					} `graphql:"contexts(first: 100, after: $after)"`
-				}
-			} `graphql:"... on Commit"`
-		} `graphql:"object(oid: $oid)"`
-	} `graphql:"repository(owner: $owner, name: $repo)"`
-}
-
 // isOwnAppSlug returns true if the given slug belongs to this SchemaBot
 // instance. An empty slug never matches — both to handle StatusContext rows
 // (which have no App) and to fail closed when ic.appSlug has not yet been
@@ -720,33 +668,36 @@ func (ic *InstallationClient) isOwnAppSlug(slug string) bool {
 	return strings.EqualFold(slug, own)
 }
 
-// GetPRCheckStatuses fetches all check runs and commit statuses for a ref via
-// the GraphQL Commit.statusCheckRollup, which returns already-deduped, latest-only
-// results in a single round trip. SchemaBot's own check runs are identified via
-// the GitHub App slug (more reliable than name matching).
+// GetPRCheckStatuses fetches check runs and commit statuses for a ref via REST.
+// SchemaBot's own check runs are identified via the GitHub App slug (more
+// reliable than name matching).
 //
 // Concurrent calls for the same (repo, ref) collapse to a single upstream
-// GraphQL request via the Client-shared singleflight (when configured), so
+// GitHub read via the Client-shared singleflight (when configured), so
 // a webhook delivery or command burst that fans out to multiple gate
-// checks for the same commit makes one round trip — even across the
-// short-lived InstallationClients spawned per delivery. The singleflight
-// delivers identity-independent rows; IsSchemaBot is re-derived per call
-// against this client's appSlug snapshot so a shared fetch delivered to N
-// waiters with different appSlug snapshots is classified correctly for
-// each.
-func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo string, ref string) ([]PRCheckStatus, error) {
+// checks for the same commit shares the upstream work — even across the
+// short-lived InstallationClients spawned per delivery.
+//
+// requiredChecks is optional. When provided, commit statuses are fetched first;
+// if they contain every configured required check, check runs are not fetched.
+// This keeps status-only gates from depending on unrelated check-run access.
+//
+// The singleflight delivers identity-independent rows; IsSchemaBot is re-derived
+// per call against this client's appSlug snapshot so a shared fetch delivered to
+// N waiters with different appSlug snapshots is classified correctly for each.
+func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo string, ref string, requiredChecks []string) ([]PRCheckStatus, error) {
 	var (
 		rows []CheckStatusRow
 		err  error
 	)
 	if ic.checkStatusSingleflight == nil {
-		rows, err = ic.fetchPRCheckStatuses(ctx, repo, ref)
+		rows, err = ic.fetchPRCheckStatuses(ctx, repo, ref, requiredChecks)
 	} else {
 		// The singleflight supplies its own ctx to the fetch so a
 		// caller cancelling cannot abort the shared GitHub request and
 		// fail unrelated waiters.
-		rows, err = ic.checkStatusSingleflight.Do(ctx, repo, ref, func(fetchCtx context.Context) ([]CheckStatusRow, error) {
-			return ic.fetchPRCheckStatuses(fetchCtx, repo, ref)
+		rows, err = ic.checkStatusSingleflight.Do(ctx, repo, checkStatusSingleflightKey(ref, requiredChecks), func(fetchCtx context.Context) ([]CheckStatusRow, error) {
+			return ic.fetchPRCheckStatuses(fetchCtx, repo, ref, requiredChecks)
 		})
 	}
 	if err != nil {
@@ -767,9 +718,7 @@ func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo strin
 
 // CheckStatusAccessDiagnostic captures what SchemaBot can prove about the
 // installation token's ability to read the REST resources underlying the PR
-// check-status gate. GitHub's GraphQL statusCheckRollup permission errors do
-// not identify the exact missing permission, so this diagnostic probes the
-// equivalent REST Checks and Commit Statuses endpoints after a rollup failure.
+// check-status gate.
 type CheckStatusAccessDiagnostic struct {
 	ChecksReadable         bool
 	CommitStatusesReadable bool
@@ -779,8 +728,8 @@ type CheckStatusAccessDiagnostic struct {
 }
 
 // DiagnoseCheckStatusAccess probes REST endpoints used to reconstruct a PR's
-// checks/statuses. It is intended for error reporting after GraphQL
-// statusCheckRollup fails, not for the hot success path.
+// checks/statuses. It is intended for error reporting after check-status reads
+// fail, not for the hot success path.
 func (ic *InstallationClient) DiagnoseCheckStatusAccess(ctx context.Context, repo string, ref string) CheckStatusAccessDiagnostic {
 	owner, repoName := splitRepo(repo)
 	d := CheckStatusAccessDiagnostic{}
@@ -812,57 +761,109 @@ func isResourceNotAccessible(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "Resource not accessible")
 }
 
-// fetchPRCheckStatuses performs the actual GraphQL round trip for
-// GetPRCheckStatuses, returning identity-independent rows suitable for
-// caching across InstallationClients with different appSlug snapshots.
-func (ic *InstallationClient) fetchPRCheckStatuses(ctx context.Context, repo string, ref string) ([]CheckStatusRow, error) {
+// fetchPRCheckStatuses performs the actual REST reads for GetPRCheckStatuses,
+// returning identity-independent rows suitable for sharing across
+// InstallationClients with different appSlug snapshots.
+func (ic *InstallationClient) fetchPRCheckStatuses(ctx context.Context, repo string, ref string, requiredChecks []string) ([]CheckStatusRow, error) {
 	owner, repoName := splitRepo(repo)
-	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationGraphQLStatusCheckRollup, repo)
-
-	vars := map[string]any{
-		"owner": githubv4.String(owner),
-		"repo":  githubv4.String(repoName),
-		"oid":   githubv4.GitObjectID(ref),
-		"after": (*githubv4.String)(nil),
-	}
 
 	var out []CheckStatusRow
+	statusRows, err := ic.fetchCommitStatusRows(ctx, owner, repoName, repo, ref)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, statusRows...)
+
+	if len(requiredChecks) > 0 && checkRowsContainRequiredChecks(statusRows, requiredChecks) {
+		return out, nil
+	}
+
+	checkRows, err := ic.fetchCheckRunRows(ctx, owner, repoName, repo, ref)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, checkRows...)
+	return out, nil
+}
+
+func (ic *InstallationClient) fetchCommitStatusRows(ctx context.Context, owner, repoName, repo, ref string) ([]CheckStatusRow, error) {
+	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationGetCombinedStatus, repo)
+	opts := &gh.ListOptions{PerPage: 100}
+	var out []CheckStatusRow
 	for {
-		var q statusCheckRollupQuery
-		if err := ic.gql.Query(ctx, &q, vars); err != nil {
-			return nil, fmt.Errorf("graphql statusCheckRollup ref %s: %w", ref, err)
+		combined, resp, err := ic.client.Repositories.GetCombinedStatus(ctx, owner, repoName, ref, opts)
+		if err != nil {
+			return nil, fmt.Errorf("get combined commit status for %s@%s: %w", repo, ref, err)
 		}
-		contexts := q.Repository.Object.Commit.StatusCheckRollup.Contexts
-		for _, n := range contexts.Nodes {
-			switch n.Typename {
-			case "CheckRun":
+		if combined != nil {
+			for _, status := range combined.Statuses {
+				state, conclusion := mapLegacyStatusState(status.GetState())
 				out = append(out, CheckStatusRow{
-					Name:       n.CheckRun.Name,
-					Status:     strings.ToLower(n.CheckRun.Status),
-					Conclusion: strings.ToLower(n.CheckRun.Conclusion),
-					AppSlug:    n.CheckRun.CheckSuite.App.Slug,
-				})
-			case "StatusContext":
-				status, conclusion := mapLegacyStatusState(n.StatusContext.State)
-				out = append(out, CheckStatusRow{
-					Name:       n.StatusContext.Context,
-					Status:     status,
+					Name:       status.GetContext(),
+					Status:     state,
 					Conclusion: conclusion,
-					// AppSlug left empty: commit statuses have no App, so
-					// IsSchemaBot evaluates to false regardless of ic.appSlug.
 				})
 			}
 		}
-		if !contexts.PageInfo.HasNextPage {
+		if resp == nil || resp.NextPage == 0 {
 			break
 		}
-		after := contexts.PageInfo.EndCursor
-		vars["after"] = &after
+		opts.Page = resp.NextPage
 	}
 	return out, nil
 }
 
-// mapLegacyStatusState maps a GraphQL StatusState enum (EXPECTED, ERROR, FAILURE,
+func (ic *InstallationClient) fetchCheckRunRows(ctx context.Context, owner, repoName, repo, ref string) ([]CheckStatusRow, error) {
+	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationListCheckRunsForRef, repo)
+	filter := "latest"
+	opts := &gh.ListCheckRunsOptions{Filter: &filter, ListOptions: gh.ListOptions{PerPage: 100}}
+	var out []CheckStatusRow
+	for {
+		result, resp, err := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, ref, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list check runs for %s@%s: %w", repo, ref, err)
+		}
+		if result != nil {
+			for _, run := range result.CheckRuns {
+				out = append(out, CheckStatusRow{
+					Name:       run.GetName(),
+					Status:     strings.ToLower(run.GetStatus()),
+					Conclusion: strings.ToLower(run.GetConclusion()),
+					AppSlug:    run.GetApp().GetSlug(),
+				})
+			}
+		}
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return out, nil
+}
+
+func checkRowsContainRequiredChecks(rows []CheckStatusRow, requiredChecks []string) bool {
+	seen := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		seen[row.Name] = true
+	}
+	for _, required := range requiredChecks {
+		if !seen[required] {
+			return false
+		}
+	}
+	return true
+}
+
+func checkStatusSingleflightKey(ref string, requiredChecks []string) string {
+	if len(requiredChecks) == 0 {
+		return ref
+	}
+	sortedRequiredChecks := append([]string(nil), requiredChecks...)
+	sort.Strings(sortedRequiredChecks)
+	return ref + "\x00" + strings.Join(sortedRequiredChecks, "\x00")
+}
+
+// mapLegacyStatusState maps a commit status state (EXPECTED, ERROR, FAILURE,
 // PENDING, SUCCESS) to the (status, conclusion) pair used by PRCheckStatus, so
 // downstream filters can treat check runs and legacy statuses uniformly.
 func mapLegacyStatusState(state string) (status, conclusion string) {

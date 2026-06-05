@@ -405,7 +405,7 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 		if details != nil && details.GitHubApp != "" {
 			app = fmt.Sprintf("SchemaBot GitHub App `%s`", details.GitHubApp)
 		}
-		fmt.Fprintf(&sb, "The %s cannot read the combined check/status rollup for this repository.\n\n", app)
+		fmt.Fprintf(&sb, "The %s cannot read PR check statuses for this repository.\n\n", app)
 
 		switch {
 		case details != nil && len(details.MissingPermissions) > 0:
@@ -415,7 +415,7 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 			}
 			sb.WriteString("\nGrant or accept those permissions, then retry:\n")
 		case details != nil && details.ChecksReadable && details.CommitStatusesReadable:
-			sb.WriteString("Diagnostic REST probes could read both **Checks** and **Commit statuses**, so GitHub rejected the GraphQL `statusCheckRollup` even though the underlying REST permissions appear readable. Verify the app installation has accepted the latest permissions, then retry:\n")
+			sb.WriteString("Diagnostic REST probes could read both **Checks** and **Commit statuses**, so the check-status read failed even though the underlying permissions appear readable. Retry the command; if it keeps failing, inspect the SchemaBot logs for the exact GitHub API error:\n")
 		default:
 			sb.WriteString("Verify the app installation has access to this repository and has permission to read both **Checks** and **Commit statuses**, then retry:\n")
 		}

@@ -265,13 +265,13 @@ type planFlowResult struct {
 	HeadSHAs    []string
 	headSHACall atomic.Int64
 
-	// GraphQLHandler optionally overrides the default passing-checks
-	// GraphQL handler installed by setupFakeGitHubForPlan. Tests that need
-	// to drive different check-gate responses across consecutive calls
-	// (e.g. PASS at the early gate, FAIL at the fresh-HEAD re-gate) install
-	// their own handler here before issuing the webhook request. Nil
-	// preserves the default "no checks → passing" behavior.
-	GraphQLHandler atomic.Pointer[http.HandlerFunc]
+	// CheckStatusNodes optionally overrides the default passing-checks REST
+	// responses installed by setupFakeGitHubForPlan. Tests that need to drive
+	// different check-gate responses across consecutive calls (e.g. PASS at the
+	// early gate, FAIL at the fresh-HEAD re-gate) install their own provider here
+	// before issuing the webhook request. Nil preserves the default
+	// "no checks → passing" behavior.
+	CheckStatusNodes atomic.Pointer[func() []checkStatusNode]
 }
 
 func (p *planFlowResult) nextHeadSHA() string {
@@ -293,20 +293,11 @@ type checkRunCapture struct {
 	Output     *ghclient.CheckRunOutput `json:"output"`
 }
 
-// registerPassingChecks adds a mock GraphQL endpoint for PR check statuses that
-// returns an empty rollup (no checks). This prevents enforcePassingChecks from
-// blocking apply commands in e2e tests.
+// registerPassingChecks adds mock REST endpoints for PR check statuses that
+// return no checks. This prevents enforcePassingChecks from blocking apply
+// commands in e2e tests.
 func registerPassingChecks(mux *http.ServeMux) {
-	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]any{"repository": map[string]any{"object": map[string]any{
-				"statusCheckRollup": map[string]any{"contexts": map[string]any{
-					"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
-					"nodes":    []map[string]any{},
-				}},
-			}}},
-		})
-	})
+	registerCheckStatusRESTHandlers(mux, nil)
 }
 
 // setupFakeGitHubForPlan sets up a fake GitHub server for plan flows.
@@ -473,22 +464,14 @@ func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[stri
 	})
 
 	// PR check statuses for enforcePassingChecks. Defaults to all passing
-	// (empty rollup) so existing tests are unaffected. Tests that need to
-	// drive different responses across calls install a handler in
-	// result.GraphQLHandler before issuing the webhook request.
-	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
-		if h := result.GraphQLHandler.Load(); h != nil {
-			(*h)(w, r)
-			return
+	// (empty REST responses) so existing tests are unaffected. Tests that need to
+	// drive different responses across calls install a provider in
+	// result.CheckStatusNodes before issuing the webhook request.
+	registerCheckStatusRESTHandlersForRef(mux, "abc123", func() []checkStatusNode {
+		if provider := result.CheckStatusNodes.Load(); provider != nil {
+			return (*provider)()
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]any{"repository": map[string]any{"object": map[string]any{
-				"statusCheckRollup": map[string]any{"contexts": map[string]any{
-					"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
-					"nodes":    []map[string]any{},
-				}},
-			}}},
-		})
+		return nil
 	})
 
 	return result

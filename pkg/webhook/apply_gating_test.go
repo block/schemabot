@@ -235,47 +235,52 @@ func TestFilterInProgressNonSchemaBotChecks_RequiredChecks(t *testing.T) {
 	}
 }
 
-// rollupNode is a single GraphQL statusCheckRollup contexts node, used by tests
-// to build mock GraphQL responses. Set Typename to "CheckRun" or "StatusContext"
-// and populate the matching fields.
-type rollupNode struct {
+// checkStatusNode is a single check run or commit status used by tests to build
+// mock REST responses. Set Typename to "CheckRun" or "StatusContext" and
+// populate the matching fields.
+type checkStatusNode struct {
 	Typename   string
 	Name       string // CheckRun.name
-	Status     string // CheckRun.status (uppercase: COMPLETED, IN_PROGRESS, ...)
-	Conclusion string // CheckRun.conclusion (uppercase: SUCCESS, FAILURE, ...)
+	Status     string // CheckRun.status
+	Conclusion string // CheckRun.conclusion
 	AppSlug    string // CheckRun.checkSuite.app.slug
 	Context    string // StatusContext.context
-	State      string // StatusContext.state (uppercase)
+	State      string // StatusContext.state
 }
 
-// rollupGraphQLHandler returns an http.HandlerFunc that responds to a GraphQL
-// statusCheckRollup query with the supplied contexts.
-func rollupGraphQLHandler(nodes []rollupNode) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		out := make([]map[string]any, 0, len(nodes))
-		for _, n := range nodes {
-			node := map[string]any{"__typename": n.Typename}
-			switch n.Typename {
-			case "CheckRun":
-				node["name"] = n.Name
-				node["status"] = n.Status
-				node["conclusion"] = n.Conclusion
-				node["checkSuite"] = map[string]any{"app": map[string]any{"slug": n.AppSlug}}
-			case "StatusContext":
-				node["context"] = n.Context
-				node["state"] = n.State
+// registerCheckStatusRESTHandlers registers REST responses for commit statuses
+// and check runs on the standard apply-gating test repository/ref.
+func registerCheckStatusRESTHandlers(mux *http.ServeMux, nodes []checkStatusNode) {
+	registerCheckStatusRESTHandlersForRef(mux, "abc123", func() []checkStatusNode { return nodes })
+}
+
+func registerCheckStatusRESTHandlersForRef(mux *http.ServeMux, ref string, nodes func() []checkStatusNode) {
+	base := "/repos/octocat/hello-world/commits/" + ref
+	mux.HandleFunc("GET "+base+"/status", func(w http.ResponseWriter, _ *http.Request) {
+		statuses := make([]map[string]any, 0)
+		for _, n := range nodes() {
+			if n.Typename != "StatusContext" {
+				continue
 			}
-			out = append(out, node)
+			statuses = append(statuses, map[string]any{"context": n.Context, "state": n.State})
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]any{"repository": map[string]any{"object": map[string]any{
-				"statusCheckRollup": map[string]any{"contexts": map[string]any{
-					"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
-					"nodes":    out,
-				}},
-			}}},
-		})
-	}
+		_ = json.NewEncoder(w).Encode(map[string]any{"statuses": statuses, "total_count": len(statuses)})
+	})
+	mux.HandleFunc("GET "+base+"/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		checkRuns := make([]map[string]any, 0)
+		for _, n := range nodes() {
+			if n.Typename != "CheckRun" {
+				continue
+			}
+			checkRuns = append(checkRuns, map[string]any{
+				"name":       n.Name,
+				"status":     n.Status,
+				"conclusion": n.Conclusion,
+				"app":        map[string]any{"slug": n.AppSlug},
+			})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": checkRuns, "total_count": len(checkRuns)})
+	})
 }
 
 func TestEnforcePassingChecks(t *testing.T) {
@@ -283,15 +288,15 @@ func TestEnforcePassingChecks(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
-		// Return a GraphQL permission error
-		mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/status", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"errors": []map[string]any{
-					{"message": "Resource not accessible by integration", "type": "FORBIDDEN"},
-				},
-			})
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Resource not accessible by integration"})
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Resource not accessible by integration"})
 		})
 
 		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
@@ -321,10 +326,10 @@ func TestEnforcePassingChecks(t *testing.T) {
 		select {
 		case body := <-comments:
 			assert.Contains(t, body, "Apply Blocked")
-			assert.Contains(t, body, "combined check/status rollup")
+			assert.Contains(t, body, "PR check statuses")
 			assert.Contains(t, body, "Checks")
 			assert.Contains(t, body, "Commit statuses")
-			assert.NotContains(t, body, "Resource not accessible", "should not expose raw GraphQL error")
+			assert.NotContains(t, body, "Resource not accessible", "should not expose raw GitHub API error")
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for permission error comment")
 		}
@@ -334,7 +339,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
-		mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/status", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 		})
 
@@ -375,10 +380,10 @@ func TestEnforcePassingChecks(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
-		mux.HandleFunc("POST /graphql", rollupGraphQLHandler([]rollupNode{
-			{Typename: "CheckRun", Name: "CI / tests", Status: "COMPLETED", Conclusion: "FAILURE", AppSlug: "github-actions"},
-			{Typename: "CheckRun", Name: "CI / lint", Status: "COMPLETED", Conclusion: "SUCCESS", AppSlug: "github-actions"},
-		}))
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "CI / tests", Status: "completed", Conclusion: "failure", AppSlug: "github-actions"},
+			{Typename: "CheckRun", Name: "CI / lint", Status: "completed", Conclusion: "success", AppSlug: "github-actions"},
+		})
 
 		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
 			var body struct {
@@ -416,10 +421,10 @@ func TestEnforcePassingChecks(t *testing.T) {
 	t.Run("required checks ignore unlisted failures when configured check is present", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 
-		mux.HandleFunc("POST /graphql", rollupGraphQLHandler([]rollupNode{
-			{Typename: "CheckRun", Name: "Required Review", Status: "COMPLETED", Conclusion: "SUCCESS", AppSlug: "review-gate"},
-			{Typename: "CheckRun", Name: "CI / tests", Status: "COMPLETED", Conclusion: "FAILURE", AppSlug: "github-actions"},
-		}))
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "Required Review", Status: "completed", Conclusion: "success", AppSlug: "review-gate"},
+			{Typename: "CheckRun", Name: "CI / tests", Status: "completed", Conclusion: "failure", AppSlug: "github-actions"},
+		})
 
 		installClient := ghclient.NewInstallationClient(client, testLogger())
 		factory := &fakeClientFactory{client: installClient}
@@ -436,13 +441,44 @@ func TestEnforcePassingChecks(t *testing.T) {
 		assert.False(t, blocked, "should allow when configured checks pass")
 	})
 
+	t.Run("required status check avoids unrelated check-run read", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		checkRunsCalled := false
+
+		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/status", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"statuses": []map[string]any{{"context": "Required Review", "state": "success"}},
+			})
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			checkRunsCalled = true
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Resource not accessible by integration"})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Required Review"}}, nil, testLogger())
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+
+		ctx := t.Context()
+		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		assert.False(t, blocked, "status-only required gate should pass without reading check runs")
+		assert.False(t, checkRunsCalled, "unrelated check runs should not be fetched once required statuses are found")
+	})
+
 	t.Run("required checks fall back to all checks when none are present", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
-		mux.HandleFunc("POST /graphql", rollupGraphQLHandler([]rollupNode{
-			{Typename: "CheckRun", Name: "CI / tests", Status: "COMPLETED", Conclusion: "FAILURE", AppSlug: "github-actions"},
-		}))
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "CI / tests", Status: "completed", Conclusion: "failure", AppSlug: "github-actions"},
+		})
 
 		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
 			var body struct {
@@ -480,10 +516,10 @@ func TestEnforcePassingChecks(t *testing.T) {
 	t.Run("all passing allows apply", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 
-		mux.HandleFunc("POST /graphql", rollupGraphQLHandler([]rollupNode{
-			{Typename: "CheckRun", Name: "CI / tests", Status: "COMPLETED", Conclusion: "SUCCESS", AppSlug: "github-actions"},
-			{Typename: "CheckRun", Name: "SchemaBot (staging)", Status: "COMPLETED", Conclusion: "ACTION_REQUIRED", AppSlug: "schemabot"},
-		}))
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "CI / tests", Status: "completed", Conclusion: "success", AppSlug: "github-actions"},
+			{Typename: "CheckRun", Name: "SchemaBot (staging)", Status: "completed", Conclusion: "action_required", AppSlug: "schemabot"},
+		})
 
 		installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
 		factory := &fakeClientFactory{client: installClient}
@@ -504,9 +540,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := make(chan string, 10)
 
-		mux.HandleFunc("POST /graphql", rollupGraphQLHandler([]rollupNode{
-			{Typename: "CheckRun", Name: "CI / tests", Status: "IN_PROGRESS", Conclusion: "", AppSlug: "github-actions"},
-		}))
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "CI / tests", Status: "in_progress", Conclusion: "", AppSlug: "github-actions"},
+		})
 
 		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
 			var body struct {
@@ -543,10 +579,10 @@ func TestEnforcePassingChecks(t *testing.T) {
 	t.Run("variant app slug excluded from gate", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 
-		mux.HandleFunc("POST /graphql", rollupGraphQLHandler([]rollupNode{
-			{Typename: "CheckRun", Name: "CI / tests", Status: "COMPLETED", Conclusion: "SUCCESS", AppSlug: "github-actions"},
-			{Typename: "CheckRun", Name: "SchemaBot (staging)", Status: "COMPLETED", Conclusion: "FAILURE", AppSlug: "schemabot-at-acme-staging"},
-		}))
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "CI / tests", Status: "completed", Conclusion: "success", AppSlug: "github-actions"},
+			{Typename: "CheckRun", Name: "SchemaBot (staging)", Status: "completed", Conclusion: "failure", AppSlug: "schemabot-at-acme-staging"},
+		})
 
 		installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot-at-acme-staging")
 		factory := &fakeClientFactory{client: installClient}

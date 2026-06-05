@@ -238,9 +238,8 @@ func TestGetPRCheckStatuses_RecomputesIsSchemaBotPerWaiter(t *testing.T) {
 	postRecovery := &InstallationClient{checkStatusSingleflight: sf}
 	postRecovery.storeAppSlug("schemabot")
 
-	// Intercept the per-client fetch via a stub so the test can
-	// orchestrate when the shared fetch returns without exercising the
-	// real GraphQL transport.
+	// Intercept the per-client fetch via a stub so the test can orchestrate
+	// when the shared fetch returns without exercising the real GitHub API.
 	const repo, sha = "octo/repo", "abc123"
 	sharedRows := []CheckStatusRow{
 		{Name: "schemabot/apply staging", Status: "completed", Conclusion: "success", AppSlug: "schemabot"},
@@ -307,8 +306,8 @@ func TestGetPRCheckStatuses_RecomputesIsSchemaBotPerWaiter(t *testing.T) {
 }
 
 // projectRowsForTest mirrors the projection step inside
-// GetPRCheckStatuses so the per-waiter classification test can verify
-// the IsSchemaBot invariant without spinning up a real GraphQL transport.
+// GetPRCheckStatuses so the per-waiter classification test can verify the
+// IsSchemaBot invariant without spinning up a real GitHub API.
 func projectRowsForTest(ic *InstallationClient, rows []CheckStatusRow) []PRCheckStatus {
 	out := make([]PRCheckStatus, len(rows))
 	for i, r := range rows {

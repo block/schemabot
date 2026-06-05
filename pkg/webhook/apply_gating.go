@@ -14,7 +14,7 @@ import (
 // are considered failing.
 func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var failing []templates.BlockingCheck
-	filterRequiredChecks := statusRollupContainsRequiredCheck(statuses, config)
+	filterRequiredChecks := statusesContainRequiredCheck(statuses, config)
 	for _, s := range statuses {
 		if s.IsSchemaBot {
 			continue
@@ -46,7 +46,7 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 		return false
 	}
 
-	statuses, err := client.GetPRCheckStatuses(ctx, repo, headSHA)
+	statuses, err := client.GetPRCheckStatuses(ctx, repo, headSHA, config.RequiredChecks)
 	if err != nil {
 		diagnostic := client.DiagnoseCheckStatusAccess(ctx, repo, headSHA)
 		details := &templates.CheckStatusAccessDetails{
@@ -63,7 +63,7 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"environment", environment,
 			"head_sha", headSHA,
 			"installation_id", installationID,
-			"github_operation", "graphql_status_check_rollup",
+			"github_operation", "read_pr_check_statuses",
 			"github_app", details.GitHubApp,
 			"checks_readable", diagnostic.ChecksReadable,
 			"commit_statuses_readable", diagnostic.CommitStatusesReadable,
@@ -118,7 +118,7 @@ func (h *Handler) githubAppDisplayNameForRepo(repo string, client *ghclient.Inst
 // excluding SchemaBot's own checks.
 func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var inProgress []templates.BlockingCheck
-	filterRequiredChecks := statusRollupContainsRequiredCheck(statuses, config)
+	filterRequiredChecks := statusesContainRequiredCheck(statuses, config)
 	for _, s := range statuses {
 		if s.IsSchemaBot {
 			continue
@@ -137,7 +137,7 @@ func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 	return inProgress
 }
 
-func statusRollupContainsRequiredCheck(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) bool {
+func statusesContainRequiredCheck(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) bool {
 	if config == nil || len(config.RequiredChecks) == 0 {
 		return false
 	}

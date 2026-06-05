@@ -2007,28 +2007,23 @@ func TestE2EApplyAutoConfirmReGatesAgainstFreshHEADBeforeApply(t *testing.T) {
 	// The schema-freshness check therefore passes; the re-gate is the only
 	// thing that can still block the apply.
 
-	// GraphQL handler: PASS on the early gate call, FAIL on the fresh-HEAD
-	// re-gate call. Without the re-gate, this transition would be invisible
-	// to `apply -y` and the apply would proceed against red CI.
-	var graphqlCalls atomic.Int64
-	passing := rollupGraphQLHandler(nil)
-	failing := rollupGraphQLHandler([]rollupNode{
-		{
+	// Check-status handler: PASS on the early gate read, FAIL on the fresh-HEAD
+	// re-gate read. Without the re-gate, this transition would be invisible to
+	// `apply -y` and the apply would proceed against red CI.
+	var checkStatusReads atomic.Int64
+	provider := func() []checkStatusNode {
+		if checkStatusReads.Add(1) <= 2 {
+			return nil
+		}
+		return []checkStatusNode{{
 			Typename:   "CheckRun",
 			Name:       "ci/lint",
-			Status:     "COMPLETED",
-			Conclusion: "FAILURE",
+			Status:     "completed",
+			Conclusion: "failure",
 			AppSlug:    "ci-bot",
-		},
-	})
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if graphqlCalls.Add(1) == 1 {
-			passing(w, r)
-			return
-		}
-		failing(w, r)
-	})
-	result.GraphQLHandler.Store(&handler)
+		}}
+	}
+	result.CheckStatusNodes.Store(&provider)
 
 	h := newE2EHandler(t, svc, client)
 
@@ -2062,11 +2057,11 @@ func TestE2EApplyAutoConfirmReGatesAgainstFreshHEADBeforeApply(t *testing.T) {
 	assert.Contains(t, blocked, "failure", "block comment must show the failing conclusion")
 	assert.Contains(t, blocked, "staging", "retry hint must reference the env")
 
-	// Re-gate must have actually happened — at least two GraphQL calls
-	// (early gate + re-gate). The singleflight does not memoise across
-	// sequential calls so the second call hits the mock.
-	assert.GreaterOrEqual(t, graphqlCalls.Load(), int64(2),
-		"expected at least 2 GraphQL calls (early gate + fresh-HEAD re-gate)")
+	// Re-gate must have actually happened. Each gate reads commit statuses and
+	// check runs, and singleflight does not memoise across sequential calls, so
+	// the fresh-HEAD re-gate hits the mock again.
+	assert.GreaterOrEqual(t, checkStatusReads.Load(), int64(4),
+		"expected early gate + fresh-HEAD re-gate check-status reads")
 
 	// Lock must be released so the user can re-run `apply -y` once checks recover.
 	require.Eventually(t, func() bool {
@@ -2112,40 +2107,35 @@ func TestE2EApplyAutoConfirmFreshHEADBlockPreservesOtherPRLock(t *testing.T) {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	// GraphQL handler: PASS on the early gate call; on the re-gate call,
+	// Check-status handler: PASS on the early gate read; on the re-gate read,
 	// FIRST swap the lock owner to a different PR (#999), THEN return FAILURE.
 	// The swap simulates an unrelated `schemabot unlock` + another PR
 	// acquiring the lock in the window between our acquire and our re-gate.
-	var graphqlCalls atomic.Int64
-	passing := rollupGraphQLHandler(nil)
-	failing := rollupGraphQLHandler([]rollupNode{
-		{
-			Typename:   "CheckRun",
-			Name:       "ci/lint",
-			Status:     "COMPLETED",
-			Conclusion: "FAILURE",
-			AppSlug:    "ci-bot",
-		},
-	})
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if graphqlCalls.Add(1) == 1 {
-			passing(w, r)
-			return
+	var checkStatusReads atomic.Int64
+	provider := func() []checkStatusNode {
+		if checkStatusReads.Add(1) <= 2 {
+			return nil
 		}
-		// Re-gate call: swap the lock to PR #999 before responding FAILURE.
+		// Re-gate read: swap the lock to PR #999 before responding FAILURE.
 		// ForceRelease then re-Acquire is the closest analogue to "another
 		// caller cleared and reacquired" within a single test process.
-		_ = svc.Storage().Locks().ForceRelease(r.Context(), dbName, "mysql")
-		_ = svc.Storage().Locks().Acquire(r.Context(), &storage.Lock{
+		_ = svc.Storage().Locks().ForceRelease(t.Context(), dbName, "mysql")
+		_ = svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
 			DatabaseName: dbName,
 			DatabaseType: "mysql",
 			Repository:   "octocat/hello-world",
 			PullRequest:  999,
 			Owner:        otherOwner,
 		})
-		failing(w, r)
-	})
-	result.GraphQLHandler.Store(&handler)
+		return []checkStatusNode{{
+			Typename:   "CheckRun",
+			Name:       "ci/lint",
+			Status:     "completed",
+			Conclusion: "failure",
+			AppSlug:    "ci-bot",
+		}}
+	}
+	result.CheckStatusNodes.Store(&provider)
 
 	h := newE2EHandler(t, svc, client)
 
