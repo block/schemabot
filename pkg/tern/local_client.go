@@ -734,6 +734,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// can poll the deploy request and query SHOW VITESS_MIGRATIONS.
 	var engineResult *engine.ProgressResult
 	var vitessApplyIsInstant bool
+	var vitessApplyData *storage.VitessApplyData
 	// Query engine for live progress. For Vitess, also query during pending state
 	// to surface PlanetScale states (preparing branch, deploy request, etc.).
 	queryDuringPending := c.config.Type == storage.DatabaseTypeVitess
@@ -756,6 +757,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			case vad == nil:
 				c.logger.Warn("VitessApplyData not found for progress — apply may still be initializing", "apply_id", activeTask.ApplyID)
 			default:
+				vitessApplyData = vad
 				vitessApplyIsInstant = vad.IsInstant
 				resumeState, resumeErr := planetscale.BuildResumeState(planetscaleResumeData(vad))
 				if resumeErr != nil {
@@ -768,6 +770,12 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		result, err := eng.Progress(ctx, progressReq)
 		if err == nil {
 			engineResult = result
+			if c.config.Type == storage.DatabaseTypeVitess && vitessApplyData != nil && result.ResumeState != nil && result.ResumeState.MigrationContext != "" && vitessApplyData.MigrationContext != result.ResumeState.MigrationContext {
+				vitessApplyData.MigrationContext = result.ResumeState.MigrationContext
+				if saveErr := c.storage.VitessApplyData().Save(ctx, vitessApplyData); saveErr != nil {
+					c.logger.Warn("failed to persist recovered Vitess migration context", "apply_id", activeTask.ApplyID, "migration_context", result.ResumeState.MigrationContext, "error", saveErr)
+				}
+			}
 			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
 			engineTaskState := taskStateFromProgressResult(result)
 			taskState := taskStateWithNoBackwardProgress(activeTask.State, engineTaskState)

@@ -71,10 +71,12 @@ func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
 
 type fakeControlEngine struct {
 	engine.Engine
-	stopCount     int
-	cutoverCount  int
-	cutoverResult *engine.ControlResult
-	cutoverErr    error
+	stopCount      int
+	cutoverCount   int
+	progressResult *engine.ProgressResult
+	progressErr    error
+	cutoverResult  *engine.ControlResult
+	cutoverErr     error
 }
 
 func (e *fakeControlEngine) Name() string { return "fake" }
@@ -88,6 +90,9 @@ func (e *fakeControlEngine) Apply(context.Context, *engine.ApplyRequest) (*engin
 }
 
 func (e *fakeControlEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	if e.progressResult != nil || e.progressErr != nil {
+		return e.progressResult, e.progressErr
+	}
 	return &engine.ProgressResult{State: engine.StateRunning}, nil
 }
 
@@ -126,6 +131,7 @@ type exactProgressStorage struct {
 	tasks           storage.TaskStore
 	logs            storage.ApplyLogStore
 	controlRequests storage.ControlRequestStore
+	vitessApplyData storage.VitessApplyDataStore
 }
 
 func (s *exactProgressStorage) Applies() storage.ApplyStore { return s.applies }
@@ -138,6 +144,30 @@ func (s *exactProgressStorage) ApplyLogs() storage.ApplyLogStore {
 }
 func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
 	return s.controlRequests
+}
+func (s *exactProgressStorage) VitessApplyData() storage.VitessApplyDataStore {
+	return s.vitessApplyData
+}
+
+type exactProgressVitessApplyDataStore struct {
+	storage.VitessApplyDataStore
+	data     *storage.VitessApplyData
+	saveData *storage.VitessApplyData
+	err      error
+}
+
+func (s *exactProgressVitessApplyDataStore) GetByApplyID(context.Context, int64) (*storage.VitessApplyData, error) {
+	return s.data, s.err
+}
+
+func (s *exactProgressVitessApplyDataStore) Save(_ context.Context, data *storage.VitessApplyData) error {
+	if s.err != nil {
+		return s.err
+	}
+	clone := *data
+	s.saveData = &clone
+	s.data = data
+	return nil
 }
 
 func TestApplyCancelHandleDoesNotCancelNewerOwner(t *testing.T) {
@@ -289,6 +319,67 @@ func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *test
 			require.ErrorIs(t, err, tc.wantError)
 		})
 	}
+}
+
+func TestLocalClient_ProgressPersistsRecoveredVitessMigrationContext(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-recovered-context",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+		Engine:          storage.EnginePlanetScale,
+	}
+	task := &storage.Task{
+		ID:             43,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-vitess-recovered-context",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Namespace:      "testdb",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	vitessData := &storage.VitessApplyData{
+		ApplyID:         apply.ID,
+		BranchName:      "schemabot-apply",
+		DeployRequestID: 123,
+		ExistingMigrationCtxs: map[string]storage.VitessMigrationContextTimestamps{
+			"preexisting": {RequestedTimestamp: "2026-01-01 00:00:00"},
+		},
+	}
+	vitessStore := &exactProgressVitessApplyDataStore{data: vitessData}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			vitessApplyData: vitessStore,
+		},
+		planetscaleEngine: &fakeControlEngine{progressResult: &engine.ProgressResult{
+			State: engine.StateRunning,
+			ResumeState: &engine.ResumeState{
+				MigrationContext: "recovered-context",
+			},
+		}},
+		logger: slog.Default(),
+	}
+
+	_, err := client.Progress(t.Context(), &ternv1.ProgressRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: apply.Environment,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, vitessStore.saveData)
+	assert.Equal(t, "recovered-context", vitessStore.saveData.MigrationContext)
+	assert.Equal(t, apply.ID, vitessStore.saveData.ApplyID)
+	assert.Equal(t, "schemabot-apply", vitessStore.saveData.BranchName)
+	assert.Equal(t, uint64(123), vitessStore.saveData.DeployRequestID)
+	assert.Contains(t, vitessStore.saveData.ExistingMigrationCtxs, "preexisting")
 }
 
 func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
