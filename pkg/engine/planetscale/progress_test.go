@@ -26,6 +26,52 @@ func TestMigrationRowTimestamps(t *testing.T) {
 	assert.Empty(t, migrationRowTimestamps(vitessMigrationRow{}))
 }
 
+func TestSelectMigrationContextUsesDeployTimestamp(t *testing.T) {
+	deployCreatedAt := time.Date(2026, 6, 4, 19, 0, 0, 0, time.UTC)
+	beforeDeploy := deployCreatedAt.Add(-time.Second)
+	firstAfterDeploy := deployCreatedAt.Add(time.Second)
+	laterAfterDeploy := deployCreatedAt.Add(2 * time.Second)
+
+	got := selectMigrationContext([]vitessMigrationRow{
+		{MigrationContext: "baseline", RequestedAt: &beforeDeploy},
+		{MigrationContext: "manual-before-deploy", RequestedAt: &beforeDeploy},
+		{MigrationContext: "schemabot-context", RequestedAt: &firstAfterDeploy},
+		{MigrationContext: "manual-after-deploy", RequestedAt: &laterAfterDeploy},
+	}, map[string]MigrationContextTimestamps{
+		"baseline": {RequestedTimestamp: beforeDeploy.Format(time.RFC3339)},
+	}, deployCreatedAt)
+
+	assert.Equal(t, "schemabot-context", got)
+}
+
+func TestSelectMigrationContextDeduplicatesShardsByEarliestRequestedAt(t *testing.T) {
+	deployCreatedAt := time.Date(2026, 6, 4, 19, 0, 0, 0, time.UTC)
+	firstShard := deployCreatedAt.Add(2 * time.Second)
+	secondShard := deployCreatedAt.Add(3 * time.Second)
+	otherContext := deployCreatedAt.Add(4 * time.Second)
+
+	got := selectMigrationContext([]vitessMigrationRow{
+		{MigrationContext: "schemabot-context", Shard: "80-", RequestedAt: &secondShard},
+		{MigrationContext: "other-context", RequestedAt: &otherContext},
+		{MigrationContext: "schemabot-context", Shard: "-80", RequestedAt: &firstShard},
+	}, nil, deployCreatedAt)
+
+	assert.Equal(t, "schemabot-context", got)
+}
+
+func TestSelectMigrationContextDoesNotGuessAmongMultipleUntimedContexts(t *testing.T) {
+	deployCreatedAt := time.Date(2026, 6, 4, 19, 0, 0, 0, time.UTC)
+
+	assert.Equal(t, "only-new-context", selectMigrationContext([]vitessMigrationRow{
+		{MigrationContext: "only-new-context"},
+	}, nil, deployCreatedAt))
+
+	assert.Empty(t, selectMigrationContext([]vitessMigrationRow{
+		{MigrationContext: "first-new-context"},
+		{MigrationContext: "second-new-context"},
+	}, nil, deployCreatedAt))
+}
+
 func TestAggregateShardProgress(t *testing.T) {
 	t.Run("two shards one table", func(t *testing.T) {
 		rows := []vitessMigrationRow{

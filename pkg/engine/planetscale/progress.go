@@ -81,7 +81,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 	if req.ResumeState.MigrationContext == "" && len(meta.ExistingMigrationCtxs) > 0 {
-		migrationContext := e.discoverMigrationContext(ctx, client, req.Database, req.Credentials, meta.ExistingMigrationCtxs)
+		migrationContext := e.discoverMigrationContext(ctx, client, req.Database, req.Credentials, meta.ExistingMigrationCtxs, dr.CreatedAt)
 		if migrationContext != "" {
 			req.ResumeState = &engine.ResumeState{
 				MigrationContext: migrationContext,
@@ -202,13 +202,13 @@ func formatMigrationTimestamp(ts *time.Time) string {
 
 // discoverMigrationContext finds the new migration_context that appeared after
 // deploying by comparing current contexts against the pre-deploy baseline.
-func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]MigrationContextTimestamps) string {
+func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]MigrationContextTimestamps, deployCreatedAt time.Time) string {
 	if creds.DSN == "" {
 		e.logger.Debug("skipping schema change context discovery, no DSN configured")
 		return ""
 	}
 
-	e.logger.Info("discovering schema change context", "database", database, "baseline_count", len(existingContexts))
+	e.logger.Info("discovering schema change context", "database", database, "baseline_count", len(existingContexts), "deploy_created_at", deployCreatedAt)
 
 	branch := mainBranch(creds)
 	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
@@ -221,23 +221,93 @@ func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.P
 		return ""
 	}
 
+	var rows []vitessMigrationRow
 	for _, ks := range keyspaces {
-		rows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, "")
+		keyspaceRows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, "")
 		if err != nil {
 			e.logger.Debug("failed to query schema changes for keyspace", "keyspace", ks.Name, "error", err)
 			continue
 		}
-		for _, r := range rows {
-			_, exists := existingContexts[r.MigrationContext]
-			if r.MigrationContext != "" && !exists {
-				e.logger.Info("discovered schema change context", "context", r.MigrationContext)
-				return r.MigrationContext
-			}
-		}
+		rows = append(rows, keyspaceRows...)
+	}
+
+	migrationContext := selectMigrationContext(rows, existingContexts, deployCreatedAt)
+	if migrationContext != "" {
+		e.logger.Info("discovered schema change context", "context", migrationContext)
+		return migrationContext
 	}
 
 	e.logger.Warn("schema change context not discovered yet")
 	return ""
+}
+
+func selectMigrationContext(rows []vitessMigrationRow, existingContexts map[string]MigrationContextTimestamps, deployCreatedAt time.Time) string {
+	type candidate struct {
+		context     string
+		requestedAt *time.Time
+	}
+
+	candidatesByContext := make(map[string]candidate)
+	for _, row := range rows {
+		if row.MigrationContext == "" {
+			continue
+		}
+		if _, exists := existingContexts[row.MigrationContext]; exists {
+			continue
+		}
+		existingCandidate, seen := candidatesByContext[row.MigrationContext]
+		if !seen || earlierTime(row.RequestedAt, existingCandidate.requestedAt) {
+			candidatesByContext[row.MigrationContext] = candidate{
+				context:     row.MigrationContext,
+				requestedAt: row.RequestedAt,
+			}
+		}
+	}
+
+	candidates := make([]candidate, 0, len(candidatesByContext))
+	for _, candidate := range candidatesByContext {
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	if len(candidates) == 1 && candidates[0].requestedAt == nil {
+		return candidates[0].context
+	}
+
+	requestedAfterDeploy := candidates[:0]
+	for _, candidate := range candidates {
+		if candidate.requestedAt == nil {
+			continue
+		}
+		if candidate.requestedAt.Before(deployCreatedAt) {
+			continue
+		}
+		requestedAfterDeploy = append(requestedAfterDeploy, candidate)
+	}
+	if len(requestedAfterDeploy) == 0 {
+		return ""
+	}
+
+	sort.Slice(requestedAfterDeploy, func(i, j int) bool {
+		left := requestedAfterDeploy[i]
+		right := requestedAfterDeploy[j]
+		if !left.requestedAt.Equal(*right.requestedAt) {
+			return left.requestedAt.Before(*right.requestedAt)
+		}
+		return left.context < right.context
+	})
+	return requestedAfterDeploy[0].context
+}
+
+func earlierTime(left, right *time.Time) bool {
+	if left == nil {
+		return false
+	}
+	if right == nil {
+		return true
+	}
+	return left.Before(*right)
 }
 
 // vitessMigrationRow holds a single row from SHOW VITESS_MIGRATIONS.

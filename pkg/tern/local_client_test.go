@@ -382,6 +382,101 @@ func TestLocalClient_ProgressPersistsRecoveredVitessMigrationContext(t *testing.
 	assert.Contains(t, vitessStore.saveData.ExistingMigrationCtxs, "preexisting")
 }
 
+func TestLocalClient_PersistRecoveredVitessMigrationContextUpdatesStoredApplyData(t *testing.T) {
+	vitessData := &storage.VitessApplyData{
+		ApplyID:         42,
+		BranchName:      "old-branch",
+		DeployRequestID: 123,
+		ExistingMigrationCtxs: map[string]storage.VitessMigrationContextTimestamps{
+			"preexisting": {RequestedTimestamp: "2026-01-01T00:00:00Z"},
+		},
+	}
+	vitessStore := &exactProgressVitessApplyDataStore{data: vitessData}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		storage: &exactProgressStorage{vitessApplyData: vitessStore},
+		logger:  slog.Default(),
+	}
+
+	client.persistRecoveredVitessMigrationContext(t.Context(), 42, &engine.ResumeState{
+		MigrationContext: "recovered-context",
+		Metadata: `{
+			"branch_name":"new-branch",
+			"deploy_request_id":456,
+			"deploy_request_url":"https://example.test/deploys/456",
+			"existing_migration_contexts":{"preexisting":{"requested_timestamp":"2026-01-01T00:00:00Z"}},
+			"is_instant":true,
+			"deferred_deploy":true
+		}`,
+	})
+
+	require.NotNil(t, vitessStore.saveData)
+	assert.Equal(t, "recovered-context", vitessStore.saveData.MigrationContext)
+	assert.Equal(t, "new-branch", vitessStore.saveData.BranchName)
+	assert.Equal(t, uint64(456), vitessStore.saveData.DeployRequestID)
+	assert.Equal(t, "https://example.test/deploys/456", vitessStore.saveData.DeployRequestURL)
+	assert.True(t, vitessStore.saveData.IsInstant)
+	assert.True(t, vitessStore.saveData.DeferredDeploy)
+	assert.Contains(t, vitessStore.saveData.ExistingMigrationCtxs, "preexisting")
+}
+
+func TestLocalClient_AtomicProgressTickPersistsRecoveredVitessMigrationContext(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-worker-context",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+		Engine:          storage.EnginePlanetScale,
+	}
+	task := &storage.Task{
+		ID:             43,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-vitess-worker-context",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Namespace:      "testdb",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	vitessStore := &exactProgressVitessApplyDataStore{data: &storage.VitessApplyData{
+		ApplyID:         apply.ID,
+		BranchName:      "schemabot-apply",
+		DeployRequestID: 123,
+	}}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			controlRequests: &testControlRequestStore{},
+			vitessApplyData: vitessStore,
+		},
+		logger: slog.Default(),
+	}
+	resumeState := &engine.ResumeState{}
+
+	stopped := client.handleAtomicProgressTick(t.Context(), &fakeControlEngine{progressResult: &engine.ProgressResult{
+		State: engine.StateRunning,
+		ResumeState: &engine.ResumeState{
+			MigrationContext: "recovered-context",
+		},
+	}}, apply, []*storage.Task{task}, &engine.Credentials{}, resumeState, &atomicPollState{lastTaskState: state.Task.Running})
+
+	assert.False(t, stopped)
+	assert.Equal(t, "recovered-context", resumeState.MigrationContext)
+	require.NotNil(t, vitessStore.saveData)
+	assert.Equal(t, "recovered-context", vitessStore.saveData.MigrationContext)
+	assert.Equal(t, apply.ID, vitessStore.saveData.ApplyID)
+}
+
 func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              123,

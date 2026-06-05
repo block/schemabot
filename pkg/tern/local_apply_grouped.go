@@ -289,6 +289,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// updated metadata like deploy request URL or migration context).
 	if result.ResumeState != nil && resumeState != nil {
 		*resumeState = *result.ResumeState
+		if c.config.Type == storage.DatabaseTypeVitess {
+			c.persistRecoveredVitessMigrationContext(ctx, apply.ID, result.ResumeState)
+		}
 	}
 
 	now := time.Now()
@@ -504,6 +507,43 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		obs.OnProgress(apply, tasks)
 	}
 	return false
+}
+
+func (c *LocalClient) persistRecoveredVitessMigrationContext(ctx context.Context, applyID int64, resumeState *engine.ResumeState) {
+	if c.config.Type != storage.DatabaseTypeVitess || resumeState == nil || resumeState.MigrationContext == "" {
+		return
+	}
+	store := c.storage.VitessApplyData()
+	if store == nil {
+		return
+	}
+	vad, err := store.GetByApplyID(ctx, applyID)
+	if err != nil {
+		c.logger.Warn("failed to load VitessApplyData for recovered migration context", "apply_id", applyID, "migration_context", resumeState.MigrationContext, "error", err)
+		return
+	}
+	if vad == nil {
+		c.logger.Warn("VitessApplyData missing for recovered migration context", "apply_id", applyID, "migration_context", resumeState.MigrationContext)
+		return
+	}
+	if vad.MigrationContext == resumeState.MigrationContext {
+		return
+	}
+
+	vad.MigrationContext = resumeState.MigrationContext
+	if meta, decodeErr := decodePSMetadataForStorage(resumeState.Metadata); decodeErr != nil {
+		c.logger.Warn("failed to decode Vitess progress metadata while persisting recovered migration context", "apply_id", applyID, "error", decodeErr)
+	} else if meta != nil {
+		vad.BranchName = meta.BranchName
+		vad.DeployRequestID = meta.DeployRequestID
+		vad.ExistingMigrationCtxs = meta.ExistingMigrationCtxs
+		vad.DeployRequestURL = meta.DeployRequestURL
+		vad.IsInstant = meta.IsInstant
+		vad.DeferredDeploy = meta.DeferredDeploy
+	}
+	if saveErr := store.Save(ctx, vad); saveErr != nil {
+		c.logger.Warn("failed to persist recovered Vitess migration context", "apply_id", applyID, "migration_context", resumeState.MigrationContext, "error", saveErr)
+	}
 }
 
 // markRevertSkipped sets RevertSkippedAt on the VitessApplyData record so

@@ -770,11 +770,8 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		result, err := eng.Progress(ctx, progressReq)
 		if err == nil {
 			engineResult = result
-			if c.config.Type == storage.DatabaseTypeVitess && vitessApplyData != nil && result.ResumeState != nil && result.ResumeState.MigrationContext != "" && vitessApplyData.MigrationContext != result.ResumeState.MigrationContext {
-				vitessApplyData.MigrationContext = result.ResumeState.MigrationContext
-				if saveErr := c.storage.VitessApplyData().Save(ctx, vitessApplyData); saveErr != nil {
-					c.logger.Warn("failed to persist recovered Vitess migration context", "apply_id", activeTask.ApplyID, "migration_context", result.ResumeState.MigrationContext, "error", saveErr)
-				}
+			if c.config.Type == storage.DatabaseTypeVitess && vitessApplyData != nil && result.ResumeState != nil {
+				c.persistRecoveredVitessMigrationContext(ctx, activeTask.ApplyID, result.ResumeState)
 			}
 			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
 			engineTaskState := taskStateFromProgressResult(result)

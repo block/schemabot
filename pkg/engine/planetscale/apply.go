@@ -422,7 +422,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// immediately after the deploy request is submitted.
 	var migrationContext string
 	for attempt := range 10 {
-		migrationContext = e.discoverMigrationContext(ctx, client, req.Database, req.Credentials, existingContexts)
+		migrationContext = e.discoverMigrationContext(ctx, client, req.Database, req.Credentials, existingContexts, dr.CreatedAt)
 		if migrationContext != "" {
 			break
 		}
