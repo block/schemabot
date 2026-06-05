@@ -385,15 +385,40 @@ func RenderApplyBlockedByFailingChecks(environment string, failing []BlockingChe
 // The function recognises the "Resource not accessible" permission error and
 // surfaces a targeted hint; all other errors are shown verbatim. Both branches
 // include a fenced retry command, matching the failing/in-progress siblings.
-func RenderApplyBlockedByCheckStatusError(environment string, err error) string {
+type CheckStatusAccessDetails struct {
+	GitHubApp              string
+	MissingPermissions     []string
+	ChecksReadable         bool
+	CommitStatusesReadable bool
+	ChecksError            string
+	CommitStatusesError    string
+}
+
+func RenderApplyBlockedByCheckStatusError(environment string, err error, details *CheckStatusAccessDetails) string {
 	var sb strings.Builder
 
 	sb.WriteString("## ❌ Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", environment)
 
 	if err != nil && strings.Contains(err.Error(), "Resource not accessible") {
-		sb.WriteString("The SchemaBot GitHub App does not have permission to read check statuses on this repository. ")
-		sb.WriteString("Grant the app **Commit statuses: Read** permission, then retry:\n")
+		app := "SchemaBot GitHub App"
+		if details != nil && details.GitHubApp != "" {
+			app = fmt.Sprintf("SchemaBot GitHub App `%s`", details.GitHubApp)
+		}
+		fmt.Fprintf(&sb, "The %s cannot read the combined check/status rollup for this repository.\n\n", app)
+
+		switch {
+		case details != nil && len(details.MissingPermissions) > 0:
+			sb.WriteString("The diagnostic REST probes indicate the installation is missing or has not accepted:\n")
+			for _, permission := range details.MissingPermissions {
+				fmt.Fprintf(&sb, "- **%s**\n", permission)
+			}
+			sb.WriteString("\nGrant or accept those permissions, then retry:\n")
+		case details != nil && details.ChecksReadable && details.CommitStatusesReadable:
+			sb.WriteString("Diagnostic REST probes could read both **Checks** and **Commit statuses**, so GitHub rejected the GraphQL `statusCheckRollup` even though the underlying REST permissions appear readable. Verify the app installation has accepted the latest permissions, then retry:\n")
+		default:
+			sb.WriteString("Verify the app installation has access to this repository and has permission to read both **Checks** and **Commit statuses**, then retry:\n")
+		}
 		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 		return sb.String()
 	}

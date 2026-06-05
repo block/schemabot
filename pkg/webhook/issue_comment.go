@@ -90,7 +90,13 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 
 	// Reject commands from repositories not in the configured allowlist
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
-		h.logger.Warn("webhook from unregistered repository", "repo", repo, "pr", pr)
+		h.logger.Warn("webhook from unregistered repository",
+			"event", "issue_comment",
+			"action", payload.Action,
+			"repo", repo,
+			"pr", pr,
+			"installation_id", installationID,
+			"requested_by", requestedBy)
 		h.postComment(repo, pr, installationID, templates.RenderRepositoryNotRegistered())
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "repository not registered",

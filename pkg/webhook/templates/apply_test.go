@@ -462,7 +462,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 	t.Run("generic error is shown verbatim with retry block", func(t *testing.T) {
 		err := errors.New("graphql query failed: 500 Internal Server Error")
 
-		result := RenderApplyBlockedByCheckStatusError("staging", err)
+		result := RenderApplyBlockedByCheckStatusError("staging", err, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "**Environment**: `staging`")
@@ -475,13 +475,18 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 	t.Run("permission error surfaces a targeted hint with retry block", func(t *testing.T) {
 		err := errors.New("GET https://api.github.com/...: 403 Resource not accessible by integration")
 
-		result := RenderApplyBlockedByCheckStatusError("production", err)
+		result := RenderApplyBlockedByCheckStatusError("production", err, &CheckStatusAccessDetails{
+			GitHubApp:          "schemabot-prod",
+			MissingPermissions: []string{"Checks: Read"},
+		})
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "**Environment**: `production`")
-		assert.Contains(t, result, "does not have permission to read check statuses")
-		assert.Contains(t, result, "**Commit statuses: Read**")
-		assert.Contains(t, result, "permission, then retry:\n```\nschemabot apply -e production\n```",
+		assert.Contains(t, result, "SchemaBot GitHub App `schemabot-prod`")
+		assert.Contains(t, result, "cannot read the combined check/status rollup")
+		assert.Contains(t, result, "**Checks: Read**")
+		assert.NotContains(t, result, "**Commit statuses: Read**")
+		assert.Contains(t, result, "then retry:\n```\nschemabot apply -e production\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
 		assert.NotContains(t, result, "Unable to verify PR check statuses",
 			"permission branch should replace the generic verbatim message")
@@ -489,8 +494,23 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 			"permission branch should not also emit the generic-branch retry copy")
 	})
 
+	t.Run("permission error explains graphQL rollup when REST probes pass", func(t *testing.T) {
+		err := errors.New("graphql statusCheckRollup ref abc123: Resource not accessible by integration")
+
+		result := RenderApplyBlockedByCheckStatusError("production", err, &CheckStatusAccessDetails{
+			GitHubApp:              "schemabot-prod",
+			ChecksReadable:         true,
+			CommitStatusesReadable: true,
+		})
+
+		assert.Contains(t, result, "SchemaBot GitHub App `schemabot-prod`")
+		assert.Contains(t, result, "Diagnostic REST probes could read both **Checks** and **Commit statuses**")
+		assert.Contains(t, result, "GraphQL `statusCheckRollup`")
+		assert.NotContains(t, result, "Grant or accept those permissions")
+	})
+
 	t.Run("nil error skips empty fence and uses concise retry copy", func(t *testing.T) {
-		result := RenderApplyBlockedByCheckStatusError("staging", nil)
+		result := RenderApplyBlockedByCheckStatusError("staging", nil, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "**Environment**: `staging`")

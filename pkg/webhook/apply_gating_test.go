@@ -321,7 +321,9 @@ func TestEnforcePassingChecks(t *testing.T) {
 		select {
 		case body := <-comments:
 			assert.Contains(t, body, "Apply Blocked")
-			assert.Contains(t, body, "Commit statuses: Read")
+			assert.Contains(t, body, "combined check/status rollup")
+			assert.Contains(t, body, "Checks")
+			assert.Contains(t, body, "Commit statuses")
 			assert.NotContains(t, body, "Resource not accessible", "should not expose raw GraphQL error")
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for permission error comment")

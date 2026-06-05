@@ -289,6 +289,13 @@ func newGitHubRateLimitTransport(base http.RoundTripper) http.RoundTripper {
 	)
 }
 
+// AppSlug returns the GitHub App slug associated with this installation
+// client, when known. It is best-effort: startup can proceed before the slug
+// is fetched, so callers should tolerate an empty string.
+func (ic *InstallationClient) AppSlug() string {
+	return ic.loadAppSlug()
+}
+
 // IsNotFoundError checks if an error is a GitHub API 404 Not Found error.
 func IsNotFoundError(err error) bool {
 	var ghErr *gh.ErrorResponse
@@ -756,6 +763,53 @@ func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo strin
 		}
 	}
 	return out, nil
+}
+
+// CheckStatusAccessDiagnostic captures what SchemaBot can prove about the
+// installation token's ability to read the REST resources underlying the PR
+// check-status gate. GitHub's GraphQL statusCheckRollup permission errors do
+// not identify the exact missing permission, so this diagnostic probes the
+// equivalent REST Checks and Commit Statuses endpoints after a rollup failure.
+type CheckStatusAccessDiagnostic struct {
+	ChecksReadable         bool
+	CommitStatusesReadable bool
+	ChecksError            string
+	CommitStatusesError    string
+	MissingPermissions     []string
+}
+
+// DiagnoseCheckStatusAccess probes REST endpoints used to reconstruct a PR's
+// checks/statuses. It is intended for error reporting after GraphQL
+// statusCheckRollup fails, not for the hot success path.
+func (ic *InstallationClient) DiagnoseCheckStatusAccess(ctx context.Context, repo string, ref string) CheckStatusAccessDiagnostic {
+	owner, repoName := splitRepo(repo)
+	d := CheckStatusAccessDiagnostic{}
+
+	checksCtx := withGitHubRateLimitContext(ctx, metrics.GitHubOperationListCheckRunsForRef, repo)
+	if _, _, err := ic.client.Checks.ListCheckRunsForRef(checksCtx, owner, repoName, ref, &gh.ListCheckRunsOptions{ListOptions: gh.ListOptions{PerPage: 1}}); err != nil {
+		d.ChecksError = err.Error()
+		if isResourceNotAccessible(err) {
+			d.MissingPermissions = append(d.MissingPermissions, "Checks: Read")
+		}
+	} else {
+		d.ChecksReadable = true
+	}
+
+	statusesCtx := withGitHubRateLimitContext(ctx, metrics.GitHubOperationGetCombinedStatus, repo)
+	if _, _, err := ic.client.Repositories.GetCombinedStatus(statusesCtx, owner, repoName, ref, &gh.ListOptions{PerPage: 1}); err != nil {
+		d.CommitStatusesError = err.Error()
+		if isResourceNotAccessible(err) {
+			d.MissingPermissions = append(d.MissingPermissions, "Commit statuses: Read")
+		}
+	} else {
+		d.CommitStatusesReadable = true
+	}
+
+	return d
+}
+
+func isResourceNotAccessible(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Resource not accessible")
 }
 
 // fetchPRCheckStatuses performs the actual GraphQL round trip for

@@ -367,6 +367,7 @@ func gitHubRequestCategory(operation string) string {
 		metrics.GitHubOperationFetchFileContent,
 		metrics.GitHubOperationFetchGitTree,
 		metrics.GitHubOperationFetchPullRequest,
+		metrics.GitHubOperationGetCombinedStatus,
 		metrics.GitHubOperationGetTeamMembership,
 		metrics.GitHubOperationGraphQLStatusCheckRollup,
 		metrics.GitHubOperationListCheckRunsForRef,

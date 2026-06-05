@@ -60,12 +60,12 @@ Under **Repository permissions**, grant:
 
 | Permission | Access | Used For |
 |-----------|--------|----------|
-| **Checks** | Read & Write | Create check runs on PRs showing plan results |
-| **Commit statuses** | Read | Read PR check statuses for the `require_passing_checks` gate |
-| **Contents** | Read | Read `schemabot.yaml` config and schema files from repos |
+| **Checks** | Read & Write | Create SchemaBot check runs and read GitHub check runs for the `require_passing_checks` gate |
+| **Commit statuses** | Read | Read legacy commit statuses for the `require_passing_checks` gate |
+| **Contents** | Read | Read `schemabot.yaml`, schema files, CODEOWNERS, and commit objects used by GitHub status rollups |
 | **Issues** | Read & Write | Post PR comments and add reactions |
 | **Metadata** | Read | Required (granted automatically) |
-| **Pull requests** | Read & Write | Fetch PR info (head SHA, changed files) |
+| **Pull requests** | Read & Write | Fetch PR info, changed files, and reviews |
 
 Under **Organization permissions**, grant:
 

@@ -70,7 +70,12 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 
 	// Reject webhooks from repositories not in the configured allowlist
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
-		h.logger.Warn("webhook from unregistered repository", "repo", repo)
+		h.logger.Warn("webhook from unregistered repository",
+			"event", "pull_request",
+			"action", payload.Action,
+			"repo", repo,
+			"pr", pr,
+			"installation_id", installationID)
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "repository not registered",
 		})

@@ -621,23 +621,48 @@ func TestRecordWebhookEventMetric(t *testing.T) {
 	metrics.RecordWebhookEvent(t.Context(), "default", "issue_comment", "created", "org/repo", "processed")
 	metrics.RecordWebhookEvent(t.Context(), "default", "pull_request", "opened", "org/repo", "processed")
 	metrics.RecordWebhookEvent(t.Context(), "default", "pull_request", "closed", "org/repo", "processed")
+	metrics.RecordWebhookEvent(t.Context(), "default", "push", "", "org/repo", "ignored")
+	metrics.RecordWebhookEvent(t.Context(), "default", "pull_request_review", "submitted", "org/repo", "ignored")
+	metrics.RecordWebhookEvent(t.Context(), "default", "issues", "edited", "org/repo", "ignored")
 	metrics.RecordWebhookEvent(t.Context(), "default", "ping", "", "", "ignored")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
 
 	var found bool
+	var sawPush, sawPullRequestReview, sawIssues bool
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			if m.Name == "schemabot.webhook.events_total" {
 				found = true
 				sum, ok := m.Data.(metricdata.Sum[int64])
 				require.True(t, ok)
-				assert.Len(t, sum.DataPoints, 4, "expected 4 data points (one per event_type/action/status combo)")
+				assert.Len(t, sum.DataPoints, 7, "expected 7 data points (one per event_type/action/status combo)")
+				for _, dp := range sum.DataPoints {
+					eventType, ok := dp.Attributes.Value("event_type")
+					require.True(t, ok)
+					action, _ := dp.Attributes.Value("action")
+					switch eventType.AsString() {
+					case "push":
+						sawPush = true
+						assert.Empty(t, action.AsString())
+					case "pull_request_review":
+						sawPullRequestReview = true
+						assert.Equal(t, "submitted", action.AsString())
+					case "issues":
+						sawIssues = true
+						assert.Equal(t, "edited", action.AsString())
+					case "unknown":
+						t.Fatalf("expected subscribed webhook events to keep their event_type label: %+v", dp.Attributes)
+					}
+				}
 			}
 		}
 	}
 	assert.True(t, found, "schemabot.webhook.events_total metric not found")
+	assert.True(t, sawPush, "push event should not be normalized to unknown")
+	assert.True(t, sawPullRequestReview, "pull_request_review event should not be normalized to unknown")
+	assert.True(t, sawIssues, "issues event should not be normalized to unknown")
 }
 
 func TestRecordControlOperationMetric(t *testing.T) {

@@ -69,13 +69,13 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `error`
 
-**event_type** (webhooks): `issue_comment`, `pull_request`, `check_run`, `ping`
+**event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `ping`, `push`
 
-**action** (webhooks): `created`, `opened`, `synchronize`, `reopened`, `closed`, `requested`, `completed` (omitted for events without actions like `ping`)
+**action** (webhooks): common GitHub actions for the subscribed webhook events, such as `created`, `opened`, `synchronize`, `submitted`, `edited`, `closed`, `requested`, `completed` (omitted for events without actions like `ping` and `push`)
 
 **status** (webhooks): `processed`, `invalid_signature`, `ignored`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_team_membership`, `graphql_status_check_rollup`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team_membership`, `graphql_status_check_rollup`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 

@@ -48,10 +48,31 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 
 	statuses, err := client.GetPRCheckStatuses(ctx, repo, headSHA)
 	if err != nil {
+		diagnostic := client.DiagnoseCheckStatusAccess(ctx, repo, headSHA)
+		details := &templates.CheckStatusAccessDetails{
+			GitHubApp:              h.githubAppDisplayNameForRepo(repo, client),
+			MissingPermissions:     diagnostic.MissingPermissions,
+			ChecksReadable:         diagnostic.ChecksReadable,
+			CommitStatusesReadable: diagnostic.CommitStatusesReadable,
+			ChecksError:            diagnostic.ChecksError,
+			CommitStatusesError:    diagnostic.CommitStatusesError,
+		}
 		h.logger.Error("failed to fetch PR check statuses, blocking apply",
-			"repo", repo, "pr", pr, "environment", environment, "error", err)
+			"repo", repo,
+			"pr", pr,
+			"environment", environment,
+			"head_sha", headSHA,
+			"installation_id", installationID,
+			"github_operation", "graphql_status_check_rollup",
+			"github_app", details.GitHubApp,
+			"checks_readable", diagnostic.ChecksReadable,
+			"commit_statuses_readable", diagnostic.CommitStatusesReadable,
+			"missing_permissions", diagnostic.MissingPermissions,
+			"checks_error", diagnostic.ChecksError,
+			"commit_statuses_error", diagnostic.CommitStatusesError,
+			"error", err)
 		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByCheckStatusError(environment, err))
+			templates.RenderApplyBlockedByCheckStatusError(environment, err, details))
 		return true
 	}
 
@@ -77,6 +98,20 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 	}
 
 	return false
+}
+
+func (h *Handler) githubAppDisplayNameForRepo(repo string, client *ghclient.InstallationClient) string {
+	if client != nil {
+		if slug := client.AppSlug(); slug != "" {
+			return slug
+		}
+	}
+	if cfg := h.config(); cfg != nil {
+		if resolved, err := cfg.ResolveGitHubAppForRepo(repo); err == nil && resolved.Name != defaultAppName {
+			return resolved.Name
+		}
+	}
+	return ""
 }
 
 // filterInProgressNonSchemaBotChecks returns checks that are still running,

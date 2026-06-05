@@ -593,22 +593,48 @@ func RecordSchedulerClaimDuration(ctx context.Context, duration time.Duration, d
 
 // knownWebhookEvents limits metric cardinality to expected GitHub event types.
 var knownWebhookEvents = map[string]bool{
-	"issue_comment": true,
-	"pull_request":  true,
-	"check_run":     true,
-	"ping":          true,
+	"create":                      true,
+	"issues":                      true,
+	"issue_comment":               true,
+	"pull_request":                true,
+	"pull_request_review":         true,
+	"pull_request_review_comment": true,
+	"check_run":                   true,
+	"ping":                        true,
+	"push":                        true,
 }
 
 // knownWebhookActions limits metric cardinality to expected GitHub webhook actions.
 var knownWebhookActions = map[string]bool{
-	"created":     true, // issue_comment
-	"opened":      true, // pull_request
-	"synchronize": true, // pull_request
-	"reopened":    true, // pull_request
-	"closed":      true, // pull_request
-	"requested":   true, // check_run
-	"completed":   true, // check_run
-	"":            true, // events without actions (e.g., ping)
+	"assigned":               true,
+	"auto_merge_disabled":    true,
+	"auto_merge_enabled":     true,
+	"closed":                 true,
+	"completed":              true,
+	"converted_to_draft":     true,
+	"created":                true,
+	"deleted":                true,
+	"demilestoned":           true,
+	"dismissed":              true,
+	"edited":                 true,
+	"labeled":                true,
+	"locked":                 true,
+	"milestoned":             true,
+	"opened":                 true,
+	"pinned":                 true,
+	"ready_for_review":       true,
+	"reopened":               true,
+	"requested":              true,
+	"review_request_removed": true,
+	"review_requested":       true,
+	"submitted":              true,
+	"synchronize":            true,
+	"transferred":            true,
+	"unassigned":             true,
+	"unlabeled":              true,
+	"unlocked":               true,
+	"unpinned":               true,
+	"":                       true, // events without actions (e.g., ping, push)
 }
 
 // RecordSchemaRequestError increments the schema request error counter.
@@ -648,6 +674,7 @@ const (
 	GitHubOperationFetchFileContent              = "fetch_file_content"
 	GitHubOperationFetchGitTree                  = "fetch_git_tree"
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
+	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeamMembership             = "get_team_membership"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
 	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
@@ -687,7 +714,10 @@ const (
 	GitHubRateLimitResourceSourceImport              = "source_import"
 )
 
-var seenUnknownGitHubMetricLabels sync.Map
+var (
+	seenUnknownGitHubMetricLabels  sync.Map
+	seenUnknownWebhookMetricLabels sync.Map
+)
 
 // GitHubRequestSample describes a GitHub API response observed by SchemaBot.
 // Category distinguishes reads from content-generating writes so dashboards can
@@ -851,6 +881,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
 		GitHubOperationFetchPullRequest,
+		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeamMembership,
 		GitHubOperationGraphQLStatusCheckRollup,
 		GitHubOperationListCheckRunsForRef,
@@ -918,9 +949,11 @@ func isKnownGitHubRateLimitResource(resource string) bool {
 // "default".
 func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, status string) {
 	if !knownWebhookEvents[eventType] {
+		logUnknownWebhookMetricLabel("event_type", eventType, appName, repo, status)
 		eventType = "unknown"
 	}
 	if !knownWebhookActions[action] {
+		logUnknownWebhookMetricLabel("action", action, appName, repo, status)
 		action = "unknown"
 	}
 	if appName == "" {
@@ -948,6 +981,19 @@ func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, s
 		attrs = append(attrs, attribute.String("repository", repo))
 	}
 	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+}
+
+func logUnknownWebhookMetricLabel(label, value, appName, repo, status string) {
+	key := label + "\x00" + value + "\x00" + appName + "\x00" + repo + "\x00" + status
+	if _, loaded := seenUnknownWebhookMetricLabels.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	slog.Warn("webhook metric label normalized to unknown",
+		"label", label,
+		"value", value,
+		"app_name", appName,
+		"repo", repo,
+		"status", status)
 }
 
 var knownStatusCheckOperations = map[string]bool{
