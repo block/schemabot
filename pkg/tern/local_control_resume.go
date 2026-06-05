@@ -665,6 +665,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Recovering apply (heartbeat expired, was in %s state)", apply.State), "", "")
 
+	deferredCutoverSignalAbsent := false
 	if shouldInspectDeferredCutoverSignal(apply) {
 		signalExists, signalSupported, err := c.deferredCutoverSignalExists(ctx, apply)
 		if err != nil {
@@ -694,6 +695,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 				"apply_id", apply.ApplyIdentifier,
 				"database", apply.Database,
 				"database_type", apply.DatabaseType)
+			deferredCutoverSignalAbsent = true
 		} else {
 			c.logger.Info("engine does not support deferred cutover signal lookup; re-plan will reconcile deferred cutover recovery",
 				"apply_id", apply.ApplyIdentifier,
@@ -710,6 +712,19 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	}
 
 	activeTasks := rp.ActiveTasks
+	if deferredCutoverSignalAbsent && len(activeTasks) > 0 {
+		message := "deferred cutover signal is absent but live schema does not match desired schema; manual reconciliation required"
+		c.logger.Error("deferred cutover recovery cannot reconcile absent cutover signal",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType,
+			"active_task_count", len(activeTasks))
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			message, apply.State, state.Apply.Failed)
+		c.failApplyWithTasks(ctx, apply, activeTasks, message)
+		c.notifyTerminalObserver(apply, tasks)
+		return nil
+	}
 	startControlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
 		return err

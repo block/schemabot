@@ -1104,9 +1104,10 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 	}
 
 	// Recovering is a temporary scheduler-owned wrapper while an engine reattaches
-	// after restart. Once the engine reports a concrete active state, storage
-	// returns to that normal state so the UI does not stay in recovery for the rest
-	// of a long row copy.
+	// after restart. Recovery starts only after storage had already reached
+	// waiting_for_cutover, so row-copy progress during reattach must not move
+	// storage backward to running. Row counters can still be displayed from live
+	// engine progress while the durable state stays cutover-blocking.
 	if isRecoveryState(storedTaskState) && recoveryCompleteWithEngineState(engineTaskState) {
 		return engineTaskState
 	}
@@ -1152,11 +1153,7 @@ func isRecoveryState(taskState string) bool {
 
 func recoveryCompleteWithEngineState(taskState string) bool {
 	return state.IsState(taskState,
-		state.Task.WaitingForDeploy,
-		state.Task.Running,
 		state.Task.WaitingForCutover,
-		state.Task.CuttingOver,
-		state.Task.RevertWindow,
 	)
 }
 

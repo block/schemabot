@@ -834,13 +834,25 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 			expected:         state.Task.FailedRetryable,
 		},
 		{
-			name:             "recovery returns to normal row copy after engine reattaches",
+			name:             "recovery preserves cutover-ready storage while engine reports row copy",
 			storedTaskState:  state.Task.Recovering,
 			engineTableState: state.Task.Running,
-			expected:         state.Task.Running,
+			expected:         state.Task.Recovering,
 		},
 		{
-			name:             "recovery stays visible until engine reports concrete work",
+			name:             "recovery exits when engine proves cutover readiness",
+			storedTaskState:  state.Task.Recovering,
+			engineTableState: state.Task.WaitingForCutover,
+			expected:         state.Task.WaitingForCutover,
+		},
+		{
+			name:             "recovery ignores cutting over because cutover readiness was not re-established",
+			storedTaskState:  state.Task.Recovering,
+			engineTableState: state.Task.CuttingOver,
+			expected:         state.Task.Recovering,
+		},
+		{
+			name:             "recovery stays visible until engine proves cutover readiness",
 			storedTaskState:  state.Task.Recovering,
 			engineTableState: state.Task.Pending,
 			expected:         state.Task.Recovering,

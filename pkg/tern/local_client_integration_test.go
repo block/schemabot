@@ -961,10 +961,10 @@ func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t
 }
 
 // This scenario covers restart recovery where storage was waiting for cutover
-// and Spirit's durable sentinel still exists. Recovery stays visible until the
-// engine reports concrete work, then storage returns to the normal active state
-// and later reaches cutover readiness through the ordinary progress path.
-func TestLocalClient_ResumeApplyDeferredCutoverRecoveryReturnsToConcreteEngineState(t *testing.T) {
+// and Spirit's durable sentinel still exists. Row-copy progress remains visible
+// during recovery, but durable storage stays cutover-blocking until Spirit proves
+// cutover readiness again.
+func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStorage(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -1125,17 +1125,17 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryReturnsToConcreteEngineSt
 		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, ternv1.State_STATE_RUNNING, progressResp.State)
+	assert.Equal(t, ternv1.State_STATE_RECOVERING, progressResp.State)
 
 	storedApply, err = stor.Applies().Get(ctx, applyID)
 	require.NoError(t, err)
 	require.NotNil(t, storedApply)
-	assert.Equal(t, state.Apply.Running, storedApply.State)
+	assert.Equal(t, state.Apply.Recovering, storedApply.State)
 
 	storedTask, err = stor.Tasks().Get(ctx, task.TaskIdentifier)
 	require.NoError(t, err)
 	require.NotNil(t, storedTask)
-	assert.Equal(t, state.Task.Running, storedTask.State)
+	assert.Equal(t, state.Task.Recovering, storedTask.State)
 
 	recoveryEngine.progress = &engine.ProgressResult{
 		State: engine.StateWaitingForCutover,
@@ -1401,6 +1401,131 @@ func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelReconcilesCompleted
 	require.NoError(t, err)
 	require.NotNil(t, storedTask)
 	assert.Equal(t, state.Task.Completed, storedTask.State)
+}
+
+// This scenario covers a deferred-cutover recovery where the Spirit sentinel is
+// absent but the live schema does not contain the desired schema. Storage was
+// already cutover-ready, so SchemaBot fails closed instead of moving backward to
+// running after losing the cutover signal.
+func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelFailsWhenWorkRemains(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(ctx))
+	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (`id` INT PRIMARY KEY)")
+	require.NoError(t, err)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	ddl := "ALTER TABLE `users` ADD COLUMN `recovery_note` varchar(255)"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-cutover-no-sentinel-work-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"}},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-cutover-no-sentinel-work-%d", time.Now().UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.WaitingForCutover,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	task := &storage.Task{
+		TaskIdentifier:  fmt.Sprintf("task-cutover-no-sentinel-work-users-%d", time.Now().UnixNano()),
+		ApplyID:         applyID,
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Task.WaitingForCutover,
+		TableName:       "users",
+		Namespace:       "testdb",
+		DDL:             ddl,
+		DDLAction:       "alter",
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		ProgressPercent: 100,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	taskID, err := stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	recoveryEngine := &stagedGroupedResumeEngine{
+		Engine: client.spiritEngine,
+		planResults: []*engine.PlanResult{{
+			Changes: []engine.SchemaChange{{
+				Namespace: "testdb",
+				TableChanges: []engine.TableChange{{
+					Table: "users",
+					DDL:   ddl,
+				}},
+			}},
+		}},
+	}
+	client.spiritEngine = recoveryEngine
+
+	require.NoError(t, client.ResumeApply(ctx, apply))
+	assert.Equal(t, 0, recoveryEngine.applyCount)
+
+	storedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Failed, storedApply.State)
+	assert.Contains(t, storedApply.ErrorMessage, "manual reconciliation required")
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Failed, storedTask.State)
+	assert.Contains(t, storedTask.ErrorMessage, "manual reconciliation required")
+
+	logs, err := stor.ApplyLogs().GetByApply(ctx, applyID)
+	require.NoError(t, err)
+	assert.True(t, hasLogMessageContaining(logs, "manual reconciliation required"))
 }
 
 // This scenario covers a scheduler-owned grouped start where remote execution is
