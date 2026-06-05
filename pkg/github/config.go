@@ -221,9 +221,14 @@ func (ic *InstallationClient) FindConfigByDatabaseName(ctx context.Context, repo
 		return nil, "", fmt.Errorf("fetch PR info: %w", err)
 	}
 
-	prConfigs, err := ic.findConfigsChangedInPR(ctx, repo, pr, prInfo.HeadSHA)
+	files, err := ic.FetchPRFiles(ctx, repo, pr)
 	if err != nil {
-		return nil, "", fmt.Errorf("find configs changed in PR: %w", err)
+		return nil, "", fmt.Errorf("fetch PR files: %w", err)
+	}
+
+	prConfigs, err := ic.findAllConfigsForPRFiles(ctx, repo, prInfo.HeadSHA, files)
+	if err != nil {
+		return nil, "", fmt.Errorf("find configs for PR: %w", err)
 	}
 	if config, configDir, ok, err := selectConfigByDatabaseName(databaseName, prConfigs); err != nil {
 		return nil, "", err
@@ -365,7 +370,10 @@ func (ic *InstallationClient) FindAllConfigsForPR(ctx context.Context, repo stri
 	if err != nil {
 		return nil, fmt.Errorf("fetch PR files: %w", err)
 	}
+	return ic.findAllConfigsForPRFiles(ctx, repo, prInfo.HeadSHA, files)
+}
 
+func (ic *InstallationClient) findAllConfigsForPRFiles(ctx context.Context, repo, ref string, files []PRFile) ([]DiscoveredConfig, error) {
 	configsByPath := make(map[string]DiscoveredConfig)
 	for _, file := range files {
 		if !isConfigFile(file.Filename) {
@@ -375,7 +383,7 @@ func (ic *InstallationClient) FindAllConfigsForPR(ctx context.Context, repo stri
 			continue
 		}
 		configDir := path.Dir(file.Filename)
-		config, err := ic.FetchConfig(ctx, repo, file.Filename, prInfo.HeadSHA)
+		config, err := ic.FetchConfig(ctx, repo, file.Filename, ref)
 		if err != nil {
 			return nil, fmt.Errorf("fetch changed config %s: %w", file.Filename, err)
 		}
@@ -388,7 +396,7 @@ func (ic *InstallationClient) FindAllConfigsForPR(ctx context.Context, repo stri
 	}
 	schemaFiles := filterSchemaFiles(filenames)
 	for _, schemaFile := range schemaFiles {
-		config, configDir, err := ic.findNearestConfig(ctx, repo, prInfo.HeadSHA, schemaFile)
+		config, configDir, err := ic.findNearestConfig(ctx, repo, ref, schemaFile)
 		if err != nil {
 			return nil, err
 		}

@@ -182,6 +182,29 @@ func TestFindConfigByDatabaseNameUsesChangedConfigFileBeforeRepoScan(t *testing.
 	assert.Equal(t, "apps/widgets/schema", schemaDir)
 }
 
+func TestFindConfigByDatabaseNameUsesChangedSchemaFileBeforeRepoScan(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("apps/widgets/schema/main/widgets.sql"),
+		Status:   new("modified"),
+	}})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"truncated": true,
+			"tree":      []any{},
+		}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	config, schemaDir, err := ic.FindConfigByDatabaseName(t.Context(), "octocat/hello-world", 1, "widgets")
+
+	require.NoError(t, err)
+	assert.Equal(t, "widgets", config.Database)
+	assert.Equal(t, "apps/widgets/schema", schemaDir)
+}
+
 func TestFindAllConfigsForPRSkipsRemovedConfigFile(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	registerPullRequest(t, mux, "abc123")
