@@ -20,6 +20,8 @@ import (
 
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/bradleyfalzon/ghinstallation/v2"
+	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit"
+	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit/github_secondary_ratelimit"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/shurcooL/githubv4"
 )
@@ -128,13 +130,14 @@ func (c *Client) fetchAppSlug() {
 	c.lastSlugAttempt = time.Now()
 	c.slugFetchMu.Unlock()
 
-	appBaseTransport := newGitHubMetricsTransport(http.DefaultTransport, 0, c.loadAppSlug)
+	appBaseTransport := newGitHubRateLimitTransport(newGitHubMetricsTransport(http.DefaultTransport, 0, c.loadAppSlug))
 	appTransport, err := ghinstallation.NewAppsTransport(appBaseTransport, c.appID, c.privateKey)
 	if err != nil {
 		c.logger.Error("failed to create app transport for slug fetch", "error", err)
 		return
 	}
 	appClient := gh.NewClient(&http.Client{Transport: appTransport, Timeout: 10 * time.Second})
+	appClient.DisableRateLimitCheck = true
 	ctx := context.Background()
 	app, _, err := appClient.Apps.Get(ctx, "")
 	if err != nil {
@@ -188,13 +191,14 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		return existing, nil
 	}
 
-	baseTransport := newGitHubMetricsTransport(http.DefaultTransport, installationID, c.loadAppSlug)
+	baseTransport := newGitHubRateLimitTransport(newGitHubMetricsTransport(http.DefaultTransport, installationID, c.loadAppSlug))
 	installationTransport, err := ghinstallation.New(baseTransport, c.appID, installationID, c.privateKey)
 	if err != nil {
 		return nil, fmt.Errorf("create installation transport for installation %d: %w", installationID, err)
 	}
 	httpc := &http.Client{Transport: installationTransport, Timeout: 30 * time.Second}
 	ghClient := gh.NewClient(httpc)
+	ghClient.DisableRateLimitCheck = true
 	ic := &InstallationClient{
 		client:                  ghClient,
 		gql:                     githubv4.NewEnterpriseClient(graphQLURLFor(ghClient), httpc),
@@ -275,6 +279,14 @@ func (ic *InstallationClient) loadAppSlug() string {
 // storeAppSlug atomically updates the app slug.
 func (ic *InstallationClient) storeAppSlug(slug string) {
 	ic.appSlug.Store(&slug)
+}
+
+const githubSecondaryRateLimitMaxSleep = 5 * time.Second
+
+func newGitHubRateLimitTransport(base http.RoundTripper) http.RoundTripper {
+	return github_ratelimit.New(base,
+		github_secondary_ratelimit.WithSingleSleepLimit(githubSecondaryRateLimitMaxSleep, nil),
+	)
 }
 
 // IsNotFoundError checks if an error is a GitHub API 404 Not Found error.
