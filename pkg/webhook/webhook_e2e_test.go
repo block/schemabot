@@ -300,6 +300,21 @@ func registerPassingChecks(mux *http.ServeMux) {
 	registerCheckStatusRESTHandlers(mux, nil)
 }
 
+func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() []checkStatusNode) {
+	prefix := "/repos/octocat/hello-world/commits/"
+	mux.HandleFunc("GET "+prefix, func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, prefix)
+		switch {
+		case strings.HasSuffix(path, "/status"):
+			writeCommitStatusResponse(w, nodes())
+		case strings.HasSuffix(path, "/check-runs"):
+			writeCheckRunsResponse(w, nodes())
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}
+
 // setupFakeGitHubForPlan sets up a fake GitHub server for plan flows.
 // schemaSQL maps filename -> content. Files are placed under schema/{namespace}/.
 // namespace is the MySQL schema name (required).
@@ -467,7 +482,7 @@ func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[stri
 	// (empty REST responses) so existing tests are unaffected. Tests that need to
 	// drive different responses across calls install a provider in
 	// result.CheckStatusNodes before issuing the webhook request.
-	registerCheckStatusRESTHandlersForRef(mux, "abc123", func() []checkStatusNode {
+	registerCheckStatusRESTHandlersForAnyRef(mux, func() []checkStatusNode {
 		if provider := result.CheckStatusNodes.Load(); provider != nil {
 			return (*provider)()
 		}

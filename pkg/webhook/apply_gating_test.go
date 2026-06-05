@@ -257,30 +257,38 @@ func registerCheckStatusRESTHandlers(mux *http.ServeMux, nodes []checkStatusNode
 func registerCheckStatusRESTHandlersForRef(mux *http.ServeMux, ref string, nodes func() []checkStatusNode) {
 	base := "/repos/octocat/hello-world/commits/" + ref
 	mux.HandleFunc("GET "+base+"/status", func(w http.ResponseWriter, _ *http.Request) {
-		statuses := make([]map[string]any, 0)
-		for _, n := range nodes() {
-			if n.Typename != "StatusContext" {
-				continue
-			}
-			statuses = append(statuses, map[string]any{"context": n.Context, "state": n.State})
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"statuses": statuses, "total_count": len(statuses)})
+		writeCommitStatusResponse(w, nodes())
 	})
 	mux.HandleFunc("GET "+base+"/check-runs", func(w http.ResponseWriter, _ *http.Request) {
-		checkRuns := make([]map[string]any, 0)
-		for _, n := range nodes() {
-			if n.Typename != "CheckRun" {
-				continue
-			}
-			checkRuns = append(checkRuns, map[string]any{
-				"name":       n.Name,
-				"status":     n.Status,
-				"conclusion": n.Conclusion,
-				"app":        map[string]any{"slug": n.AppSlug},
-			})
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": checkRuns, "total_count": len(checkRuns)})
+		writeCheckRunsResponse(w, nodes())
 	})
+}
+
+func writeCommitStatusResponse(w http.ResponseWriter, nodes []checkStatusNode) {
+	statuses := make([]map[string]any, 0)
+	for _, n := range nodes {
+		if n.Typename != "StatusContext" {
+			continue
+		}
+		statuses = append(statuses, map[string]any{"context": n.Context, "state": n.State})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"statuses": statuses, "total_count": len(statuses)})
+}
+
+func writeCheckRunsResponse(w http.ResponseWriter, nodes []checkStatusNode) {
+	checkRuns := make([]map[string]any, 0)
+	for _, n := range nodes {
+		if n.Typename != "CheckRun" {
+			continue
+		}
+		checkRuns = append(checkRuns, map[string]any{
+			"name":       n.Name,
+			"status":     n.Status,
+			"conclusion": n.Conclusion,
+			"app":        map[string]any{"slug": n.AppSlug},
+		})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": checkRuns, "total_count": len(checkRuns)})
 }
 
 func TestEnforcePassingChecks(t *testing.T) {
