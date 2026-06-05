@@ -184,6 +184,7 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	// Clean up any stale data from previous test runs (shared storage DB)
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
 	// Delete child apply_operations rows before their parent applies rows so the
 	// operator claim loop cannot re-claim orphan operations whose parent lookup
 	// returns nil.
@@ -1502,6 +1503,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	// Clean up stale data
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", appDBName)
 
 	stagingClient, err := tern.NewLocalClient(tern.LocalConfig{
@@ -2422,6 +2424,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, lock, "lock should be held after rollback command")
 	assert.Equal(t, "octocat/hello-world#1", lock.Owner)
+	assert.True(t, strings.HasPrefix(lock.PendingPlanID, rollbackPendingPlanPrefix), "rollback lock should pin a tagged rollback plan")
 
 	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
 	require.NoError(t, err)
@@ -2485,6 +2488,18 @@ func TestE2ERollbackConfirmNoLock(t *testing.T) {
 	factory := &fakeClientFactory{client: installClient}
 
 	h := NewHandler(svc, factory, nil, logger)
+
+	_, err := svc.Storage().Applies().Create(t.Context(), &storage.Apply{
+		ApplyIdentifier: "apply_aabbccdd0012",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           "completed",
+		Engine:          "spirit",
+	})
+	require.NoError(t, err)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot rollback-confirm -e staging",
@@ -2759,7 +2774,7 @@ func isRollbackActionRequiredWithoutApplyOwnership(check *storage.Check) bool {
 
 // TestE2ERollbackIgnoredByNonOwningInstance verifies that in a multi-instance
 // setup, an instance that doesn't own the apply's environment silently ignores
-// the rollback command instead of posting "Apply Not Found".
+// rollback commands instead of reacting or posting "Apply Not Found".
 func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 	dbName := "webhook_rb_multienv"
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"production"})
@@ -2786,6 +2801,7 @@ func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
 	comments := make(chan string, 10)
+	reactions := make(chan string, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Body string `json:"body"`
@@ -2795,6 +2811,15 @@ func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
 	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
@@ -2802,22 +2827,31 @@ func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 
 	h := NewHandler(svc, factory, nil, logger)
 
-	// Send rollback command for the staging apply to the production instance
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot rollback apply-aabbccdd0011 -e staging",
-		isPR:    true,
-	}, nil)
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
+	commands := []string{
+		"schemabot rollback apply-aabbccdd0011 -e staging",
+		"schemabot rollback-confirm apply-aabbccdd0011 -e staging",
+		"schemabot rollback-confirm -e staging",
+	}
+	for _, command := range commands {
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: command,
+			isPR:    true,
+		}, nil)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "environment handled by another instance")
+	}
 
 	// The production instance should NOT post any comment (it silently ignores
-	// the staging rollback). Wait long enough for any async handler to fire.
+	// the staging commands). Wait long enough for any async handler to fire.
 	select {
 	case body := <-comments:
-		t.Fatalf("production instance should not post a comment for staging rollback, got: %s", body)
+		t.Fatalf("production instance should not post a comment for staging rollback command, got: %s", body)
+	case reaction := <-reactions:
+		t.Fatalf("production instance should not react to staging rollback command, got: %s", reaction)
 	case <-time.After(2 * time.Second):
-		// Expected: no comment posted
+		// Expected: no comment or reaction posted.
 	}
 }
 
@@ -3443,6 +3477,8 @@ func setupE2EServiceWithAllowedEnvs(t *testing.T, allowedEnvs []string) *api.Ser
 	// Clean up stale data
 	_, _ = schemabotDB.ExecContext(t.Context(),
 		"DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+	_, _ = schemabotDB.ExecContext(t.Context(),
+		"DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
 
 	serverConfig := &api.ServerConfig{
 		AllowedEnvironments: allowedEnvs,

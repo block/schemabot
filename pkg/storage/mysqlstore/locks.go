@@ -28,9 +28,9 @@ type lockStore struct {
 // concurrent applies for the same PR and database (e.g. staging and production
 // apply-confirms) share the same owner and lock key, so both must succeed. A
 // non-empty lock.PendingPlanID then overwrites the stored one — the latest apply
-// attempt's confirmation plan must be the one apply-confirm loads. A re-acquire
-// that passes an empty PendingPlanID (rollback, CLI) leaves the existing value
-// intact.
+// or rollback attempt's confirmation plan must be the one the corresponding
+// confirm command loads. A re-acquire that passes an empty PendingPlanID (CLI)
+// leaves the existing value intact.
 func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 	existing, err := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
 	if err != nil {

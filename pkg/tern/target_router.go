@@ -285,16 +285,6 @@ func (r *TargetRouter) SkipRevert(ctx context.Context, req *ternv1.SkipRevertReq
 	return client.SkipRevert(ctx, req)
 }
 
-// RollbackPlan generates a rollback plan for a target. The database argument is
-// treated as the target key because rollback has no target-aware proto request.
-func (r *TargetRouter) RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error) {
-	client, _, err := r.clientForTarget(ctx, database, "", environment, database)
-	if err != nil {
-		return nil, err
-	}
-	return client.RollbackPlan(ctx, database, environment)
-}
-
 // Health checks storage connectivity for the data-plane router.
 func (r *TargetRouter) Health(ctx context.Context) error {
 	return r.storage.Ping(ctx)

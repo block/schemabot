@@ -33,6 +33,7 @@ type PlanCommentData struct {
 	Repository  string
 	RequestedBy string // Empty means auto-generated
 	IsMySQL     bool
+	ApplyID     string
 
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData

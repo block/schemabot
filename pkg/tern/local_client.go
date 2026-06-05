@@ -366,6 +366,28 @@ func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *st
 	return exists, true, nil
 }
 
+func (c *LocalClient) normalizeSchemaFiles(schemaFiles schema.SchemaFiles) (schema.SchemaFiles, error) {
+	if c.config.Type != storage.DatabaseTypeMySQL {
+		return schemaFiles, nil
+	}
+	normalized := make(schema.SchemaFiles, len(schemaFiles))
+	for ns, files := range schemaFiles {
+		targetNamespace := c.planNamespace(ns)
+		if normalized[targetNamespace] != nil {
+			return nil, fmt.Errorf("schema files contain duplicate namespace %q", targetNamespace)
+		}
+		normalized[targetNamespace] = files
+	}
+	return normalized, nil
+}
+
+func (c *LocalClient) planNamespace(ns string) string {
+	if ns == "" || (c.config.Type == storage.DatabaseTypeMySQL && ns == "default") {
+		return c.config.Database
+	}
+	return ns
+}
+
 // Health checks the service health.
 func (c *LocalClient) Health(ctx context.Context) error {
 	return c.storage.Ping(ctx)
@@ -559,8 +581,11 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		return nil, fmt.Errorf("type must be %q or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess)
 	}
 
-	// Convert schema files from proto to engine type
-	schemaFiles := protoToSchemaFiles(req.SchemaFiles)
+	// Convert schema files from proto to engine type.
+	schemaFiles, err := c.normalizeSchemaFiles(protoToSchemaFiles(req.SchemaFiles))
+	if err != nil {
+		return nil, err
+	}
 
 	planLogAttrs := []any{"database", c.config.Database}
 	planLogAttrs = append(planLogAttrs, dsnLogAttrs(c.config.TargetDSN)...)
@@ -602,10 +627,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// For Vitess, each namespace is a keyspace. For Spirit, there's one namespace.
 	namespaces := make(map[string]*storage.NamespacePlanData)
 	for _, sc := range result.Changes {
-		ns := sc.Namespace
-		if ns == "" {
-			ns = c.config.Database
-		}
+		ns := c.planNamespace(sc.Namespace)
 		nsData := namespaces[ns]
 		if nsData == nil {
 			nsData = &storage.NamespacePlanData{}
@@ -698,8 +720,9 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Convert engine SchemaChanges to proto SchemaChanges.
 	var changes []*ternv1.SchemaChange
 	for _, sc := range result.Changes {
+		ns := c.planNamespace(sc.Namespace)
 		protoSC := &ternv1.SchemaChange{
-			Namespace:             sc.Namespace,
+			Namespace:             ns,
 			Metadata:              sc.Metadata,
 			OriginalFiles:         sc.OriginalFiles,
 			OriginalFilesCaptured: sc.OriginalFilesCaptured,
@@ -711,7 +734,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Ddl:          t.DDL,
 				IsUnsafe:     t.IsUnsafe,
 				UnsafeReason: t.UnsafeReason,
-				Namespace:    sc.Namespace,
+				Namespace:    ns,
 			})
 		}
 		changes = append(changes, protoSC)

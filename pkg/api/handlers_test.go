@@ -602,9 +602,6 @@ func (m *mockTernClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertR
 	}
 	return nil, m.skipRevertErr
 }
-func (m *mockTernClient) RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error) {
-	return nil, nil
-}
 func (m *mockTernClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
 	m.resumeMu.Lock()
 	m.resumeApply = apply
@@ -3717,4 +3714,35 @@ func TestDeriveErrorCode(t *testing.T) {
 			assert.Equal(t, tt.expected, deriveErrorCode(tt.state, tt.errMsg))
 		})
 	}
+}
+
+func TestRollbackSchemaFilesAllowsCapturedEmptyOriginalFiles(t *testing.T) {
+	plan := &storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"shop": {
+				OriginalFiles:         map[string]string{},
+				OriginalFilesCaptured: true,
+			},
+		},
+	}
+
+	schemaFiles, err := rollbackSchemaFiles(plan)
+	require.NoError(t, err)
+	require.Contains(t, schemaFiles, "shop")
+	assert.Empty(t, schemaFiles["shop"].Files)
+}
+
+func TestRollbackSchemaFilesRejectsPlanWithoutCapturedOriginalFiles(t *testing.T) {
+	plan := &storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"shop": {
+				OriginalFiles: map[string]string{},
+			},
+		},
+	}
+
+	schemaFiles, err := rollbackSchemaFiles(plan)
+	require.Error(t, err)
+	assert.Nil(t, schemaFiles)
+	assert.Contains(t, err.Error(), `no original schema files available for rollback namespace "shop"`)
 }

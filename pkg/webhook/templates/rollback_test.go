@@ -13,6 +13,7 @@ func TestRenderRollbackPlanComment_WithChanges(t *testing.T) {
 		Environment: "staging",
 		RequestedBy: "testuser",
 		IsMySQL:     true,
+		ApplyID:     "apply_abc123",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -33,6 +34,7 @@ func TestRenderRollbackPlanComment_WithChanges(t *testing.T) {
 	assert.Contains(t, rendered, "DROP COLUMN")
 	assert.Contains(t, rendered, "destructive changes")
 	assert.Contains(t, rendered, "schemabot rollback-confirm -e staging")
+	assert.NotContains(t, rendered, "schemabot rollback-confirm -e staging -d")
 	assert.Contains(t, rendered, "schemabot unlock")
 }
 
@@ -57,6 +59,7 @@ func TestRenderRollbackPlanComment_Vitess(t *testing.T) {
 		Environment: "staging",
 		RequestedBy: "admin",
 		IsMySQL:     false,
+		ApplyID:     "apply_abc123",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace:   "myks",
@@ -68,6 +71,7 @@ func TestRenderRollbackPlanComment_Vitess(t *testing.T) {
 	rendered := RenderRollbackPlanComment(data)
 	assert.Contains(t, rendered, "## Vitess Schema Rollback Plan")
 	assert.Contains(t, rendered, "schemabot rollback-confirm -e staging")
+	assert.NotContains(t, rendered, "schemabot rollback-confirm -e staging -d")
 }
 
 func TestRenderRollbackPlanComment_WithLintViolations(t *testing.T) {
@@ -76,6 +80,7 @@ func TestRenderRollbackPlanComment_WithLintViolations(t *testing.T) {
 		Environment: "staging",
 		RequestedBy: "testuser",
 		IsMySQL:     true,
+		ApplyID:     "apply_abc123",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace:   "testapp",
@@ -108,10 +113,20 @@ func TestRenderRollbackConfirmNoLock(t *testing.T) {
 	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e staging")
 }
 
+func TestRenderRollbackConfirmNoLockWithoutDatabase(t *testing.T) {
+	rendered := RenderRollbackConfirmNoLock("", "staging")
+	assert.Contains(t, rendered, "## 🔒 No Lock Found")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "No rollback lock is held by this PR")
+	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e staging")
+	assert.NotContains(t, rendered, "**Database**")
+}
+
 func TestRenderRollbackMissingApplyID(t *testing.T) {
 	rendered := RenderRollbackMissingApplyID()
 	assert.Contains(t, rendered, "## Missing Apply ID")
 	assert.Contains(t, rendered, "schemabot rollback <apply-id> -e <environment>")
+	assert.Contains(t, rendered, "schemabot rollback-confirm -e <environment>")
 	assert.Contains(t, rendered, "schemabot status")
 }
 

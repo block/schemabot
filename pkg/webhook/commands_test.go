@@ -62,9 +62,8 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		{name: action.Revert, requiresEnv: true},
 		{name: action.SkipRevert, requiresEnv: true},
 		{name: action.Cutover, requiresEnv: true, hasApplyID: true},
-		{name: action.Rollback, requiresEnv: true, hasApplyID: true,
-			supportsDefer: true},
-		{name: action.RollbackConfirm, requiresEnv: true},
+		{name: action.Rollback, requiresEnv: true, hasApplyID: true},
+		{name: action.RollbackConfirm, requiresEnv: true, supportsDefer: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -414,7 +413,7 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "rollback-confirm",
+			name: "rollback-confirm without apply ID",
 			body: "schemabot rollback-confirm -e production",
 			expected: CommandResult{
 				Action:      "rollback-confirm",
@@ -431,6 +430,25 @@ func TestParseCommand(t *testing.T) {
 				Environment: "production",
 				Found:       true,
 				IsMention:   true,
+			},
+		},
+		{
+			name: "rollback-confirm with ignored apply ID",
+			body: "schemabot rollback-confirm apply_abc123 -e production",
+			expected: CommandResult{
+				Action:      "rollback-confirm",
+				Environment: "production",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "rollback-confirm missing env",
+			body: "schemabot rollback-confirm apply_abc123",
+			expected: CommandResult{
+				Action:     "rollback-confirm",
+				IsMention:  true,
+				MissingEnv: true,
 			},
 		},
 		{

@@ -741,10 +741,6 @@ func (c *stopCommandTernClient) SkipRevert(context.Context, *ternv1.SkipRevertRe
 	return nil, nil
 }
 
-func (c *stopCommandTernClient) RollbackPlan(context.Context, string, string) (*ternv1.PlanResponse, error) {
-	return nil, nil
-}
-
 func (c *stopCommandTernClient) Health(context.Context) error { return nil }
 
 func (c *stopCommandTernClient) ResumeApply(context.Context, *storage.Apply) error { return nil }

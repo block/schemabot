@@ -141,6 +141,11 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
 			return
 		}
+		if result.Action == action.RollbackConfirm {
+			h.postComment(repo, pr, installationID, templates.RenderRollbackMissingEnv())
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
+			return
+		}
 		h.postComment(repo, pr, installationID, templates.RenderMissingEnv(result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
 		return
@@ -155,6 +160,12 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "environment handled by another instance",
 		})
+		return
+	}
+
+	if result.Found && result.Action == action.Rollback && result.ApplyID == "" {
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID())
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing apply ID"})
 		return
 	}
 
@@ -196,6 +207,12 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// Reject -y/--yes on commands that don't support it
 	if result.Action != action.Apply && parser.HasAutoConfirmFlag(payload.Comment.Body) {
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedAutoConfirm(result.Action))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+	if result.Action == action.Rollback && parser.HasDeferCutoverFlag(payload.Comment.Body) {
+		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy,
+			"`--defer-cutover` belongs on `schemabot rollback-confirm`, after reviewing the rollback plan.")
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
 		return
 	}

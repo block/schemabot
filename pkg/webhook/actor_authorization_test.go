@@ -468,26 +468,26 @@ func TestHandleRollbackCommandAllowsAuthorizedActor(t *testing.T) {
 // TestHandleRollbackConfirmCommandBlocksUnauthorizedActor exercises the PR
 // rollback-confirm flow with actor authorization enabled. Rollback-confirm
 // executes DDL with unsafe changes allowed, so an actor who is not a
-// configured admin/operator receives a denial comment before SchemaBot reads
-// lock state or executes the rollback.
+// configured admin/operator receives a denial comment before SchemaBot releases
+// the PR-owned rollback lock or executes the rollback.
 func TestHandleRollbackConfirmCommandBlocksUnauthorizedActor(t *testing.T) {
 	client, mux := setupGitHubServer(t)
-	registerApplyDiscoveryEndpoints(t, mux, "orders")
 	comments := make(chan string, 2)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 
 	locks := &actorAuthLockStore{locks: []*storage.Lock{{
-		DatabaseName: "orders",
-		DatabaseType: storage.DatabaseTypeMySQL,
-		Owner:        "octocat/hello-world#1",
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
+		DatabaseName:  "orders",
+		DatabaseType:  storage.DatabaseTypeMySQL,
+		Owner:         "octocat/hello-world#1",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		PendingPlanID: rollbackPendingPlanID("rollback-plan-auth"),
 	}}}
 	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
 		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
 	})
 	installClient := ghclient.NewInstallationClient(client, testLogger())
-	h := actorAuthStorageTestHandler(cfg, &actorAuthStorage{locks: locks}, installClient)
+	h := actorAuthStorageTestHandler(cfg, &actorAuthStorage{locks: locks, plan: rollbackAuthPlan()}, installClient)
 
 	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "mona", CommandResult{Action: action.RollbackConfirm})
 
@@ -500,11 +500,10 @@ func TestHandleRollbackConfirmCommandBlocksUnauthorizedActor(t *testing.T) {
 
 // TestHandleRollbackConfirmCommandAllowsAuthorizedActor verifies that a
 // configured admin proceeds past the actor authorization gate for
-// rollback-confirm: the command reaches the lock-ownership check and reports
-// that no rollback lock is held.
+// rollback-confirm: the command reports that this PR has no pending rollback
+// plan without relying on current PR schema-file discovery.
 func TestHandleRollbackConfirmCommandAllowsAuthorizedActor(t *testing.T) {
 	client, mux := setupGitHubServer(t)
-	registerApplyDiscoveryEndpoints(t, mux, "orders")
 	comments := make(chan string, 2)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 
@@ -518,8 +517,25 @@ func TestHandleRollbackConfirmCommandAllowsAuthorizedActor(t *testing.T) {
 
 	body := requireComment(t, comments, "rollback-confirm no-lock comment")
 	assert.Contains(t, body, "No Lock Found")
-	assert.Contains(t, body, "`orders`")
+	assert.Contains(t, body, "No rollback lock is held by this PR")
 	assert.NotContains(t, body, "is not authorized")
+}
+
+func rollbackAuthPlan() *storage.Plan {
+	return &storage.Plan{
+		PlanIdentifier: "rollback-plan-auth",
+		Database:       "orders",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		Environment:    "staging",
+		Deployment:     "orders",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"orders": {
+				Tables: []storage.TableChange{{Table: "users", Operation: "drop", DDL: "DROP TABLE `users`"}},
+			},
+		},
+	}
 }
 
 // TestHandleUnlockCommandBlocksUnauthorizedActor exercises the PR force-unlock
@@ -633,6 +649,7 @@ func actorAuthRollbackApply() *storage.Apply {
 type actorAuthStorage struct {
 	emptyStorage
 	apply *storage.Apply
+	plan  *storage.Plan
 	locks *actorAuthLockStore
 }
 
@@ -645,7 +662,7 @@ func (s *actorAuthStorage) Locks() storage.LockStore {
 }
 
 func (s *actorAuthStorage) Plans() storage.PlanStore {
-	return &actorAuthPlanStore{apply: s.apply}
+	return &actorAuthPlanStore{apply: s.apply, plan: s.plan}
 }
 
 func (s *actorAuthStorage) Tasks() storage.TaskStore {
@@ -671,9 +688,20 @@ func (s *actorAuthApplyStore) GetByDatabase(_ context.Context, _, _, _ string) (
 type actorAuthPlanStore struct {
 	storage.PlanStore
 	apply *storage.Apply
+	plan  *storage.Plan
+}
+
+func (s *actorAuthPlanStore) Get(_ context.Context, identifier string) (*storage.Plan, error) {
+	if s.plan == nil || s.plan.PlanIdentifier != identifier {
+		return nil, nil
+	}
+	return s.plan, nil
 }
 
 func (s *actorAuthPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
+	if s.plan != nil && s.plan.ID == id {
+		return s.plan, nil
+	}
 	if s.apply == nil || s.apply.PlanID != id {
 		return nil, nil
 	}

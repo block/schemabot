@@ -1685,7 +1685,7 @@ func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.ExecuteRollbackPlan(r.Context(), apply.Database, apply.Environment, apply.Deployment)
+	resp, err := s.ExecuteRollbackPlanForApply(r.Context(), apply)
 	if err != nil {
 		metrics.RecordControlOperation(r.Context(), "rollback_plan", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "rollback plan", apply, err)

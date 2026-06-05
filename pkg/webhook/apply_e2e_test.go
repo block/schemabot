@@ -1777,6 +1777,60 @@ func TestE2EApplyConfirmRejectsWhenPlanSHAStale(t *testing.T) {
 	}
 }
 
+func TestE2EApplyConfirmRejectsRollbackLock(t *testing.T) {
+	dbName := "webhook_confirm_rollback_lock"
+	svc := setupE2EService(t, dbName)
+
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: rollbackPendingPlanID("plan_rollback_abc123"),
+	}))
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB;",
+	}, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "rollback plan")
+		assert.Contains(t, body, "schemabot rollback-confirm")
+		assert.NotContains(t, body, "Schema Change In Progress")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for rollback-lock rejection comment")
+	}
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, a := range applies {
+		assert.NotEqual(t, dbName, a.Database, "apply-confirm must not create an apply for a rollback lock")
+	}
+}
+
 // TestE2EApplyConfirmStalePlanPreservesOtherPRLock is the cross-delivery
 // sibling of TestE2EApplyConfirmStaleSchemaPreservesOtherPRLock: it locks in
 // the lock-release semantics on the cross-delivery path.

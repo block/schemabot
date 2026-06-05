@@ -623,7 +623,7 @@ func TestLocalClient_Plan(t *testing.T) {
 		Type:     "mysql",
 		Database: "testdb",
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"default": {
+			"testdb": {
 				Files: map[string]string{
 					"users.sql": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
 				},
@@ -633,7 +633,12 @@ func TestLocalClient_Plan(t *testing.T) {
 	require.NoError(t, err, "Plan() returned error")
 
 	assert.NotEmpty(t, resp.PlanId, "expected plan_id but got empty string")
-	assert.NotEmpty(t, resp.Changes, "expected at least one schema change")
+	require.NotEmpty(t, resp.Changes, "expected at least one schema change")
+	assert.Contains(t, resp.Changes[0].OriginalFiles["users.sql"], "CREATE TABLE `users`")
+	assert.True(t, resp.Changes[0].OriginalFilesCaptured)
+	assert.Equal(t, "testdb", resp.Changes[0].Namespace)
+	require.NotEmpty(t, resp.Changes[0].TableChanges)
+	assert.Equal(t, "testdb", resp.Changes[0].TableChanges[0].Namespace)
 }
 
 func TestLocalClient_Plan_UsesConfigDatabase(t *testing.T) {
@@ -666,7 +671,7 @@ func TestLocalClient_Plan_UsesConfigDatabase(t *testing.T) {
 		Type:     "mysql",
 		Database: "", // ignored in local mode
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"default": {
+			"testdb": {
 				Files: map[string]string{
 					"users.sql": "CREATE TABLE users (id INT PRIMARY KEY)",
 				},
@@ -748,7 +753,7 @@ func TestLocalClient_Apply(t *testing.T) {
 		Type:     "mysql",
 		Database: "testdb",
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"default": {
+			"testdb": {
 				Files: schemaFiles,
 			},
 		},
@@ -2649,7 +2654,7 @@ func TestLocalClient_Apply_MultiTableSequential(t *testing.T) {
 		Type:     "mysql",
 		Database: "testdb",
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"default": {
+			"testdb": {
 				Files: schemaFiles,
 			},
 		},

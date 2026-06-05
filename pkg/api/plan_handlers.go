@@ -548,32 +548,60 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		}
 	}
 
-	namespaces, err := protoChangesToNamespaces(resp.Changes, req.SchemaFiles)
-	if err != nil {
-		return nil, fmt.Errorf("convert plan namespaces: %w", err)
+	route := storedPlanRoute{
+		DatabaseType: resolvedTarget.DatabaseType,
+		Deployment:   deployment,
+		Target:       resolvedTarget.Target,
+	}
+	if err := s.storePlanResponse(ctx, req, resp, route); err != nil {
+		return nil, err
 	}
 
-	// Store plan in SchemaBot's storage (idempotent — duplicate is ignored)
+	return planResponseFromProto(resp), nil
+}
+
+type storedPlanRoute struct {
+	DatabaseType string
+	Deployment   string
+	Target       string
+}
+
+func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *ternv1.PlanResponse, route storedPlanRoute) error {
+	prInt := 0
+	if req.PullRequest != nil {
+		prInt = int(*req.PullRequest)
+	}
+	trustedSchemaPath := ""
+	if req.SourceTrusted {
+		trustedSchemaPath = req.SchemaPath
+	}
+	headSHA := ""
+	if req.HeadSHA != nil {
+		headSHA = *req.HeadSHA
+	}
+	namespaces, err := protoChangesToNamespaces(resp.Changes, req.SchemaFiles)
+	if err != nil {
+		return fmt.Errorf("convert plan namespaces: %w", err)
+	}
 	storedPlan := &storage.Plan{
 		PlanIdentifier: resp.PlanId,
 		Database:       req.Database,
-		DatabaseType:   resolvedTarget.DatabaseType,
-		Deployment:     deployment,
-		Target:         resolvedTarget.Target,
+		DatabaseType:   route.DatabaseType,
+		Deployment:     route.Deployment,
+		Target:         route.Target,
 		Repository:     req.Repository,
 		PullRequest:    prInt,
 		SchemaPath:     trustedSchemaPath,
 		Environment:    req.Environment,
 		SchemaFiles:    protoToSchemaFiles(req.SchemaFiles),
 		Namespaces:     namespaces,
-		HeadSHA:        ternReq.HeadSha,
+		HeadSHA:        headSHA,
 		CreatedAt:      time.Now(),
 	}
 	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
-		return nil, fmt.Errorf("store plan: %w", err)
+		return fmt.Errorf("store plan: %w", err)
 	}
-
-	return planResponseFromProto(resp), nil
+	return nil
 }
 
 // handleApply handles POST /api/apply requests.
@@ -986,27 +1014,97 @@ func applyTaskChanges(plan *storage.Plan) []storage.TableChange {
 	return changes
 }
 
-// ExecuteRollbackPlan generates a rollback plan via the Tern client.
-// The plan is automatically stored by the Tern client's RollbackPlan method
-// (which calls Plan internally). This is the shared implementation used by
-// both the HTTP handler and the webhook handler.
-func (s *Service) ExecuteRollbackPlan(ctx context.Context, database, environment, deployment string) (*apitypes.PlanResponse, error) {
-	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
-	if err != nil {
-		return nil, fmt.Errorf("resolve deployment for rollback plan: %w", err)
+// ExecuteRollbackPlanForApply generates a rollback plan for a specific apply.
+func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storage.Apply) (*apitypes.PlanResponse, error) {
+	if apply == nil {
+		return nil, fmt.Errorf("apply is required")
+	}
+	if !state.IsState(apply.State, state.Apply.Completed) {
+		return nil, fmt.Errorf("apply %s is in state %q; only completed applies can be rolled back", apply.ApplyIdentifier, apply.State)
 	}
 
-	client, err := s.TernClient(deployment, environment)
+	plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
-		return nil, fmt.Errorf("database %q (%s): %w", database, environment, err)
+		return nil, fmt.Errorf("get rollback source plan: %w", err)
 	}
-
-	resp, err := client.RollbackPlan(ctx, database, environment)
+	if plan == nil {
+		return nil, fmt.Errorf("plan not found for apply %s", apply.ApplyIdentifier)
+	}
+	if !rollbackSourcePlanMatchesApply(plan, apply) {
+		return nil, fmt.Errorf("source plan %s belongs to %s/%s/%s, not apply %s for %s/%s/%s",
+			plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Environment,
+			apply.ApplyIdentifier, apply.Database, apply.DatabaseType, apply.Environment)
+	}
+	schemaFiles, err := rollbackSchemaFiles(plan)
 	if err != nil {
 		return nil, err
 	}
 
+	deployment, err := storedDeploymentForApply(apply)
+	if err != nil {
+		return nil, err
+	}
+	if plan.Target == "" {
+		return nil, fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
+	}
+	client, err := s.TernClient(deployment, apply.Environment)
+	if err != nil {
+		return nil, fmt.Errorf("database %q (%s): %w", apply.Database, apply.Environment, err)
+	}
+
+	prNumber := int32(apply.PullRequest)
+	req := PlanRequest{
+		Database:    apply.Database,
+		Environment: apply.Environment,
+		Type:        apply.DatabaseType,
+		SchemaFiles: schemaFiles,
+		Repository:  apply.Repository,
+		PullRequest: &prNumber,
+	}
+	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
+		Database:    req.Database,
+		Type:        req.Type,
+		SchemaFiles: req.SchemaFiles,
+		Repository:  req.Repository,
+		PullRequest: prNumber,
+		Environment: req.Environment,
+		Target:      plan.Target,
+	})
+	if err != nil {
+		return nil, err
+	}
+	route := storedPlanRoute{
+		DatabaseType: apply.DatabaseType,
+		Deployment:   deployment,
+		Target:       plan.Target,
+	}
+	if err := s.storePlanResponse(ctx, req, resp, route); err != nil {
+		return nil, err
+	}
+
 	return planResponseFromProto(resp), nil
+}
+
+func rollbackSourcePlanMatchesApply(plan *storage.Plan, apply *storage.Apply) bool {
+	return plan.Database == apply.Database &&
+		plan.DatabaseType == apply.DatabaseType &&
+		plan.Environment == apply.Environment
+}
+
+func rollbackSchemaFiles(plan *storage.Plan) (map[string]*ternv1.SchemaFiles, error) {
+	schemaFiles := make(map[string]*ternv1.SchemaFiles)
+	for ns, nsData := range plan.Namespaces {
+		if nsData == nil || !nsData.OriginalFilesCaptured {
+			return nil, fmt.Errorf("no original schema files available for rollback namespace %q", ns)
+		}
+		files := make(map[string]string, len(nsData.OriginalFiles))
+		maps.Copy(files, nsData.OriginalFiles)
+		schemaFiles[ns] = &ternv1.SchemaFiles{Files: files}
+	}
+	if len(schemaFiles) == 0 {
+		return nil, fmt.Errorf("no namespaces available for rollback")
+	}
+	return schemaFiles, nil
 }
 
 // validateSchemaFiles checks that schema_files has at least one namespace and

@@ -782,13 +782,6 @@ func (c *GRPCClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertReque
 	return c.client.SkipRevert(ctx, req)
 }
 
-// RollbackPlan is not supported via gRPC client.
-// Rollback functionality requires access to storage for plan lookup, which is only
-// available in local mode. Use LocalClient for rollback operations.
-func (c *GRPCClient) RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error) {
-	return nil, fmt.Errorf("rollback is not supported via gRPC client - use local mode")
-}
-
 func (c *GRPCClient) Health(ctx context.Context) error {
 	_, err := c.client.Health(ctx, &ternv1.HealthRequest{})
 	return err

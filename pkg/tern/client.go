@@ -64,10 +64,6 @@ type Client interface {
 	// Only supported for Vitess (PlanetScale).
 	SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error)
 
-	// RollbackPlan generates a plan to revert to the schema state before the most recent apply.
-	// Uses the original schema files captured at plan time.
-	RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error)
-
 	// Health checks the service health.
 	Health(ctx context.Context) error
 

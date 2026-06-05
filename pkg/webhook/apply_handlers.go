@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -422,6 +423,13 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 			LockPR:      existingLock.PullRequest,
 			LockCreated: existingLock.CreatedAt,
 		}))
+		return
+	}
+	if strings.HasPrefix(existingLock.PendingPlanID, rollbackPendingPlanPrefix) {
+		h.logger.Info("apply-confirm rejected: lock belongs to rollback plan", "repo", repo, "pr", pr,
+			"database", database, "environment", environment, "pending_plan_id", existingLock.PendingPlanID)
+		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy,
+			"This lock belongs to a rollback plan. Use `schemabot rollback-confirm` to execute it, or `schemabot unlock` to cancel it.")
 		return
 	}
 

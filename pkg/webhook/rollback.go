@@ -7,14 +7,21 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+const (
+	rollbackPendingPlanPrefix = "rollback:"
+	vSchemaArtifactName       = "vschema.json"
+)
+
 // handleRollbackCommand handles the "schemabot rollback <apply-id> -e <env>" PR comment command.
-// It looks up the specified apply, generates a rollback plan from its original schema,
+// It looks up the specified apply, generates a rollback plan from its original schema files,
 // acquires a lock, and posts the plan for confirmation.
 func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
 	ctx, cancel := h.commandContext(commandTimeout)
@@ -147,8 +154,10 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		return
 	}
 
-	// Generate rollback plan (uses the most recent completed apply for this database/environment)
-	planResp, err := h.service.ExecuteRollbackPlan(ctx, database, environment, "")
+	// Generate the rollback plan from the requested apply's captured original
+	// schema. The lock is already held and the source apply was revalidated
+	// after lock acquisition, so the plan can be pinned for confirmation.
+	planResp, err := h.service.ExecuteRollbackPlanForApply(ctx, apply)
 	if err != nil {
 		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		errMsg := err.Error()
@@ -161,19 +170,39 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		return
 	}
 
-	if len(planResp.FlatTables()) == 0 {
+	if !rollbackPlanResponseHasChanges(planResp) {
 		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackNothingToDo(database, environment, applyID))
 		return
 	}
 
-	// Build comment data
+	lock := &storage.Lock{
+		DatabaseName:  database,
+		DatabaseType:  dbType,
+		Owner:         lockOwner,
+		Repository:    repo,
+		PullRequest:   pr,
+		PendingPlanID: rollbackPendingPlanID(planResp.PlanID),
+	}
+	if err := lockStore.Acquire(ctx, lock); err != nil {
+		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		h.logger.Error("failed to pin rollback plan on lock", "repo", repo, "pr", pr,
+			"database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "error", err)
+		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Failed to pin rollback plan on lock: "+err.Error())
+		return
+	}
+
+	// Build comment data. The source apply ID stays in the comment metadata for
+	// auditability, but rollback-confirm loads the lock-pinned rollback plan so
+	// the user does not need to repeat the apply ID.
 	commentData := templates.PlanCommentData{
 		Database:    database,
 		Environment: environment,
 		RequestedBy: requestedBy,
 		IsMySQL:     dbType == "mysql",
+		ApplyID:     apply.ApplyIdentifier,
 	}
 
 	for _, sc := range planResp.Changes {
@@ -245,7 +274,8 @@ func (h *Handler) releaseRollbackLockAfterRejectedPlan(ctx context.Context, data
 }
 
 // handleRollbackConfirmCommand handles the "schemabot rollback-confirm -e <env>" PR comment command.
-// It verifies the lock, re-generates the rollback plan for drift detection, and executes the apply.
+// It verifies the lock, loads the rollback plan pinned by the preceding rollback
+// command, and executes the apply.
 func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
@@ -254,55 +284,38 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 	}
 	defer cancel()
 
-	// Discover database config from PR's schemabot.yaml
-	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.RollbackConfirm)
+	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
+	existingLock, rollbackPlan, err := h.rollbackConfirmPlanForPR(ctx, repo, pr, environment, lockOwner)
 	if err != nil {
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.RollbackConfirm, err)
+		h.logger.Error("failed to resolve rollback-confirm plan", "repo", repo, "pr", pr,
+			"environment", environment, "error", err)
+		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, err.Error())
 		return
 	}
-	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.RollbackConfirm, err)
+	if existingLock == nil || rollbackPlan == nil {
+		h.postComment(repo, pr, installationID, templates.RenderRollbackConfirmNoLock("", environment))
 		return
 	}
 
-	database := schemaResult.Database
-	dbType := schemaResult.Type
-	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
+	database := rollbackPlan.Database
+	dbType := rollbackPlan.DatabaseType
+	schemaResult := &ghclient.SchemaRequestResult{
+		Database:    database,
+		Type:        dbType,
+		Repository:  repo,
+		PullRequest: pr,
+	}
 
 	// Rollback-confirm executes DDL with unsafe changes allowed, so the actor
-	// must be an authorized admin/operator before any lock state is read,
-	// released, or acted on.
+	// must be an authorized admin/operator before any lock is released or acted
+	// on. The database comes from the lock-pinned rollback plan instead of
+	// current PR files so confirmation follows the reviewed rollback artifact.
 	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm); blocked {
 		return
 	}
 
-	// Check lock ownership
-	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
-	if err != nil {
-		h.logger.Error("failed to check lock", "error", err)
-		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Failed to check lock status: "+err.Error())
-		return
-	}
-	if existingLock == nil {
-		h.postComment(repo, pr, installationID, templates.RenderRollbackConfirmNoLock(database, environment))
-		return
-	}
-	if existingLock.Owner != lockOwner {
-		h.postComment(repo, pr, installationID,
-			templates.RenderRollbackLockNotOwned(database, environment, existingLock.Owner))
-		return
-	}
-
-	// Re-generate rollback plan for drift detection
-	planResp, err := h.service.ExecuteRollbackPlan(ctx, database, environment, "")
-	if err != nil {
-		h.logger.Error("rollback plan failed on confirm", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, err.Error())
-		return
-	}
-
 	// If no changes remain, release lock and notify
-	if len(planResp.FlatTables()) == 0 {
+	if !planHasChanges(rollbackPlan) {
 		if err := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner); err != nil {
 			h.logger.Error("rollback-confirm found nothing to roll back but failed to release the database lock; applies on this database will be blocked until the lock is released manually",
 				"repo", repo, "pr", pr, "database", database,
@@ -325,9 +338,77 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 		options["defer_cutover"] = "true"
 	}
 
+	factory, factoryErr := h.factoryForRepo(repo)
+	if factoryErr != nil {
+		h.logger.Error("rollback blocked: cannot resolve GitHub App client for repo",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "error", factoryErr)
+		return
+	}
+
+	observer := NewCommentObserver(CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        h.service.Storage(),
+		Repo:           repo,
+		PR:             pr,
+		InstallationID: installationID,
+		DeferCutover:   options["defer_cutover"] == "true",
+		SupportChannel: h.supportChannel(),
+		Logger:         h.logger,
+		OnTerminalHook: func(a *storage.Apply) {
+			updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, a)
+			if err != nil {
+				h.logger.Error("observer: failed to update check record for rollback",
+					"repo", repo, "pr", pr, "database", a.Database,
+					"database_type", a.DatabaseType, "environment", a.Environment,
+					"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier,
+					"error", err)
+				return
+			}
+			if !updated {
+				h.logger.Debug("observer: skipping aggregate check update for rollback, apply no longer owns check state",
+					"repo", repo, "pr", pr, "database", a.Database,
+					"database_type", a.DatabaseType, "environment", a.Environment,
+					"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
+				return
+			}
+			if state.IsState(a.State, state.Apply.Completed) {
+				h.setCheckActionRequired(repo, pr, installationID, a)
+				return
+			}
+
+			ghInstClient, err := factory.ForInstallation(installationID)
+			if err != nil {
+				h.logger.Error("observer: failed to create GitHub client for rollback aggregate update",
+					"repo", repo, "pr", pr, "database", a.Database,
+					"database_type", a.DatabaseType, "environment", a.Environment,
+					"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier,
+					"error", err)
+				return
+			}
+			checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, a.Environment, a.DatabaseType, a.Database)
+			if err != nil {
+				h.logger.Error("observer: failed to load check record for rollback aggregate update",
+					"repo", repo, "pr", pr, "database", a.Database,
+					"database_type", a.DatabaseType, "environment", a.Environment,
+					"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier,
+					"error", err)
+				return
+			}
+			if checkRecord == nil {
+				h.logger.Error("observer: missing check record for rollback aggregate update",
+					"repo", repo, "pr", pr, "database", a.Database,
+					"database_type", a.DatabaseType, "environment", a.Environment,
+					"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
+				return
+			}
+			h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
+		},
+	})
+	h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, observer)
+
 	// Execute apply with the rollback plan
 	applyReq := api.ApplyRequest{
-		PlanID:         planResp.PlanID,
+		PlanID:         rollbackPlan.PlanIdentifier,
 		Environment:    environment,
 		Options:        options,
 		Caller:         lockOwner,
@@ -336,12 +417,14 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
+		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
 		h.logger.Error("rollback apply failed", "repo", repo, "pr", pr, "error", err)
 		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Failed to execute rollback: "+err.Error())
 		return
 	}
 
 	if !applyResp.Accepted {
+		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackNotAccepted(database, environment, applyResp.ErrorMessage))
 		return
@@ -352,6 +435,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 	// ExecuteApply rejects accepted rollbacks unless SchemaBot stored its own
 	// apply row. Keep this guard fail-closed in case that invariant changes.
 	if applyID <= 0 {
+		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
 		h.logger.Error("accepted rollback did not return an apply id",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment)
@@ -386,77 +470,141 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 	// Post initial progress comment for the observer to edit.
 	progressBody := formatProgressComment(apply, nil)
 	h.postAndTrackComment(ctx, repo, pr, installationID, applyID, state.Comment.Progress, progressBody)
+}
 
-	// Resolve the App factory for this repo once so the observer captures
-	// the correct App for all subsequent GitHub calls (comments, check runs).
-	factory, factoryErr := h.factoryForRepo(repo)
-	if factoryErr != nil {
-		h.logger.Error("rollback blocked: cannot resolve GitHub App client for repo",
-			"repo", repo, "pr", pr, "database", database, "environment", environment, "error", factoryErr)
-		return
+func (h *Handler) rollbackConfirmPlanForPR(ctx context.Context, repo string, pr int, environment, lockOwner string) (*storage.Lock, *storage.Plan, error) {
+	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list locks for %s#%d: %w", repo, pr, err)
 	}
 
-	// Set observer for rollback progress and check run updates.
-	// On successful rollback, set check to action_required because the PR
-	// changes need to be re-applied.
-	h.service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, applyID,
-		NewCommentObserver(CommentObserverConfig{
-			GHClient:       factory,
-			Storage:        h.service.Storage(),
-			Repo:           repo,
-			PR:             pr,
-			InstallationID: installationID,
-			ApplyID:        applyID,
-			SupportChannel: h.supportChannel(),
-			Logger:         h.logger,
-			OnTerminalHook: func(a *storage.Apply) {
-				updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, a)
-				if err != nil {
-					h.logger.Error("observer: failed to update check record for rollback",
-						"repo", repo, "pr", pr, "database", a.Database,
-						"database_type", a.DatabaseType, "environment", a.Environment,
-						"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier,
-						"error", err)
-					return
-				}
-				if !updated {
-					h.logger.Debug("observer: skipping aggregate check update for rollback, apply no longer owns check state",
-						"repo", repo, "pr", pr, "database", a.Database,
-						"database_type", a.DatabaseType, "environment", a.Environment,
-						"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
-					return
-				}
-				if state.IsState(a.State, state.Apply.Completed) {
-					h.setCheckActionRequired(repo, pr, installationID, a)
-					return
-				}
+	var matchedLock *storage.Lock
+	var matchedPlan *storage.Plan
+	for _, lock := range locks {
+		if lock == nil {
+			h.logger.Warn("rollback-confirm skipping nil lock from storage", "repo", repo, "pr", pr, "environment", environment)
+			continue
+		}
+		if !strings.HasPrefix(lock.PendingPlanID, rollbackPendingPlanPrefix) {
+			h.logger.Debug("rollback-confirm skipping non-rollback lock",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName,
+				"database_type", lock.DatabaseType, "pending_plan_id", lock.PendingPlanID)
+			continue
+		}
+		if lock.Owner != lockOwner {
+			return nil, nil, fmt.Errorf("rollback lock for %s/%s belongs to %s, not %s",
+				lock.DatabaseName, lock.DatabaseType, lock.Owner, lockOwner)
+		}
 
-				ghInstClient, err := factory.ForInstallation(installationID)
-				if err != nil {
-					h.logger.Error("observer: failed to create GitHub client for rollback aggregate update",
-						"repo", repo, "pr", pr, "database", a.Database,
-						"database_type", a.DatabaseType, "environment", a.Environment,
-						"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier,
-						"error", err)
-					return
-				}
-				checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, a.Environment, a.DatabaseType, a.Database)
-				if err != nil {
-					h.logger.Error("observer: failed to load check record for rollback aggregate update",
-						"repo", repo, "pr", pr, "database", a.Database,
-						"database_type", a.DatabaseType, "environment", a.Environment,
-						"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier,
-						"error", err)
-					return
-				}
-				if checkRecord == nil {
-					h.logger.Error("observer: missing check record for rollback aggregate update",
-						"repo", repo, "pr", pr, "database", a.Database,
-						"database_type", a.DatabaseType, "environment", a.Environment,
-						"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
-					return
-				}
-				h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
-			},
-		}))
+		plan, err := h.rollbackPlanForLock(ctx, lock)
+		if err != nil {
+			return nil, nil, fmt.Errorf("load rollback plan for %s/%s: %w", lock.DatabaseName, lock.DatabaseType, err)
+		}
+		if plan == nil {
+			h.logger.Warn("rollback-confirm skipping rollback lock with no pinned plan",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName,
+				"database_type", lock.DatabaseType, "pending_plan_id", lock.PendingPlanID)
+			continue
+		}
+		if plan.Environment != environment {
+			h.logger.Debug("rollback-confirm skipping rollback plan for another environment",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName,
+				"database_type", lock.DatabaseType, "plan_id", plan.PlanIdentifier,
+				"plan_environment", plan.Environment, "requested_environment", environment)
+			continue
+		}
+		if mismatch := rollbackPlanCommandMismatch(plan, repo, pr, lock.DatabaseName, lock.DatabaseType, environment); mismatch != "" {
+			return nil, nil, fmt.Errorf("rollback lock %s/%s has mismatched pinned plan: %s", lock.DatabaseName, lock.DatabaseType, mismatch)
+		}
+		if matchedPlan != nil {
+			return nil, nil, fmt.Errorf("multiple rollback plans are pending for environment %s; cancel one with `schemabot unlock` before retrying `schemabot rollback-confirm -e %s`", environment, environment)
+		}
+		matchedLock = lock
+		matchedPlan = plan
+	}
+
+	return matchedLock, matchedPlan, nil
+}
+
+func rollbackPendingPlanID(planID string) string {
+	if planID == "" {
+		return ""
+	}
+	return rollbackPendingPlanPrefix + planID
+}
+
+func rollbackPlanIDFromLock(lock *storage.Lock) (string, bool) {
+	if lock == nil || !strings.HasPrefix(lock.PendingPlanID, rollbackPendingPlanPrefix) {
+		return "", false
+	}
+	planID := strings.TrimPrefix(lock.PendingPlanID, rollbackPendingPlanPrefix)
+	return planID, planID != ""
+}
+
+func rollbackPlanResponseHasChanges(resp *apitypes.PlanResponse) bool {
+	if resp == nil {
+		return false
+	}
+	for _, sc := range resp.Changes {
+		if len(sc.TableChanges) > 0 {
+			return true
+		}
+		if sc.Metadata["vschema"] != "" || sc.Metadata["vschema_changed"] == "true" {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) rollbackPlanForLock(ctx context.Context, lock *storage.Lock) (*storage.Plan, error) {
+	planID, ok := rollbackPlanIDFromLock(lock)
+	if !ok {
+		return nil, nil
+	}
+	plan, err := h.service.Storage().Plans().Get(ctx, planID)
+	if err != nil {
+		return nil, fmt.Errorf("load rollback plan %s: %w", planID, err)
+	}
+	if plan == nil {
+		return nil, fmt.Errorf("rollback plan not found: %s", planID)
+	}
+	return plan, nil
+}
+
+func rollbackPlanCommandMismatch(plan *storage.Plan, repo string, pr int, database, dbType, environment string) string {
+	if plan == nil {
+		return "rollback plan is missing"
+	}
+	if plan.Repository != repo || plan.PullRequest != pr {
+		return fmt.Sprintf("rollback plan %s belongs to %s#%d, not %s#%d",
+			plan.PlanIdentifier, plan.Repository, plan.PullRequest, repo, pr)
+	}
+	if plan.Database != database {
+		return fmt.Sprintf("rollback plan %s belongs to database %s, not %s",
+			plan.PlanIdentifier, plan.Database, database)
+	}
+	if plan.DatabaseType != dbType {
+		return fmt.Sprintf("rollback plan %s belongs to database type %s, not %s",
+			plan.PlanIdentifier, plan.DatabaseType, dbType)
+	}
+	if plan.Environment != environment {
+		return fmt.Sprintf("rollback plan %s belongs to environment %s, not %s",
+			plan.PlanIdentifier, plan.Environment, environment)
+	}
+	return ""
+}
+
+func planHasChanges(plan *storage.Plan) bool {
+	if plan == nil {
+		return false
+	}
+	if len(plan.FlatDDLChanges()) > 0 {
+		return true
+	}
+	for _, nsData := range plan.Namespaces {
+		if nsData != nil && nsData.Artifacts[vSchemaArtifactName] != "" {
+			return true
+		}
+	}
+	return false
 }

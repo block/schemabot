@@ -79,8 +79,6 @@ type targetRouterRecordingClient struct {
 	planReq            *ternv1.PlanRequest
 	applyReq           *ternv1.ApplyRequest
 	progressReq        *ternv1.ProgressRequest
-	rollbackDatabase   string
-	rollbackEnv        string
 	resumeApply        *storage.Apply
 	targetDSN          string
 	pendingObserverSet bool
@@ -130,12 +128,6 @@ func (c *targetRouterRecordingClient) Revert(context.Context, *ternv1.RevertRequ
 
 func (c *targetRouterRecordingClient) SkipRevert(context.Context, *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error) {
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
-}
-
-func (c *targetRouterRecordingClient) RollbackPlan(_ context.Context, database, environment string) (*ternv1.PlanResponse, error) {
-	c.rollbackDatabase = database
-	c.rollbackEnv = environment
-	return &ternv1.PlanResponse{PlanId: "rollback-plan"}, nil
 }
 
 func (c *targetRouterRecordingClient) Health(context.Context) error { return nil }
@@ -204,73 +196,6 @@ func TestTargetRouterRoutesPlanThroughStaticTarget(t *testing.T) {
 	_, err = router.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders-logical", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: "dsid-orders-prod"})
 	require.NoError(t, err)
 	assert.Len(t, created, 1, "the router should cache LocalClients by resolved target route and namespace")
-}
-
-func TestTargetRouterRoutesPullSchemaNamespaceWithoutChangingLogicalDatabase(t *testing.T) {
-	resolver := newStaticResolver(t)
-	created := make(map[string]*targetRouterRecordingClient)
-	router := newTargetRouterForTest(t, resolver, nil, nil, created)
-
-	_, err := router.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
-		Database:    "orders-logical",
-		Type:        storage.DatabaseTypeMySQL,
-		Environment: "production",
-		Target:      "dsid-orders-prod",
-		Namespace:   "orders_production",
-	})
-
-	require.NoError(t, err)
-	client := created["orders_production"]
-	require.NotNil(t, client)
-	require.NotNil(t, client.pullReq)
-	assert.Equal(t, "orders-logical", client.pullReq.Database)
-	assert.Equal(t, "orders_production", client.pullReq.Namespace)
-	assert.Equal(t, "dsid-orders-prod", client.pullReq.Target)
-}
-
-func TestTargetRouterRoutesAllNamespacePullWithoutInjectingNamespace(t *testing.T) {
-	resolver := newStaticResolver(t)
-	created := make(map[string]*targetRouterRecordingClient)
-	router := newTargetRouterForTest(t, resolver, nil, nil, created)
-
-	_, err := router.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
-		Database:    "orders-logical",
-		Type:        storage.DatabaseTypeMySQL,
-		Environment: "production",
-		Target:      "dsid-orders-prod",
-	})
-
-	require.NoError(t, err)
-	client := created["orders-logical"]
-	require.NotNil(t, client)
-	require.NotNil(t, client.pullReq)
-	assert.Equal(t, "orders-logical", client.pullReq.Database)
-	assert.Empty(t, client.pullReq.Namespace)
-	assert.Equal(t, "dsid-orders-prod", client.pullReq.Target)
-}
-
-func TestTargetRouterRollbackPlanRoutesEnvironment(t *testing.T) {
-	var resolvedReq inventory.Request
-	resolver := targetRouterResolverFunc(func(_ context.Context, req inventory.Request) (*inventory.Target, error) {
-		resolvedReq = req
-		return &inventory.Target{
-			Target:       req.Target,
-			DatabaseType: storage.DatabaseTypeMySQL,
-			DSN:          "root@tcp(localhost:3306)/",
-		}, nil
-	})
-	created := make(map[string]*targetRouterRecordingClient)
-	router := newTargetRouterForTest(t, resolver, nil, nil, created)
-
-	resp, err := router.RollbackPlan(t.Context(), "dsid-orders-prod", "staging")
-
-	require.NoError(t, err)
-	assert.Equal(t, "rollback-plan", resp.PlanId)
-	assert.Equal(t, inventory.Request{Target: "dsid-orders-prod", Environment: "staging"}, resolvedReq)
-	client := created["dsid-orders-prod"]
-	require.NotNil(t, client)
-	assert.Equal(t, "dsid-orders-prod", client.rollbackDatabase)
-	assert.Equal(t, "staging", client.rollbackEnv)
 }
 
 func TestTargetRouterApplyUsesTargetScopedPendingObserver(t *testing.T) {

@@ -2,7 +2,6 @@ package webhook
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -15,9 +14,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
-	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -72,6 +69,44 @@ func TestWebhookRollbackConfirmDispatch(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "rollback-confirm started")
+}
+
+func TestWebhookRollbackConfirmIgnoresApplyID(t *testing.T) {
+	h, _, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot rollback-confirm apply_abc123 -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "rollback-confirm started")
+}
+
+func TestWebhookRollbackConfirmMissingEnv(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot rollback-confirm",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "missing environment flag")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Missing Environment")
+		assert.Contains(t, body, "-e")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for comment")
+	}
 }
 
 func TestWebhookRollbackRejectsDatabaseFlag(t *testing.T) {
@@ -208,24 +243,35 @@ func TestHandleRollbackCommandStorageUnavailablePostsError(t *testing.T) {
 	assert.Contains(t, body, "Storage is not available")
 }
 
-// rollbackNoopTernClient returns a rollback plan with no schema changes,
-// simulating a database that already matches the original schema when
-// rollback-confirm re-plans for drift detection.
-type rollbackNoopTernClient struct {
-	tern.Client
-}
+func TestWebhookRollbackRejectsDeferCutoverOnPlanningCommand(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
 
-func (c *rollbackNoopTernClient) RollbackPlan(context.Context, string, string) (*ternv1.PlanResponse, error) {
-	return &ternv1.PlanResponse{PlanId: "rollback-plan-noop"}, nil
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot rollback apply_abc123 -e staging --defer-cutover",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unsupported flag")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "--defer-cutover")
+		assert.Contains(t, body, "rollback-confirm")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for comment")
+	}
 }
 
 // newRollbackConfirmNoopHandler builds a handler whose rollback-confirm
-// re-plan finds no remaining changes, backed by the supplied lock store and
-// logger, plus a channel that captures posted PR comments.
+// pinned rollback plan has no remaining changes, backed by the supplied lock
+// store and logger, plus a channel that captures posted PR comments.
 func newRollbackConfirmNoopHandler(t *testing.T, locks *actorAuthLockStore, logger *slog.Logger) (*Handler, chan string) {
 	t.Helper()
 	client, mux := setupGitHubServer(t)
-	registerApplyDiscoveryEndpoints(t, mux, "orders")
 	comments := make(chan string, 2)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 
@@ -233,8 +279,18 @@ func newRollbackConfirmNoopHandler(t *testing.T, locks *actorAuthLockStore, logg
 		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
 	})
 	installClient := ghclient.NewInstallationClient(client, logger)
-	svc := api.New(&actorAuthStorage{locks: locks}, cfg,
-		map[string]tern.Client{"orders/staging": &rollbackNoopTernClient{}}, logger)
+	svc := api.New(&actorAuthStorage{
+		locks: locks,
+		plan: &storage.Plan{
+			PlanIdentifier: "rollback-plan-noop",
+			Database:       "orders",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Repository:     "octocat/hello-world",
+			PullRequest:    1,
+			Environment:    "staging",
+			Deployment:     "orders",
+		},
+	}, cfg, nil, logger)
 	return &Handler{
 		service:   svc,
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
@@ -246,11 +302,12 @@ func newRollbackConfirmNoopHandler(t *testing.T, locks *actorAuthLockStore, logg
 // rollback-confirm command in these tests.
 func prOwnedRollbackLock() *storage.Lock {
 	return &storage.Lock{
-		DatabaseName: "orders",
-		DatabaseType: storage.DatabaseTypeMySQL,
-		Owner:        "octocat/hello-world#1",
-		Repository:   "octocat/hello-world",
-		PullRequest:  1,
+		DatabaseName:  "orders",
+		DatabaseType:  storage.DatabaseTypeMySQL,
+		Owner:         "octocat/hello-world#1",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		PendingPlanID: rollbackPendingPlanID("rollback-plan-noop"),
 	}
 }
 

@@ -73,6 +73,12 @@ func RenderRollbackNoCompletedApply(database, environment string) string {
 // RenderRollbackConfirmNoLock renders a message when rollback-confirm is run
 // without a held lock.
 func RenderRollbackConfirmNoLock(database, environment string) string {
+	if database == "" {
+		return fmt.Sprintf("## 🔒 No Lock Found\n\n"+
+			"**Environment**: `%s`\n\n"+
+			"No rollback lock is held by this PR. Run `schemabot rollback <apply-id> -e %s` first to generate a rollback plan.",
+			environment, environment)
+	}
 	return fmt.Sprintf("## 🔒 No Lock Found\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+
 		"No rollback lock is held. Run `schemabot rollback <apply-id> -e %s` first to generate a rollback plan.",
@@ -84,6 +90,7 @@ func RenderRollbackConfirmNoLock(database, environment string) string {
 func RenderRollbackMissingApplyID() string {
 	return "## Missing Apply ID\n\n" +
 		"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n" +
+		"Confirm a generated rollback with `schemabot rollback-confirm -e <environment>`.\n\n" +
 		"You can find the apply ID in the summary comment of a completed apply, " +
 		"or by running `schemabot status`."
 }

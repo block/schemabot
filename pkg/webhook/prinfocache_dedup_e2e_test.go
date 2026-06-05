@@ -109,20 +109,11 @@ func TestUnlockHandlerDedupesPRFetchAcrossLocks(t *testing.T) {
 		"handleUnlockCommand must dedupe FetchPullRequest across all per-lock check-run cleanups within one invocation")
 }
 
-// TestRollbackConfirmHandlerDedupesPRFetch proves that a single
-// "schemabot rollback-confirm" invocation collapses every
-// FetchPullRequest call fanned out by CreateSchemaRequestFromPR
-// (FindConfigByDatabaseName + the post-discovery FetchPullRequest in
-// schema.go) to a single upstream GitHub call via the WithPRInfoCache
-// wrap on the handler's ctx. Without that wrap, each FetchPullRequest
-// site would issue its own /pulls fetch.
-//
-// The test deliberately runs without an acquired lock so the handler
-// bails out at the "no lock" comment immediately after
-// CreateSchemaRequestFromPR completes. The dedup invariant is exercised
-// by the synchronous CreateSchemaRequestFromPR fan-out, which is enough
-// to lock the regression in.
-func TestRollbackConfirmHandlerDedupesPRFetch(t *testing.T) {
+// TestRollbackConfirmHandlerDoesNotFetchPRForNoLock proves that
+// "schemabot rollback-confirm" does not discover schema files from the current
+// PR when there is no PR-owned rollback lock. Confirmation must execute only a
+// lock-pinned rollback plan created by a preceding rollback command.
+func TestRollbackConfirmHandlerDoesNotFetchPRForNoLock(t *testing.T) {
 	dbName := "webhook_rbconfirm_dedup"
 	svc := setupE2EService(t, dbName)
 
@@ -146,15 +137,26 @@ func TestRollbackConfirmHandlerDedupesPRFetch(t *testing.T) {
 	factory := &fakeClientFactory{client: installClient}
 	h := NewHandler(svc, factory, nil, logger)
 
-	// Call the handler entry point synchronously. No lock is acquired
-	// so the handler bails out at the "no lock" branch right after
-	// CreateSchemaRequestFromPR returns — but CreateSchemaRequestFromPR
-	// itself has already exercised multiple FetchPullRequest call sites
-	// within the same ctx scope.
+	applyIdentifier := "apply_rbconfirm_dedup"
+	_, err := svc.Storage().Applies().Create(t.Context(), &storage.Apply{
+		ApplyIdentifier: applyIdentifier,
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           "completed",
+		Engine:          "spirit",
+	})
+	require.NoError(t, err)
+
+	// Call the handler entry point synchronously. No lock is acquired, so the
+	// handler must bail out without fetching the PR or discovering current schema
+	// files.
 	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "testuser", CommandResult{
 		Environment: "staging",
 	})
 
-	assert.Equal(t, int32(1), prFetchCalls.Load(),
-		"handleRollbackConfirmCommand must dedupe FetchPullRequest across CreateSchemaRequestFromPR's internal fan-out within one invocation")
+	assert.Equal(t, int32(0), prFetchCalls.Load(),
+		"handleRollbackConfirmCommand must not fetch the PR when no rollback lock is pending")
 }

@@ -38,8 +38,8 @@ func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
 	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
 }
 
-func TestPlanHasRollbackSchemaFilesAcceptsOriginalFiles(t *testing.T) {
-	assert.True(t, planHasRollbackSchemaFiles(&storage.Plan{
+func TestPlanHasOriginalFilesCaptureAcceptsOriginalFiles(t *testing.T) {
+	assert.True(t, (&storage.Plan{
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"commerce": {
 				OriginalFiles: map[string]string{
@@ -48,19 +48,19 @@ func TestPlanHasRollbackSchemaFilesAcceptsOriginalFiles(t *testing.T) {
 				OriginalFilesCaptured: true,
 			},
 		},
-	}))
-	assert.True(t, planHasRollbackSchemaFiles(&storage.Plan{
+	}).HasOriginalFilesCapture())
+	assert.True(t, (&storage.Plan{
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"commerce": {
 				OriginalFilesCaptured: true,
 			},
 		},
-	}))
-	assert.False(t, planHasRollbackSchemaFiles(&storage.Plan{
+	}).HasOriginalFilesCapture())
+	assert.False(t, (&storage.Plan{
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"commerce": {},
 		},
-	}))
+	}).HasOriginalFilesCapture())
 }
 
 type exactProgressApplyStore struct {
@@ -2253,4 +2253,15 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 		assert.Equal(t, "vtgate-dsn", creds.DSN)
 		assert.Equal(t, "acme", creds.Metadata["organization"])
 	})
+}
+
+func TestLocalClient_PlanNamespaceUsesConfiguredDatabase(t *testing.T) {
+	client := &LocalClient{config: LocalConfig{
+		Database: "testdb",
+		Type:     storage.DatabaseTypeMySQL,
+	}}
+
+	assert.Equal(t, "testdb", client.planNamespace(""))
+	assert.Equal(t, "testdb", client.planNamespace("default"))
+	assert.Equal(t, "analytics", client.planNamespace("analytics"))
 }

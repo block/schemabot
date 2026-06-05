@@ -69,9 +69,8 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Revert, RequiresEnv: true},
 	{Name: action.SkipRevert, RequiresEnv: true},
 	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},
-	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true,
-		SupportsDeferCutover: true},
-	{Name: action.RollbackConfirm, RequiresEnv: true},
+	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true},
+	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true},
 }
 
 // specByName indexes commandSpecs for O(1) lookup by command word.
@@ -135,7 +134,7 @@ func NewCommandParser() *CommandParser {
 // CommandResult represents the result of parsing a command.
 type CommandResult struct {
 	Action       string
-	ApplyID      string // Positional arg for rollback <apply-id>
+	ApplyID      string // Positional apply identifier for apply-scoped commands.
 	Environment  string
 	Database     string // Optional -d flag value
 	SkipRevert   bool
@@ -269,4 +268,10 @@ func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
 // regardless of which command it accompanies.
 func (p *CommandParser) HasDatabaseFlag(body string) bool {
 	return p.databaseRegex.MatchString(body)
+}
+
+// HasDeferCutoverFlag reports whether the body contains `--defer-cutover`,
+// regardless of which command it accompanies.
+func (p *CommandParser) HasDeferCutoverFlag(body string) bool {
+	return p.deferCutoverRegex.MatchString(body)
 }
