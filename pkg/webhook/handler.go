@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -64,6 +65,7 @@ const (
 	headerDeliveryID     = "X-GitHub-Delivery"
 	headerSignature256   = "X-Hub-Signature-256"
 	hookTargetTypeApp    = "integration"
+	maxWebhookBodyBytes  = 10 << 20
 )
 
 // Handler processes GitHub webhook events.
@@ -275,8 +277,22 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 // ServeHTTP handles incoming webhook requests.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Read body for signature validation
+	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			h.logger.Warn("webhook rejected: request body too large",
+				"delivery_id", r.Header.Get(headerDeliveryID),
+				"event", r.Header.Get("X-GitHub-Event"),
+				"limit_bytes", maxBytesErr.Limit)
+			h.writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		h.logger.Warn("webhook rejected: failed to read request body",
+			"delivery_id", r.Header.Get(headerDeliveryID),
+			"event", r.Header.Get("X-GitHub-Event"),
+			"error", err)
 		h.writeError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}

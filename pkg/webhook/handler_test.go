@@ -72,6 +72,24 @@ func TestWebhookRejectsInvalidSignature(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, rr.Code)
 }
 
+func TestWebhookRejectsOversizedBody(t *testing.T) {
+	h := &Handler{
+		webhookSecretsByApp: map[string][]byte{defaultAppName: []byte("secret")},
+		logger:              testLogger(),
+	}
+
+	body := strings.NewReader(strings.Repeat("a", maxWebhookBodyBytes+1))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", body)
+	req.Header.Set("X-Hub-Signature-256", "sha256=invalid")
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, rr.Code)
+	assert.Contains(t, rr.Body.String(), "request body too large")
+}
+
 func TestWebhookIgnoresUnknownEvents(t *testing.T) {
 	h := &Handler{logger: testLogger()} // No secret — skip validation
 
