@@ -390,8 +390,6 @@ type CheckStatusAccessDetails struct {
 	MissingPermissions     []string
 	ChecksReadable         bool
 	CommitStatusesReadable bool
-	ChecksError            string
-	CommitStatusesError    string
 }
 
 func RenderApplyBlockedByCheckStatusError(environment string, err error, details *CheckStatusAccessDetails) string {

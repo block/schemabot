@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -48,14 +49,16 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 
 	statuses, err := client.GetPRCheckStatuses(ctx, repo, headSHA, config.RequiredChecks)
 	if err != nil {
-		diagnostic := client.DiagnoseCheckStatusAccess(ctx, repo, headSHA)
 		details := &templates.CheckStatusAccessDetails{
-			GitHubApp:              h.githubAppDisplayNameForRepo(repo, client),
-			MissingPermissions:     diagnostic.MissingPermissions,
-			ChecksReadable:         diagnostic.ChecksReadable,
-			CommitStatusesReadable: diagnostic.CommitStatusesReadable,
-			ChecksError:            diagnostic.ChecksError,
-			CommitStatusesError:    diagnostic.CommitStatusesError,
+			GitHubApp: h.githubAppDisplayNameForRepo(repo, client),
+		}
+		diagnostic := ghclient.CheckStatusAccessDiagnostic{}
+		diagnosticRan := checkStatusReadLooksPermissionDenied(err)
+		if diagnosticRan {
+			diagnostic = client.DiagnoseCheckStatusAccess(ctx, repo, headSHA)
+			details.MissingPermissions = diagnostic.MissingPermissions
+			details.ChecksReadable = diagnostic.ChecksReadable
+			details.CommitStatusesReadable = diagnostic.CommitStatusesReadable
 		}
 		h.logger.Error("failed to fetch PR check statuses, blocking apply",
 			"repo", repo,
@@ -65,6 +68,7 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"installation_id", installationID,
 			"github_operation", "read_pr_check_statuses",
 			"github_app", details.GitHubApp,
+			"diagnostic_ran", diagnosticRan,
 			"checks_readable", diagnostic.ChecksReadable,
 			"commit_statuses_readable", diagnostic.CommitStatusesReadable,
 			"missing_permissions", diagnostic.MissingPermissions,
@@ -98,6 +102,10 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 	}
 
 	return false
+}
+
+func checkStatusReadLooksPermissionDenied(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Resource not accessible")
 }
 
 func (h *Handler) githubAppDisplayNameForRepo(repo string, client *ghclient.InstallationClient) string {
