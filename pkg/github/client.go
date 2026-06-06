@@ -466,6 +466,12 @@ type PRFile struct {
 	Status   string // added, removed, modified, renamed
 }
 
+// GitHub caps pull request file listings at this documented maximum and does
+// not provide a separate completeness marker for larger PRs. Treat reaching
+// the cap as incomplete so schema discovery fails closed instead of assuming
+// there are no managed schema changes later in the list.
+const maxGitHubPRFiles = 3000
+
 // FetchPRFiles gets the list of files changed in a PR.
 func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
 	owner, repoName := splitRepo(repo)
@@ -482,6 +488,9 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 				Filename: f.GetFilename(),
 				Status:   f.GetStatus(),
 			})
+		}
+		if len(allFiles) >= maxGitHubPRFiles {
+			return nil, fmt.Errorf("list PR files for %s#%d reached GitHub API limit: %w", repo, pr, ErrPRFilesIncomplete)
 		}
 		if resp.NextPage == 0 {
 			break

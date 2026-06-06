@@ -98,10 +98,11 @@ const ConfigFileName = "schemabot.yaml"
 
 // Config discovery errors.
 var (
-	ErrNoConfig         = fmt.Errorf("no schemabot.yaml config found")
-	ErrInvalidConfig    = fmt.Errorf("invalid schemabot.yaml config found")
-	ErrMultipleConfigs  = fmt.Errorf("multiple schemabot.yaml configs found - use -d flag to specify database")
-	ErrGitTreeTruncated = fmt.Errorf("GitHub returned a truncated repository tree; config discovery is incomplete")
+	ErrNoConfig          = fmt.Errorf("no schemabot.yaml config found")
+	ErrInvalidConfig     = fmt.Errorf("invalid schemabot.yaml config found")
+	ErrMultipleConfigs   = fmt.Errorf("multiple schemabot.yaml configs found - use -d flag to specify database")
+	ErrGitTreeTruncated  = fmt.Errorf("GitHub returned a truncated repository tree; config discovery is incomplete")
+	ErrPRFilesIncomplete = fmt.Errorf("GitHub returned the maximum number of pull request files; config discovery is incomplete")
 )
 
 // DatabaseNotFoundError indicates the specified database was not found in any config.

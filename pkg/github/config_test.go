@@ -227,6 +227,26 @@ func TestFindAllConfigsFailsClosedOnTruncatedGitTree(t *testing.T) {
 	assert.ErrorIs(t, err, ErrGitTreeTruncated)
 }
 
+func TestFindAllConfigsForPRFailsClosedOnIncompletePRFileList(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+
+	files := make([]*gh.CommitFile, maxGitHubPRFiles)
+	filename := "docs/readme.md"
+	status := "modified"
+	for i := range files {
+		files[i] = &gh.CommitFile{Filename: &filename, Status: &status}
+	}
+	registerPullRequestFiles(t, mux, files)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.FindAllConfigsForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPRFilesIncomplete)
+	assert.False(t, errors.Is(err, ErrNoConfig))
+}
+
 func TestFetchSchemaFilesOptimizedWalksSchemaDirectoryOnly(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema", []*gh.RepositoryContent{
