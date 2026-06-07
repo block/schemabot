@@ -470,10 +470,12 @@ above.
 
 ## Operator Guidance
 
-When this document says to retry SchemaBot from a PR, it means posting a
-SchemaBot command as a PR comment. The GitHub Check Run "Re-run" button is not
-the recovery path today because SchemaBot does not handle GitHub's
-`check_run.rerequested` webhook event.
+When a SchemaBot aggregate check fails because discovery, planning, or check
+publishing hit a transient error, users can click GitHub's **Re-run** button on
+the failed SchemaBot check to trigger SchemaBot discovery and auto-plan again
+for the current PR head. SchemaBot ignores Check Run re-run events for older
+commits after the PR head has moved, so stale re-runs cannot publish status for
+the current branch protection gate.
 
 Use these PR comment commands for normal retry paths:
 

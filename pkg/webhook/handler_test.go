@@ -103,6 +103,56 @@ func TestWebhookIgnoresUnknownEvents(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "ignored")
 }
 
+func TestCheckRunRerequestIgnoresNonSchemaBotCheck(t *testing.T) {
+	h, _, _ := newTestHandler(t)
+
+	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{
+		checkName: "CI / tests",
+		headSHA:   "abc123",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "non-SchemaBot check")
+}
+
+func TestCheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": "newsha222", "ref": "feature-branch"},
+			"base": map[string]any{"sha": "def456", "ref": "main"},
+			"user": map[string]any{"login": "testuser"},
+		}))
+	})
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	factory := &fakeClientFactory{client: installClient}
+	service := api.New(&emptyStorage{}, &api.ServerConfig{
+		AllowedEnvironments: []string{"staging"},
+	}, nil, testLogger())
+
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+		logger:    testLogger(),
+	}
+
+	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{
+		checkName: "SchemaBot (staging)",
+		headSHA:   "oldsha111",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "stale head SHA")
+}
+
 // newTestHandler creates a Handler wired to a fake GitHub API server.
 // Returns the handler and a channel that receives posted comment bodies.
 func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {

@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -89,25 +90,38 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 		"head_sha", headSHA,
 	)
 
-	// Discover all configs matching changed schema files in this PR
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
+	if err != nil {
+		h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+		h.writeError(w, http.StatusInternalServerError, "failed to initialize GitHub client")
+		return
+	}
 	defer cancel()
+
+	message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request")
+	h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
+}
+
+func (h *Handler) autoPlanBootstrap(repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	// Dedupe FetchPullRequest calls within this webhook delivery.
 	ctx = ghclient.WithPRInfoCache(ctx)
 
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
-		h.logger.Error("failed to create GitHub client", "error", err)
-		h.writeError(w, http.StatusInternalServerError, "failed to initialize GitHub client")
-		return
+		cancel()
+		return nil, nil, nil, fmt.Errorf("create GitHub client for repo %s installation %d: %w", repo, installationID, err)
 	}
+	return ctx, cancel, client, nil
+}
 
+func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string) string {
+	// Discover all configs matching changed schema files in this PR
 	configs, err := client.FindAllConfigsForPR(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "error", err)
+		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		h.writeJSON(w, http.StatusOK, map[string]string{"message": "config discovery failed"})
-		return
+		return "config discovery failed"
 	}
 
 	// Collect database names from discovered configs
@@ -123,7 +137,7 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 	})
 
 	if len(configs) == 0 {
-		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr)
+		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
 		// Post passing aggregates on the current HEAD SHA so branch protection
 		// isn't blocked on PRs that don't touch schema files. Always post —
 		// on synchronize events the HEAD SHA changes, so the aggregate must be
@@ -142,8 +156,7 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 				"No managed schema changes",
 				"This PR does not contain schema changes managed by SchemaBot.")
 		})
-		h.writeJSON(w, http.StatusOK, map[string]string{"message": "no schema files in PR"})
-		return
+		return "no schema files in PR"
 	}
 
 	// Launch auto-plan for each discovered config
@@ -154,7 +167,7 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 		})
 	}
 
-	h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan started"})
+	return "auto-plan started"
 }
 
 func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error) {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -13,11 +14,26 @@ func aggregateCheckNameForEnv(baseName, env string) string {
 	return fmt.Sprintf("%s (%s)", baseName, env)
 }
 
+func (h *Handler) serverConfig() (*api.ServerConfig, bool) {
+	if h == nil {
+		return nil, false
+	}
+	if h.service == nil {
+		return nil, false
+	}
+	config := h.service.Config()
+	if config == nil {
+		return nil, false
+	}
+	return config, true
+}
+
 func (h *Handler) aggregateCheckNameForRepo(repo string) string {
-	if h == nil || h.service == nil || h.service.Config() == nil {
+	config, ok := h.serverConfig()
+	if !ok {
 		return aggregateCheckName
 	}
-	return h.service.Config().GitHubCheckNameBaseForRepo(repo)
+	return config.GitHubCheckNameBaseForRepo(repo)
 }
 
 // filterChecksByEnvironment returns only stored check state for the given environment.

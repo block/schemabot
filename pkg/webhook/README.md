@@ -190,6 +190,5 @@ Schema request errors are mapped to specific GitHub comment templates:
 
 ## Not Implemented In Webhooks
 
-- Check Run action buttons and GitHub `check_run.rerequested` handling.
 - PR-comment control operations for `stop`, `cutover`, `revert`, and
   `skip-revert`; use the CLI for those operator actions.

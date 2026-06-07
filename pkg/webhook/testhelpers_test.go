@@ -48,6 +48,13 @@ type prWebhookPayloadOpts struct {
 	headRef string
 }
 
+type checkRunWebhookPayloadOpts struct {
+	action    string
+	checkName string
+	headSHA   string
+	pr        int
+}
+
 // buildPRWebhookRequest constructs a valid pull_request webhook POST request with HMAC signature.
 func buildPRWebhookRequest(t *testing.T, opts prWebhookPayloadOpts, secret []byte) *http.Request {
 	t.Helper()
@@ -87,6 +94,57 @@ func buildPRWebhookRequest(t *testing.T, opts prWebhookPayloadOpts, secret []byt
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(string(body)))
 	req.Header.Set("X-GitHub-Event", "pull_request")
+
+	if len(secret) > 0 {
+		mac := hmac.New(sha256.New, secret)
+		mac.Write(body)
+		sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		req.Header.Set("X-Hub-Signature-256", sig)
+	}
+
+	return req
+}
+
+// buildCheckRunWebhookRequest constructs a valid check_run webhook POST request with HMAC signature.
+func buildCheckRunWebhookRequest(t *testing.T, opts checkRunWebhookPayloadOpts, secret []byte) *http.Request {
+	t.Helper()
+
+	if opts.action == "" {
+		opts.action = "rerequested"
+	}
+	if opts.checkName == "" {
+		opts.checkName = "SchemaBot"
+	}
+	if opts.headSHA == "" {
+		opts.headSHA = "abc123"
+	}
+	if opts.pr == 0 {
+		opts.pr = 1
+	}
+
+	payload := map[string]any{
+		"action": opts.action,
+		"check_run": map[string]any{
+			"id":       123,
+			"name":     opts.checkName,
+			"head_sha": opts.headSHA,
+			"pull_requests": []map[string]any{{
+				"number": opts.pr,
+			}},
+		},
+		"repository": map[string]any{
+			"full_name": "octocat/hello-world",
+		},
+		"installation": map[string]any{
+			"id": 12345,
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-GitHub-Event", "check_run")
 
 	if len(secret) > 0 {
 		mac := hmac.New(sha256.New, secret)

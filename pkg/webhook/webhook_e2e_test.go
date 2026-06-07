@@ -3544,6 +3544,128 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	assert.True(t, seen["SchemaBot (production)"], "expected SchemaBot (production) check")
 }
 
+// TestE2ECheckRunRerequestReplansCurrentPR verifies that rerunning a SchemaBot
+// Check Run from GitHub reuses auto-plan discovery and republishes aggregate
+// check state for the current PR head.
+func TestE2ECheckRunRerequestReplansCurrentPR(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("abc123")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new("README.md"), Status: new("modified")},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.Tree{
+			SHA:       new("abc123"),
+			Entries:   []*gh.TreeEntry{},
+			Truncated: new(false),
+		})
+	})
+
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	h := newE2EHandler(t, svc, client)
+	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{
+		checkName: "SchemaBot (staging)",
+		headSHA:   "abc123",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "SchemaBot (staging)", cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for rerun aggregate check")
+	}
+}
+
+// TestE2ECheckRunRerequestIgnoresStaleHeadSHA verifies that rerunning an old
+// Check Run cannot publish check state for a commit that is no longer the PR
+// head.
+func TestE2ECheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	var fileListCalls atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("newsha222")},
+			Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		fileListCalls.Add(1)
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new("README.md"), Status: new("modified")},
+		})
+	})
+
+	checkRuns := make(chan checkRunCapture, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	h := newE2EHandler(t, svc, client)
+	req := buildCheckRunWebhookRequest(t, checkRunWebhookPayloadOpts{
+		checkName: "SchemaBot (staging)",
+		headSHA:   "oldsha111",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "stale head SHA")
+	assert.Equal(t, int64(0), fileListCalls.Load(), "stale check reruns should stop before config discovery")
+
+	select {
+	case cr := <-checkRuns:
+		t.Fatalf("stale check rerun should not publish a check run, got: %+v", cr)
+	case <-time.After(250 * time.Millisecond):
+	}
+}
+
 // TestE2EPassingAggregateSynchronizeUpdatesNewSHA verifies that when a non-schema PR
 // receives a synchronize event (force push / new commit), the passing aggregate check
 // is recreated on the new HEAD SHA — not left stale on the old commit.
