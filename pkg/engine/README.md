@@ -81,6 +81,43 @@ type Engine interface {
 
 Engines must support resume: if the server restarts mid-schema-change, the engine must be able to resume from where it left off. The `ResumeState` field on requests carries opaque state (e.g., Spirit's checkpoint table name) that enables this.
 
+Tern owns persistence; engines own resume metadata semantics. Tern should load
+the persisted data and pass the resulting `ResumeState` back to the engine, but
+it should not interpret engine-private `ResumeState.Metadata` JSON.
+
+```
+┌─────────────┐
+│ Engine      │
+│ Apply/      │
+│ Progress    │
+└──────┬──────┘
+       │ returns ResumeState{MigrationContext, Metadata}
+       ▼
+┌─────────────┐
+│ Tern stores │
+│ opaque      │
+│ state       │
+└──────┬──────┘
+       │ loads it for Progress / Control
+       ▼
+┌─────────────┐
+│ Engine      │
+│ validates   │
+│ metadata    │
+└──────┬──────┘
+       │ same ResumeState
+       ▼
+┌─────────────┐
+│ Engine      │
+│ operation   │
+└─────────────┘
+```
+
+Engines with operation-specific metadata requirements can implement
+`ControlResumeValidator`. For example, PlanetScale allows partial metadata while
+a branch is being prepared, but control operations require deploy request
+metadata before they can target a server-side deploy request.
+
 ## Key Types
 
 - **PlanRequest/PlanResult**: Schema files in, DDL + table changes + lint warnings out

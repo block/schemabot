@@ -14,9 +14,10 @@ func TestStart_RejectsNonDeferredDeploy(t *testing.T) {
 
 	// Non-deferred metadata — Start should return "not supported"
 	meta, err := encodePSMetadata(&psMetadata{
-		BranchName:      "schemabot-mydb-abc",
-		DeployRequestID: 1,
-		DeferredDeploy:  false,
+		BranchName:       "schemabot-mydb-abc",
+		DeployRequestID:  1,
+		DeployRequestURL: "https://example.test/deploys/1",
+		DeferredDeploy:   false,
 	})
 	require.NoError(t, err)
 
@@ -33,10 +34,11 @@ func TestStart_AcceptsDeferredDeploy(t *testing.T) {
 	e := &Engine{}
 
 	meta, err := encodePSMetadata(&psMetadata{
-		BranchName:      "schemabot-mydb-abc",
-		DeployRequestID: 1,
-		IsInstant:       true,
-		DeferredDeploy:  true,
+		BranchName:       "schemabot-mydb-abc",
+		DeployRequestID:  1,
+		DeployRequestURL: "https://example.test/deploys/1",
+		IsInstant:        true,
+		DeferredDeploy:   true,
 	})
 	require.NoError(t, err)
 

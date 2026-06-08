@@ -355,6 +355,27 @@ type ControlRequest struct {
 	Credentials *Credentials // Resolved credentials (from discovery)
 }
 
+// ControlOperation names the control action that will consume a ResumeState.
+// Engines can use this to validate opaque metadata before a caller attempts an
+// operation that would otherwise fail later against the backing service.
+type ControlOperation string
+
+const (
+	ControlStop       ControlOperation = "stop"
+	ControlStart      ControlOperation = "start"
+	ControlCutover    ControlOperation = "cutover"
+	ControlRevert     ControlOperation = "revert"
+	ControlSkipRevert ControlOperation = "skip_revert"
+	ControlVolume     ControlOperation = "volume"
+)
+
+// ControlResumeValidator is an optional interface for engines whose resume
+// metadata has operation-specific readiness requirements. The tern layer owns
+// loading persisted data; engines own the meaning of ResumeState.Metadata.
+type ControlResumeValidator interface {
+	ValidateControlResumeState(operation ControlOperation, state *ResumeState) error
+}
+
 // ControlResult is the response from control operations.
 type ControlResult struct {
 	Accepted    bool

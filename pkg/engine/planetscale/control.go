@@ -3,11 +3,14 @@ package planetscale
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/engine"
 )
+
+var _ engine.ControlResumeValidator = (*Engine)(nil)
 
 // Stop cancels the deploy request. This is permanent.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
@@ -162,12 +165,50 @@ func (e *Engine) controlMeta(req *engine.ControlRequest) (*psMetadata, error) {
 	if req.ResumeState == nil || req.ResumeState.Metadata == "" {
 		return nil, fmt.Errorf("no active schema change")
 	}
+	if err := e.ValidateControlResumeState("", req.ResumeState); err != nil {
+		return nil, err
+	}
 	meta, err := decodePSMetadata(req.ResumeState.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("decode resume state: %w", err)
 	}
-	if meta.DeployRequestID == 0 {
-		return nil, fmt.Errorf("no active schema change")
-	}
 	return meta, nil
+}
+
+// ValidateControlResumeState checks that the opaque PlanetScale resume state can
+// address the deploy request targeted by a control operation.
+func (e *Engine) ValidateControlResumeState(operation engine.ControlOperation, resumeState *engine.ResumeState) error {
+	return validateControlResumeState(operation, resumeState)
+}
+
+func validateControlResumeState(operation engine.ControlOperation, resumeState *engine.ResumeState) error {
+	if resumeState == nil || resumeState.Metadata == "" {
+		return fmt.Errorf("no active schema change")
+	}
+	meta, err := decodePSMetadata(resumeState.Metadata)
+	if err != nil {
+		return fmt.Errorf("decode resume state: %w", err)
+	}
+	if missing := missingControlMetadata(meta); len(missing) > 0 {
+		prefix := "deploy request metadata is incomplete"
+		if operation != "" {
+			prefix = fmt.Sprintf("%s control resume state is incomplete", operation)
+		}
+		return fmt.Errorf("%s (missing %s)", prefix, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func missingControlMetadata(meta *psMetadata) []string {
+	var missing []string
+	if meta.BranchName == "" {
+		missing = append(missing, "branch_name")
+	}
+	if meta.DeployRequestID == 0 {
+		missing = append(missing, "deploy_request_id")
+	}
+	if meta.DeployRequestURL == "" {
+		missing = append(missing, "deploy_request_url")
+	}
+	return missing
 }

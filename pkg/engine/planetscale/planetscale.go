@@ -488,24 +488,14 @@ func BuildResumeState(data ResumeData) (*engine.ResumeState, error) {
 // BuildControlResumeState encodes PlanetScale resume metadata for control
 // operations that act on an existing deploy request.
 func BuildControlResumeState(data ResumeData) (*engine.ResumeState, error) {
-	if missing := missingControlResumeData(data); len(missing) > 0 {
-		return nil, fmt.Errorf("deploy request metadata is incomplete (missing %s)", strings.Join(missing, ", "))
+	resumeState, err := BuildResumeState(data)
+	if err != nil {
+		return nil, err
 	}
-	return BuildResumeState(data)
-}
-
-func missingControlResumeData(data ResumeData) []string {
-	var missing []string
-	if data.BranchName == "" {
-		missing = append(missing, "branch_name")
+	if err := validateControlResumeState("", resumeState); err != nil {
+		return nil, err
 	}
-	if data.DeployRequestID == 0 {
-		missing = append(missing, "deploy_request_id")
-	}
-	if data.DeployRequestURL == "" {
-		missing = append(missing, "deploy_request_url")
-	}
-	return missing
+	return resumeState, nil
 }
 
 func encodePSMetadata(m *psMetadata) (string, error) {

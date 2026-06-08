@@ -174,6 +174,32 @@ func TestDecodePSMetadata_Invalid(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestBuildControlResumeStateRequiresDeployRequestMetadata(t *testing.T) {
+	_, err := BuildControlResumeState(ResumeData{
+		BranchName:       "schemabot-mydb-12345678",
+		MigrationContext: "ctx-123",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "deploy request metadata is incomplete")
+	assert.Contains(t, err.Error(), "deploy_request_id")
+	assert.Contains(t, err.Error(), "deploy_request_url")
+}
+
+func TestValidateControlResumeStateIncludesOperation(t *testing.T) {
+	resumeState, err := BuildResumeState(ResumeData{
+		BranchName:       "schemabot-mydb-12345678",
+		MigrationContext: "ctx-123",
+	})
+	require.NoError(t, err)
+
+	err = validateControlResumeState(engine.ControlCutover, resumeState)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cutover control resume state is incomplete")
+	assert.Contains(t, err.Error(), "deploy_request_id")
+}
+
 func TestSplitStatements(t *testing.T) {
 	stmts, err := ddl.SplitStatements("CREATE TABLE `a` (id INT); ALTER TABLE `b` ADD COLUMN x INT;")
 	require.NoError(t, err)

@@ -82,7 +82,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		if eng == nil {
 			return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 		}
-		controlReq, err := c.buildControlRequest(ctx, applyTasks[0], creds)
+		controlReq, err := c.buildControlRequest(ctx, applyTasks[0], creds, eng, engine.ControlStart)
 		if err != nil {
 			return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
 		}

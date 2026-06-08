@@ -94,7 +94,7 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 
-	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	controlReq, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlCutover)
 	if err != nil {
 		return nil, fmt.Errorf("build cutover request for apply %d: %w", task.ApplyID, err)
 	}
@@ -408,7 +408,7 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 		if task.State == state.Task.Running ||
 			task.State == state.Task.WaitingForCutover ||
 			task.State == state.Task.CuttingOver {
-			req, err := c.buildControlRequest(ctx, task, creds)
+			req, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlStop)
 			if err != nil {
 				return fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
 			}
@@ -570,10 +570,9 @@ func (c *LocalClient) controlSetup(ctx context.Context) (*storage.Task, *engine.
 	return task, c.credentials(), eng, nil
 }
 
-// buildControlRequest creates a ControlRequest with persisted Vitess deploy data.
-// PlanetScale control operations identify the server-side deploy request from
-// ResumeState.Metadata, so missing stored data must fail before calling the engine.
-func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Task, creds *engine.Credentials) (*engine.ControlRequest, error) {
+// buildControlRequest creates a ControlRequest with persisted engine resume data.
+// Engines own validation of opaque ResumeState.Metadata before control calls.
+func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Task, creds *engine.Credentials, eng engine.Engine, operation engine.ControlOperation) (*engine.ControlRequest, error) {
 	req := &engine.ControlRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
@@ -595,6 +594,11 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 			return nil, fmt.Errorf("build Vitess control resume state for apply %d: %w", task.ApplyID, err)
 		}
 		req.ResumeState = resumeState
+	}
+	if validator, ok := eng.(engine.ControlResumeValidator); ok {
+		if err := validator.ValidateControlResumeState(operation, req.ResumeState); err != nil {
+			return nil, fmt.Errorf("validate %s resume state for task %s: %w", operation, task.TaskIdentifier, err)
+		}
 	}
 	return req, nil
 }
@@ -623,7 +627,7 @@ func (c *LocalClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*t
 	if err != nil {
 		return nil, err
 	}
-	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	controlReq, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlVolume)
 	if err != nil {
 		return nil, fmt.Errorf("build volume request for task %s: %w", task.TaskIdentifier, err)
 	}
@@ -652,7 +656,7 @@ func (c *LocalClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*t
 		return nil, err
 	}
 
-	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	controlReq, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlRevert)
 	if err != nil {
 		return nil, fmt.Errorf("build revert request for task %s: %w", task.TaskIdentifier, err)
 	}
@@ -669,7 +673,7 @@ func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequ
 		return nil, err
 	}
 
-	controlReq, err := c.buildControlRequest(ctx, task, creds)
+	controlReq, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlSkipRevert)
 	if err != nil {
 		return nil, fmt.Errorf("build skip-revert request for task %s: %w", task.TaskIdentifier, err)
 	}
