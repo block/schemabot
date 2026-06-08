@@ -7,13 +7,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestRenderRepositoryNotRegistered(t *testing.T) {
-	rendered := RenderRepositoryNotRegistered()
-	assert.Contains(t, rendered, "**Repository not registered.**")
-	assert.Contains(t, rendered, "`repos`")
-	assert.Contains(t, rendered, "redeploy")
-}
-
 func TestRenderRollbackMissingArguments(t *testing.T) {
 	rendered := RenderRollbackMissingArguments()
 	assert.Contains(t, rendered, "## Missing Arguments")

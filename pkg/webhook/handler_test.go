@@ -655,10 +655,8 @@ func TestWebhookRepoAllowlistRejectsUnregisteredRepo(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		assert.Contains(t, body, "Repository not registered")
-		assert.Contains(t, body, "`repos`")
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for rejection comment")
+		t.Fatalf("unexpected rejection comment: %s", body)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

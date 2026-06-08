@@ -24,6 +24,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
 | `schemabot.webhook.events_total` | Counter | environment, event_type, action, repository, status | GitHub webhook events |
+| `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action, repository | Webhook events ignored because the repository is not configured |
 | `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API responses observed by SchemaBot |
 | `schemabot.github.rate_limit.limit` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
 | `schemabot.github.rate_limit.remaining` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |

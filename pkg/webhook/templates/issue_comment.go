@@ -6,13 +6,6 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
-// RenderRepositoryNotRegistered renders the message posted when a SchemaBot
-// command arrives from a repository that is not in the configured allowlist.
-func RenderRepositoryNotRegistered() string {
-	return "**Repository not registered.** This repository is not in SchemaBot's configuration. " +
-		"To onboard, add it to the `repos` section of SchemaBot's config and redeploy."
-}
-
 // RenderRollbackMissingArguments renders the message posted when `schemabot rollback`
 // is invoked without an apply ID and without an `-e` flag.
 func RenderRollbackMissingArguments() string {

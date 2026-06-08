@@ -355,7 +355,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch eventType {
 	case "issue_comment":
-		h.handleIssueComment(w, body)
+		h.handleIssueComment(ctx, metricApp, w, body)
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	case "check_run":
 		// Phase 2: h.handleCheckRun(w, body)
@@ -369,7 +369,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run events not yet implemented"})
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "ignored")
 	case "pull_request":
-		h.handlePullRequest(w, body)
+		h.handlePullRequest(ctx, metricApp, w, body)
 		metrics.RecordWebhookEvent(ctx, metricApp, eventType, action, repo, "processed")
 	default:
 		h.logger.Info("webhook ignored",

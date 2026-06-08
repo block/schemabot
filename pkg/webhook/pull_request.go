@@ -34,7 +34,7 @@ type pullRequestPayload struct {
 
 // handlePullRequest processes GitHub pull_request webhook events.
 // On PR open/synchronize/reopen, it auto-plans all databases with schema changes.
-func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
+func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte) {
 	var payload pullRequestPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid pull_request payload")
@@ -76,6 +76,7 @@ func (h *Handler) handlePullRequest(w http.ResponseWriter, body []byte) {
 			"repo", repo,
 			"pr", pr,
 			"installation_id", installationID)
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "pull_request", payload.Action, repo)
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "repository not registered",
 		})

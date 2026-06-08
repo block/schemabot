@@ -290,10 +290,12 @@ tern_deployments:
     staging: "tern2-staging:9090"
 ```
 
-When a webhook arrives from an unlisted repository:
-- If the user invoked a SchemaBot command (e.g., `schemabot plan`), a PR comment explains the repo is not registered.
-- Auto-plan events (PR open/sync) are ignored without a PR comment because the
-  repository is outside this SchemaBot instance's ownership.
+When a SchemaBot command or auto-plan event reaches the allowlist check from an
+unlisted repository:
+- SchemaBot logs a warning and ignores the event without posting a PR comment
+  because the repository is outside this SchemaBot instance's ownership.
+- SchemaBot increments `schemabot.webhook.unregistered_repository_ignored_total`
+  so operators can detect unexpected webhook delivery or missing configuration.
 
 If `repos` is not configured or empty, all repositories are allowed.
 

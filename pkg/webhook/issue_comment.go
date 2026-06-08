@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -38,7 +39,7 @@ type webhookPayload struct {
 }
 
 // handleIssueComment processes GitHub issue comment webhooks.
-func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
+func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte) {
 	var payload webhookPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid webhook payload")
@@ -97,7 +98,7 @@ func (h *Handler) handleIssueComment(w http.ResponseWriter, body []byte) {
 			"pr", pr,
 			"installation_id", installationID,
 			"requested_by", requestedBy)
-		h.postComment(repo, pr, installationID, templates.RenderRepositoryNotRegistered())
+		metrics.RecordUnregisteredRepositoryWebhook(ctx, metricApp, "issue_comment", payload.Action, repo)
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "repository not registered",
 		})

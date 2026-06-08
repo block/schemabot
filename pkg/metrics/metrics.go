@@ -996,6 +996,44 @@ func logUnknownWebhookMetricLabel(label, value, appName, repo, status string) {
 		"status", status)
 }
 
+// RecordUnregisteredRepositoryWebhook increments the counter for webhook events
+// ignored because the repository is outside this SchemaBot instance's configured
+// ownership. A spike means GitHub is delivering events for repositories that this
+// deployment will not process.
+func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType, action, repo string) {
+	if !knownWebhookEvents[eventType] {
+		logUnknownWebhookMetricLabel("event_type", eventType, appName, repo, "ignored")
+		eventType = "unknown"
+	}
+	if !knownWebhookActions[action] {
+		logUnknownWebhookMetricLabel("action", action, appName, repo, "ignored")
+		action = "unknown"
+	}
+	if appName == "" {
+		appName = "default"
+	}
+
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.webhook.unregistered_repository_ignored_total",
+		otelmetric.WithDescription("Total number of GitHub webhook events ignored because the repository is not configured"),
+		otelmetric.WithUnit("{event}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create unregistered repository webhook counter", "error", err)
+		return
+	}
+	attrs := []attribute.KeyValue{
+		EnvironmentAttribute(""),
+		attribute.String("app_name", appName),
+		attribute.String("event_type", eventType),
+		attribute.String("repository", repo),
+	}
+	if action != "" {
+		attrs = append(attrs, attribute.String("action", action))
+	}
+	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
+}
+
 var knownStatusCheckOperations = map[string]bool{
 	"plan_check_recorded":                  true,
 	"apply_started":                        true,
