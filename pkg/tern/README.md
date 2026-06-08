@@ -23,7 +23,7 @@ type Client interface {
     Volume(ctx, *VolumeRequest) (*VolumeResponse, error)
     Revert(ctx, *RevertRequest) (*RevertResponse, error)
     SkipRevert(ctx, *SkipRevertRequest) (*SkipRevertResponse, error)
-    RollbackPlan(ctx, database string) (*PlanResponse, error)
+    RollbackPlan(ctx, database, environment string) (*PlanResponse, error)
     Health(ctx) error
     ResumeApply(ctx, *storage.Apply) error
     ResumeApplyOperation(ctx, *storage.Apply, applyOperationID int64) error

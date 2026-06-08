@@ -74,6 +74,73 @@ func TestWebhookRollbackConfirmDispatch(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "rollback-confirm started")
 }
 
+func TestWebhookRollbackRejectsDatabaseFlag(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot rollback apply_abc123 -e staging -d users_db",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unsupported flag")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "`-d` flag is not supported")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for comment")
+	}
+}
+
+func TestWebhookRollbackConfirmRejectsDatabaseFlag(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot rollback-confirm -e staging -d users_db",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unsupported flag")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "`-d` flag is not supported")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for comment")
+	}
+}
+
+func TestWebhookRejectsDatabaseFlagForAnyCommandThatDoesNotSupportIt(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot stop apply_abc123 -e staging -d users_db",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unsupported flag")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "`-d` flag is not supported")
+		assert.Contains(t, body, "`stop`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for comment")
+	}
+}
+
 func TestWebhookRollbackMissingApplyID(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
@@ -119,6 +186,28 @@ func TestWebhookRollbackMissingApplyIDAndEnv(t *testing.T) {
 	}
 }
 
+func TestHandleRollbackCommandStorageUnavailablePostsError(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := &Handler{
+		service:   api.New(nil, &api.ServerConfig{}, nil, testLogger()),
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    testLogger(),
+	}
+
+	h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", CommandResult{
+		Action:      action.Rollback,
+		ApplyID:     "apply_abc123",
+		Environment: "staging",
+	})
+
+	body := requireComment(t, comments, "storage-unavailable rollback comment")
+	assert.Contains(t, body, "Storage is not available")
+}
+
 // rollbackNoopTernClient returns a rollback plan with no schema changes,
 // simulating a database that already matches the original schema when
 // rollback-confirm re-plans for drift detection.
@@ -126,7 +215,7 @@ type rollbackNoopTernClient struct {
 	tern.Client
 }
 
-func (c *rollbackNoopTernClient) RollbackPlan(context.Context, string) (*ternv1.PlanResponse, error) {
+func (c *rollbackNoopTernClient) RollbackPlan(context.Context, string, string) (*ternv1.PlanResponse, error) {
 	return &ternv1.PlanResponse{PlanId: "rollback-plan-noop"}, nil
 }
 

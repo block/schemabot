@@ -150,10 +150,9 @@ func TestRollbackConfirmHandlerDedupesPRFetch(t *testing.T) {
 	// so the handler bails out at the "no lock" branch right after
 	// CreateSchemaRequestFromPR returns — but CreateSchemaRequestFromPR
 	// itself has already exercised multiple FetchPullRequest call sites
-	// (FindConfigByDatabaseName + schema.go) within the same ctx scope.
-	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", dbName, 12345, "testuser", CommandResult{
+	// within the same ctx scope.
+	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "testuser", CommandResult{
 		Environment: "staging",
-		Database:    dbName,
 	})
 
 	assert.Equal(t, int32(1), prFetchCalls.Load(),

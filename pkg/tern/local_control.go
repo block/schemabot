@@ -857,9 +857,13 @@ func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequ
 }
 
 // RollbackPlan generates a plan to revert to the schema state before the most recent apply.
-func (c *LocalClient) RollbackPlan(ctx context.Context, database string) (*ternv1.PlanResponse, error) {
-	// Find the most recent completed task for this database
-	tasks, err := c.storage.Tasks().GetByDatabase(ctx, c.config.Database)
+func (c *LocalClient) RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error) {
+	if database != c.config.Database {
+		return nil, fmt.Errorf("rollback plan requested database %s, but client is configured for database %s", database, c.config.Database)
+	}
+
+	// Find the most recent completed task for this database and environment.
+	tasks, err := c.storage.Tasks().GetByDatabase(ctx, database)
 	if err != nil {
 		return nil, fmt.Errorf("get tasks failed: %w", err)
 	}
@@ -868,7 +872,7 @@ func (c *LocalClient) RollbackPlan(ctx context.Context, database string) (*ternv
 	// We prefer CompletedAt comparison when available, but fall back to creation order.
 	var latestCompletedTask *storage.Task
 	for _, t := range tasks {
-		if t.State == state.Task.Completed {
+		if t.Environment == environment && t.DatabaseType == c.config.Type && state.IsState(t.State, state.Task.Completed) {
 			switch {
 			case latestCompletedTask == nil:
 				latestCompletedTask = t
@@ -886,7 +890,7 @@ func (c *LocalClient) RollbackPlan(ctx context.Context, database string) (*ternv
 	}
 
 	if latestCompletedTask == nil {
-		return nil, fmt.Errorf("no completed schema change found to rollback")
+		return nil, fmt.Errorf("no completed schema change found to rollback for database %s environment %s", database, environment)
 	}
 
 	// Get the plan associated with this task
@@ -896,6 +900,9 @@ func (c *LocalClient) RollbackPlan(ctx context.Context, database string) (*ternv
 	}
 	if plan == nil {
 		return nil, fmt.Errorf("plan not found for completed task")
+	}
+	if plan.Environment != environment {
+		return nil, fmt.Errorf("completed task for database %s environment %s points to plan for environment %s", database, environment, plan.Environment)
 	}
 
 	originalSchema := plan.FlatOriginalSchema()
@@ -918,9 +925,9 @@ func (c *LocalClient) RollbackPlan(ctx context.Context, database string) (*ternv
 
 	// Generate a new plan using the original schema as the target
 	return c.Plan(ctx, &ternv1.PlanRequest{
-		Database:    c.config.Database,
+		Database:    database,
 		Type:        c.config.Type,
-		Environment: plan.Environment,
+		Environment: environment,
 		Target:      plan.Target,
 		SchemaFiles: schemaFiles,
 	})

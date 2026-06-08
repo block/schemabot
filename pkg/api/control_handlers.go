@@ -63,11 +63,161 @@ func IsInternalControlError(err error) bool {
 	return controlOperationHTTPStatus(err) >= http.StatusInternalServerError
 }
 
+// ControlOperationHTTPStatus returns the HTTP status associated with a control
+// operation error. Untyped errors are internal failures.
+func ControlOperationHTTPStatus(err error) int {
+	return controlOperationHTTPStatus(err)
+}
+
 func controlHTTPErrorf(status int, format string, args ...any) error {
 	return &controlOperationHTTPError{
 		status: status,
 		err:    fmt.Errorf(format, args...),
 	}
+}
+
+// RollbackSourceRequest identifies the completed apply that a rollback command
+// wants to reverse. GitHub comment flows require repository and pull request
+// scope to keep a PR from rolling back another PR's work.
+type RollbackSourceRequest struct {
+	ApplyIdentifier         string
+	Environment             string
+	Repository              string
+	PullRequest             int
+	RequirePullRequestScope bool
+}
+
+// ValidateRollbackSourceApply rejects rollback requests that cannot be mapped
+// unambiguously to the rollback planner's current source apply. Until rollback
+// planning targets a selected apply directly, only the latest completed source
+// apply with stored original schema is safe to roll back.
+func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackSourceRequest) (*storage.Apply, *storage.Plan, error) {
+	if req.ApplyIdentifier == "" {
+		return nil, nil, controlHTTPErrorf(http.StatusBadRequest, "apply_id is required")
+	}
+	if req.Environment == "" {
+		return nil, nil, controlHTTPErrorf(http.StatusBadRequest, "environment is required")
+	}
+	if s.storage == nil {
+		return nil, nil, fmt.Errorf("storage is not available")
+	}
+
+	applyStore := s.storage.Applies()
+	if applyStore == nil {
+		return nil, nil, fmt.Errorf("apply store is not available")
+	}
+	planStore := s.storage.Plans()
+	if planStore == nil {
+		return nil, nil, fmt.Errorf("plan store is not available")
+	}
+	taskStore := s.storage.Tasks()
+	if taskStore == nil {
+		return nil, nil, fmt.Errorf("task store is not available")
+	}
+
+	apply, err := applyStore.GetByApplyIdentifier(ctx, req.ApplyIdentifier)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load apply %s for rollback: %w", req.ApplyIdentifier, err)
+	}
+	if apply == nil {
+		return nil, nil, controlHTTPErrorf(http.StatusNotFound, "apply not found: %s", req.ApplyIdentifier)
+	}
+
+	if err := validateRollbackSourceScope(req, apply); err != nil {
+		return apply, nil, err
+	}
+
+	plan, err := planStore.GetByID(ctx, apply.PlanID)
+	if err != nil {
+		return apply, nil, fmt.Errorf("load source plan %d for rollback apply %s: %w", apply.PlanID, apply.ApplyIdentifier, err)
+	}
+	if plan == nil {
+		return apply, nil, fmt.Errorf("source plan %d not found for rollback apply %s", apply.PlanID, apply.ApplyIdentifier)
+	}
+	if len(plan.FlatOriginalSchema()) == 0 {
+		return apply, plan, controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema", apply.ApplyIdentifier)
+	}
+
+	latestTask, err := latestCompletedTaskForRollback(ctx, taskStore, apply.Database, apply.DatabaseType, apply.Environment)
+	if err != nil {
+		return apply, plan, err
+	}
+	if latestTask == nil {
+		return apply, plan, controlConflictf("no completed schema change task found for database %s environment %s", apply.Database, apply.Environment)
+	}
+	if latestTask.ApplyID != apply.ID {
+		return apply, plan, controlConflictf("apply %s is not the schema change that the current rollback planner would select for database %s environment %s", apply.ApplyIdentifier, apply.Database, apply.Environment)
+	}
+	if latestTask.PlanID != apply.PlanID {
+		return apply, plan, fmt.Errorf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
+	}
+
+	return apply, plan, nil
+}
+
+func validateRollbackSourceScope(req RollbackSourceRequest, apply *storage.Apply) error {
+	if !state.IsState(apply.State, state.Apply.Completed) {
+		return controlConflictf("apply %s is %s; rollback requires a completed apply", apply.ApplyIdentifier, apply.State)
+	}
+	if apply.Environment != req.Environment {
+		return controlHTTPErrorf(http.StatusBadRequest,
+			"apply %q belongs to environment %q, not %q", apply.ApplyIdentifier, apply.Environment, req.Environment)
+	}
+	if req.RequirePullRequestScope {
+		if req.Repository == "" {
+			return controlHTTPErrorf(http.StatusBadRequest, "repository is required")
+		}
+		if req.PullRequest <= 0 {
+			return controlHTTPErrorf(http.StatusBadRequest, "pull_request is required")
+		}
+	}
+	if req.Repository != "" {
+		if apply.Repository != req.Repository {
+			return controlHTTPErrorf(http.StatusBadRequest,
+				"apply %q belongs to repository %q, not %q", apply.ApplyIdentifier, apply.Repository, req.Repository)
+		}
+	}
+	if req.PullRequest > 0 {
+		if apply.PullRequest != req.PullRequest {
+			return controlHTTPErrorf(http.StatusBadRequest,
+				"apply %q belongs to PR #%d, not #%d", apply.ApplyIdentifier, apply.PullRequest, req.PullRequest)
+		}
+	}
+	return nil
+}
+
+func latestCompletedTaskForRollback(ctx context.Context, store storage.TaskStore, database, dbType, environment string) (*storage.Task, error) {
+	tasks, err := store.GetByDatabase(ctx, database)
+	if err != nil {
+		return nil, fmt.Errorf("load completed schema change tasks for database %s environment %s: %w", database, environment, err)
+	}
+
+	var latest *storage.Task
+	for _, task := range tasks {
+		if rollbackTaskMatchesPlannerScope(task, dbType, environment) && latest == nil {
+			latest = task
+		} else if rollbackTaskMatchesPlannerScope(task, dbType, environment) && rollbackTaskCompletedAfter(task, latest) {
+			latest = task
+		}
+	}
+	return latest, nil
+}
+
+func rollbackTaskMatchesPlannerScope(task *storage.Task, dbType, environment string) bool {
+	return state.IsState(task.State, state.Task.Completed) && task.DatabaseType == dbType && task.Environment == environment
+}
+
+func rollbackTaskCompletedAfter(candidate, current *storage.Task) bool {
+	if candidate.CompletedAt != nil && current.CompletedAt != nil {
+		return candidate.CompletedAt.After(*current.CompletedAt)
+	}
+	if candidate.CompletedAt != nil {
+		return true
+	}
+	if current.CompletedAt != nil {
+		return false
+	}
+	return candidate.CreatedAt.After(current.CreatedAt)
 }
 
 func controlOperationCaller(caller string) string {
@@ -1502,7 +1652,8 @@ func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 
 // RollbackPlanRequest is the HTTP request body for POST /api/rollback/plan.
 type RollbackPlanRequest struct {
-	ApplyID string `json:"apply_id"`
+	ApplyID     string `json:"apply_id"`
+	Environment string `json:"environment"`
 }
 
 // handleRollbackPlan handles POST /api/rollback/plan requests.
@@ -1520,15 +1671,17 @@ func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "apply_id is required")
 		return
 	}
-
-	// Look up the apply to get database/environment
-	apply, err := s.storage.Applies().GetByApplyIdentifier(r.Context(), req.ApplyID)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "failed to look up apply: "+err.Error())
+	if req.Environment == "" {
+		s.writeError(w, http.StatusBadRequest, "environment is required")
 		return
 	}
-	if apply == nil {
-		s.writeError(w, http.StatusNotFound, "apply not found: "+req.ApplyID)
+
+	apply, _, err := s.ValidateRollbackSourceApply(r.Context(), RollbackSourceRequest{
+		ApplyIdentifier: req.ApplyID,
+		Environment:     req.Environment,
+	})
+	if err != nil {
+		s.writeControlError(w, "rollback plan", apply, err)
 		return
 	}
 

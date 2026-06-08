@@ -741,7 +741,7 @@ func (c *stopCommandTernClient) SkipRevert(context.Context, *ternv1.SkipRevertRe
 	return nil, nil
 }
 
-func (c *stopCommandTernClient) RollbackPlan(context.Context, string) (*ternv1.PlanResponse, error) {
+func (c *stopCommandTernClient) RollbackPlan(context.Context, string, string) (*ternv1.PlanResponse, error) {
 	return nil, nil
 }
 

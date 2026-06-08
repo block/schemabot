@@ -122,6 +122,30 @@ func TestRenderRollbackApplyNotFound(t *testing.T) {
 	assert.Contains(t, rendered, "Check the ID and try again")
 }
 
+func TestRenderRollbackRejected(t *testing.T) {
+	rendered := RenderRollbackRejected(RollbackRejectedData{
+		ApplyID:     "apply-abc123",
+		Database:    "testapp",
+		Environment: "staging",
+		Reason:      "apply apply-abc123 is not the latest completed schema change",
+	})
+	assert.Contains(t, rendered, "## Rollback Not Allowed")
+	assert.Contains(t, rendered, "`apply-abc123`")
+	assert.Contains(t, rendered, "`testapp`")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "not the latest completed schema change")
+	assert.Contains(t, rendered, "stored original schema")
+}
+
+func TestRenderRollbackRejectedSanitizesReason(t *testing.T) {
+	rendered := RenderRollbackRejected(RollbackRejectedData{
+		ApplyID: "apply-abc123",
+		Reason:  "first line\nsecond `line`",
+	})
+	assert.Contains(t, rendered, "**Reason**: `first line second 'line'`")
+	assert.NotContains(t, rendered, "first line\nsecond")
+}
+
 func TestRenderRollbackBlockedByLock(t *testing.T) {
 	t.Run("PR-owned lock renders as link", func(t *testing.T) {
 		rendered := RenderRollbackBlockedByLock("testapp", "staging", "block/myapp#42", "block/myapp", 42)
@@ -203,6 +227,7 @@ func TestRollbackTemplates_NoStrayWhitespace(t *testing.T) {
 	for name, body := range map[string]string{
 		"MissingApplyID":            RenderRollbackMissingApplyID(),
 		"ApplyNotFound":             RenderRollbackApplyNotFound("a"),
+		"Rejected":                  RenderRollbackRejected(RollbackRejectedData{ApplyID: "a", Database: "d", Environment: "e", Reason: "r"}),
 		"BlockedByLockPR":           RenderRollbackBlockedByLock("d", "e", "o", "r", 1),
 		"BlockedByLockOwner":        RenderRollbackBlockedByLock("d", "e", "o", "", 0),
 		"NothingToDo":               RenderRollbackNothingToDo("d", "e", "a"),

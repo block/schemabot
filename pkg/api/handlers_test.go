@@ -107,29 +107,72 @@ func (m *mockStorageWithApplyStores) ControlRequests() storage.ControlRequestSto
 
 type staticPlanStore struct {
 	storage.PlanStore
-	plan *storage.Plan
-	err  error
+	plan      *storage.Plan
+	plansByID map[int64]*storage.Plan
+	err       error
 }
 
 func (s *staticPlanStore) Get(context.Context, string) (*storage.Plan, error) {
 	return s.plan, s.err
 }
 
-type staticApplyStore struct {
-	storage.ApplyStore
-	apply *storage.Apply
-	err   error
+func (s *staticPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.plansByID != nil {
+		return s.plansByID[id], nil
+	}
+	return s.plan, nil
 }
 
-func (s *staticApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
-	return s.apply, s.err
+type staticApplyStore struct {
+	storage.ApplyStore
+	apply   *storage.Apply
+	applies []*storage.Apply
+	err     error
+}
+
+func (s *staticApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if len(s.applies) == 0 {
+		return s.apply, nil
+	}
+	for _, apply := range s.applies {
+		if apply.ApplyIdentifier == applyIdentifier {
+			return apply, nil
+		}
+	}
+	return nil, nil
 }
 func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 	return s.apply, s.err
 }
-func (s *staticApplyStore) GetByDatabase(context.Context, string, string, string) ([]*storage.Apply, error) {
+func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, environment string) ([]*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
+	}
+	if len(s.applies) > 0 {
+		var applies []*storage.Apply
+		for _, apply := range s.applies {
+			if apply.Database != database {
+				continue
+			}
+			if dbType != "" {
+				if apply.DatabaseType != dbType {
+					continue
+				}
+			}
+			if environment != "" {
+				if apply.Environment != environment {
+					continue
+				}
+			}
+			applies = append(applies, apply)
+		}
+		return applies, nil
 	}
 	if s.apply == nil {
 		return nil, nil
@@ -387,6 +430,18 @@ func (s *capturingTaskStore) GetByApplyID(_ context.Context, applyID int64) ([]*
 	return tasks, s.err
 }
 
+func (s *capturingTaskStore) GetByDatabase(_ context.Context, database string) ([]*storage.Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var tasks []*storage.Task
+	for _, task := range s.tasks {
+		if task.Database == database {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks, s.err
+}
+
 type emptyLockStore struct {
 	storage.LockStore
 }
@@ -541,7 +596,7 @@ func (m *mockTernClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertR
 	}
 	return nil, m.skipRevertErr
 }
-func (m *mockTernClient) RollbackPlan(ctx context.Context, database string) (*ternv1.PlanResponse, error) {
+func (m *mockTernClient) RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error) {
 	return nil, nil
 }
 func (m *mockTernClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
@@ -1706,6 +1761,186 @@ func TestProgressResponseFromProtoPreservesVSchemaChangeType(t *testing.T) {
 	assert.Equal(t, "vschema_update", resp.Tables[0].ChangeType)
 }
 
+func TestValidateRollbackSourceApplyAcceptsLatestCompletedApplyWithOriginalSchema(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_latest", 1, 10, now)
+	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, true), []*storage.Task{
+		rollbackGuardrailTask(1, 10, now),
+	})
+
+	gotApply, gotPlan, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+		ApplyIdentifier: "apply_latest",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     1,
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, apply, gotApply)
+	require.NotNil(t, gotPlan)
+	assert.Equal(t, int64(10), gotPlan.ID)
+}
+
+func TestValidateRollbackSourceApplyRequiresEnvironment(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_latest", 1, 10, now)
+	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, true), []*storage.Task{
+		rollbackGuardrailTask(1, 10, now),
+	})
+
+	_, _, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+		ApplyIdentifier: "apply_latest",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "environment is required")
+}
+
+func TestValidateRollbackSourceApplyRequiresPullRequestScopeWhenRequested(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_latest", 1, 10, now)
+	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, true), []*storage.Task{
+		rollbackGuardrailTask(1, 10, now),
+	})
+
+	_, _, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+		ApplyIdentifier:         "apply_latest",
+		Environment:             "staging",
+		RequirePullRequestScope: true,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "repository is required")
+}
+
+func TestValidateRollbackSourceApplyRejectsPlanWithoutOriginalSchema(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_no_schema", 1, 10, now)
+	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, false), []*storage.Task{
+		rollbackGuardrailTask(1, 10, now),
+	})
+
+	_, _, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+		ApplyIdentifier: "apply_no_schema",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     1,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no stored original schema")
+}
+
+func TestValidateRollbackSourceApplyRejectsPlannerSourceMismatchForOlderApply(t *testing.T) {
+	now := time.Now().UTC()
+	older := rollbackGuardrailApply("apply_older", 1, 10, now.Add(-time.Minute))
+	newer := rollbackGuardrailApply("apply_newer", 2, 20, now)
+	svc := newRollbackGuardrailServiceWithApplies([]*storage.Apply{older, newer}, map[int64]*storage.Plan{
+		10: rollbackGuardrailPlan(10, true),
+		20: rollbackGuardrailPlan(20, true),
+	}, []*storage.Task{
+		rollbackGuardrailTask(1, 10, now.Add(-time.Minute)),
+		rollbackGuardrailTask(2, 20, now),
+	})
+
+	_, _, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+		ApplyIdentifier: "apply_older",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     1,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "current rollback planner would select")
+}
+
+func TestValidateRollbackSourceApplyScopesLatestCompletedTaskByEnvironment(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_staging", 1, 10, now.Add(-time.Minute))
+	prodTask := rollbackGuardrailTask(2, 20, now)
+	prodTask.Environment = "production"
+	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, true), []*storage.Task{
+		rollbackGuardrailTask(1, 10, now.Add(-time.Minute)),
+		prodTask,
+	})
+
+	gotApply, gotPlan, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+		ApplyIdentifier: "apply_staging",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     1,
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, apply, gotApply)
+	require.NotNil(t, gotPlan)
+	assert.Equal(t, int64(10), gotPlan.ID)
+}
+
+func newRollbackGuardrailService(apply *storage.Apply, plan *storage.Plan, tasks []*storage.Task) *Service {
+	return newRollbackGuardrailServiceWithApplies([]*storage.Apply{apply}, map[int64]*storage.Plan{plan.ID: plan}, tasks)
+}
+
+func newRollbackGuardrailServiceWithApplies(applies []*storage.Apply, plans map[int64]*storage.Plan, tasks []*storage.Task) *Service {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{plansByID: plans},
+		applies: &staticApplyStore{applies: applies},
+		tasks:   &capturingTaskStore{tasks: tasks},
+	}, testServerConfig(), nil, logger)
+}
+
+func rollbackGuardrailApply(identifier string, id, planID int64, completedAt time.Time) *storage.Apply {
+	return &storage.Apply{
+		ID:              id,
+		ApplyIdentifier: identifier,
+		PlanID:          planID,
+		Database:        "orders",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     1,
+		Environment:     "staging",
+		State:           state.Apply.Completed,
+		CompletedAt:     &completedAt,
+		CreatedAt:       completedAt,
+		UpdatedAt:       completedAt,
+	}
+}
+
+func rollbackGuardrailPlan(id int64, includeOriginalSchema bool) *storage.Plan {
+	plan := &storage.Plan{
+		ID:           id,
+		Database:     "orders",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Environment:  "staging",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"orders": {},
+		},
+	}
+	if includeOriginalSchema {
+		plan.Namespaces["orders"].OriginalSchema = map[string]string{
+			"users": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		}
+	}
+	return plan
+}
+
+func rollbackGuardrailTask(applyID, planID int64, completedAt time.Time) *storage.Task {
+	return &storage.Task{
+		ApplyID:      applyID,
+		PlanID:       planID,
+		Database:     "orders",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Repository:   "org/repo",
+		PullRequest:  1,
+		Environment:  "staging",
+		State:        state.Task.Completed,
+		CompletedAt:  &completedAt,
+		CreatedAt:    completedAt,
+		UpdatedAt:    completedAt,
+	}
+}
+
 func TestHandleStatusLimitAndEnvironment(t *testing.T) {
 	now := time.Now().UTC()
 	applies := &recentApplyStore{
@@ -2240,7 +2475,7 @@ func TestControlHandlersRejectClientDeployment(t *testing.T) {
 		{
 			name: "rollback plan",
 			path: "/api/rollback/plan",
-			body: `{"apply_id": "apply-123", "deployment": "default"}`,
+			body: `{"apply_id": "apply-123", "environment": "staging", "deployment": "default"}`,
 		},
 	}
 
@@ -2260,6 +2495,20 @@ func TestControlHandlersRejectClientDeployment(t *testing.T) {
 			assert.Contains(t, w.Body.String(), "deployment")
 		})
 	}
+}
+
+func TestRollbackPlanRequiresEnvironment(t *testing.T) {
+	svc := newTestService()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/rollback/plan", strings.NewReader(`{"apply_id": "apply-123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "environment is required")
 }
 
 func TestControlHandlersRejectClientDatabase(t *testing.T) {
@@ -2296,6 +2545,11 @@ func TestControlHandlersRejectClientDatabase(t *testing.T) {
 		{
 			name: "skip-revert",
 			path: "/api/skip-revert",
+			body: `{"database": "testdb", "environment": "staging", "apply_id": "apply-123"}`,
+		},
+		{
+			name: "rollback plan",
+			path: "/api/rollback/plan",
 			body: `{"database": "testdb", "environment": "staging", "apply_id": "apply-123"}`,
 		},
 	}
