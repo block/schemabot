@@ -254,6 +254,56 @@ func TestScheduler_OperatorClaimsOperationToCompletion(t *testing.T) {
 	require.NotNil(t, ops[0].CompletedAt, "completed operation stamps completed_at")
 }
 
+// TestScheduler_OperatorReconcilesOperationWhenParentTerminal covers the safety
+// case where the operator claims an apply_operations row whose parent apply is
+// already terminal — for example the operator flag is enabled after the apply
+// finished, or the parent reached a terminal state via another path. The
+// operator must reconcile the operation to the parent's terminal state rather
+// than re-claiming the same non-terminal row on every poll forever.
+func TestScheduler_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
+	ctx := t.Context()
+	appDBName, appDSN := createTestDB(t, "operator_reconcile_")
+	ts := startTestServerOperator(t, appDBName, appDSN)
+
+	now := time.Now()
+	applyID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-terminal-parent",
+		Database:        appDBName,
+		DatabaseType:    "mysql",
+		Deployment:      appDBName,
+		Engine:          "spirit",
+		State:           state.Apply.Completed,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: appDBName,
+		Target:     appDBName,
+		State:      state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+		if err != nil || op == nil {
+			return false
+		}
+		return state.IsState(op.State, state.ApplyOperation.Completed)
+	}, 10*time.Second, 100*time.Millisecond,
+		"operator should reconcile the operation to completed when its parent apply is already completed")
+
+	op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+	require.NoError(t, err)
+	require.NotNil(t, op)
+	assert.Equal(t, state.ApplyOperation.Completed, op.State)
+	require.NotNil(t, op.CompletedAt, "reconciled completed operation stamps completed_at")
+}
+
 func TestScheduler_ClaimOrdering(t *testing.T) {
 	ctx := t.Context()
 
