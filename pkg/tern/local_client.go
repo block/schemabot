@@ -769,10 +769,10 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			Credentials: creds,
 		}
 		if c.config.Type == storage.DatabaseTypeVitess {
-			resumeState, resumeErr := c.loadEngineResumeState(ctx, activeTask.ApplyID)
+			resumeState, resumeErr := c.loadEngineResumeState(ctx, activeTask)
 			if resumeErr != nil {
-				c.logger.Error("failed to load Vitess engine resume state for progress", "apply_id", activeTask.ApplyID, "error", resumeErr)
-				return nil, fmt.Errorf("load Vitess engine resume state for progress apply %d: %w", activeTask.ApplyID, resumeErr)
+				c.logger.Error("failed to load Vitess engine resume state for progress", "apply_id", activeTask.ApplyID, "task_id", activeTask.TaskIdentifier, "error", resumeErr)
+				return nil, fmt.Errorf("load Vitess engine resume state for progress task %s: %w", activeTask.TaskIdentifier, resumeErr)
 			}
 			progressReq.ResumeState = resumeState
 			vad, vadErr := c.storage.VitessApplyData().GetByApplyID(ctx, activeTask.ApplyID)
@@ -789,7 +789,12 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		if err == nil {
 			engineResult = result
 			if c.config.Type == storage.DatabaseTypeVitess && result.ResumeState != nil {
-				if saveErr := c.saveEngineResumeState(ctx, apply, result.ResumeState); saveErr != nil {
+				operationID, operationErr := applyOperationIDForTask(activeTask)
+				if operationErr != nil {
+					c.logger.Error("failed to resolve apply operation for Vitess engine resume state from progress", "apply_id", apply.ApplyIdentifier, "task_id", activeTask.TaskIdentifier, "error", operationErr)
+					return nil, fmt.Errorf("resolve apply operation for Vitess engine resume state from progress task %s: %w", activeTask.TaskIdentifier, operationErr)
+				}
+				if saveErr := c.saveEngineResumeStateForOperation(ctx, operationID, result.ResumeState); saveErr != nil {
 					c.logger.Error("failed to save Vitess engine resume state from progress", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 					return nil, fmt.Errorf("save Vitess engine resume state from progress apply %s: %w", apply.ApplyIdentifier, saveErr)
 				}

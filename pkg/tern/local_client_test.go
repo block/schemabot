@@ -134,7 +134,7 @@ type exactProgressStorage struct {
 	logs            storage.ApplyLogStore
 	controlRequests storage.ControlRequestStore
 	vitessApplyData storage.VitessApplyDataStore
-	resumeStates    storage.EngineResumeStateStore
+	applyOperations storage.ApplyOperationStore
 }
 
 func (s *exactProgressStorage) Applies() storage.ApplyStore { return s.applies }
@@ -151,8 +151,8 @@ func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
 func (s *exactProgressStorage) VitessApplyData() storage.VitessApplyDataStore {
 	return s.vitessApplyData
 }
-func (s *exactProgressStorage) EngineResumeStates() storage.EngineResumeStateStore {
-	return s.resumeStates
+func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
+	return s.applyOperations
 }
 
 type exactProgressVitessApplyDataStore struct {
@@ -165,24 +165,25 @@ func (s *exactProgressVitessApplyDataStore) GetByApplyID(context.Context, int64)
 	return s.data, s.err
 }
 
-type exactProgressEngineResumeStateStore struct {
-	storage.EngineResumeStateStore
+type exactProgressApplyOperationStore struct {
+	storage.ApplyOperationStore
 	data  *storage.EngineResumeState
 	err   error
 	saved *storage.EngineResumeState
 }
 
-func (s *exactProgressEngineResumeStateStore) Save(_ context.Context, resumeState *storage.EngineResumeState) error {
+func (s *exactProgressApplyOperationStore) SaveEngineResumeState(_ context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
 	if s.err != nil {
 		return s.err
 	}
 	clone := *resumeState
+	clone.ApplyOperationID = operationID
 	s.saved = &clone
 	s.data = &clone
 	return nil
 }
 
-func (s *exactProgressEngineResumeStateStore) GetByApplyID(context.Context, int64) (*storage.EngineResumeState, error) {
+func (s *exactProgressApplyOperationStore) GetEngineResumeState(context.Context, int64) (*storage.EngineResumeState, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -344,17 +345,19 @@ func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *test
 }
 
 func TestLocalClient_VitessProgressRequiresEngineResumeState(t *testing.T) {
+	operationID := int64(99)
 	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-progress", DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale}
 	task := &storage.Task{
-		ID:             7,
-		ApplyID:        apply.ID,
-		TaskIdentifier: "task-vitess-progress",
-		Database:       "testdb",
-		DatabaseType:   storage.DatabaseTypeVitess,
-		Engine:         storage.EnginePlanetScale,
-		Namespace:      "commerce",
-		TableName:      "users",
-		State:          state.Task.Running,
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-progress",
+		Database:         "testdb",
+		DatabaseType:     storage.DatabaseTypeVitess,
+		Engine:           storage.EnginePlanetScale,
+		Namespace:        "commerce",
+		TableName:        "users",
+		State:            state.Task.Running,
 	}
 	eng := &fakeControlEngine{}
 	client := &LocalClient{
@@ -366,7 +369,7 @@ func TestLocalClient_VitessProgressRequiresEngineResumeState(t *testing.T) {
 			applies:         &exactProgressApplyStore{apply: apply},
 			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
 			vitessApplyData: &exactProgressVitessApplyDataStore{},
-			resumeStates:    &exactProgressEngineResumeStateStore{},
+			applyOperations: &exactProgressApplyOperationStore{},
 		},
 		planetscaleEngine: eng,
 		logger:            slog.Default(),
@@ -382,27 +385,28 @@ func TestLocalClient_VitessProgressRequiresEngineResumeState(t *testing.T) {
 }
 
 func TestLocalClient_VitessProgressPassesAndPersistsEngineResumeState(t *testing.T) {
+	operationID := int64(99)
 	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-progress", DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale}
 	task := &storage.Task{
-		ID:             7,
-		ApplyID:        apply.ID,
-		TaskIdentifier: "task-vitess-progress",
-		Database:       "testdb",
-		DatabaseType:   storage.DatabaseTypeVitess,
-		Engine:         storage.EnginePlanetScale,
-		Namespace:      "commerce",
-		TableName:      "users",
-		State:          state.Task.Running,
-		DDLAction:      "alter",
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-progress",
+		Database:         "testdb",
+		DatabaseType:     storage.DatabaseTypeVitess,
+		Engine:           storage.EnginePlanetScale,
+		Namespace:        "commerce",
+		TableName:        "users",
+		State:            state.Task.Running,
+		DDLAction:        "alter",
 	}
 	storedResumeState := &storage.EngineResumeState{
-		ApplyID:          apply.ID,
-		Engine:           storage.EnginePlanetScale,
+		ApplyOperationID: operationID,
 		MigrationContext: "ctx-123",
 		Metadata:         `{"branch_name":"branch-123","deploy_request_id":321,"deploy_request_url":"https://example.test/deploys/321"}`,
 	}
 	updatedMetadata := `{"branch_name":"branch-123","deploy_request_id":321,"deploy_request_url":"https://example.test/deploys/321","is_instant":true}`
-	resumeStates := &exactProgressEngineResumeStateStore{data: storedResumeState}
+	applyOperations := &exactProgressApplyOperationStore{data: storedResumeState}
 	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{
 		State: engine.StateRunning,
 		ResumeState: &engine.ResumeState{
@@ -429,7 +433,7 @@ func TestLocalClient_VitessProgressPassesAndPersistsEngineResumeState(t *testing
 				ApplyID:   apply.ID,
 				IsInstant: true,
 			}},
-			resumeStates: resumeStates,
+			applyOperations: applyOperations,
 		},
 		planetscaleEngine: eng,
 		logger:            slog.Default(),
@@ -445,10 +449,9 @@ func TestLocalClient_VitessProgressPassesAndPersistsEngineResumeState(t *testing
 	require.NotNil(t, eng.progressReq.ResumeState)
 	assert.Equal(t, storedResumeState.MigrationContext, eng.progressReq.ResumeState.MigrationContext)
 	assert.JSONEq(t, storedResumeState.Metadata, eng.progressReq.ResumeState.Metadata)
-	require.NotNil(t, resumeStates.saved)
-	assert.Equal(t, apply.ID, resumeStates.saved.ApplyID)
-	assert.Equal(t, storage.EnginePlanetScale, resumeStates.saved.Engine)
-	assert.JSONEq(t, updatedMetadata, resumeStates.saved.Metadata)
+	require.NotNil(t, applyOperations.saved)
+	assert.Equal(t, operationID, applyOperations.saved.ApplyOperationID)
+	assert.JSONEq(t, updatedMetadata, applyOperations.saved.Metadata)
 	require.Len(t, progress.Tables, 1)
 	assert.Equal(t, int32(42), progress.Tables[0].PercentComplete)
 	assert.True(t, progress.Tables[0].IsInstant)

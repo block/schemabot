@@ -41,9 +41,6 @@ type Storage interface {
 	// VitessApplyData returns the Vitess apply data store.
 	VitessApplyData() VitessApplyDataStore
 
-	// EngineResumeStates returns the opaque engine resume state store.
-	EngineResumeStates() EngineResumeStateStore
-
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -370,6 +367,12 @@ type ApplyOperationStore interface {
 	// MarkFailed sets state=failed, error_message, and completed_at on a child row.
 	MarkFailed(ctx context.Context, id int64, errMsg string) error
 
+	// SaveEngineResumeState stores opaque engine resume state on the operation.
+	SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *EngineResumeState) error
+
+	// GetEngineResumeState returns opaque engine resume state for the operation.
+	GetEngineResumeState(ctx context.Context, operationID int64) (*EngineResumeState, error)
+
 	// FindNextApplyOperation atomically claims the next child row that needs
 	// attention and refreshes its heartbeat in the same transaction.
 	//
@@ -401,15 +404,6 @@ type VitessApplyDataStore interface {
 
 	// GetByApplyID returns the Vitess apply data for the given apply ID.
 	GetByApplyID(ctx context.Context, applyID int64) (*VitessApplyData, error)
-}
-
-// EngineResumeStateStore manages opaque engine resume state.
-type EngineResumeStateStore interface {
-	// Save creates or updates opaque engine resume state for an apply.
-	Save(ctx context.Context, resumeState *EngineResumeState) error
-
-	// GetByApplyID returns opaque engine resume state for the given apply ID.
-	GetByApplyID(ctx context.Context, applyID int64) (*EngineResumeState, error)
 }
 
 // ApplyLogStore manages apply log entries for debugging and audit.

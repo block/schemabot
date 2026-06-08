@@ -46,6 +46,8 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.Empty(t, got.ErrorMessage)
 	assert.Nil(t, got.StartedAt)
 	assert.Nil(t, got.CompletedAt)
+	assert.Empty(t, got.EngineResumeContext)
+	assert.Empty(t, got.EngineResumeMetadata)
 	assert.NotZero(t, got.CreatedAt)
 	assert.NotZero(t, got.UpdatedAt)
 }
@@ -58,6 +60,79 @@ func TestApplyOperationStore_Get_NotFound(t *testing.T) {
 	got, err := store.ApplyOperations().Get(ctx, 999999)
 	require.NoError(t, err)
 	require.Nil(t, got)
+}
+
+func TestApplyOperationStore_EngineResumeState(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+	apply := createTestApply(t, store, lock, "apply_op_engine_resume_state", 1)
+	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: "region-a",
+		Target:     "payments",
+	})
+	require.NoError(t, err)
+
+	_, err = store.ApplyOperations().GetEngineResumeState(ctx, operationID)
+	require.ErrorIs(t, err, storage.ErrEngineResumeStateNotFound)
+
+	require.ErrorContains(t, store.ApplyOperations().SaveEngineResumeState(ctx, operationID, nil), "resume state is nil")
+	require.ErrorContains(t, store.ApplyOperations().SaveEngineResumeState(ctx, operationID, &storage.EngineResumeState{
+		ApplyOperationID: operationID + 1,
+		MigrationContext: "ctx-wrong-operation",
+		Metadata:         `{"branch_name":"wrong-branch"}`,
+	}), "resume state belongs to apply_operation")
+
+	initial := &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: "ctx-123",
+		Metadata:         `{"branch_name":"branch-123","deploy_request_id":123}`,
+	}
+	require.NoError(t, store.ApplyOperations().SaveEngineResumeState(ctx, operationID, initial))
+
+	retrieved, err := store.ApplyOperations().GetEngineResumeState(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, operationID, retrieved.ApplyOperationID)
+	assert.Equal(t, "ctx-123", retrieved.MigrationContext)
+	assert.JSONEq(t, initial.Metadata, retrieved.Metadata)
+
+	operation, err := store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, operation)
+	assert.Equal(t, "ctx-123", operation.EngineResumeContext)
+	assert.JSONEq(t, initial.Metadata, operation.EngineResumeMetadata)
+
+	updated := &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: "ctx-456",
+		Metadata:         `{"branch_name":"branch-456","deploy_request_id":456}`,
+	}
+	require.NoError(t, store.ApplyOperations().SaveEngineResumeState(ctx, operationID, updated))
+
+	retrieved, err = store.ApplyOperations().GetEngineResumeState(ctx, operationID)
+	require.NoError(t, err)
+	assert.Equal(t, "ctx-456", retrieved.MigrationContext)
+	assert.JSONEq(t, updated.Metadata, retrieved.Metadata)
+}
+
+func TestApplyOperationStore_EngineResumeStateMissingOperation(t *testing.T) {
+	clearTables(t)
+	store := New(testDB)
+
+	resumeState, err := store.ApplyOperations().GetEngineResumeState(t.Context(), 99999)
+	require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
+	assert.Nil(t, resumeState)
+
+	err = store.ApplyOperations().SaveEngineResumeState(t.Context(), 99999, &storage.EngineResumeState{
+		ApplyOperationID: 99999,
+		MigrationContext: "ctx-missing",
+		Metadata:         `{"branch_name":"missing"}`,
+	})
+	require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
 }
 
 func TestApplyOperationStore_GetByApplyAndDeployment(t *testing.T) {
@@ -722,6 +797,28 @@ func TestApplyOperationStore_LeaseGuardsWrites(t *testing.T) {
 	afterCurrentHeartbeat, err := store.ApplyOperations().Get(ctx, heartbeatID)
 	require.NoError(t, err)
 	assert.True(t, afterCurrentHeartbeat.UpdatedAt.After(beforeHeartbeat.UpdatedAt))
+
+	resumeID := createApplyOperationForLeaseTest(t, store, apply.ID, "region-resume-state")
+	require.ErrorIs(t, store.ApplyOperations().SaveEngineResumeState(staleCtx, resumeID, &storage.EngineResumeState{
+		ApplyOperationID: resumeID,
+		MigrationContext: "stale-context",
+		Metadata:         `{"deploy_request_id":123}`,
+	}), storage.ErrApplyLeaseLost)
+	resumeAfterStale, err := store.ApplyOperations().Get(ctx, resumeID)
+	require.NoError(t, err)
+	require.NotNil(t, resumeAfterStale)
+	assert.Empty(t, resumeAfterStale.EngineResumeContext)
+	assert.Empty(t, resumeAfterStale.EngineResumeMetadata)
+	require.NoError(t, store.ApplyOperations().SaveEngineResumeState(currentCtx, resumeID, &storage.EngineResumeState{
+		ApplyOperationID: resumeID,
+		MigrationContext: "current-context",
+		Metadata:         `{"deploy_request_id":456}`,
+	}))
+	resumeAfterCurrent, err := store.ApplyOperations().Get(ctx, resumeID)
+	require.NoError(t, err)
+	require.NotNil(t, resumeAfterCurrent)
+	assert.Equal(t, "current-context", resumeAfterCurrent.EngineResumeContext)
+	assert.JSONEq(t, `{"deploy_request_id":456}`, resumeAfterCurrent.EngineResumeMetadata)
 
 	otherID := createApplyOperationForLeaseTest(t, store, otherApply.ID, "region-other")
 	require.ErrorIs(t, store.ApplyOperations().UpdateState(currentCtx, otherID, state.ApplyOperation.Running), storage.ErrApplyLeaseLost)

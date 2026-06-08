@@ -441,6 +441,12 @@ type ApplyOperation struct {
 	// CompletedAt is when this child row reached a terminal state.
 	CompletedAt *time.Time
 
+	// EngineResumeContext and EngineResumeMetadata are opaque state owned by the
+	// engine package and scoped to this execution operation. SchemaBot stores and
+	// replays them but does not interpret them for control/progress calls.
+	EngineResumeContext  string
+	EngineResumeMetadata string
+
 	// CreatedAt is when the child row was inserted (typically at apply create).
 	CreatedAt time.Time
 
@@ -810,11 +816,7 @@ type VitessApplyData struct {
 
 // EngineResumeState stores opaque resume data owned by the engine package.
 type EngineResumeState struct {
-	ID               int64
-	ApplyID          int64
-	Engine           string
+	ApplyOperationID int64
 	MigrationContext string
 	Metadata         string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
 }

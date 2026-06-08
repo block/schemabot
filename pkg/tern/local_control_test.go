@@ -72,13 +72,13 @@ func (s *controlTestApplyLogStore) Append(context.Context, *storage.ApplyLog) er
 	return nil
 }
 
-type controlTestEngineResumeStateStore struct {
-	storage.EngineResumeStateStore
+type controlTestApplyOperationStore struct {
+	storage.ApplyOperationStore
 	data *storage.EngineResumeState
 	err  error
 }
 
-func (s *controlTestEngineResumeStateStore) GetByApplyID(context.Context, int64) (*storage.EngineResumeState, error) {
+func (s *controlTestApplyOperationStore) GetEngineResumeState(context.Context, int64) (*storage.EngineResumeState, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -93,7 +93,7 @@ type controlTestStorage struct {
 	applies         storage.ApplyStore
 	tasks           storage.TaskStore
 	applyLogs       storage.ApplyLogStore
-	resumeStates    storage.EngineResumeStateStore
+	applyOperations storage.ApplyOperationStore
 	controlRequests storage.ControlRequestStore
 }
 
@@ -113,8 +113,8 @@ func (s *controlTestStorage) VitessApplyData() storage.VitessApplyDataStore {
 	return nil
 }
 
-func (s *controlTestStorage) EngineResumeStates() storage.EngineResumeStateStore {
-	return s.resumeStates
+func (s *controlTestStorage) ApplyOperations() storage.ApplyOperationStore {
+	return s.applyOperations
 }
 
 func (s *controlTestStorage) ControlRequests() storage.ControlRequestStore {
@@ -175,36 +175,34 @@ func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, res
 			Type:     storage.DatabaseTypeVitess,
 		},
 		storage: &controlTestStorage{
-			applies:      &controlTestApplyStore{apply: apply},
-			tasks:        &controlTestTaskStore{tasks: tasks},
-			applyLogs:    &controlTestApplyLogStore{},
-			resumeStates: &controlTestEngineResumeStateStore{data: resumeState},
+			applies:         &controlTestApplyStore{apply: apply},
+			tasks:           &controlTestTaskStore{tasks: tasks},
+			applyLogs:       &controlTestApplyLogStore{},
+			applyOperations: &controlTestApplyOperationStore{data: resumeState},
 		},
 		planetscaleEngine: eng,
 		logger:            slog.Default(),
 	}
 }
 
-func engineResumeStateFromPlanetScaleData(t *testing.T, applyID int64, data planetscale.ResumeData) *storage.EngineResumeState {
+func engineResumeStateFromPlanetScaleData(t *testing.T, operationID int64, data planetscale.ResumeData) *storage.EngineResumeState {
 	t.Helper()
 	engineState, err := planetscale.BuildResumeState(data)
 	require.NoError(t, err)
 	return &storage.EngineResumeState{
-		ApplyID:          applyID,
-		Engine:           storage.EnginePlanetScale,
+		ApplyOperationID: operationID,
 		MigrationContext: engineState.MigrationContext,
 		Metadata:         engineState.Metadata,
 	}
 }
 
-func maybeEngineResumeStateFromPlanetScaleData(applyID int64, data planetscale.ResumeData) *storage.EngineResumeState {
+func maybeEngineResumeStateFromPlanetScaleData(operationID int64, data planetscale.ResumeData) *storage.EngineResumeState {
 	engineState, err := planetscale.BuildResumeState(data)
 	if err != nil {
 		return nil
 	}
 	return &storage.EngineResumeState{
-		ApplyID:          applyID,
-		Engine:           storage.EnginePlanetScale,
+		ApplyOperationID: operationID,
 		MigrationContext: engineState.MigrationContext,
 		Metadata:         engineState.Metadata,
 	}
@@ -247,12 +245,14 @@ func TestLocalClient_StopMarksMySQLApplyStopped(t *testing.T) {
 // apply. If that state is missing, LocalClient returns an error before
 // invoking the engine so the storage invariant violation is visible.
 func TestLocalClient_CutoverRequiresEngineResumeState(t *testing.T) {
+	operationID := int64(99)
 	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-control"}
 	task := &storage.Task{
-		ID:             7,
-		ApplyID:        apply.ID,
-		TaskIdentifier: "task-vitess-control",
-		State:          state.Task.WaitingForCutover,
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-control",
+		State:            state.Task.WaitingForCutover,
 	}
 	eng := &controlCaptureEngine{}
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
@@ -302,15 +302,17 @@ func TestLocalClient_CutoverRequiresCompleteEngineResumeState(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			operationID := int64(99)
 			apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-control"}
 			task := &storage.Task{
-				ID:             7,
-				ApplyID:        apply.ID,
-				TaskIdentifier: "task-vitess-control",
-				State:          state.Task.WaitingForCutover,
+				ID:               7,
+				ApplyID:          apply.ID,
+				ApplyOperationID: &operationID,
+				TaskIdentifier:   "task-vitess-control",
+				State:            state.Task.WaitingForCutover,
 			}
 			eng := planetscale.New(slog.Default())
-			resumeState := maybeEngineResumeStateFromPlanetScaleData(apply.ID, tc.resumeData)
+			resumeState := maybeEngineResumeStateFromPlanetScaleData(operationID, tc.resumeData)
 			client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
 			_, err := client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier})
@@ -325,12 +327,14 @@ func TestLocalClient_CutoverRequiresCompleteEngineResumeState(t *testing.T) {
 // server-side deploy request. LocalClient should pass that metadata through to
 // the engine without requiring a live progress poll first.
 func TestLocalClient_CutoverPassesEngineResumeState(t *testing.T) {
+	operationID := int64(99)
 	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-control"}
 	task := &storage.Task{
-		ID:             7,
-		ApplyID:        apply.ID,
-		TaskIdentifier: "task-vitess-control",
-		State:          state.Task.WaitingForCutover,
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-control",
+		State:            state.Task.WaitingForCutover,
 	}
 	resumeData := planetscale.ResumeData{
 		BranchName:       "branch-123",
@@ -340,7 +344,7 @@ func TestLocalClient_CutoverPassesEngineResumeState(t *testing.T) {
 		IsInstant:        true,
 		DeferredDeploy:   true,
 	}
-	resumeState := engineResumeStateFromPlanetScaleData(t, apply.ID, resumeData)
+	resumeState := engineResumeStateFromPlanetScaleData(t, operationID, resumeData)
 	eng := &controlCaptureEngine{}
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
@@ -372,14 +376,16 @@ func TestLocalClient_CutoverPassesEngineResumeState(t *testing.T) {
 // cannot cancel the deploy request, LocalClient should return the error instead
 // of marking the apply cancelled locally.
 func TestLocalClient_StopReturnsVitessEngineStopError(t *testing.T) {
+	operationID := int64(99)
 	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-control"}
 	task := &storage.Task{
-		ID:             7,
-		ApplyID:        apply.ID,
-		TaskIdentifier: "task-vitess-control",
-		State:          state.Task.Running,
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-control",
+		State:            state.Task.Running,
 	}
-	resumeState := engineResumeStateFromPlanetScaleData(t, apply.ID, planetscale.ResumeData{
+	resumeState := engineResumeStateFromPlanetScaleData(t, operationID, planetscale.ResumeData{
 		BranchName:       "branch-123",
 		DeployRequestID:  321,
 		MigrationContext: "ctx-123",

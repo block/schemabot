@@ -577,9 +577,9 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 		Credentials: creds,
 	}
 	if c.config.Type == storage.DatabaseTypeVitess {
-		resumeState, err := c.loadEngineResumeState(ctx, task.ApplyID)
+		resumeState, err := c.loadEngineResumeState(ctx, task)
 		if err != nil {
-			return nil, fmt.Errorf("load Vitess engine resume state for apply %d: %w", task.ApplyID, err)
+			return nil, fmt.Errorf("load Vitess engine resume state for task %s: %w", task.TaskIdentifier, err)
 		}
 		req.ResumeState = resumeState
 	}

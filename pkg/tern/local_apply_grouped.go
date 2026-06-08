@@ -113,7 +113,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
 				return
 			}
-			if saveErr := c.saveEngineResumeState(ctx, apply, rs); saveErr != nil {
+			if saveErr := c.saveEngineResumeState(ctx, tasks, rs); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist opaque resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 				return
 			}
@@ -176,7 +176,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	if result.ResumeState != nil {
 		resumeState = result.ResumeState
 		if c.config.Type == storage.DatabaseTypeVitess {
-			if saveErr := c.saveEngineResumeState(ctx, apply, resumeState); saveErr != nil {
+			if saveErr := c.saveEngineResumeState(ctx, tasks, resumeState); saveErr != nil {
 				c.logger.Error("failed to save opaque engine resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 				c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
 				return
@@ -232,33 +232,40 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState)
 }
 
-func (c *LocalClient) saveEngineResumeState(ctx context.Context, apply *storage.Apply, resumeState *engine.ResumeState) error {
+func (c *LocalClient) saveEngineResumeState(ctx context.Context, tasks []*storage.Task, resumeState *engine.ResumeState) error {
+	operationID, err := applyOperationIDForTasks(tasks)
+	if err != nil {
+		return err
+	}
+	return c.saveEngineResumeStateForOperation(ctx, operationID, resumeState)
+}
+
+func (c *LocalClient) saveEngineResumeStateForOperation(ctx context.Context, operationID int64, resumeState *engine.ResumeState) error {
 	metadata := resumeState.Metadata
 	if metadata == "" {
 		metadata = "{}"
 	}
-	engineName := apply.Engine
-	if engineName == "" {
-		engineName = storage.EngineForType(apply.DatabaseType)
-	}
-	store := c.storage.EngineResumeStates()
+	store := c.storage.ApplyOperations()
 	if store == nil {
-		return fmt.Errorf("engine resume state store is not configured")
+		return fmt.Errorf("apply operation store is not configured")
 	}
-	return store.Save(ctx, &storage.EngineResumeState{
-		ApplyID:          apply.ID,
-		Engine:           engineName,
+	return store.SaveEngineResumeState(ctx, operationID, &storage.EngineResumeState{
+		ApplyOperationID: operationID,
 		MigrationContext: resumeState.MigrationContext,
 		Metadata:         metadata,
 	})
 }
 
-func (c *LocalClient) loadEngineResumeState(ctx context.Context, applyID int64) (*engine.ResumeState, error) {
-	store := c.storage.EngineResumeStates()
-	if store == nil {
-		return nil, fmt.Errorf("engine resume state store is not configured")
+func (c *LocalClient) loadEngineResumeState(ctx context.Context, task *storage.Task) (*engine.ResumeState, error) {
+	operationID, err := applyOperationIDForTask(task)
+	if err != nil {
+		return nil, err
 	}
-	stored, err := store.GetByApplyID(ctx, applyID)
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return nil, fmt.Errorf("apply operation store is not configured")
+	}
+	stored, err := store.GetEngineResumeState(ctx, operationID)
 	if err != nil {
 		return nil, err
 	}
@@ -266,6 +273,40 @@ func (c *LocalClient) loadEngineResumeState(ctx context.Context, applyID int64) 
 		MigrationContext: stored.MigrationContext,
 		Metadata:         stored.Metadata,
 	}, nil
+}
+
+func applyOperationIDForTasks(tasks []*storage.Task) (int64, error) {
+	var operationID int64
+	for _, task := range tasks {
+		if task == nil {
+			return 0, fmt.Errorf("engine resume state task is nil")
+		}
+		id, err := applyOperationIDForTask(task)
+		if err != nil {
+			return 0, err
+		}
+		if operationID == 0 {
+			operationID = id
+			continue
+		}
+		if operationID != id {
+			return 0, fmt.Errorf("engine resume state spans multiple apply operations: %d and %d", operationID, id)
+		}
+	}
+	if operationID == 0 {
+		return 0, fmt.Errorf("engine resume state has no apply operation")
+	}
+	return operationID, nil
+}
+
+func applyOperationIDForTask(task *storage.Task) (int64, error) {
+	if task == nil {
+		return 0, fmt.Errorf("engine resume state task is nil")
+	}
+	if task.ApplyOperationID == nil || *task.ApplyOperationID == 0 {
+		return 0, fmt.Errorf("task %s has no apply_operation_id for engine resume state", task.TaskIdentifier)
+	}
+	return *task.ApplyOperationID, nil
 }
 
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
@@ -341,7 +382,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	if result.ResumeState != nil && resumeState != nil {
 		*resumeState = *result.ResumeState
 		if c.config.Type == storage.DatabaseTypeVitess {
-			if saveErr := c.saveEngineResumeState(ctx, apply, resumeState); saveErr != nil {
+			if saveErr := c.saveEngineResumeState(ctx, tasks, resumeState); saveErr != nil {
 				c.logger.Error("failed to save Vitess engine resume state from progress polling",
 					"apply_id", apply.ApplyIdentifier, "error", saveErr)
 				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state from progress polling: %v", saveErr))

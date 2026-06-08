@@ -1,11 +1,6 @@
 // apply_operations.go implements ApplyOperationStore for per-(apply,
 // deployment) child rows under a multi-deployment apply — the unit of work
 // the operator claims.
-//
-// This file ships the storage primitive only; no other code path in
-// SchemaBot reads or writes these rows yet. The apply-create dual-write
-// and operator claim/lock relocation arrive in subsequent PRs in the
-// multi-deployment apply workstream.
 package mysqlstore
 
 import (
@@ -23,7 +18,8 @@ import (
 
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, deployment, target, state, error_message,
-	started_at, completed_at, created_at, updated_at`
+	started_at, completed_at, engine_resume_context, engine_resume_metadata,
+	created_at, updated_at`
 
 // mysqlErrDupEntry is MySQL's error number for a duplicate-key violation.
 // Used to translate unique-index conflicts into typed storage errors.
@@ -61,11 +57,11 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 	result, err := exec.ExecContext(ctx, `
 		INSERT INTO apply_operations (
 			apply_id, deployment, target, state, error_message,
-			started_at, completed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
+			started_at, completed_at, engine_resume_context, engine_resume_metadata
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		ad.ApplyID, ad.Deployment, ad.Target, stateVal, nullString(ad.ErrorMessage),
-		ad.StartedAt, ad.CompletedAt,
+		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
 		var mysqlErr *mysql.MySQLError
@@ -312,6 +308,65 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 	return s.checkUpdatedOrExists(ctx, result, id, lease, hasLease, false)
 }
 
+// SaveEngineResumeState stores opaque engine state on the operation that owns
+// the execution. It updates only resume-state columns so callers can persist
+// engine progress without changing operation lifecycle state.
+func (s *applyOperationStore) SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
+	if resumeState == nil {
+		return fmt.Errorf("save engine resume state for apply_operation %d: resume state is nil", operationID)
+	}
+	if resumeState.ApplyOperationID != 0 && resumeState.ApplyOperationID != operationID {
+		return fmt.Errorf("save engine resume state for apply_operation %d: resume state belongs to apply_operation %d", operationID, resumeState.ApplyOperationID)
+	}
+	lease, hasLease, err := applyOperationLeaseFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	metadata := resumeState.Metadata
+	if metadata == "" {
+		metadata = "{}"
+	}
+	leaseJoin, leasePredicate, leaseArgs := applyOperationLeaseSQL(lease, hasLease)
+	args := append([]any{nullString(resumeState.MigrationContext), metadata, operationID}, leaseArgs...)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations ao
+		`+leaseJoin+`
+		SET ao.engine_resume_context = ?, ao.engine_resume_metadata = ?
+		WHERE ao.id = ?`+leasePredicate+`
+	`, args...)
+	if err != nil {
+		return fmt.Errorf("save engine resume state for apply_operation %d: %w", operationID, err)
+	}
+	return s.checkUpdatedOrExists(ctx, result, operationID, lease, hasLease, false)
+}
+
+// GetEngineResumeState returns opaque engine state for an operation. Missing
+// state is distinct from a missing operation so control/progress callers can
+// surface the storage invariant violation clearly.
+func (s *applyOperationStore) GetEngineResumeState(ctx context.Context, operationID int64) (*storage.EngineResumeState, error) {
+	var contextVal sql.NullString
+	var metadata sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT engine_resume_context, engine_resume_metadata
+		FROM apply_operations
+		WHERE id = ?
+	`, operationID).Scan(&contextVal, &metadata)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storage.ErrApplyOperationNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get engine resume state for apply_operation %d: %w", operationID, err)
+	}
+	if !metadata.Valid || metadata.String == "" {
+		return nil, storage.ErrEngineResumeStateNotFound
+	}
+	return &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: contextVal.String,
+		Metadata:         metadata.String,
+	}, nil
+}
+
 // applyOperationHeartbeatStaleness is the lease window after which a claimed
 // apply_operations row may be re-claimed by another worker. Mirrors the apply
 // heartbeat staleness in applies.go.
@@ -484,11 +539,13 @@ func scanApplyOperations(rows *sql.Rows) ([]*storage.ApplyOperation, error) {
 func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var ad storage.ApplyOperation
 	var errMsg sql.NullString
+	var engineResumeContext, engineResumeMetadata sql.NullString
 	var startedAt, completedAt sql.NullTime
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.Target, &ad.State, &errMsg,
-		&startedAt, &completedAt, &ad.CreatedAt, &ad.UpdatedAt,
+		&startedAt, &completedAt, &engineResumeContext, &engineResumeMetadata,
+		&ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -503,6 +560,12 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	if completedAt.Valid {
 		t := completedAt.Time
 		ad.CompletedAt = &t
+	}
+	if engineResumeContext.Valid {
+		ad.EngineResumeContext = engineResumeContext.String
+	}
+	if engineResumeMetadata.Valid {
+		ad.EngineResumeMetadata = engineResumeMetadata.String
 	}
 	return &ad, nil
 }

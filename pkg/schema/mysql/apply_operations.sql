@@ -3,6 +3,8 @@ CREATE TABLE `apply_operations` (
   `apply_id` bigint unsigned NOT NULL,
   `deployment` varchar(255) NOT NULL,
   `target` varchar(255) NOT NULL DEFAULT '',
+  `engine_resume_context` varchar(255) DEFAULT NULL,
+  `engine_resume_metadata` json DEFAULT NULL,
   `state` varchar(100) NOT NULL DEFAULT 'pending',
   `error_message` text,
   `started_at` datetime DEFAULT NULL,
