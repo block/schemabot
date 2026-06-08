@@ -87,9 +87,67 @@ func TestRecordUnregisteredRepositoryWebhook(t *testing.T) {
 	assert.True(t, found)
 }
 
+func TestRecordWebhookEventKnownObservedGitHubLabels(t *testing.T) {
+	seenUnknownWebhookMetricLabels = sync.Map{}
+	t.Cleanup(func() {
+		seenUnknownWebhookMetricLabels = sync.Map{}
+	})
+
+	reader := metric.NewManualReader()
+	mp := metric.NewMeterProvider(metric.WithReader(reader))
+	previousProvider := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	defer func() {
+		otel.SetMeterProvider(previousProvider)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	}()
+
+	RecordWebhookEvent(t.Context(), "default", "check_suite", "requested", "octocat/hello-world", "ignored")
+	RecordWebhookEvent(t.Context(), "default", "pull_request", "enqueued", "octocat/hello-world", "processed")
+	RecordWebhookEvent(t.Context(), "default", "pull_request", "dequeued", "octocat/hello-world", "processed")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	got := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.webhook.events_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			for _, dp := range sum.DataPoints {
+				key := metricAttributeString(t, dp.Attributes, "event_type") + ":" +
+					metricAttributeString(t, dp.Attributes, "action") + ":" +
+					metricAttributeString(t, dp.Attributes, "status")
+				got[key] = dp.Value
+			}
+		}
+	}
+	assert.Equal(t, map[string]int64{
+		"check_suite:requested:ignored":   1,
+		"pull_request:enqueued:processed": 1,
+		"pull_request:dequeued:processed": 1,
+	}, got)
+
+	var unknownLabels int
+	seenUnknownWebhookMetricLabels.Range(func(_, _ any) bool {
+		unknownLabels++
+		return true
+	})
+	assert.Zero(t, unknownLabels)
+}
+
 func assertMetricAttribute(t *testing.T, attrs attribute.Set, key string, want string) {
+	t.Helper()
+	got := metricAttributeString(t, attrs, key)
+	assert.Equal(t, want, got)
+}
+
+func metricAttributeString(t *testing.T, attrs attribute.Set, key string) string {
 	t.Helper()
 	got, ok := attrs.Value(attribute.Key(key))
 	require.True(t, ok)
-	assert.Equal(t, want, got.AsString())
+	return got.AsString()
 }

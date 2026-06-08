@@ -593,6 +593,7 @@ func RecordSchedulerClaimDuration(ctx context.Context, duration time.Duration, d
 
 // knownWebhookEvents limits metric cardinality to expected GitHub event types.
 var knownWebhookEvents = map[string]bool{
+	"check_suite":                 true,
 	"create":                      true,
 	"issues":                      true,
 	"issue_comment":               true,
@@ -615,8 +616,10 @@ var knownWebhookActions = map[string]bool{
 	"created":                true,
 	"deleted":                true,
 	"demilestoned":           true,
+	"dequeued":               true,
 	"dismissed":              true,
 	"edited":                 true,
+	"enqueued":               true,
 	"labeled":                true,
 	"locked":                 true,
 	"milestoned":             true,
