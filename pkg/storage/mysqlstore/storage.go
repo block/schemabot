@@ -22,6 +22,7 @@ type Storage struct {
 	checks          *checkStore
 	settings        *settingsStore
 	vitessApplyData *vitessApplyDataStore
+	resumeStates    *engineResumeStateStore
 }
 
 // New creates a new MySQL storage instance.
@@ -39,6 +40,7 @@ func New(db *sql.DB) *Storage {
 		checks:          &checkStore{db: db},
 		settings:        &settingsStore{db: db},
 		vitessApplyData: &vitessApplyDataStore{db: db},
+		resumeStates:    &engineResumeStateStore{db: db},
 	}
 }
 
@@ -95,6 +97,11 @@ func (s *Storage) Settings() storage.SettingsStore {
 // VitessApplyData returns the Vitess apply data store.
 func (s *Storage) VitessApplyData() storage.VitessApplyDataStore {
 	return s.vitessApplyData
+}
+
+// EngineResumeStates returns the opaque engine resume state store.
+func (s *Storage) EngineResumeStates() storage.EngineResumeStateStore {
+	return s.resumeStates
 }
 
 // Ping verifies the database connection is alive.

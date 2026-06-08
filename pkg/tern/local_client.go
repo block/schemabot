@@ -750,8 +750,8 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	eng := c.getEngine()
 
 	// Get live progress from engine for the currently running task.
-	// For Vitess, reconstruct ResumeState from vitess_apply_data so the engine
-	// can poll the deploy request and query SHOW VITESS_MIGRATIONS.
+	// For Vitess, load opaque ResumeState so the engine can poll the deploy
+	// request and query SHOW VITESS_MIGRATIONS.
 	var engineResult *engine.ProgressResult
 	var vitessApplyIsInstant bool
 	// Query engine for live progress. For Vitess, also query during pending state
@@ -769,6 +769,12 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			Credentials: creds,
 		}
 		if c.config.Type == storage.DatabaseTypeVitess {
+			resumeState, resumeErr := c.loadEngineResumeState(ctx, activeTask.ApplyID)
+			if resumeErr != nil {
+				c.logger.Error("failed to load Vitess engine resume state for progress", "apply_id", activeTask.ApplyID, "error", resumeErr)
+				return nil, fmt.Errorf("load Vitess engine resume state for progress apply %d: %w", activeTask.ApplyID, resumeErr)
+			}
+			progressReq.ResumeState = resumeState
 			vad, vadErr := c.storage.VitessApplyData().GetByApplyID(ctx, activeTask.ApplyID)
 			switch {
 			case vadErr != nil:
@@ -777,17 +783,17 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				c.logger.Warn("VitessApplyData not found for progress — apply may still be initializing", "apply_id", activeTask.ApplyID)
 			default:
 				vitessApplyIsInstant = vad.IsInstant
-				resumeState, resumeErr := planetscale.BuildResumeState(planetscaleResumeData(vad))
-				if resumeErr != nil {
-					c.logger.Error("failed to build Vitess resume state for progress", "apply_id", activeTask.ApplyID, "error", resumeErr)
-				} else {
-					progressReq.ResumeState = resumeState
-				}
 			}
 		}
 		result, err := eng.Progress(ctx, progressReq)
 		if err == nil {
 			engineResult = result
+			if c.config.Type == storage.DatabaseTypeVitess && result.ResumeState != nil {
+				if saveErr := c.saveEngineResumeState(ctx, apply, result.ResumeState); saveErr != nil {
+					c.logger.Error("failed to save Vitess engine resume state from progress", "apply_id", apply.ApplyIdentifier, "error", saveErr)
+					return nil, fmt.Errorf("save Vitess engine resume state from progress apply %s: %w", apply.ApplyIdentifier, saveErr)
+				}
+			}
 			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
 			engineTaskState := taskStateFromProgressResult(result)
 			taskState := taskStateWithNoBackwardProgress(activeTask.State, engineTaskState)

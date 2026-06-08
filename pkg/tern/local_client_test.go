@@ -71,10 +71,13 @@ func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
 
 type fakeControlEngine struct {
 	engine.Engine
-	stopCount     int
-	cutoverCount  int
-	cutoverResult *engine.ControlResult
-	cutoverErr    error
+	stopCount      int
+	cutoverCount   int
+	cutoverResult  *engine.ControlResult
+	cutoverErr     error
+	progressReq    *engine.ProgressRequest
+	progressResult *engine.ProgressResult
+	progressErr    error
 }
 
 func (e *fakeControlEngine) Name() string { return "fake" }
@@ -87,7 +90,11 @@ func (e *fakeControlEngine) Apply(context.Context, *engine.ApplyRequest) (*engin
 	return &engine.ApplyResult{Accepted: true}, nil
 }
 
-func (e *fakeControlEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+func (e *fakeControlEngine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	e.progressReq = req
+	if e.progressResult != nil || e.progressErr != nil {
+		return e.progressResult, e.progressErr
+	}
 	return &engine.ProgressResult{State: engine.StateRunning}, nil
 }
 
@@ -126,6 +133,8 @@ type exactProgressStorage struct {
 	tasks           storage.TaskStore
 	logs            storage.ApplyLogStore
 	controlRequests storage.ControlRequestStore
+	vitessApplyData storage.VitessApplyDataStore
+	resumeStates    storage.EngineResumeStateStore
 }
 
 func (s *exactProgressStorage) Applies() storage.ApplyStore { return s.applies }
@@ -138,6 +147,49 @@ func (s *exactProgressStorage) ApplyLogs() storage.ApplyLogStore {
 }
 func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
 	return s.controlRequests
+}
+func (s *exactProgressStorage) VitessApplyData() storage.VitessApplyDataStore {
+	return s.vitessApplyData
+}
+func (s *exactProgressStorage) EngineResumeStates() storage.EngineResumeStateStore {
+	return s.resumeStates
+}
+
+type exactProgressVitessApplyDataStore struct {
+	storage.VitessApplyDataStore
+	data *storage.VitessApplyData
+	err  error
+}
+
+func (s *exactProgressVitessApplyDataStore) GetByApplyID(context.Context, int64) (*storage.VitessApplyData, error) {
+	return s.data, s.err
+}
+
+type exactProgressEngineResumeStateStore struct {
+	storage.EngineResumeStateStore
+	data  *storage.EngineResumeState
+	err   error
+	saved *storage.EngineResumeState
+}
+
+func (s *exactProgressEngineResumeStateStore) Save(_ context.Context, resumeState *storage.EngineResumeState) error {
+	if s.err != nil {
+		return s.err
+	}
+	clone := *resumeState
+	s.saved = &clone
+	s.data = &clone
+	return nil
+}
+
+func (s *exactProgressEngineResumeStateStore) GetByApplyID(context.Context, int64) (*storage.EngineResumeState, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.data == nil {
+		return nil, storage.ErrEngineResumeStateNotFound
+	}
+	return s.data, nil
 }
 
 func TestApplyCancelHandleDoesNotCancelNewerOwner(t *testing.T) {
@@ -289,6 +341,117 @@ func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *test
 			require.ErrorIs(t, err, tc.wantError)
 		})
 	}
+}
+
+func TestLocalClient_VitessProgressRequiresEngineResumeState(t *testing.T) {
+	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-progress", DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-vitess-progress",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Engine:         storage.EnginePlanetScale,
+		Namespace:      "commerce",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	eng := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			vitessApplyData: &exactProgressVitessApplyDataStore{},
+			resumeStates:    &exactProgressEngineResumeStateStore{},
+		},
+		planetscaleEngine: eng,
+		logger:            slog.Default(),
+	}
+
+	_, err := client.Progress(t.Context(), &ternv1.ProgressRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: "staging",
+	})
+
+	require.ErrorIs(t, err, storage.ErrEngineResumeStateNotFound)
+	assert.Nil(t, eng.progressReq, "progress should not call the engine without resume state")
+}
+
+func TestLocalClient_VitessProgressPassesAndPersistsEngineResumeState(t *testing.T) {
+	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-progress", DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-vitess-progress",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Engine:         storage.EnginePlanetScale,
+		Namespace:      "commerce",
+		TableName:      "users",
+		State:          state.Task.Running,
+		DDLAction:      "alter",
+	}
+	storedResumeState := &storage.EngineResumeState{
+		ApplyID:          apply.ID,
+		Engine:           storage.EnginePlanetScale,
+		MigrationContext: "ctx-123",
+		Metadata:         `{"branch_name":"branch-123","deploy_request_id":321,"deploy_request_url":"https://example.test/deploys/321"}`,
+	}
+	updatedMetadata := `{"branch_name":"branch-123","deploy_request_id":321,"deploy_request_url":"https://example.test/deploys/321","is_instant":true}`
+	resumeStates := &exactProgressEngineResumeStateStore{data: storedResumeState}
+	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{
+		State: engine.StateRunning,
+		ResumeState: &engine.ResumeState{
+			MigrationContext: "ctx-123",
+			Metadata:         updatedMetadata,
+		},
+		Tables: []engine.TableProgress{{
+			Namespace: "commerce",
+			Table:     "users",
+			State:     state.Task.Running,
+			Progress:  42,
+			IsInstant: true,
+		}},
+	}}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			vitessApplyData: &exactProgressVitessApplyDataStore{data: &storage.VitessApplyData{
+				ApplyID:   apply.ID,
+				IsInstant: true,
+			}},
+			resumeStates: resumeStates,
+		},
+		planetscaleEngine: eng,
+		logger:            slog.Default(),
+	}
+
+	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: "staging",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, eng.progressReq)
+	require.NotNil(t, eng.progressReq.ResumeState)
+	assert.Equal(t, storedResumeState.MigrationContext, eng.progressReq.ResumeState.MigrationContext)
+	assert.JSONEq(t, storedResumeState.Metadata, eng.progressReq.ResumeState.Metadata)
+	require.NotNil(t, resumeStates.saved)
+	assert.Equal(t, apply.ID, resumeStates.saved.ApplyID)
+	assert.Equal(t, storage.EnginePlanetScale, resumeStates.saved.Engine)
+	assert.JSONEq(t, updatedMetadata, resumeStates.saved.Metadata)
+	require.Len(t, progress.Tables, 1)
+	assert.Equal(t, int32(42), progress.Tables[0].PercentComplete)
+	assert.True(t, progress.Tables[0].IsInstant)
 }
 
 func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {

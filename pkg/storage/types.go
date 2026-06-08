@@ -807,3 +807,14 @@ type VitessApplyData struct {
 	// this can take longer as shards are processed in batches.
 	RevertSkippedAt *time.Time
 }
+
+// EngineResumeState stores opaque resume data owned by the engine package.
+type EngineResumeState struct {
+	ID               int64
+	ApplyID          int64
+	Engine           string
+	MigrationContext string
+	Metadata         string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}

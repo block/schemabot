@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/engine/planetscale"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -578,20 +577,9 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 		Credentials: creds,
 	}
 	if c.config.Type == storage.DatabaseTypeVitess {
-		store := c.storage.VitessApplyData()
-		if store == nil {
-			return nil, fmt.Errorf("vitess apply data store is not configured")
-		}
-		vad, err := store.GetByApplyID(ctx, task.ApplyID)
+		resumeState, err := c.loadEngineResumeState(ctx, task.ApplyID)
 		if err != nil {
-			return nil, fmt.Errorf("load Vitess apply data for apply %d: %w", task.ApplyID, err)
-		}
-		if vad == nil {
-			return nil, fmt.Errorf("load Vitess apply data for apply %d: %w", task.ApplyID, storage.ErrVitessApplyDataNotFound)
-		}
-		resumeState, err := planetscale.BuildResumeState(planetscaleResumeData(vad))
-		if err != nil {
-			return nil, fmt.Errorf("build Vitess resume state for apply %d: %w", task.ApplyID, err)
+			return nil, fmt.Errorf("load Vitess engine resume state for apply %d: %w", task.ApplyID, err)
 		}
 		req.ResumeState = resumeState
 	}
@@ -601,20 +589,6 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 		}
 	}
 	return req, nil
-}
-
-func planetscaleResumeData(vad *storage.VitessApplyData) planetscale.ResumeData {
-	if vad == nil {
-		return planetscale.ResumeData{}
-	}
-	return planetscale.ResumeData{
-		BranchName:       vad.BranchName,
-		DeployRequestID:  vad.DeployRequestID,
-		DeployRequestURL: vad.DeployRequestURL,
-		MigrationContext: vad.MigrationContext,
-		IsInstant:        vad.IsInstant,
-		DeferredDeploy:   vad.DeferredDeploy,
-	}
 }
 
 // Volume modifies the schema change speed/concurrency in-flight.

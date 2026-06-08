@@ -33,7 +33,7 @@ func TestEnsureSchema(t *testing.T) {
 	require.NoError(t, EnsureSchema(dsn, logger), "First EnsureSchema failed")
 
 	// Verify tables exist
-	tables := []string{"tasks", "plans", "locks", "checks", "settings", "apply_operations", "vitess_apply_data", "vitess_tasks"}
+	tables := []string{"tasks", "plans", "locks", "checks", "settings", "apply_operations", "engine_resume_states", "vitess_apply_data", "vitess_tasks"}
 	for _, table := range tables {
 		assert.True(t, testutil.TableExists(t, db, "schemabot", table), "Table %s not found", table)
 	}
