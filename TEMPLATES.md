@@ -1721,6 +1721,50 @@ schemabot stop apply-a1b2c3d4e5f6
 </details>
 
 <details>
+<summary><a name="second-table-estimate-exceeded"></a><strong>Second Table Estimate Exceeded</strong></summary>
+
+
+## Schema Change In Progress
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+📊 1/3 complete · 1 running (Active) · 1 queued
+
+### Table Progress
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Active
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+- Rows copied: 145,000,000 so far
+- ℹ️ _More rows than initially estimated, copying is still active and will continue_
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6
+```
+
+</details>
+
+<details>
 <summary><a name="third-table-running"></a><strong>Third Table Running</strong></summary>
 
 
@@ -4761,6 +4805,21 @@ The following changes will permanently delete data:
 
 ```
 </details>
+
+
+## Interactive TUI (CLI)
+
+```
+⣾ Running...
+
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Active ⠋
+       ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+       • Rows copied: 145,250,000 so far
+       • ℹ️ More rows than initially estimated, copying is still active and will continue
+
+
+ESC detach • s stop • v volume
+```
 
 
 ## Exit Context (CLI)

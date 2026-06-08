@@ -267,8 +267,8 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		tbl := &apitypes.TableProgressResponse{
 			TableName:       "orders",
 			PercentComplete: 105,
-			RowsCopied:      230000,
-			RowsTotal:       221000,
+			RowsCopied:      221000,
+			RowsTotal:       230000,
 		}
 
 		output := captureOutput(t, func() {
@@ -277,6 +277,28 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		plain := stripANSI(output)
 
 		assert.Contains(t, plain, "progress=100%")
+	})
+
+	t.Run("estimate exceeded shows active progress", func(t *testing.T) {
+		e := &logEmitter{}
+		ts := &tableLogState{}
+		tbl := &apitypes.TableProgressResponse{
+			TableName:       "orders",
+			PercentComplete: 145,
+			RowsCopied:      145000,
+			RowsTotal:       100000,
+		}
+
+		output := captureOutput(t, func() {
+			e.emitProgressHeartbeat(tbl, ts)
+		})
+		plain := stripANSI(output)
+
+		assert.Contains(t, plain, "progress=Active")
+		assert.Contains(t, plain, "rows_copied=\"145,000 so far\"")
+		assert.NotContains(t, plain, "145%")
+		assert.NotContains(t, plain, "100%")
+		assert.NotContains(t, plain, "rows=100,000/100,000")
 	})
 
 	t.Run("no task_id in output", func(t *testing.T) {

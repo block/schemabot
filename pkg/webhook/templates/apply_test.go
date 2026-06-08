@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -63,6 +64,31 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 
 	assert.Contains(t, result, "**`products`**")
 	assert.Contains(t, result, "Queued")
+}
+
+func TestRenderApplyStatusComment_EstimateExceeded(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Running,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", Status: state.Task.Completed},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: state.Task.Running, RowsCopied: 145000, RowsTotal: 100000, PercentComplete: 145},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "1 running (Active)")
+	assert.Contains(t, result, ui.ProgressBarActivity()+" Active")
+	assert.Contains(t, result, "- Rows copied: 145,000 so far\n- ℹ️ _"+ui.EstimateExceededTooltip+"_")
+	assert.NotContains(t, result, "[ℹ️](##")
+	assert.NotContains(t, result, "<br>")
+	assert.NotContains(t, result, "145%")
+	assert.NotContains(t, result, "100%")
+	assert.NotContains(t, result, "100,000 / 100,000")
 }
 
 func TestRenderApplyStatusComment_Completed(t *testing.T) {
@@ -372,6 +398,17 @@ func TestPreviewCommentApplyProgress(t *testing.T) {
 	assert.Contains(t, result, "**`products`**")
 	assert.Contains(t, result, "62%")
 	assert.Contains(t, result, "Queued")
+}
+
+func TestPreviewCommentApplyEstimateExceeded(t *testing.T) {
+	result := PreviewCommentApplyEstimateExceeded()
+
+	assert.Contains(t, result, "Schema Change In Progress")
+	assert.Contains(t, result, "1 running (Active)")
+	assert.Contains(t, result, "Active")
+	assert.Contains(t, result, "Rows copied: 145,000,000 so far")
+	assert.NotContains(t, result, "145%")
+	assert.NotContains(t, result, "100,000,000 / 100,000,000")
 }
 
 func TestPreviewCommentApplyCompleted(t *testing.T) {

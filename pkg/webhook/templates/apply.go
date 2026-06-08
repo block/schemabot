@@ -188,6 +188,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 
 	var completed, running, queued, failed, stopped, waiting, recovering, cutting, cancelled int
 	var runningPct int
+	var runningEstimateExceeded bool
 
 	for _, t := range tables {
 		switch state.NormalizeTaskStatus(t.Status) {
@@ -195,7 +196,11 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			completed++
 		case state.Task.Running:
 			running++
-			runningPct = t.PercentComplete
+			if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
+				runningEstimateExceeded = true
+			} else {
+				runningPct = ui.ClampPercent(t.PercentComplete)
+			}
 		case state.Task.Pending:
 			queued++
 		case state.Task.WaitingForCutover:
@@ -226,7 +231,9 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		if multi {
 			label = fmt.Sprintf("%d running", running)
 		}
-		if runningPct > 0 {
+		if runningEstimateExceeded {
+			label += " (Active)"
+		} else if runningPct > 0 {
 			label += fmt.Sprintf(" (%d%%)", runningPct)
 		}
 		parts = append(parts, label)
@@ -371,6 +378,14 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 // renderRunningTable renders a table that is actively copying rows.
 func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 	if table.RowsTotal > 0 {
+		if ui.EstimateExceeded(table.RowsCopied, table.RowsTotal) {
+			fmt.Fprintf(sb, "**`%s`**: %s Active\n", table.TableName, ui.ProgressBarActivity())
+			writeDDLLine(sb, table.DDL)
+			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
+			fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
+			return
+		}
+
 		pct := ui.ClampPercent(table.PercentComplete)
 		bar := ui.ProgressBarRowCopy(pct)
 		fmt.Fprintf(sb, "**`%s`**: %s %d%%\n", table.TableName, bar, pct)
@@ -776,13 +791,13 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
 	case state.Task.Failed:
 		label := "Failed"
 		if t.PercentComplete > 0 {
-			label = fmt.Sprintf("Failed at %d%%", t.PercentComplete)
+			label = fmt.Sprintf("Failed at %d%%", ui.ClampPercent(t.PercentComplete))
 		}
 		fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, label)
 	case state.Task.Stopped:
 		label := "Stopped"
 		if t.PercentComplete > 0 {
-			label = fmt.Sprintf("Stopped at %d%%", t.PercentComplete)
+			label = fmt.Sprintf("Stopped at %d%%", ui.ClampPercent(t.PercentComplete))
 		}
 		fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, label)
 	case "reverted":

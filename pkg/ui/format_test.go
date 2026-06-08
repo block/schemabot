@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
@@ -30,6 +31,13 @@ func TestTableStatePriority(t *testing.T) {
 			assert.Equal(t, tt.expected, TableStatePriority(tt.state))
 		})
 	}
+}
+
+func TestProgressBarActivity(t *testing.T) {
+	bar := ProgressBarActivity()
+
+	assert.Equal(t, 20, strings.Count(bar, ColorBlue))
+	assert.Zero(t, strings.Count(bar, ColorEmpty))
 }
 
 func TestCleanLintReason(t *testing.T) {

@@ -458,29 +458,25 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	// If Spirit provides per-table progress, use it
 	if len(spiritProgress.Tables) > 0 {
 		for _, st := range spiritProgress.Tables {
+			rowsCopied := int64(st.RowsCopied)
+			rowsTotal := int64(st.RowsTotal)
 			tp := engine.TableProgress{
 				Namespace:  rm.tableNamespace[st.TableName],
 				Table:      st.TableName,
 				DDL:        ddlByTable[st.TableName],
 				State:      stateStr,
-				RowsCopied: int64(st.RowsCopied),
-				RowsTotal:  int64(st.RowsTotal),
+				RowsCopied: rowsCopied,
+				RowsTotal:  rowsTotal,
 			}
 			// Calculate percent (clamp to 100 — concurrent inserts can cause RowsCopied > RowsTotal)
 			if st.RowsTotal > 0 {
 				tp.Progress = min(int(float64(st.RowsCopied)/float64(st.RowsTotal)*100), 100)
 			}
-			// Clamp rows copied for display (concurrent inserts can cause RowsCopied > RowsTotal)
-			displayCopied := st.RowsCopied
-			if st.RowsTotal > 0 && displayCopied > st.RowsTotal {
-				displayCopied = st.RowsTotal
-			}
-			tp.RowsCopied = int64(displayCopied)
 
 			// Build progress detail string (ETA is shown at status line level, not per-table)
 			if st.RowsTotal > 0 {
 				tp.ProgressDetail = fmt.Sprintf("%d/%d %d%% copyRows",
-					displayCopied, st.RowsTotal, tp.Progress)
+					st.RowsCopied, st.RowsTotal, tp.Progress)
 			}
 			if st.IsComplete {
 				tp.State = "completed"

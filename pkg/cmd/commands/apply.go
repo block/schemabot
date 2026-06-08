@@ -426,7 +426,7 @@ func kvColor(key string) string {
 	switch key {
 	case "table", "keyspace":
 		return ansiCyan
-	case "progress", "rows", "eta", "duration":
+	case "progress", "rows", "rows_copied", "eta", "duration":
 		return ansiBold
 	case "status":
 		return ansiYellow
@@ -861,12 +861,19 @@ func recoveringLogMessage(tbl *apitypes.TableProgressResponse) string {
 
 // emitProgressHeartbeat emits a progress line for a table actively copying rows.
 func (e *logEmitter) emitProgressHeartbeat(tbl *apitypes.TableProgressResponse, ts *tableLogState) {
-	pct := min(int(tbl.PercentComplete), 100)
 	kvs := tableKVs("Copying rows", tbl, ts)
-	kvs = append(kvs,
-		"progress", fmt.Sprintf("%d%%", pct),
-		"rows", fmt.Sprintf("%s/%s", ui.FormatNumber(ui.ClampRows(tbl.RowsCopied, tbl.RowsTotal)), ui.FormatNumber(tbl.RowsTotal)),
-	)
+	if ui.EstimateExceeded(tbl.RowsCopied, tbl.RowsTotal) {
+		kvs = append(kvs,
+			"progress", "Active",
+			"rows_copied", fmt.Sprintf("%s so far", ui.FormatNumber(tbl.RowsCopied)),
+		)
+	} else {
+		pct := ui.ClampPercent(int(tbl.PercentComplete))
+		kvs = append(kvs,
+			"progress", fmt.Sprintf("%d%%", pct),
+			"rows", fmt.Sprintf("%s/%s", ui.FormatNumber(ui.ClampRows(tbl.RowsCopied, tbl.RowsTotal)), ui.FormatNumber(tbl.RowsTotal)),
+		)
+	}
 
 	// Try to extract ETA from Spirit progress detail
 	if tbl.ProgressDetail != "" {

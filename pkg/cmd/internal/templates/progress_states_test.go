@@ -268,6 +268,41 @@ func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 	})
 }
 
+func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
+	t.Run("structured progress", func(t *testing.T) {
+		tp := TableProgress{
+			TableName:       "users",
+			ChangeType:      "alter",
+			Status:          state.Apply.Running,
+			RowsCopied:      145000,
+			RowsTotal:       100000,
+			PercentComplete: 145,
+		}
+
+		output := FormatTableProgress(tp)
+		assert.Contains(t, output, ui.ProgressBarActivity()+" Active")
+		assert.Contains(t, output, "Rows copied: 145,000 so far")
+		assert.Contains(t, output, ui.EstimateExceededTooltip)
+		assert.NotContains(t, output, "145%")
+		assert.NotContains(t, output, "100%")
+		assert.NotContains(t, output, "100,000 / 100,000")
+	})
+
+	t.Run("parsed Spirit progress", func(t *testing.T) {
+		tp := TableProgress{
+			TableName:      "users",
+			ChangeType:     "alter",
+			Status:         state.Apply.Running,
+			ProgressDetail: "145000/100000 100% copyRows ETA TBD",
+		}
+
+		output := FormatTableProgress(tp)
+		assert.Contains(t, output, ui.ProgressBarActivity()+" Active")
+		assert.Contains(t, output, "Rows copied: 145,000 so far")
+		assert.NotContains(t, output, "100%")
+	})
+}
+
 func TestVSchemaStatusLabel(t *testing.T) {
 	assert.Equal(t, "Pending", vschemaStatusLabel(state.Apply.Pending))
 	assert.Equal(t, "Pending", vschemaStatusLabel(state.Apply.WaitingForDeploy))

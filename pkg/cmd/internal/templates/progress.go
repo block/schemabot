@@ -214,6 +214,19 @@ func WriteProgress(data ProgressData) {
 // keyspaces where all tables share the same terminal status.
 // This prevents a wall of "Complete" lines for 30+ unsharded keyspaces.
 func FormatNamespacedTables(tables []TableProgress) string {
+	return FormatNamespacedTablesWithActivityBar(tables, ui.ProgressBarActivity())
+}
+
+// FormatNamespacedTablesWithActivityBar returns tables grouped by keyspace using
+// the provided activity bar when row-copy progress has exceeded its estimate.
+func FormatNamespacedTablesWithActivityBar(tables []TableProgress, activityBar string) string {
+	return FormatNamespacedTablesWithActivity(tables, activityBar, "Active")
+}
+
+// FormatNamespacedTablesWithActivity returns tables grouped by keyspace using
+// the provided activity bar and label when row-copy progress has exceeded its
+// estimate.
+func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, activityLabel string) string {
 	type nsEntry struct {
 		namespace string
 		tables    []TableProgress
@@ -284,7 +297,7 @@ func FormatNamespacedTables(tables []TableProgress) string {
 					break
 				}
 				b.WriteString(FormatKeyspaceHeader(ns))
-				b.WriteString(FormatTableProgress(g.tables[0]))
+				b.WriteString(FormatTableProgressWithActivity(g.tables[0], activityBar, activityLabel))
 			}
 		} else {
 			b.WriteString(FormatKeyspaceHeader(g.namespaces[0]))
@@ -296,7 +309,7 @@ func FormatNamespacedTables(tables []TableProgress) string {
 			}
 			for _, t := range g.tables {
 				if !isVSchemaTask(t) {
-					b.WriteString(FormatTableProgress(t))
+					b.WriteString(FormatTableProgressWithActivity(t, activityBar, activityLabel))
 				}
 			}
 		}
@@ -419,6 +432,19 @@ func FormatProgressState(s string) string {
 //	DDL statement (indented below)
 //	Rows: X / Y (if applicable)
 func FormatTableProgress(t TableProgress) string {
+	return FormatTableProgressWithActivityBar(t, ui.ProgressBarActivity())
+}
+
+// FormatTableProgressWithActivityBar returns progress for a single table using
+// the provided activity bar when row-copy progress has exceeded its estimate.
+func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) string {
+	return FormatTableProgressWithActivity(t, activityBar, "Active")
+}
+
+// FormatTableProgressWithActivity returns progress for a single table using the
+// provided activity bar and label when row-copy progress has exceeded its
+// estimate.
+func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
 	var b strings.Builder
 
 	// Instant DDL: show "Applying instantly" for any non-terminal state.
@@ -533,8 +559,9 @@ func FormatTableProgress(t TableProgress) string {
 		return b.String()
 	case state.Apply.Cancelled:
 		if t.PercentComplete > 0 {
-			bar := ui.ProgressBarFailed(t.PercentComplete)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⊘ Cancelled at %d%%\n", t.TableName, bar, t.PercentComplete)
+			cancelledPercent := ui.ClampPercent(t.PercentComplete)
+			bar := ui.ProgressBarFailed(cancelledPercent)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⊘ Cancelled at %d%%\n", t.TableName, bar, cancelledPercent)
 		} else {
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⊘ Cancelled (not started)\n", t.TableName)
 		}
@@ -572,9 +599,15 @@ func FormatTableProgress(t TableProgress) string {
 	switch {
 	case t.ProgressDetail != "":
 		if info := ParseSpiritProgress(t.ProgressDetail); info != nil {
+			if ui.EstimateExceeded(info.RowsCopied, info.RowsTotal) && info.State == "copyRows" {
+				b.WriteString(formatEstimateExceededTable(t, info.RowsCopied, activityBar, activityLabel))
+				return b.String()
+			}
+
 			// Parsed successfully - show emoji progress bar with structured data
-			bar := ui.ProgressBarRowCopy(info.Percent)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%\n", t.TableName, bar, info.Percent)
+			displayPercent := ui.ClampPercent(info.Percent)
+			bar := ui.ProgressBarRowCopy(displayPercent)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%\n", t.TableName, bar, displayPercent)
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDL(t.DDL))
 			}
@@ -603,9 +636,14 @@ func FormatTableProgress(t TableProgress) string {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
 	case t.RowsTotal > 0:
+		if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
+			b.WriteString(formatEstimateExceededTable(t, t.RowsCopied, activityBar, activityLabel))
+			return b.String()
+		}
+
 		// Row copy in progress — show progress bar with structured fields
-		bar := ui.ProgressBarRowCopy(t.PercentComplete)
-		displayPercent := min(t.PercentComplete, 100)
+		displayPercent := ui.ClampPercent(t.PercentComplete)
+		bar := ui.ProgressBarRowCopy(displayPercent)
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%\n", t.TableName, bar, displayPercent)
 
 		if t.DDL != "" {
@@ -653,6 +691,17 @@ func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 		return
 	}
 	fmt.Fprintf(b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
+}
+
+func formatEstimateExceededTable(t TableProgress, rowsCopied int64, activityBar, activityLabel string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, activityBar, activityLabel)
+	if t.DDL != "" {
+		b.WriteString(formatProgressDDL(t.DDL))
+	}
+	fmt.Fprintf(&b, indentDetail+"Rows copied: %s so far\n", ui.FormatNumber(rowsCopied))
+	fmt.Fprintf(&b, indentDetail+"%sℹ️ %s%s\n", ANSIDim, ui.EstimateExceededTooltip, ANSIReset)
+	return b.String()
 }
 
 // writeTableProgress writes progress for a single table to stdout.

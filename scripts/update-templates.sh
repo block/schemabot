@@ -124,6 +124,20 @@ render_cli_section() {
     echo "" >> "$SNAPSHOT"
 }
 
+# Helper: render a single CLI/TUI snapshot as a fenced terminal block.
+render_cli_snapshot_section() {
+    local heading="$1"
+    local preview_type="$2"
+
+    echo "" >> "$SNAPSHOT"
+    echo "## ${heading}" >> "$SNAPSHOT"
+    echo "" >> "$SNAPSHOT"
+    echo '```' >> "$SNAPSHOT"
+    "$BINARY" preview "$preview_type" 2>&1 | strip_ansi >> "$SNAPSHOT"
+    echo '```' >> "$SNAPSHOT"
+    echo "" >> "$SNAPSHOT"
+}
+
 # === Paired sections (PR + CLI) ===
 render_paired_section "Plan & Status"  "comment_plan_all"       "cli_plan_all"
 render_paired_section "Locking"        "comment_locking_all"    "cli_locking_all"
@@ -143,4 +157,5 @@ render_paired_section "Apply Flow"     "comment_apply_flow_all" "cli_apply_all"
 render_cli_section "Sequential Mode (CLI)" "sequential_all"
 render_cli_section "Defer Cutover (CLI)"   "defer_all"
 render_cli_section "Lint & Unsafe (CLI)"   "lint_all"
+render_cli_snapshot_section "Interactive TUI (CLI)" "tui_estimate_exceeded"
 render_cli_section "Exit Context (CLI)"    "exit_all"

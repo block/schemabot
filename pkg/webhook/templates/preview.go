@@ -665,6 +665,18 @@ func PreviewCommentApplyProgress() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
+// PreviewCommentApplyEstimateExceeded renders an apply comment where the active row copy has exceeded MySQL's initial estimate.
+func PreviewCommentApplyEstimateExceeded() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Running
+	tables[1].RowsCopied = 145000000
+	tables[1].RowsTotal = 100000000
+	tables[1].PercentComplete = 100
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
 // PreviewCommentApplyThirdRunning renders an apply comment where the third table is running.
 func PreviewCommentApplyThirdRunning() string {
 	tables := sampleApplyTables()

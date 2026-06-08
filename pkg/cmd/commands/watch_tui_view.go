@@ -328,12 +328,15 @@ func (m WatchModel) renderTables(b *strings.Builder, tables []tableProgress) {
 		}
 	}
 
+	activityBar := ui.ProgressBarActivity()
+	activityLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+	activityLabel := activityLabelStyle.Render("Active " + activityLabelFrames[m.activityLabelFrame%len(activityLabelFrames)])
 	if hasNamespaces {
-		b.WriteString(templates.FormatNamespacedTables(tplTables))
+		b.WriteString(templates.FormatNamespacedTablesWithActivity(tplTables, activityBar, activityLabel))
 	} else {
 		b.WriteString("\n")
 		for _, t := range tplTables {
-			b.WriteString(templates.FormatTableProgress(t))
+			b.WriteString(templates.FormatTableProgressWithActivity(t, activityBar, activityLabel))
 		}
 	}
 }

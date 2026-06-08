@@ -52,7 +52,7 @@ key to debugging stale-progress issues.
 Key details:
 - **ETA is embedded in `Summary`**, not a separate field. Downstream layers parse it out with a regex.
 - **`IsComplete`** comes from the chunker's in-memory `finalChunkSent` flag, NOT from the checkpoint table. This means `IsComplete` is lost on crash — it only exists while the runner is alive.
-- **`RowsCopied` can exceed `RowsTotal`** when rows are inserted during the copy. All downstream layers clamp this for display.
+- **`RowsCopied` can exceed `RowsTotal`** when the initial MySQL estimate is low. Downstream renderers treat this as an active estimate-exceeded state rather than a percentage above 100%.
 
 ## Engine layer
 
@@ -64,7 +64,7 @@ Key details:
 3. Determines overall state: preserves terminal states (`stopped`, `failed`) from `runningMigration.state` — Spirit's state doesn't override these.
 4. Builds per-table `engine.TableProgress`:
    - Calculates `Progress` percent (clamped 0–100).
-   - Clamps `RowsCopied` to `RowsTotal` for display.
+   - Preserves raw `RowsCopied` so renderers can detect when the initial estimate was exceeded.
    - Sets `ProgressDetail` = formatted summary like `"12345/50000 24% copyRows"`.
    - If `IsComplete` is true, overrides `State` to `"complete"` and `Progress` to 100.
 
@@ -163,7 +163,7 @@ The TUI polls the API every **2 seconds** via `tick()`.
 
 `parseProgressResult()` converts the JSON response to internal types. For each table,
 if `ProgressDetail` is non-empty, it runs `ParseSpiritProgress()` — a regex parser
-in `pkg/cmd/templates/progress.go` that extracts structured data from Spirit's summary string:
+in `pkg/cmd/internal/templates/progress.go` that extracts structured data from Spirit's summary string:
 
 ```
 "71436/221193 32.30% copyRows ETA 5m 30s"
@@ -180,7 +180,7 @@ numeric fields.
 The TUI and CLI use emoji progress bars to convey state at a glance. Each color maps to a
 specific state. The bar is 20 squares wide; filled squares represent percent complete.
 
-Defined in `pkg/cmd/templates/progress.go`.
+Defined in `pkg/cmd/internal/templates/progress.go`.
 
 ### Progress bar colors
 
@@ -195,10 +195,18 @@ Defined in `pkg/cmd/templates/progress.go`.
 
 ### Per-table display by state
 
-**Copying rows** — blue bar with percent, row counts, and ETA:
+**Copying rows** — blue bar with percent, row counts, and ETA while the estimate still holds:
 ```
   orders: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32% (71,436/221,193 rows) ETA 5m 30s
           ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Copying rows after estimate exceeded** — full-width activity indicator with no percentage:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Active
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 145,000 so far
+       • ℹ️ More rows than initially estimated, copying is still active and will continue
 ```
 
 **Queued** (pending, not yet started) — empty bar:
@@ -301,5 +309,6 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
    The engine layer doesn't extract it into a separate field — it flows through as `ProgressDetail`
    and is parsed by the CLI with a regex. If the regex fails, no ETA is shown.
 
-6. **`RowsCopied` clamping.** Spirit can report `RowsCopied > RowsTotal` due to concurrent inserts.
-   The engine layer clamps rows for display, and the CLI templates also clamp independently.
+6. **Estimate-exceeded display.** Spirit can report `RowsCopied > RowsTotal` when MySQL's initial
+   estimate is low. SchemaBot preserves the raw copied count, clamps determinate percentages to 100,
+   and switches active row-copy renderers to an `Active` display with copied-so-far rows.

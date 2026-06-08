@@ -12,6 +12,7 @@ import (
 // PreviewCmd previews CLI output templates without running schema changes.
 type PreviewCmd struct {
 	Type string `arg:"" optional:"" help:"Preview type (run 'schemabot preview' for valid types)"`
+	Live bool   `help:"Run interactive preview for TUI preview types"`
 }
 
 // Run executes the preview command.
@@ -24,6 +25,9 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	if cmd.Type == "" {
 		printPreviewUsage()
 		return nil
+	}
+	if strings.HasPrefix(cmd.Type, "tui_") {
+		return previewTUI(cmd.Type, cmd.Live)
 	}
 
 	previewType := templates.PreviewType(cmd.Type)
@@ -76,6 +80,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyPlan, templates.PreviewCommentApplyPlanOptions,
 		templates.PreviewCommentApplyPlanUnsafe,
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
+		templates.PreviewCommentApplyEstimateExceeded,
 		templates.PreviewCommentApplyFailed, templates.PreviewCommentApplyStopped,
 		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
 		templates.PreviewCommentSingleProgress, templates.PreviewCommentSingleComplete,
@@ -210,6 +215,10 @@ Log Output Mode (-o log):
   log_detailed          All fields including task_id
   log_all               Show all log output previews
 
+Interactive TUI:
+  tui_estimate_exceeded Show a TUI snapshot for an estimate-exceeded apply
+  --live                Run TUI previews against a fake in-process API
+
 Comment Templates (GitHub PR comments):
   comment_plan                  Plan comment with DDL changes + lint violations
   comment_plan_empty            Plan comment with no changes
@@ -224,6 +233,7 @@ Comment Templates (GitHub PR comments):
   comment_single_failed         Single table: failed
   comment_single_stopped        Single table: stopped
   comment_apply_progress        Multi-table: in progress (per-table progress bars)
+  comment_apply_estimate_exceeded Multi-table: running after MySQL row estimate was exceeded
   comment_apply_completed       Multi-table: completed (all tables done)
   comment_apply_failed          Multi-table: failed (with error and cancelled tables)
   comment_apply_stopped         Multi-table: stopped (partial progress)

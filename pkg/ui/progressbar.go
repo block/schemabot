@@ -15,6 +15,9 @@ const (
 
 const barWidth = 20
 
+// EstimateExceededTooltip explains why an active row copy no longer shows a percentage.
+const EstimateExceededTooltip = "More rows than initially estimated, copying is still active and will continue"
+
 // ProgressBar creates a visual progress bar using the given color emoji.
 func ProgressBar(percent int, color string) string {
 	if percent < 0 {
@@ -30,13 +33,18 @@ func ProgressBar(percent int, color string) string {
 	if filled > barWidth {
 		filled = barWidth
 	}
-	empty := barWidth - filled
-	return strings.Repeat(color, filled) + strings.Repeat(ColorEmpty, empty)
+	return progressBarSegments(color, filled, barWidth-filled)
 }
 
 // ProgressBarRowCopy creates a blue progress bar for row copy in progress.
 func ProgressBarRowCopy(percent int) string {
 	return ProgressBar(percent, ColorBlue)
+}
+
+// ProgressBarActivity creates a full-width activity indicator for active work without
+// a trustworthy denominator.
+func ProgressBarActivity() string {
+	return progressBarSegments(ColorBlue, barWidth, 0)
 }
 
 // ProgressBarComplete creates a full green progress bar (100% done).
@@ -57,4 +65,8 @@ func ProgressBarStopped(percent int) string {
 // ProgressBarFailed creates a red progress bar for failed applies.
 func ProgressBarFailed(percent int) string {
 	return ProgressBar(percent, ColorRed)
+}
+
+func progressBarSegments(filledColor string, filled, empty int) string {
+	return strings.Repeat(filledColor, filled) + strings.Repeat(ColorEmpty, empty)
 }

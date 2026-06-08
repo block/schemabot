@@ -42,16 +42,17 @@ type WatchModel struct {
 	metadata         map[string]string // Full metadata from progress response
 
 	// UI state
-	pastPending       bool
-	detached          bool
-	quitting          bool
-	spinner           spinner.Model
-	startedAt         time.Time
-	initialized       bool
-	volumeMode        bool // True when in volume adjustment mode
-	volumePending     int  // Pending volume change (0 = none)
-	volumeChanging    bool // True while volume change is in progress
-	consecutiveErrors int  // Consecutive fetch failures (drives backoff)
+	pastPending        bool
+	detached           bool
+	quitting           bool
+	spinner            spinner.Model
+	activityLabelFrame int
+	startedAt          time.Time
+	initialized        bool
+	volumeMode         bool // True when in volume adjustment mode
+	volumePending      int  // Pending volume change (0 = none)
+	volumeChanging     bool // True while volume change is in progress
+	consecutiveErrors  int  // Consecutive fetch failures (drives backoff)
 }
 
 // tableProgress represents progress for a single table.
@@ -79,6 +80,8 @@ type shardProgress struct {
 	ETASeconds      int64
 	CutoverAttempts int
 }
+
+var activityLabelFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // Messages
 type tickMsg time.Time
@@ -337,6 +340,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
+		m.activityLabelFrame = (m.activityLabelFrame + 1) % len(activityLabelFrames)
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
 	}

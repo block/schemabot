@@ -48,6 +48,11 @@ func ClampRows(copied, total int64) int64 {
 	return copied
 }
 
+// EstimateExceeded reports whether the row copy has exceeded its estimated total.
+func EstimateExceeded(copied, total int64) bool {
+	return total > 0 && copied > total
+}
+
 // ClampPercent returns a percentage clamped to [0, 100].
 func ClampPercent(pct int) int {
 	if pct > 100 {

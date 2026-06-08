@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 func TestFetchProgress_ServerReturns500_ReturnsError(t *testing.T) {
@@ -241,6 +242,37 @@ func TestWatchModel_RecoveringShowsCopyingRows(t *testing.T) {
 	assert.Contains(t, view, "SchemaBot is recovering after restart")
 	assert.NotContains(t, view, "Cutover will be available once recovery completes")
 	assert.NotContains(t, view, "Press Enter to proceed with cutover")
+}
+
+func TestWatchModel_EstimateExceededUsesActivityLabel(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
+	m.initialized = true
+	m.state = state.Apply.Running
+	m.activityLabelFrame = 2
+	m.tables = []tableProgress{{
+		Name:       "users",
+		Status:     state.Task.Running,
+		RowsCopied: 145000,
+		RowsTotal:  100000,
+		Percent:    145,
+	}}
+
+	view := m.View()
+
+	assert.Contains(t, view, ui.ProgressBarActivity()+" Active ⠹")
+	assert.Contains(t, view, "Rows copied: 145,000 so far")
+	assert.Contains(t, view, "More rows than initially estimated, copying is still active and will continue")
+	assert.NotContains(t, view, "145%")
+}
+
+func TestWatchModel_SpinnerTickAdvancesActivityLabel(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
+
+	updated, cmd := m.Update(m.spinner.Tick())
+	m = updated.(WatchModel)
+
+	assert.Equal(t, 1, m.activityLabelFrame)
+	assert.NotNil(t, cmd)
 }
 
 func TestWatchModel_ConnectionError_CanEscape(t *testing.T) {
