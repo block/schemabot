@@ -269,6 +269,25 @@ func protoToSchemaFiles(sf map[string]*ternv1.SchemaFiles) schema.SchemaFiles {
 	return result
 }
 
+// schemaFilesToProto converts the engine's schema.SchemaFiles to proto
+// SchemaFiles. Remote deployments that re-plan per shard (e.g. sharded engines)
+// need the full declarative input, including vschema.json, at apply time.
+func schemaFilesToProto(sf schema.SchemaFiles) map[string]*ternv1.SchemaFiles {
+	if len(sf) == 0 {
+		return nil
+	}
+	result := make(map[string]*ternv1.SchemaFiles, len(sf))
+	for ns, namespace := range sf {
+		if namespace == nil {
+			continue
+		}
+		files := make(map[string]string, len(namespace.Files))
+		maps.Copy(files, namespace.Files)
+		result[ns] = &ternv1.SchemaFiles{Files: files}
+	}
+	return result
+}
+
 // psMetadataForStorage is a subset of the PlanetScale engine's metadata
 // used for storing deploy request tracking data.
 type psMetadataForStorage struct {

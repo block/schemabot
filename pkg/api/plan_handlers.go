@@ -93,8 +93,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "environment is required")
 		return
 	}
-	if req.Type != storage.DatabaseTypeMySQL && req.Type != storage.DatabaseTypeVitess {
-		s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+" or "+storage.DatabaseTypeVitess)
+	switch req.Type {
+	case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
+	default:
+		s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", or "+storage.DatabaseTypeStrata)
 		return
 	}
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {

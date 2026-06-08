@@ -219,6 +219,8 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 		return ternv1.Engine_ENGINE_PLANETSCALE, nil
 	case storage.EngineSpirit:
 		return ternv1.Engine_ENGINE_SPIRIT, nil
+	case storage.EngineStrata:
+		return ternv1.Engine_ENGINE_STRATA, nil
 	default:
 		return 0, fmt.Errorf("unknown engine: %s", name)
 	}

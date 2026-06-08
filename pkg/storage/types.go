@@ -158,20 +158,26 @@ type Setting struct {
 const (
 	DatabaseTypeVitess = "vitess"
 	DatabaseTypeMySQL  = "mysql"
+	DatabaseTypeStrata = "strata"
 )
 
 // Engine constants.
 const (
 	EngineSpirit      = "spirit"
 	EnginePlanetScale = "planetscale"
+	EngineStrata      = "strata"
 )
 
 // EngineForType returns the engine name for a database type.
 func EngineForType(dbType string) string {
-	if dbType == DatabaseTypeVitess {
+	switch dbType {
+	case DatabaseTypeVitess:
 		return EnginePlanetScale
+	case DatabaseTypeStrata:
+		return EngineStrata
+	default:
+		return EngineSpirit
 	}
-	return EngineSpirit
 }
 
 // TableChange represents a DDL change to a single table.

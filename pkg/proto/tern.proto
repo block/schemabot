@@ -196,6 +196,7 @@ service Tern {
 enum Engine {
   ENGINE_SPIRIT = 0;
   ENGINE_PLANETSCALE = 1;
+  ENGINE_STRATA = 2;
 }
 
 // State represents the state of a schema change task.
@@ -292,6 +293,15 @@ message LintViolation {
   string severity = 6; // "error", "warning", or "info"
 }
 
+// ShardPlan reports per-shard membership and drift for a namespace. A shard is
+// listed with needs_change=true when its current schema differs from the
+// desired schema.
+message ShardPlan {
+  string shard = 1;
+  string namespace = 2;
+  bool needs_change = 3;
+}
+
 // PlanResponse contains the generated schema change plan.
 // Lint violations with severity "error" block apply unless --allow-unsafe.
 message PlanResponse {
@@ -300,6 +310,9 @@ message PlanResponse {
   repeated SchemaChange changes = 3;
   repeated LintViolation lint_violations = 4;
   repeated string errors = 5;
+  // Per-shard membership and drift, populated for sharded engines. Empty for
+  // single-endpoint engines.
+  repeated ShardPlan shards = 6;
 }
 
 // ApplyRequest requests execution of a previously generated plan.
@@ -321,6 +334,9 @@ message ApplyRequest {
   string target = 8;
   // Caller identity (e.g., "cli:user@hostname", "webhook:repo#pr").
   string caller = 9;
+  // Optional phased-apply selector for sharded engines. When empty, the apply
+  // covers every shard. When set, only the named shards run in this apply.
+  repeated string target_shards = 10;
 }
 
 // ApplyResponse indicates whether the apply was accepted.

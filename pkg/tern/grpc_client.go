@@ -974,6 +974,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		Database:    apply.Database,
 		Type:        apply.DatabaseType,
 		DdlChanges:  tasksToProtoTableChanges(tasks),
+		SchemaFiles: schemaFilesToProto(plan.SchemaFiles),
 		Environment: apply.Environment,
 		Target:      target,
 		Caller:      apply.Caller,

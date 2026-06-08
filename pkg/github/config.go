@@ -18,6 +18,7 @@ type DatabaseType string
 const (
 	DatabaseTypeVitess DatabaseType = "vitess"
 	DatabaseTypeMySQL  DatabaseType = "mysql"
+	DatabaseTypeStrata DatabaseType = "strata"
 )
 
 // EnvironmentEntry represents an environment a repository has opted into.
@@ -143,10 +144,12 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: database is required", configPath)
 	}
 	if config.Type == "" {
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type is required (must be 'vitess' or 'mysql')", configPath)
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type is required (must be 'vitess', 'mysql', or 'strata')", configPath)
 	}
-	if config.Type != DatabaseTypeVitess && config.Type != DatabaseTypeMySQL {
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type must be 'vitess' or 'mysql', got '%s'", configPath, config.Type)
+	switch config.Type {
+	case DatabaseTypeVitess, DatabaseTypeMySQL, DatabaseTypeStrata:
+	default:
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type must be 'vitess', 'mysql', or 'strata', got '%s'", configPath, config.Type)
 	}
 
 	validEnvs := map[string]bool{"staging": true, "production": true}

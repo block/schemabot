@@ -242,7 +242,7 @@ type DSNFromConfigPaths struct {
 
 // DatabaseConfig holds configuration for a registered database.
 type DatabaseConfig struct {
-	// Type is the database type: "mysql" or "vitess".
+	// Type is the database type: "mysql", "vitess", or "strata".
 	Type string `yaml:"type"`
 
 	// Environments contains per-environment configuration.
@@ -336,6 +336,7 @@ type EnvironmentConfig struct {
 
 	// For PlanetScale/Vitess:
 	// Organization is the PlanetScale organization name.
+	// sadscan:disable kingfisher.planetscale.2
 	Organization string `yaml:"organization,omitempty"`
 
 	// TokenSecretRef is the reference to the PlanetScale API token secret.
@@ -475,8 +476,10 @@ func (c *ServerConfig) Validate() error {
 		if err := validateDatabaseActorAuthorization(name, dbConfig); err != nil {
 			return err
 		}
-		if dbConfig.Type != storage.DatabaseTypeMySQL && dbConfig.Type != storage.DatabaseTypeVitess {
-			return fmt.Errorf("database %q has invalid type %q (must be %s or %s)", name, dbConfig.Type, storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess)
+		switch dbConfig.Type {
+		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
+		default:
+			return fmt.Errorf("database %q has invalid type %q (must be %s, %s, or %s)", name, dbConfig.Type, storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata)
 		}
 		if len(dbConfig.Environments) == 0 {
 			return fmt.Errorf("database %q has no environments configured", name)
