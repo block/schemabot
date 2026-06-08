@@ -213,6 +213,47 @@ func TestScheduler_BasicClaimAndResume(t *testing.T) {
 	)
 }
 
+// TestScheduler_OperatorClaimsOperationToCompletion exercises the operation-level
+// claim loop (operator_claim_operations enabled). An apply created through the
+// normal flow dual-writes exactly one apply_operations row; the operator claims
+// that row, acquires the parent apply lease, drives the schema change to
+// completion, and marks the operation row completed.
+func TestScheduler_OperatorClaimsOperationToCompletion(t *testing.T) {
+	ctx := t.Context()
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	appDBName, appDSN := createTestDB(t, "operator_claim_")
+	ts := startTestServerOperator(t, appDBName, appDSN)
+
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+
+	applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id": planID, "environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true)
+	applyID, _ := applyResp["apply_id"].(string)
+	require.NotEmpty(t, applyID)
+
+	waitForState(t, "http://"+ts.Addr, applyID, "completed", 20*time.Second)
+
+	apply, err := ts.Storage.Applies().GetByApplyIdentifier(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+
+	ops, err := ts.Storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 1, "apply-create dual-write emits exactly one operation row")
+	assert.Equal(t, state.ApplyOperation.Completed, ops[0].State, "operator marks the claimed operation completed")
+	assert.Equal(t, apply.Deployment, ops[0].Deployment)
+	require.NotNil(t, ops[0].CompletedAt, "completed operation stamps completed_at")
+}
+
 func TestScheduler_ClaimOrdering(t *testing.T) {
 	ctx := t.Context()
 

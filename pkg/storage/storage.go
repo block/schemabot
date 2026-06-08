@@ -228,6 +228,17 @@ type ApplyStore interface {
 	// Returns the claimed apply, or nil if nothing needs work.
 	FindNextApply(ctx context.Context, owner string) (*Apply, error)
 
+	// ClaimApplyByID atomically claims one specific apply by ID, scoped to the
+	// same claimability rules as FindNextApply (pending with tasks, stale active
+	// state, retryable within budget, or a pending start control request). On a
+	// successful claim it rotates the lease (owner, token, acquired_at) and
+	// refreshes the heartbeat so scheduler-owned writes can fail closed after
+	// ownership changes. Returns the claimed apply, or nil if the apply does not
+	// exist or is not currently claimable (e.g. another worker holds a fresh
+	// lease or the apply is terminal). Used by the operation-level claim loop to
+	// acquire the parent apply lease after claiming an apply_operations row.
+	ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*Apply, error)
+
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 	// Should be called every 10 seconds while working on an apply.
 	// If not called for > 1 minute, another worker can claim the apply.

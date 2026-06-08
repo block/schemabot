@@ -795,20 +795,118 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 		return nil, fmt.Errorf("query next claimable apply: %w", err)
 	}
 
+	claimed, err := persistApplyClaim(ctx, tx, apply, owner)
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return nil, nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claim apply %d: %w", apply.ID, err)
+	}
+
+	return apply, nil
+}
+
+// ClaimApplyByID atomically claims one specific apply by ID using the same
+// claimability rules as FindNextApply, scoped to a single row. The operation-
+// level claim loop calls this after claiming an apply_operations row to acquire
+// the parent apply lease that lease-guarded writes (ResumeApply, MarkCompleted,
+// Heartbeat) require. Returns nil when the apply does not exist, is locked by a
+// peer (SKIP LOCKED), or is not currently claimable.
+func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*storage.Apply, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("operator owner is required to claim apply %d: %w", applyID, storage.ErrApplyLeaseLost)
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin claim apply %d transaction: %w", applyID, err)
+	}
+	defer rollbackApplyTx(ctx, tx, "claim apply by id")
+
+	activeStates := claimableApplyStates()
+	activeStatePlaceholders := placeholders(len(activeStates))
+	queryArgs := []any{applyID, state.Apply.Pending}
+	queryArgs = append(queryArgs, stringArgs(activeStates)...)
+	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
+	queryArgs = append(queryArgs,
+		state.Apply.Pending,
+		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.Apply.Stopped,
+		storage.ControlOperationStart, storage.ControlRequestPending)
+
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM applies a
+		WHERE a.id = ?
+			AND (
+				(a.state = ? AND EXISTS (SELECT 1 FROM tasks t WHERE t.apply_id = a.id))
+				OR (a.state IN (%s) AND a.updated_at < NOW() - INTERVAL 1 MINUTE)
+				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= NOW() - INTERVAL ? DAY)
+				OR (
+					a.state = ?
+					AND EXISTS (
+						SELECT 1
+						FROM apply_control_requests cr
+						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+					)
+				)
+				OR (
+					a.state = ?
+					AND EXISTS (
+						SELECT 1
+						FROM apply_control_requests cr
+						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+					)
+				)
+			)
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED
+	`, applyColumns, activeStatePlaceholders), queryArgs...)
+
+	apply, err := scanApplyInto(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // apply does not exist, is locked, or is not claimable
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query claimable apply %d: %w", applyID, err)
+	}
+
+	claimed, err := persistApplyClaim(ctx, tx, apply, owner)
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return nil, nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claim apply %d: %w", apply.ID, err)
+	}
+
+	return apply, nil
+}
+
+// persistApplyClaim rotates the lease (owner, token, acquired_at) onto apply in
+// memory and persists it inside tx, refreshing the heartbeat in the same write.
+// Pending, stopped-start, and retryable applies move into running as part of the
+// claim so another worker cannot immediately re-claim the same durable request
+// after the transaction releases its row lock; active applies just refresh the
+// heartbeat. Reports false when the guarded UPDATE matched zero rows, meaning
+// another worker moved the row between SELECT and UPDATE.
+func persistApplyClaim(ctx context.Context, tx *sql.Tx, apply *storage.Apply, owner string) (bool, error) {
 	leaseToken := uuid.NewString()
 	leaseAcquiredAt := time.Now()
 	apply.LeaseOwner = owner
 	apply.LeaseToken = leaseToken
 	apply.LeaseAcquiredAt = &leaseAcquiredAt
 
-	// Refresh the heartbeat as part of the claim before releasing the row lock.
-	// Pending, stopped-start, and retryable applies move into an active owner
-	// state while the scheduler acts, so another worker cannot immediately claim
-	// the same durable request after this transaction releases its lock.
 	if apply.State == state.Apply.Pending || apply.State == state.Apply.Stopped || apply.State == state.Apply.FailedRetryable {
-		var result sql.Result
 		nextState := state.Apply.Running
-		result, err = tx.ExecContext(ctx, `
+		result, err := tx.ExecContext(ctx, `
 			UPDATE applies
 			SET state = ?, updated_at = NOW(),
 			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW(),
@@ -818,36 +916,31 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 			WHERE id = ? AND state = ?
 		`, nextState, owner, leaseToken, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.ID, apply.State)
 		if err != nil {
-			return nil, fmt.Errorf("claim apply %d in state %s: %w", apply.ID, apply.State, err)
+			return false, fmt.Errorf("claim apply %d in state %s: %w", apply.ID, apply.State, err)
 		}
 		rows, err := result.RowsAffected()
 		if err != nil {
-			return nil, fmt.Errorf("read claim rows affected for apply %d: %w", apply.ID, err)
+			return false, fmt.Errorf("read claim rows affected for apply %d: %w", apply.ID, err)
 		}
 		if rows == 0 {
-			return nil, nil
+			return false, nil
 		}
 		if apply.State == state.Apply.FailedRetryable {
 			apply.Attempt++
 			apply.ErrorMessage = ""
 		}
-	} else {
-		_, err = tx.ExecContext(ctx, `
-			UPDATE applies
-			SET updated_at = NOW(),
-			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
-			WHERE id = ?
-		`, owner, leaseToken, apply.ID)
-		if err != nil {
-			return nil, fmt.Errorf("refresh heartbeat for claimed apply %d: %w", apply.ID, err)
-		}
+		return true, nil
 	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit claim apply %d: %w", apply.ID, err)
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = NOW(),
+		    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, owner, leaseToken, apply.ID); err != nil {
+		return false, fmt.Errorf("refresh heartbeat for claimed apply %d: %w", apply.ID, err)
 	}
-
-	return apply, nil
+	return true, nil
 }
 
 // Heartbeat updates the apply's updated_at timestamp to maintain the lease.

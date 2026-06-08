@@ -68,6 +68,18 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 
 func startTestServerWithSchedulerInterval(t *testing.T, appDBName, appDSN string, schedulerInterval time.Duration) testServer {
 	t.Helper()
+	return startTestServerWithOptions(t, appDBName, appDSN, schedulerInterval, false)
+}
+
+// startTestServerOperator starts a test server whose scheduler claims work at
+// the apply_operations level (operator_claim_operations enabled).
+func startTestServerOperator(t *testing.T, appDBName, appDSN string) testServer {
+	t.Helper()
+	return startTestServerWithOptions(t, appDBName, appDSN, 200*time.Millisecond, true)
+}
+
+func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, schedulerInterval time.Duration, operatorClaimOperations bool) testServer {
+	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -84,6 +96,7 @@ func startTestServerWithSchedulerInterval(t *testing.T, appDBName, appDSN string
 	require.NoError(t, err, "create local client")
 
 	serverConfig := &schemabotapi.ServerConfig{
+		OperatorClaimOperations: operatorClaimOperations,
 		Databases: map[string]schemabotapi.DatabaseConfig{
 			appDBName: {
 				Type: "mysql",

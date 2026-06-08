@@ -928,6 +928,123 @@ func TestApplyStore_FindNextApplyClaimsRetryable(t *testing.T) {
 	assert.Nil(t, claimedAgain)
 }
 
+// ClaimApplyByID claims one specific apply by ID with the same claimability
+// rules as FindNextApply. The operation-level claim loop uses it to acquire the
+// parent apply lease after claiming an apply_operations row, so a pending apply
+// with tasks must be claimable, the claim must rotate a fresh lease, and a
+// repeat claim must be rejected while the lease is fresh.
+func TestApplyStore_ClaimApplyByIDClaimsPendingWithTasks(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_pending", 600, state.Apply.Pending, "staging")
+	addClaimByIDTask(t, store, apply, "task_claim_by_id")
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.Pending, claimed.State, "caller sees the pre-claim state")
+	assert.Equal(t, "operator-a", claimed.LeaseOwner)
+	assert.NotEmpty(t, claimed.LeaseToken)
+	require.NotNil(t, claimed.LeaseAcquiredAt)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Running, persisted.State)
+	assert.Equal(t, "operator-a", persisted.LeaseOwner)
+
+	again, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
+	require.NoError(t, err)
+	assert.Nil(t, again, "a freshly claimed apply is owned by its current worker")
+}
+
+// ClaimApplyByID must not steal a fresh lease from a healthy apply-level worker,
+// so a running apply with a fresh heartbeat is not claimable; it only becomes
+// claimable once its heartbeat goes stale, matching FindNextApply recovery.
+func TestApplyStore_ClaimApplyByIDSkipsFreshRunningUntilStale(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_running", 601, state.Apply.Running, "staging")
+
+	fresh, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	assert.Nil(t, fresh, "a fresh running apply is owned by its active worker")
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = NOW() - INTERVAL 2 MINUTE
+		WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, state.Apply.Running, claimed.State)
+	assert.Equal(t, "operator-a", claimed.LeaseOwner)
+	assert.NotEmpty(t, claimed.LeaseToken)
+}
+
+// ClaimApplyByID returns nil for applies that are not claimable (terminal) or
+// do not exist, so the operation loop fails closed instead of driving work.
+func TestApplyStore_ClaimApplyByIDReturnsNilForTerminalAndMissing(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	completed := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_done", 602, state.Apply.Completed, "staging")
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, completed.ID, "operator-a")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "terminal applies are never claimable")
+
+	missing, err := store.Applies().ClaimApplyByID(ctx, 9_999_999, "operator-a")
+	require.NoError(t, err)
+	assert.Nil(t, missing, "a non-existent apply id yields no claim")
+}
+
+// ClaimApplyByID requires an owner so a lease can never be acquired without an
+// identity that lease-guarded writes can fail closed against.
+func TestApplyStore_ClaimApplyByIDRequiresOwner(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	_, err := store.Applies().ClaimApplyByID(ctx, 1, "")
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+}
+
+func addClaimByIDTask(t *testing.T, store *Storage, apply *storage.Apply, taskID string) {
+	t.Helper()
+	task := &storage.Task{
+		TaskIdentifier: taskID,
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Pending,
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `note` varchar(255)",
+		DDLAction:      "alter",
+		Options:        []byte("{}"),
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	id, err := store.Tasks().Create(t.Context(), task)
+	require.NoError(t, err)
+	task.ID = id
+}
+
 func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

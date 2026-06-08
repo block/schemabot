@@ -79,6 +79,14 @@ type ServerConfig struct {
 	// FOR UPDATE SKIP LOCKED to prevent races. Defaults to 1.
 	SchedulerWorkers int `yaml:"scheduler_workers"`
 
+	// OperatorClaimOperations switches scheduler workers to claim work at the
+	// apply_operations (per-deployment) level via FindNextApplyOperation instead
+	// of the apply level via FindNextApply. While the apply-create dual-write
+	// produces exactly one operation per apply, the two paths are equivalent;
+	// the operation-level path is the foundation for multi-deployment applies.
+	// Defaults to false (apply-level claiming).
+	OperatorClaimOperations bool `yaml:"operator_claim_operations,omitempty"`
+
 	// RequirePassingChecks blocks apply when non-SchemaBot PR checks are failing.
 	// When enabled (default), SchemaBot verifies that all other checks (CI, linters,
 	// security scans) have passed before executing a schema change. Checks with
