@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/planetscale"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -160,7 +161,7 @@ func newMySQLControlTestClient(apply *storage.Apply, tasks []*storage.Task, eng 
 	}
 }
 
-func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, vitessData *storage.VitessApplyData, vitessDataErr error, eng *controlCaptureEngine) *LocalClient {
+func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, vitessData *storage.VitessApplyData, vitessDataErr error, eng engine.Engine) *LocalClient {
 	return &LocalClient{
 		config: LocalConfig{
 			Database: "testdb",
@@ -279,14 +280,13 @@ func TestLocalClient_CutoverRequiresCompleteVitessApplyData(t *testing.T) {
 				TaskIdentifier: "task-vitess-control",
 				State:          state.Task.WaitingForCutover,
 			}
-			eng := &controlCaptureEngine{}
+			eng := planetscale.New(slog.Default())
 			client := newVitessControlTestClient(apply, []*storage.Task{task}, tc.vitessData, nil, eng)
 
 			_, err := client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier})
 
-			require.ErrorContains(t, err, "deploy request metadata is incomplete")
+			require.ErrorContains(t, err, "cutover control resume state is incomplete")
 			require.ErrorContains(t, err, tc.missingPart)
-			assert.Nil(t, eng.cutoverReq, "cutover should not call the engine without deploy request metadata")
 		})
 	}
 }

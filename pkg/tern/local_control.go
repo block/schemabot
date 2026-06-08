@@ -589,9 +589,9 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 		if vad == nil {
 			return nil, fmt.Errorf("load Vitess apply data for apply %d: %w", task.ApplyID, storage.ErrVitessApplyDataNotFound)
 		}
-		resumeState, err := planetscale.BuildControlResumeState(planetscaleResumeData(vad))
+		resumeState, err := planetscale.BuildResumeState(planetscaleResumeData(vad))
 		if err != nil {
-			return nil, fmt.Errorf("build Vitess control resume state for apply %d: %w", task.ApplyID, err)
+			return nil, fmt.Errorf("build Vitess resume state for apply %d: %w", task.ApplyID, err)
 		}
 		req.ResumeState = resumeState
 	}
