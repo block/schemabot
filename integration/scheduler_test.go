@@ -246,6 +246,18 @@ func TestScheduler_OperatorClaimsOperationToCompletion(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, apply)
 
+	// The operator marks the operation terminal after the parent apply is
+	// persisted completed, so poll for the operation's terminal state rather
+	// than reading it the instant the apply finishes.
+	require.Eventually(t, func() bool {
+		ops, err := ts.Storage.ApplyOperations().ListByApply(ctx, apply.ID)
+		if err != nil || len(ops) != 1 {
+			return false
+		}
+		return state.IsState(ops[0].State, state.ApplyOperation.Completed)
+	}, 10*time.Second, 100*time.Millisecond,
+		"operator should mark the claimed operation completed after the apply finishes")
+
 	ops, err := ts.Storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)
 	require.Len(t, ops, 1, "apply-create dual-write emits exactly one operation row")
