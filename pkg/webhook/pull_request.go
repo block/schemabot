@@ -186,7 +186,7 @@ func (h *Handler) filterManagedDiscoveredConfigs(ctx context.Context, repo strin
 			})
 			continue
 		}
-		if h.schemaPathManagedByRepo(ctx, repo, pr, headSHA, cfg.Config.Database, string(cfg.Config.GetType()), cfg.SchemaDir, source) {
+		if h.shouldProcessSchemaConfig(ctx, repo, pr, headSHA, cfg.Config.Database, string(cfg.Config.GetType()), cfg.SchemaDir, source) {
 			managed = append(managed, cfg)
 		}
 	}

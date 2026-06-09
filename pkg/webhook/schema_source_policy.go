@@ -12,7 +12,7 @@ func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *
 	if err != nil {
 		return nil, err
 	}
-	if !h.schemaPathManagedByRepo(ctx, repo, pr, schemaResult.HeadSHA, schemaResult.Database, schemaResult.Type, schemaResult.SchemaPath, source) {
+	if !h.shouldProcessSchemaConfig(ctx, repo, pr, schemaResult.HeadSHA, schemaResult.Database, schemaResult.Type, schemaResult.SchemaPath, source) {
 		return nil, ghclient.ErrNoConfig
 	}
 	return schemaResult, nil
@@ -30,10 +30,10 @@ func (h *Handler) configPathManagedByRepo(ctx context.Context, repo string, pr i
 			"schema_path", schemaPath, "source", source)
 		return false
 	}
-	return h.schemaPathManagedByRepo(ctx, repo, pr, headSHA, config.Database, string(config.GetType()), schemaPath, source)
+	return h.shouldProcessSchemaConfig(ctx, repo, pr, headSHA, config.Database, string(config.GetType()), schemaPath, source)
 }
 
-func (h *Handler) schemaPathManagedByRepo(ctx context.Context, repo string, pr int, headSHA, database, databaseType, schemaPath, source string) bool {
+func (h *Handler) shouldProcessSchemaConfig(ctx context.Context, repo string, pr int, headSHA, database, databaseType, schemaPath, source string) bool {
 	config, ok := h.serverConfig()
 	if !ok {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
