@@ -218,6 +218,29 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	return svc
 }
 
+func configureE2EServiceEnvironments(t *testing.T, svc *api.Service, dbName string, environments ...string) {
+	t.Helper()
+	config := svc.Config()
+	if config.Databases == nil {
+		config.Databases = make(map[string]api.DatabaseConfig)
+	}
+	dbConfig := config.Databases[dbName]
+	if dbConfig.Type == "" {
+		dbConfig.Type = "mysql"
+	}
+	if dbConfig.Environments == nil {
+		dbConfig.Environments = make(map[string]api.EnvironmentConfig)
+	}
+	stagingConfig := dbConfig.Environments["staging"]
+	for _, environment := range environments {
+		if _, ok := dbConfig.Environments[environment]; ok {
+			continue
+		}
+		dbConfig.Environments[environment] = stagingConfig
+	}
+	config.Databases[dbName] = dbConfig
+}
+
 // seedCheck creates a check record in storage with common defaults.
 // Use conclusion "action_required" for pending changes, "success" for applied.
 func seedCheck(t *testing.T, svc *api.Service, dbName, env, conclusion string) {
@@ -3400,6 +3423,7 @@ func setupE2EServiceWithAllowedEnvs(t *testing.T, allowedEnvs []string) *api.Ser
 func TestE2EAutoPlanFailsWhenConfiguredEnvironmentsAreNotAllowed(t *testing.T) {
 	dbName := "webhook_no_owned_envs"
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"sandbox"})
+	configureE2EServiceEnvironments(t, svc, dbName, "staging", "production")
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)

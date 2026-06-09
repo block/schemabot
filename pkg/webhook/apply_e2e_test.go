@@ -1122,6 +1122,7 @@ func TestE2EApplyStaleLockReacquire(t *testing.T) {
 func TestE2EApplyProductionBlockedByStagingFirst(t *testing.T) {
 	dbName := "webhook_staging_first"
 	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "production")
 
 	// Seed a staging check that is NOT success (action_required — unapplied changes)
 	seedCheck(t, svc, dbName, "staging", "action_required")
@@ -1171,6 +1172,7 @@ func TestE2EApplyProductionBlockedByStagingFirst(t *testing.T) {
 func TestE2EApplyUsesCustomServerEnvironmentOrder(t *testing.T) {
 	dbName := "webhook_custom_env_order"
 	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "production")
 	svc.Config().EnvironmentOrder = []string{"production", "staging"}
 
 	seedCheck(t, svc, dbName, "production", "action_required")
@@ -1215,6 +1217,7 @@ func TestE2EApplyUsesCustomServerEnvironmentOrder(t *testing.T) {
 func TestE2EApplyProductionAllowedWhenStagingSuccess(t *testing.T) {
 	dbName := "webhook_staging_ok"
 	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "production")
 
 	// Seed a staging check that IS success
 	seedCheck(t, svc, dbName, "staging", "success")

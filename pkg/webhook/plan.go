@@ -162,11 +162,17 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 	}
 	configuredEnvironments, envErr := h.configuredDatabaseEnvironments(schemaDatabase)
 	if envErr != nil {
+		if isAutoPlan {
+			h.postFailingAggregateForMultiEnvSetupError(ctx, client, repo, pr, schemaDatabase, envErr)
+		}
 		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr)
 		return
 	}
 	environments, envErr := h.allowedDatabaseEnvironments(schemaDatabase)
 	if envErr != nil {
+		if isAutoPlan {
+			h.postFailingAggregateForMultiEnvSetupError(ctx, client, repo, pr, schemaDatabase, envErr)
+		}
 		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr)
 		return
 	}
@@ -321,6 +327,19 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 
 	// Post a single combined comment
 	h.postComment(repo, pr, installationID, templates.RenderMultiEnvPlanComment(multiEnvData))
+}
+
+func (h *Handler) postFailingAggregateForMultiEnvSetupError(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database string, err error) {
+	prInfo, fetchErr := client.FetchPullRequest(ctx, repo, pr)
+	if fetchErr != nil {
+		h.logger.Error("failed to fetch PR for multi-env setup failure aggregate", "repo", repo, "pr", pr, "database", database, "error", fetchErr)
+		return
+	}
+	userError := userFacingError(err)
+	h.logger.Warn("multi-env plan setup failed; posting failing aggregate",
+		"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "database", database, "error", err)
+	h.postFailingAggregates(ctx, client, repo, pr, prInfo.HeadSHA,
+		h.aggregateMessagesForAllEnvironments(userError))
 }
 
 // handleSchemaRequestError maps schema request errors to GitHub comments.
