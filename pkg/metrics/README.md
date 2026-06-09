@@ -31,10 +31,12 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
-| `schemabot.scheduler.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the scheduler |
-| `schemabot.scheduler.resume_failures_total` | Counter | database, environment, reason | Scheduler resume attempts that failed |
-| `schemabot.scheduler.claim_failures_total` | Counter | environment, reason | Scheduler claim attempts that failed |
-| `schemabot.scheduler.claim_duration_seconds` | Histogram | database, environment, previous_state | Scheduler claim and resume duration |
+| `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
+| `schemabot.operator.resume_failures_total` | Counter | database, environment, reason | Operator resume attempts that failed |
+| `schemabot.operator.claim_failures_total` | Counter | environment, reason | Operator claim attempts that failed |
+| `schemabot.operator.claim_duration_seconds` | Histogram | database, environment, previous_state | Operator claim and resume duration |
+
+> **Deprecated aliases:** the `schemabot.scheduler.*` series (`resumed_total`, `resume_failures_total`, `claim_failures_total`, `claim_duration_seconds`) is still emitted alongside the `schemabot.operator.*` series for one release so dashboards and alerts can migrate. The scheduler-named series will be removed afterward.
 
 ### Attribute Values
 
@@ -84,9 +86,9 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (GitHub API): `success`, `error`, `unknown`
 
-**reason** (scheduler claim failures): `storage_error`, `expire_retryable_error`, `missing_lease_token`, `unknown`
+**reason** (operator claim failures): `storage_error`, `expire_retryable_error`, `missing_lease_token`, `unknown`
 
-**reason** (scheduler resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
+**reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
 
 ### Check Ownership Misses
 

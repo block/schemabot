@@ -603,7 +603,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"environment", apply.Environment,
 			"requested_by", caller)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
-			"Immediate stop skipped for remote Tern client; durable scheduler owner will reconcile stop state")
+			"Immediate stop skipped for remote Tern client; durable operator owner will reconcile stop state")
 		return
 	}
 	resp, err := client.Stop(ctx, &ternv1.StopRequest{
@@ -1320,7 +1320,7 @@ func startNotAllowedForState(apply *storage.Apply) error {
 	case state.IsState(apply.State, state.Apply.RevertWindow):
 		return controlConflictf("schema change is in revert window; use revert or skip-revert instead of start")
 	case state.IsState(apply.State, state.Apply.FailedRetryable):
-		return controlConflictf("schema change is waiting for scheduler retry; start is not allowed")
+		return controlConflictf("schema change is waiting for operator retry; start is not allowed")
 	case state.IsState(apply.State, state.Apply.Failed):
 		return controlConflictf("schema change failed and cannot be started")
 	case state.IsState(apply.State, state.Apply.Completed):

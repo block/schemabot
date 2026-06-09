@@ -195,7 +195,7 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	t.Cleanup(func() { _ = localClient.Close() })
 
 	serverConfig := &api.ServerConfig{
-		SchedulerWorkers: 1,
+		OperatorWorkers: 1,
 		Databases: map[string]api.DatabaseConfig{
 			appDBName: {
 				Type: "mysql",

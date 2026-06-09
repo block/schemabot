@@ -499,96 +499,91 @@ func RecordLockOperation(ctx context.Context, operation, database, status string
 	)
 }
 
-// RecordSchedulerResume increments the scheduler resumed counter when an apply is
+// operatorMetricNames returns the canonical operator metric name alongside its
+// deprecated schemabot.scheduler.* alias. Both are emitted for one release so
+// dashboards and alerts can migrate before the legacy series is removed.
+func operatorMetricNames(suffix string) [2]string {
+	return [2]string{"schemabot.operator." + suffix, "schemabot.scheduler." + suffix}
+}
+
+// addOperatorCounter increments an operator counter and its deprecated
+// scheduler-named alias with the same value and attributes.
+func addOperatorCounter(ctx context.Context, suffix, description, unit string, value int64, attrs ...attribute.KeyValue) {
+	meter := otel.Meter(meterName)
+	for _, name := range operatorMetricNames(suffix) {
+		counter, err := meter.Int64Counter(name,
+			otelmetric.WithDescription(description),
+			otelmetric.WithUnit(unit),
+		)
+		if err != nil {
+			slog.Warn("failed to create operator counter", "metric", name, "error", err)
+			continue
+		}
+		counter.Add(ctx, value, otelmetric.WithAttributes(attrs...))
+	}
+}
+
+// RecordOperatorResume increments the operator resumed counter when an apply is
 // successfully claimed and resumed.
-func RecordSchedulerResume(ctx context.Context, database, deployment, environment, previousState string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.scheduler.resumed_total",
-		otelmetric.WithDescription("Total number of applies resumed by the scheduler"),
-		otelmetric.WithUnit("{apply}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create scheduler resumed counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("database", database),
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-			attribute.String("previous_state", previousState),
-		),
+func RecordOperatorResume(ctx context.Context, database, deployment, environment, previousState string) {
+	addOperatorCounter(ctx, "resumed_total",
+		"Total number of applies resumed by the operator", "{apply}", 1,
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("previous_state", previousState),
 	)
 }
 
-// RecordSchedulerResumeFailure increments the scheduler resume failure counter.
-func RecordSchedulerResumeFailure(ctx context.Context, database, deployment, environment, reason string) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.scheduler.resume_failures_total",
-		otelmetric.WithDescription("Total number of scheduler resume attempts that failed"),
-		otelmetric.WithUnit("{apply}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create scheduler resume failure counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			attribute.String("database", database),
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-			attribute.String("reason", reason),
-		),
+// RecordOperatorResumeFailure increments the operator resume failure counter.
+func RecordOperatorResumeFailure(ctx context.Context, database, deployment, environment, reason string) {
+	addOperatorCounter(ctx, "resume_failures_total",
+		"Total number of operator resume attempts that failed", "{apply}", 1,
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("reason", reason),
 	)
 }
 
-var knownSchedulerClaimFailureReasons = map[string]bool{
+var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error": true,
 	"missing_lease_token":    true,
 	"storage_error":          true,
 }
 
-// RecordSchedulerClaimFailure increments the scheduler claim failure counter.
-func RecordSchedulerClaimFailure(ctx context.Context, reason string) {
-	if !knownSchedulerClaimFailureReasons[reason] {
+// RecordOperatorClaimFailure increments the operator claim failure counter.
+func RecordOperatorClaimFailure(ctx context.Context, reason string) {
+	if !knownOperatorClaimFailureReasons[reason] {
 		reason = "unknown"
 	}
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64Counter("schemabot.scheduler.claim_failures_total",
-		otelmetric.WithDescription("Total number of scheduler claim attempts that failed"),
-		otelmetric.WithUnit("{attempt}"),
-	)
-	if err != nil {
-		slog.Warn("failed to create scheduler claim failure counter", "error", err)
-		return
-	}
-	counter.Add(ctx, 1,
-		otelmetric.WithAttributes(
-			EnvironmentAttribute(""),
-			attribute.String("reason", reason),
-		),
+	addOperatorCounter(ctx, "claim_failures_total",
+		"Total number of operator claim attempts that failed", "{attempt}", 1,
+		EnvironmentAttribute(""),
+		attribute.String("reason", reason),
 	)
 }
 
-// RecordSchedulerClaimDuration records how long it took to claim and resume an apply.
-func RecordSchedulerClaimDuration(ctx context.Context, duration time.Duration, database, deployment, environment, previousState string) {
+// RecordOperatorClaimDuration records how long it took to claim and resume an apply.
+func RecordOperatorClaimDuration(ctx context.Context, duration time.Duration, database, deployment, environment, previousState string) {
 	meter := otel.Meter(meterName)
-	hist, err := meter.Float64Histogram("schemabot.scheduler.claim_duration_seconds",
-		otelmetric.WithDescription("Duration of scheduler claim + resume operations"),
-		otelmetric.WithUnit("s"),
+	attrs := otelmetric.WithAttributes(
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("previous_state", previousState),
 	)
-	if err != nil {
-		slog.Warn("failed to create scheduler claim duration histogram", "error", err)
-		return
+	for _, name := range operatorMetricNames("claim_duration_seconds") {
+		hist, err := meter.Float64Histogram(name,
+			otelmetric.WithDescription("Duration of operator claim + resume operations"),
+			otelmetric.WithUnit("s"),
+		)
+		if err != nil {
+			slog.Warn("failed to create operator claim duration histogram", "metric", name, "error", err)
+			continue
+		}
+		hist.Record(ctx, duration.Seconds(), attrs)
 	}
-	hist.Record(ctx, duration.Seconds(),
-		otelmetric.WithAttributes(
-			attribute.String("database", database),
-			DeploymentAttribute(deployment),
-			EnvironmentAttribute(environment),
-			attribute.String("previous_state", previousState),
-		),
-	)
 }
 
 // knownWebhookEvents limits metric cardinality to expected GitHub event types.

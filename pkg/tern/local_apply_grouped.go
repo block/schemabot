@@ -576,7 +576,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 		eventMessage := fmt.Sprintf("Apply completed with state: %s", result.State)
 		if retryableFailure {
-			eventMessage = "Apply paused for scheduler retry after retryable engine failure"
+			eventMessage = "Apply paused for operator retry after retryable engine failure"
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			eventMessage, ps.lastTaskState, apply.State)

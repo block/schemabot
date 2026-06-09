@@ -258,10 +258,10 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 	metrics.RecordRemoteDeploymentHealth(t.Context(), "pie", "staging", true)
 	metrics.RecordRemoteDeploymentHealthCheck(t.Context(), "pie", "staging", "success", "healthy")
 	metrics.RecordLockOperation(t.Context(), "acquire", "mydb", "success")
-	metrics.RecordSchedulerResume(t.Context(), "mydb", "pie", "staging", "running")
-	metrics.RecordSchedulerResumeFailure(t.Context(), "mydb", "pie", "staging", "no_client")
-	metrics.RecordSchedulerClaimFailure(t.Context(), "storage_error")
-	metrics.RecordSchedulerClaimDuration(t.Context(), time.Second, "mydb", "pie", "staging", "running")
+	metrics.RecordOperatorResume(t.Context(), "mydb", "pie", "staging", "running")
+	metrics.RecordOperatorResumeFailure(t.Context(), "mydb", "pie", "staging", "no_client")
+	metrics.RecordOperatorClaimFailure(t.Context(), "storage_error")
+	metrics.RecordOperatorClaimDuration(t.Context(), time.Second, "mydb", "pie", "staging", "running")
 	metrics.RecordSchemaRequestError(t.Context(), "org/repo", "apply", "mydb", "staging", "invalid_config")
 	metrics.RecordGitHubRequest(t.Context(), metrics.GitHubRequestSample{
 		Operation:  metrics.GitHubOperationFetchPullRequest,
@@ -315,6 +315,9 @@ func metricHasDeploymentAttribute(metricName string) bool {
 		"schemabot.control_operations_total",
 		"schemabot.remote_deployment.health",
 		"schemabot.remote_deployment.health_checks_total",
+		"schemabot.operator.resumed_total",
+		"schemabot.operator.resume_failures_total",
+		"schemabot.operator.claim_duration_seconds",
 		"schemabot.scheduler.resumed_total",
 		"schemabot.scheduler.resume_failures_total",
 		"schemabot.scheduler.claim_duration_seconds":
@@ -701,7 +704,7 @@ func TestRecordLockOperationMetric(t *testing.T) {
 	assert.True(t, names["schemabot.lock_operations_total"], "expected schemabot.lock_operations_total")
 }
 
-func TestRecordSchedulerMetrics(t *testing.T) {
+func TestRecordOperatorMetrics(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	prevMP := otel.GetMeterProvider()
@@ -711,13 +714,13 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 		require.NoError(t, mp.Shutdown(t.Context()))
 	})
 
-	metrics.RecordSchedulerResume(t.Context(), "testdb", "pie", "staging", "running")
-	metrics.RecordSchedulerResumeFailure(t.Context(), "testdb", "pie", "staging", "no_client")
-	metrics.RecordSchedulerResumeFailure(t.Context(), "testdb", "pie", "staging", "lease_lost")
-	metrics.RecordSchedulerClaimFailure(t.Context(), "storage_error")
-	metrics.RecordSchedulerClaimFailure(t.Context(), "expire_retryable_error")
-	metrics.RecordSchedulerClaimFailure(t.Context(), "missing_lease_token")
-	metrics.RecordSchedulerClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "pie", "staging", "running")
+	metrics.RecordOperatorResume(t.Context(), "testdb", "pie", "staging", "running")
+	metrics.RecordOperatorResumeFailure(t.Context(), "testdb", "pie", "staging", "no_client")
+	metrics.RecordOperatorResumeFailure(t.Context(), "testdb", "pie", "staging", "lease_lost")
+	metrics.RecordOperatorClaimFailure(t.Context(), "storage_error")
+	metrics.RecordOperatorClaimFailure(t.Context(), "expire_retryable_error")
+	metrics.RecordOperatorClaimFailure(t.Context(), "missing_lease_token")
+	metrics.RecordOperatorClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "pie", "staging", "running")
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
@@ -729,7 +732,7 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			names[m.Name] = true
-			if m.Name != "schemabot.scheduler.claim_failures_total" && m.Name != "schemabot.scheduler.resume_failures_total" {
+			if m.Name != "schemabot.operator.claim_failures_total" && m.Name != "schemabot.operator.resume_failures_total" {
 				continue
 			}
 			sum, ok := m.Data.(metricdata.Sum[int64])
@@ -748,10 +751,15 @@ func TestRecordSchedulerMetrics(t *testing.T) {
 			}
 		}
 	}
-	assert.True(t, names["schemabot.scheduler.resumed_total"], "expected schemabot.scheduler.resumed_total")
-	assert.True(t, names["schemabot.scheduler.resume_failures_total"], "expected schemabot.scheduler.resume_failures_total")
-	assert.True(t, names["schemabot.scheduler.claim_failures_total"], "expected schemabot.scheduler.claim_failures_total")
-	assert.True(t, names["schemabot.scheduler.claim_duration_seconds"], "expected schemabot.scheduler.claim_duration_seconds")
+	assert.True(t, names["schemabot.operator.resumed_total"], "expected schemabot.operator.resumed_total")
+	assert.True(t, names["schemabot.operator.resume_failures_total"], "expected schemabot.operator.resume_failures_total")
+	assert.True(t, names["schemabot.operator.claim_failures_total"], "expected schemabot.operator.claim_failures_total")
+	assert.True(t, names["schemabot.operator.claim_duration_seconds"], "expected schemabot.operator.claim_duration_seconds")
+	// Deprecated scheduler-named aliases are dual-emitted for one release.
+	assert.True(t, names["schemabot.scheduler.resumed_total"], "expected deprecated schemabot.scheduler.resumed_total alias")
+	assert.True(t, names["schemabot.scheduler.resume_failures_total"], "expected deprecated schemabot.scheduler.resume_failures_total alias")
+	assert.True(t, names["schemabot.scheduler.claim_failures_total"], "expected deprecated schemabot.scheduler.claim_failures_total alias")
+	assert.True(t, names["schemabot.scheduler.claim_duration_seconds"], "expected deprecated schemabot.scheduler.claim_duration_seconds alias")
 	assert.True(t, sawExpireRetryableError, "expected expire_retryable_error claim failure reason to be preserved")
 	assert.True(t, sawMissingLeaseToken, "expected missing_lease_token claim failure reason to be preserved")
 	assert.True(t, sawLeaseLost, "expected lease_lost resume failure reason to be recorded")

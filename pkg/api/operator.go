@@ -30,9 +30,9 @@ const (
 	// min(operatorPollInterval, ApplyOperationHeartbeatInterval).
 	ApplyOperationHeartbeatInterval = 10 * time.Second
 
-	// DefaultSchedulerWorkers is the number of concurrent operator workers
-	// when not configured via scheduler_workers in the server config.
-	DefaultSchedulerWorkers = 4
+	// DefaultOperatorWorkers is the number of concurrent operator workers
+	// when not configured via operator_workers in the server config.
+	DefaultOperatorWorkers = 4
 )
 
 // StartOperator starts the background operator worker pool.
@@ -42,7 +42,7 @@ const (
 // includes queued applies, crash recovery for applies with stale heartbeats,
 // and retry recovery for transient engine failures.
 //
-// Launches N concurrent workers (configured via scheduler_workers in config).
+// Launches N concurrent workers (configured via operator_workers in config).
 // Each worker independently claims applies using FOR UPDATE SKIP LOCKED.
 // Call StopOperator to gracefully stop.
 func (s *Service) StartOperator(ctx context.Context) {
@@ -53,9 +53,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 		return
 	}
 
-	workers := s.config.SchedulerWorkers
+	workers := s.config.OperatorWorkers
 	if workers <= 0 {
-		workers = DefaultSchedulerWorkers
+		workers = DefaultOperatorWorkers
 	}
 
 	stop := make(chan struct{})
@@ -160,7 +160,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 	expired, err := s.storage.Applies().ExpireRetryable(ctx)
 	if err != nil {
 		s.logger.Error("operator: failed to expire retryable applies", "worker", workerID, "error", err)
-		metrics.RecordSchedulerClaimFailure(ctx, "expire_retryable_error")
+		metrics.RecordOperatorClaimFailure(ctx, "expire_retryable_error")
 		return
 	}
 	for _, expiration := range expired {
@@ -172,7 +172,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 			"environment", apply.Environment,
 			"attempt", apply.Attempt,
 			"reason", expiration.Reason)
-		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
 	}
 
 	owner := operatorLeaseOwner(workerID)
@@ -185,7 +185,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 	apply, err := s.storage.Applies().FindNextApply(ctx, owner)
 	if err != nil {
 		s.logger.Error("operator: failed to claim apply", "worker", workerID, "lease_owner", owner, "error", err)
-		metrics.RecordSchedulerClaimFailure(ctx, "storage_error")
+		metrics.RecordOperatorClaimFailure(ctx, "storage_error")
 		return
 	}
 
@@ -201,7 +201,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"environment", apply.Environment)
-		metrics.RecordSchedulerClaimFailure(ctx, "missing_lease_token")
+		metrics.RecordOperatorClaimFailure(ctx, "missing_lease_token")
 		return
 	}
 	ctx = storage.WithApplyLease(ctx, lease)
@@ -220,7 +220,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx)
 	if err != nil {
 		s.logger.Error("operator: failed to claim apply_operation", "worker", workerID, "lease_owner", owner, "error", err)
-		metrics.RecordSchedulerClaimFailure(ctx, "operation_storage_error")
+		metrics.RecordOperatorClaimFailure(ctx, "operation_storage_error")
 		return
 	}
 	if op == nil {
@@ -240,7 +240,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 			"apply_db_id", op.ApplyID,
 			"deployment", op.Deployment,
 			"error", err)
-		metrics.RecordSchedulerClaimFailure(ctx, "operation_parent_claim_error")
+		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_claim_error")
 		return
 	}
 	if apply == nil {
@@ -265,7 +265,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 			"database", apply.Database,
 			"deployment", op.Deployment,
 			"environment", apply.Environment)
-		metrics.RecordSchedulerClaimFailure(ctx, "missing_lease_token")
+		metrics.RecordOperatorClaimFailure(ctx, "missing_lease_token")
 		return
 	}
 	leasedCtx := storage.WithApplyLease(ctx, lease)
@@ -325,7 +325,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 			"apply_db_id", op.ApplyID,
 			"deployment", op.Deployment,
 			"error", err)
-		metrics.RecordSchedulerClaimFailure(ctx, "operation_parent_not_claimable")
+		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 		return
 	}
 	if parent == nil {
@@ -334,7 +334,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 			"apply_operation_id", op.ID,
 			"apply_db_id", op.ApplyID,
 			"deployment", op.Deployment)
-		metrics.RecordSchedulerClaimFailure(ctx, "operation_parent_not_claimable")
+		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 		return
 	}
 	if state.IsTerminalApplyState(parent.State) {
@@ -355,7 +355,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 		"deployment", op.Deployment,
 		"environment", parent.Environment,
 		"state", parent.State)
-	metrics.RecordSchedulerClaimFailure(ctx, "operation_parent_not_claimable")
+	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 }
 
 // resumeClaimedApply drives a claimed apply through ResumeApply with the apply
@@ -385,7 +385,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"error", err)
-		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, "", apply.Environment, "missing_deployment")
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, "", apply.Environment, "missing_deployment")
 		return false
 	}
 	client, err := s.TernClient(deployment, apply.Environment)
@@ -397,7 +397,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 			"deployment", deployment,
 			"environment", apply.Environment,
 			"error", err)
-		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, deployment, apply.Environment, "no_client")
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "no_client")
 		return false
 	}
 
@@ -419,7 +419,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 				"deployment", deployment,
 				"environment", apply.Environment,
 				"error", err)
-			metrics.RecordSchedulerResumeFailure(ctx, apply.Database, deployment, apply.Environment, "lease_lost")
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "lease_lost")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}
@@ -445,7 +445,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 			"deployment", deployment,
 			"environment", apply.Environment,
 			"error", err)
-		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, deployment, apply.Environment, "resume_error")
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "resume_error")
 		if retryableClaim {
 			metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 		}
@@ -461,8 +461,8 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 		"environment", apply.Environment,
 		"previous_state", previousState,
 		"duration", duration)
-	metrics.RecordSchedulerResume(ctx, apply.Database, deployment, apply.Environment, previousState)
-	metrics.RecordSchedulerClaimDuration(ctx, duration, apply.Database, deployment, apply.Environment, previousState)
+	metrics.RecordOperatorResume(ctx, apply.Database, deployment, apply.Environment, previousState)
+	metrics.RecordOperatorClaimDuration(ctx, duration, apply.Database, deployment, apply.Environment, previousState)
 	return true
 }
 

@@ -246,7 +246,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 							"database", apply.Database,
 							"environment", apply.Environment,
 							"error", err)
-						metrics.RecordSchedulerResumeFailure(hbCtx, apply.Database, apply.Deployment, apply.Environment, "lease_lost")
+						metrics.RecordOperatorResumeFailure(hbCtx, apply.Database, apply.Deployment, apply.Environment, "lease_lost")
 						for _, cancel := range cancelApply {
 							if cancel != nil {
 								cancel()

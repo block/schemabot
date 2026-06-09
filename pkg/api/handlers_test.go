@@ -1256,7 +1256,7 @@ func TestExecuteApplyWakesOperatorForQueuedLocalApply(t *testing.T) {
 	applies := &capturingApplyStore{findCh: make(chan struct{}, 1)}
 	mock := &mockTernClient{resumeCh: make(chan *storage.Apply, 1)}
 	svc, _ := newExecuteApplyTestService(mock, applies)
-	svc.config.SchedulerWorkers = 1
+	svc.config.OperatorWorkers = 1
 	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
 	svc.StartOperator(t.Context())
 	t.Cleanup(svc.StopOperator)
@@ -2501,7 +2501,7 @@ func TestStartHandler(t *testing.T) {
 			{
 				name:        "failed retryable",
 				applyState:  state.Apply.FailedRetryable,
-				wantMessage: "scheduler retry",
+				wantMessage: "operator retry",
 			},
 			{
 				name:        "failed",

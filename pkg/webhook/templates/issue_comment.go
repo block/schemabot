@@ -60,7 +60,7 @@ func RenderControlMissingApplyID(action string) string {
 func RenderStopCommandAccepted(data StopCommandAcceptedData) string {
 	statusLine := "Stop request accepted. SchemaBot will stop this schema change; status remains available from the PR progress comment or CLI."
 	if data.Status == "already_requested" {
-		statusLine = "Stop was already requested. SchemaBot will keep the existing stop request pending until the scheduler owner finishes it."
+		statusLine = "Stop was already requested. SchemaBot will keep the existing stop request pending until the operator owner finishes it."
 	}
 
 	body := "## Stop Request Accepted\n\n" +

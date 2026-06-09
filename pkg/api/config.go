@@ -74,10 +74,20 @@ type ServerConfig struct {
 	// staging before production.
 	EnvironmentOrder []string `yaml:"environment_order"`
 
-	// SchedulerWorkers is the number of concurrent scheduler workers that claim
+	// OperatorWorkers is the number of concurrent operator workers that claim
 	// and resume applies. Each worker independently polls FindNextApply with
-	// FOR UPDATE SKIP LOCKED to prevent races. Defaults to 1.
-	SchedulerWorkers int `yaml:"scheduler_workers"`
+	// FOR UPDATE SKIP LOCKED to prevent races. Defaults to DefaultOperatorWorkers.
+	OperatorWorkers int `yaml:"operator_workers"`
+
+	// SchedulerWorkers is the deprecated alias for OperatorWorkers. It is kept
+	// so existing config files that still set scheduler_workers continue to
+	// load (the YAML decoder runs with KnownFields(true) and would otherwise
+	// reject the unknown key). Validate() copies it into OperatorWorkers when
+	// the new key is unset and logs a deprecation warning. Remove one release
+	// after the operator rename has soaked.
+	//
+	// Deprecated: use operator_workers.
+	SchedulerWorkers int `yaml:"scheduler_workers,omitempty"`
 
 	// OperatorClaimOperations switches scheduler workers to claim work at the
 	// apply_operations (per-deployment) level via FindNextApplyOperation instead
@@ -446,8 +456,29 @@ func LoadServerConfigFromFile(path string) (*ServerConfig, error) {
 	return &config, nil
 }
 
+// resolveDeprecatedOperatorWorkers folds the deprecated scheduler_workers key
+// into operator_workers. When only the deprecated key is set it is honored and
+// a deprecation warning is logged; setting both keys is rejected so the
+// effective value is never ambiguous.
+func (c *ServerConfig) resolveDeprecatedOperatorWorkers() error {
+	if c.SchedulerWorkers == 0 {
+		return nil
+	}
+	if c.OperatorWorkers != 0 {
+		return fmt.Errorf("set only one of operator_workers or scheduler_workers (scheduler_workers is deprecated)")
+	}
+	slog.Warn("scheduler_workers is deprecated; use operator_workers", "scheduler_workers", c.SchedulerWorkers)
+	c.OperatorWorkers = c.SchedulerWorkers
+	c.SchedulerWorkers = 0
+	return nil
+}
+
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
+	if err := c.resolveDeprecatedOperatorWorkers(); err != nil {
+		return err
+	}
+
 	// The database registry is required in both local mode and gRPC mode:
 	// local environments provide DSNs, while remote environments provide the
 	// server-owned target/deployment route.
