@@ -20,7 +20,7 @@ func NewPermanentError(msg string, args ...any) error {
 	return &PermanentError{Err: fmt.Errorf(msg, args...)}
 }
 
-// IsRetryable returns true if the error should be retried by the scheduler.
+// IsRetryable returns true if the error should be retried by the operator.
 // All errors are retryable by default, and engines explicitly wrap only
 // permanent errors with PermanentError.
 func IsRetryable(err error) bool {

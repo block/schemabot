@@ -225,7 +225,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 
 	for i, task := range tasks {
 		if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
-			c.logger.Warn("pending stop request processing failed; current apply owner will exit for scheduler retry",
+			c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return
 		} else if handled {
@@ -415,10 +415,10 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 	}
 }
 
-// prepareStoppedTasksForResume turns a scheduler-claimed start request back into
+// prepareStoppedTasksForResume turns a operator-claimed start request back into
 // runnable task work. The start intent stays pending until stopped task rows are
 // requeued and the apply is ready for execution, so a worker crash can still be
-// recovered by another scheduler worker.
+// recovered by another operator worker.
 func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) {
 	if !startRequested {
 		return
@@ -470,7 +470,7 @@ func (c *LocalClient) markApplyRecovering(ctx context.Context, apply *storage.Ap
 
 // launchAtomicResume sends all DDLs to the engine in one call, marks tasks and
 // apply as RUNNING, logs the provided message, and then polls for completion.
-// Scheduler-owned calls block so the worker owns the apply until terminal or
+// Operator-owned calls block so the worker owns the apply until terminal or
 // retry-waiting state; user start calls poll in the background and returns
 // after the engine accepts the resume.
 func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.Apply,
@@ -608,7 +608,7 @@ func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*stor
 	}
 }
 
-// ResumeApply starts or resumes an apply claimed by a scheduler worker.
+// ResumeApply starts or resumes an apply claimed by a operator worker.
 // Pending applies are dispatched for the first time; stale applies use the
 // engine's resume metadata to continue after a missed heartbeat.
 func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
@@ -669,7 +669,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	if shouldInspectDeferredCutoverSignal(apply) {
 		signalExists, signalSupported, err := c.deferredCutoverSignalExists(ctx, apply)
 		if err != nil {
-			c.logger.Warn("deferred cutover recovery could not verify engine cutover signal; scheduler will retry",
+			c.logger.Warn("deferred cutover recovery could not verify engine cutover signal; operator will retry",
 				"apply_id", apply.ApplyIdentifier,
 				"database", apply.Database,
 				"database_type", apply.DatabaseType,
@@ -793,7 +793,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 
 func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error, startRequested bool) error {
 	if c.shouldRetryEngineError(err) {
-		c.logger.Warn("engine apply failed during recovery, pausing apply for scheduler retry",
+		c.logger.Warn("engine apply failed during recovery, pausing apply for operator retry",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"database_type", apply.DatabaseType,

@@ -35,13 +35,13 @@ const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_i
 
 const (
 	// maxRecoveryAttempts is the retry budget for failed_retryable applies. The
-	// original apply attempt is separate; this counts scheduler redispatches.
+	// original apply attempt is separate; this counts operator redispatches.
 	maxRecoveryAttempts = 10
 
 	// retryableRecoveryFreshnessDays prevents old retryable failures from
 	// being redispatched unexpectedly after retry policy or attempt budgets
 	// change. Old failures require deliberate operator action instead of
-	// automatic scheduler pickup.
+	// automatic operator pickup.
 	retryableRecoveryFreshnessDays = 1
 )
 
@@ -69,7 +69,7 @@ type txBeginner interface {
 	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
 }
 
-// claimableApplyStates returns active apply states where scheduler recovery can
+// claimableApplyStates returns active apply states where operator recovery can
 // safely resume work after the heartbeat becomes stale. Pending has a separate
 // queue path and does not need to be stale before a worker claims it. Terminal
 // states are already done, failed_retryable has its own retry path, stopped
@@ -721,7 +721,7 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 
 // FindNextApply atomically claims the next apply that needs attention.
 // A claim selects one stale apply and refreshes its heartbeat in the same
-// transaction. That heartbeat is the scheduler's lease while it reloads state
+// transaction. That heartbeat is the operator's lease while it reloads state
 // and resumes the apply.
 // Returns the claimed apply, or nil if nothing needs work.
 //
@@ -733,7 +733,7 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 // so claims only need to lease one row and avoid worker races on that row.
 func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.Apply, error) {
 	if owner == "" {
-		return nil, fmt.Errorf("scheduler owner is required to claim apply: %w", storage.ErrApplyLeaseLost)
+		return nil, fmt.Errorf("operator owner is required to claim apply: %w", storage.ErrApplyLeaseLost)
 	}
 	// Read committed keeps concurrent SKIP LOCKED claims from taking next-key
 	// range locks that can serialize workers across otherwise independent targets.
@@ -947,7 +947,7 @@ func persistApplyClaim(ctx context.Context, tx *sql.Tx, apply *storage.Apply, ow
 // Should be called every 10 seconds while working on an apply.
 // If not called for > 1 minute, another worker can claim the apply via FindNextApply.
 // When ctx has an apply lease, a stale token returns ErrApplyLeaseLost so the
-// old scheduler owner stops before writing state or external side effects.
+// old operator owner stops before writing state or external side effects.
 func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
 	if err != nil {

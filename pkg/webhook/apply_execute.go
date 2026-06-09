@@ -110,7 +110,7 @@ func (h *Handler) executeApply(
 	}
 
 	// Set observer before queuing the apply so ExecuteApply can register it on
-	// the durable apply row before scheduler dispatch starts.
+	// the durable apply row before operator dispatch starts.
 	observer := NewCommentObserver(CommentObserverConfig{
 		GHClient:       factory,
 		Storage:        h.service.Storage(),

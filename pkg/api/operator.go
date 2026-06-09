@@ -12,10 +12,10 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// Scheduler constants.
+// Operator constants.
 const (
-	// SchedulerPollInterval is the default interval for polling applies that need attention.
-	SchedulerPollInterval = 10 * time.Second
+	// OperatorPollInterval is the default interval for polling applies that need attention.
+	OperatorPollInterval = 10 * time.Second
 
 	// HeartbeatTimeout is how long since last heartbeat before
 	// an apply is considered to have a crashed worker and needs recovery.
@@ -24,32 +24,32 @@ const (
 
 	// ApplyOperationHeartbeatInterval bounds how often the operation-row
 	// heartbeat fires while ResumeApply runs. It is kept safely below
-	// HeartbeatTimeout so that a large (or misconfigured) scheduler poll
+	// HeartbeatTimeout so that a large (or misconfigured) operator poll
 	// interval cannot let apply_operations.updated_at go stale and allow a peer
 	// worker to re-claim the operation mid-resume. The effective cadence is
-	// min(schedulerPollInterval, ApplyOperationHeartbeatInterval).
+	// min(operatorPollInterval, ApplyOperationHeartbeatInterval).
 	ApplyOperationHeartbeatInterval = 10 * time.Second
 
-	// DefaultSchedulerWorkers is the number of concurrent scheduler workers
+	// DefaultSchedulerWorkers is the number of concurrent operator workers
 	// when not configured via scheduler_workers in the server config.
 	DefaultSchedulerWorkers = 4
 )
 
-// StartScheduler starts the background scheduler worker pool.
+// StartOperator starts the background operator worker pool.
 //
-// Scheduler workers claim apply work from storage so one server can make
+// Operator workers claim apply work from storage so one server can make
 // progress across independent databases and environments concurrently. This
 // includes queued applies, crash recovery for applies with stale heartbeats,
 // and retry recovery for transient engine failures.
 //
 // Launches N concurrent workers (configured via scheduler_workers in config).
 // Each worker independently claims applies using FOR UPDATE SKIP LOCKED.
-// Call StopScheduler to gracefully stop.
-func (s *Service) StartScheduler(ctx context.Context) {
-	s.schedulerMu.Lock()
+// Call StopOperator to gracefully stop.
+func (s *Service) StartOperator(ctx context.Context) {
+	s.operatorMu.Lock()
 	if s.stopRecovery != nil {
-		s.schedulerMu.Unlock()
-		s.logger.Info("scheduler already running")
+		s.operatorMu.Unlock()
+		s.logger.Info("operator already running")
 		return
 	}
 
@@ -63,33 +63,33 @@ func (s *Service) StartScheduler(ctx context.Context) {
 	workerCtx, cancel := context.WithCancel(ctx)
 	s.stopRecovery = stop
 	s.cancelRecovery = cancel
-	s.schedulerWake = wake
-	s.schedulerMu.Unlock()
+	s.operatorWake = wake
+	s.operatorMu.Unlock()
 
 	for i := range workers {
 		workerID := i
 		s.recoveryWg.Go(func() {
-			s.schedulerWorker(workerCtx, workerID, stop, wake)
+			s.operatorWorker(workerCtx, workerID, stop, wake)
 		})
 	}
 
-	s.logger.Info("scheduler started", "workers", workers, "interval", s.schedulerPollInterval)
+	s.logger.Info("operator started", "workers", workers, "interval", s.operatorPollInterval)
 }
 
-// StopScheduler stops the background scheduler and waits for all workers to finish.
+// StopOperator stops the background operator and waits for all workers to finish.
 // Safe to call multiple times.
-func (s *Service) StopScheduler() {
-	s.schedulerMu.Lock()
+func (s *Service) StopOperator() {
+	s.operatorMu.Lock()
 	if s.stopRecovery == nil {
-		s.schedulerMu.Unlock()
+		s.operatorMu.Unlock()
 		return
 	}
 	stop := s.stopRecovery
 	cancel := s.cancelRecovery
 	s.stopRecovery = nil
 	s.cancelRecovery = nil
-	s.schedulerWake = nil
-	s.schedulerMu.Unlock()
+	s.operatorWake = nil
+	s.operatorMu.Unlock()
 
 	close(stop)
 	if cancel != nil {
@@ -98,14 +98,14 @@ func (s *Service) StopScheduler() {
 	s.recoveryWg.Wait()
 }
 
-func (s *Service) wakeScheduler(applyIdentifier, database, environment string) {
-	s.schedulerMu.Lock()
-	wake := s.schedulerWake
+func (s *Service) wakeOperator(applyIdentifier, database, environment string) {
+	s.operatorMu.Lock()
+	wake := s.operatorWake
 	running := s.stopRecovery != nil
-	s.schedulerMu.Unlock()
+	s.operatorMu.Unlock()
 
 	if !running || wake == nil {
-		s.logger.Debug("scheduler wake skipped because scheduler is not running",
+		s.logger.Debug("operator wake skipped because operator is not running",
 			"apply_id", applyIdentifier,
 			"database", database,
 			"environment", environment)
@@ -114,39 +114,39 @@ func (s *Service) wakeScheduler(applyIdentifier, database, environment string) {
 
 	select {
 	case wake <- struct{}{}:
-		s.logger.Debug("scheduler wake queued",
+		s.logger.Debug("operator wake queued",
 			"apply_id", applyIdentifier,
 			"database", database,
 			"environment", environment)
 	default:
-		s.logger.Debug("scheduler wake already pending",
+		s.logger.Debug("operator wake already pending",
 			"apply_id", applyIdentifier,
 			"database", database,
 			"environment", environment)
 	}
 }
 
-// schedulerWorker is a single worker that claims at most one apply on startup
-// and on each scheduler poll tick. Wake signals share the same claim path as
+// operatorWorker is a single worker that claims at most one apply on startup
+// and on each operator poll tick. Wake signals share the same claim path as
 // polling; storage locking decides whether a worker actually owns work.
-func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan struct{}, wake <-chan struct{}) {
-	ticker := time.NewTicker(s.schedulerPollInterval)
+func (s *Service) operatorWorker(ctx context.Context, workerID int, stop <-chan struct{}, wake <-chan struct{}) {
+	ticker := time.NewTicker(s.operatorPollInterval)
 	defer ticker.Stop()
 
-	s.logger.Debug("scheduler worker started", "worker", workerID)
+	s.logger.Debug("operator worker started", "worker", workerID)
 
 	s.recoverApplies(ctx, workerID)
 
 	for {
 		select {
 		case <-stop:
-			s.logger.Debug("scheduler worker stopping", "worker", workerID)
+			s.logger.Debug("operator worker stopping", "worker", workerID)
 			return
 		case <-ctx.Done():
-			s.logger.Debug("scheduler worker context cancelled", "worker", workerID)
+			s.logger.Debug("operator worker context cancelled", "worker", workerID)
 			return
 		case <-wake:
-			s.logger.Debug("scheduler worker woke for queued apply", "worker", workerID)
+			s.logger.Debug("operator worker woke for queued apply", "worker", workerID)
 			s.recoverApplies(ctx, workerID)
 		case <-ticker.C:
 			s.recoverApplies(ctx, workerID)
@@ -159,13 +159,13 @@ func (s *Service) schedulerWorker(ctx context.Context, workerID int, stop <-chan
 func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 	expired, err := s.storage.Applies().ExpireRetryable(ctx)
 	if err != nil {
-		s.logger.Error("scheduler: failed to expire retryable applies", "worker", workerID, "error", err)
+		s.logger.Error("operator: failed to expire retryable applies", "worker", workerID, "error", err)
 		metrics.RecordSchedulerClaimFailure(ctx, "expire_retryable_error")
 		return
 	}
 	for _, expiration := range expired {
 		apply := expiration.Apply
-		s.logger.Error("scheduler: retryable apply expired",
+		s.logger.Error("operator: retryable apply expired",
 			"worker", workerID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
@@ -175,7 +175,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		metrics.RecordSchedulerResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
 	}
 
-	owner := schedulerLeaseOwner(workerID)
+	owner := operatorLeaseOwner(workerID)
 
 	if s.config.OperatorClaimOperations {
 		s.recoverApplyOperation(ctx, workerID, owner)
@@ -184,18 +184,18 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 
 	apply, err := s.storage.Applies().FindNextApply(ctx, owner)
 	if err != nil {
-		s.logger.Error("scheduler: failed to claim apply", "worker", workerID, "lease_owner", owner, "error", err)
+		s.logger.Error("operator: failed to claim apply", "worker", workerID, "lease_owner", owner, "error", err)
 		metrics.RecordSchedulerClaimFailure(ctx, "storage_error")
 		return
 	}
 
 	if apply == nil {
-		s.logger.Debug("scheduler: no apply to claim", "worker", workerID)
+		s.logger.Debug("operator: no apply to claim", "worker", workerID)
 		return
 	}
 	lease := apply.Lease()
 	if !lease.Valid() {
-		s.logger.Error("scheduler: claimed apply without a valid lease token; scheduler will not resume it",
+		s.logger.Error("operator: claimed apply without a valid lease token; operator will not resume it",
 			"worker", workerID,
 			"lease_owner", owner,
 			"apply_id", apply.ApplyIdentifier,
@@ -365,7 +365,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *storage.Apply) bool {
 	lease := apply.Lease()
 	start := s.clock.Now()
-	s.logger.Info("scheduler: claimed apply",
+	s.logger.Info("operator: claimed apply",
 		"worker", workerID,
 		"lease_owner", lease.Owner,
 		"apply_id", apply.ApplyIdentifier,
@@ -379,7 +379,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
-		s.logger.Error("scheduler: claimed apply is missing stored deployment metadata",
+		s.logger.Error("operator: claimed apply is missing stored deployment metadata",
 			"worker", workerID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
@@ -390,7 +390,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 	}
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		s.logger.Error("scheduler: failed to get client",
+		s.logger.Error("operator: failed to get client",
 			"worker", workerID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
@@ -411,7 +411,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 	}
 	if err := client.ResumeApply(ctx, apply); err != nil {
 		if errors.Is(err, storage.ErrApplyLeaseLost) {
-			s.logger.Warn("scheduler: apply lease was lost; worker will stop writing this apply",
+			s.logger.Warn("operator: apply lease was lost; worker will stop writing this apply",
 				"worker", workerID,
 				"lease_owner", lease.Owner,
 				"apply_id", apply.ApplyIdentifier,
@@ -426,7 +426,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 			return false
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-			s.logger.Debug("scheduler: stopped while running claimed apply",
+			s.logger.Debug("operator: stopped while running claimed apply",
 				"worker", workerID,
 				"apply_id", apply.ApplyIdentifier,
 				"database", apply.Database,
@@ -438,7 +438,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 			}
 			return false
 		}
-		s.logger.Error("scheduler: failed to resume apply",
+		s.logger.Error("operator: failed to resume apply",
 			"worker", workerID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
@@ -453,7 +453,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 	}
 
 	duration := s.clock.Now().Sub(start)
-	s.logger.Info("scheduler: resumed apply",
+	s.logger.Info("operator: resumed apply",
 		"worker", workerID,
 		"apply_id", apply.ApplyIdentifier,
 		"database", apply.Database,
@@ -467,14 +467,14 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 }
 
 // startApplyOperationHeartbeat refreshes the claimed operation row's lease while
-// ResumeApply runs, at min(schedulerPollInterval, ApplyOperationHeartbeatInterval)
+// ResumeApply runs, at min(operatorPollInterval, ApplyOperationHeartbeatInterval)
 // so the row cannot go stale and be re-claimed by a peer even when the poll
 // interval is large. A lost parent apply lease cancels the run so the displaced
 // worker stops; other heartbeat errors are logged and retried on the next tick.
 // Returns a stop func that is safe to call more than once.
 func (s *Service) startApplyOperationHeartbeat(ctx context.Context, workerID int, op *storage.ApplyOperation, apply *storage.Apply, cancelRun context.CancelFunc) func() {
 	hbCtx, stop := context.WithCancel(ctx)
-	interval := min(s.schedulerPollInterval, ApplyOperationHeartbeatInterval)
+	interval := min(s.operatorPollInterval, ApplyOperationHeartbeatInterval)
 	s.recoveryWg.Go(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -551,7 +551,7 @@ func (s *Service) markOperationFromApplyState(ctx context.Context, workerID int,
 	}
 }
 
-func schedulerLeaseOwner(workerID int) string {
+func operatorLeaseOwner(workerID int) string {
 	hostname, err := os.Hostname()
 	if err != nil || hostname == "" {
 		hostname = "unknown-host"

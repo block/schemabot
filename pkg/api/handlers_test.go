@@ -1026,9 +1026,9 @@ func TestPlanHandlerSourcePolicyAllowsDirectSource(t *testing.T) {
 	assert.Equal(t, "plan-source-policy", resp.PlanID)
 }
 
-func TestExecuteApplyQueuesRemoteApplyForScheduler(t *testing.T) {
+func TestExecuteApplyQueuesRemoteApplyForOperator(t *testing.T) {
 	// Remote applies follow the same durable queue path as local applies. The
-	// request returns the control-plane apply ID before the scheduler dispatches
+	// request returns the control-plane apply ID before the operator dispatches
 	// work to remote Tern and stores external_id.
 	applies := &capturingApplyStore{}
 	mock := &mockTernClient{isRemote: true}
@@ -1049,7 +1049,7 @@ func TestExecuteApplyQueuesRemoteApplyForScheduler(t *testing.T) {
 	assert.Empty(t, applies.apply.ExternalID)
 	assert.Equal(t, storage.EngineSpirit, applies.apply.Engine)
 	assert.Equal(t, "testdb", applies.apply.GetOptions().Target)
-	assert.Nil(t, mock.applyReq, "request path should not call remote Tern before scheduler claim")
+	assert.Nil(t, mock.applyReq, "request path should not call remote Tern before operator claim")
 	require.Len(t, tasks.tasks, 1)
 	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
 	// Apply create dual-writes one apply_operations row mirroring the apply's
@@ -1062,7 +1062,7 @@ func TestExecuteApplyQueuesRemoteApplyForScheduler(t *testing.T) {
 }
 
 func TestProgressByApplyIDServesQueuedRemoteApplyFromStorage(t *testing.T) {
-	// The scheduler marks the control-plane row running before gRPC dispatch
+	// The operator marks the control-plane row running before gRPC dispatch
 	// stores external_id. During that handoff, apply-id progress should be
 	// served locally as pending instead of asking the data plane about an ID it
 	// does not know yet.
@@ -1093,7 +1093,7 @@ func TestProgressByApplyIDServesQueuedRemoteApplyFromStorage(t *testing.T) {
 	mux.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	assert.Nil(t, mock.progressReq, "remote progress should wait until scheduler stores external_id")
+	assert.Nil(t, mock.progressReq, "remote progress should wait until operator stores external_id")
 
 	var resp apitypes.ProgressResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
@@ -1190,7 +1190,7 @@ func TestProgressByApplyIDOnlySendsApplyIDAndEnvironment(t *testing.T) {
 	assert.Equal(t, "staging", mock.progressReq.Environment)
 }
 
-func TestExecuteApplyQueuesLocalApplyForScheduler(t *testing.T) {
+func TestExecuteApplyQueuesLocalApplyForOperator(t *testing.T) {
 	applies := &capturingApplyStore{}
 	mock := &mockTernClient{}
 	svc, tasks := newExecuteApplyTestService(mock, applies)
@@ -1252,19 +1252,19 @@ func TestExecuteApplyDoesNotStorePartialQueueWhenTaskCreateFails(t *testing.T) {
 	assert.Empty(t, tasks.tasks)
 }
 
-func TestExecuteApplyWakesSchedulerForQueuedLocalApply(t *testing.T) {
+func TestExecuteApplyWakesOperatorForQueuedLocalApply(t *testing.T) {
 	applies := &capturingApplyStore{findCh: make(chan struct{}, 1)}
 	mock := &mockTernClient{resumeCh: make(chan *storage.Apply, 1)}
 	svc, _ := newExecuteApplyTestService(mock, applies)
 	svc.config.SchedulerWorkers = 1
-	require.NoError(t, svc.SetSchedulerPollInterval(time.Hour))
-	svc.StartScheduler(t.Context())
-	t.Cleanup(svc.StopScheduler)
+	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
+	svc.StartOperator(t.Context())
+	t.Cleanup(svc.StopOperator)
 
 	select {
 	case <-applies.findCh:
 	case <-time.After(2 * time.Second):
-		require.Fail(t, "scheduler did not perform startup claim")
+		require.Fail(t, "operator did not perform startup claim")
 	}
 
 	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
@@ -1282,7 +1282,7 @@ func TestExecuteApplyWakesSchedulerForQueuedLocalApply(t *testing.T) {
 		assert.Equal(t, state.Apply.Pending, resumedApply.State)
 		assert.Equal(t, "testdb", resumedApply.Database)
 	case <-time.After(2 * time.Second):
-		require.Fail(t, "scheduler did not resume queued apply after wake")
+		require.Fail(t, "operator did not resume queued apply after wake")
 	}
 }
 
@@ -2038,7 +2038,7 @@ func TestStopHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		assert.Nil(t, mock.stopReq, "remote stop must be reconciled by the scheduler owner")
+		assert.Nil(t, mock.stopReq, "remote stop must be reconciled by the operator owner")
 		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 		require.NoError(t, err)
 		require.NotNil(t, controlReq)
@@ -2180,7 +2180,7 @@ func TestStartHandler(t *testing.T) {
 		assert.Contains(t, w.Body.String(), "pending stop request")
 	})
 
-	t.Run("queues stopped apply for scheduler by apply_id", func(t *testing.T) {
+	t.Run("queues stopped apply for operator by apply_id", func(t *testing.T) {
 		mock := &mockTernClient{}
 		apply := stoppedTestApply("apply-xyz789")
 		task := &storage.Task{
@@ -2201,7 +2201,7 @@ func TestStartHandler(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-		assert.Nil(t, mock.startReq, "request path should queue scheduler work without calling Tern start")
+		assert.Nil(t, mock.startReq, "request path should queue operator work without calling Tern start")
 		assert.Equal(t, state.Apply.Stopped, apply.State)
 		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 		require.NoError(t, err)
@@ -2273,7 +2273,7 @@ func TestStartHandler(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, resp.Accepted)
 		assert.Equal(t, "already_requested", resp.Status)
-		assert.Equal(t, state.Apply.Running, apply.State, "duplicate start must not rewind a scheduler-claimed apply")
+		assert.Equal(t, state.Apply.Running, apply.State, "duplicate start must not rewind a operator-claimed apply")
 	})
 
 	t.Run("queues stopped tasks when stored apply row is still running", func(t *testing.T) {
@@ -2297,7 +2297,7 @@ func TestStartHandler(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-		assert.Nil(t, mock.startReq, "request path should queue scheduler work without calling Tern start")
+		assert.Nil(t, mock.startReq, "request path should queue operator work without calling Tern start")
 		assert.Equal(t, state.Apply.Stopped, apply.State)
 		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 		require.NoError(t, err)
@@ -2336,7 +2336,7 @@ func TestStartHandler(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-		assert.Nil(t, mock.startReq, "request path should queue scheduler work without calling Tern start")
+		assert.Nil(t, mock.startReq, "request path should queue operator work without calling Tern start")
 		require.NotNil(t, mock.progressReq)
 		assert.Equal(t, "remote-apply-stoplag", mock.progressReq.ApplyId)
 		assert.Equal(t, state.Apply.Stopped, apply.State)
@@ -2401,7 +2401,7 @@ func TestStartHandler(t *testing.T) {
 		assert.Equal(t, int64(1), resp.StartedCount)
 	})
 
-	t.Run("returns already requested for remote duplicate after scheduler claim", func(t *testing.T) {
+	t.Run("returns already requested for remote duplicate after operator claim", func(t *testing.T) {
 		mock := &mockTernClient{
 			isRemote: true,
 			progressResp: &ternv1.ProgressResponse{
@@ -2610,7 +2610,7 @@ func TestStartHandler(t *testing.T) {
 }
 
 func TestCutoverHandler(t *testing.T) {
-	t.Run("queues cutover for scheduler by apply_id", func(t *testing.T) {
+	t.Run("queues cutover for operator by apply_id", func(t *testing.T) {
 		mock := &mockTernClient{}
 		apply := activeTestApply("apply-cut123")
 		apply.State = state.Apply.WaitingForCutover
@@ -2629,7 +2629,7 @@ func TestCutoverHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		assert.Nil(t, mock.cutoverReq, "request path should queue scheduler work without calling Tern cutover")
+		assert.Nil(t, mock.cutoverReq, "request path should queue operator work without calling Tern cutover")
 		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
 		require.NoError(t, err)
 		require.NotNil(t, controlReq)

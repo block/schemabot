@@ -356,7 +356,7 @@ func applyMetricStatusForError(err error) string {
 }
 
 // ExecuteApply queues an apply request in storage and returns once the work is
-// durable. Scheduler workers own dispatching queued work through the Tern
+// durable. Operator workers own dispatching queued work through the Tern
 // client so request cancellation cannot orphan in-memory execution.
 //
 // Flow:
@@ -364,7 +364,7 @@ func applyMetricStatusForError(err error) string {
 //  2. Resolve the Tern client to validate the deployment/environment.
 //  3. Create a pending Apply record and pending Task records from the plan.
 //  4. Attach any pending observer to the stored apply before dispatch can start.
-//  5. Wake a scheduler worker so fresh applies usually start immediately.
+//  5. Wake a operator worker so fresh applies usually start immediately.
 //  6. Return the SchemaBot apply_identifier to the HTTP caller.
 //
 // Returns the API response, the stored apply ID (0 if not stored), and any error.
@@ -503,7 +503,7 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	span.SetAttributes(attribute.String("apply_id", applyIdentifier), attribute.Bool("accepted", true))
 	recordApplyResult("success")
 	metrics.AdjustActiveApplies(ctx, 1, plan.Database, plan.Deployment, req.Environment)
-	s.wakeScheduler(applyIdentifier, plan.Database, req.Environment)
+	s.wakeOperator(applyIdentifier, plan.Database, req.Environment)
 
 	return &apitypes.ApplyResponse{
 		Accepted: true,

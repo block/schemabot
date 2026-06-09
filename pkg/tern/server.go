@@ -55,7 +55,7 @@ func (s *Server) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.A
 }
 
 // applyErrorCode preserves engine retryability across the gRPC boundary for
-// scheduler-driven dispatch.
+// operator-driven dispatch.
 func applyErrorCode(err error) codes.Code {
 	if err == nil {
 		return codes.OK

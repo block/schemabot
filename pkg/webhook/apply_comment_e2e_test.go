@@ -531,7 +531,7 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	assert.Len(t, allComments, 2, "upsert should not create duplicate entries")
 }
 
-// This scenario covers a recovered PR observer whose scheduler worker has lost
+// This scenario covers a recovered PR observer whose operator worker has lost
 // ownership before it reaches terminal notification. The stale observer must not
 // edit progress, post a summary, mark summary state, or run terminal hooks.
 func TestE2ECommentObserverSkipsTerminalSideEffectsAfterLeaseLoss(t *testing.T) {

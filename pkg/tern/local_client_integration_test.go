@@ -807,9 +807,9 @@ func TestLocalClient_GroupedApplyKeepsClaimLeaseRunning(t *testing.T) {
 	assert.Equal(t, state.Apply.Completed, completed.State)
 }
 
-// This scenario covers a scheduler-owned grouped start where the target schema
+// This scenario covers a operator-owned grouped start where the target schema
 // advances between the recovery re-plan and the final pre-dispatch schema check.
-// The scheduler should complete durable state without reissuing engine apply work.
+// The operator should complete durable state without reissuing engine apply work.
 func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -1294,7 +1294,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverFailureMarksApplyRetryable(t *tes
 }
 
 // This scenario covers a deferred-cutover recovery where the Spirit sentinel is
-// already absent when SchemaBot restarts. The scheduler should reconcile against
+// already absent when SchemaBot restarts. The operator should reconcile against
 // the live schema instead of blocking forever in cutover recovery.
 func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelReconcilesCompletedSchema(t *testing.T) {
 	if testing.Short() {
@@ -1528,7 +1528,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelFailsWhenWorkRemain
 	assert.True(t, hasLogMessageContaining(logs, "manual reconciliation required"))
 }
 
-// This scenario covers a scheduler-owned grouped start where remote execution is
+// This scenario covers a operator-owned grouped start where remote execution is
 // rejected after the durable start request was claimed. The start request should
 // fail visibly instead of being marked completed before engine acceptance.
 func TestLocalClient_ResumeApplyGroupedStartRequestFailsWhenEngineRejects(t *testing.T) {
@@ -2344,7 +2344,7 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 }
 
 // TestLocalClient_Apply_FailedAtomicHasErrorMessage verifies that when Spirit
-// reports an atomic apply failure, the apply pauses for scheduler retry and the
+// reports an atomic apply failure, the apply pauses for operator retry and the
 // failure reason is persisted on both the apply and task records.
 func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	if testing.Short() {
@@ -2401,7 +2401,7 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 			return false
 		}
 		return applies[0].State == state.Apply.FailedRetryable
-	}, 30*time.Second, 500*time.Millisecond, "apply should pause for scheduler retry")
+	}, 30*time.Second, 500*time.Millisecond, "apply should pause for operator retry")
 
 	applies, _ := stor.Applies().GetByDatabase(ctx, "testdb", "mysql", "")
 	require.NotEmpty(t, applies)
@@ -2417,7 +2417,7 @@ func TestLocalClient_Apply_FailedAtomicHasErrorMessage(t *testing.T) {
 	assert.NotEmpty(t, tasks[0].ErrorMessage, "task.ErrorMessage should contain the failure reason")
 }
 
-func TestLocalClient_AtomicRetryableFailureQueuesSchedulerRetry(t *testing.T) {
+func TestLocalClient_AtomicRetryableFailureQueuesOperatorRetry(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -2525,7 +2525,7 @@ func TestLocalClient_AtomicRetryableFailureQueuesSchedulerRetry(t *testing.T) {
 
 	// The engine reports a failed result with Retryable=true. The local Tern
 	// worker should stop this attempt, keep the apply non-terminal, and leave
-	// already-completed task work untouched for the scheduler retry.
+	// already-completed task work untouched for the operator retry.
 	client.pollForCompletionAtomic(ctx, apply, tasks, &engine.Credentials{DSN: dsn}, nil)
 
 	failedApply, err := stor.Applies().Get(ctx, applyID)
@@ -2555,7 +2555,7 @@ func TestLocalClient_AtomicRetryableFailureQueuesSchedulerRetry(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, completedTask.State)
 	assert.NotNil(t, completedTask.CompletedAt)
 
-	// When the scheduler claims this apply, retryable tasks are queued for the
+	// When the operator claims this apply, retryable tasks are queued for the
 	// next dispatch attempt. Completed tasks stay completed so successful table
 	// work is not repeated.
 	client.prepareRetryableTasksForResume(ctx, failedApply, failedTasks)

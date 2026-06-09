@@ -91,7 +91,7 @@ func engineStateToStorage(es engine.State) string {
 
 // taskStateFromProgressResult converts an engine progress result to the task
 // state Tern should persist. Engines use Retryable to opt a failed result into
-// scheduler recovery instead of permanent failure.
+// operator recovery instead of permanent failure.
 func taskStateFromProgressResult(result *engine.ProgressResult) string {
 	if result == nil {
 		return state.Task.Pending

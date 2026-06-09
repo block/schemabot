@@ -147,7 +147,7 @@ func runE2EComposeCommand(t *testing.T, args ...string) string {
 }
 
 // crashE2ESchemaBotServer kills only the SchemaBot server process. The backing
-// MySQL containers stay up, preserving apply/task rows for scheduler recovery.
+// MySQL containers stay up, preserving apply/task rows for operator recovery.
 func crashE2ESchemaBotServer(t *testing.T) {
 	t.Helper()
 	runE2EComposeCommand(t, "kill", "-s", "SIGKILL", "schemabot")

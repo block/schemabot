@@ -38,7 +38,7 @@ func (e *controlOperationHTTPError) Unwrap() error {
 }
 
 // controlConflictf marks an operator request as rejected rather than failed.
-// Storage, Tern, and scheduler errors still fall back to 500s.
+// Storage, Tern, and operator errors still fall back to 500s.
 func controlConflictf(format string, args ...any) error {
 	return &controlOperationHTTPError{
 		status: http.StatusConflict,
@@ -282,7 +282,7 @@ func (s *Service) controlTarget(ctx context.Context, operation, applyIdentifier,
 // an apply-scoped control or progress request.
 //
 // HTTP callers use SchemaBot's apply_identifier. In remote gRPC mode,
-// SchemaBot queues work locally first; after the scheduler dispatches it, Tern
+// SchemaBot queues work locally first; after the operator dispatches it, Tern
 // returns its own apply ID and SchemaBot stores that value as external_id.
 // Subsequent RPCs to remote Tern must use external_id. In local mode, the API
 // layer and LocalClient share storage, so external_id stays empty and the
@@ -327,7 +327,7 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, httpStatus, resp)
 }
 
-// ExecuteCutover records durable cutover intent for an apply. The scheduler
+// ExecuteCutover records durable cutover intent for an apply. The operator
 // owner is responsible for completing cutover against the data plane.
 func (s *Service) ExecuteCutover(ctx context.Context, req apitypes.ControlRequest) (*apitypes.ControlResponse, error) {
 	client, apply, ternApplyID, err := s.controlTarget(ctx, "cutover", req.ApplyID, req.Environment)
@@ -366,7 +366,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 			"environment", apply.Environment,
 			"requested_by", caller,
 			"original_requested_by", controlReq.RequestedBy)
-		s.wakeScheduler(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
 	}
 	readiness, err := s.cutoverRequestReadiness(ctx, client, apply, ternApplyID)
@@ -422,13 +422,13 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		message = "Cutover requested by user while cutover request already pending"
 	}
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered, message)
-	s.logger.Info("cutover request queued for scheduler",
+	s.logger.Info("cutover request queued for operator",
 		"apply_id", apply.ApplyIdentifier,
 		"database", apply.Database,
 		"deployment", apply.Deployment,
 		"environment", apply.Environment,
 		"requested_by", caller)
-	s.wakeScheduler(apply.ApplyIdentifier, apply.Database, apply.Environment)
+	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 	if alreadyPending {
 		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
 	}
@@ -530,7 +530,7 @@ func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, httpStatus, stopResp)
 }
 
-// ExecuteStop records durable stop intent for an apply. The scheduler owner is
+// ExecuteStop records durable stop intent for an apply. The operator owner is
 // responsible for completing the stop if the immediate local attempt cannot.
 func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) (*apitypes.StopResponse, error) {
 	client, apply, ternApplyID, err := s.controlTarget(ctx, "stop", req.ApplyID, req.Environment)
@@ -568,7 +568,7 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 		} else {
 			s.tryImmediateStopAfterQueue(ctx, client, apply, ternApplyID, environment, caller)
 		}
-		s.wakeScheduler(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 	}
 
 	httpStatus := http.StatusOK
@@ -595,7 +595,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 		return
 	}
 	if client.IsRemote() {
-		s.logger.Info("immediate stop skipped for remote Tern client; durable stop request remains pending for scheduler-owned reconciliation",
+		s.logger.Info("immediate stop skipped for remote Tern client; durable stop request remains pending for operator-owned reconciliation",
 			"apply_id", apply.ApplyIdentifier,
 			"tern_apply_id", ternApplyID,
 			"database", apply.Database,
@@ -893,7 +893,7 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	var resp *ternv1.StartResponse
 	var err error
 	responseStatus := ""
-	queuedForScheduler := false
+	queuedForOperator := false
 	switch {
 	case state.IsState(apply.State, state.Apply.WaitingForDeploy):
 		if err := s.rejectControlIfStopPending(r.Context(), "start dispatch", apply); err != nil {
@@ -911,21 +911,21 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		})
 	case state.IsState(apply.State, state.Apply.Pending):
 		resp, responseStatus, err = s.startResponseForPendingStartRequest(r.Context(), apply)
-		queuedForScheduler = err == nil && resp.Accepted
+		queuedForOperator = err == nil && resp.Accepted
 	case storedApplyMayHaveStoppedTasksForStart(apply.State):
-		// A queued or scheduler-claimed start can leave the durable request
+		// A queued or operator-claimed start can leave the durable request
 		// pending while the stored apply is stopped or running. Treat retries in
 		// either state as idempotent duplicates instead of revalidating remote
 		// state or recording another request.
 		var foundPendingStart bool
 		resp, responseStatus, foundPendingStart, err = s.pendingStartResponseIfPresent(r.Context(), apply)
-		queuedForScheduler = err == nil && foundPendingStart && resp.Accepted
+		queuedForOperator = err == nil && foundPendingStart && resp.Accepted
 		if err == nil && !foundPendingStart && client.IsRemote() && apply.ExternalID != "" {
-			resp, responseStatus, err = s.queueRemoteStoppedApplyForScheduler(r.Context(), client, apply, req.Caller)
+			resp, responseStatus, err = s.queueRemoteStoppedApplyForOperator(r.Context(), client, apply, req.Caller)
 		} else if err == nil && !foundPendingStart {
-			resp, responseStatus, err = s.queueStoppedApplyForScheduler(r.Context(), apply, req.Caller)
+			resp, responseStatus, err = s.queueStoppedApplyForOperator(r.Context(), apply, req.Caller)
 		}
-		queuedForScheduler = queuedForScheduler || (err == nil && resp.Accepted)
+		queuedForOperator = queuedForOperator || (err == nil && resp.Accepted)
 	default:
 		err = startNotAllowedForState(apply)
 	}
@@ -942,8 +942,8 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventStartRequested, "Start requested by user")
-		if queuedForScheduler {
-			s.wakeScheduler(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		if queuedForOperator {
+			s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		}
 	}
 
@@ -1050,11 +1050,11 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 	return nil
 }
 
-// queueStoppedApplyForScheduler makes a user start request claimable by a
-// scheduler worker. Resuming stopped table work can outlive the HTTP request,
+// queueStoppedApplyForOperator makes a user start request claimable by a
+// operator worker. Resuming stopped table work can outlive the HTTP request,
 // so the handler records intent, normalizes a lagging stored apply row to
-// stopped, and wakes the scheduler.
-func (s *Service) queueStoppedApplyForScheduler(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.StartResponse, string, error) {
+// stopped, and wakes the operator.
+func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.StartResponse, string, error) {
 	if !storedApplyMayHaveStoppedTasksForStart(apply.State) {
 		return nil, "", startNotAllowedForState(apply)
 	}
@@ -1090,14 +1090,14 @@ func (s *Service) queueStoppedApplyForScheduler(ctx context.Context, apply *stor
 			return nil, "", err
 		}
 	}
-	return s.persistStartRequestForScheduler(ctx, apply, caller, startedCount, skippedCount)
+	return s.persistStartRequestForOperator(ctx, apply, caller, startedCount, skippedCount)
 }
 
-// queueRemoteStoppedApplyForScheduler validates remote stopped state before
-// recording scheduler work. In gRPC mode, progress can show the data plane as
+// queueRemoteStoppedApplyForOperator validates remote stopped state before
+// recording operator work. In gRPC mode, progress can show the data plane as
 // stopped before the control-plane task rows have synced to stopped, so the
 // remote apply state is the start gate.
-func (s *Service) queueRemoteStoppedApplyForScheduler(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*ternv1.StartResponse, string, error) {
+func (s *Service) queueRemoteStoppedApplyForOperator(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*ternv1.StartResponse, string, error) {
 	if !storedApplyMayHaveStoppedTasksForStart(apply.State) {
 		return nil, "", startNotAllowedForState(apply)
 	}
@@ -1133,7 +1133,7 @@ func (s *Service) queueRemoteStoppedApplyForScheduler(ctx context.Context, clien
 			return nil, "", err
 		}
 	}
-	return s.persistStartRequestForScheduler(ctx, apply, caller, startedCount, skippedCount)
+	return s.persistStartRequestForOperator(ctx, apply, caller, startedCount, skippedCount)
 }
 
 func (s *Service) ensureStoredApplyStoppedForStartClaim(ctx context.Context, apply *storage.Apply) error {
@@ -1152,7 +1152,7 @@ func (s *Service) ensureStoredApplyStoppedForStartClaim(ctx context.Context, app
 	apply.UpdatedAt = now
 	if err := applyStore.Update(ctx, apply); err != nil {
 		*apply = previousApply
-		return fmt.Errorf("mark stored apply %s stopped before scheduler start: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("mark stored apply %s stopped before operator start: %w", apply.ApplyIdentifier, err)
 	}
 	return nil
 }
@@ -1172,7 +1172,7 @@ func remoteStoppedApplyStartCounts(tables []*ternv1.TableProgress) (int64, int64
 	return startedCount, skippedCount
 }
 
-func (s *Service) persistStartRequestForScheduler(ctx context.Context, apply *storage.Apply, caller string, startedCount, skippedCount int64) (*ternv1.StartResponse, string, error) {
+func (s *Service) persistStartRequestForOperator(ctx context.Context, apply *storage.Apply, caller string, startedCount, skippedCount int64) (*ternv1.StartResponse, string, error) {
 	controlReq, alreadyPending, err := s.createStartControlRequest(ctx, apply, caller, startedCount, skippedCount)
 	if err != nil {
 		return nil, "", err
@@ -1293,7 +1293,7 @@ func validateStartRequestState(apply *storage.Apply) error {
 
 // isStartRequestAllowedState is an allowlist for states where /start has a
 // concrete action. New apply states must opt in here before they can reach the
-// scheduler or Tern start paths.
+// operator or Tern start paths.
 func isStartRequestAllowedState(applyState string) bool {
 	return state.IsState(
 		applyState,
@@ -1310,7 +1310,7 @@ func startNotAllowedForState(apply *storage.Apply) error {
 		return controlConflictf("schema change is pending and no start request is queued")
 	case state.IsState(apply.State, state.Apply.Running):
 		// Running applies may reach this helper after the handler checks for
-		// stopped task rows. Without stopped task rows, there is no scheduler
+		// stopped task rows. Without stopped task rows, there is no operator
 		// start work to queue.
 		return controlConflictf("schema change is still running; stop it before starting it again")
 	case state.IsState(apply.State, state.Apply.WaitingForCutover):

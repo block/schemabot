@@ -473,11 +473,11 @@ func TestK8s_Progress(t *testing.T) {
 	testutil.WaitForState(t, ep, applyID, state.Apply.Completed, testutil.PollDeadline)
 }
 
-// TestK8s_StopStartThroughScheduler verifies that a stopped gRPC apply is
-// resumed through durable control-plane scheduler state. The API accepts the
-// start request before the data plane performs the resume, then the scheduler
+// TestK8s_StopStartThroughOperator verifies that a stopped gRPC apply is
+// resumed through durable control-plane operator state. The API accepts the
+// start request before the data plane performs the resume, then the operator
 // completes the handoff and the schema change finishes on the target database.
-func TestK8s_StopStartThroughScheduler(t *testing.T) {
+func TestK8s_StopStartThroughOperator(t *testing.T) {
 	fixture := startRunningIndexAddApply(t, "k8s_stopstart")
 
 	stopResp, err := client.CallStopAPI(fixture.Endpoint, "staging", fixture.ApplyID)
@@ -496,11 +496,11 @@ func TestK8s_StopStartThroughScheduler(t *testing.T) {
 	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
 }
 
-// TestK8s_DeferCutoverThroughScheduler verifies that a deferred gRPC apply is
-// cut over through durable control-plane scheduler state. The API accepts the
-// cutover request before the data plane performs cutover, then the scheduler
+// TestK8s_DeferCutoverThroughOperator verifies that a deferred gRPC apply is
+// cut over through durable control-plane operator state. The API accepts the
+// cutover request before the data plane performs cutover, then the operator
 // completes the request and the target database reaches the planned schema.
-func TestK8s_DeferCutoverThroughScheduler(t *testing.T) {
+func TestK8s_DeferCutoverThroughOperator(t *testing.T) {
 	fixture := startIndexAddApplyWithOptions(t, "k8s_cutover", false, map[string]string{"defer_cutover": "true"}, 10000)
 
 	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.WaitingForCutover, 3*time.Minute)
@@ -703,15 +703,15 @@ func hasRowCopyProgress(rowsTotal, rowsCopied int64, percentComplete int32) bool
 	return rowsTotal > 0 && (rowsCopied > 0 || percentComplete > 0)
 }
 
-// TestK8s_Scheduler_DataPlanePodRestartRecoversIndexAdd verifies scheduler
+// TestK8s_Operator_DataPlanePodRestartRecoversIndexAdd verifies operator
 // recovery across the two-tier Kubernetes deployment. The control plane keeps
 // the user-facing apply alive while the data-plane pods are replaced mid-apply.
-func TestK8s_Scheduler_DataPlanePodRestartRecoversIndexAdd(t *testing.T) {
+func TestK8s_Operator_DataPlanePodRestartRecoversIndexAdd(t *testing.T) {
 	fixture := startRunningIndexAddApply(t, "k8s_sched_dp")
 
 	crashedPods := crashPods(t, "data-plane")
 
-	// The restarted data-plane scheduler claims stale local apply rows. Aging
+	// The restarted data-plane operator claims stale local apply rows. Aging
 	// the heartbeat avoids waiting for the production staleness threshold.
 	markDataPlaneHeartbeatStale(t, fixture.DataPlaneApplyID)
 	waitForPodsReadyAfterDeletion(t, "data-plane", crashedPods, 2*time.Minute)
@@ -721,15 +721,15 @@ func TestK8s_Scheduler_DataPlanePodRestartRecoversIndexAdd(t *testing.T) {
 	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
 }
 
-// TestK8s_Scheduler_ControlPlanePodRestartReconnectsToRunningDataPlane verifies
+// TestK8s_Operator_ControlPlanePodRestartReconnectsToRunningDataPlane verifies
 // that control-plane recovery restarts only the gRPC progress poller. The data
 // plane keeps running the schema change while the control-plane pod is replaced.
-func TestK8s_Scheduler_ControlPlanePodRestartReconnectsToRunningDataPlane(t *testing.T) {
+func TestK8s_Operator_ControlPlanePodRestartReconnectsToRunningDataPlane(t *testing.T) {
 	fixture := startRunningIndexAddApply(t, "k8s_sched_cp")
 
 	crashedPod := crashPod(t, "control-plane")
 
-	// The restarted control-plane scheduler claims the stale SchemaBot apply
+	// The restarted control-plane operator claims the stale SchemaBot apply
 	// row, then GRPCClient resumes progress polling using the data-plane apply ID.
 	markControlPlaneHeartbeatStale(t, fixture.ApplyID)
 	waitForReplacementPodReady(t, "control-plane", crashedPod, 2*time.Minute)

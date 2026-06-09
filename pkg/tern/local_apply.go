@@ -308,7 +308,7 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 // Priority order:
 // 1. RUNNING/WAITING_FOR_CUTOVER/CUTTING_OVER - active work in progress
 // 2. FAILED - at least one task failed (CANCELLED tasks also indicate failure)
-// 3. FAILED_RETRYABLE - scheduler recovery may retry failed task work
+// 3. FAILED_RETRYABLE - operator recovery may retry failed task work
 // 4. PENDING - more work queued
 // 5. STOPPED - apply was stopped (even if some tasks completed)
 // 6. COMPLETED - all tasks completed successfully

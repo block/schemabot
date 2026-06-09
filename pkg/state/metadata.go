@@ -16,7 +16,7 @@ type ApplyStateInfo struct {
 	Label string
 
 	// Terminal is true for states where no further processing will occur.
-	// FailedRetryable is NOT terminal — the scheduler may retry it.
+	// FailedRetryable is NOT terminal — the operator may retry it.
 	// Stopped IS terminal at the apply level (operators must explicitly resume).
 	Terminal bool
 

@@ -1,5 +1,5 @@
 // Package clock provides a minimal time source abstraction so orchestration
-// code (scheduler, comment observer) can be exercised deterministically in
+// code (operator, comment observer) can be exercised deterministically in
 // tests without sleeping or racing against the wall clock.
 package clock
 

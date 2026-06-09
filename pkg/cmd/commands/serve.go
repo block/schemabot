@@ -147,13 +147,13 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	// in the background so GitHub repair does not block server startup.
 	webhookRuntime.StartMissingSummaryReconciliation(ctx, logger)
 
-	// Start the scheduler worker pool after webhook callbacks are registered.
+	// Start the operator worker pool after webhook callbacks are registered.
 	// This polls for apply work every 10 seconds:
 	// - Runs immediately on startup
 	// - Dispatches queued local applies
 	// - Recovers applies with stale heartbeats (> 1 minute) using FOR UPDATE SKIP LOCKED
 	// - STOPPED applies are NOT auto-resumed (user must call `schemabot start`)
-	svc.StartScheduler(ctx)
+	svc.StartOperator(ctx)
 
 	// Optionally start gRPC server for Tern proto (used by docker-compose.grpc.yml)
 	var grpcServer *grpc.Server

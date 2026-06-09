@@ -82,7 +82,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		c.logger.Error("failed to set started_at", "apply_id", apply.ApplyIdentifier, "error", err)
 	}
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
-		c.logger.Warn("pending stop request processing failed before grouped engine apply; current apply owner will exit for scheduler retry",
+		c.logger.Warn("pending stop request processing failed before grouped engine apply; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "error", err)
 		return
 	} else if handled {
@@ -149,7 +149,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			c.failApplyWithTasks(ctx, apply, tasks, err.Error())
 		}
 		if newState == state.Apply.FailedRetryable {
-			c.logger.Warn("apply paused for scheduler retry", "mode", mode, "error", err, "apply_id", apply.ApplyIdentifier)
+			c.logger.Warn("apply paused for operator retry", "mode", mode, "error", err, "apply_id", apply.ApplyIdentifier)
 		} else {
 			c.logger.Error("apply failed", "mode", mode, "error", err, "apply_id", apply.ApplyIdentifier)
 		}
@@ -334,10 +334,10 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 
 // handleAtomicProgressTick processes a single progress poll tick in atomic mode.
 // Returns true when polling should stop because the apply reached a terminal state
-// or this owner attempt must exit for scheduler retry.
+// or this owner attempt must exit for operator retry.
 func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState) bool {
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
-		c.logger.Warn("pending stop request processing failed; current apply owner will exit for scheduler retry",
+		c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "error", err)
 		return true
 	} else if handled {
@@ -363,7 +363,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"error", err, "apply_id", apply.ApplyIdentifier, "consecutive_errors", ps.consecutiveErrors)
 		if ps.consecutiveErrors >= 10 {
 			if c.shouldRetryEngineError(err) {
-				c.logger.Warn("progress polling failed repeatedly, pausing apply for scheduler retry",
+				c.logger.Warn("progress polling failed repeatedly, pausing apply for operator retry",
 					"apply_id", apply.ApplyIdentifier, "consecutive_errors", ps.consecutiveErrors)
 				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
 				return true
@@ -412,14 +412,14 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// Update all tasks with engine progress
 	c.syncAtomicTaskProgress(ctx, tasks, result, newState, now)
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
-		c.logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for scheduler retry",
+		c.logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "error", err)
 		return true
 	} else if handled {
 		return true
 	}
 	if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
-		c.logger.Warn("pending cutover request processing failed after progress sync; current apply owner will exit for scheduler retry",
+		c.logger.Warn("pending cutover request processing failed after progress sync; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "error", err)
 		return true
 	}
@@ -527,7 +527,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"progress_state", apply.State)
 		*apply = *freshApply
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
-			c.logger.Warn("failed to complete pending stop request for terminal apply; current apply owner will exit for scheduler retry",
+			c.logger.Warn("failed to complete pending stop request for terminal apply; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return true
 		}
@@ -558,14 +558,14 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
 		}
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
-			c.logger.Warn("failed to complete pending stop request after terminal progress reconciliation; current apply owner will exit for scheduler retry",
+			c.logger.Warn("failed to complete pending stop request after terminal progress reconciliation; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return true
 		}
 		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 		switch {
 		case retryableFailure:
-			c.logger.Warn("apply paused for scheduler retry",
+			c.logger.Warn("apply paused for operator retry",
 				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
 		case result.State == engine.StateFailed:
 			c.logger.Error("apply failed",

@@ -70,7 +70,7 @@ package tern
 //   - external_id: Tern's apply_id (the remote engine's apply identifier), used in all
 //     gRPC calls to the remote Tern (Progress, Stop, Start, Cutover, etc.).
 //
-// gRPC mode progress flow after scheduler dispatch:
+// gRPC mode progress flow after operator dispatch:
 //
 //	CLI/caller
 //	    │ apply_identifier="apply-abc123"
@@ -87,7 +87,7 @@ package tern
 //	ProgressResponse
 //
 // The API layer generates apply_identifier as a SchemaBot UUID when it queues
-// the apply. The scheduler later dispatches the queued apply to remote Tern and
+// the apply. The operator later dispatches the queued apply to remote Tern and
 // stores Tern's ApplyId as external_id. Apply-scoped HTTP handlers load the
 // stored apply row and send external_id to Tern when it is present.
 //
@@ -627,7 +627,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 		return false, nil
 	}
 	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !isTerminalProtoState(progress.State) {
-		slog.Warn("remote gRPC stop error found nonterminal progress; durable stop request remains pending for scheduler retry",
+		slog.Warn("remote gRPC stop error found nonterminal progress; durable stop request remains pending for operator retry",
 			"apply_id", apply.ApplyIdentifier,
 			"external_id", apply.ExternalID,
 			"database", apply.Database,
@@ -730,10 +730,10 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 	return err
 }
 
-// ResumeApply runs work claimed by the scheduler. Fresh queued applies have no
+// ResumeApply runs work claimed by the operator. Fresh queued applies have no
 // external_id yet, so this method first dispatches them to remote Tern and
 // stores the returned ID. The call then polls until the apply reaches a stored
-// terminal state or the scheduler context is canceled.
+// terminal state or the operator context is canceled.
 func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
 	if c.storage == nil {
 		return fmt.Errorf("storage not configured for GRPCClient")
@@ -864,7 +864,7 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 			})
 			if err != nil {
 				message := fmt.Sprintf("remote start failed for remote apply %s: %v", apply.ExternalID, err)
-				slog.Warn("remote gRPC start failed; storing stopped state for scheduler retry",
+				slog.Warn("remote gRPC start failed; storing stopped state for operator retry",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,
@@ -1289,7 +1289,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	remoteApplyFromProgress := *remoteApply
 	storedApply, transitionStatus, err := c.reloadStoredApplyForRemoteTransition(ctx, remoteApply, false)
 
-	// A scheduler claim can start from a stale stored "stopped" row. If the
+	// A operator claim can start from a stale stored "stopped" row. If the
 	// exact remote apply has already advanced to another terminal state, the
 	// remote result is the newer truth and should replace the stored stopped row.
 	if transitionStatus == storedApplyTransitionAlreadyTerminal && storedStoppedApplyCanAdoptRemoteTerminalState(storedApply, &remoteApplyFromProgress) {
@@ -1311,7 +1311,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	}
 
 	// Keep the stored apply active until stored task rows are written. If task
-	// storage is unavailable, the scheduler can retry this worker instead of
+	// storage is unavailable, the operator can retry this worker instead of
 	// treating a terminal apply as fully reconciled.
 	storedTasks, err := c.storage.Tasks().GetByApplyID(ctx, storedApply.ID)
 	if err != nil {
@@ -1347,7 +1347,7 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	}
 	// Stopped is a terminal apply state, but it is not completion of a pending
 	// Start request. A start can be queued while the previous worker is still
-	// recording the stop; leave that request pending so the scheduler can claim
+	// recording the stop; leave that request pending so the operator can claim
 	// the stopped row and perform the resume.
 	if !state.IsState(storedApply.State, state.Apply.Stopped) {
 		if err := completePendingStartControlRequests(ctx, c.storage, storedApply); err != nil {
@@ -1573,7 +1573,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 		case <-ticker.C:
 			if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
-				slog.Warn("pending gRPC stop request processing failed; current apply owner will exit for scheduler retry",
+				slog.Warn("pending gRPC stop request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,
@@ -1584,7 +1584,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				return nil
 			}
 			if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
-				slog.Warn("pending gRPC cutover request processing failed; current apply owner will exit for scheduler retry",
+				slog.Warn("pending gRPC cutover request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,
@@ -1662,7 +1662,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					stoppedAfterStartDeadline = now.Add(grpcStoppedAfterStartGracePeriod)
 				}
 				if !loggedStoppedAfterStart {
-					slog.Info("remote gRPC apply still stopped after start accepted; scheduler will keep polling",
+					slog.Info("remote gRPC apply still stopped after start accepted; operator will keep polling",
 						"apply_id", apply.ApplyIdentifier,
 						"external_id", apply.ExternalID,
 						"database", apply.Database,

@@ -179,14 +179,14 @@ type ApplyStore interface {
 	Create(ctx context.Context, apply *Apply) (int64, error)
 
 	// CreateWithTasks stores a new apply and its initial tasks in one
-	// transaction. Pending applies become scheduler-claimable only after the
+	// transaction. Pending applies become operator-claimable only after the
 	// task rows are committed.
 	CreateWithTasks(ctx context.Context, apply *Apply, tasks []*Task) (int64, error)
 
 	// CreateWithTasksAndOperations stores a new apply, its initial tasks, and
 	// its per-deployment apply_operations rows in a single transaction. Each
 	// operation row's ApplyID is set to the new apply ID before insert.
-	// Pending applies become scheduler-claimable only after every row is
+	// Pending applies become operator-claimable only after every row is
 	// committed, so the operator never observes a partially-populated apply.
 	CreateWithTasksAndOperations(ctx context.Context, apply *Apply, tasks []*Task, operations []*ApplyOperation) (int64, error)
 
@@ -224,7 +224,7 @@ type ApplyStore interface {
 	// FindNextApply atomically claims the next apply that needs attention.
 	// A claim selects one apply that needs work and refreshes its heartbeat in
 	// the same transaction. The owner is stored with a freshly generated lease
-	// token so scheduler-owned writes can fail closed after ownership changes.
+	// token so operator-owned writes can fail closed after ownership changes.
 	// Returns the claimed apply, or nil if nothing needs work.
 	FindNextApply(ctx context.Context, owner string) (*Apply, error)
 
@@ -232,7 +232,7 @@ type ApplyStore interface {
 	// same claimability rules as FindNextApply (pending with tasks, stale active
 	// state, retryable within budget, or a pending start control request). On a
 	// successful claim it rotates the lease (owner, token, acquired_at) and
-	// refreshes the heartbeat so scheduler-owned writes can fail closed after
+	// refreshes the heartbeat so operator-owned writes can fail closed after
 	// ownership changes. Returns the claimed apply, or nil if the apply does not
 	// exist or is not currently claimable (e.g. another worker holds a fresh
 	// lease or the apply is terminal). Used by the operation-level claim loop to
@@ -244,7 +244,7 @@ type ApplyStore interface {
 	// If not called for > 1 minute, another worker can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
 
-	// CheckLease verifies that a scheduler apply lease is still current without
+	// CheckLease verifies that a operator apply lease is still current without
 	// mutating the apply row.
 	CheckLease(ctx context.Context, lease ApplyLease) error
 
@@ -275,7 +275,7 @@ type RecentAppliesFilter struct {
 	States      []string
 }
 
-// RetryableExpirationReason identifies why scheduler retry recovery stopped.
+// RetryableExpirationReason identifies why operator retry recovery stopped.
 type RetryableExpirationReason string
 
 const (
@@ -284,7 +284,7 @@ const (
 )
 
 // RetryableApplyExpiration is a failed_retryable apply that was made permanent
-// because scheduler recovery should no longer retry it automatically.
+// because operator recovery should no longer retry it automatically.
 type RetryableApplyExpiration struct {
 	Apply  *Apply
 	Reason RetryableExpirationReason
@@ -401,7 +401,7 @@ type ApplyOperationStore interface {
 	//
 	// Returns the claimed row, or nil if nothing needs work.
 	//
-	// Pure storage primitive: no scheduler/operator loop calls this yet —
+	// Pure storage primitive: no operator/operator loop calls this yet —
 	// the per-deployment claim loop arrives in a subsequent PR in the
 	// multi-deployment apply workstream.
 	FindNextApplyOperation(ctx context.Context) (*ApplyOperation, error)
@@ -439,7 +439,7 @@ type ApplyLogStore interface {
 }
 
 // ControlRequestStore manages durable user control requests.
-// A control request is behavioral state, not just audit: scheduler workers use
+// A control request is behavioral state, not just audit: operator workers use
 // pending rows to recover accepted operations after process restarts.
 type ControlRequestStore interface {
 	// RequestPending records a pending request for an apply operation. If the

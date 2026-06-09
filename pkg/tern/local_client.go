@@ -617,7 +617,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	// Direct client calls can still register a pending observer before starting
 	// the engine. API-created applies use the service-level observer registry
-	// because scheduler workers dispatch them asynchronously.
+	// because operator workers dispatch them asynchronously.
 	if obs := c.consumePendingObserver(); obs != nil {
 		// Set the apply ID on the observer if it supports it (e.g., CommentObserver
 		// needs the ID to look up tracked comments for editing).
@@ -1116,7 +1116,7 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 		return engineTaskState
 	}
 
-	// Recovering is a temporary scheduler-owned wrapper while an engine reattaches
+	// Recovering is a temporary operator-owned wrapper while an engine reattaches
 	// after restart. Recovery starts only after storage had already reached
 	// waiting_for_cutover, so row-copy progress during reattach must not move
 	// storage backward to running. Row counters can still be displayed from live
@@ -1132,7 +1132,7 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 		return engineTaskState
 	}
 
-	// Scheduler/control-owned states block stale active engine progress.
+	// Operator/control-owned states block stale active engine progress.
 	if blocksActiveEngineProgress(storedTaskState) {
 		return storedTaskState
 	}
@@ -1152,10 +1152,10 @@ func taskStateWithNoBackwardProgress(storedTaskState, engineTaskState string) st
 	return engineTaskState
 }
 
-// blocksActiveEngineProgress identifies durable scheduler/control states that
+// blocksActiveEngineProgress identifies durable operator/control states that
 // should not be overwritten by a stale active engine poll. For example, a user
 // can stop a task while the engine still reports running for a short window, or
-// the scheduler can mark a task failed_retryable before a retry claims it.
+// the operator can mark a task failed_retryable before a retry claims it.
 func blocksActiveEngineProgress(taskState string) bool {
 	return state.IsState(taskState, state.Task.Stopped, state.Task.FailedRetryable)
 }
@@ -1171,7 +1171,7 @@ func recoveryCompleteWithEngineState(taskState string) bool {
 }
 
 // activeTaskProgressRank orders ordinary active task phases. Terminal states
-// and scheduler/control-owned states are handled before this helper, so new
+// and operator/control-owned states are handled before this helper, so new
 // task states must be consciously assigned to one of those policies.
 func activeTaskProgressRank(taskState string) (int, bool) {
 	switch state.NormalizeTaskStatus(taskState) {

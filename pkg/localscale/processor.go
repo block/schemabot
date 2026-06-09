@@ -337,8 +337,8 @@ type migrationInfo struct {
 //
 // Vitess migration statuses (from vitess.io/vitess/go/vt/schema):
 //
-//	requested        → Migration submitted to tablet, not yet picked up by scheduler
-//	queued           → Picked up by scheduler, waiting for execution slot
+//	requested        → Migration submitted to tablet, not yet picked up by operator
+//	queued           → Picked up by operator, waiting for execution slot
 //	ready            → Ready to execute but waiting (e.g., for --in-order-completion)
 //	running          → Actively copying rows (or cutting over if ready_to_complete=true)
 //	ready_to_complete→ Row copy done, waiting for cutover (explicit or auto)

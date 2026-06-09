@@ -69,7 +69,7 @@ func TestServerProgressMapsMissingApplyDataToNotFound(t *testing.T) {
 
 func TestServerApplyMapsEngineRetryabilityToStatusCode(t *testing.T) {
 	// The data plane must preserve engine retryability across gRPC so the
-	// control-plane scheduler can pause retryable errors without retrying
+	// control-plane operator can pause retryable errors without retrying
 	// known-permanent engine failures.
 	testCases := []struct {
 		name string

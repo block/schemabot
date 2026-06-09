@@ -25,7 +25,7 @@ type ProgressObserver interface {
 }
 
 // SetObserver registers a progress observer for an apply.
-// Called by the scheduler before resuming an apply. Safe to call concurrently.
+// Called by the operator before resuming an apply. Safe to call concurrently.
 func (c *LocalClient) SetObserver(applyID int64, observer ProgressObserver) {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()
@@ -52,7 +52,7 @@ func (c *LocalClient) SetObserver(applyID int64, observer ProgressObserver) {
 
 // SetPendingObserver sets an observer that will be consumed by the next direct
 // client Apply() call. The API service uses its own pending-observer registry
-// because scheduler workers dispatch API-created applies asynchronously.
+// because operator workers dispatch API-created applies asynchronously.
 func (c *LocalClient) SetPendingObserver(observer ProgressObserver) {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()

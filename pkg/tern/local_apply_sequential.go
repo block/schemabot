@@ -42,7 +42,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 
 	for i, task := range tasks {
 		if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
-			c.logger.Warn("pending stop request processing failed; current apply owner will exit for scheduler retry",
+			c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			return
 		} else if handled {
@@ -140,7 +140,7 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, task *storage.Task) ta
 // Returns the outcome: taskContinue (completed), taskFailed, or taskStopped.
 func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, plan *storage.Plan, options map[string]string, creds *engine.Credentials) taskAction {
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
-		c.logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for scheduler retry",
+		c.logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
 		return taskAbort
 	} else if handled {
@@ -227,7 +227,7 @@ type atomicPollState struct {
 }
 
 // startApplyHeartbeat starts a background goroutine that heartbeats the apply
-// every 10 seconds, preventing the scheduler from treating it as crashed.
+// every 10 seconds, preventing the operator from treating it as crashed.
 // Returns a cancel function that stops the heartbeat. Must be deferred by the caller.
 func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Apply, cancelApply ...context.CancelFunc) context.CancelFunc {
 	hbCtx, cancel := context.WithCancel(ctx)
@@ -277,7 +277,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			return taskStopped
 		case <-ticker.C:
 			if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
-				c.logger.Warn("pending stop request processing failed; current apply owner will exit for scheduler retry",
+				c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
 			} else if handled {
@@ -285,7 +285,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				return taskStopped
 			}
 			if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
-				c.logger.Warn("pending cutover request processing failed; current apply owner will exit for scheduler retry",
+				c.logger.Warn("pending cutover request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
 			}
@@ -380,7 +380,7 @@ func (c *LocalClient) markTaskFailed(ctx context.Context, task *storage.Task, er
 	c.transitionTaskState(ctx, task, 0, state.Task.Failed, "")
 }
 
-// markTaskRetryable records a task failure that scheduler recovery may retry.
+// markTaskRetryable records a task failure that operator recovery may retry.
 func (c *LocalClient) markTaskRetryable(ctx context.Context, task *storage.Task, errMsg string) {
 	task.ErrorMessage = errMsg
 	task.CompletedAt = nil
@@ -397,7 +397,7 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 
 // finalizeSequentialApply updates the apply state based on sequential task outcomes.
 // Permanent failures cancel remaining pending tasks; retryable failures leave
-// pending tasks queued for scheduler recovery.
+// pending tasks queued for operator recovery.
 func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) {
 	now := time.Now()
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {

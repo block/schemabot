@@ -94,7 +94,7 @@ func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
 }
 
 // Service is the SchemaBot API service.
-// RecoveryCallback is called after the scheduler claims an apply for recovery.
+// RecoveryCallback is called after the operator claims an apply for recovery.
 // The webhook handler uses this to start watching progress and posting PR comments.
 type RecoveryCallback func(apply *storage.Apply)
 
@@ -112,19 +112,19 @@ type Service struct {
 	logger      *slog.Logger
 	clock       clock.Clock
 
-	// Scheduler loop management.
-	schedulerMu           sync.Mutex
-	stopRecovery          chan struct{}
-	cancelRecovery        context.CancelFunc
-	schedulerWake         chan struct{}
-	recoveryWg            sync.WaitGroup
-	schedulerPollInterval time.Duration
-	remoteHealthMu        sync.Mutex
-	remoteHealthCancel    context.CancelFunc
-	remoteHealthWg        sync.WaitGroup
-	remoteHealthInterval  time.Duration
+	// Operator loop management.
+	operatorMu           sync.Mutex
+	stopRecovery         chan struct{}
+	cancelRecovery       context.CancelFunc
+	operatorWake         chan struct{}
+	recoveryWg           sync.WaitGroup
+	operatorPollInterval time.Duration
+	remoteHealthMu       sync.Mutex
+	remoteHealthCancel   context.CancelFunc
+	remoteHealthWg       sync.WaitGroup
+	remoteHealthInterval time.Duration
 
-	// OnApplyRecovered is called after the scheduler claims an apply and before
+	// OnApplyRecovered is called after the operator claims an apply and before
 	// ResumeApply starts the engine/poller. Set by the webhook handler to attach
 	// an observer for PR comments.
 	OnApplyRecovered RecoveryCallback
@@ -152,7 +152,7 @@ func (s *Service) SetApplyObserver(database, deployment, environment string, app
 }
 
 // SetPendingObserver stores an observer for the next apply request for this
-// target. ExecuteApply registers it on the durable apply before scheduler
+// target. ExecuteApply registers it on the durable apply before operator
 // dispatch can start.
 func (s *Service) SetPendingObserver(database, deployment, environment string, observer tern.ProgressObserver) {
 	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
@@ -197,49 +197,49 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		ternClients = make(map[string]tern.Client)
 	}
 	return &Service{
-		storage:               st,
-		config:                config,
-		ternClients:           ternClients,
-		logger:                logger,
-		clock:                 clock.Real{},
-		schedulerPollInterval: SchedulerPollInterval,
-		remoteHealthInterval:  RemoteDeploymentHealthCheckInterval,
-		pendingObservers:      make(map[pendingObserverKey]tern.ProgressObserver),
+		storage:              st,
+		config:               config,
+		ternClients:          ternClients,
+		logger:               logger,
+		clock:                clock.Real{},
+		operatorPollInterval: OperatorPollInterval,
+		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
+		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
 	}
 }
 
 // SetClock overrides the time source used by orchestration loops (currently
-// the scheduler claim-duration measurement). Must be called before
-// StartScheduler — once scheduler workers are running they read s.clock
+// the operator claim-duration measurement). Must be called before
+// StartOperator — once operator workers are running they read s.clock
 // concurrently, so swapping the field is rejected to avoid a data race.
 // Production callers should leave the default clock.Real{} in place; tests
 // use clock.NewFake to make timing observable. A nil or typed-nil c is
 // coalesced to clock.Real{} via clock.Default.
 func (s *Service) SetClock(c clock.Clock) error {
-	s.schedulerMu.Lock()
-	defer s.schedulerMu.Unlock()
+	s.operatorMu.Lock()
+	defer s.operatorMu.Unlock()
 	if s.stopRecovery != nil {
-		return fmt.Errorf("cannot change clock while scheduler is running")
+		return fmt.Errorf("cannot change clock while operator is running")
 	}
 	s.clock = clock.Default(c)
 	return nil
 }
 
-// SetSchedulerPollInterval sets the scheduler worker poll interval.
+// SetOperatorPollInterval sets the operator worker poll interval.
 // Most deployments should use the default interval; this is a low-level
-// embedding hook for callers that need to tune the scheduler loop directly.
-// Call before StartScheduler so workers create their tickers with the intended
+// embedding hook for callers that need to tune the operator loop directly.
+// Call before StartOperator so workers create their tickers with the intended
 // interval.
-func (s *Service) SetSchedulerPollInterval(interval time.Duration) error {
+func (s *Service) SetOperatorPollInterval(interval time.Duration) error {
 	if interval <= 0 {
-		return fmt.Errorf("scheduler poll interval must be positive")
+		return fmt.Errorf("operator poll interval must be positive")
 	}
-	s.schedulerMu.Lock()
-	defer s.schedulerMu.Unlock()
+	s.operatorMu.Lock()
+	defer s.operatorMu.Unlock()
 	if s.stopRecovery != nil {
-		return fmt.Errorf("scheduler already running")
+		return fmt.Errorf("operator already running")
 	}
-	s.schedulerPollInterval = interval
+	s.operatorPollInterval = interval
 	return nil
 }
 
@@ -521,7 +521,7 @@ func (s *Service) Storage() storage.Storage {
 // Close closes the service and releases resources.
 func (s *Service) Close() error {
 	// Stop background workers first.
-	s.StopScheduler()
+	s.StopOperator()
 	s.StopRemoteDeploymentHealthMonitor()
 
 	s.ternMu.Lock()

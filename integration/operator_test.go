@@ -25,12 +25,12 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// These tests exercise scheduler behavior at two levels: the full worker loop
+// These tests exercise operator behavior at two levels: the full worker loop
 // in the resume tests, and the atomic claim query through FindNextApply.
-// Scheduler workers use FindNextApply before calling ResumeApply, so direct
+// Operator workers use FindNextApply before calling ResumeApply, so direct
 // calls keep claim policy tests focused without waiting for ticks.
 
-type schedulerClaimFixture struct {
+type operatorClaimFixture struct {
 	appDBName string
 	storageDB *sql.DB
 	store     *mysqlstore.Storage
@@ -75,14 +75,14 @@ func (c *blockingResumeClient) waitForResume(t *testing.T, timeout time.Duration
 	select {
 	case <-c.started:
 	case <-timer.C:
-		require.Failf(t, "timeout", "scheduler did not claim blocked apply within %s", timeout)
+		require.Failf(t, "timeout", "operator did not claim blocked apply within %s", timeout)
 	}
 }
 
-// newSchedulerClaimFixture creates a real target database plus a clean SchemaBot
+// newOperatorClaimFixture creates a real target database plus a clean SchemaBot
 // metadata store. The claim-policy tests write apply rows directly into storage
-// so they can test scheduler decisions without depending on worker timing.
-func newSchedulerClaimFixture(t *testing.T, appDBPrefix string) *schedulerClaimFixture {
+// so they can test operator decisions without depending on worker timing.
+func newOperatorClaimFixture(t *testing.T, appDBPrefix string) *operatorClaimFixture {
 	t.Helper()
 
 	appDBName, _ := createTestDB(t, appDBPrefix)
@@ -94,19 +94,19 @@ func newSchedulerClaimFixture(t *testing.T, appDBPrefix string) *schedulerClaimF
 		utils.CloseAndLog(storageDB)
 	})
 
-	return &schedulerClaimFixture{
+	return &operatorClaimFixture{
 		appDBName: appDBName,
 		storageDB: storageDB,
 		store:     mysqlstore.New(storageDB),
 	}
 }
 
-func (f *schedulerClaimFixture) resetStorage(t *testing.T) {
+func (f *operatorClaimFixture) resetStorage(t *testing.T) {
 	t.Helper()
 	clearStorageDB(t, f.storageDB)
 }
 
-func TestScheduler_BasicClaimAndResume(t *testing.T) {
+func TestOperator_BasicClaimAndResume(t *testing.T) {
 	ctx := t.Context()
 	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
 	require.NoError(t, err)
@@ -128,7 +128,7 @@ func TestScheduler_BasicClaimAndResume(t *testing.T) {
 	require.True(t, applyResp["accepted"] == true)
 	applyID, _ := applyResp["apply_id"].(string)
 	waitForState(t, "http://"+ts.Addr, applyID, "completed", 15*time.Second)
-	ts.Service.StopScheduler()
+	ts.Service.StopOperator()
 
 	// Remove the table so the second plan contains DDL that recovery can resume.
 	targetConn, err := sql.Open("mysql", appDSN)
@@ -193,9 +193,9 @@ func TestScheduler_BasicClaimAndResume(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Scheduler recovery should claim the stale apply and resume it to completion.
-	ts.Service.StartScheduler(t.Context())
-	defer ts.Service.StopScheduler()
+	// Operator recovery should claim the stale apply and resume it to completion.
+	ts.Service.StartOperator(t.Context())
+	defer ts.Service.StopOperator()
 
 	var lastState string
 	testutil.Poll(t, 20*time.Second, 500*time.Millisecond,
@@ -208,17 +208,17 @@ func TestScheduler_BasicClaimAndResume(t *testing.T) {
 			return apply != nil && apply.State == state.Apply.Completed
 		},
 		func() string {
-			return fmt.Sprintf("scheduler did not resume stale apply %d, last state: %q", staleID, lastState)
+			return fmt.Sprintf("operator did not resume stale apply %d, last state: %q", staleID, lastState)
 		},
 	)
 }
 
-// TestScheduler_OperatorClaimsOperationToCompletion exercises the operation-level
+// TestOperator_OperatorClaimsOperationToCompletion exercises the operation-level
 // claim loop (operator_claim_operations enabled). An apply created through the
 // normal flow dual-writes exactly one apply_operations row; the operator claims
 // that row, acquires the parent apply lease, drives the schema change to
 // completion, and marks the operation row completed.
-func TestScheduler_OperatorClaimsOperationToCompletion(t *testing.T) {
+func TestOperator_OperatorClaimsOperationToCompletion(t *testing.T) {
 	ctx := t.Context()
 	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
 	require.NoError(t, err)
@@ -266,13 +266,13 @@ func TestScheduler_OperatorClaimsOperationToCompletion(t *testing.T) {
 	require.NotNil(t, ops[0].CompletedAt, "completed operation stamps completed_at")
 }
 
-// TestScheduler_OperatorReconcilesOperationWhenParentTerminal covers the safety
+// TestOperator_OperatorReconcilesOperationWhenParentTerminal covers the safety
 // case where the operator claims an apply_operations row whose parent apply is
 // already terminal — for example the operator flag is enabled after the apply
 // finished, or the parent reached a terminal state via another path. The
 // operator must reconcile the operation to the parent's terminal state rather
 // than re-claiming the same non-terminal row on every poll forever.
-func TestScheduler_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
+func TestOperator_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
 	ctx := t.Context()
 	appDBName, appDSN := createTestDB(t, "operator_reconcile_")
 	ts := startTestServerOperator(t, appDBName, appDSN)
@@ -316,10 +316,10 @@ func TestScheduler_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
 	require.NotNil(t, op.CompletedAt, "reconciled completed operation stamps completed_at")
 }
 
-func TestScheduler_ClaimOrdering(t *testing.T) {
+func TestOperator_ClaimOrdering(t *testing.T) {
 	ctx := t.Context()
 
-	fixture := newSchedulerClaimFixture(t, "ord1_")
+	fixture := newOperatorClaimFixture(t, "ord1_")
 	db1Name := fixture.appDBName
 	db2Name, _ := createTestDB(t, "ord2_")
 	stor := fixture.store
@@ -357,21 +357,21 @@ func TestScheduler_ClaimOrdering(t *testing.T) {
 	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET created_at = NOW() - INTERVAL 1 MINUTE, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", newerID)
 	require.NoError(t, err)
 
-	// The scheduler claim path should pick the oldest stale apply first.
+	// The operator claim path should pick the oldest stale apply first.
 	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, "apply-order-older", claimed.ApplyIdentifier)
 
-	// After the first target is claimed, the scheduler can claim the next stale target.
+	// After the first target is claimed, the operator can claim the next stale target.
 	claimed2, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed2)
 	assert.Equal(t, "apply-order-newer", claimed2.ApplyIdentifier)
 }
 
-func TestScheduler_ClaimableStates(t *testing.T) {
-	fixture := newSchedulerClaimFixture(t, "claim_states_")
+func TestOperator_ClaimableStates(t *testing.T) {
+	fixture := newOperatorClaimFixture(t, "claim_states_")
 	appDBName := fixture.appDBName
 	stor := fixture.store
 	schemabotDB := fixture.storageDB
@@ -421,7 +421,7 @@ func TestScheduler_ClaimableStates(t *testing.T) {
 			})
 			require.NoError(t, err)
 			if tc.applyState == state.Apply.Pending {
-				// Pending applies become scheduler work only after task creation
+				// Pending applies become operator work only after task creation
 				// finishes; a bare pending apply is still in request setup.
 				_, err := stor.Tasks().Create(ctx, &storage.Task{
 					TaskIdentifier: fmt.Sprintf("task-%s", applyIdentifier),
@@ -445,7 +445,7 @@ func TestScheduler_ClaimableStates(t *testing.T) {
 				applyIdentifier)
 			require.NoError(t, err)
 
-			// The scheduler should claim only queued or stale applies in states it can resume safely.
+			// The operator should claim only queued or stale applies in states it can resume safely.
 			claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 			require.NoError(t, err)
 			if tc.wantClaim {
@@ -458,10 +458,10 @@ func TestScheduler_ClaimableStates(t *testing.T) {
 	}
 }
 
-func TestScheduler_ClaimRefreshesHeartbeat(t *testing.T) {
+func TestOperator_ClaimRefreshesHeartbeat(t *testing.T) {
 	ctx := t.Context()
 
-	fixture := newSchedulerClaimFixture(t, "claim_heartbeat_")
+	fixture := newOperatorClaimFixture(t, "claim_heartbeat_")
 	appDBName := fixture.appDBName
 	stor := fixture.store
 	schemabotDB := fixture.storageDB
@@ -484,7 +484,7 @@ func TestScheduler_ClaimRefreshesHeartbeat(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, beforeClaim)
 
-	// Claiming is also the scheduler's lease renewal; it keeps another worker from immediately reclaiming the same apply.
+	// Claiming is also the operator's lease renewal; it keeps another worker from immediately reclaiming the same apply.
 	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
@@ -500,11 +500,11 @@ func TestScheduler_ClaimRefreshesHeartbeat(t *testing.T) {
 	assert.Nil(t, reclaimed, "freshly claimed apply should not be claimable again")
 }
 
-func TestScheduler_ExpiresRetryableBudget(t *testing.T) {
+func TestOperator_ExpiresRetryableBudget(t *testing.T) {
 	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	fixture := newSchedulerClaimFixture(t, "retry_budget_")
+	fixture := newOperatorClaimFixture(t, "retry_budget_")
 	appDBName := fixture.appDBName
 	stor := fixture.store
 
@@ -544,11 +544,11 @@ func TestScheduler_ExpiresRetryableBudget(t *testing.T) {
 	require.NoError(t, err)
 
 	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{SchedulerWorkers: 1}, nil, logger)
-	require.NoError(t, svc.SetSchedulerPollInterval(50*time.Millisecond))
-	svc.StartScheduler(ctx)
-	defer svc.StopScheduler()
+	require.NoError(t, svc.SetOperatorPollInterval(50*time.Millisecond))
+	svc.StartOperator(ctx)
+	defer svc.StopOperator()
 
-	// The scheduler should convert retry-waiting work to permanent failure once
+	// The operator should convert retry-waiting work to permanent failure once
 	// the retry budget is exhausted, instead of leaving it claimable forever.
 	require.Eventually(t, func() bool {
 		apply, err := stor.Applies().Get(ctx, applyID)
@@ -562,7 +562,7 @@ func TestScheduler_ExpiresRetryableBudget(t *testing.T) {
 	assert.Equal(t, state.Task.Failed, tasks[0].State)
 }
 
-func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
+func TestOperator_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 	ctx := t.Context()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -590,10 +590,10 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 	}, stor, logger)
 	require.NoError(t, err)
 
-	plan1 := planCreateTableForScheduler(t, client1, stor, db1Name, "scheduler_worker_a")
-	plan2 := planCreateTableForScheduler(t, client2, stor, db2Name, "scheduler_worker_b")
-	apply1ID := seedStaleSchedulerApply(t, stor, schemabotDB, db1Name, plan1, time.Now().Add(-3*time.Minute))
-	apply2ID := seedStaleSchedulerApply(t, stor, schemabotDB, db2Name, plan2, time.Now().Add(-2*time.Minute))
+	plan1 := planCreateTableForOperator(t, client1, stor, db1Name, "operator_worker_a")
+	plan2 := planCreateTableForOperator(t, client2, stor, db2Name, "operator_worker_b")
+	apply1ID := seedStaleOperatorApply(t, stor, schemabotDB, db1Name, plan1, time.Now().Add(-3*time.Minute))
+	apply2ID := seedStaleOperatorApply(t, stor, schemabotDB, db2Name, plan2, time.Now().Add(-2*time.Minute))
 
 	blockedResume := make(chan struct{})
 	var releaseBlockedResume sync.Once
@@ -603,7 +603,7 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 		})
 	}
 
-	// The first client blocks after the scheduler claims its apply. That keeps
+	// The first client blocks after the operator claims its apply. That keeps
 	// one worker occupied across the next poll, so completion of the second
 	// apply proves another worker can claim independent work.
 	blockingClient1 := newBlockingResumeClient(client1, blockedResume)
@@ -629,13 +629,13 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 		db2Name + "/staging": client2,
 	}, logger)
 
-	schedulerPollInterval := 500 * time.Millisecond
-	require.NoError(t, svc.SetSchedulerPollInterval(schedulerPollInterval))
+	operatorPollInterval := 500 * time.Millisecond
+	require.NoError(t, svc.SetOperatorPollInterval(operatorPollInterval))
 
-	svc.StartScheduler(ctx)
+	svc.StartOperator(ctx)
 	defer func() {
 		releaseBlockedClient()
-		svc.StopScheduler()
+		svc.StopOperator()
 	}()
 
 	blockingClient1.waitForResume(t, 5*time.Second)
@@ -643,7 +643,7 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 	// A worker can miss work on the startup claim and pick it up on the next
 	// poll. The important behavior is that the second apply completes while the
 	// first worker is still blocked.
-	waitForSchedulerAppliesCompleted(t, stor, []int64{apply2ID}, schedulerPollInterval+5*time.Second)
+	waitForOperatorAppliesCompleted(t, stor, []int64{apply2ID}, operatorPollInterval+5*time.Second)
 
 	blockedApply, err := stor.Applies().Get(ctx, apply1ID)
 	require.NoError(t, err)
@@ -651,10 +651,10 @@ func TestScheduler_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, blockedApply.State)
 
 	releaseBlockedClient()
-	waitForSchedulerAppliesCompleted(t, stor, []int64{apply1ID}, 5*time.Second)
+	waitForOperatorAppliesCompleted(t, stor, []int64{apply1ID}, 5*time.Second)
 }
 
-func planCreateTableForScheduler(t *testing.T, client tern.Client, stor *mysqlstore.Storage, dbName, tableName string) *storage.Plan {
+func planCreateTableForOperator(t *testing.T, client tern.Client, stor *mysqlstore.Storage, dbName, tableName string) *storage.Plan {
 	t.Helper()
 
 	resp, err := client.Plan(t.Context(), &ternv1.PlanRequest{
@@ -684,7 +684,7 @@ CREATE TABLE %s (
 	return plan
 }
 
-func seedStaleSchedulerApply(
+func seedStaleOperatorApply(
 	t *testing.T,
 	stor *mysqlstore.Storage,
 	db *sql.DB,
@@ -740,7 +740,7 @@ func seedStaleSchedulerApply(
 	return applyID
 }
 
-func waitForSchedulerAppliesCompleted(t *testing.T, stor *mysqlstore.Storage, applyIDs []int64, timeout time.Duration) {
+func waitForOperatorAppliesCompleted(t *testing.T, stor *mysqlstore.Storage, applyIDs []int64, timeout time.Duration) {
 	t.Helper()
 
 	completed := make(map[int64]bool, len(applyIDs))
@@ -767,15 +767,15 @@ func waitForSchedulerAppliesCompleted(t *testing.T, stor *mysqlstore.Storage, ap
 					states[applyID] = apply.State
 				}
 			}
-			return fmt.Sprintf("scheduler did not complete all applies within %s; states: %v", timeout, states)
+			return fmt.Sprintf("operator did not complete all applies within %s; states: %v", timeout, states)
 		},
 	)
 }
 
-func TestScheduler_DatabaseExclusionScopedByEnvironment(t *testing.T) {
+func TestOperator_DatabaseExclusionScopedByEnvironment(t *testing.T) {
 	ctx := t.Context()
 
-	fixture := newSchedulerClaimFixture(t, "env_excl_")
+	fixture := newOperatorClaimFixture(t, "env_excl_")
 	appDBName := fixture.appDBName
 	stor := fixture.store
 	schemabotDB := fixture.storageDB
@@ -811,17 +811,17 @@ func TestScheduler_DatabaseExclusionScopedByEnvironment(t *testing.T) {
 	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", productionID)
 	require.NoError(t, err)
 
-	// The scheduler should allow a stale apply when the active apply is for another environment.
+	// The operator should allow a stale apply when the active apply is for another environment.
 	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, "apply-env-stale-production", claimed.ApplyIdentifier)
 }
 
-func TestScheduler_PlanetScaleSetupStatesNotClaimed(t *testing.T) {
+func TestOperator_PlanetScaleSetupStatesNotClaimed(t *testing.T) {
 	ctx := t.Context()
 
-	fixture := newSchedulerClaimFixture(t, "ps_states_")
+	fixture := newOperatorClaimFixture(t, "ps_states_")
 	appDBName := fixture.appDBName
 	stor := fixture.store
 	schemabotDB := fixture.storageDB
@@ -853,7 +853,7 @@ func TestScheduler_PlanetScaleSetupStatesNotClaimed(t *testing.T) {
 			"apply-ps-"+ps)
 		require.NoError(t, err)
 
-		// The scheduler should leave PlanetScale setup states unclaimed until resume metadata can be hydrated.
+		// The operator should leave PlanetScale setup states unclaimed until resume metadata can be hydrated.
 		claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 		require.NoError(t, err)
 		assert.Nil(t, claimed, "stale %s should not be claimed without persisted resume metadata", ps)

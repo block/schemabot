@@ -358,11 +358,11 @@ type Apply struct {
 	// ErrorMessage contains error details if state is failed.
 	ErrorMessage string
 
-	// Options contains durable apply options and scheduler metadata as JSON.
+	// Options contains durable apply options and operator metadata as JSON.
 	// Use ParseApplyOptions() to get typed access.
 	Options []byte
 
-	// Attempt tracks scheduler retry attempts for failed_retryable applies.
+	// Attempt tracks operator retry attempts for failed_retryable applies.
 	// Once the retry budget is exhausted, the apply becomes failed.
 	Attempt int
 
@@ -441,7 +441,7 @@ type ApplyOperation struct {
 	// ErrorMessage contains error details if state is failed.
 	ErrorMessage string
 
-	// StartedAt is when the scheduler claimed this child row and execution began.
+	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time
 
 	// CompletedAt is when this child row reached a non-resumable terminal state
@@ -509,7 +509,7 @@ const (
 type ControlRequestStatus string
 
 const (
-	// ControlRequestPending means a scheduler worker still needs to act.
+	// ControlRequestPending means a operator worker still needs to act.
 	ControlRequestPending ControlRequestStatus = "pending"
 	// ControlRequestCompleted means the requested operation has been accepted.
 	ControlRequestCompleted ControlRequestStatus = "completed"
@@ -663,7 +663,7 @@ type Task struct {
 	// Options contains engine-specific options as JSON.
 	Options []byte
 
-	// Attempt tracks how many times this task has been retried by scheduler recovery.
+	// Attempt tracks how many times this task has been retried by operator recovery.
 	Attempt int
 
 	// Namespace is the schema name (MySQL) or keyspace (Vitess) this table belongs to.

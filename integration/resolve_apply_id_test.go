@@ -72,7 +72,7 @@ func TestRemoteApplyID_ControlOperations(t *testing.T) {
 	svc := schemabotapi.New(st, serverConfig, map[string]tern.Client{
 		"default/staging": ternClient,
 	}, logger)
-	startTestScheduler(t, svc)
+	startTestOperator(t, svc)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	mux := http.NewServeMux()
@@ -129,7 +129,7 @@ func TestRemoteApplyID_ControlOperations(t *testing.T) {
 	applyIdentifier, ok := applyResult["apply_id"].(string)
 	require.True(t, ok && applyIdentifier != "", "apply response missing apply_id")
 
-	// 5. Verify apply_identifier != external_id after the scheduler dispatches
+	// 5. Verify apply_identifier != external_id after the operator dispatches
 	// the queued control-plane apply to remote Tern.
 	storedApply := waitForStoredExternalID(t, st.Applies(), applyIdentifier, 10*time.Second)
 	require.NotEmpty(t, storedApply.ExternalID, "external_id should be set by remote Tern")

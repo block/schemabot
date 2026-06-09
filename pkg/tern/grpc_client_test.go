@@ -616,7 +616,7 @@ func testCapturingGRPCClient(t *testing.T, server *capturingTernServer) (*GRPCCl
 }
 
 func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
-	// Scheduler claims start with a stored control-plane apply row and pending
+	// Operator claims start with a stored control-plane apply row and pending
 	// tasks but no external_id. ResumeApply dispatches the queued work to
 	// remote Tern, stores the returned data-plane ID, then polls it to terminal.
 	server := &capturingTernServer{
@@ -691,7 +691,7 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 
 func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
 	// gRPC mode keeps the stored apply history in the control plane. When the
-	// scheduler dispatches work to a remote Tern service, operators should still
+	// operator dispatches work to a remote Tern service, operators should still
 	// see the dispatch and final state through SchemaBot apply logs.
 	server := &capturingTernServer{
 		remoteApplyID:  "remote-lifecycle-123",
@@ -888,7 +888,7 @@ func TestGRPCClient_ProgressPollTerminalErrorFailsApply(t *testing.T) {
 
 func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) {
 	// Retryable progress RPC errors can happen while the remote service is
-	// unavailable. After repeated failures, the apply should pause for scheduler
+	// unavailable. After repeated failures, the apply should pause for operator
 	// recovery and expose the polling error through status and logs.
 	server := &capturingTernServer{
 		progressErr: status.Error(codes.Unavailable, "remote service unavailable"),
@@ -936,7 +936,7 @@ func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) 
 }
 
 func TestGRPCClient_ProgressPollBoundsStoppedAfterStart(t *testing.T) {
-	// A scheduler-owned start may briefly see the remote stopped state from the
+	// A operator-owned start may briefly see the remote stopped state from the
 	// preceding stop, but that grace period must end with a stored stopped result
 	// instead of an unbounded polling loop.
 	originalGracePeriod := grpcStoppedAfterStartGracePeriod
@@ -1001,7 +1001,7 @@ func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *te
 	// A freshly dispatched remote apply can report pending before the remote
 	// engine starts copying rows. SchemaBot has already claimed the queued apply
 	// locally, so progress polling must not write pending back to the stored
-	// apply row and make it claimable by another scheduler worker.
+	// apply row and make it claimable by another operator worker.
 	server := &capturingTernServer{
 		remoteApplyID: "remote-pending-first",
 		progressStates: []ternv1.State{
@@ -1122,7 +1122,7 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 
 	assert.Equal(t, state.Apply.Running,
 		applyStateFromRemoteProgress(state.Apply.Stopped, state.Apply.Running, true),
-		"a scheduler-owned start may adopt active remote progress after a stale stopped write")
+		"a operator-owned start may adopt active remote progress after a stale stopped write")
 }
 
 func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing.T) {
@@ -1421,7 +1421,7 @@ func hasLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 func TestGRPCClient_PollReturnsTerminalStorageUpdateError(t *testing.T) {
 	// A terminal remote state is not enough by itself; the control plane must
-	// persist that terminal state to storage before the scheduler worker exits.
+	// persist that terminal state to storage before the operator worker exits.
 	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
 		progressState:    ternv1.State_STATE_COMPLETED,
 		progressStateSet: true,
@@ -1457,7 +1457,7 @@ func TestGRPCClient_PollReturnsTerminalStorageUpdateError(t *testing.T) {
 func TestGRPCClient_PollKeepsApplyActiveWhenTerminalTaskLoadFails(t *testing.T) {
 	// Terminal remote progress is only fully reconciled once stored task rows are
 	// updated too. If task storage fails, the apply should remain active so a
-	// later scheduler attempt can finish reconciliation.
+	// later operator attempt can finish reconciliation.
 	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
 		progressState:    ternv1.State_STATE_COMPLETED,
 		progressStateSet: true,
@@ -1615,7 +1615,7 @@ func TestGRPCClient_ResumeApplyRejectsAmbiguousRemoteDispatchState(t *testing.T)
 func TestGRPCClient_ResumeApplyDoesNotFailStateWhenRemoteDispatchOutcomeIsAmbiguous(t *testing.T) {
 	// Cancellation or deadline from the remote Apply RPC does not prove whether
 	// the data plane accepted the schema change. Leave stored state unchanged
-	// so the scheduler does not record a false terminal failure.
+	// so the operator does not record a false terminal failure.
 	server := &capturingTernServer{
 		applyErr: status.Error(codes.DeadlineExceeded, "deadline waiting for response"),
 	}
@@ -1663,7 +1663,7 @@ func TestGRPCClient_ResumeApplyDoesNotFailStateWhenRemoteDispatchOutcomeIsAmbigu
 func TestGRPCClient_ResumeApplyClassifiesRemoteDispatchErrors(t *testing.T) {
 	// When remote dispatch is rejected before the data plane accepts work, the
 	// control plane records the failure using the gRPC status code. Retryable
-	// status codes stay claimable for the scheduler; known-permanent status
+	// status codes stay claimable for the operator; known-permanent status
 	// codes become terminal failures.
 	testCases := []struct {
 		name            string
@@ -1820,7 +1820,7 @@ func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 }
 
 func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
-	// A scheduler claim can move the apply row before the worker calls remote
+	// A operator claim can move the apply row before the worker calls remote
 	// Start. The durable control request lets a later worker recover that
 	// intent and validate the remote stopped state.
 	server := &capturingTernServer{
@@ -1861,7 +1861,7 @@ func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
 }
 
 func TestGRPCClient_ResumeApplyStartErrorLeavesApplyStopped(t *testing.T) {
-	// When the scheduler accepts a stored start request but remote Tern rejects
+	// When the operator accepts a stored start request but remote Tern rejects
 	// the Start RPC, keep the apply stopped with a visible reason and leave the
 	// start request pending for a later retry/reconciliation attempt.
 	server := &capturingTernServer{
@@ -1926,7 +1926,7 @@ func TestGRPCClient_ResumeApplyStartErrorLeavesApplyStopped(t *testing.T) {
 }
 
 func TestGRPCClient_ResumeApplyProcessesQueuedStop(t *testing.T) {
-	// A pending durable stop is processed by the scheduler-owned worker before
+	// A pending durable stop is processed by the operator-owned worker before
 	// resume/start work. The worker mirrors remote stopped progress to storage
 	// before completing the durable request.
 	server := &capturingTernServer{
@@ -1985,7 +1985,7 @@ func TestGRPCClient_ResumeApplyProcessesQueuedStop(t *testing.T) {
 }
 
 func TestGRPCClient_ResumeApplyProcessesQueuedCutover(t *testing.T) {
-	// A pending durable cutover is processed by the scheduler-owned worker using
+	// A pending durable cutover is processed by the operator-owned worker using
 	// the remote apply ID, then completed once remote Tern accepts the request.
 	server := &capturingTernServer{
 		cutoverAccepted:  true,
@@ -2043,7 +2043,7 @@ func TestGRPCClient_ResumeApplyProcessesQueuedCutover(t *testing.T) {
 
 func TestGRPCClient_ProcessPendingCutoverWaitsWhenNotReady(t *testing.T) {
 	// A transient running sample after cutover was requested should not fail the
-	// durable request. The scheduler will retry after the next progress sync.
+	// durable request. The operator will retry after the next progress sync.
 	server := &capturingTernServer{}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
@@ -2133,7 +2133,7 @@ func TestGRPCClient_ProcessPendingCutoverWaitsWhileRecovering(t *testing.T) {
 
 func TestGRPCClient_ResumeApplyCutoverErrorFailsPendingRequest(t *testing.T) {
 	// A cutover RPC failure leaves a visible failed control request so the
-	// scheduler does not retry indefinitely without a new operator request.
+	// operator does not retry indefinitely without a new operator request.
 	server := &capturingTernServer{
 		cutoverErr: status.Error(codes.Unavailable, "remote cutover unavailable"),
 	}
@@ -2186,7 +2186,7 @@ func TestGRPCClient_ResumeApplyCutoverErrorFailsPendingRequest(t *testing.T) {
 
 func TestGRPCClient_ResumeApplyCompletesQueuedStartWhenRemoteAlreadyActive(t *testing.T) {
 	// An operator can start the remote apply directly after SchemaBot records
-	// durable start intent. The scheduler adopts the active remote state instead
+	// durable start intent. The operator adopts the active remote state instead
 	// of sending another Start request, then continues polling the exact apply ID.
 	server := &capturingTernServer{
 		progressStates: []ternv1.State{
@@ -2252,7 +2252,7 @@ func TestGRPCClient_ResumeApplyCompletesQueuedStartWhenRemoteAlreadyActive(t *te
 func TestGRPCClient_ReconcileStoppedRemoteProgressKeepsQueuedStartPending(t *testing.T) {
 	// A Start request can be accepted while an older worker is still recording
 	// the remote stop. The stop sync must not consume the pending Start intent;
-	// the scheduler needs that durable request to claim and resume the apply.
+	// the operator needs that durable request to claim and resume the apply.
 	now := time.Now()
 	remoteApply := &storage.Apply{
 		ID:              1,
@@ -2410,7 +2410,7 @@ func TestGRPCClient_ResumeApplyDoesNotStartWhenStoppedStateCheckFails(t *testing
 
 func TestGRPCClient_ResumeApplyFailsWhenStoppedRemoteHasNoActiveProgress(t *testing.T) {
 	// STATE_NO_ACTIVE_CHANGE is inconsistent for an exact stopped apply ID. The
-	// scheduler should not fall back to Start because there is no remote stopped
+	// operator should not fall back to Start because there is no remote stopped
 	// state to resume.
 	server := &capturingTernServer{
 		progressState:    ternv1.State_STATE_NO_ACTIVE_CHANGE,

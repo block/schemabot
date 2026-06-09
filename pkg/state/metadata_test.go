@@ -25,7 +25,7 @@ func TestApplyMetadata_CoversAllStates(t *testing.T) {
 }
 
 // TestApplyMetadata_TerminalSet pins which states are classified as terminal.
-// Changing this set affects scheduler claiming, reconciliation, and merge
+// Changing this set affects operator claiming, reconciliation, and merge
 // gating, so a deliberate test failure here is the intent when adding or
 // removing a terminal state.
 func TestApplyMetadata_TerminalSet(t *testing.T) {
@@ -39,7 +39,7 @@ func TestApplyMetadata_TerminalSet(t *testing.T) {
 	for s, info := range applyMetadata {
 		assert.Equalf(t, expected[s], info.Terminal, "Terminal classification for %q", s)
 	}
-	// FailedRetryable must not be terminal — the scheduler retries it.
+	// FailedRetryable must not be terminal — the operator retries it.
 	assert.False(t, applyMetadata[Apply.FailedRetryable].Terminal, "FailedRetryable must not be terminal")
 }
 

@@ -45,7 +45,7 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 }
 
 // markApplyRetryableWithTasks pauses an apply after a retryable engine failure.
-// Non-terminal tasks move to failed_retryable so scheduler recovery can decide
+// Non-terminal tasks move to failed_retryable so operator recovery can decide
 // which work to re-dispatch on the next attempt.
 func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
 	for _, task := range tasks {

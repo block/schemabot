@@ -63,22 +63,22 @@ func createTestDB(t *testing.T, prefix string) (appDBName, appDSN string) {
 // registered via t.Cleanup.
 func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 	t.Helper()
-	return startTestServerWithSchedulerInterval(t, appDBName, appDSN, 200*time.Millisecond)
+	return startTestServerWithOperatorInterval(t, appDBName, appDSN, 200*time.Millisecond)
 }
 
-func startTestServerWithSchedulerInterval(t *testing.T, appDBName, appDSN string, schedulerInterval time.Duration) testServer {
+func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string, operatorInterval time.Duration) testServer {
 	t.Helper()
-	return startTestServerWithOptions(t, appDBName, appDSN, schedulerInterval, false)
+	return startTestServerWithOptions(t, appDBName, appDSN, operatorInterval, false)
 }
 
-// startTestServerOperator starts a test server whose scheduler claims work at
+// startTestServerOperator starts a test server whose operator claims work at
 // the apply_operations level (operator_claim_operations enabled).
 func startTestServerOperator(t *testing.T, appDBName, appDSN string) testServer {
 	t.Helper()
 	return startTestServerWithOptions(t, appDBName, appDSN, 200*time.Millisecond, true)
 }
 
-func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, schedulerInterval time.Duration, operatorClaimOperations bool) testServer {
+func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operatorInterval time.Duration, operatorClaimOperations bool) testServer {
 	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -109,7 +109,7 @@ func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, schedule
 	svc := schemabotapi.New(storage, serverConfig, map[string]tern.Client{
 		appDBName + "/staging": localClient,
 	}, logger)
-	startTestSchedulerWithInterval(t, svc, schedulerInterval)
+	startTestOperatorWithInterval(t, svc, operatorInterval)
 
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
@@ -133,16 +133,16 @@ func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, schedule
 	return testServer{Addr: addr, Storage: storage, Service: svc}
 }
 
-func startTestScheduler(t *testing.T, svc *schemabotapi.Service) {
+func startTestOperator(t *testing.T, svc *schemabotapi.Service) {
 	t.Helper()
-	startTestSchedulerWithInterval(t, svc, 200*time.Millisecond)
+	startTestOperatorWithInterval(t, svc, 200*time.Millisecond)
 }
 
-func startTestSchedulerWithInterval(t *testing.T, svc *schemabotapi.Service, interval time.Duration) {
+func startTestOperatorWithInterval(t *testing.T, svc *schemabotapi.Service, interval time.Duration) {
 	t.Helper()
 
-	require.NoError(t, svc.SetSchedulerPollInterval(interval))
-	svc.StartScheduler(t.Context())
+	require.NoError(t, svc.SetOperatorPollInterval(interval))
+	svc.StartOperator(t.Context())
 }
 
 // postJSON marshals body as JSON, POSTs to url, asserts HTTP 200,
@@ -1331,15 +1331,15 @@ CREATE TABLE orders (
 // TestFullWorkflow_Spirit_PartialFailure verifies sequential apply behavior
 // when one table fails with a retryable Spirit error. Completed work remains
 // completed, the failed table pauses in failed_retryable, and later table work
-// stays pending for the scheduler retry.
+// stays pending for the operator retry.
 func TestFullWorkflow_Spirit_PartialFailure(t *testing.T) {
 	ctx := t.Context()
 
 	appDBName, _ := createTestDB(t, "partialfail_")
-	// The first queued apply starts through a scheduler wake, so this test can
+	// The first queued apply starts through a operator wake, so this test can
 	// use a slower poll interval to observe the retryable pause before the next
-	// scheduler retry consumes it.
-	ts := startTestServerWithSchedulerInterval(t, appDBName, strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1), 5*time.Second)
+	// operator retry consumes it.
+	ts := startTestServerWithOperatorInterval(t, appDBName, strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1), 5*time.Second)
 
 	endpoint := "http://" + ts.Addr
 

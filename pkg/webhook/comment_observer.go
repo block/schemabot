@@ -259,7 +259,7 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	// GitHub comments and check updates are side effects outside MySQL's
 	// transaction boundary. Re-check the apply lease immediately before each
 	// side effect so a stale worker cannot publish progress, terminal comments,
-	// or check updates after a newer scheduler owner has claimed the apply.
+	// or check updates after a newer operator owner has claimed the apply.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := o.stor.Applies().CheckLease(ctx, lease); err != nil {

@@ -51,7 +51,7 @@ type Client interface {
 	// Health checks the service health.
 	Health(ctx context.Context) error
 
-	// ResumeApply starts or resumes work claimed by a scheduler worker.
+	// ResumeApply starts or resumes work claimed by a operator worker.
 	// Fresh pending applies are dispatched for the first time; stale applies
 	// use checkpoint/resume capabilities of the underlying engine.
 	ResumeApply(ctx context.Context, apply *storage.Apply) error
@@ -71,7 +71,7 @@ type Client interface {
 	SetPendingObserver(observer ProgressObserver)
 
 	// SetObserver registers a progress observer for an active apply.
-	// Used by the scheduler to attach an observer before resuming.
+	// Used by the operator to attach an observer before resuming.
 	SetObserver(applyID int64, observer ProgressObserver)
 
 	// Close releases any resources held by the client.

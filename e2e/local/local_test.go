@@ -937,7 +937,7 @@ CREATE TABLE %s (
 	}
 }
 
-func TestLocal_Scheduler_ServerCrashRecoversIndexAdd(t *testing.T) {
+func TestLocal_Operator_ServerCrashRecoversIndexAdd(t *testing.T) {
 	binPath := buildCLI(t)
 	endpoint := schemabotURL(t)
 	ensureNoActiveChange(t, endpoint)
@@ -983,7 +983,7 @@ CREATE TABLE %s (
 	require.NotEqual(t, state.Apply.Completed, stateBeforeCrash, "apply completed before crash")
 
 	// Kill the real SchemaBot container while Spirit is adding the index. The
-	// storage heartbeat is aged after the crash so the scheduler recovery path
+	// storage heartbeat is aged after the crash so the operator recovery path
 	// runs immediately instead of waiting for the production heartbeat timeout.
 	crashE2ESchemaBotServer(t)
 	needsRestart := true

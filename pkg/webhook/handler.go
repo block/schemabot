@@ -132,7 +132,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		priorEnvCheckRetryInterval: defaultPriorEnvCheckRetryInterval,
 	}
 
-	// Register recovery callback so the scheduler can attach comment observers
+	// Register recovery callback so the operator can attach comment observers
 	// before resuming recovered applies.
 	if service != nil {
 		service.OnApplyRecovered = func(apply *storage.Apply) {

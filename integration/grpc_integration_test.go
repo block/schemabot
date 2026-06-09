@@ -126,7 +126,7 @@ func startSchemaBot(t *testing.T, ternGRPCAddr string) string {
 	svc := schemabotapi.New(storage, serverConfig, map[string]tern.Client{
 		"default/staging": ternClient,
 	}, logger)
-	startTestScheduler(t, svc)
+	startTestOperator(t, svc)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	mux := http.NewServeMux()
@@ -236,7 +236,7 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 	svc := schemabotapi.New(schemabotStorage, serverConfig, map[string]tern.Client{
 		"default/staging": ternClient,
 	}, logger)
-	startTestScheduler(t, svc)
+	startTestOperator(t, svc)
 	defer utils.CloseAndLog(svc)
 
 	mux := http.NewServeMux()
@@ -304,7 +304,7 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 	applyID, ok := applyResult["apply_id"].(string)
 	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResult)
 
-	// Step 3: Scheduler dispatches the queued apply and stores remote Tern's id.
+	// Step 3: Operator dispatches the queued apply and stores remote Tern's id.
 	storedApply := waitForStoredExternalID(t, schemabotStorage.Applies(), applyID, 10*time.Second)
 	assert.NotEmpty(t, storedApply.ExternalID, "external_id is empty, expected it to be set from remote Tern's apply_id")
 	assert.NotEqual(t, applyID, storedApply.ExternalID,
@@ -369,7 +369,7 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 	svc := schemabotapi.New(schemabotStorage, serverConfig, map[string]tern.Client{
 		"default/staging": ternClient,
 	}, logger)
-	startTestScheduler(t, svc)
+	startTestOperator(t, svc)
 	defer utils.CloseAndLog(svc)
 
 	mux := http.NewServeMux()
@@ -571,7 +571,7 @@ func TestGRPC_ServerSideDeploymentStoredOnApply(t *testing.T) {
 	svc := schemabotapi.New(schemabotStorage, serverConfig, map[string]tern.Client{
 		"us-west/staging": ternClient,
 	}, logger)
-	startTestScheduler(t, svc)
+	startTestOperator(t, svc)
 	defer utils.CloseAndLog(svc)
 
 	mux := http.NewServeMux()

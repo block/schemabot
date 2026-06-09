@@ -209,7 +209,7 @@ func maybeEngineResumeStateFromPlanetScaleData(operationID int64, data planetsca
 }
 
 // Local MySQL stop is resumable: stopped task rows and the stored apply row
-// should move to stopped together so a later scheduler-owned start can claim
+// should move to stopped together so a later operator-owned start can claim
 // the apply without waiting for stale heartbeat recovery.
 func TestLocalClient_StopMarksMySQLApplyStopped(t *testing.T) {
 	apply := &storage.Apply{

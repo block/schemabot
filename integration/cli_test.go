@@ -856,7 +856,7 @@ func startSchemaBotLocal(t *testing.T) string {
 	}
 
 	svc := schemabotapi.New(storage, config, ternClients, logger)
-	startTestScheduler(t, svc)
+	startTestOperator(t, svc)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	// Start HTTP server
@@ -938,7 +938,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	}
 
 	svc := schemabotapi.New(storage, config, ternClients, logger)
-	startTestScheduler(t, svc)
+	startTestOperator(t, svc)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	// Start HTTP server

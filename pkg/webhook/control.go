@@ -10,7 +10,7 @@ import (
 )
 
 // handleStopCommand handles the "schemabot stop <apply-id> -e <env>" PR
-// comment command by recording durable stop intent for the scheduler owner.
+// comment command by recording durable stop intent for the operator owner.
 func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()
@@ -187,7 +187,7 @@ func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, r
 }
 
 // handleCutoverCommand handles the "schemabot cutover <apply-id> -e <env>" PR
-// comment command by recording durable cutover intent for the scheduler owner.
+// comment command by recording durable cutover intent for the operator owner.
 func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
 	ctx, cancel := h.commandContext(commandTimeout)
 	defer cancel()

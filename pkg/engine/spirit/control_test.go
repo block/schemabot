@@ -228,7 +228,7 @@ func TestSettingsToVolume(t *testing.T) {
 
 // Volume adjustments store a stopped state so Spirit can resume from checkpoint
 // with new settings. Progress should still report running during that window so
-// the scheduler keeps polling the active schema change.
+// the operator keeps polling the active schema change.
 func TestVolumeReportsRunningWhileStoredStoppedStateRestarts(t *testing.T) {
 	eng := New(Config{})
 	rm := &runningMigration{

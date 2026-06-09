@@ -233,7 +233,7 @@ func TestE2EStopCommandStopsDeferredCutoverLocalApply(t *testing.T) {
 
 // TestE2ECutoverCommandRecordsDurableRequest verifies that a PR comment
 // cutover command records durable operator intent for the exact apply and
-// environment, then leaves the scheduler owner to perform the data-plane action.
+// environment, then leaves the operator owner to perform the data-plane action.
 func TestE2ECutoverCommandRecordsDurableRequest(t *testing.T) {
 	ctx := t.Context()
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)

@@ -136,7 +136,7 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	svc := schemabotapi.New(schemabotStorage, serverConfig, map[string]tern.Client{
 		remoteDeployment + "/staging": grpcClient,
 	}, logger)
-	startTestScheduler(t, svc)
+	startTestOperator(t, svc)
 	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	mux := http.NewServeMux()

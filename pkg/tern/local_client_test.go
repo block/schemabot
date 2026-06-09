@@ -815,7 +815,7 @@ func TestTaskStateWithNoBackwardProgressPolicyCoversTaskStates(t *testing.T) {
 			hasProgressRank
 
 		assert.Truef(t, hasPolicy,
-			"task state %s=%q must be terminal, scheduler/control-owned, recovery-owned, or ranked as active progress",
+			"task state %s=%q must be terminal, operator/control-owned, recovery-owned, or ranked as active progress",
 			taskName, taskState)
 	}
 }
@@ -994,7 +994,7 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 			expected:         state.Task.Running,
 		},
 		{
-			name:             "scheduler retryable state is preserved against active engine state",
+			name:             "operator retryable state is preserved against active engine state",
 			storedTaskState:  state.Task.FailedRetryable,
 			engineTableState: state.Task.Running,
 			expected:         state.Task.FailedRetryable,

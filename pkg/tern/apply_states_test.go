@@ -102,7 +102,7 @@ func TestDeriveApplyPhase(t *testing.T) {
 }
 
 func TestTaskStateFromProgressResult(t *testing.T) {
-	t.Run("retryable failed result becomes scheduler-retryable task state", func(t *testing.T) {
+	t.Run("retryable failed result becomes operator-retryable task state", func(t *testing.T) {
 		result := &engine.ProgressResult{State: engine.StateFailed, Retryable: true}
 		assert.Equal(t, state.Task.FailedRetryable, taskStateFromProgressResult(result))
 	})
@@ -262,7 +262,7 @@ func TestDeriveOverallState(t *testing.T) {
 			wantState: state.Task.Failed,
 		},
 		{
-			name: "retryable failed waits for scheduler with completed work",
+			name: "retryable failed waits for operator with completed work",
 			tasks: []*storage.Task{
 				{State: state.Task.FailedRetryable},
 				{State: state.Task.Completed},
@@ -270,7 +270,7 @@ func TestDeriveOverallState(t *testing.T) {
 			wantState: state.Task.FailedRetryable,
 		},
 		{
-			name: "retryable failed waits for scheduler with pending work",
+			name: "retryable failed waits for operator with pending work",
 			tasks: []*storage.Task{
 				{State: state.Task.FailedRetryable},
 				{State: state.Task.Pending},
@@ -368,7 +368,7 @@ func TestDeriveVSchemaTaskState(t *testing.T) {
 		assert.Equal(t, state.Task.Failed, got)
 	})
 
-	t.Run("transitions to retryable failure when scheduler can recover", func(t *testing.T) {
+	t.Run("transitions to retryable failure when operator can recover", func(t *testing.T) {
 		task := &storage.Task{State: state.Task.Running}
 		result := &engine.ProgressResult{State: engine.StateFailed, Retryable: true, ErrorMessage: "temporary engine failure"}
 		got := c.deriveVSchemaTaskState(task, result, state.Task.FailedRetryable, now)

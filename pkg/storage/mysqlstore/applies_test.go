@@ -132,7 +132,7 @@ func TestApplyStore_CreateWithTasksCommitsQueueAtomically(t *testing.T) {
 	assert.Equal(t, applyID, tasks[1].ApplyID)
 
 	// A pending apply created with its full task set is immediately ready for
-	// scheduler dispatch; workers never see a partially populated task list.
+	// operator dispatch; workers never see a partially populated task list.
 	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
@@ -1126,7 +1126,7 @@ func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
 }
 
 // TestApplyStore_FindNextApplySkipsOldRetryable verifies that automatic
-// scheduler recovery only redispatches recently updated retryable failures.
+// operator recovery only redispatches recently updated retryable failures.
 // Old failures require deliberate operator action instead of being picked up
 // later by a policy or retry-budget change.
 func TestApplyStore_FindNextApplySkipsOldRetryable(t *testing.T) {
@@ -1163,11 +1163,11 @@ func TestApplyStore_FindNextApplyRequiresTasksForPendingApply(t *testing.T) {
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_pending_claim", 502, state.Apply.Pending, "staging")
 
 	// A pending apply record can be visible before its task rows are written.
-	// The scheduler must wait for the task list so dispatch has concrete table
+	// The operator must wait for the task list so dispatch has concrete table
 	// work to run.
 	claimedBeforeTasks, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
-	assert.Nil(t, claimedBeforeTasks, "pending applies are not ready for scheduler dispatch until their tasks are persisted")
+	assert.Nil(t, claimedBeforeTasks, "pending applies are not ready for operator dispatch until their tasks are persisted")
 
 	now := time.Now()
 	_, err = store.Tasks().Create(ctx, &storage.Task{
@@ -1327,7 +1327,7 @@ func TestApplyStore_FindNextApplySkipsFailedStoppedStartControlRequest(t *testin
 
 	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
-	assert.Nil(t, claimed, "failed start requests should not be retried automatically by scheduler claims")
+	assert.Nil(t, claimed, "failed start requests should not be retried automatically by operator claims")
 
 	reset, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
@@ -1452,7 +1452,7 @@ func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 	wg.Wait()
 
 	require.Empty(t, claimErrors)
-	require.Len(t, claimed, 1, "only one scheduler worker should claim a pending apply")
+	require.Len(t, claimed, 1, "only one operator worker should claim a pending apply")
 	assert.Equal(t, apply.ApplyIdentifier, claimed[0].ApplyIdentifier)
 	assert.Equal(t, state.Apply.Pending, claimed[0].State)
 
