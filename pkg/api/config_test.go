@@ -1083,6 +1083,83 @@ func TestServerConfig_ResolveDatabaseTargets_BypassValidate(t *testing.T) {
 	})
 }
 
+// TestServerConfig_ResolveDatabaseTargets_DeploymentOrder exercises the
+// resolver directly on hand-built multi-deployment configs (bypassing the
+// Validate() >1-entry gate) so it can cover deployment_order ordering and the
+// permutation checks the resolver enforces.
+func TestServerConfig_ResolveDatabaseTargets_DeploymentOrder(t *testing.T) {
+	makeCfg := func(env EnvironmentConfig) *ServerConfig {
+		return &ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type:         "mysql",
+					Environments: map[string]EnvironmentConfig{"production": env},
+				},
+			},
+		}
+	}
+	deployments := map[string]DeploymentTarget{
+		"payments-a": {Target: "payments"},
+		"payments-b": {Target: "payments"},
+		"payments-c": {Target: "payments"},
+	}
+	resolvedOrder := func(t *testing.T, targets []ResolvedDatabaseTarget) []string {
+		t.Helper()
+		order := make([]string, 0, len(targets))
+		for _, rt := range targets {
+			order = append(order, rt.Deployment)
+		}
+		return order
+	}
+
+	t.Run("explicit deployment_order controls rollout order", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{
+			Deployments:     deployments,
+			DeploymentOrder: []string{"payments-c", "payments-a", "payments-b"},
+		})
+		got, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"payments-c", "payments-a", "payments-b"}, resolvedOrder(t, got))
+	})
+
+	t.Run("empty deployment_order falls back to alphabetical", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{Deployments: deployments})
+		got, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"payments-a", "payments-b", "payments-c"}, resolvedOrder(t, got))
+	})
+
+	t.Run("deployment_order missing a deployment errors", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{
+			Deployments:     deployments,
+			DeploymentOrder: []string{"payments-a", "payments-b"},
+		})
+		_, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `deployment_order is missing deployment "payments-c"`)
+	})
+
+	t.Run("deployment_order with duplicate entry errors", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{
+			Deployments:     deployments,
+			DeploymentOrder: []string{"payments-a", "payments-a", "payments-b", "payments-c"},
+		})
+		_, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `deployment_order has duplicate entry "payments-a"`)
+	})
+
+	t.Run("deployment_order with unknown deployment errors", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{
+			Deployments:     deployments,
+			DeploymentOrder: []string{"payments-a", "payments-b", "payments-c", "payments-z"},
+		})
+		_, err := cfg.ResolveDatabaseTargets("payments", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `deployment_order references unknown deployment "payments-z"`)
+	})
+}
+
 func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 	baseTern := TernConfig{
 		"payments-a": {"production": "tern-a:9090"},
@@ -1177,6 +1254,37 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			},
 			tern:       baseTern,
 			wantErrSub: "cannot configure both local DSN and target/deployment(s)",
+		},
+		{
+			name: "single-entry deployments map with matching deployment_order",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+				DeploymentOrder: []string{"payments-a"},
+			},
+			tern: baseTern,
+		},
+		{
+			name: "deployment_order referencing unknown deployment is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+				DeploymentOrder: []string{"payments-z"},
+			},
+			tern:       baseTern,
+			wantErrSub: `deployment_order references unknown deployment "payments-z"`,
+		},
+		{
+			name: "deployment_order without a deployments map is rejected",
+			envConfig: EnvironmentConfig{
+				Target:          "payments",
+				Deployment:      "payments-a",
+				DeploymentOrder: []string{"payments-a"},
+			},
+			tern:       baseTern,
+			wantErrSub: "sets deployment_order without a deployments map",
 		},
 	}
 

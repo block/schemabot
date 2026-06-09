@@ -351,6 +351,13 @@ type EnvironmentConfig struct {
 	//     payments-b: { target: payments }
 	Deployments map[string]DeploymentTarget `yaml:"deployments,omitempty"`
 
+	// DeploymentOrder defines the rollout order of the deployments map for this
+	// environment, analogous to the server-wide EnvironmentOrder. When set it
+	// must list every key in Deployments exactly once; ResolveDatabaseTargets
+	// then returns deployments in this order. When empty, deployments resolve in
+	// alphabetical key order. Only meaningful alongside a Deployments map.
+	DeploymentOrder []string `yaml:"deployment_order,omitempty"`
+
 	// For PlanetScale/Vitess:
 	// Organization is the PlanetScale organization name.
 	// sadscan:disable kingfisher.planetscale.2
@@ -526,6 +533,9 @@ func (c *ServerConfig) Validate() error {
 			hasDSN := envConfig.HasLocalDSN()
 			hasScalarRouting := envConfig.Target != "" || envConfig.Deployment != ""
 			hasMapRouting := envConfig.Deployments != nil
+			if len(envConfig.DeploymentOrder) > 0 && !hasMapRouting {
+				return fmt.Errorf("database %q environment %q sets deployment_order without a deployments map", name, env)
+			}
 			switch {
 			case hasDSN && (hasScalarRouting || hasMapRouting):
 				return fmt.Errorf("database %q environment %q cannot configure both local DSN and target/deployment(s)", name, env)
@@ -539,6 +549,11 @@ func (c *ServerConfig) Validate() error {
 			case hasMapRouting:
 				if len(envConfig.Deployments) == 0 {
 					return fmt.Errorf("database %q environment %q deployments map is empty", name, env)
+				}
+				if len(envConfig.DeploymentOrder) > 0 {
+					if err := validateDeploymentOrder(envConfig.Deployments, envConfig.DeploymentOrder, fmt.Sprintf("database %q environment %q", name, env)); err != nil {
+						return err
+					}
 				}
 				// The multi-deployment apply path (plan, progress, webhook)
 				// is not yet wired to ResolveDatabaseTargets, so accepting a
@@ -758,6 +773,54 @@ func (c *ServerConfig) ResolveDatabaseTarget(database, environment string) (Reso
 	return targets[0], nil
 }
 
+// orderedDeploymentKeys returns the keys of a deployments map in rollout order:
+// the explicit deployment_order when set, otherwise alphabetical for
+// deterministic resolution. When an order is given it is validated to be a
+// permutation of the map keys.
+func orderedDeploymentKeys(deployments map[string]DeploymentTarget, order []string, context string) ([]string, error) {
+	for deployment := range deployments {
+		if deployment == "" {
+			return nil, fmt.Errorf("%s has a deployments map entry with an empty key", context)
+		}
+	}
+	if len(order) == 0 {
+		keys := make([]string, 0, len(deployments))
+		for deployment := range deployments {
+			keys = append(keys, deployment)
+		}
+		slices.Sort(keys)
+		return keys, nil
+	}
+	if err := validateDeploymentOrder(deployments, order, context); err != nil {
+		return nil, err
+	}
+	return slices.Clone(order), nil
+}
+
+// validateDeploymentOrder checks that deployment_order lists every key in the
+// deployments map exactly once, with no empty, duplicate, or unknown entries.
+func validateDeploymentOrder(deployments map[string]DeploymentTarget, order []string, context string) error {
+	seen := make(map[string]bool, len(order))
+	for _, deployment := range order {
+		if deployment == "" {
+			return fmt.Errorf("%s deployment_order has an empty entry", context)
+		}
+		if seen[deployment] {
+			return fmt.Errorf("%s deployment_order has duplicate entry %q", context, deployment)
+		}
+		if _, ok := deployments[deployment]; !ok {
+			return fmt.Errorf("%s deployment_order references unknown deployment %q", context, deployment)
+		}
+		seen[deployment] = true
+	}
+	for deployment := range deployments {
+		if !seen[deployment] {
+			return fmt.Errorf("%s deployment_order is missing deployment %q", context, deployment)
+		}
+	}
+	return nil
+}
+
 // ResolveDatabaseTargets returns the complete routing metadata for a configured
 // database/environment as one or more deployment slices. Single-deployment
 // configurations (scalar target/deployment or local DSN) return a one-element
@@ -792,14 +855,10 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]R
 		if len(envConfig.Deployments) == 0 {
 			return nil, fmt.Errorf("database %q environment %q deployments map is empty", database, environment)
 		}
-		deployments := make([]string, 0, len(envConfig.Deployments))
-		for deployment := range envConfig.Deployments {
-			if deployment == "" {
-				return nil, fmt.Errorf("database %q environment %q has a deployments map entry with an empty key", database, environment)
-			}
-			deployments = append(deployments, deployment)
+		deployments, err := orderedDeploymentKeys(envConfig.Deployments, envConfig.DeploymentOrder, fmt.Sprintf("database %q environment %q", database, environment))
+		if err != nil {
+			return nil, err
 		}
-		slices.Sort(deployments)
 		out := make([]ResolvedDatabaseTarget, 0, len(deployments))
 		for _, deployment := range deployments {
 			dt := envConfig.Deployments[deployment]

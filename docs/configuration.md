@@ -152,6 +152,10 @@ databases:
     type: mysql
     environments:
       production:
+        deployment_order:
+          - payments-c
+          - payments-a
+          - payments-b
         deployments:
           payments-a:
             target: "payments"
@@ -176,7 +180,9 @@ Rules:
 - Until the orchestration path is wired, the map MUST contain exactly one entry; multi-entry maps are rejected at config load.
 - Single-deployment environments should continue to use the scalar `target` / `deployment` shape.
 
-Resolution order from the config layer is deterministic and sorted by deployment key. Server-owned cross-deployment ordering (e.g. rolling deploys across regions) is a forthcoming addition that will live alongside `environment_order`.
+### Deployment Order
+
+`deployment_order` defines the rollout order across the `deployments` map for an environment, analogous to the server-wide `environment_order`. When set, it MUST list every key in `deployments` exactly once (no empty, duplicate, or unknown entries) and MUST accompany a `deployments` map. `ResolveDatabaseTargets` then returns deployments in this order. When omitted, deployments resolve in alphabetical key order, which stays the deterministic default.
 
 ## Environment Order
 
