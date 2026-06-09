@@ -1103,6 +1103,38 @@ func TestProgressByApplyIDServesQueuedRemoteApplyFromStorage(t *testing.T) {
 	assert.Equal(t, "users", resp.Tables[0].TableName)
 }
 
+func TestDatabaseEnvironmentsUsesServerPromotionOrder(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"testdb": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"sandbox":    {},
+					"staging":    {},
+					"production": {},
+				},
+			},
+		},
+		EnvironmentOrder: []string{"production", "staging"},
+	}, nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases/testdb/environments", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp struct {
+		Database     string   `json:"database"`
+		Environments []string `json:"environments"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "testdb", resp.Database)
+	assert.Equal(t, []string{"production", "staging", "sandbox"}, resp.Environments)
+}
+
 func TestProgressByApplyIDResolvesExternalIDForRemoteApply(t *testing.T) {
 	mock := &mockTernClient{
 		isRemote: true,

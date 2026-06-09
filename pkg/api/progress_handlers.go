@@ -406,13 +406,25 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	var environments []string
-
-	// Databases is the server-side registry for both local DSN and remote Tern targets.
-	if dbConfig := s.config.Database(database); dbConfig != nil {
-		for env := range dbConfig.Environments {
-			environments = append(environments, env)
+	environments, err := s.config.DatabaseEnvironments(database)
+	if err != nil {
+		available := make([]string, 0, len(s.config.Databases))
+		for name := range s.config.Databases {
+			available = append(available, name)
 		}
+		sort.Strings(available)
+		s.logger.Warn("database environments not found",
+			"database", database,
+			"available_databases", available,
+			"error", err)
+		if len(available) > 0 {
+			s.writeError(w, http.StatusNotFound,
+				fmt.Sprintf("no environments found for database %q - configure this database in the SchemaBot server config (available: %v)", database, available))
+		} else {
+			s.writeError(w, http.StatusNotFound,
+				fmt.Sprintf("no environments found for database %q - no databases configured on this server", database))
+		}
+		return
 	}
 
 	if len(environments) == 0 {
@@ -433,8 +445,6 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 		}
 		return
 	}
-
-	sort.Strings(environments)
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"database":     database,
