@@ -1147,24 +1147,70 @@ func (s *applyStore) GetByPR(ctx context.Context, repo string, pr int) ([]*stora
 	return scanApplies(rows)
 }
 
-// Delete removes an apply by ID.
+// Delete removes an apply by ID, along with its per-deployment
+// apply_operations rows, in a single transaction. Deleting the children
+// transactionally prevents orphan operation rows that the operator claim loop
+// would otherwise re-claim forever (their parent lookup returns nil).
 func (s *applyStore) Delete(ctx context.Context, id int64) error {
-	result, err := s.db.ExecContext(ctx, `
-		DELETE FROM applies WHERE id = ?
-	`, id)
+	const opName = "delete apply"
+	writeTx, err := beginApplyWriteTx(ctx, s.db, opName)
 	if err != nil {
 		return err
 	}
+	defer writeTx.close(ctx, opName)
 
-	return checkRowsAffected(result, storage.ErrApplyNotFound)
+	if _, err := writeTx.tx.ExecContext(ctx, `
+		DELETE FROM apply_operations WHERE apply_id = ?
+	`, id); err != nil {
+		return fmt.Errorf("delete apply_operations for apply %d: %w", id, err)
+	}
+
+	result, err := writeTx.tx.ExecContext(ctx, `
+		DELETE FROM applies WHERE id = ?
+	`, id)
+	if err != nil {
+		return fmt.Errorf("delete apply %d: %w", id, err)
+	}
+	if err := checkRowsAffected(result, storage.ErrApplyNotFound); err != nil {
+		return err
+	}
+
+	if err := writeTx.commit(); err != nil {
+		return fmt.Errorf("commit delete apply %d: %w", id, err)
+	}
+	return nil
 }
 
-// DeleteByPR removes all applies for a PR.
+// DeleteByPR removes all applies for a PR, along with their per-deployment
+// apply_operations rows, in a single transaction. Deleting the children
+// transactionally prevents orphan operation rows that the operator claim loop
+// would otherwise re-claim forever (their parent lookup returns nil).
 func (s *applyStore) DeleteByPR(ctx context.Context, repo string, pr int) error {
-	_, err := s.db.ExecContext(ctx, `
+	const opName = "delete applies by PR"
+	writeTx, err := beginApplyWriteTx(ctx, s.db, opName)
+	if err != nil {
+		return err
+	}
+	defer writeTx.close(ctx, opName)
+
+	if _, err := writeTx.tx.ExecContext(ctx, `
+		DELETE ao FROM apply_operations ao
+		JOIN applies a ON a.id = ao.apply_id
+		WHERE a.repository = ? AND a.pull_request = ?
+	`, repo, pr); err != nil {
+		return fmt.Errorf("delete apply_operations for PR %s#%d: %w", repo, pr, err)
+	}
+
+	if _, err := writeTx.tx.ExecContext(ctx, `
 		DELETE FROM applies WHERE repository = ? AND pull_request = ?
-	`, repo, pr)
-	return err
+	`, repo, pr); err != nil {
+		return fmt.Errorf("delete applies for PR %s#%d: %w", repo, pr, err)
+	}
+
+	if err := writeTx.commit(); err != nil {
+		return fmt.Errorf("commit delete applies for PR %s#%d: %w", repo, pr, err)
+	}
+	return nil
 }
 
 // scanApply scans a single apply row, returning nil if not found.

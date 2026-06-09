@@ -1703,6 +1703,66 @@ func TestApplyStore_DeleteByPR(t *testing.T) {
 	require.Len(t, applies, 1)
 }
 
+// TestApplyStore_Delete_RemovesApplyOperations verifies that deleting an apply
+// also removes its per-deployment apply_operations rows in the same transaction.
+// Orphan child rows would otherwise be re-claimed forever by the operator claim
+// loop, since their parent lookup returns nil.
+func TestApplyStore_Delete_RemovesApplyOperations(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_delete_ops", 610)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.Applies().Delete(ctx, apply.ID))
+
+	deleted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Nil(t, deleted)
+
+	op, err := store.ApplyOperations().Get(ctx, opID)
+	require.NoError(t, err)
+	require.Nil(t, op, "apply_operations row must be deleted with its parent apply")
+}
+
+// TestApplyStore_DeleteByPR_RemovesApplyOperations verifies that DeleteByPR
+// removes the apply_operations rows of the deleted applies while leaving other
+// PRs' operations intact.
+func TestApplyStore_DeleteByPR_RemovesApplyOperations(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "staging", "org/repo", 110)
+	lock2 := createTestLockWithPR(t, store, "db2", "mysql", "staging", "org/repo", 210)
+	apply1 := createTestApply(t, store, lock1, "apply_pr110", 711)
+	apply2 := createTestApply(t, store, lock2, "apply_pr210", 712)
+
+	op1, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply1.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+	op2, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply2.ID, Deployment: "region-a",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.Applies().DeleteByPR(ctx, "org/repo", 110))
+
+	got1, err := store.ApplyOperations().Get(ctx, op1)
+	require.NoError(t, err)
+	require.Nil(t, got1, "deleted PR's apply_operations row must be removed")
+
+	got2, err := store.ApplyOperations().Get(ctx, op2)
+	require.NoError(t, err)
+	require.NotNil(t, got2, "other PR's apply_operations row must be preserved")
+}
+
 func TestApplyStore_Options(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

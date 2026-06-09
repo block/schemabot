@@ -310,6 +310,79 @@ func TestApplyOperationStore_MarkFailed(t *testing.T) {
 	assert.True(t, state.IsApplyOperationTerminal(got.State))
 }
 
+// TestApplyOperationStore_MarkTerminal verifies that non-resumable terminal
+// states (cancelled, reverted) stamp completed_at, while the resumable stopped
+// state mirrors via UpdateState and leaves completed_at nil — matching the
+// apply-level convention since stopped work may still resume.
+func TestApplyOperationStore_MarkTerminal(t *testing.T) {
+	ctx := t.Context()
+	store := New(testDB)
+
+	for _, terminalState := range []string{state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted} {
+		t.Run(terminalState+"_stamps_completed_at", func(t *testing.T) {
+			clearTables(t)
+			lock := createTestLock(t, store, "testdb", "mysql", "staging")
+			apply := createTestApply(t, store, lock, "apply_md_term_"+terminalState, 1)
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a",
+			})
+			require.NoError(t, err)
+
+			require.NoError(t, store.ApplyOperations().MarkTerminal(ctx, id, terminalState))
+			got, err := store.ApplyOperations().Get(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, terminalState, got.State)
+			require.NotNil(t, got.CompletedAt, "MarkTerminal must stamp completed_at for %s", terminalState)
+			assert.True(t, state.IsApplyOperationTerminal(got.State))
+		})
+	}
+
+	t.Run("stopped_keeps_completed_at_nil", func(t *testing.T) {
+		clearTables(t)
+		lock := createTestLock(t, store, "testdb", "mysql", "staging")
+		apply := createTestApply(t, store, lock, "apply_md_term_stopped", 1)
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a",
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, id, state.ApplyOperation.Stopped))
+		got, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, state.ApplyOperation.Stopped, got.State)
+		assert.Nil(t, got.CompletedAt, "stopped is resumable and must keep completed_at nil")
+		assert.True(t, state.IsApplyOperationTerminal(got.State))
+	})
+
+	t.Run("idempotent_preserves_completed_at", func(t *testing.T) {
+		clearTables(t)
+		lock := createTestLock(t, store, "testdb", "mysql", "staging")
+		apply := createTestApply(t, store, lock, "apply_md_term_idem", 1)
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a",
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, store.ApplyOperations().MarkTerminal(ctx, id, state.ApplyOperation.Cancelled))
+		first, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, first.CompletedAt)
+
+		require.NoError(t, store.ApplyOperations().MarkTerminal(ctx, id, state.ApplyOperation.Cancelled))
+		second, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, second.CompletedAt)
+		assert.Equal(t, first.CompletedAt.UnixNano(), second.CompletedAt.UnixNano(),
+			"COALESCE should preserve original completed_at across repeat MarkTerminal calls")
+	})
+
+	t.Run("missing_row_returns_not_found", func(t *testing.T) {
+		clearTables(t)
+		err := store.ApplyOperations().MarkTerminal(ctx, 999999, state.ApplyOperation.Cancelled)
+		require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
+	})
+}
+
 func TestApplyOperationStore_UpdateState(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

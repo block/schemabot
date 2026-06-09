@@ -378,6 +378,13 @@ type ApplyOperationStore interface {
 	// MarkFailed sets state=failed, error_message, and completed_at on a child row.
 	MarkFailed(ctx context.Context, id int64, errMsg string) error
 
+	// MarkTerminal sets a terminal state and stamps completed_at on a child row.
+	// Use for terminal states that record a reconciliation time (cancelled,
+	// reverted). Do not use for stopped: stopped is resumable, so it keeps
+	// completed_at nil (use UpdateState). Use MarkCompleted / MarkFailed for
+	// completed / failed.
+	MarkTerminal(ctx context.Context, id int64, newState string) error
+
 	// SaveEngineResumeState stores opaque engine resume state on the operation.
 	SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *EngineResumeState) error
 

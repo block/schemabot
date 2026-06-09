@@ -308,6 +308,33 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 	return s.checkUpdatedOrExists(ctx, result, id, lease, hasLease, false)
 }
 
+// MarkTerminal sets the given terminal state and stamps completed_at=NOW().
+// Returns storage.ErrApplyOperationNotFound if no row matches the ID.
+//
+// For terminal states that record a reconciliation time (cancelled, reverted).
+// stopped is resumable and must keep completed_at nil — use UpdateState for it.
+//
+// Idempotent: COALESCE preserves completed_at, and re-applying the same state
+// is a no-op, so a re-issue against an already-terminal row returns nil.
+func (s *applyOperationStore) MarkTerminal(ctx context.Context, id int64, newState string) error {
+	lease, hasLease, err := applyOperationLeaseFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	leaseJoin, leasePredicate, leaseArgs := applyOperationLeaseSQL(lease, hasLease)
+	args := append([]any{newState, id}, leaseArgs...)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations ao
+		`+leaseJoin+`
+		SET ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())
+		WHERE ao.id = ?`+leasePredicate+`
+	`, args...)
+	if err != nil {
+		return fmt.Errorf("mark apply_operation terminal (id=%d, state=%s): %w", id, newState, err)
+	}
+	return s.checkUpdatedOrExists(ctx, result, id, lease, hasLease, false)
+}
+
 // SaveEngineResumeState stores opaque engine state on the operation that owns
 // the execution. It updates only resume-state columns so callers can persist
 // engine progress without changing operation lifecycle state.

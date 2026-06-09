@@ -529,10 +529,18 @@ func (s *Service) markOperationFromApplyState(ctx context.Context, workerID int,
 				"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
 				"deployment", op.Deployment, "environment", apply.Environment, "error", err)
 		}
-	case state.IsTerminalApplyState(apply.State):
-		// stopped / cancelled / reverted — mirror the terminal state onto the row.
+	case state.IsState(apply.State, state.Apply.Stopped):
+		// stopped is resumable, so mirror the state but leave completed_at nil
+		// (matching the apply-level convention) — stopped work may resume.
 		if err := opStore.UpdateState(ctx, op.ID, apply.State); err != nil {
-			s.logger.Error("operator: failed to update terminal apply_operation state",
+			s.logger.Error("operator: failed to update stopped apply_operation state",
+				"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+				"deployment", op.Deployment, "environment", apply.Environment, "state", apply.State, "error", err)
+		}
+	case state.IsTerminalApplyState(apply.State):
+		// cancelled / reverted — non-resumable terminal states; stamp completed_at.
+		if err := opStore.MarkTerminal(ctx, op.ID, apply.State); err != nil {
+			s.logger.Error("operator: failed to mark terminal apply_operation state",
 				"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
 				"deployment", op.Deployment, "environment", apply.Environment, "state", apply.State, "error", err)
 		}

@@ -444,7 +444,10 @@ type ApplyOperation struct {
 	// StartedAt is when the scheduler claimed this child row and execution began.
 	StartedAt *time.Time
 
-	// CompletedAt is when this child row reached a terminal state.
+	// CompletedAt is when this child row reached a non-resumable terminal state
+	// (completed, failed, cancelled, reverted). It stays nil for the resumable
+	// stopped state, matching the apply-level convention, since stopped work may
+	// still resume.
 	CompletedAt *time.Time
 
 	// EngineResumeContext and EngineResumeMetadata are opaque state owned by the
