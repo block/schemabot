@@ -188,7 +188,37 @@ environment_order:
   - production
 ```
 
-If omitted, SchemaBot defaults to `staging` before `production`. Before applying production, SchemaBot checks staging first when both environments are configured for the database because the server-owned `environment_order` says staging precedes production.
+If omitted, SchemaBot defaults to `staging` before `production`. Before applying production from a PR comment, SchemaBot checks staging first because the server-owned `environment_order` says staging precedes production.
+
+There are two related but separate concepts:
+
+- **Routing environments** — the `databases.<name>.environments` entries this SchemaBot process can plan/apply directly. These entries must include the local DSN or remote `target`/`deployment` needed to execute work for that environment.
+- **Promotion order** — the ordered environment chain used by PR comment applies. In a single deployment, this is normally the same set as the database's routing environments. In a deployment scoped with `allowed_environments`, promotion gating uses `environment_order` so a production-only deployment can still verify earlier environments that are owned by another SchemaBot deployment.
+
+For example, this production-scoped deployment only has production routing metadata, but production applies still require the staging aggregate check to be successful because `staging` precedes `production` in `environment_order`:
+
+```yaml
+allowed_environments:
+  - production
+
+environment_order:
+  - staging
+  - production
+
+databases:
+  payments:
+    type: mysql
+    environments:
+      production:
+        target: "payments-production"
+        deployment: primary
+
+tern_deployments:
+  primary:
+    production: "tern-production:9090"
+```
+
+The production deployment does not need a staging target. It verifies staging by reading the staging deployment's GitHub aggregate check, then resolves only the production target from its own config.
 
 ## Hybrid Mode
 

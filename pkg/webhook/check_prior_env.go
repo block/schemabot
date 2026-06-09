@@ -3,8 +3,10 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -32,7 +34,7 @@ func (h *Handler) checkPriorEnvironments(
 	installationID int64, requestedBy string,
 ) bool {
 	config := h.service.Config()
-	environments = config.OrderedEnvironments(environments)
+	environments = promotionGateEnvironments(config, environment, environments)
 
 	// Find the index of the current environment
 	currentIdx := -1
@@ -66,6 +68,19 @@ func (h *Handler) checkPriorEnvironments(
 	}
 
 	return false
+}
+
+func promotionGateEnvironments(config *api.ServerConfig, environment string, environments []string) []string {
+	if config == nil {
+		return environments
+	}
+	if len(config.AllowedEnvironments) > 0 {
+		order := config.PromotionEnvironmentOrder()
+		if slices.Contains(order, environment) {
+			return order
+		}
+	}
+	return config.OrderedEnvironments(environments)
 }
 
 // checkPriorEnvViaLocal checks the prior environment status using the local database.

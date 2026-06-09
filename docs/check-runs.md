@@ -844,8 +844,12 @@ environment_order:
 If `environment_order` is omitted, SchemaBot defaults to staging before
 production.
 
-Before applying to an environment, SchemaBot checks all prior environments for
-the same database that are configured server-side:
+Before applying to an environment from a PR comment, SchemaBot checks prior
+environments from the server-owned promotion order. In a single deployment, the
+promotion gate uses the database environments configured on that server. In a
+deployment scoped with `allowed_environments`, the promotion gate uses
+`environment_order` so an environment-local deployment can still verify earlier
+environments owned by another SchemaBot deployment.
 
 | Prior environment state | Apply allowed? | Reason |
 | --- | --- | --- |
@@ -873,13 +877,14 @@ same database's staging row.
 
 In split deployments, GitHub check runs are the central authority for
 cross-environment gating. A production SchemaBot instance does not need staging
-target identifiers in its server config. Its apply flow is:
+target identifiers in its server config; it only needs the shared
+`environment_order` that says staging precedes production. Its apply flow is:
 
 ```text
 schemabot apply -e production
         |
         v
-Read configured environments and promotion order from server config
+Read promotion order from server config
         |
         v
 For each prior environment:
