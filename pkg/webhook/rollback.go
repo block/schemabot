@@ -154,6 +154,10 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.RollbackConfirm, err)
 		return
 	}
+	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.RollbackConfirm, err)
+		return
+	}
 
 	database := schemaResult.Database
 	dbType := schemaResult.Type

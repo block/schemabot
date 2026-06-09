@@ -11,20 +11,18 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/e2eutil"
-	ghclient "github.com/block/schemabot/pkg/github"
 )
 
-func TestLoadCLIConfig_WithEnvironments(t *testing.T) {
-	dir := e2eutil.WriteSchemaDir(t, "testapp", "mysql", map[string]string{
-		"users.sql": "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY);",
-	}, e2eutil.WithEnvironmentNames("staging", "production"))
+func TestLoadCLIConfig_RejectsEnvironments(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\nenvironments:\n  - staging\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "users.sql"), []byte("CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY);"), 0644))
 
 	cfg, err := LoadCLIConfig(dir)
-	require.NoError(t, err)
-
-	assert.Equal(t, "testapp", cfg.Database)
-	assert.Equal(t, "mysql", cfg.Type)
-	assert.Equal(t, ghclient.EnvironmentList{{Name: "production"}, {Name: "staging"}}, cfg.Environments)
+	require.Error(t, err)
+	assert.Nil(t, cfg)
+	assert.Contains(t, err.Error(), "field environments not found")
 }
 
 func TestLoadCLIConfig_WithoutEnvironments(t *testing.T) {
@@ -36,6 +34,7 @@ func TestLoadCLIConfig_WithoutEnvironments(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "testapp", cfg.Database)
+	assert.Equal(t, "mysql", cfg.Type)
 }
 
 func TestLoadCLIConfig_RejectsDeployment(t *testing.T) {

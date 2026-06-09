@@ -462,7 +462,7 @@ Run output remains human-readable and may change.
 | `rollback_completed` | Per-database row | A rollback succeeded, so the target environment no longer contains the PR's desired schema. |
 | `github_schema_config_discovery_unavailable` | Aggregate row | SchemaBot knew the PR head SHA, but GitHub was unavailable while SchemaBot inspected changed files or repository contents. |
 | `schema_config_discovery_failed` | Aggregate row | SchemaBot could reach GitHub, but could not determine the managed schema configuration or schema files. |
-| `no_allowed_configured_environments` | Aggregate row | Schema files changed, but none of the environments declared by `schemabot.yaml` are allowed for this deployment. |
+| `no_allowed_configured_environments` | Aggregate row | Schema files changed, but none of the database's server-configured environments are allowed for this deployment. |
 
 Generic plan and apply errors can still publish `completed` / `failure` without
 a stable `blocking_reason` when the error is not one of the explicit classes
@@ -499,7 +499,7 @@ Common fail-closed scenarios:
 | Aggregate update skipped for a stale SHA | A background worker tried to publish status for a commit that is no longer the PR head. | Confirm the latest commit has a SchemaBot aggregate check. If it does not, comment `schemabot plan -e <environment>` or `schemabot plan`. |
 | GitHub unavailable during config discovery | SchemaBot cannot safely read PR metadata or repository contents. | Wait for GitHub API recovery, then comment `schemabot plan -e <environment>` or `schemabot plan`. CLI operations can still manage live schema changes while GitHub is down, but they do not make branch protection pass. |
 | Config discovery failed for a non-GitHub reason | SchemaBot could read GitHub, but could not determine the managed schema config or schema files. | Fix `schemabot.yaml`, the schema file layout, or the invalid SQL/config state. Push the fix, or comment `schemabot plan -e <environment>` after fixing the PR. Use logs with `blocking_reason=schema_config_discovery_failed` for the underlying read or parse failure. |
-| Schema changes found but no configured environments are allowed | The repo's `schemabot.yaml` asks for environments this deployment is not allowed to process. Publishing success would hide a deployment/config mismatch. | Align `schemabot.yaml` and this deployment's `allowed_environments`, then push the config fix or comment `schemabot plan -e <environment>`. |
+| Schema changes found but no configured environments are allowed | The database is configured only for environments this deployment is not allowed to process. Publishing success would hide a deployment/config mismatch. | Align the server database environment config with this deployment's `allowed_environments`, then push the config fix or comment `schemabot plan -e <environment>`. |
 | Accepted apply cannot be tracked | The engine accepted work, but SchemaBot could not store or reload the apply ID needed for progress and check ownership. | Treat this as a storage or apply-tracking incident. Inspect engine state and the `applies` table before retrying; do not rely on branch protection until a new plan reflects the live schema. |
 | Accepted apply could not update required check state | The apply may be running, but SchemaBot could not mark the stored check row `in_progress` with the accepted `apply_id`. | Inspect the accepted apply, storage health, and aggregate check. Retry only after confirming the live schema state and stored check state agree. |
 | Prior-environment check state could not be read | SchemaBot cannot prove that an earlier environment is clean. | Treat this as a SchemaBot storage health issue. Restore storage access, then repeat the blocked command, for example `schemabot apply -e production`. Do not bypass the promotion gate unless this is an explicit breakglass decision. |
@@ -768,8 +768,8 @@ continues to block until a new plan shows no changes or the changes are applied.
 ### Schema changes but no configured environments are allowed
 
 When `allowed_environments` is configured, a SchemaBot deployment may discover
-that the PR touches a managed database but none of the environments declared by
-that database's `schemabot.yaml` are allowed for this deployment. That is treated
+that the PR touches a managed database but none of that database's
+server-configured environments are allowed for this deployment. That is treated
 as a configuration mismatch, not a no-op. SchemaBot publishes a failing aggregate
 for the environments this deployment is responsible for, stores
 `blocking_reason=no_allowed_configured_environments`, and does not post a plan
@@ -832,8 +832,8 @@ watcher from overwriting a newer plan or newer apply result.
 
 ## Environment Ordering
 
-Environment ordering is enforced for PR comment commands. The set of enabled
-environments comes from `schemabot.yaml`, but the order comes from server config:
+Environment ordering is enforced for PR comment commands. The set of configured
+environments and their promotion order both come from server config:
 
 ```yaml
 environment_order:
@@ -844,21 +844,8 @@ environment_order:
 If `environment_order` is omitted, SchemaBot defaults to staging before
 production.
 
-For clients, `schemabot.yaml` environments are strictly an opt-in mechanism:
-
-```yaml
-environments:
-  - production
-  - staging
-```
-
-The order in that file is ignored for apply gating. In the example above, the
-repository has opted into both environments. SchemaBot still treats staging as
-the prior environment for production because the server-owned order says staging
-comes first.
-
 Before applying to an environment, SchemaBot checks all prior environments for
-the same database that are also enabled in `schemabot.yaml`:
+the same database that are configured server-side:
 
 | Prior environment state | Apply allowed? | Reason |
 | --- | --- | --- |
@@ -892,8 +879,7 @@ target identifiers in its server config. Its apply flow is:
 schemabot apply -e production
         |
         v
-Read enabled environments from schemabot.yaml
-and promotion order from server config
+Read configured environments and promotion order from server config
         |
         v
 For each prior environment:

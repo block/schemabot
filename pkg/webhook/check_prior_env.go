@@ -20,7 +20,7 @@ import (
 //   - applying to staging: sandbox must be success
 //   - applying to production: both sandbox and staging must be success
 //
-// schemabot.yaml only opts into environments; its YAML order is ignored.
+// Server config owns the configured environments and their promotion order.
 // When allowed_environments is configured, this instance only owns a subset of
 // environments. For prior environments owned by this instance, local storage is
 // checked. For prior environments owned by another instance, the GitHub Checks

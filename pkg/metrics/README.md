@@ -145,7 +145,7 @@ Operation values:
 | `stale_check_cleanup` | SchemaBot handled stored check state for a database that is no longer touched by the latest commit on the PR branch. Plan-only state can be cleared; apply-owned state stays blocked. |
 | `stale_check_reconciliation` | SchemaBot repaired stale `in_progress` stored check state by comparing it with authoritative apply state after a worker restart, crash, or race. |
 | `schema_config_discovery` | SchemaBot discovered managed schema configs for the PR before deciding what to plan or which aggregate checks to publish. |
-| `schema_config_environment_validation` | SchemaBot found schema changes but none of the environments declared by `schemabot.yaml` are allowed for this deployment, so it failed the aggregate check closed. |
+| `schema_config_environment_validation` | SchemaBot found schema changes but none of the database's server-configured environments are allowed for this deployment, so it failed the aggregate check closed. |
 
 A spike in `status="blocked"` for `operation="aggregate_check_sync"` or
 `operation="stale_check_cleanup"` means SchemaBot is fail-closing instead of

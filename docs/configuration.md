@@ -180,7 +180,7 @@ Resolution order from the config layer is deterministic and sorted by deployment
 
 ## Environment Order
 
-For clients, `schemabot.yaml` environments are strictly an opt-in mechanism. They control which environments a repository opts into; they do not control promotion order. SchemaBot enforces promotion order from server config:
+Environment availability and promotion order are server-owned. Repository `schemabot.yaml` files identify the database and type; they do not list or opt into environments. SchemaBot resolves the environments for a database from server config:
 
 ```yaml
 environment_order:
@@ -188,21 +188,7 @@ environment_order:
   - production
 ```
 
-If omitted, SchemaBot defaults to `staging` before `production`. The order of values in `schemabot.yaml` is ignored for apply gating, so these two repo configs are equivalent:
-
-```yaml
-environments:
-  - staging
-  - production
-```
-
-```yaml
-environments:
-  - production
-  - staging
-```
-
-Both enable staging and production. When applying production, SchemaBot checks staging first because the server-owned `environment_order` says staging precedes production.
+If omitted, SchemaBot defaults to `staging` before `production`. Before applying production, SchemaBot checks staging first when both environments are configured for the database because the server-owned `environment_order` says staging precedes production.
 
 ## Hybrid Mode
 
@@ -488,11 +474,12 @@ Do not require the staging ConfigMap to contain production targets, or the produ
 When a PR is opened or updated, each instance auto-plans only the environments it owns. The staging instance plans staging, the production instance plans production. Each posts its own plan comment and creates its own per-environment aggregate check.
 
 If a PR changes managed schema files but a deployment's `allowed_environments`
-does not overlap any environment declared by the matching `schemabot.yaml`, that
+does not overlap any environment configured server-side for the database, that
 deployment publishes a failing aggregate check instead of treating the PR as
-safe. This usually means the repo config and server config disagree. Align the
-`schemabot.yaml` environments with the deployment's `allowed_environments`, then
-run `schemabot plan -e <environment>` or push a new commit to refresh checks.
+safe. This usually means the database environment config and deployment scoping
+disagree. Align the server environment config with the deployment's
+`allowed_environments`, then run `schemabot plan -e <environment>` or push a new
+commit to refresh checks.
 
 ## Multi-App Routing
 

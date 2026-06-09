@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	gh "github.com/google/go-github/v86/github"
@@ -17,7 +18,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestEnvironmentList_SimpleForm(t *testing.T) {
+func TestSchemabotConfigRejectsEnvironments(t *testing.T) {
 	yamlData := `
 database: testdb
 type: mysql
@@ -26,58 +27,11 @@ environments:
   - production
 `
 	var config SchemabotConfig
-	require.NoError(t, yaml.Unmarshal([]byte(yamlData), &config))
-	assert.Equal(t, []string{"staging", "production"}, config.GetEnvironments())
-}
-
-func TestEnvironmentList_MapFormRejected(t *testing.T) {
-	yamlData := `
-database: testdb
-type: mysql
-environments:
-  staging:
-    target: cluster-staging-001
-  production:
-    target: cluster-production-001
-`
-	var config SchemabotConfig
-	err := yaml.Unmarshal([]byte(yamlData), &config)
+	decoder := yaml.NewDecoder(strings.NewReader(yamlData))
+	decoder.KnownFields(true)
+	err := decoder.Decode(&config)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "configure database targets in the SchemaBot server config")
-}
-
-func TestGetEnvironments_Default(t *testing.T) {
-	config := SchemabotConfig{Database: "mydb"}
-	assert.Equal(t, []string{"staging"}, config.GetEnvironments())
-}
-
-func TestHasEnvironment_SimpleForm(t *testing.T) {
-	config := SchemabotConfig{
-		Database: "mydb",
-		Environments: EnvironmentList{
-			{Name: "staging"},
-			{Name: "production"},
-		},
-	}
-	assert.True(t, config.HasEnvironment("staging"))
-	assert.True(t, config.HasEnvironment("production"))
-	assert.False(t, config.HasEnvironment("unknown"))
-}
-
-func TestHasEnvironment_MapForm(t *testing.T) {
-	yamlData := `
-database: testdb
-type: mysql
-environments:
-  staging:
-    target: cluster-001
-  production:
-    target: cluster-002
-`
-	var config SchemabotConfig
-	err := yaml.Unmarshal([]byte(yamlData), &config)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "configure database targets in the SchemaBot server config")
+	assert.Contains(t, err.Error(), "field environments not found")
 }
 
 func TestFindAllConfigsForPRClassifiesGitHubUnavailable(t *testing.T) {

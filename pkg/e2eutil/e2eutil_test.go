@@ -22,19 +22,3 @@ func TestWriteSchemaDir_NoOptions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "CREATE TABLE t1 (id INT);", string(sql))
 }
-
-func TestWriteSchemaDir_WithEnvironmentNames(t *testing.T) {
-	dir := WriteSchemaDir(t, "testdb", "mysql", map[string]string{
-		"001.sql": "CREATE TABLE t1 (id INT);",
-	}, WithEnvironmentNames("staging", "production"))
-
-	config, err := os.ReadFile(filepath.Join(dir, "schemabot.yaml"))
-	require.NoError(t, err)
-
-	configStr := string(config)
-	assert.Contains(t, configStr, "database: testdb")
-	assert.Contains(t, configStr, "type: mysql")
-	assert.Contains(t, configStr, "environments:")
-	assert.Contains(t, configStr, "  - staging")
-	assert.Contains(t, configStr, "  - production")
-}

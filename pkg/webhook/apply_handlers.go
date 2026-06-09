@@ -30,6 +30,10 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
 		return
 	}
+	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
+		return
+	}
 
 	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); blocked {
 		return
@@ -64,8 +68,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	dbType := schemaResult.Type
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 
-	// Environment ordering enforcement: prior environments must be clean before applying.
-	// The repo config only opts into environments; server config owns their order.
+	// Environment ordering enforcement: prior server-configured environments must be clean before applying.
 	if blocked := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID, requestedBy); blocked {
 		h.logger.Info("apply blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		return
@@ -336,6 +339,10 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
 	if err != nil {
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
+		return
+	}
+	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
 		return
 	}

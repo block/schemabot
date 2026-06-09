@@ -2,9 +2,11 @@ package webhook
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -34,6 +36,50 @@ func (h *Handler) aggregateCheckNameForRepo(repo string) string {
 		return aggregateCheckName
 	}
 	return config.GitHubCheckNameBaseForRepo(repo)
+}
+
+func (h *Handler) configuredDatabaseEnvironments(database string) ([]string, error) {
+	config, ok := h.serverConfig()
+	if !ok {
+		return nil, fmt.Errorf("server config is unavailable")
+	}
+	return config.DatabaseEnvironments(database)
+}
+
+func (h *Handler) allowedDatabaseEnvironments(database string) ([]string, error) {
+	config, ok := h.serverConfig()
+	if !ok {
+		return nil, fmt.Errorf("server config is unavailable")
+	}
+	environments, err := config.DatabaseEnvironments(database)
+	if err != nil {
+		return nil, fmt.Errorf("resolve configured environments for database %q: %w", database, err)
+	}
+	if len(config.AllowedEnvironments) == 0 {
+		return environments, nil
+	}
+	allowed := make([]string, 0, len(environments))
+	for _, environment := range environments {
+		if config.IsEnvironmentAllowed(environment) {
+			allowed = append(allowed, environment)
+		}
+	}
+	return allowed, nil
+}
+
+func (h *Handler) attachServerEnvironments(schemaResult *ghclient.SchemaRequestResult, environment string) error {
+	if schemaResult == nil {
+		return fmt.Errorf("schema request result is nil")
+	}
+	environments, err := h.configuredDatabaseEnvironments(schemaResult.Database)
+	if err != nil {
+		return fmt.Errorf("resolve configured environments for database %q: %w", schemaResult.Database, err)
+	}
+	if environment != "" && !slices.Contains(environments, environment) {
+		return fmt.Errorf("database %q environment %q is not configured on this server", schemaResult.Database, environment)
+	}
+	schemaResult.Environments = environments
+	return nil
 }
 
 // filterChecksByEnvironment returns only stored check state for the given environment.

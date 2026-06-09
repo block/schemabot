@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -118,19 +117,10 @@ func RunCLIWithError(binPath, dir string, args ...string) (string, error) {
 	return stdout.String() + stderr.String(), err
 }
 
-type schemaDirConfig struct {
-	environments []string
-}
+type schemaDirConfig struct{}
 
 // SchemaDirOption configures optional fields for WriteSchemaDir.
 type SchemaDirOption func(*schemaDirConfig)
-
-// WithEnvironmentNames adds environment names to the generated schemabot.yaml.
-func WithEnvironmentNames(envs ...string) SchemaDirOption {
-	return func(c *schemaDirConfig) {
-		c.environments = append([]string(nil), envs...)
-	}
-}
 
 // WriteSchemaDir creates a temporary directory with a schemabot.yaml config and
 // the provided SQL files. Returns the directory path.
@@ -145,14 +135,6 @@ func WriteSchemaDir(t *testing.T, database, dbType string, sqlFiles map[string]s
 	dir := t.TempDir()
 	var b strings.Builder
 	fmt.Fprintf(&b, "database: %s\ntype: %s\n", database, dbType)
-	if len(cfg.environments) > 0 {
-		envNames := append([]string(nil), cfg.environments...)
-		sort.Strings(envNames)
-		b.WriteString("environments:\n")
-		for _, env := range envNames {
-			fmt.Fprintf(&b, "  - %s\n", env)
-		}
-	}
 	if err := os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(b.String()), 0644); err != nil {
 		t.Fatalf("write schemabot.yaml: %v", err)
 	}

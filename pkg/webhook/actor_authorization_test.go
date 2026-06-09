@@ -489,7 +489,7 @@ func teamMembersHandler(t *testing.T, statusCode int, members ...string) http.Ha
 func registerApplyDiscoveryEndpoints(t *testing.T, mux *http.ServeMux, database string) {
 	t.Helper()
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nenvironments:\n  - staging\n", database)
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", database)
 	schemaSQL := "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`))"
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {

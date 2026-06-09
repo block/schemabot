@@ -99,10 +99,10 @@ The `schemabot.yaml` config file marks a directory as containing schema files:
 ```yaml
 database: payments_db
 type: mysql
-environments:
-  - staging
-  - production
 ```
+
+Environment availability and order are resolved from server config for the
+configured database.
 
 Three discovery strategies, tried in order:
 

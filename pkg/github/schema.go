@@ -14,7 +14,7 @@ import (
 // SchemaRequestResult contains everything needed to execute a plan from a PR.
 type SchemaRequestResult struct {
 	Database     string
-	Environments []string // Enabled environments from schemabot.yaml; server config owns promotion order.
+	Environments []string // Server-owned environments for this database, populated by webhook handlers.
 	Type         string   // "mysql" or "vitess"
 	SchemaFiles  map[string]*ternv1.SchemaFiles
 	Repository   string
@@ -41,10 +41,6 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 		return nil, err
 	}
 
-	if environment != "" && !config.HasEnvironment(environment) {
-		return nil, fmt.Errorf("environment %q is not configured for this database (configured: %v)", environment, config.GetEnvironments())
-	}
-
 	// Get PR info for head SHA
 	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
@@ -64,14 +60,13 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 	}
 
 	return &SchemaRequestResult{
-		Database:     config.Database,
-		Environments: config.GetEnvironments(),
-		Type:         string(config.GetType()),
-		SchemaFiles:  schemaFiles,
-		Repository:   repo,
-		PullRequest:  pr,
-		SchemaPath:   configDir,
-		HeadSHA:      prInfo.HeadSHA,
+		Database:    config.Database,
+		Type:        string(config.GetType()),
+		SchemaFiles: schemaFiles,
+		Repository:  repo,
+		PullRequest: pr,
+		SchemaPath:  configDir,
+		HeadSHA:     prInfo.HeadSHA,
 	}, nil
 }
 

@@ -165,16 +165,14 @@ my-repo/
 ```yaml
 database: mydb
 type: mysql
-environments:
-  - staging
-  - production
 ```
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `database` | Yes | Must match a database name in your SchemaBot server config |
 | `type` | Yes | `"mysql"` or `"vitess"` |
-| `environments` | No | Defaults to `["staging"]`. Valid values: `"staging"`, `"production"`. This is an opt-in list; server config controls promotion order. |
+
+Environment availability and promotion order are configured on the SchemaBot server.
 
 ### Schema File Layout
 

@@ -39,6 +39,11 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return
 	}
+	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
+		return
+	}
 
 	// Reject if the PR HEAD advanced after discovery loaded schema files.
 	// Rendering a plan comment against stale files would mislead the user
@@ -138,44 +143,35 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 		return
 	}
 
-	// Find config to get environments
-	var environments []string
+	// Find config to get the database identity. Environments are server-owned.
+	var schemaDatabase string
 	if databaseName != "" {
 		config, _, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
 			return
 		}
-		environments = config.GetEnvironments()
+		schemaDatabase = config.Database
 	} else {
 		config, _, findErr := client.FindConfigForPR(ctx, repo, pr)
 		if findErr != nil {
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
 			return
 		}
-		environments = config.GetEnvironments()
+		schemaDatabase = config.Database
 	}
-	configuredEnvironments := append([]string(nil), environments...)
-	var allowedEnvironments []string
-
-	// Filter environments to those this service is allowed to handle.
-	if h.service != nil {
-		config := h.service.Config()
-		environments = config.OrderedEnvironments(environments)
-		allowedEnvironments = append([]string(nil), config.AllowedEnvironments...)
-		if len(config.AllowedEnvironments) > 0 {
-			var allowed []string
-			for _, env := range environments {
-				if config.IsEnvironmentAllowed(env) {
-					allowed = append(allowed, env)
-				} else {
-					h.logger.Debug("skipping environment not allowed for this service",
-						"repo", repo, "pr", pr, "env", env)
-				}
-			}
-			environments = allowed
-		}
+	configuredEnvironments, envErr := h.configuredDatabaseEnvironments(schemaDatabase)
+	if envErr != nil {
+		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr)
+		return
 	}
+	environments, envErr := h.allowedDatabaseEnvironments(schemaDatabase)
+	if envErr != nil {
+		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr)
+		return
+	}
+	configuredEnvironments = append([]string(nil), configuredEnvironments...)
+	allowedEnvironments := append([]string(nil), h.service.Config().AllowedEnvironments...)
 
 	if len(environments) == 0 {
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
@@ -214,6 +210,11 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 		schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, env, databaseName)
 		if err != nil {
 			h.logger.Error("schema request failed", "repo", repo, "pr", pr, "env", env, "error", err)
+			multiEnvData.Errors[env] = userFacingError(err)
+			continue
+		}
+		if err := h.attachServerEnvironments(schemaResult, env); err != nil {
+			h.logger.Error("schema environment validation failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)
 			continue
 		}

@@ -17,7 +17,6 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
-	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -63,10 +62,9 @@ var ErrSilent = errors.New("silent error")
 
 // CLIConfig represents the schemabot.yaml configuration file for CLI commands.
 type CLIConfig struct {
-	Database     string                   `yaml:"database"`
-	Type         string                   `yaml:"type"`
-	Environments ghclient.EnvironmentList `yaml:"environments,omitempty"`
-	SchemaDir    string                   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	Database  string `yaml:"database"`
+	Type      string `yaml:"type"`
+	SchemaDir string `yaml:"-"` // Set by LoadCLIConfig, not from YAML
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.

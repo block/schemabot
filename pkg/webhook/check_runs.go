@@ -85,10 +85,10 @@ var configDiscoveryFailedBlock = checkBlockReason{
 }
 
 // noAllowedConfiguredEnvironmentsBlock is used when schema files changed but
-// the environments declared by schemabot.yaml do not overlap this service's
-// allowed_environments. SchemaBot cannot safely plan the schema change in that
-// configuration, so the aggregate check must fail closed.
+// the server-configured environments for the database do not overlap this
+// service's allowed_environments. SchemaBot cannot safely plan the schema
+// change in that configuration, so the aggregate check must fail closed.
 var noAllowedConfiguredEnvironmentsBlock = checkBlockReason{
 	blockingReason: "no_allowed_configured_environments",
-	message:        "SchemaBot found schema changes, but no environment declared by schemabot.yaml is allowed for this SchemaBot deployment. Align schemabot.yaml with allowed_environments, then retry the check.",
+	message:        "SchemaBot found schema changes, but no configured environment for this database is allowed for this SchemaBot deployment. Align server environment configuration with allowed_environments, then retry the check.",
 }

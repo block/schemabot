@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"slices"
 	"sort"
 	"strings"
 
@@ -21,46 +20,12 @@ const (
 	DatabaseTypeStrata DatabaseType = "strata"
 )
 
-// EnvironmentEntry represents an environment a repository has opted into.
-type EnvironmentEntry struct {
-	Name string
-}
-
-// EnvironmentList supports a list of environment names in YAML:
-//
-//	environments:
-//	  - staging
-//	  - production
-type EnvironmentList []EnvironmentEntry
-
-// UnmarshalYAML handles list-of-strings form.
-func (e *EnvironmentList) UnmarshalYAML(value *yaml.Node) error {
-	*e = nil // Reset to avoid accumulating entries on re-unmarshal
-	switch value.Kind {
-	case yaml.SequenceNode:
-		// List form: ["staging", "production"]
-		var names []string
-		if err := value.Decode(&names); err != nil {
-			return err
-		}
-		for _, name := range names {
-			*e = append(*e, EnvironmentEntry{Name: name})
-		}
-		return nil
-	case yaml.MappingNode:
-		return fmt.Errorf("environments must be a list of names; configure database targets in the SchemaBot server config")
-	default:
-		return fmt.Errorf("environments must be a list, got %v", value.Kind)
-	}
-}
-
 // SchemabotConfig represents the schemabot.yaml configuration file.
 // The presence of this file in a directory indicates that directory contains schema files.
 type SchemabotConfig struct {
-	Database     string          `yaml:"database" json:"database"`
-	Name         string          `yaml:"name" json:"name"`
-	Type         DatabaseType    `yaml:"type,omitempty" json:"type,omitempty"`
-	Environments EnvironmentList `yaml:"environments,omitempty" json:"environments,omitempty"`
+	Database string       `yaml:"database" json:"database"`
+	Name     string       `yaml:"name" json:"name"`
+	Type     DatabaseType `yaml:"type,omitempty" json:"type,omitempty"`
 }
 
 // GetType returns the database type. Type is always set — FetchConfig rejects empty values.
@@ -68,30 +33,11 @@ func (c *SchemabotConfig) GetType() DatabaseType {
 	return c.Type
 }
 
-// GetEnvironments returns the enabled environment names, defaulting to ["staging"].
-// The returned order is not authoritative; SchemaBot servers own promotion order.
-func (c *SchemabotConfig) GetEnvironments() []string {
-	if len(c.Environments) == 0 {
-		return []string{"staging"}
-	}
-	names := make([]string, len(c.Environments))
-	for i, e := range c.Environments {
-		names[i] = e.Name
-	}
-	return names
-}
-
-// HasEnvironment returns true if the specified environment is configured.
-func (c *SchemabotConfig) HasEnvironment(env string) bool {
-	return slices.Contains(c.GetEnvironments(), env)
-}
-
 // DiscoveredConfig represents a schemabot.yaml config found via Tree API search.
 type DiscoveredConfig struct {
-	Config       *SchemabotConfig
-	Path         string   // Full path to schemabot.yaml file
-	SchemaDir    string   // Directory containing schemabot.yaml
-	Environments []string // Enabled environments from config.GetEnvironments()
+	Config    *SchemabotConfig
+	Path      string // Full path to schemabot.yaml file
+	SchemaDir string // Directory containing schemabot.yaml
 }
 
 // ConfigFileName is the name of the schemabot config file.
@@ -152,13 +98,6 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type must be 'vitess', 'mysql', or 'strata', got '%s'", configPath, config.Type)
 	}
 
-	validEnvs := map[string]bool{"staging": true, "production": true}
-	for _, env := range config.Environments {
-		if !validEnvs[env.Name] {
-			return nil, fmt.Errorf("invalid schemabot.yaml at %s: environment must be 'staging' or 'production', got '%s'", configPath, env.Name)
-		}
-	}
-
 	return &config, nil
 }
 
@@ -203,10 +142,9 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 
 		schemaDir := path.Dir(configPath)
 		result.ValidConfigs = append(result.ValidConfigs, DiscoveredConfig{
-			Config:       config,
-			Path:         configPath,
-			SchemaDir:    schemaDir,
-			Environments: config.GetEnvironments(),
+			Config:    config,
+			Path:      configPath,
+			SchemaDir: schemaDir,
 		})
 	}
 
@@ -506,10 +444,9 @@ func newDiscoveredConfig(config *SchemabotConfig, dir string) DiscoveredConfig {
 		configPath = ConfigFileName
 	}
 	return DiscoveredConfig{
-		Config:       config,
-		Path:         configPath,
-		SchemaDir:    dir,
-		Environments: config.GetEnvironments(),
+		Config:    config,
+		Path:      configPath,
+		SchemaDir: dir,
 	}
 }
 

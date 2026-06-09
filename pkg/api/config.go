@@ -70,9 +70,8 @@ type ServerConfig struct {
 	// When empty or nil, all environments are allowed.
 	AllowedEnvironments []string `yaml:"allowed_environments"`
 
-	// EnvironmentOrder defines the server-owned promotion order. Client-side
-	// schemabot.yaml environments only opt into environments; their YAML order is
-	// not authoritative for apply gating. Defaults to staging before production.
+	// EnvironmentOrder defines the server-owned promotion order. Defaults to
+	// staging before production.
 	EnvironmentOrder []string `yaml:"environment_order"`
 
 	// SchedulerWorkers is the number of concurrent scheduler workers that claim
@@ -683,6 +682,23 @@ func (c *ServerConfig) DatabaseEnvironment(database, environment string) *Enviro
 		return &env
 	}
 	return nil
+}
+
+// DatabaseEnvironments returns the environments configured server-side for a
+// database, ordered by the server-owned promotion order.
+func (c *ServerConfig) DatabaseEnvironments(database string) ([]string, error) {
+	if c == nil {
+		return nil, fmt.Errorf("server config is nil")
+	}
+	db := c.Database(database)
+	if db == nil {
+		return nil, fmt.Errorf("database %q is not configured on this server", database)
+	}
+	environments := make([]string, 0, len(db.Environments))
+	for environment := range db.Environments {
+		environments = append(environments, environment)
+	}
+	return c.OrderedEnvironments(environments), nil
 }
 
 // ResolveDatabaseTarget returns the complete routing metadata for a configured
