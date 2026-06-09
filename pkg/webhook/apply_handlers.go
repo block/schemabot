@@ -25,7 +25,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 	defer cancel()
 
 	// Discover config and fetch schema files from PR
-	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
+	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Apply)
 	if err != nil {
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err)
 		return
@@ -337,7 +337,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 	defer cancel()
 
 	// Discover database config from PR's schemabot.yaml
-	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
+	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.ApplyConfirm)
 	if err != nil {
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err)
 		return
@@ -586,15 +586,18 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		return "", err
 	}
 
-	config, _, err := client.FindConfigForPR(ctx, repo, pr)
+	config, configDir, err := client.FindConfigForPR(ctx, repo, pr)
 	if errors.Is(err, ghclient.ErrNoConfig) {
-		config, _, _, err = client.FindConfigInRepo(ctx, repo, pr)
+		config, configDir, _, err = client.FindConfigInRepo(ctx, repo, pr)
 	}
 	if err != nil {
 		if errors.Is(err, ghclient.ErrMultipleConfigs) {
 			return "", fmt.Errorf("multiple SchemaBot configs match this PR; retry with `schemabot unlock -d <database> --force`: %w", err)
 		}
 		return "", err
+	}
+	if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Unlock) {
+		return "", ghclient.ErrNoConfig
 	}
 	if config == nil || config.Database == "" {
 		return "", fmt.Errorf("no database found in SchemaBot config")

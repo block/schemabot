@@ -124,6 +124,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		return "config discovery failed"
 	}
+	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
 
 	// Collect database names from discovered configs
 	affectedDatabases := make(map[string]bool)
@@ -169,6 +170,27 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	}
 
 	return "auto-plan started"
+}
+
+func (h *Handler) filterManagedDiscoveredConfigs(ctx context.Context, repo string, pr int, headSHA, source string, configs []ghclient.DiscoveredConfig) []ghclient.DiscoveredConfig {
+	managed := configs[:0]
+	for _, cfg := range configs {
+		if cfg.Config == nil {
+			h.logger.Warn("discovered schema config is missing parsed config and will be ignored",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"schema_path", cfg.SchemaDir, "source", source)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "schema_config_discovery",
+				Repository: repo,
+				Status:     "skipped",
+			})
+			continue
+		}
+		if h.schemaPathManagedByRepo(ctx, repo, pr, headSHA, cfg.Config.Database, string(cfg.Config.GetType()), cfg.SchemaDir, source) {
+			managed = append(managed, cfg)
+		}
+	}
+	return managed
 }
 
 func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error) {

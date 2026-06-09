@@ -58,7 +58,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **operation** (check ownership): `apply_finished`, `rollback_finished`
 
-**operation** (status checks): `plan_check_recorded`, `apply_started`, `apply_finished`, `rollback_finished`, `aggregate_check_sync`, `stale_check_cleanup`, `stale_check_reconciliation`, `schema_config_discovery`, `schema_config_environment_validation`
+**operation** (status checks): `plan_check_recorded`, `apply_started`, `apply_finished`, `rollback_finished`, `aggregate_check_sync`, `stale_check_cleanup`, `stale_check_reconciliation`, `schema_config_discovery`, `schema_config_source_policy`, `schema_config_environment_validation`
 
 **status** (status checks): `success`, `error`, `skipped`, `stale`, `noop`, `blocked` (operation outcome, not GitHub Check Run conclusion)
 
@@ -145,6 +145,7 @@ Operation values:
 | `stale_check_cleanup` | SchemaBot handled stored check state for a database that is no longer touched by the latest commit on the PR branch. Plan-only state can be cleared; apply-owned state stays blocked. |
 | `stale_check_reconciliation` | SchemaBot repaired stale `in_progress` stored check state by comparing it with authoritative apply state after a worker restart, crash, or race. |
 | `schema_config_discovery` | SchemaBot discovered managed schema configs for the PR before deciding what to plan or which aggregate checks to publish. |
+| `schema_config_source_policy` | SchemaBot evaluated whether a discovered `schemabot.yaml` path is inside this repository's server-owned `allowed_dirs` boundary. `status="skipped"` means the config is outside the managed paths and was ignored; `status="error"` means the config is in a managed path but cannot be routed safely. |
 | `schema_config_environment_validation` | SchemaBot found schema changes but none of the database's server-configured environments are allowed for this deployment, so it failed the aggregate check closed. |
 
 A spike in `status="blocked"` for `operation="aggregate_check_sync"` or

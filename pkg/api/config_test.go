@@ -776,6 +776,124 @@ func TestServerConfig_AuthorizePlanSource(t *testing.T) {
 	}
 }
 
+func TestServerConfig_RepoSchemaDirAllowlist(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/payments"},
+				},
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"schema/payments"},
+			},
+			"ledger": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/ledger"},
+				},
+				AllowedRepos: []string{"octocat/hello-world"},
+				AllowedDirs:  []string{"services/ledger/schema"},
+			},
+			"docs": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/docs"},
+				},
+				AllowedRepos: []string{"octocat/docs"},
+				AllowedDirs:  []string{"schema/docs"},
+			},
+			"open": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/open"},
+				},
+				AllowedDirs: []string{"shared/open"},
+			},
+			"unscoped": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/unscoped"},
+				},
+				AllowedRepos: []string{"octocat/no-dirs"},
+			},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		repo          string
+		schemaPath    string
+		wantAllowlist bool
+		wantAllowed   bool
+	}{
+		{
+			name:          "repo with allowed dirs allows configured path",
+			repo:          "octocat/hello-world",
+			schemaPath:    "schema/payments",
+			wantAllowlist: true,
+			wantAllowed:   true,
+		},
+		{
+			name:          "repo with allowed dirs allows descendant path",
+			repo:          "octocat/hello-world",
+			schemaPath:    "services/ledger/schema/tables",
+			wantAllowlist: true,
+			wantAllowed:   true,
+		},
+		{
+			name:          "repo with allowed dirs rejects sibling path",
+			repo:          "octocat/hello-world",
+			schemaPath:    "schema/payments_archive",
+			wantAllowlist: true,
+			wantAllowed:   false,
+		},
+		{
+			name:          "repo with allowed dirs rejects local fixture path",
+			repo:          "octocat/hello-world",
+			schemaPath:    "schema/local/testapp",
+			wantAllowlist: true,
+			wantAllowed:   false,
+		},
+		{
+			name:          "repo with allowed dirs rejects path owned by another repo",
+			repo:          "octocat/hello-world",
+			schemaPath:    "schema/docs",
+			wantAllowlist: true,
+			wantAllowed:   false,
+		},
+		{
+			name:          "database without allowed repos applies to any repo",
+			repo:          "octocat/another-repo",
+			schemaPath:    "shared/open",
+			wantAllowlist: true,
+			wantAllowed:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantAllowlist, cfg.RepoHasSchemaDirAllowlist(tt.repo))
+			assert.Equal(t, tt.wantAllowed, cfg.SchemaPathAllowedForRepo(tt.repo, tt.schemaPath))
+		})
+	}
+
+	noDirCfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"unscoped": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/unscoped"},
+				},
+				AllowedRepos: []string{"octocat/no-dirs"},
+			},
+		},
+	}
+
+	assert.False(t, noDirCfg.RepoHasSchemaDirAllowlist("octocat/no-dirs"))
+	assert.False(t, noDirCfg.SchemaPathAllowedForRepo("octocat/no-dirs", "anything/testapp"))
+}
+
 func TestServerConfig_ResolveDatabaseTarget(t *testing.T) {
 	cfg := ServerConfig{
 		Databases: map[string]DatabaseConfig{

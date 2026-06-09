@@ -115,6 +115,45 @@ func (c *ServerConfig) AuthorizePlanSource(req PlanSourcePolicyRequest) error {
 	return nil
 }
 
+// RepoHasSchemaDirAllowlist reports whether this repository has any configured
+// database with allowed_dirs. When true, those directories are the repo-level
+// ownership boundary for SchemaBot config discovery.
+func (c *ServerConfig) RepoHasSchemaDirAllowlist(repo string) bool {
+	if c == nil {
+		return false
+	}
+	for _, dbConfig := range c.Databases {
+		if len(dbConfig.AllowedDirs) == 0 {
+			continue
+		}
+		if databaseAllowsRepo(dbConfig, repo) {
+			return true
+		}
+	}
+	return false
+}
+
+// SchemaPathAllowedForRepo reports whether schemaPath is under any allowed_dirs
+// for databases this repository may manage. Call RepoHasSchemaDirAllowlist first
+// when callers need to distinguish "no repo allowlist" from "not allowed".
+func (c *ServerConfig) SchemaPathAllowedForRepo(repo, schemaPath string) bool {
+	if c == nil {
+		return false
+	}
+	for _, dbConfig := range c.Databases {
+		if len(dbConfig.AllowedDirs) == 0 {
+			continue
+		}
+		if !databaseAllowsRepo(dbConfig, repo) {
+			continue
+		}
+		if schemaPathAllowed(dbConfig.AllowedDirs, schemaPath) {
+			return true
+		}
+	}
+	return false
+}
+
 func (d DatabaseConfig) hasSourcePolicy() bool {
 	return len(d.AllowedRepos) > 0 || len(d.AllowedDirs) > 0
 }
@@ -168,6 +207,10 @@ func repoAllowed(allowedRepos []string, repo string) bool {
 		}
 	}
 	return false
+}
+
+func databaseAllowsRepo(dbConfig DatabaseConfig, repo string) bool {
+	return len(dbConfig.AllowedRepos) == 0 || repoAllowed(dbConfig.AllowedRepos, repo)
 }
 
 func schemaPathAllowed(allowedDirs []string, schemaPath string) bool {

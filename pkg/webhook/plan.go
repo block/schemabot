@@ -33,7 +33,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	}
 
 	// Discover config and fetch schema files from PR
-	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
+	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
 	if err != nil {
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
@@ -146,16 +146,24 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 	// Find config to get the database identity. Environments are server-owned.
 	var schemaDatabase string
 	if databaseName != "" {
-		config, _, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
+		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
 			return
 		}
+		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, ghclient.ErrNoConfig)
+			return
+		}
 		schemaDatabase = config.Database
 	} else {
-		config, _, findErr := client.FindConfigForPR(ctx, repo, pr)
+		config, configDir, findErr := client.FindConfigForPR(ctx, repo, pr)
 		if findErr != nil {
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
+			return
+		}
+		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, ghclient.ErrNoConfig)
 			return
 		}
 		schemaDatabase = config.Database
@@ -213,7 +221,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 	}
 
 	for _, env := range environments {
-		schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, env, databaseName)
+		schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, env, databaseName, action.Plan)
 		if err != nil {
 			h.logger.Error("schema request failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)

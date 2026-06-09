@@ -149,7 +149,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 	defer cancel()
 
 	// Discover database config from PR's schemabot.yaml
-	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
+	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.RollbackConfirm)
 	if err != nil {
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.RollbackConfirm, err)
 		return
