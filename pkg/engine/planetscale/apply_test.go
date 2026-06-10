@@ -121,8 +121,8 @@ func TestWaitForDeployRequestPending_HonorsContextCancellation(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	client := &pendingPollClient{number: 9, pollErr: errors.New("unreachable"), pollsBefore: 1_000_000}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
 
 	done := make(chan error, 1)
 	go func() {
@@ -134,9 +134,26 @@ func TestWaitForDeployRequestPending_HonorsContextCancellation(t *testing.T) {
 	select {
 	case err := <-done:
 		require.Error(t, err)
-		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.ErrorIs(t, err, context.Canceled)
 		assert.Contains(t, err.Error(), "deploy request 9")
-	case <-time.After(5 * time.Second):
+		assert.Equal(t, 0, client.getCallCount)
+	case <-time.After(500 * time.Millisecond):
 		t.Fatal("waitForDeployRequestPending did not return after context cancellation")
 	}
+}
+
+// A nil deploy request indicates an upstream caller never created or fetched it;
+// the poll loop surfaces a wrapped error naming the database rather than
+// dereferencing nil.
+func TestWaitForDeployRequestPending_NilDeployRequestIsRejected(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &pendingPollClient{number: 11, pollErr: errors.New("unreachable"), pollsBefore: 1_000_000}
+
+	dr, err := e.waitForDeployRequestPending(t.Context(), client, "org", "testdb", nil)
+
+	require.Error(t, err)
+	assert.Nil(t, dr)
+	assert.Contains(t, err.Error(), "deploy request is nil")
+	assert.Contains(t, err.Error(), "testdb")
+	assert.Equal(t, 0, client.getCallCount)
 }
