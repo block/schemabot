@@ -124,6 +124,11 @@ type Service struct {
 	remoteHealthWg       sync.WaitGroup
 	remoteHealthInterval time.Duration
 
+	// Pending drops cleaner loop management.
+	pendingDropsMu     sync.Mutex
+	pendingDropsCancel context.CancelFunc
+	pendingDropsWg     sync.WaitGroup
+
 	// OnApplyRecovered is called after the operator claims an apply and before
 	// ResumeApply starts the engine/poller. Set by the webhook handler to attach
 	// an observer for PR comments.
@@ -371,6 +376,9 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	}
 	if envConfig.APIURL != "" {
 		metadata["api_url"] = envConfig.APIURL
+	}
+	if !s.config.PendingDropsEnabled() {
+		metadata["pending_drops"] = "false"
 	}
 	client, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  database,

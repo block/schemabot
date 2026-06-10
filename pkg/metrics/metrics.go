@@ -1120,3 +1120,88 @@ func RecordPendingDropMoved(ctx context.Context, database string) {
 		),
 	)
 }
+
+// RecordPendingDropsCleanupDropped increments the counter for expired
+// quarantined tables permanently dropped by the pending drops cleaner.
+func RecordPendingDropsCleanupDropped(ctx context.Context, database, environment string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.pending_drops.cleanup_dropped_total",
+		otelmetric.WithDescription("Total number of expired quarantined tables dropped by the pending drops cleaner"),
+		otelmetric.WithUnit("{table}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create pending drops cleanup dropped counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+			EnvironmentAttribute(environment),
+		),
+	)
+}
+
+// RecordPendingDropsCleanupSkipped increments the counter for quarantined
+// tables the cleaner skipped because their names carry no valid timestamp
+// prefix. A sustained nonzero rate means tables are accumulating that an
+// operator must inspect and remove manually.
+func RecordPendingDropsCleanupSkipped(ctx context.Context, database, environment string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.pending_drops.cleanup_skipped_total",
+		otelmetric.WithDescription("Total number of quarantined tables skipped by the cleaner due to unparseable names"),
+		otelmetric.WithUnit("{table}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create pending drops cleanup skipped counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+			EnvironmentAttribute(environment),
+		),
+	)
+}
+
+// RecordPendingDropsCleanupLockSkipped increments the counter for cleanup
+// passes skipped because another SchemaBot instance owns the per-target
+// advisory lock.
+func RecordPendingDropsCleanupLockSkipped(ctx context.Context, database, environment string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.pending_drops.cleanup_lock_skipped_total",
+		otelmetric.WithDescription("Total number of pending drops cleanup target passes skipped because another instance held the cleanup lock"),
+		otelmetric.WithUnit("{pass}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create pending drops cleanup lock skipped counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+			EnvironmentAttribute(environment),
+		),
+	)
+}
+
+// RecordPendingDropsCleanupError increments the counter for pending drops
+// cleanup failures. Failed targets and tables are retried on the next cleanup
+// pass.
+func RecordPendingDropsCleanupError(ctx context.Context, database, environment, reason string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.pending_drops.cleanup_errors_total",
+		otelmetric.WithDescription("Total number of pending drops cleanup failures"),
+		otelmetric.WithUnit("{error}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create pending drops cleanup errors counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+			EnvironmentAttribute(environment),
+			attribute.String("reason", reason),
+		),
+	)
+}

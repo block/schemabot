@@ -65,3 +65,16 @@ func TestParseTimestampRejectsInvalidNames(t *testing.T) {
 	_, ok := ParseTimestamp("20260610143022123_")
 	assert.True(t, ok)
 }
+
+func TestTargetLockNameIncludesTargetIdentity(t *testing.T) {
+	base := targetLockName(Target{Database: "orders", Environment: "staging"})
+	same := targetLockName(Target{Database: "orders", Environment: "staging"})
+	differentDatabase := targetLockName(Target{Database: "customers", Environment: "staging"})
+	differentEnvironment := targetLockName(Target{Database: "orders", Environment: "production"})
+
+	assert.Equal(t, same, base)
+	assert.NotEqual(t, differentDatabase, base)
+	assert.NotEqual(t, differentEnvironment, base)
+	assert.LessOrEqual(t, len(base), 64)
+	assert.True(t, strings.HasPrefix(base, lockNamePrefix))
+}

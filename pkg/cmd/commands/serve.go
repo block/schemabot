@@ -185,6 +185,11 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	svc.StartRemoteDeploymentHealthMonitor(ctx)
 	defer svc.StopRemoteDeploymentHealthMonitor()
 
+	// Permanently drop expired quarantined tables from local-mode MySQL
+	// databases once their pending drops retention period has passed.
+	svc.StartPendingDropsCleaner(ctx)
+	defer svc.StopPendingDropsCleaner()
+
 	// Configure routes
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
@@ -261,10 +266,15 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 		if err != nil {
 			return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 		}
+		var metadata map[string]string
+		if !config.PendingDropsEnabled() {
+			metadata = map[string]string{"pending_drops": "false"}
+		}
 		localClient, err = tern.NewLocalClient(tern.LocalConfig{
 			Database:  dbName,
 			Type:      dbConfig.Type,
 			TargetDSN: targetDSN,
+			Metadata:  metadata,
 		}, st, logger)
 		if err != nil {
 			return nil, fmt.Errorf("create local client for %s: %w", dbName, err)

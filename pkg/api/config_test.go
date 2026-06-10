@@ -3,15 +3,19 @@ package api
 import (
 	"bytes"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	gomysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -2494,4 +2498,115 @@ repos:
 	require.Contains(t, cfg.Apps, "app-b")
 	assert.Equal(t, "app-a", cfg.Repos["org-a/repo-x"].GitHubApp)
 	assert.Equal(t, "app-b", cfg.Repos["org-b/repo-y"].GitHubApp)
+}
+
+func TestPendingDropsConfig(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+
+	t.Run("enabled by default", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.True(t, cfg.PendingDropsEnabled())
+	})
+
+	t.Run("explicit disable", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{Enabled: boolPtr(false)}}
+		assert.False(t, cfg.PendingDropsEnabled())
+		assert.False(t, cfg.PendingDropsCleanupEnabled())
+	})
+
+	t.Run("cleanup enabled by default", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.True(t, cfg.PendingDropsCleanupEnabled())
+	})
+
+	t.Run("cleanup can be disabled without disabling quarantine", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{CleanupEnabled: boolPtr(false)}}
+		assert.True(t, cfg.PendingDropsEnabled())
+		assert.False(t, cfg.PendingDropsCleanupEnabled())
+	})
+
+	t.Run("default retention", func(t *testing.T) {
+		cfg := ServerConfig{}
+		retention, err := cfg.PendingDropsRetention()
+		require.NoError(t, err)
+		assert.Equal(t, pendingdrops.DefaultRetention, retention)
+	})
+
+	t.Run("custom retention", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{Retention: "48h"}}
+		retention, err := cfg.PendingDropsRetention()
+		require.NoError(t, err)
+		assert.Equal(t, 48*time.Hour, retention)
+	})
+
+	t.Run("invalid retention rejected", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{Retention: "soon"}}
+		_, err := cfg.PendingDropsRetention()
+		assert.ErrorContains(t, err, "pending_drops.retention")
+	})
+
+	t.Run("non-positive retention rejected", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{Retention: "-1h"}}
+		_, err := cfg.PendingDropsRetention()
+		assert.ErrorContains(t, err, "must be positive")
+	})
+
+	t.Run("validate rejects invalid retention", func(t *testing.T) {
+		cfg := ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+			PendingDrops: PendingDropsConfig{Retention: "not-a-duration"},
+		}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "pending_drops.retention")
+	})
+
+	t.Run("validate ignores invalid retention when pending drops disabled", func(t *testing.T) {
+		cfg := ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+			PendingDrops: PendingDropsConfig{Enabled: boolPtr(false), Retention: "not-a-duration"},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+}
+
+func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
+	dsnPath := filepath.Join(t.TempDir(), "target.dsn")
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "file:" + dsnPath},
+				},
+			},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := New(nil, cfg, nil, logger)
+
+	targets, unresolved := svc.pendingDropsTargets(t.Context())
+	assert.Empty(t, targets)
+	assert.Equal(t, 1, unresolved)
+
+	dsn := "root:testpassword@tcp(127.0.0.1:3306)/testdb?timeout=1s"
+	require.NoError(t, os.WriteFile(dsnPath, []byte(dsn), 0o600))
+
+	targets, unresolved = svc.pendingDropsTargets(t.Context())
+	require.Len(t, targets, 1)
+	assert.Equal(t, 0, unresolved)
+	assert.Equal(t, pendingdrops.Target{Database: "mydb", Environment: "staging", DSN: dsn}, targets[0])
 }

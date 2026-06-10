@@ -10,7 +10,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
 	gomysql "github.com/go-sql-driver/mysql"
@@ -130,6 +132,66 @@ type ServerConfig struct {
 	//
 	// Defaults to true (respond to all commands).
 	RespondToUnscoped *bool `yaml:"respond_to_unscoped"`
+
+	// PendingDrops configures the pending drops quarantine for MySQL/Spirit
+	// databases. When enabled (the default), DROP TABLE statements rename the
+	// table into the _pending_drops database instead of dropping it. The
+	// background cleaner can be run by this process or disabled so another
+	// deployment owns permanent cleanup after the retention period.
+	PendingDrops PendingDropsConfig `yaml:"pending_drops,omitempty"`
+}
+
+// PendingDropsConfig configures the pending drops quarantine for MySQL/Spirit
+// databases.
+type PendingDropsConfig struct {
+	// Enabled controls the quarantine.
+	// Defaults to true when not configured (nil = enabled).
+	Enabled *bool `yaml:"enabled"`
+
+	// CleanupEnabled controls whether this server process starts the background
+	// cleaner. Defaults to true when the quarantine is enabled. Set this to false
+	// on frequently redeployed executors when another deployment owns cleanup.
+	CleanupEnabled *bool `yaml:"cleanup_enabled"`
+
+	// Retention is how long quarantined tables are kept before the cleaner
+	// drops them permanently, as a Go duration string (e.g. "168h").
+	// Defaults to 7 days.
+	Retention string `yaml:"retention,omitempty"`
+
+	// DryRun makes the cleaner log the tables it would drop without dropping
+	// them. The quarantine itself is unaffected.
+	DryRun bool `yaml:"dry_run,omitempty"`
+}
+
+// PendingDropsEnabled reports whether the pending drops quarantine is enabled.
+// Defaults to true when not configured.
+func (c *ServerConfig) PendingDropsEnabled() bool {
+	return c.PendingDrops.Enabled == nil || *c.PendingDrops.Enabled
+}
+
+// PendingDropsCleanupEnabled reports whether this process should run the
+// pending drops cleaner. The cleaner never runs when the quarantine is disabled.
+func (c *ServerConfig) PendingDropsCleanupEnabled() bool {
+	if !c.PendingDropsEnabled() {
+		return false
+	}
+	return c.PendingDrops.CleanupEnabled == nil || *c.PendingDrops.CleanupEnabled
+}
+
+// PendingDropsRetention returns the configured retention for quarantined
+// tables, falling back to the default when not configured.
+func (c *ServerConfig) PendingDropsRetention() (time.Duration, error) {
+	if c.PendingDrops.Retention == "" {
+		return pendingdrops.DefaultRetention, nil
+	}
+	d, err := time.ParseDuration(c.PendingDrops.Retention)
+	if err != nil {
+		return 0, fmt.Errorf("parse pending_drops.retention %q: %w", c.PendingDrops.Retention, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("pending_drops.retention must be positive, got %q", c.PendingDrops.Retention)
+	}
+	return d, nil
 }
 
 // GitHubConfig configures the GitHub App used for webhook-driven schema changes.
@@ -507,6 +569,11 @@ func (c *ServerConfig) Validate() error {
 	}
 	if err := c.validateGitHubAppsConfig(); err != nil {
 		return err
+	}
+	if c.PendingDropsEnabled() {
+		if _, err := c.PendingDropsRetention(); err != nil {
+			return err
+		}
 	}
 
 	// Validate Databases if present. An environment is either local mode
