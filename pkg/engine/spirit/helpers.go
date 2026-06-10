@@ -3,6 +3,7 @@ package spirit
 import (
 	"database/sql"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn"
@@ -12,6 +13,8 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/schema"
 )
+
+var lookupCNAME = net.LookupCNAME
 
 // parseDSN extracts connection info from a MySQL DSN using the mysql driver's parser.
 func parseDSN(dsn string) (host, username, password, database string, err error) {
@@ -39,16 +42,40 @@ func mysqlConnectionDSN(dsn string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse DSN: %w", err)
 	}
-	if cfg.TLSConfig != "" || !dbconn.IsRDSHost(cfg.Addr) {
+	if cfg.TLSConfig != "" {
+		return dsn, nil
+	}
+	tlsMode, ok := mysqlTLSModeForHost(cfg.Addr)
+	if !ok {
 		return dsn, nil
 	}
 	dbConfig := dbconn.NewDBConfig()
-	dbConfig.TLSMode = "REQUIRED"
+	dbConfig.TLSMode = tlsMode
 	connectionDSN, err := dbconn.EnhanceDSNWithTLS(dsn, dbConfig)
 	if err != nil {
 		return "", fmt.Errorf("enhance RDS DSN with TLS: %w", err)
 	}
 	return connectionDSN, nil
+}
+
+func mysqlTLSModeForHost(addr string) (string, bool) {
+	if dbconn.IsRDSHost(addr) {
+		return "REQUIRED", true
+	}
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	canonicalHost, err := lookupCNAME(host)
+	if err != nil {
+		return "", false
+	}
+	canonicalHost = strings.TrimSuffix(canonicalHost, ".")
+	if !dbconn.IsRDSHost(canonicalHost) {
+		return "", false
+	}
+	return "VERIFY_CA", true
 }
 
 // namespaceForTable finds which namespace a table belongs to by checking
