@@ -1038,3 +1038,59 @@ func TestRecoveringProtoConversion(t *testing.T) {
 	assert.Equal(t, ternv1.State_STATE_RECOVERING, storageStateToProto("recovering_cutover"))
 	assert.Equal(t, state.Apply.Recovering, ProtoStateToStorage(ternv1.State_STATE_RECOVERING))
 }
+
+// dsnLogAttrs describes a target DSN for logging using only the network address
+// and database name. The DSN password — even one containing reserved characters
+// like '/', '@', and ':' — must never appear in the emitted attributes, and the
+// host and database must be reported so operators can trace the target.
+func TestDSNLogAttrs(t *testing.T) {
+	const password = "p:a/ss@w:rd/with@special"
+	dsn := "appuser:" + password + "@tcp(db.example.internal:3306)/orders?parseTime=true"
+
+	attrs := dsnLogAttrs(dsn)
+
+	for _, a := range attrs {
+		if s, ok := a.(string); ok {
+			assert.NotContains(t, s, password, "log attribute must not contain the DSN password")
+		}
+	}
+
+	values := attrValues(t, attrs)
+	assert.Equal(t, "db.example.internal:3306", values["target_addr"])
+	assert.Equal(t, "orders", values["target_db"])
+	assert.NotContains(t, values, "target_dsn_prefix", "raw DSN prefix must not be logged")
+}
+
+// dsnLogAttrs records that parsing failed without echoing any part of an
+// unparseable DSN, so a malformed credential-bearing string never reaches logs.
+func TestDSNLogAttrsUnparseable(t *testing.T) {
+	const password = "secretpw"
+	// Missing the slash before the database name makes ParseDSN fail.
+	dsn := "appuser:" + password + "@tcp(db.example.internal:3306)"
+
+	attrs := dsnLogAttrs(dsn)
+
+	for _, a := range attrs {
+		if s, ok := a.(string); ok {
+			assert.NotContains(t, s, password, "failed-parse log attribute must not contain the DSN password")
+		}
+	}
+
+	values := attrValues(t, attrs)
+	assert.Equal(t, false, values["target_dsn_parsed"])
+	assert.NotContains(t, values, "target_addr")
+}
+
+// attrValues converts a flat slog key/value attribute slice into a map keyed by
+// attribute name for assertions.
+func attrValues(t *testing.T, attrs []any) map[string]any {
+	t.Helper()
+	require.Equal(t, 0, len(attrs)%2, "attributes must form key/value pairs")
+	values := make(map[string]any, len(attrs)/2)
+	for i := 0; i+1 < len(attrs); i += 2 {
+		key, ok := attrs[i].(string)
+		require.True(t, ok, "attribute key must be a string")
+		values[key] = attrs[i+1]
+	}
+	return values
+}

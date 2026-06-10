@@ -94,6 +94,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -280,11 +281,10 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 
 	creds := c.credentials()
 
-	c.logger.Info("LocalClient.Plan: calling engine",
-		"database", c.config.Database,
-		"target_dsn_prefix", c.config.TargetDSN[:min(len(c.config.TargetDSN), 40)],
-		"schema_file_count", len(schemaFiles),
-	)
+	planLogAttrs := []any{"database", c.config.Database}
+	planLogAttrs = append(planLogAttrs, dsnLogAttrs(c.config.TargetDSN)...)
+	planLogAttrs = append(planLogAttrs, "schema_file_count", len(schemaFiles))
+	c.logger.Info("LocalClient.Plan: calling engine", planLogAttrs...)
 
 	result, err := eng.Plan(ctx, &engine.PlanRequest{
 		Database:     c.config.Database,
@@ -1197,4 +1197,21 @@ func ensureMetadata(m map[string]string) map[string]string {
 		return make(map[string]string)
 	}
 	return m
+}
+
+// dsnLogAttrs returns slog key/value attributes describing a target DSN using
+// only non-sensitive fields (network address and database name). The DSN
+// password and raw DSN string are never included, so these attributes are safe
+// to emit in logs. If the DSN cannot be parsed, the attributes record that
+// parsing failed without echoing any part of the DSN, since a parse error
+// message can contain fragments of the credential-bearing string.
+func dsnLogAttrs(dsn string) []any {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return []any{"target_dsn_parsed", false}
+	}
+	return []any{
+		"target_addr", cfg.Addr,
+		"target_db", cfg.DBName,
+	}
 }
