@@ -626,6 +626,94 @@ func TestLocalClient_Apply(t *testing.T) {
 	assert.Equal(t, 1, columnCount, "expected email column to exist, got count %d", columnCount)
 }
 
+// An apply created via the Tern client must carry exactly one apply_operations
+// row, and every task must link to it via ApplyOperationID. The operator claim
+// loop selects work exclusively from apply_operations, and the engine
+// resume-state path requires a non-nil ApplyOperationID, so an apply without
+// this child row would never start, recover, or persist resume state.
+func TestLocalClient_Apply_WritesApplyOperationRow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "failed to open database")
+	defer utils.CloseAndLog(db)
+
+	_, err = db.ExecContext(ctx, "CREATE TABLE users (id INT PRIMARY KEY)")
+	require.NoError(t, err, "failed to create table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err, "failed to create client")
+	defer utils.CloseAndLog(client)
+
+	schemaFiles := buildSchemaWithAllTables(t, dsn, map[string]string{
+		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+	})
+
+	planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
+		Type:     "mysql",
+		Database: "testdb",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"default": {Files: schemaFiles},
+		},
+	})
+	require.NoError(t, err, "Plan() returned error")
+	require.NotEmpty(t, planResp.PlanId, "expected plan_id but got empty string")
+
+	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      planResp.PlanId,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err, "Apply() returned error")
+	require.True(t, applyResp.Accepted, "expected apply to be accepted, got error: %s", applyResp.ErrorMessage)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyResp.ApplyId)
+	require.NoError(t, err, "lookup apply by identifier")
+	require.NotNil(t, apply, "apply should exist in storage")
+
+	operations, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err, "list apply operations")
+	require.Len(t, operations, 1, "exactly one apply_operations row must be written per apply")
+
+	op := operations[0]
+	assert.Equal(t, apply.ID, op.ApplyID, "operation must reference the apply")
+	assert.Equal(t, "testdb", op.Deployment, "operation deployment must mirror the apply deployment")
+	assert.Equal(t, "testdb", op.Target, "operation target must mirror the resolved plan target")
+	assert.Equal(t, state.ApplyOperation.Pending, op.State, "operation must start pending")
+
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err, "list tasks for apply")
+	require.NotEmpty(t, tasks, "apply must have at least one task")
+	for _, task := range tasks {
+		require.NotNil(t, task.ApplyOperationID, "task %s must link to the apply_operations row", task.TaskIdentifier)
+		assert.Equal(t, op.ID, *task.ApplyOperationID, "task %s must reference the apply's operation row", task.TaskIdentifier)
+	}
+
+	// The apply still runs to completion against the real Spirit engine with the
+	// operation row present (the sequential path is unaffected by the linkage).
+	waitForApplyComplete(t, client, ctx, applyResp.ApplyId)
+
+	var columnCount int
+	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'users' AND COLUMN_NAME = 'email'").Scan(&columnCount)
+	require.NoError(t, err, "query columns")
+	assert.Equal(t, 1, columnCount, "expected email column to exist, got count %d", columnCount)
+}
+
 // TestLocalClient_Progress verifies that progress is scoped to a concrete apply
 // and returns the stored task details for that apply.
 func TestLocalClient_Progress(t *testing.T) {

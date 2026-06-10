@@ -538,7 +538,21 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	optionsJSON := storage.MarshalApplyOptions(applyOpts)
 
-	// Create Apply record first (1 Apply -> N Tasks)
+	// Create VSchema tasks for namespaces with VSchema changes so the
+	// progress API and TUI can track VSchema application alongside DDL.
+	// For VSchema-only deploys (0 DDL changes), this gives the progress API
+	// something to track.
+	for ns, nsData := range plan.Namespaces {
+		if len(nsData.VSchema) > 0 {
+			ddlChanges = append(ddlChanges, storage.TableChange{
+				Table:     "VSchema: " + ns,
+				Namespace: ns,
+				Operation: "vschema_update",
+			})
+		}
+	}
+
+	// Build the Apply record (1 Apply -> N Tasks).
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 	apply := &storage.Apply{
 		ApplyIdentifier: applyIdentifier,
@@ -556,19 +570,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
-	applyID, err := c.storage.Applies().Create(ctx, apply)
-	if err != nil {
-		return nil, fmt.Errorf("create apply: %w", err)
-	}
-	apply.ID = applyID
 
-	// Log apply started
-	c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Apply started: %s", applyIdentifier), "", state.Apply.Pending)
-
-	// Create one Task per DDLChange in the plan.
-	// For VSchema-only deploys (0 DDL changes), create a synthetic task per
-	// keyspace with VSchema changes so the progress API has something to track.
 	c.logger.Info("Apply: creating tasks",
 		"plan_id", plan.PlanIdentifier,
 		"ddl_change_count", len(ddlChanges),
@@ -581,24 +583,11 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		)
 	}
 
-	// Create VSchema tasks for namespaces with VSchema changes so the
-	// progress API and TUI can track VSchema application alongside DDL.
-	for ns, nsData := range plan.Namespaces {
-		if len(nsData.VSchema) > 0 {
-			ddlChanges = append(ddlChanges, storage.TableChange{
-				Table:     "VSchema: " + ns,
-				Namespace: ns,
-				Operation: "vschema_update",
-			})
-		}
-	}
-
 	tasks := make([]*storage.Task, len(ddlChanges))
 	for i, ddlChange := range ddlChanges {
 		taskIdentifier := "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 		tasks[i] = &storage.Task{
 			TaskIdentifier: taskIdentifier,
-			ApplyID:        applyID,
 			PlanID:         plan.ID,
 			Database:       plan.Database,
 			DatabaseType:   plan.DatabaseType,
@@ -615,12 +604,30 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
-		taskID, err := c.storage.Tasks().Create(ctx, tasks[i])
-		if err != nil {
-			return nil, fmt.Errorf("create task for table %s: %w", ddlChange.Table, err)
-		}
-		tasks[i].ID = taskID
 	}
+
+	// Dual-write one apply_operations row alongside the applies row in the
+	// same transaction so every apply created via the Tern client carries a
+	// claimable, resumable operation. CreateWithTasksAndOperations links each
+	// task to the single operation via ApplyOperationID, which the engine
+	// resume-state path requires and the operator claim loop selects on.
+	operations := []*storage.ApplyOperation{{
+		Deployment: apply.Deployment,
+		Target:     plan.Target,
+		State:      state.ApplyOperation.Pending,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}}
+
+	applyID, err := c.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+	if err != nil {
+		return nil, fmt.Errorf("create apply %s with tasks and operations: %w", applyIdentifier, err)
+	}
+	apply.ID = applyID
+
+	// Log apply started
+	c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Apply started: %s", applyIdentifier), "", state.Apply.Pending)
 
 	// Direct client calls can still register a pending observer before starting
 	// the engine. API-created applies use the service-level observer registry
