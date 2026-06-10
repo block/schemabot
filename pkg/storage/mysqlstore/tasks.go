@@ -156,6 +156,26 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 	return scanTasks(rows)
 }
 
+// GetByApplyOperationID returns the tasks for a single apply_operation (one
+// deployment of a multi-deployment apply). While the config layer hard-blocks
+// more than one deployment per environment this returns the same rows as
+// GetByApplyID for the apply's single operation; it lets a worker drive and
+// reconcile one deployment independently once an apply fans out across several.
+func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*storage.Task, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+taskColumns+`
+		FROM `+"`tasks`"+` FORCE INDEX (`+"`idx_apply_operation_id`"+`)
+		WHERE `+"`apply_operation_id`"+` = ?
+		ORDER BY `+"`created_at`"+` DESC
+	`, applyOperationID)
+	if err != nil {
+		return nil, fmt.Errorf("query tasks for apply_operation %d: %w", applyOperationID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanTasks(rows)
+}
+
 // GetByDatabase returns all tasks for a database.
 // Results are ordered by created_at DESC, then by id DESC as a tiebreaker
 // (since created_at only has second precision).

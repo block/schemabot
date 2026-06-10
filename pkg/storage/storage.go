@@ -308,6 +308,11 @@ type TaskStore interface {
 	// Used for aggregating task states to derive Apply state.
 	GetByApplyID(ctx context.Context, applyID int64) ([]*Task, error)
 
+	// GetByApplyOperationID returns the tasks for a single apply_operation
+	// (one deployment of a multi-deployment apply). Used to drive and
+	// reconcile one operation independently of its sibling deployments.
+	GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*Task, error)
+
 	// GetByDatabase returns all tasks for a database.
 	GetByDatabase(ctx context.Context, database string) ([]*Task, error)
 
