@@ -262,8 +262,10 @@ func isTerminalProtoState(ps ternv1.State) bool {
 func protoToSchemaFiles(sf map[string]*ternv1.SchemaFiles) schema.SchemaFiles {
 	result := make(schema.SchemaFiles, len(sf))
 	for ns, ksFiles := range sf {
-		files := make(map[string]string, len(ksFiles.Files))
-		maps.Copy(files, ksFiles.Files)
+		// A nil namespace value yields an empty Files map; GetFiles is nil-safe.
+		nsFiles := ksFiles.GetFiles()
+		files := make(map[string]string, len(nsFiles))
+		maps.Copy(files, nsFiles)
 		result[ns] = &schema.Namespace{Files: files}
 	}
 	return result

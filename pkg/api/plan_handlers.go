@@ -670,19 +670,27 @@ func (s *Service) ExecuteRollbackPlan(ctx context.Context, database, environment
 	return planResponseFromProto(resp), nil
 }
 
-// validateSchemaFiles checks that schema_files has at least one namespace.
-// An empty Files map within a namespace is valid (signals "drop all tables"),
-// so we only reject when schema_files itself is missing.
+// validateSchemaFiles checks that schema_files has at least one namespace and
+// that every namespace carries a non-null value. An empty Files map within a
+// namespace is valid (signals "drop all tables"), so we only reject when
+// schema_files itself is missing or a namespace value is null.
 //
-// Returns a warning message if any namespace has empty files (could indicate
-// a JSON field name bug like "sql_files" instead of "files"). Callers should
-// log this but not reject the request.
+// A null namespace value (e.g. JSON `{"default": null}`) is rejected as a hard
+// error: it cannot be converted to schema files and is almost always a
+// malformed request.
+//
+// Returns a warning message if any namespace has an empty (but non-null) files
+// map (could indicate a JSON field name bug like "sql_files" instead of
+// "files"). Callers should log this but not reject the request.
 func validateSchemaFiles(schemaFiles map[string]*ternv1.SchemaFiles) (warning string, err error) {
 	if len(schemaFiles) == 0 {
 		return "", fmt.Errorf("schema_files is required: must contain at least one namespace (JSON field for files is \"files\", not \"sql_files\")")
 	}
 	for ns, sf := range schemaFiles {
-		if sf == nil || len(sf.GetFiles()) == 0 {
+		if sf == nil {
+			return "", fmt.Errorf("schema_files[%q] is null: each namespace must be an object with a \"files\" map", ns)
+		}
+		if len(sf.GetFiles()) == 0 {
 			warning = fmt.Sprintf("schema_files[%q] has no files — if this is unintentional, check that the JSON field is \"files\" (not \"sql_files\")", ns)
 		}
 	}

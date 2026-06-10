@@ -980,6 +980,31 @@ func TestPlanHandlerRejectsClientSuppliedSchemaPath(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "schema_path")
 }
 
+// A null namespace value (JSON `{"default": null}`) is rejected with a clear
+// 400 instead of panicking the request goroutine in schema-files conversion.
+func TestPlanHandlerRejectsNullSchemaFilesNamespace(t *testing.T) {
+	svc := newTestService()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	body := `{
+		"database": "payments",
+		"environment": "staging",
+		"type": "mysql",
+		"schema_files": {"default": null}
+	}`
+	req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/plan", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var resp apitypes.ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Contains(t, resp.Error, `schema_files["default"] is null`)
+}
+
 func TestPlanHandlerSourcePolicyAllowsDirectSource(t *testing.T) {
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
