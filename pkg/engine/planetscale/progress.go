@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -335,7 +336,7 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 			DDLAction:        colMap["ddl_action"],
 			IsImmediate:      colMap["is_immediate_operation"] == "1",
 		}
-		if v, err := strconv.Atoi(colMap["progress"]); err != nil && colMap["progress"] != "" {
+		if v, err := parseProgressPercent(colMap["progress"]); err != nil {
 			e.logger.Debug("parse vitess_migrations field", "field", "progress", "value", colMap["progress"], "error", err)
 		} else {
 			row.Progress = v
@@ -377,6 +378,24 @@ func validateMigrationContext(s string) error {
 		return fmt.Errorf("invalid context: contains unsafe characters")
 	}
 	return nil
+}
+
+// parseProgressPercent parses the Vitess schema_migrations.progress column,
+// which is a float percentage (e.g. "54.35"), rounds it to the nearest int,
+// and clamps the result to [0, 100].
+func parseProgressPercent(s string) (int, error) {
+	if s == "" {
+		return 0, nil
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse progress percent %q: %w", s, err)
+	}
+	pct := int(math.Round(f))
+	if pct < 0 {
+		return 0, nil
+	}
+	return min(pct, 100), nil
 }
 
 func parseInt64(s string) (int64, error) {
@@ -477,7 +496,7 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 				shardState = state.Vitess.ReadyToComplete
 			}
 
-			shardPct := sh.progress
+			shardPct := min(sh.progress, 100)
 			shardCopied := sh.rowsCopied
 			// When a shard is ready for cutover, the copy phase is complete.
 			// Clamp to 100% since Vitess row counts can lag behind slightly.
@@ -504,7 +523,9 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 		}
 
 		if tblTableRows > 0 {
-			tblProgress = int(tblRowsCopied * 100 / tblTableRows)
+			// rows_copied can momentarily exceed table_rows (concurrent inserts
+			// during copy), so clamp to 100.
+			tblProgress = min(int(tblRowsCopied*100/tblTableRows), 100)
 		} else if tableState == state.Vitess.Complete || tableState == state.Vitess.ReadyToComplete {
 			tblProgress = 100
 		}
@@ -535,7 +556,7 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 
 	overallProgress := 0
 	if totalTableRows > 0 {
-		overallProgress = int(totalRowsCopied * 100 / totalTableRows)
+		overallProgress = min(int(totalRowsCopied*100/totalTableRows), 100)
 	} else if len(tables) > 0 {
 		allDone := true
 		for _, t := range tables {

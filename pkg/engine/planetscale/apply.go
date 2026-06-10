@@ -24,6 +24,13 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
+// noChangesApplyResult builds the result for a converged apply where the deploy
+// request reported no schema differences. It must be Accepted so the tern layer
+// completes the apply's tasks instead of treating the no-op as a failure.
+func noChangesApplyResult(message string) *engine.ApplyResult {
+	return &engine.ApplyResult{Accepted: true, Message: message}
+}
+
 // Apply starts executing a schema change plan.
 // Creates a PlanetScale branch, applies DDL via MySQL connection to the branch,
 // then creates and starts a deploy request.
@@ -278,7 +285,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 			Message:  fmt.Sprintf("Deploy request #%d: no changes detected", dr.Number),
 			Metadata: map[string]string{"deploy_request_id": fmt.Sprintf("%d", dr.Number)},
 		})
-		return &engine.ApplyResult{Message: "no changes detected"}, nil
+		return noChangesApplyResult("no changes detected"), nil
 	}
 
 	// Determine instant DDL eligibility. Prefer instant when PlanetScale reports
@@ -807,7 +814,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("deploy request #%d failed on resume (state: %s)", dr.Number, dr.DeploymentState)
 	}
 	if dr.DeploymentState == deployState.NoChanges {
-		return &engine.ApplyResult{Message: "no changes detected on resume"}, nil
+		return noChangesApplyResult("no changes detected on resume"), nil
 	}
 
 	// Deploy — prefer instant when eligible (no row copy, no revert window needed).

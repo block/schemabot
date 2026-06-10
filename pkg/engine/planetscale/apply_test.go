@@ -27,6 +27,19 @@ func (c *permanentVSchemaErrorClient) UpdateKeyspaceVSchema(context.Context, *ps
 	return nil, &ps.Error{Code: ps.ErrInvalid}
 }
 
+// A schema that is already converged produces a deploy request with no
+// differences. The apply must be accepted so the orchestrator completes the
+// change's tasks normally rather than reporting a spurious failure.
+func TestNoChangesApplyResultIsAccepted(t *testing.T) {
+	fresh := noChangesApplyResult("no changes detected")
+	assert.True(t, fresh.Accepted)
+	assert.Equal(t, "no changes detected", fresh.Message)
+
+	resume := noChangesApplyResult("no changes detected on resume")
+	assert.True(t, resume.Accepted)
+	assert.Equal(t, "no changes detected on resume", resume.Message)
+}
+
 func TestApply_MainBranchReuseIsPermanent(t *testing.T) {
 	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)), func(_, _ string) (psclient.PSClient, error) {
 		return nil, nil

@@ -142,6 +142,58 @@ func TestAggregateShardProgress(t *testing.T) {
 		assert.Equal(t, 50, tables[0].Shards[1].Progress)
 		assert.Equal(t, int64(5000), tables[0].Shards[1].RowsCopied)
 	})
+
+	t.Run("rows_copied exceeding table_rows clamps to 100%", func(t *testing.T) {
+		// While a shard is still copying, rows_copied can momentarily exceed the
+		// estimated table_rows because of concurrent inserts. Table and overall
+		// progress must never exceed 100%.
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-", Table: "orders", Status: "running", Progress: 99, RowsCopied: 12000, TableRows: 10000},
+		}
+
+		tables, overall := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.Running, tables[0].State)
+		assert.Equal(t, 100, tables[0].Progress)
+		assert.Equal(t, 100, overall)
+	})
+}
+
+func TestParseProgressPercent(t *testing.T) {
+	t.Run("fractional value rounds to nearest int", func(t *testing.T) {
+		pct, err := parseProgressPercent("54.35")
+		require.NoError(t, err)
+		assert.Equal(t, 54, pct)
+	})
+
+	t.Run("rounds half up", func(t *testing.T) {
+		pct, err := parseProgressPercent("54.5")
+		require.NoError(t, err)
+		assert.Equal(t, 55, pct)
+	})
+
+	t.Run("empty value is zero", func(t *testing.T) {
+		pct, err := parseProgressPercent("")
+		require.NoError(t, err)
+		assert.Equal(t, 0, pct)
+	})
+
+	t.Run("clamps above 100", func(t *testing.T) {
+		pct, err := parseProgressPercent("101.7")
+		require.NoError(t, err)
+		assert.Equal(t, 100, pct)
+	})
+
+	t.Run("clamps below 0", func(t *testing.T) {
+		pct, err := parseProgressPercent("-3.2")
+		require.NoError(t, err)
+		assert.Equal(t, 0, pct)
+	})
+
+	t.Run("non-numeric value errors", func(t *testing.T) {
+		_, err := parseProgressPercent("notanumber")
+		require.Error(t, err)
+	})
 }
 
 func TestValidateMigrationContext(t *testing.T) {
