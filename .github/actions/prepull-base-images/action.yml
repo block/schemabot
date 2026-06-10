@@ -1,0 +1,54 @@
+name: "Pre-pull base images"
+description: >-
+  Pre-pull the Docker Hub base images that E2E image builds depend on, with
+  bounded retry and backoff. Warming the local image cache before
+  `docker compose up --build` / `docker build` means the subsequent build
+  resolves base images locally instead of issuing live Docker Hub pulls
+  mid-build, where unauthenticated rate-limit timeouts and the buildx progress
+  race ("read |0: file already closed") surface.
+
+inputs:
+  images:
+    description: "Space- or newline-separated list of base images to pull."
+    required: false
+    default: |
+      alpine:3.19
+      mysql:8.0
+  attempts:
+    description: "Maximum pull attempts per image."
+    required: false
+    default: "5"
+
+runs:
+  using: "composite"
+  steps:
+    - name: "Pull base images with retry"
+      shell: bash
+      env:
+        IMAGES: ${{ inputs.images }}
+        ATTEMPTS: ${{ inputs.attempts }}
+      run: |
+        set -euo pipefail
+
+        pull_with_retry() {
+          local image="$1"
+          local delay=5
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            if docker pull "$image"; then
+              echo "Pulled $image (attempt $attempt)"
+              return 0
+            fi
+            if [ "$attempt" -lt "$ATTEMPTS" ]; then
+              echo "::warning::Failed to pull $image (attempt $attempt/$ATTEMPTS); retrying in ${delay}s"
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+          done
+          echo "::error::Failed to pull $image after $ATTEMPTS attempts"
+          return 1
+        }
+
+        for image in $IMAGES; do
+          [ -n "$image" ] || continue
+          pull_with_retry "$image"
+        done

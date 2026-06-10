@@ -209,6 +209,8 @@ jobs:
             ~/.cache/go-build
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - name: "Pre-pull base images"
+        uses: ./.github/actions/prepull-base-images
       - name: "Test"
         run: make test-e2e-mysql test-e2e-grpc
       - name: "Container logs on failure"
@@ -262,6 +264,8 @@ jobs:
             ~/.cache/go-build
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - name: "Pre-pull base images"
+        uses: ./.github/actions/prepull-base-images
       - name: "Test"
         run: |
           echo "Vitess e2e shard ${{ matrix.shard }}: ${{ matrix.run_filter }}"
@@ -302,6 +306,30 @@ jobs:
           CGO_ENABLED=0 GOOS=linux go build -o bin/schemabot-linux ./pkg/cmd
           cp bin/schemabot-linux deploy/local/schemabot-dev
           eval $(minikube docker-env)
+
+          # Warm minikube's image cache before the build and before kubelet
+          # pulls mysql:8.0 for the MySQL pods. Pulling here (with retry) keeps
+          # the unauthenticated Docker Hub rate-limit timeouts off the build and
+          # deploy critical path.
+          pull_with_retry() {
+            local image="$1"
+            local delay=5
+            for attempt in 1 2 3 4 5; do
+              if docker pull "$image"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 5 ]; then
+                echo "::warning::Failed to pull $image (attempt $attempt/5); retrying in ${delay}s"
+                sleep "$delay"
+                delay=$((delay * 2))
+              fi
+            done
+            echo "::error::Failed to pull $image after 5 attempts"
+            return 1
+          }
+          pull_with_retry alpine:3.19
+          pull_with_retry mysql:8.0
+
           docker build -t schemabot:test -f deploy/local/Dockerfile.dev deploy/local/
           rm -f deploy/local/schemabot-dev
       - name: "Deploy and test"
