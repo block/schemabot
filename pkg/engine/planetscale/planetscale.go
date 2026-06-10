@@ -423,6 +423,10 @@ const (
 	// backoff (20s, 40s, 60s, 60s) this gives ~3 minutes of total
 	// wait time before failing.
 	maxSnapshotRetries = 5
+
+	// deployRequestPollInterval is how long to wait between polls while a deploy
+	// request is pending PlanetScale's asynchronous schema diff computation.
+	deployRequestPollInterval = 500 * time.Millisecond
 )
 
 // deployState is a shorthand alias for PlanetScale deploy request state constants.

@@ -254,16 +254,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		DeployRequestID:  dr.Number,
 		DeployRequestURL: dr.HtmlURL,
 	})
-	for dr.DeploymentState == deployState.Pending {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("context cancelled waiting for deploy request: %w", ctx.Err())
-		case <-time.After(500 * time.Millisecond):
-		}
-		dr, err = e.getDeployRequest(ctx, client, org, req.Database, dr.Number)
-		if err != nil {
-			return nil, fmt.Errorf("poll deploy request %d: %w", dr.Number, err)
-		}
+	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
+	if err != nil {
+		return nil, err
 	}
 	if dr.DeploymentState == deployState.Error {
 		errMsg := formatDeployRequestError(dr)
@@ -796,12 +789,9 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request on resume: %w", err)
 	}
-	for dr.DeploymentState == deployState.Pending {
-		time.Sleep(500 * time.Millisecond)
-		dr, err = e.getDeployRequest(ctx, client, org, req.Database, dr.Number)
-		if err != nil {
-			return nil, fmt.Errorf("poll deploy request %d on resume: %w", dr.Number, err)
-		}
+	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
+	if err != nil {
+		return nil, fmt.Errorf("wait for deploy request on resume: %w", err)
 	}
 	if dr.DeploymentState == deployState.Error {
 		return nil, fmt.Errorf("deploy request #%d failed on resume (state: %s)", dr.Number, dr.DeploymentState)

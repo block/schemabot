@@ -518,3 +518,25 @@ func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient,
 		Number:       number,
 	})
 }
+
+// waitForDeployRequestPending polls a deploy request until PlanetScale finishes
+// computing its schema diff and transitions it out of the pending state. The
+// deploy request number is held in a local so a transient poll error never
+// dereferences a nil deploy request, and the poll honors context cancellation so
+// a deploy stuck in pending does not block indefinitely.
+func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclient.PSClient, org, database string, dr *ps.DeployRequest) (*ps.DeployRequest, error) {
+	number := dr.Number
+	for dr.DeploymentState == deployState.Pending {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled waiting for deploy request %d: %w", number, ctx.Err())
+		case <-time.After(deployRequestPollInterval):
+		}
+		next, err := e.getDeployRequest(ctx, client, org, database, number)
+		if err != nil {
+			return nil, fmt.Errorf("poll deploy request %d: %w", number, err)
+		}
+		dr = next
+	}
+	return dr, nil
+}
