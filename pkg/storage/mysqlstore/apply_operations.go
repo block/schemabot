@@ -407,6 +407,16 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // staleness window) are re-leased without changing their state. Terminal
 // rows are never claimed.
 //
+// Sibling ordering: a pending row is only claimable once every earlier
+// sibling of the same apply (lower created_at, id) has reached completed.
+// This serializes a multi-deployment apply along its deployment_order — the
+// order materialized by the apply-create dual-write into row insertion order
+// — and halts the rollout on the first non-completed sibling (e.g. a failed
+// deployment), since any earlier non-completed row blocks every later one.
+// The gate applies only to starting a pending row; an already-active row
+// re-leasing a stale heartbeat is recovering work it already started, so it
+// is never re-gated.
+//
 // Mirrors ApplyStore.FindNextApply: SELECT ... FOR UPDATE SKIP LOCKED to
 // avoid worker races, READ COMMITTED isolation to prevent next-key range
 // locks from serializing claims across otherwise independent rows.
@@ -424,14 +434,23 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
 
-	queryArgs := []any{state.ApplyOperation.Pending}
+	queryArgs := []any{state.ApplyOperation.Pending, state.ApplyOperation.Completed}
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
 		WHERE (
-			state = ?
+			(
+				state = ?
+				AND NOT EXISTS (
+					SELECT 1
+					FROM apply_operations AS earlier
+					WHERE earlier.apply_id = apply_operations.apply_id
+						AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
+						AND earlier.state <> ?
+				)
+			)
 			OR (state IN (%s) AND updated_at < NOW() - INTERVAL %s)
 		)
 		ORDER BY created_at, id
