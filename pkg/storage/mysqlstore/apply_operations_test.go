@@ -690,6 +690,81 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsTerminal(t *testing.T) 
 	assert.Nil(t, claimed, "terminal rows must never be re-claimed (full vocabulary)")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingStart
+// verifies stop/start parity with ApplyStore.FindNextApply: a stopped operation
+// whose parent apply has a pending start request is reclaimable so the operator
+// can resume it. Without this, a stopped operation would strand the apply's
+// start request under the operation-claim path. The re-claim keeps the row's
+// stopped state (the resume drive transitions it) and refreshes the heartbeat.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingStart(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_stopped_start", 1, state.Apply.Stopped, "staging")
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Stopped,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "stopped operation with a pending start request must be reclaimable")
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Stopped, claimed.State, "re-claim must keep the stopped state for the resume drive to transition")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.Stopped, persisted.State)
+	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithCompletedStart
+// verifies the claim predicate filters on a *pending* start request: once the
+// start request is no longer pending, the stopped operation is terminal again
+// and must not be re-claimed.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithCompletedStart(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_stopped_done", 1, state.Apply.Stopped, "staging")
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Stopped,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+	// Move the start request out of pending; the stopped row is terminal again.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_control_requests SET status = ? WHERE apply_id = ? AND operation = ?
+	`, storage.ControlRequestCompleted, apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "stopped operation must not be reclaimed once its start request is no longer pending")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims verifies
 // the SKIP LOCKED contract on a contended row: N workers race to claim a
 // single pending child row, and exactly one wins. Mirrors the apply-level

@@ -436,7 +436,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 
 	queryArgs := []any{state.ApplyOperation.Pending, state.ApplyOperation.Completed}
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.Stopped,
+		storage.ControlOperationStart, storage.ControlRequestPending)
 
+	// The stopped-row clause mirrors ApplyStore.FindNextApply: a stopped
+	// operation whose parent apply has a pending start request is reclaimable
+	// so the operator can resume it. Like the stale-active clause, it carries
+	// no deployment-order gate — a stopped row already ran, so resuming it is
+	// recovering work it started rather than starting a new deployment.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -452,6 +460,16 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 				)
 			)
 			OR (state IN (%s) AND updated_at < NOW() - INTERVAL %s)
+			OR (
+				state = ?
+				AND EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation = ?
+						AND cr.status = ?
+				)
+			)
 		)
 		ORDER BY created_at, id
 		LIMIT 1
@@ -487,7 +505,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 			return nil, nil
 		}
 	} else {
-		// Already-active stale row: just refresh the heartbeat as our lease.
+		// Re-leasing a row that already started: a stale active heartbeat, or a
+		// stopped operation whose parent apply has a pending start request. Both
+		// keep their current state and are driven by the caller, so just refresh
+		// the heartbeat as our lease.
 		_, err = tx.ExecContext(ctx, `
 			UPDATE apply_operations SET updated_at = NOW() WHERE id = ?
 		`, ad.ID)
