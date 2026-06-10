@@ -650,6 +650,9 @@ func (c *ServerConfig) Validate() error {
 			return fmt.Errorf("database %q has no environments configured", name)
 		}
 		for env, envConfig := range dbConfig.Environments {
+			if err := envConfig.validateRevertWindowDuration(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
+				return err
+			}
 			hasDSN := envConfig.HasLocalDSN()
 			hasScalarRouting := envConfig.Target != "" || envConfig.Deployment != ""
 			hasMapRouting := envConfig.Deployments != nil
@@ -1350,6 +1353,20 @@ func (c EnvironmentConfig) ResolveDSN() (string, error) {
 		return c.DSNFrom.Resolve()
 	}
 	return secrets.Resolve(c.DSN, "")
+}
+
+// validateRevertWindowDuration ensures a configured revert window parses as a
+// Go duration. An empty value means "use the engine default"; only a non-empty
+// unparseable value is rejected so a typo fails closed at config load instead of
+// silently reverting to the default window.
+func (c EnvironmentConfig) validateRevertWindowDuration(context string) error {
+	if c.RevertWindowDuration == "" {
+		return nil
+	}
+	if _, err := time.ParseDuration(c.RevertWindowDuration); err != nil {
+		return fmt.Errorf("%s revert_window_duration %q is not a valid duration: %w", context, c.RevertWindowDuration, err)
+	}
+	return nil
 }
 
 func (c *DSNFromConfig) Validate(context string) error {

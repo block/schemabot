@@ -194,3 +194,23 @@ func TestServiceDeploymentForDatabaseEnvironment(t *testing.T) {
 	_, err = service.deploymentForDatabaseEnvironment("missing", "", "staging")
 	require.Error(t, err)
 }
+
+// A PlanetScale token reference that resolves to a value without the name:value
+// separator is rejected when building the local client, rather than silently
+// producing an empty token name and value.
+func TestNewLocalTernClient_RejectsMalformedTokenReference(t *testing.T) {
+	cfg := &ServerConfig{}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	envConfig := EnvironmentConfig{
+		DSN:            "root@tcp(localhost:3306)/mydb",
+		Organization:   "acme",
+		TokenSecretRef: "no-separator-token",
+	}
+
+	_, err := service.newLocalTernClient("vitessdb-staging", "vitessdb", "vitess", envConfig)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vitessdb-staging")
+	assert.Contains(t, err.Error(), `"no-separator-token"`)
+	assert.Contains(t, err.Error(), "name:value format")
+}
