@@ -1160,6 +1160,25 @@ func TestServerConfig_ResolveDatabaseTargets_DeploymentOrder(t *testing.T) {
 	})
 }
 
+// validateDeploymentOrder must report an empty deployments map key with the
+// same clear error used elsewhere, rather than the confusing
+// "missing deployment \"\"" that fell out of the permutation check. This guards
+// the Validate() path, which calls validateDeploymentOrder before its own
+// empty-key check.
+func TestValidateDeploymentOrder_EmptyMapKey(t *testing.T) {
+	err := validateDeploymentOrder(
+		map[string]DeploymentTarget{
+			"":           {Target: "payments"},
+			"payments-a": {Target: "payments"},
+		},
+		[]string{"payments-a"},
+		"database \"payments\" environment \"production\"",
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has a deployments map entry with an empty key")
+	assert.NotContains(t, err.Error(), `missing deployment ""`)
+}
+
 func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 	baseTern := TernConfig{
 		"payments-a": {"production": "tern-a:9090"},

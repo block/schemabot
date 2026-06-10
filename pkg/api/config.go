@@ -800,6 +800,11 @@ func orderedDeploymentKeys(deployments map[string]DeploymentTarget, order []stri
 // validateDeploymentOrder checks that deployment_order lists every key in the
 // deployments map exactly once, with no empty, duplicate, or unknown entries.
 func validateDeploymentOrder(deployments map[string]DeploymentTarget, order []string, context string) error {
+	for deployment := range deployments {
+		if deployment == "" {
+			return fmt.Errorf("%s has a deployments map entry with an empty key", context)
+		}
+	}
 	seen := make(map[string]bool, len(order))
 	for _, deployment := range order {
 		if deployment == "" {
