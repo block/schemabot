@@ -71,6 +71,7 @@ type runningMigration struct {
 	tableNamespace          map[string]string // table name → namespace (from ApplyRequest.Changes)
 	tables                  []string
 	ddls                    []string // DDL statement for each table
+	originalDDLs            []string // Full statement list from Apply, in execution order; never overwritten so resume can run the whole plan
 	combinedStatement       string   // Original combined statement passed to Spirit (for checkpoint-safe restart)
 	runners                 []*spiritmigration.Runner
 	progressCallback        func() string // returns Summary from Spirit's Progress API
@@ -391,6 +392,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		database:       database,
 		tableNamespace: tableNamespace,
 		tables:         nil, // Tables will be populated by executeMigration
+		originalDDLs:   req.FlatDDL(),
 		state:          engine.StateRunning,
 		started:        time.Now(),
 		deferCutover:   deferCutover,

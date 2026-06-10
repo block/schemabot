@@ -107,7 +107,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 	password := rm.password
 	database := rm.database
 	tables := rm.tables
-	ddls := rm.ddls
+	originalDDLs := rm.originalDDLs
 	combinedStatement := rm.combinedStatement
 	deferCutover := rm.deferCutover
 	e.mu.Unlock()
@@ -133,10 +133,6 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		"tables", tables,
 	)
 
-	// Update state under the lock before launching goroutine.
-	// Use the stored combined statement directly (not executeMigration) to avoid
-	// re-parsing DDLs through statement.New(), which can normalize formatting and
-	// cause Spirit checkpoint mismatches ("alter statement does not match").
 	e.mu.Lock()
 	rm.state = engine.StateRunning
 	e.mu.Unlock()
@@ -149,11 +145,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 			e.runningMigration.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		if combinedStatement != "" {
-			_ = e.executeSpiritMigration(bgCtx, host, username, password, database, combinedStatement, deferCutover)
-		} else {
-			e.executeMigration(bgCtx, host, username, password, database, ddls, deferCutover)
-		}
+		e.resumeMigration(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover)
 	})
 
 	return &engine.ControlResult{

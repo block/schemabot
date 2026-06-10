@@ -20,117 +20,30 @@ import (
 // Spirit requires non-ALTER statements to be executed individually (not combined).
 // ALTER statements can be combined for atomic multi-table schema changes.
 func (e *Engine) executeMigration(ctx context.Context, host, username, password, database string, ddlStatements []string, deferCutover bool) {
-	// Categorize DDL statements using AST-based classification
-	// Spirit requires non-ALTER to be individual
-	var createStatements []string
-	var dropStatements []string
-	var alterStatements []string
-
-	for _, stmt := range ddlStatements {
-		stmtType, _, err := ddl.ClassifyStatement(stmt)
-		if err != nil {
-			e.logger.Error("failed to classify statement", "error", err, "statement", stmt)
-			e.setMigrationFailed(err)
-			return
-		}
-		switch stmtType {
-		case statement.StatementCreateTable:
-			createStatements = append(createStatements, stmt)
-		case statement.StatementDropTable:
-			dropStatements = append(dropStatements, stmt)
-		default:
-			// ALTER TABLE, RENAME TABLE, and unknown go here
-			alterStatements = append(alterStatements, stmt)
-		}
+	phases, err := classifyDDLPhases(ddlStatements)
+	if err != nil {
+		e.logger.Error("failed to classify statement", "error", err)
+		e.setMigrationFailed(err)
+		return
 	}
 
-	// Execute CREATE TABLE statements first (each individually through Spirit)
-	for _, stmt := range createStatements {
-		if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
-			// A cancelled context means the operator stopped the change; engine
-			// state must remain Stopped and later phases must not run. Only a
-			// genuine failure (context still live) transitions to StateFailed.
-			if ctx.Err() != nil {
-				e.logger.Info("schema change stopped during CREATE TABLE",
-					"database", database,
-					"reason", ctx.Err(),
-				)
-				return
-			}
-			e.logger.Error("CREATE TABLE failed", "error", err)
-			e.setMigrationFailed(fmt.Errorf("CREATE TABLE failed: %w", err))
+	// Execute CREATE TABLE statements first (each individually through Spirit).
+	if !e.executeCreateStatements(ctx, host, username, password, database, phases.creates) {
+		return
+	}
+
+	// Execute ALTER statements (combined for atomic multi-table execution).
+	if len(phases.alters) > 0 {
+		if !e.executeAlterPhase(ctx, host, username, password, database, phases.alters, deferCutover) {
 			return
 		}
 	}
 
-	// Execute ALTER statements (can be combined for atomic execution)
-	if len(alterStatements) > 0 {
-		combinedStatement := strings.Join(alterStatements, "; ")
-
-		// Parse statements to extract table names for logging
-		var tables []string
-		for _, stmt := range alterStatements {
-			parsed, err := statement.New(stmt)
-			if err != nil {
-				e.logger.Error("failed to parse statement for logging", "error", err, "statement", stmt)
-				e.setMigrationFailed(fmt.Errorf("failed to parse statement: %w", err))
-				return
-			}
-			if len(parsed) > 0 {
-				tables = append(tables, parsed[0].Table)
-			}
-		}
-
-		e.logger.Info("executing ALTER via Spirit",
-			"database", database,
-			"tables", tables,
-			"ddl_count", len(alterStatements),
-			"defer_cutover", deferCutover,
-		)
-
-		if err := e.executeSpiritMigration(ctx, host, username, password, database, combinedStatement, deferCutover); err != nil {
-			return // Error already logged and state set
-		}
-	}
-
-	// Execute DROP TABLE statements last. By default the table is quarantined
-	// in the pending drops database instead of dropped, so its data stays
-	// recoverable until the retention period expires. When pending drops is
-	// disabled, the DROP executes directly through Spirit.
-	for _, stmt := range dropStatements {
-		if e.disablePendingDrops {
-			if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
-				// A cancelled context means the operator stopped the change; engine
-				// state must remain Stopped and later phases must not run. Only a
-				// genuine failure (context still live) transitions to StateFailed.
-				if ctx.Err() != nil {
-					e.logger.Info("schema change stopped during DROP TABLE",
-						"database", database,
-						"reason", ctx.Err(),
-					)
-					return
-				}
-				e.logger.Error("DROP TABLE failed", "error", err)
-				e.setMigrationFailed(fmt.Errorf("DROP TABLE failed: %w", err))
-				return
-			}
-			continue
-		}
-		if err := e.quarantineDroppedTables(ctx, host, username, password, database, stmt); err != nil {
-			// A cancelled context means the operator stopped the change; engine
-			// state must remain Stopped and later phases must not run. Only a
-			// genuine failure (context still live) transitions to StateFailed.
-			if ctx.Err() != nil {
-				e.logger.Info("schema change stopped during DROP TABLE",
-					"database", database,
-					"reason", ctx.Err(),
-				)
-				return
-			}
-			e.logger.Error("DROP TABLE quarantine failed", "error", err)
-			e.setMigrationFailed(fmt.Errorf("DROP TABLE quarantine failed: %w", err))
-			return
-		}
+	// Execute DROP TABLE statements last. By default each table is quarantined
+	// in the pending drops database instead of dropped; when pending drops is
+	// disabled the DROP runs directly through Spirit.
+	if !e.executeDropStatements(ctx, host, username, password, database, phases.drops) {
+		return
 	}
 
 	// A cancelled context means the operator stopped the change; engine state
@@ -143,10 +56,184 @@ func (e *Engine) executeMigration(ctx context.Context, host, username, password,
 		return
 	}
 
-	// If we had no ALTER statements (only CREATE/DROP), mark as completed
-	if len(alterStatements) == 0 {
-		e.setMigrationState(engine.StateCompleted)
+	// Completion is signalled only after every phase has run, so a poller never
+	// observes StateCompleted while a later DROP phase is still pending.
+	e.setMigrationState(engine.StateCompleted)
+}
+
+// resumeMigration continues a stopped schema change to completion.
+//
+// When an ALTER was in flight, its statements are resumed from Spirit's
+// checkpoint using the stored verbatim combined statement (not the original DDL
+// list) so the statement string matches the checkpoint exactly — re-parsing
+// through statement.New() can normalize formatting and trip Spirit's "alter
+// statement does not match" guard. CREATE statements always run before the ALTER
+// phase, so once an ALTER has started they are already applied; only the DROP
+// phase remains and must run after the resumed ALTER completes. When no ALTER was
+// in flight, the whole plan is run from the start.
+func (e *Engine) resumeMigration(ctx context.Context, host, username, password, database string, originalDDLs []string, combinedStatement string, deferCutover bool) {
+	if combinedStatement == "" {
+		e.executeMigration(ctx, host, username, password, database, originalDDLs, deferCutover)
+		return
 	}
+
+	if err := e.executeSpiritMigration(ctx, host, username, password, database, combinedStatement, deferCutover); err != nil {
+		return // Error already logged and state set; on stop the state stays Stopped.
+	}
+
+	// A stop during the resumed ALTER cancels the context; leave the state
+	// Stopped and do not run the pending DROP phase.
+	if ctx.Err() != nil {
+		e.logger.Info("schema change stopped during resumed ALTER",
+			"database", database,
+			"reason", ctx.Err(),
+		)
+		return
+	}
+
+	phases, err := classifyDDLPhases(originalDDLs)
+	if err != nil {
+		e.logger.Error("failed to classify statements on resume", "database", database, "error", err)
+		e.setMigrationFailed(err)
+		return
+	}
+
+	if !e.executeDropStatements(ctx, host, username, password, database, phases.drops) {
+		return
+	}
+
+	if ctx.Err() != nil {
+		e.logger.Info("schema change stopped before completion",
+			"database", database,
+			"reason", ctx.Err(),
+		)
+		return
+	}
+
+	e.setMigrationState(engine.StateCompleted)
+}
+
+// ddlPhases groups a plan's statements into the order Spirit requires:
+// CREATE first, then ALTER (combined), then DROP.
+type ddlPhases struct {
+	creates []string
+	alters  []string
+	drops   []string
+}
+
+// classifyDDLPhases groups DDL statements into CREATE/ALTER/DROP phases using
+// AST-based classification. RENAME and unrecognized statements run in the ALTER
+// phase, matching Spirit's handling.
+func classifyDDLPhases(ddlStatements []string) (ddlPhases, error) {
+	var phases ddlPhases
+	for _, stmt := range ddlStatements {
+		stmtType, _, err := ddl.ClassifyStatement(stmt)
+		if err != nil {
+			return ddlPhases{}, fmt.Errorf("classify statement %q: %w", stmt, err)
+		}
+		switch stmtType {
+		case statement.StatementCreateTable:
+			phases.creates = append(phases.creates, stmt)
+		case statement.StatementDropTable:
+			phases.drops = append(phases.drops, stmt)
+		default:
+			phases.alters = append(phases.alters, stmt)
+		}
+	}
+	return phases, nil
+}
+
+// executeCreateStatements runs each CREATE TABLE through Spirit. It returns false
+// when execution should stop: a cancelled context leaves the state Stopped, a
+// genuine failure transitions to StateFailed. The caller must not run later
+// phases when this returns false.
+func (e *Engine) executeCreateStatements(ctx context.Context, host, username, password, database string, creates []string) bool {
+	for _, stmt := range creates {
+		if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
+			if ctx.Err() != nil {
+				e.logger.Info("schema change stopped during CREATE TABLE",
+					"database", database,
+					"reason", ctx.Err(),
+				)
+				return false
+			}
+			e.logger.Error("CREATE TABLE failed", "database", database, "error", err)
+			e.setMigrationFailed(fmt.Errorf("CREATE TABLE failed: %w", err))
+			return false
+		}
+	}
+	return true
+}
+
+// executeAlterPhase combines the ALTER statements and runs them through Spirit.
+// It returns true when the ALTER ran and the caller may proceed to the DROP
+// phase, and false on a genuine failure (executeSpiritMigration has already set
+// StateFailed). A stop cancels the context but returns true; the caller's later
+// ctx.Err() checks then keep the state Stopped without running further phases.
+func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password, database string, alters []string, deferCutover bool) bool {
+	combinedStatement := strings.Join(alters, "; ")
+
+	var tables []string
+	for _, stmt := range alters {
+		parsed, err := statement.New(stmt)
+		if err != nil {
+			e.logger.Error("failed to parse statement for logging", "database", database, "error", err, "statement", stmt)
+			e.setMigrationFailed(fmt.Errorf("parse ALTER statement %q: %w", stmt, err))
+			return false
+		}
+		if len(parsed) > 0 {
+			tables = append(tables, parsed[0].Table)
+		}
+	}
+
+	e.logger.Info("executing ALTER via Spirit",
+		"database", database,
+		"tables", tables,
+		"ddl_count", len(alters),
+		"defer_cutover", deferCutover,
+	)
+
+	return e.executeSpiritMigration(ctx, host, username, password, database, combinedStatement, deferCutover) == nil
+}
+
+// executeDropStatements runs the DROP TABLE phase. By default each table is
+// quarantined in the pending drops database so its data stays recoverable until
+// the retention period expires; when pending drops is disabled the DROP runs
+// directly through Spirit. Both the initial-apply DROP phase and the resume DROP
+// phase call this helper, so a resumed DROP quarantines exactly like an initial
+// one. It returns false when execution should stop: a cancelled context leaves
+// the state Stopped, a genuine failure transitions to StateFailed.
+func (e *Engine) executeDropStatements(ctx context.Context, host, username, password, database string, drops []string) bool {
+	for _, stmt := range drops {
+		if err := e.executeDropStatement(ctx, host, username, password, database, stmt); err != nil {
+			if ctx.Err() != nil {
+				e.logger.Info("schema change stopped during DROP TABLE",
+					"database", database,
+					"reason", ctx.Err(),
+				)
+				return false
+			}
+			e.logger.Error("DROP TABLE phase failed", "database", database, "error", err)
+			e.setMigrationFailed(fmt.Errorf("DROP TABLE phase failed: %w", err))
+			return false
+		}
+	}
+	return true
+}
+
+// executeDropStatement runs a single DROP TABLE statement, quarantining the
+// table by default and dropping it directly only when pending drops is disabled.
+func (e *Engine) executeDropStatement(ctx context.Context, host, username, password, database, stmt string) error {
+	if e.disablePendingDrops {
+		if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
+			return fmt.Errorf("drop table directly: %w", err)
+		}
+		return nil
+	}
+	if err := e.quarantineDroppedTables(ctx, host, username, password, database, stmt); err != nil {
+		return fmt.Errorf("quarantine dropped table: %w", err)
+	}
+	return nil
 }
 
 // executeSingleStatement runs a single DDL statement through Spirit.
@@ -285,9 +372,8 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		return err
 	}
 
-	e.setMigrationState(engine.StateCompleted)
 	utils.CloseAndLog(runner)
-	e.logger.Info("schema change completed", "database", database, "tables", tables)
+	e.logger.Info("ALTER phase completed", "database", database, "tables", tables)
 	return nil
 }
 

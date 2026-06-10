@@ -21,6 +21,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 
@@ -1579,11 +1580,11 @@ func TestEngine_Stop_DuringAlterWithPendingDrop(t *testing.T) {
 
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
 
 	_, err := db.ExecContext(t.Context(), `CREATE TABLE stop_alter_target (
 		id INT PRIMARY KEY AUTO_INCREMENT,
-		name VARCHAR(50) NOT NULL,
-		data VARCHAR(500) NOT NULL
+		name VARCHAR(50) NOT NULL
 	)`)
 	require.NoError(t, err, "create alter target table")
 
@@ -1655,19 +1656,65 @@ func TestEngine_Stop_DuringAlterWithPendingDrop(t *testing.T) {
 	assert.True(t, testutil.TableExists(t, db, "testdb", "stop_drop_target"),
 		"pending DROP must not run when the change is stopped mid-ALTER")
 
-	// A stopped change must be resumable; it must not be wedged in a state that
-	// Start() refuses (e.g. failed).
+	// Resuming a stopped change must finish the entire plan from its checkpoint:
+	// complete the ALTER and then run the queued DROP phase. The default DROP
+	// behavior quarantines the table into the pending drops database rather than
+	// dropping it, so a resume that only finishes the ALTER and skips the DROP
+	// phase would leave the table unquarantined. The test waits for completion and
+	// verifies both effects.
 	startResult, err := eng.Start(ctx, &engine.ControlRequest{
 		Database:    "testdb",
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
 	require.NoError(t, err, "Start() must permit resume of a stopped change")
-	assert.True(t, startResult.Accepted, "resume not accepted: %s", startResult.Message)
+	require.True(t, startResult.Accepted, "resume not accepted: %s", startResult.Message)
+
+	resumeDeadline := time.Now().Add(5 * time.Minute)
+	var finalState engine.State
+	for time.Now().Before(resumeDeadline) {
+		progress, perr := eng.Progress(ctx, &engine.ProgressRequest{})
+		require.NoError(t, perr, "Progress() during resume")
+		finalState = progress.State
+		require.NotEqual(t, engine.StateFailed, finalState, "resume failed: %s", progress.ErrorMessage)
+		if finalState == engine.StateCompleted {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.Equal(t, engine.StateCompleted, finalState,
+		"resumed change must run to completion, not stall in %s", finalState)
+
+	// The ALTER's effect must be present: the resumed copy must finish widening
+	// name from varchar(50) to varchar(100).
+	var nameLen int
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = 'testdb'
+		AND TABLE_NAME = 'stop_alter_target'
+		AND COLUMN_NAME = 'name'
+	`).Scan(&nameLen), "read name column length")
+	assert.Equal(t, 100, nameLen, "resumed ALTER must widen name to varchar(100)")
+
+	// The queued DROP phase must run on resume: its target table is quarantined
+	// into the pending drops database, so it is gone from the source database and
+	// present in the pending drops database with a parseable timestamp prefix.
+	assert.False(t, testutil.TableExists(t, db, "testdb", "stop_drop_target"),
+		"resumed DROP phase must remove stop_drop_target from the source database")
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 1, "resumed DROP phase must quarantine exactly one table")
+	assert.Contains(t, quarantined[0], "_stop_drop_target",
+		"quarantined table name must carry the dropped table's name")
+	_, ok := pendingdrops.ParseTimestamp(quarantined[0])
+	assert.True(t, ok, "quarantine table name %q must carry a parseable timestamp", quarantined[0])
 }
 
-// seedTableRows inserts enough rows that a Spirit table copy on the table is
-// observably in-flight across several progress polls. The (name, data) columns
-// match the tables seeded for stop-mid-flight scenarios.
+// seedTableRows inserts enough narrow rows that a Spirit table copy on the table
+// stays observably in-flight across several progress polls, so a stop reliably
+// lands mid-copy. Rows are intentionally narrow (no large payload) so both the
+// seed and a subsequent resume-to-completion copy stay well within the suite
+// timeout. The seeded column matches the tables used for stop-mid-flight
+// scenarios.
 func seedTableRows(t *testing.T, db *sql.DB, tableName string) {
 	t.Helper()
 
@@ -1682,7 +1729,7 @@ func seedTableRows(t *testing.T, db *sql.DB, tableName string) {
 
 	const rowCount = 500000
 	query := fmt.Sprintf(
-		"INSERT INTO `%s` (name, data) SELECT CONCAT('name-', seq), REPEAT('x', 400) FROM %s LIMIT %d",
+		"INSERT INTO `%s` (name) SELECT CONCAT('name-', seq) FROM %s LIMIT %d",
 		tableName, seqGen, rowCount,
 	)
 
