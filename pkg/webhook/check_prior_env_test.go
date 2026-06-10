@@ -182,7 +182,7 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"total_count": 1,
 			"check_runs": []map[string]any{
-				{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "action_required"},
+				{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "action_required", "app": map[string]any{"slug": "schemabot"}},
 			},
 		})
 	})
@@ -196,7 +196,7 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
 	})
 
-	installClient := ghclient.NewInstallationClient(client, testLogger())
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
 	service := api.New(&emptyStorage{}, &api.ServerConfig{
 		AllowedEnvironments: []string{"production"},
 		EnvironmentOrder:    []string{"staging", "production"},
@@ -296,7 +296,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			})
 		})
 
-		installClient := ghclient.NewInstallationClient(client, testLogger())
+		installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
 		factory := &fakeClientFactory{client: installClient}
 		config := &api.ServerConfig{}
 		if len(configs) > 0 {
@@ -318,7 +318,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 	t.Run("staging check success allows proceed", func(t *testing.T) {
 		h, comments := setupCheckRunServer(t, []map[string]any{
-			{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success"},
+			{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
 		})
 
 		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
@@ -333,7 +333,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 	t.Run("custom check name success allows proceed", func(t *testing.T) {
 		h, comments := setupCheckRunServer(t, []map[string]any{
-			{"id": 1, "name": "SchemaBot X (staging)", "status": "completed", "conclusion": "success"},
+			{"id": 1, "name": "SchemaBot X (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
 		}, &api.ServerConfig{GitHub: api.GitHubConfig{CheckName: "SchemaBot X"}})
 
 		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
@@ -348,7 +348,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 	t.Run("staging check pending blocks apply", func(t *testing.T) {
 		h, _ := setupCheckRunServer(t, []map[string]any{
-			{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "action_required"},
+			{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "action_required", "app": map[string]any{"slug": "schemabot"}},
 		})
 
 		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
@@ -374,11 +374,87 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 	t.Run("staging check in progress blocks apply", func(t *testing.T) {
 		h, _ := setupCheckRunServer(t, []map[string]any{
-			{"id": 1, "name": "SchemaBot (staging)", "status": "in_progress", "conclusion": ""},
+			{"id": 1, "name": "SchemaBot (staging)", "status": "in_progress", "conclusion": "", "app": map[string]any{"slug": "schemabot"}},
 		})
 
 		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
 		assert.True(t, blocked)
+	})
+
+	// A repository contributor can create a GitHub Actions job whose name matches
+	// the staging instance's aggregate Check Run. The promotion gate must only
+	// trust Check Runs created by SchemaBot's own GitHub App, so a passing
+	// same-named run from another app blocks the production apply as if the
+	// staging check were missing.
+	t.Run("same-named foreign-app success run blocks apply", func(t *testing.T) {
+		h, comments := setupCheckRunServer(t, []map[string]any{
+			{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "github-actions"}},
+		})
+
+		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		assert.True(t, blocked, "a foreign-app check run must not satisfy the promotion gate")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Apply Blocked")
+			assert.Contains(t, body, "could not find a completed `staging` check")
+		default:
+			t.Fatal("expected a comment explaining the missing prior environment check")
+		}
+	})
+
+	// When SchemaBot does not know its own GitHub App slug it cannot verify
+	// which app created the staging Check Run, so the promotion gate blocks the
+	// production apply even though a same-named passing run exists.
+	t.Run("unknown own app slug blocks apply", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 10)
+
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"head": map[string]any{"sha": headSHA, "ref": "feature"},
+				"base": map[string]any{"sha": "base123", "ref": "main"},
+				"user": map[string]any{"login": "testuser"},
+			})
+		})
+
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+
+		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"total_count": 1,
+				"check_runs": []map[string]any{
+					{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+				},
+			})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		h := &Handler{
+			ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+			logger:                     testLogger(),
+			priorEnvCheckMaxAttempts:   1,
+			priorEnvCheckRetryInterval: time.Nanosecond,
+		}
+
+		blocked := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345)
+		assert.True(t, blocked, "unverifiable check run ownership must block the promotion gate")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Apply Blocked")
+			assert.Contains(t, body, "staging")
+		default:
+			t.Fatal("expected a comment explaining the verification failure")
+		}
 	})
 
 	// This covers the cross-instance race where the production SchemaBot instance
@@ -413,7 +489,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			checkRuns := []map[string]any{}
 			if checkCalls > 1 {
 				checkRuns = []map[string]any{
-					{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success"},
+					{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
 				}
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -422,7 +498,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			})
 		})
 
-		installClient := ghclient.NewInstallationClient(client, testLogger())
+		installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
 		h := &Handler{
 			ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
 			logger:                     testLogger(),
@@ -469,7 +545,7 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 		})
 
-		installClient := ghclient.NewInstallationClient(client, testLogger())
+		installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
 		factory := &fakeClientFactory{client: installClient}
 
 		h := &Handler{

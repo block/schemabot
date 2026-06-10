@@ -118,6 +118,112 @@ func TestEditIssueCommentDoesNotRetryNonRateLimitWriteError(t *testing.T) {
 	assert.Equal(t, int64(1), attempts.Load())
 }
 
+// TestFindCheckRunByNameIgnoresForeignAppCheckRuns covers a PR commit that
+// carries two completed check runs with the same name: a passing run created
+// by another GitHub App and SchemaBot's own run, which has not passed. The
+// lookup must return SchemaBot's own run so a same-named foreign run can
+// never satisfy a gate that relies on this lookup.
+func TestFindCheckRunByNameIgnoresForeignAppCheckRuns(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "SchemaBot (staging)", r.URL.Query().Get("check_name"))
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 2,
+			"check_runs": []map[string]any{
+				{"id": 7, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "github-actions"}},
+				{"id": 3, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "action_required", "app": map[string]any{"slug": "schemabot"}},
+			},
+		}))
+	})
+
+	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "schemabot")
+	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, int64(3), result.ID)
+	assert.Equal(t, "SchemaBot (staging)", result.Name)
+	assert.Equal(t, "completed", result.Status)
+	assert.Equal(t, "action_required", result.Conclusion)
+}
+
+// TestFindCheckRunByNameReturnsNilWhenOnlyForeignAppRunsExist covers a PR
+// commit where the only check run with the requested name was created by
+// another GitHub App. The lookup must report the check run as missing so
+// callers treat the gate as unsatisfied.
+func TestFindCheckRunByNameReturnsNilWhenOnlyForeignAppRunsExist(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 1,
+			"check_runs": []map[string]any{
+				{"id": 7, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "github-actions"}},
+			},
+		}))
+	})
+
+	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "schemabot")
+	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+
+	require.NoError(t, err)
+	assert.Nil(t, result)
+}
+
+// TestFindCheckRunByNameReturnsMostRecentOwnAppRun covers a PR commit with
+// several own-app check runs sharing the same name. The lookup must return
+// the most recently created run (highest check run ID) regardless of the
+// order GitHub lists them in, so a stale earlier run cannot mask the current
+// gate state.
+func TestFindCheckRunByNameReturnsMostRecentOwnAppRun(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 2,
+			"check_runs": []map[string]any{
+				{"id": 3, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "failure", "app": map[string]any{"slug": "schemabot"}},
+				{"id": 9, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+			},
+		}))
+	})
+
+	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "schemabot")
+	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, int64(9), result.ID)
+	assert.Equal(t, "success", result.Conclusion)
+}
+
+// TestFindCheckRunByNameErrorsWhenOwnAppSlugUnknown covers the case where the
+// client does not know its own GitHub App slug, so check run ownership cannot
+// be verified. The lookup must return an error without querying GitHub —
+// ownership ambiguity must never be converted into a result a gate could
+// trust.
+func TestFindCheckRunByNameErrorsWhenOwnAppSlugUnknown(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	var requests atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 1,
+			"check_runs": []map[string]any{
+				{"id": 7, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+			},
+		}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "check run ownership cannot be verified")
+	assert.Contains(t, err.Error(), "octocat/hello-world")
+	assert.Contains(t, err.Error(), "abc123")
+	assert.Nil(t, result)
+	assert.Equal(t, int64(0), requests.Load())
+}
+
 func setupRateLimitedTestGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {
 	t.Helper()
 

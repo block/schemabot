@@ -196,6 +196,10 @@ func storedPriorEnvCheckStatus(check *storage.Check) string {
 // staging are applied. This is the correct behavior for the remote case — we
 // cannot query per-database check state from another instance, and it is safer to
 // require the entire environment to be healthy before promoting.
+//
+// Only Check Runs created by this GitHub App are trusted: a same-named check
+// run from another app (e.g. a GitHub Actions job) cannot satisfy the gate,
+// and when ownership cannot be verified the gate blocks the apply.
 func (h *Handler) checkPriorEnvViaGitHub(
 	ctx context.Context, repo string, pr int,
 	database, environment, priorEnv string,
@@ -223,7 +227,11 @@ func (h *Handler) checkPriorEnvViaGitHub(
 	checkResult, err := h.waitForGitHubPriorEnvCheck(ctx, client, repo, pr, database, environment, priorEnv, prInfo.HeadSHA, checkName)
 	if err != nil {
 		h.logger.Error("failed to query GitHub check for prior environment, blocking apply",
-			"prior_env", priorEnv, "check_name", checkName, "error", err)
+			"repo", repo, "pr", pr,
+			"database", database,
+			"environment", environment, "prior_environment", priorEnv,
+			"head_sha", prInfo.HeadSHA,
+			"check_name", checkName, "error", err)
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "query check runs", err))
 		return true

@@ -617,32 +617,60 @@ type CheckRunResult struct {
 }
 
 // FindCheckRunByName searches for a check run on a specific commit by name.
-// Returns nil if no matching check run is found.
+// Only check runs created by this SchemaBot GitHub App are considered: a
+// same-named check run created by another app (for example a GitHub Actions
+// job configured with a matching name) is ignored, so it can never satisfy a
+// gate that relies on this lookup. When multiple own-app runs share the name,
+// the most recently created one (highest check run ID) is returned.
+//
+// Returns nil if no own-app check run matches. Returns an error when the own
+// app slug is unknown — check run ownership cannot be verified, and callers
+// must fail closed instead of trusting a same-named run.
 func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*CheckRunResult, error) {
+	if ic.loadAppSlug() == "" {
+		return nil, fmt.Errorf("find check run %q on %s@%s: GitHub App slug is unavailable, check run ownership cannot be verified", checkName, repo, headSHA)
+	}
+
 	owner, repoName := splitRepo(repo)
+	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationListCheckRunsForRef, repo)
 	opts := &gh.ListCheckRunsOptions{
 		CheckName: new(checkName),
 		ListOptions: gh.ListOptions{
-			PerPage: 1,
+			PerPage: 100,
 		},
 	}
 
-	result, _, err := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, headSHA, opts)
-	if err != nil {
-		return nil, fmt.Errorf("list check runs for %s: %w", checkName, err)
+	var newest *CheckRunResult
+	for {
+		result, resp, err := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, headSHA, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list check runs named %q on %s@%s: %w", checkName, repo, headSHA, err)
+		}
+		if result != nil {
+			for _, run := range result.CheckRuns {
+				if !ic.isOwnAppSlug(run.GetApp().GetSlug()) {
+					ic.logger.Warn("ignoring same-named check run created by another GitHub App",
+						"repo", repo, "head_sha", headSHA, "check_name", checkName,
+						"check_run_id", run.GetID(), "app_slug", run.GetApp().GetSlug())
+					continue
+				}
+				if newest == nil || run.GetID() > newest.ID {
+					newest = &CheckRunResult{
+						ID:         run.GetID(),
+						Name:       run.GetName(),
+						Status:     run.GetStatus(),
+						Conclusion: run.GetConclusion(),
+					}
+				}
+			}
+		}
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
 	}
 
-	if len(result.CheckRuns) == 0 {
-		return nil, nil
-	}
-
-	cr := result.CheckRuns[0]
-	return &CheckRunResult{
-		ID:         cr.GetID(),
-		Name:       cr.GetName(),
-		Status:     cr.GetStatus(),
-		Conclusion: cr.GetConclusion(),
-	}, nil
+	return newest, nil
 }
 
 // PRCheckStatus represents the status of a single PR check (check run or commit status).
