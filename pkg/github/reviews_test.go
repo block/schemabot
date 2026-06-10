@@ -81,6 +81,7 @@ func TestParseCodeowners(t *testing.T) {
 }
 
 func TestGetApprovedReviewers(t *testing.T) {
+	sameSecond := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
 		name     string
 		reviews  []*ReviewInfo
@@ -103,6 +104,35 @@ func TestGetApprovedReviewers(t *testing.T) {
 			reviews: []*ReviewInfo{
 				{User: "alice", State: ReviewApproved, SubmittedAt: time.Now().Add(-time.Hour)},
 				{User: "alice", State: ReviewChangesRequested, SubmittedAt: time.Now()},
+			},
+			expected: nil,
+		},
+		{
+			// A reviewer who approves and then replies on a thread (which GitHub
+			// records as a COMMENTED review) keeps their approval, since COMMENTED
+			// reviews are non-binding feedback.
+			name: "approval then commented - still approved",
+			reviews: []*ReviewInfo{
+				{User: "alice", State: ReviewApproved, SubmittedAt: time.Now().Add(-time.Hour)},
+				{User: "alice", State: ReviewCommented, SubmittedAt: time.Now()},
+			},
+			expected: []string{"alice"},
+		},
+		{
+			// COMMENTED is non-binding feedback and never grants approval on its own.
+			name: "commented only - not approved",
+			reviews: []*ReviewInfo{
+				{User: "alice", State: ReviewCommented, SubmittedAt: time.Now()},
+			},
+			expected: nil,
+		},
+		{
+			// GitHub timestamps have second granularity, so a CHANGES_REQUESTED
+			// that follows an APPROVED in the same second must still win.
+			name: "approval then changes requested same timestamp - not approved",
+			reviews: []*ReviewInfo{
+				{User: "alice", State: ReviewApproved, SubmittedAt: sameSecond},
+				{User: "alice", State: ReviewChangesRequested, SubmittedAt: sameSecond},
 			},
 			expected: nil,
 		},

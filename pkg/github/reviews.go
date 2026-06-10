@@ -57,11 +57,13 @@ func (ic *InstallationClient) ListReviews(ctx context.Context, repo string, pr i
 	return allReviews, nil
 }
 
-// GetApprovedReviewers returns usernames whose latest review is APPROVED.
-// Reviews are processed in chronological order; only the most recent review
-// per user counts.
+// GetApprovedReviewers returns usernames whose latest decisive review is
+// APPROVED. A user is approved iff their most recent APPROVED, CHANGES_REQUESTED,
+// or DISMISSED review is APPROVED. COMMENTED reviews are non-binding feedback in
+// GitHub's model and never alter a user's approval state, so they are ignored
+// when determining the latest decisive review. On equal timestamps the later
+// entry wins, matching GitHub's chronological ordering.
 func GetApprovedReviewers(reviews []*ReviewInfo) []string {
-	// Track each user's latest review by timestamp
 	type latestReview struct {
 		State       string
 		SubmittedAt time.Time
@@ -71,8 +73,11 @@ func GetApprovedReviewers(reviews []*ReviewInfo) []string {
 		if r.User == "" {
 			continue
 		}
+		if strings.EqualFold(r.State, ReviewCommented) {
+			continue
+		}
 		key := strings.ToLower(r.User)
-		if cur, ok := latest[key]; !ok || r.SubmittedAt.After(cur.SubmittedAt) {
+		if cur, ok := latest[key]; !ok || !r.SubmittedAt.Before(cur.SubmittedAt) {
 			latest[key] = latestReview{State: r.State, SubmittedAt: r.SubmittedAt}
 		}
 	}
