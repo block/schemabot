@@ -77,3 +77,37 @@ func TestNormalizeTaskStatus_StorageCompleted(t *testing.T) {
 func TestNormalizeTaskStatus_UnknownDefaultsToRunning(t *testing.T) {
 	assert.Equal(t, Task.Running, NormalizeTaskStatus("something_unknown"))
 }
+
+func TestIsInFlightTaskState(t *testing.T) {
+	inFlight := []string{
+		Task.Running,
+		Task.WaitingForCutover,
+		Task.CuttingOver,
+		Task.WaitingForDeploy,
+		Task.Recovering,
+	}
+	for _, s := range inFlight {
+		assert.True(t, IsInFlightTaskState(s), "IsInFlightTaskState(%q)", s)
+	}
+
+	resting := []string{
+		Task.Stopped,
+		Task.FailedRetryable,
+		Task.Pending,
+		Task.Completed,
+		Task.Failed,
+		Task.Reverted,
+		Task.Cancelled,
+		Task.RevertWindow,
+	}
+	for _, s := range resting {
+		assert.False(t, IsInFlightTaskState(s), "IsInFlightTaskState(%q)", s)
+	}
+}
+
+func TestIsInFlightTaskState_NormalizesProtoPrefix(t *testing.T) {
+	assert.True(t, IsInFlightTaskState("STATE_RUNNING"))
+	assert.True(t, IsInFlightTaskState("WAITING_FOR_CUTOVER"))
+	assert.False(t, IsInFlightTaskState("STATE_STOPPED"))
+	assert.False(t, IsInFlightTaskState("FAILED_RETRYABLE"))
+}
