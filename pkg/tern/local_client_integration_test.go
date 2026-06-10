@@ -875,7 +875,7 @@ func TestLocalClient_ResumeApplyOperationDrivesOperationTasks(t *testing.T) {
 		ApplyID:    applyID,
 		Deployment: "testdb",
 		Target:     "testdb",
-		State:      state.Apply.Pending,
+		State:      state.ApplyOperation.Pending,
 	})
 	require.NoError(t, err)
 

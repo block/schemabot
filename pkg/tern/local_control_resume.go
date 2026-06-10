@@ -629,6 +629,13 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	if err != nil {
 		return fmt.Errorf("get tasks for apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
 	}
+	// An empty result is the fail-closed signal for an invalid or mismatched
+	// applyOperationID. Unlike ResumeApply, we must not forward this to
+	// resumeApplyWithTasks: that path marks the whole parent apply as failed,
+	// which is incorrect when only one operation lookup came back empty.
+	if len(tasks) == 0 {
+		return fmt.Errorf("no tasks found for apply_operation %d (apply %s)", applyOperationID, apply.ApplyIdentifier)
+	}
 	return c.resumeApplyWithTasks(ctx, apply, tasks)
 }
 
