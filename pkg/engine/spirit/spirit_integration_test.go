@@ -731,12 +731,14 @@ func TestEngine_Progress_NamespaceFromApplyChanges(t *testing.T) {
 // example the stopped runner that stays registered while a volume change
 // restarts the schema change.
 func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
-	password := "testpassword"
+	host, username, password, database, err := parseDSN(sharedDSN)
+	require.NoError(t, err, "parseDSN")
+
 	runner, err := spiritmigration.NewRunner(&spiritmigration.Migration{
-		Host:      "localhost:3306",
-		Username:  "root",
+		Host:      host,
+		Username:  username,
 		Password:  &password,
-		Database:  "testdb",
+		Database:  database,
 		Statement: "ALTER TABLE `progress_close` ADD COLUMN `email` varchar(255) NULL",
 	})
 	require.NoError(t, err, "NewRunner")
@@ -745,7 +747,7 @@ func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
 	t.Run("running state keeps reporting running", func(t *testing.T) {
 		eng := New(Config{})
 		eng.runningMigration = &runningMigration{
-			database: "testdb",
+			database: database,
 			tables:   []string{"progress_close"},
 			state:    engine.StateRunning,
 			runners:  []*spiritmigration.Runner{runner},
@@ -759,7 +761,7 @@ func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
 	t.Run("volume restart reports running", func(t *testing.T) {
 		eng := New(Config{})
 		eng.runningMigration = &runningMigration{
-			database:                "testdb",
+			database:                database,
 			tables:                  []string{"progress_close"},
 			state:                   engine.StateStopped,
 			volumeRestartInProgress: true,
@@ -774,7 +776,7 @@ func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
 	t.Run("failed state keeps reporting failed", func(t *testing.T) {
 		eng := New(Config{})
 		eng.runningMigration = &runningMigration{
-			database:     "testdb",
+			database:     database,
 			tables:       []string{"progress_close"},
 			state:        engine.StateFailed,
 			errorMessage: "schema change failed: ddl error",
@@ -786,6 +788,21 @@ func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
 		assert.Equal(t, engine.StateFailed, result.State)
 		assert.Equal(t, "schema change failed: ddl error", result.ErrorMessage)
 		assert.True(t, result.Retryable)
+	})
+
+	t.Run("completed state keeps reporting completed", func(t *testing.T) {
+		eng := New(Config{})
+		eng.runningMigration = &runningMigration{
+			database:     database,
+			tables:       []string{"progress_close"},
+			state:        engine.StateCompleted,
+			deferCutover: true,
+			runners:      []*spiritmigration.Runner{runner},
+		}
+
+		result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+		require.NoError(t, err, "Progress()")
+		assert.Equal(t, engine.StateCompleted, result.State)
 	})
 }
 
