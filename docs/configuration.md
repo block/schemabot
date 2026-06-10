@@ -11,6 +11,7 @@
 - [Environment Order](#environment-order)
 - [Hybrid Mode](#hybrid-mode)
 - [Operator Workers](#operator-workers)
+- [Pending Drops](#pending-drops)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
 - [Review Gate](#review-gate)
@@ -268,6 +269,37 @@ Increase `operator_workers` when one SchemaBot server should make operator progr
 An operator claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the worker's lease while it reloads state and resumes the apply.
 
 > **Deprecated:** the previous `scheduler_workers` key still works as an alias for `operator_workers` and is honored with a deprecation warning. Set only one of the two. The alias will be removed one release after the operator rename has soaked.
+
+## Pending Drops
+
+For MySQL databases executed by the Spirit engine, `DROP TABLE` statements are
+quarantined by default: the table is renamed into a `_pending_drops` database
+on the target server with a timestamp prefix instead of being dropped. The data
+stays recoverable until a background cleaner permanently drops the table after
+the retention period. See [Pending Drops](pending-drops.md) for the full
+lifecycle and recovery steps.
+
+```yaml
+pending_drops:
+  enabled: true          # default: true
+  cleanup_enabled: true  # default: true when enabled is true
+  retention: 168h        # default: 168h (7 days)
+  dry_run: false         # default: false — set true to log instead of dropping
+```
+
+Set `enabled: false` to execute `DROP TABLE` directly with no quarantine and no
+cleaner. Set `cleanup_enabled: false` to keep quarantining drops while this
+server process does not run the background cleaner; use that for frequently
+redeployed executors when a stable operator deployment owns cleanup.
+`dry_run: true` keeps the quarantine active but makes the cleaner log the tables
+it would drop without dropping them, which is useful when previewing a retention
+change.
+
+The cleaner only runs against local-mode MySQL databases (environments with a
+`dsn`). For databases routed to a remote deployment over gRPC, the control-plane
+process has no target DSN and cannot clean that target. Cleanup runs only if the
+remote deployment is also a SchemaBot server with the target configured as
+local-mode MySQL and `cleanup_enabled: true`.
 
 ## Repository Allowlist
 

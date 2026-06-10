@@ -1117,6 +1117,7 @@ func RecordPendingDropMoved(ctx context.Context, database string) {
 	counter.Add(ctx, 1,
 		otelmetric.WithAttributes(
 			attribute.String("database", database),
+			EnvironmentAttribute(""),
 		),
 	)
 }
