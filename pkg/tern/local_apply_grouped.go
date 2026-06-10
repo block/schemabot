@@ -816,7 +816,7 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 		// VSchema tasks follow deploy-request-level state, not per-migration state.
 		// They have no SHOW VITESS_MIGRATIONS rows. Their state transitions are:
 		// pending → running (during in_progress_vschema) → completed/failed.
-		if task.DDLAction == "vschema_update" {
+		if isVSchemaTask(task) {
 			vsState := c.deriveVSchemaTaskState(task, result, newState, now)
 			if vsState != task.State {
 				msg := fmt.Sprintf("VSchema %s → %s", task.State, vsState)

@@ -672,16 +672,30 @@ func (c *LocalClient) groupedResumeState(ctx context.Context, apply *storage.App
 // groupedResumeChanges rebuilds the engine changes for a grouped resume from
 // the stored tasks, grouped per namespace. Tasks carry the authoritative
 // remaining work after re-planning, and engines key per-table progress on
-// namespace and table, so the rebuilt changes must preserve both.
+// namespace and table, so the rebuilt changes must preserve both. VSchema tasks
+// carry no DDL — they are excluded from TableChanges and instead flag their
+// namespace with the vschema_changed metadata so the engine applies vschema.json
+// from the schema files, mirroring how the fresh apply builds changes.
 func groupedResumeChanges(tasks []*storage.Task) []engine.SchemaChange {
 	indexByNamespace := make(map[string]int, len(tasks))
 	var changes []engine.SchemaChange
-	for _, task := range tasks {
-		idx, ok := indexByNamespace[task.Namespace]
+	ensureNamespace := func(namespace string) int {
+		idx, ok := indexByNamespace[namespace]
 		if !ok {
 			idx = len(changes)
-			indexByNamespace[task.Namespace] = idx
-			changes = append(changes, engine.SchemaChange{Namespace: task.Namespace})
+			indexByNamespace[namespace] = idx
+			changes = append(changes, engine.SchemaChange{Namespace: namespace})
+		}
+		return idx
+	}
+	for _, task := range tasks {
+		idx := ensureNamespace(task.Namespace)
+		if isVSchemaTask(task) {
+			if changes[idx].Metadata == nil {
+				changes[idx].Metadata = make(map[string]string)
+			}
+			changes[idx].Metadata["vschema_changed"] = "true"
+			continue
 		}
 		changes[idx].TableChanges = append(changes[idx].TableChanges, engine.TableChange{
 			Table:     task.TableName,
@@ -690,6 +704,13 @@ func groupedResumeChanges(tasks []*storage.Task) []engine.SchemaChange {
 		})
 	}
 	return changes
+}
+
+// isVSchemaTask reports whether a task represents a VSchema update rather than a
+// table DDL change. VSchema tasks have no DDL; their work is applying the
+// namespace's vschema.json.
+func isVSchemaTask(task *storage.Task) bool {
+	return task.DDLAction == "vschema_update"
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {

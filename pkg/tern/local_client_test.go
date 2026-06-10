@@ -585,6 +585,46 @@ func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
 	assert.Equal(t, statement.StatementAlterTable, changes[1].TableChanges[0].Operation)
 }
 
+// A VSchema task carries no DDL, so a resumed apply with mixed VSchema and DDL
+// work must keep the VSchema out of TableChanges and instead flag its namespace
+// with the vschema_changed metadata. This is how the engine knows to re-apply
+// vschema.json from the schema files on resume.
+func TestGroupedResumeChangesCarriesVSchemaMetadata(t *testing.T) {
+	tasks := []*storage.Task{
+		{Namespace: "commerce", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter"},
+		{Namespace: "commerce", TableName: "VSchema: commerce", DDLAction: "vschema_update"},
+	}
+
+	changes := groupedResumeChanges(tasks)
+
+	require.Len(t, changes, 1)
+	assert.Equal(t, "commerce", changes[0].Namespace)
+	require.Len(t, changes[0].TableChanges, 1)
+	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
+	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
+	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
+	assert.Equal(t, "true", changes[0].Metadata["vschema_changed"])
+	for _, tc := range changes[0].TableChanges {
+		assert.NotEmpty(t, tc.DDL, "resume changes must not contain an empty-DDL table change")
+	}
+}
+
+// A VSchema-only apply has no DDL tasks. Its resumed change must still carry a
+// namespace flagged with vschema_changed and no table changes, so the engine
+// applies vschema.json without attempting to execute an empty statement.
+func TestGroupedResumeChangesVSchemaOnly(t *testing.T) {
+	tasks := []*storage.Task{
+		{Namespace: "commerce", TableName: "VSchema: commerce", DDLAction: "vschema_update"},
+	}
+
+	changes := groupedResumeChanges(tasks)
+
+	require.Len(t, changes, 1)
+	assert.Equal(t, "commerce", changes[0].Namespace)
+	assert.Empty(t, changes[0].TableChanges)
+	assert.Equal(t, "true", changes[0].Metadata["vschema_changed"])
+}
+
 func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              123,
