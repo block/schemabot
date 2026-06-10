@@ -424,7 +424,7 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
 			"environment", check.Environment, "check_id", check.ID,
-			"apply_id", priorApplyID, "error", err)
+			"prior_apply_id", priorApplyID, "error", err)
 		return false
 	}
 
@@ -444,7 +444,7 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
 			"environment", check.Environment, "check_id", check.ID,
-			"apply_id", priorApplyID)
+			"prior_apply_id", priorApplyID)
 		return true
 	}
 

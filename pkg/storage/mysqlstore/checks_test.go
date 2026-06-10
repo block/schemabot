@@ -705,6 +705,127 @@ func TestCheckStore_MarkStalePlanSuccessfulLeavesTerminalApplyOwnedBlocking(t *t
 	require.Equal(t, apply.ID, retrieved.ApplyID)
 }
 
+// Stale cleanup runs more than once for the same dropped database: the webhook
+// can re-deliver, or a later commit re-triggers cleanup for a database that is
+// already cleaned. Re-marking a row that already holds the plan-only successful
+// values is idempotent and must report success, not falsely report the row as
+// blocked by an in-flight apply. Under MySQL's production changed-rows
+// semantics the no-op update affects zero rows, so this is the case that proves
+// the re-read distinguishes "already successful" from "apply-owned". The test
+// runs on a changed-rows connection (no clientFoundRows) to exercise that path.
+func TestCheckStore_MarkStalePlanSuccessfulIsIdempotentUnderChangedRows(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := newChangedRowsStore(t)
+
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:     "org/repo",
+		PullRequest:    123,
+		HeadSHA:        "oldsha",
+		Environment:    "staging",
+		DatabaseType:   "mysql",
+		DatabaseName:   "testdb",
+		HasChanges:     true,
+		Status:         "completed",
+		Conclusion:     "action_required",
+		BlockingReason: "schema_change_pending",
+		ErrorMessage:   "schema change pending apply",
+	}))
+
+	successCheck := &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "newsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	}
+
+	marked, err := store.Checks().MarkStalePlanSuccessful(ctx, successCheck)
+	require.NoError(t, err)
+	require.True(t, marked, "first stale cleanup must mark the plan-only check successful")
+
+	// Re-marking the already-successful row is a no-op write under changed-rows
+	// semantics, but the row is genuinely successful and must still report so.
+	marked, err = store.Checks().MarkStalePlanSuccessful(ctx, successCheck)
+	require.NoError(t, err)
+	require.True(t, marked, "re-marking an already-successful plan check must report success, not blocking")
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "newsha", retrieved.HeadSHA)
+	require.Equal(t, "completed", retrieved.Status)
+	require.Equal(t, "success", retrieved.Conclusion)
+	require.False(t, retrieved.HasChanges)
+	require.Equal(t, int64(0), retrieved.ApplyID)
+	require.Empty(t, retrieved.BlockingReason)
+	require.Empty(t, retrieved.ErrorMessage)
+}
+
+// Under changed-rows semantics, a row claimed by a started apply between the
+// cleanup read and the write must still be reported as blocking. The guard
+// excludes it (zero rows affected) and the re-read finds an in_progress,
+// apply-owned row, so cleanup must not derive a passing check from it.
+func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlockingUnderChangedRows(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := newChangedRowsStore(t)
+
+	apply := createCheckStoreApply(t, store, "apply-claimed-under-changed-rows", state.Apply.Running)
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "oldsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		CheckRunID:   100,
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       "in_progress",
+		Conclusion:   "",
+	}))
+
+	marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "newsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	})
+	require.NoError(t, err)
+	require.False(t, marked, "in-flight apply-owned check must not be marked successful by stale cleanup")
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "oldsha", retrieved.HeadSHA)
+	require.Equal(t, "in_progress", retrieved.Status)
+	require.True(t, retrieved.HasChanges)
+	require.Equal(t, apply.ID, retrieved.ApplyID)
+}
+
+// newChangedRowsStore opens a Storage on a connection without clientFoundRows so
+// UPDATE ... RowsAffected reflects changed rows, matching production semantics.
+func newChangedRowsStore(t *testing.T) *Storage {
+	t.Helper()
+	db, err := sql.Open("mysql", testDSNChangedRows)
+	require.NoError(t, err)
+	require.NoError(t, db.PingContext(t.Context()))
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	return New(db)
+}
+
 func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheck(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
