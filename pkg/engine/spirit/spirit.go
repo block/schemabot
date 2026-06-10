@@ -50,11 +50,12 @@ type Engine struct {
 	linter       *lint.Linter
 
 	// Configuration
-	targetChunkTime time.Duration
-	threads         int
-	lockWaitTimeout time.Duration
-	debugLogs       bool
-	cpuHint         int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown)
+	targetChunkTime     time.Duration
+	threads             int
+	lockWaitTimeout     time.Duration
+	debugLogs           bool
+	disablePendingDrops bool
+	cpuHint             int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown)
 
 	// Log callback for routing Spirit logs to ApplyLogStore (with table context)
 	onLog func(level slog.Level, table, msg string)
@@ -101,6 +102,12 @@ type Config struct {
 	Threads         int
 	LockWaitTimeout time.Duration
 	DebugLogs       bool // Enable Spirit's verbose debug logs (replication events, etc.)
+
+	// DisablePendingDrops executes DROP TABLE statements directly instead of
+	// quarantining the table in the pending drops database. Quarantine is the
+	// default because it keeps dropped table data recoverable until the
+	// retention period expires.
+	DisablePendingDrops bool
 }
 
 // New creates a new Spirit engine.
@@ -126,12 +133,13 @@ func New(cfg Config) *Engine {
 	}
 
 	eng := &Engine{
-		logger:          logger,
-		linter:          lint.New(),
-		targetChunkTime: targetChunkTime,
-		threads:         threads,
-		lockWaitTimeout: lockWaitTimeout,
-		debugLogs:       cfg.DebugLogs,
+		logger:              logger,
+		linter:              lint.New(),
+		targetChunkTime:     targetChunkTime,
+		threads:             threads,
+		lockWaitTimeout:     lockWaitTimeout,
+		debugLogs:           cfg.DebugLogs,
+		disablePendingDrops: cfg.DisablePendingDrops,
 	}
 
 	// Create Spirit logger with filter that checks debugLogs at runtime

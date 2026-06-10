@@ -123,6 +123,8 @@ type LocalConfig struct {
 	// engine via Credentials.Metadata and reads specific keys as needed.
 	// Keys used by PlanetScale: organization, token_name, token_value,
 	// tls_name, revert_window_duration, main_branch.
+	// Keys used by Spirit: pending_drops ("false" disables the pending drops
+	// quarantine so DROP TABLE executes directly).
 	Metadata map[string]string
 }
 
@@ -182,9 +184,14 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 	}
 
 	return &LocalClient{
-		config:            cfg,
-		storage:           stor,
-		spiritEngine:      spirit.New(spirit.Config{Logger: logger}),
+		config:  cfg,
+		storage: stor,
+		spiritEngine: spirit.New(spirit.Config{
+			Logger: logger,
+			// Pending drops quarantine is on by default; deployments opt out
+			// via the pending_drops metadata key.
+			DisablePendingDrops: cfg.Metadata["pending_drops"] == "false",
+		}),
 		planetscaleEngine: psEngine,
 		logger:            logger,
 		heartbeatInterval: 10 * time.Second,

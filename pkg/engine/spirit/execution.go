@@ -83,11 +83,22 @@ func (e *Engine) executeMigration(ctx context.Context, host, username, password,
 		}
 	}
 
-	// Execute DROP TABLE statements last (each individually through Spirit)
+	// Execute DROP TABLE statements last. By default the table is quarantined
+	// in the pending drops database instead of dropped, so its data stays
+	// recoverable until the retention period expires. When pending drops is
+	// disabled, the DROP executes directly through Spirit.
 	for _, stmt := range dropStatements {
-		if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
-			e.logger.Error("DROP TABLE failed", "error", err)
-			e.setMigrationFailed(fmt.Errorf("DROP TABLE failed: %w", err))
+		if e.disablePendingDrops {
+			if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
+				e.logger.Error("DROP TABLE failed", "error", err)
+				e.setMigrationFailed(fmt.Errorf("DROP TABLE failed: %w", err))
+				return
+			}
+			continue
+		}
+		if err := e.quarantineDroppedTables(ctx, host, username, password, database, stmt); err != nil {
+			e.logger.Error("DROP TABLE quarantine failed", "error", err)
+			e.setMigrationFailed(fmt.Errorf("DROP TABLE quarantine failed: %w", err))
 			return
 		}
 	}

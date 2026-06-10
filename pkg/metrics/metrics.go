@@ -1101,3 +1101,22 @@ func RecordStatusCheckOperation(ctx context.Context, op StatusCheckOperation) {
 	}
 	counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
 }
+
+// RecordPendingDropMoved increments the counter for tables quarantined into
+// the pending drops database instead of being dropped.
+func RecordPendingDropMoved(ctx context.Context, database string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.pending_drops.tables_moved_total",
+		otelmetric.WithDescription("Total number of dropped tables quarantined into the pending drops database"),
+		otelmetric.WithUnit("{table}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create pending drops moved counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+		),
+	)
+}
