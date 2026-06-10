@@ -1306,6 +1306,98 @@ func TestApplyStore_FindNextApplyClaimsStoppedStartControlRequest(t *testing.T) 
 	assert.Nil(t, claimedAgain, "claim transition should prevent another worker from taking the same stopped start request")
 }
 
+// TestApplyStore_ClaimStoppedStartRefusedWhenTargetActive verifies the
+// one-active-apply-per-target invariant survives a stopped→running claim. A
+// stopped apply is not "active", so a newer apply can become active for the same
+// target while it sits stopped. Claiming the stopped apply must re-check the
+// target under the apply-target lock: when another active apply owns the target
+// the claim is refused, the stopped apply stays stopped, and the pending start
+// control request is failed with an operator-visible reason — so the target
+// never ends up with two running applies.
+func TestApplyStore_ClaimStoppedStartRefusedWhenTargetActive(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	active := createTestApplyWithStateAndEnv(t, store, lock, "apply_active_running", 1, state.Apply.Running, "staging")
+	stopped := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_blocked", 2, state.Apply.Stopped, "staging")
+
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   stopped.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, stopped.ID, "test-owner")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "claim must be refused while another active apply owns the target")
+
+	persistedStopped, err := store.Applies().Get(ctx, stopped.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedStopped)
+	assert.Equal(t, state.Apply.Stopped, persistedStopped.State, "refused claim must leave the apply stopped")
+
+	stillPending, err := store.ControlRequests().GetPending(ctx, stopped.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, stillPending, "the start request must no longer be pending after refusal")
+
+	failed := getStartControlRequest(t, stopped.ID)
+	assert.Equal(t, storage.ControlRequestFailed, failed.Status)
+	assert.Contains(t, failed.ErrorMessage, "another active apply exists for testdb/mysql/staging")
+
+	assertExactlyOneRunningApply(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+
+	persistedActive, err := store.Applies().Get(ctx, active.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedActive)
+	assert.Equal(t, state.Apply.Running, persistedActive.State)
+}
+
+// TestApplyStore_ClaimStoppedStartSucceedsWhenTargetClear verifies the happy
+// path of the stopped→running claim re-check: with no other active apply on the
+// target, claiming a stopped apply that carries a pending start control request
+// transitions it to running and leaves exactly one running apply for the target.
+func TestApplyStore_ClaimStoppedStartSucceedsWhenTargetClear(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	stopped := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_clear", 1, state.Apply.Stopped, "staging")
+
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   stopped.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, stopped.ID, "test-owner")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "clear target must allow the stopped apply to be claimed")
+	assert.Equal(t, stopped.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.Stopped, claimed.State, "caller sees the pre-claim state")
+
+	persisted, err := store.Applies().Get(ctx, stopped.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Running, persisted.State, "claim must transition stopped → running")
+
+	// The resume path (operator) completes the start request after a successful
+	// claim; the storage claim's job is only to safely make the apply running.
+	stillPending, err := store.ControlRequests().GetPending(ctx, stopped.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, stillPending, "a successful claim leaves the start request pending for the resume path to complete")
+
+	assertExactlyOneRunningApply(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+}
+
 func TestApplyStore_FindNextApplyClaimsStaleWaitingForCutoverControlRequest(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -1986,6 +2078,37 @@ func createTestLockWithPR(t *testing.T, store *Storage, dbName, dbType, env, rep
 	lock, err := store.Locks().Get(ctx, dbName, dbType)
 	require.NoError(t, err)
 	return lock
+}
+
+// getStartControlRequest reads the 'start' control request for an apply
+// regardless of status, so tests can assert on a failed request that the
+// status-scoped GetPending accessor cannot return.
+func getStartControlRequest(t *testing.T, applyID int64) *storage.ApplyControlRequest {
+	t.Helper()
+	row := testDB.QueryRowContext(t.Context(), `
+		SELECT `+controlRequestColumns+`
+		FROM apply_control_requests
+		WHERE apply_id = ? AND operation = ?
+	`, applyID, storage.ControlOperationStart)
+	req, err := scanControlRequest(row)
+	require.NoError(t, err)
+	require.NotNil(t, req, "expected a start control request for apply %d", applyID)
+	return req
+}
+
+// assertExactlyOneRunningApply fails unless exactly one running apply exists for
+// the target, guarding the one-active-apply-per-target invariant.
+func assertExactlyOneRunningApply(t *testing.T, store *Storage, database, dbType, environment string) {
+	t.Helper()
+	applies, err := store.Applies().GetByDatabase(t.Context(), database, dbType, environment)
+	require.NoError(t, err)
+	running := 0
+	for _, a := range applies {
+		if state.IsState(a.State, state.Apply.Running) {
+			running++
+		}
+	}
+	assert.Equal(t, 1, running, "exactly one running apply must exist for %s/%s/%s", database, dbType, environment)
 }
 
 func createTestApply(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64) *storage.Apply {

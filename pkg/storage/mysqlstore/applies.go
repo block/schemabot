@@ -814,16 +814,19 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 		return nil, fmt.Errorf("query next claimable apply: %w", err)
 	}
 
-	claimed, err := persistApplyClaim(ctx, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
-	if !claimed {
+	if outcome.claimedAndComplete() {
+		return apply, nil
+	}
+	if outcome != claimAcquired {
 		return nil, nil
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit claim apply %d: %w", apply.ID, err)
+		return nil, fmt.Errorf("commit claim apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
 	}
 
 	return apply, nil
@@ -834,7 +837,10 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 // level claim loop calls this after claiming an apply_operations row to acquire
 // the parent apply lease that lease-guarded writes (ResumeApply, MarkCompleted,
 // Heartbeat) require. Returns nil when the apply does not exist, is locked by a
-// peer (SKIP LOCKED), or is not currently claimable.
+// peer (SKIP LOCKED), is not currently claimable, or — for a stopped apply with
+// a pending start request — the claim was refused because another active apply
+// owns the target (the start request is failed in that case; see
+// persistApplyClaim).
 func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*storage.Apply, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply %d: %w", applyID, storage.ErrApplyLeaseLost)
@@ -894,19 +900,50 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 		return nil, fmt.Errorf("query claimable apply %d: %w", applyID, err)
 	}
 
-	claimed, err := persistApplyClaim(ctx, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
-	if !claimed {
+	if outcome.claimedAndComplete() {
+		return apply, nil
+	}
+	if outcome != claimAcquired {
 		return nil, nil
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit claim apply %d: %w", apply.ID, err)
+		return nil, fmt.Errorf("commit claim apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
 	}
 
 	return apply, nil
+}
+
+// claimOutcome describes how persistApplyClaim resolved a claim attempt and
+// who owns committing the transaction.
+type claimOutcome int
+
+const (
+	// claimLostRace means a concurrent writer moved the row between the SELECT
+	// and the guarded UPDATE; the caller must roll back and back off.
+	claimLostRace claimOutcome = iota
+	// claimAcquired means the claim succeeded and the caller must commit tx.
+	claimAcquired
+	// claimAcquiredCommitted means a stopped→running claim succeeded and was
+	// already committed inside persistApplyClaim under the apply-target lock, so
+	// the caller must return the apply without committing again.
+	claimAcquiredCommitted
+	// claimRefusedActiveTarget means a stopped→running claim was refused because
+	// another active apply already owns the target. The pending start control
+	// request was failed and committed inside persistApplyClaim, so the caller
+	// must not claim and must not commit again.
+	claimRefusedActiveTarget
+)
+
+// claimedAndComplete reports whether the outcome both acquired the claim and
+// requires no further commit from the caller — i.e. the stopped path committed
+// under the apply-target lock.
+func (o claimOutcome) claimedAndComplete() bool {
+	return o == claimAcquiredCommitted
 }
 
 // persistApplyClaim rotates the lease (owner, token, acquired_at) onto apply in
@@ -914,41 +951,36 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 // Pending, stopped-start, and retryable applies move into running as part of the
 // claim so another worker cannot immediately re-claim the same durable request
 // after the transaction releases its row lock; active applies just refresh the
-// heartbeat. Reports false when the guarded UPDATE matched zero rows, meaning
-// another worker moved the row between SELECT and UPDATE.
-func persistApplyClaim(ctx context.Context, tx *sql.Tx, apply *storage.Apply, owner string) (bool, error) {
+// heartbeat.
+//
+// A stopped→running claim re-checks the one-active-apply-per-target invariant
+// under the apply-target lock before transitioning, because a stopped apply is
+// not "active" and a newer apply may have been created for the same target while
+// it sat stopped. The lock is held across the transition and the commit so a
+// concurrent create cannot slip a second active apply onto the target in the
+// window between the re-check and the commit. When another active apply owns the
+// target the claim is refused and the pending start control request is failed so
+// the operator sees why.
+func persistApplyClaim(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *storage.Apply, owner string) (claimOutcome, error) {
 	leaseToken := uuid.NewString()
 	leaseAcquiredAt := time.Now()
 	apply.LeaseOwner = owner
 	apply.LeaseToken = leaseToken
 	apply.LeaseAcquiredAt = &leaseAcquiredAt
 
-	if apply.State == state.Apply.Pending || apply.State == state.Apply.Stopped || apply.State == state.Apply.FailedRetryable {
-		nextState := state.Apply.Running
-		result, err := tx.ExecContext(ctx, `
-			UPDATE applies
-			SET state = ?, updated_at = NOW(),
-			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW(),
-			    attempt = CASE WHEN ? = ? THEN attempt + 1 ELSE attempt END,
-			    completed_at = NULL,
-			    error_message = CASE WHEN ? = ? THEN '' ELSE error_message END
-			WHERE id = ? AND state = ?
-		`, nextState, owner, leaseToken, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.ID, apply.State)
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		return claimStoppedApplyUnderTargetLock(ctx, db, tx, apply, owner, leaseToken)
+	}
+
+	if isStartingClaim(apply.State) {
+		claimed, err := transitionClaimToRunning(ctx, tx, apply, owner, leaseToken)
 		if err != nil {
-			return false, fmt.Errorf("claim apply %d in state %s: %w", apply.ID, apply.State, err)
+			return claimLostRace, err
 		}
-		rows, err := result.RowsAffected()
-		if err != nil {
-			return false, fmt.Errorf("read claim rows affected for apply %d: %w", apply.ID, err)
+		if !claimed {
+			return claimLostRace, nil
 		}
-		if rows == 0 {
-			return false, nil
-		}
-		if apply.State == state.Apply.FailedRetryable {
-			apply.Attempt++
-			apply.ErrorMessage = ""
-		}
-		return true, nil
+		return claimAcquired, nil
 	}
 
 	if _, err := tx.ExecContext(ctx, `
@@ -957,9 +989,128 @@ func persistApplyClaim(ctx context.Context, tx *sql.Tx, apply *storage.Apply, ow
 		    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
 		WHERE id = ?
 	`, owner, leaseToken, apply.ID); err != nil {
-		return false, fmt.Errorf("refresh heartbeat for claimed apply %d: %w", apply.ID, err)
+		return claimLostRace, fmt.Errorf("refresh heartbeat for claimed apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
+	}
+	return claimAcquired, nil
+}
+
+// claimStoppedApplyUnderTargetLock drives the full stopped→running claim while
+// holding the apply-target lock: re-check the one-active-apply-per-target
+// invariant, then either transition+commit or refuse+commit. It commits inside
+// the lock so a concurrent create cannot add a second active apply between the
+// re-check and the commit. The lock is released only after the commit.
+func claimStoppedApplyUnderTargetLock(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
+	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, tx, apply)
+	if err != nil {
+		return claimLostRace, err
+	}
+	if !hasApplyTarget(database, dbType, environment) {
+		return claimLostRace, fmt.Errorf("stopped apply %d (%s) is missing target metadata for claim re-check", apply.ID, apply.ApplyIdentifier)
+	}
+
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, database, dbType, environment)
+	if err != nil {
+		return claimLostRace, err
+	}
+	defer releaseApplyTargetLockConn(ctx, conn, lockName, "claim stopped apply")
+
+	if err := checkNoActiveApplyForTarget(ctx, tx, database, dbType, environment, deployment, apply.ID); err != nil {
+		if !errors.Is(err, storage.ErrActiveApplyExists) {
+			return claimLostRace, err
+		}
+		return refuseStoppedClaimForActiveTarget(ctx, tx, apply, owner, database, dbType, environment)
+	}
+
+	claimed, err := transitionClaimToRunning(ctx, tx, apply, owner, leaseToken)
+	if err != nil {
+		return claimLostRace, err
+	}
+	if !claimed {
+		return claimLostRace, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return claimLostRace, fmt.Errorf("commit claim stopped apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
+	}
+	return claimAcquiredCommitted, nil
+}
+
+// isStartingClaim reports whether a claim of an apply in this state transitions
+// it into running (as opposed to only refreshing the heartbeat of an already
+// active apply).
+func isStartingClaim(applyState string) bool {
+	return state.IsState(applyState, state.Apply.Pending, state.Apply.Stopped, state.Apply.FailedRetryable)
+}
+
+// transitionClaimToRunning performs the guarded stopped/pending/retryable →
+// running transition that rotates the lease. WHERE state = ? guards against a
+// concurrent transition landing between the SELECT and this UPDATE; a zero
+// rows-affected result means another worker already moved the row, so the
+// caller backs off cleanly. Reports false on that lost race.
+func transitionClaimToRunning(ctx context.Context, tx *sql.Tx, apply *storage.Apply, owner, leaseToken string) (bool, error) {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE applies
+		SET state = ?, updated_at = NOW(),
+		    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW(),
+		    attempt = CASE WHEN ? = ? THEN attempt + 1 ELSE attempt END,
+		    completed_at = NULL,
+		    error_message = CASE WHEN ? = ? THEN '' ELSE error_message END
+		WHERE id = ? AND state = ?
+	`, state.Apply.Running, owner, leaseToken, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.ID, apply.State)
+	if err != nil {
+		return false, fmt.Errorf("claim apply %d (%s) in state %s: %w", apply.ID, apply.ApplyIdentifier, apply.State, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read claim rows affected for apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+	if state.IsState(apply.State, state.Apply.FailedRetryable) {
+		apply.Attempt++
+		apply.ErrorMessage = ""
 	}
 	return true, nil
+}
+
+// refuseStoppedClaimForActiveTarget fails the pending start control request for
+// a stopped apply that cannot be resumed because another active apply owns the
+// target, and commits that failure inside tx. The start was accepted but cannot
+// be honored, so leaving the request pending would silently strand it; failing
+// it surfaces the reason to the operator. Returns claimRefusedActiveTarget.
+func refuseStoppedClaimForActiveTarget(ctx context.Context, tx *sql.Tx, apply *storage.Apply, owner, database, dbType, environment string) (claimOutcome, error) {
+	reason := fmt.Sprintf("start refused: another active apply exists for %s/%s/%s", database, dbType, environment)
+	if err := failPendingStartControlRequestTx(ctx, tx, apply.ID, reason); err != nil {
+		return claimLostRace, fmt.Errorf("fail pending start control request for apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return claimLostRace, fmt.Errorf("commit refused stopped claim for apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
+	}
+	slog.WarnContext(ctx, "claim refused: another active apply exists for target; failing pending start control request",
+		"apply_id", apply.ApplyIdentifier,
+		"apply_db_id", apply.ID,
+		"database", database,
+		"database_type", dbType,
+		"environment", environment,
+		"lease_owner", owner,
+		"reason", reason)
+	return claimRefusedActiveTarget, nil
+}
+
+// failPendingStartControlRequestTx marks the pending 'start' control request for
+// an apply failed inside the supplied claim transaction so the refusal and the
+// failed request commit atomically. Mirrors controlRequestStore.FailPending's
+// SQL; this path holds no apply lease, so it is unguarded by lease token.
+func failPendingStartControlRequestTx(ctx context.Context, tx *sql.Tx, applyID int64, reason string) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE apply_control_requests
+		SET status = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE apply_id = ? AND operation = ? AND status = ?
+	`, storage.ControlRequestFailed, reason, applyID, storage.ControlOperationStart, storage.ControlRequestPending)
+	if err != nil {
+		return fmt.Errorf("update apply_control_requests for apply %d: %w", applyID, err)
+	}
+	return nil
 }
 
 // Heartbeat updates the apply's updated_at timestamp to maintain the lease.
