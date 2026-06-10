@@ -375,28 +375,29 @@ type DatabaseConfig struct {
 	// and descendants. A literal "*" allows any trusted schema directory.
 	AllowedDirs []string `yaml:"allowed_dirs,omitempty"`
 
-	// OperatorTeams are GitHub teams whose members may run apply/apply-confirm
-	// PR comment commands for this database when PR command authorization is enabled.
+	// OperatorTeams are GitHub teams whose members may run mutating PR comment
+	// commands for this database when PR command authorization is enabled.
 	OperatorTeams []string `yaml:"operator_teams,omitempty"`
 
-	// OperatorUsers are GitHub users who may run apply/apply-confirm PR comment
-	// commands for this database when PR command authorization is enabled.
+	// OperatorUsers are GitHub users who may run mutating PR comment commands
+	// for this database when PR command authorization is enabled.
 	OperatorUsers []string `yaml:"operator_users,omitempty"`
 }
 
-// PRCommandAuthorizationConfig configures actor authorization for SchemaBot
-// apply/apply-confirm GitHub PR comment commands.
+// PRCommandAuthorizationConfig configures actor authorization for mutating
+// SchemaBot GitHub PR comment commands (apply, stop, cutover, rollback,
+// unlock, and their confirmation variants).
 type PRCommandAuthorizationConfig struct {
-	// Enabled turns on fail-closed actor authorization for apply/apply-confirm
-	// PR commands.
+	// Enabled turns on fail-closed actor authorization for mutating PR
+	// commands.
 	Enabled bool `yaml:"enabled,omitempty"`
 
-	// AdminTeams are GitHub teams whose members may run apply/apply-confirm PR
-	// commands for any configured database.
+	// AdminTeams are GitHub teams whose members may run mutating PR commands
+	// for any configured database.
 	AdminTeams []string `yaml:"admin_teams,omitempty"`
 
-	// AdminUsers are GitHub users who may run apply/apply-confirm PR commands
-	// for any configured database.
+	// AdminUsers are GitHub users who may run mutating PR commands for any
+	// configured database.
 	AdminUsers []string `yaml:"admin_users,omitempty"`
 }
 

@@ -36,7 +36,7 @@ type ActorAuthorizationCommentData struct {
 }
 
 // RenderPRCommandNotAuthorized renders a comment when a GitHub PR command
-// actor is not allowed to run SchemaBot apply/apply-confirm for the database.
+// actor is not allowed to run a mutating SchemaBot command for the database.
 func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 	var sb strings.Builder
 
@@ -54,7 +54,7 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 }
 
 // RenderPRCommandAuthorizationUnavailable renders a comment when SchemaBot
-// cannot verify actor authorization for apply/apply-confirm.
+// cannot verify actor authorization for a mutating PR command.
 func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData) string {
 	var sb strings.Builder
 

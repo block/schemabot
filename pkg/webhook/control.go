@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -97,28 +96,9 @@ func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, r
 			fmt.Sprintf("Apply %s belongs to environment %q, not %q", result.ApplyID, apply.Environment, result.Environment))
 		return
 	}
-	var client *ghclient.InstallationClient
-	if h.service.Config().PRCommandAuthorizationEnabled() && h.ghClients.Len() > 0 {
-		var clientErr error
-		client, clientErr = h.clientForRepo(repo, installationID)
-		if clientErr != nil {
-			h.logger.Warn("stop PR command blocked because actor authorization client could not be created",
-				"repo", repo,
-				"pr", pr,
-				"apply_id", result.ApplyID,
-				"database", apply.Database,
-				"database_type", apply.DatabaseType,
-				"environment", result.Environment,
-				"requested_by", requestedBy,
-				"error", clientErr)
-			h.postComment(repo, pr, installationID, templates.RenderPRCommandAuthorizationUnavailable(templates.ActorAuthorizationCommentData{
-				RequestedBy: requestedBy,
-				CommandName: action.Stop,
-				Database:    apply.Database,
-				Environment: result.Environment,
-			}))
-			return
-		}
+	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, apply.Database, result.Environment, action.Stop)
+	if blocked {
+		return
 	}
 	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, action.Stop); blocked {
 		return
@@ -274,28 +254,9 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 			fmt.Sprintf("Apply %s belongs to environment %q, not %q", result.ApplyID, apply.Environment, result.Environment))
 		return
 	}
-	var client *ghclient.InstallationClient
-	if h.service.Config().PRCommandAuthorizationEnabled() && h.ghClients.Len() > 0 {
-		var clientErr error
-		client, clientErr = h.clientForRepo(repo, installationID)
-		if clientErr != nil {
-			h.logger.Warn("cutover PR command blocked because actor authorization client could not be created",
-				"repo", repo,
-				"pr", pr,
-				"apply_id", result.ApplyID,
-				"database", apply.Database,
-				"database_type", apply.DatabaseType,
-				"environment", result.Environment,
-				"requested_by", requestedBy,
-				"error", clientErr)
-			h.postComment(repo, pr, installationID, templates.RenderPRCommandAuthorizationUnavailable(templates.ActorAuthorizationCommentData{
-				RequestedBy: requestedBy,
-				CommandName: action.Cutover,
-				Database:    apply.Database,
-				Environment: result.Environment,
-			}))
-			return
-		}
+	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, apply.Database, result.Environment, action.Cutover)
+	if blocked {
+		return
 	}
 	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, action.Cutover); blocked {
 		return

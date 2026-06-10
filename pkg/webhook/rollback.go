@@ -55,6 +55,17 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		return
 	}
 
+	// Rollback executes DDL against the target database, so the actor must be
+	// an authorized admin/operator before any lock is acquired or a rollback
+	// plan is generated.
+	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, database, environment, action.Rollback)
+	if blocked {
+		return
+	}
+	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback); blocked {
+		return
+	}
+
 	// Check for existing lock
 	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
 	if err != nil {
@@ -162,6 +173,13 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 	database := schemaResult.Database
 	dbType := schemaResult.Type
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
+
+	// Rollback-confirm executes DDL with unsafe changes allowed, so the actor
+	// must be an authorized admin/operator before any lock state is read,
+	// released, or acted on.
+	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm); blocked {
+		return
+	}
 
 	// Check lock ownership
 	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
