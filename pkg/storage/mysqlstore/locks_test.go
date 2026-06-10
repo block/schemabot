@@ -151,6 +151,76 @@ func TestLockStore_Acquire_SameOwnerConcurrent(t *testing.T) {
 	assert.Contains(t, lock.PendingPlanID, "plan-", "stored plan should be one of the concurrent attempts")
 }
 
+// Under MySQL's default changed-rows semantics, a same-owner refresh whose new
+// confirmation plan already matches the stored value reports zero affected rows
+// even though the owner still holds the lock. This happens when a concurrent
+// same-owner caller wrote the same plan first. The refresh must treat the caller
+// as still holding the lock and succeed, not turn it away with ErrLockHeld.
+func TestLockStore_Acquire_RefreshSameOwnerValueAlreadyMatches(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+
+	db, err := sql.Open("mysql", testDSNChangedRows)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	require.NoError(t, db.PingContext(ctx))
+	store := &lockStore{db: db}
+
+	require.NoError(t, store.Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "plan-1",
+	}))
+
+	// A concurrent same-owner caller already set pending_plan_id to plan-2.
+	_, err = db.ExecContext(ctx, `
+		UPDATE locks
+		SET pending_plan_id = ?
+		WHERE database_name = ? AND database_type = ? AND owner = ?
+	`, "plan-2", "testdb", "vitess", "org/repo#123")
+	require.NoError(t, err)
+
+	// This caller's refresh targets the same value. The UPDATE matches the row but
+	// changes nothing, so RowsAffected is 0 under changed-rows semantics. The caller
+	// still owns the lock, so the refresh must succeed.
+	err = store.refreshPendingPlanID(ctx,
+		&storage.Lock{
+			DatabaseName:  "testdb",
+			DatabaseType:  "vitess",
+			Owner:         "org/repo#123",
+			PendingPlanID: "plan-2",
+		},
+		&storage.Lock{
+			DatabaseName:  "testdb",
+			DatabaseType:  "vitess",
+			Owner:         "org/repo#123",
+			PendingPlanID: "plan-1",
+		})
+	require.NoError(t, err)
+
+	lock, err := store.Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "org/repo#123", lock.Owner)
+	assert.Equal(t, "plan-2", lock.PendingPlanID)
+
+	// A full same-owner Acquire whose plan already matches the stored value must
+	// also succeed for the same reason.
+	require.NoError(t, store.Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "plan-2",
+	}))
+}
+
 // When the lock changes hands between reading it and refreshing its confirmation
 // plan, the refresh must not silently succeed: the caller no longer holds the lock
 // and must learn the accurate cause (held by another owner, or gone entirely).

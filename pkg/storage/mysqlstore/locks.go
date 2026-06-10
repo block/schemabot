@@ -79,11 +79,15 @@ func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 // refreshPendingPlanID overwrites the stored confirmation plan reference when the
 // caller supplied a new one (an apply re-run posts a new confirmation plan).
 // The UPDATE is owner-scoped: it only changes the row while this owner still holds
-// the lock. The refresh runs only when the value differs, so a row that matched
-// the predicate always changes — RowsAffected==0 therefore means the owner
-// predicate no longer matched (the lock was released or re-acquired by another
-// owner between the read and this write), under both changed-rows and
-// clientFoundRows DSN semantics. Re-read to report the accurate cause.
+// the lock.
+//
+// RowsAffected==0 is ambiguous and must not be read as "the owner predicate no
+// longer matched". Under MySQL's default changed-rows semantics, a matched row
+// reports zero affected rows when the stored value already equals the new value —
+// which happens when a concurrent same-owner caller set the same pending_plan_id
+// between this caller's read and its write. The owner still holds the lock in that
+// case, so the refresh has succeeded. To distinguish that from a genuine ownership
+// change, re-read the lock and branch on its actual state.
 func (s *lockStore) refreshPendingPlanID(ctx context.Context, lock, existing *storage.Lock) error {
 	if lock.PendingPlanID == "" || lock.PendingPlanID == existing.PendingPlanID {
 		return nil
@@ -108,11 +112,16 @@ func (s *lockStore) refreshPendingPlanID(ctx context.Context, lock, existing *st
 
 	current, getErr := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
 	if getErr != nil {
-		return fmt.Errorf("read lock after pending_plan_id refresh missed for %s/%s: %w",
-			lock.DatabaseName, lock.DatabaseType, getErr)
+		return fmt.Errorf("read lock after pending_plan_id refresh affected no rows for %s/%s owner=%s: %w",
+			lock.DatabaseName, lock.DatabaseType, lock.Owner, getErr)
 	}
 	if current == nil {
 		return storage.ErrLockNotFound
+	}
+	if current.Owner == lock.Owner {
+		// The caller still owns the lock; the UPDATE affected no rows only because
+		// the stored value already matched, so the refresh is satisfied.
+		return nil
 	}
 	return storage.ErrLockHeld
 }
