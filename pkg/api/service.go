@@ -345,7 +345,11 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		if len(parts) != 2 {
 			return nil, fmt.Errorf("token for %s resolved from %q must be in name:value format", key, envConfig.TokenSecretRef)
 		}
-		tokenName, tokenValue = parts[0], parts[1]
+		tokenName = strings.TrimSpace(parts[0])
+		tokenValue = strings.TrimSpace(parts[1])
+		if tokenName == "" || tokenValue == "" {
+			return nil, fmt.Errorf("token for %s resolved from %q must be in name:value format with a non-empty name and value", key, envConfig.TokenSecretRef)
+		}
 	}
 
 	// Register TLS config for PlanetScale MySQL connections if configured
@@ -358,13 +362,17 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	}
 
 	// LocalClient uses SchemaBot's storage directly. ServerConfig.Validate
-	// rejects an unparseable revert_window_duration at config load; parse here
-	// fails closed rather than silently falling back to the default window.
+	// rejects an unparseable or non-positive revert_window_duration at config
+	// load; parsing here fails closed rather than silently falling back to the
+	// default window.
 	var revertWindow time.Duration
 	if envConfig.RevertWindowDuration != "" {
 		d, err := time.ParseDuration(envConfig.RevertWindowDuration)
 		if err != nil {
 			return nil, fmt.Errorf("parse revert_window_duration %q for %s: %w", envConfig.RevertWindowDuration, key, err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("revert_window_duration %q for %s must be positive (omit it to use the engine default)", envConfig.RevertWindowDuration, key)
 		}
 		revertWindow = d
 	}

@@ -1356,15 +1356,20 @@ func (c EnvironmentConfig) ResolveDSN() (string, error) {
 }
 
 // validateRevertWindowDuration ensures a configured revert window parses as a
-// Go duration. An empty value means "use the engine default"; only a non-empty
-// unparseable value is rejected so a typo fails closed at config load instead of
-// silently reverting to the default window.
+// positive Go duration. An empty value means "use the engine default". A
+// non-empty value that is unparseable or non-positive is rejected so a typo or
+// a meaningless window fails closed at config load instead of silently reverting
+// to the default window.
 func (c EnvironmentConfig) validateRevertWindowDuration(context string) error {
 	if c.RevertWindowDuration == "" {
 		return nil
 	}
-	if _, err := time.ParseDuration(c.RevertWindowDuration); err != nil {
+	d, err := time.ParseDuration(c.RevertWindowDuration)
+	if err != nil {
 		return fmt.Errorf("%s revert_window_duration %q is not a valid duration: %w", context, c.RevertWindowDuration, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("%s revert_window_duration %q must be positive (omit it to use the engine default)", context, c.RevertWindowDuration)
 	}
 	return nil
 }

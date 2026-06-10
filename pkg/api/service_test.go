@@ -214,3 +214,43 @@ func TestNewLocalTernClient_RejectsMalformedTokenReference(t *testing.T) {
 	assert.Contains(t, err.Error(), `"no-separator-token"`)
 	assert.Contains(t, err.Error(), "name:value format")
 }
+
+// A PlanetScale token reference that resolves to a value with the name:value
+// separator present but an empty name or empty value is rejected, rather than
+// silently producing an empty token name or value.
+func TestNewLocalTernClient_RejectsTokenReferenceWithEmptyParts(t *testing.T) {
+	cfg := &ServerConfig{}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	for _, ref := range []string{":secret", "name:", "  :  "} {
+		t.Run(ref, func(t *testing.T) {
+			envConfig := EnvironmentConfig{
+				DSN:            "root@tcp(localhost:3306)/mydb",
+				Organization:   "acme",
+				TokenSecretRef: ref,
+			}
+
+			_, err := service.newLocalTernClient("vitessdb-staging", "vitessdb", "vitess", envConfig)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "vitessdb-staging")
+			assert.Contains(t, err.Error(), "non-empty name and value")
+		})
+	}
+}
+
+// A PlanetScale token reference that resolves to a well-formed name:value pair
+// is accepted when building the local client.
+func TestNewLocalTernClient_AcceptsWellFormedTokenReference(t *testing.T) {
+	cfg := &ServerConfig{}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	envConfig := EnvironmentConfig{
+		DSN:            "root@tcp(localhost:3306)/mydb",
+		Organization:   "acme",
+		TokenSecretRef: "name:value",
+	}
+
+	client, err := service.newLocalTernClient("vitessdb-staging", "vitessdb", "vitess", envConfig)
+	require.NoError(t, err)
+	assert.NotNil(t, client)
+}

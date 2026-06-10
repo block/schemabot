@@ -570,6 +570,31 @@ func TestServerConfig_ValidateRejectsInvalidRevertWindowDuration(t *testing.T) {
 	assert.Contains(t, err.Error(), "not a valid duration")
 }
 
+// A revert_window_duration that parses but is non-positive ("0", "-5m") is
+// rejected so a meaningless window fails closed at config load instead of
+// silently reverting to the engine default window.
+func TestServerConfig_ValidateRejectsNonPositiveRevertWindowDuration(t *testing.T) {
+	for _, value := range []string{"0", "0s", "-5m"} {
+		t.Run(value, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "vitess",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", RevertWindowDuration: value},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" revert_window_duration "`+value+`"`)
+			assert.Contains(t, err.Error(), "must be positive")
+		})
+	}
+}
+
 // A well-formed revert_window_duration parses to the configured window.
 func TestServerConfig_ValidateAcceptsValidRevertWindowDuration(t *testing.T) {
 	cfg := ServerConfig{
