@@ -264,6 +264,15 @@ func TestOperator_OperatorClaimsOperationToCompletion(t *testing.T) {
 	assert.Equal(t, state.ApplyOperation.Completed, ops[0].State, "operator marks the claimed operation completed")
 	assert.Equal(t, apply.Deployment, ops[0].Deployment)
 	require.NotNil(t, ops[0].CompletedAt, "completed operation stamps completed_at")
+
+	// applies.state is derived from its child operation rows: the parent must
+	// equal DeriveApplyState of the operation states it owns.
+	finalApply, err := ts.Storage.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, finalApply)
+	derived := state.DeriveApplyState([]string{ops[0].State})
+	assert.Equal(t, state.Apply.Completed, derived)
+	assert.Equal(t, derived, finalApply.State, "parent apply state is derived from its child operations")
 }
 
 // TestOperator_OperatorReconcilesOperationWhenParentTerminal covers the safety
@@ -314,6 +323,15 @@ func TestOperator_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
 	require.NotNil(t, op)
 	assert.Equal(t, state.ApplyOperation.Completed, op.State)
 	require.NotNil(t, op.CompletedAt, "reconciled completed operation stamps completed_at")
+
+	// Even on the terminal-parent reconciliation path, the parent stays equal to
+	// DeriveApplyState of its child operations.
+	parent, err := ts.Storage.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	derived := state.DeriveApplyState([]string{op.State})
+	assert.Equal(t, state.Apply.Completed, derived)
+	assert.Equal(t, derived, parent.State, "parent apply state is derived from its child operations")
 }
 
 func TestOperator_ClaimOrdering(t *testing.T) {

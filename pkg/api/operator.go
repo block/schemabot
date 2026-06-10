@@ -306,7 +306,23 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
-	s.markOperationFromApplyState(leasedCtx, workerID, op, finalApply)
+	marked, err := s.markOperationFromApplyState(leasedCtx, workerID, op, finalApply)
+	if err != nil {
+		s.logger.Error("operator: failed to update apply_operation from parent apply state; derived apply state not updated",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", finalApply.Environment, "state", finalApply.State, "error", err)
+		return
+	}
+	if !marked {
+		return
+	}
+
+	if err := s.updateApplyStateFromOperations(leasedCtx, workerID, finalApply); err != nil {
+		s.logger.Error("operator: failed to update derived apply state from apply_operations",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
+		return
+	}
 }
 
 // reconcileUnclaimableParent handles a claimed operation whose parent apply
@@ -345,7 +361,22 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 			"deployment", op.Deployment,
 			"environment", parent.Environment,
 			"state", parent.State)
-		s.markOperationFromApplyState(ctx, workerID, op, parent)
+		marked, err := s.markOperationFromApplyState(ctx, workerID, op, parent)
+		if err != nil {
+			s.logger.Error("operator: failed to reconcile apply_operation from terminal parent; derived apply state not updated",
+				"worker", workerID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
+				"deployment", op.Deployment, "environment", parent.Environment, "state", parent.State, "error", err)
+			return
+		}
+		if !marked {
+			return
+		}
+		if err := s.updateApplyStateFromOperations(ctx, workerID, parent); err != nil {
+			s.logger.Error("operator: failed to update derived apply state for terminal parent",
+				"worker", workerID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
+				"deployment", op.Deployment, "environment", parent.Environment, "error", err)
+			return
+		}
 		return
 	}
 	s.logger.Warn("operator: parent apply not claimable for operation; operation will be retried",
@@ -512,43 +543,114 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, workerID int
 }
 
 // markOperationFromApplyState transitions the claimed operation row to mirror
-// the parent apply's final state after a successful resume. Non-terminal parent
-// states leave the operation claimable so a later poll re-leases and resumes it.
-func (s *Service) markOperationFromApplyState(ctx context.Context, workerID int, op *storage.ApplyOperation, apply *storage.Apply) {
+// the parent apply's final state after a successful resume.
+//
+// It returns updated=true only when the operation row was durably written to a
+// terminal state, which is the signal the caller needs before deriving the
+// parent apply's state from its children. A non-terminal parent leaves the
+// operation claimable (updated=false, nil error) so a later poll re-leases and
+// resumes it; a write failure returns the error so the caller skips derivation
+// rather than aggregating a stale child state.
+func (s *Service) markOperationFromApplyState(ctx context.Context, workerID int, op *storage.ApplyOperation, apply *storage.Apply) (updated bool, err error) {
 	opStore := s.storage.ApplyOperations()
 	switch {
 	case state.IsState(apply.State, state.Apply.Completed):
 		if err := opStore.MarkCompleted(ctx, op.ID); err != nil {
-			s.logger.Error("operator: failed to mark apply_operation completed",
-				"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-				"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+			return false, fmt.Errorf("mark apply_operation %d completed (deployment %q): %w", op.ID, op.Deployment, err)
 		}
+		return true, nil
 	case state.IsState(apply.State, state.Apply.Failed):
 		if err := opStore.MarkFailed(ctx, op.ID, apply.ErrorMessage); err != nil {
-			s.logger.Error("operator: failed to mark apply_operation failed",
-				"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-				"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+			return false, fmt.Errorf("mark apply_operation %d failed (deployment %q): %w", op.ID, op.Deployment, err)
 		}
+		return true, nil
 	case state.IsState(apply.State, state.Apply.Stopped):
 		// stopped is resumable, so mirror the state but leave completed_at nil
 		// (matching the apply-level convention) — stopped work may resume.
 		if err := opStore.UpdateState(ctx, op.ID, apply.State); err != nil {
-			s.logger.Error("operator: failed to update stopped apply_operation state",
-				"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-				"deployment", op.Deployment, "environment", apply.Environment, "state", apply.State, "error", err)
+			return false, fmt.Errorf("update stopped apply_operation %d state (deployment %q): %w", op.ID, op.Deployment, err)
 		}
+		return true, nil
 	case state.IsTerminalApplyState(apply.State):
 		// cancelled / reverted — non-resumable terminal states; stamp completed_at.
 		if err := opStore.MarkTerminal(ctx, op.ID, apply.State); err != nil {
-			s.logger.Error("operator: failed to mark terminal apply_operation state",
-				"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-				"deployment", op.Deployment, "environment", apply.Environment, "state", apply.State, "error", err)
+			return false, fmt.Errorf("mark terminal apply_operation %d state %q (deployment %q): %w", op.ID, apply.State, op.Deployment, err)
 		}
+		return true, nil
 	default:
 		s.logger.Debug("operator: parent apply not terminal after resume; leaving operation claimable",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", apply.Environment, "state", apply.State)
+		return false, nil
 	}
+}
+
+// updateApplyStateFromOperations re-derives applies.state from the apply's child
+// apply_operations rows and persists it when it differs from the current value.
+//
+// This is the inverse of markOperationFromApplyState: the operator drives each
+// operation row to its state, then the parent apply's state follows from the
+// aggregate via the same state.DeriveApplyState that derives apply state from
+// task states. While an apply has exactly one operation the derived value equals
+// the value ResumeApply already persisted, so this is a no-op until the
+// multi-deployment fan-out makes an apply own more than one operation.
+//
+// The caller is responsible for lease scoping: the active operator path passes a
+// lease-scoped context so the write fails closed after ownership changes; the
+// terminal-parent reconciliation path passes an unscoped context, which is safe
+// because a terminal parent has no competing driver and the terminal-to-non-
+// terminal guard below refuses to revive it.
+func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID int, apply *storage.Apply) error {
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("list apply_operations for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if len(ops) == 0 {
+		return fmt.Errorf("derive apply state for apply %s (%d): no apply_operations rows", apply.ApplyIdentifier, apply.ID)
+	}
+
+	childStates := make([]string, len(ops))
+	for i, op := range ops {
+		childStates[i] = op.State
+	}
+	derived := state.DeriveApplyState(childStates)
+
+	if state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived) {
+		return fmt.Errorf("derive apply state for terminal apply %s (%d): child operations derive non-terminal state %q from parent state %q",
+			apply.ApplyIdentifier, apply.ID, derived, apply.State)
+	}
+
+	if state.IsState(apply.State, derived) {
+		s.logger.Debug("operator: derived apply state matches current; no update",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment,
+			"state", derived, "operation_count", len(ops))
+		return nil
+	}
+
+	updated := *apply
+	updated.State = derived
+	switch {
+	case state.IsState(derived, state.Apply.Stopped):
+		// stopped is resumable; keep completed_at nil to match the convention.
+		updated.CompletedAt = nil
+	case state.IsTerminalApplyState(derived):
+		if updated.CompletedAt == nil {
+			now := s.clock.Now()
+			updated.CompletedAt = &now
+		}
+	default:
+		updated.CompletedAt = nil
+	}
+
+	if err := s.storage.Applies().Update(ctx, &updated); err != nil {
+		return fmt.Errorf("update derived apply state for apply %s (%d) to %q: %w", apply.ApplyIdentifier, apply.ID, derived, err)
+	}
+	s.logger.Info("operator: updated derived apply state from apply_operations",
+		"worker", workerID, "apply_id", apply.ApplyIdentifier,
+		"database", apply.Database, "environment", apply.Environment,
+		"previous_state", apply.State, "derived_state", derived, "operation_count", len(ops))
+	return nil
 }
 
 func operatorLeaseOwner(workerID int) string {
