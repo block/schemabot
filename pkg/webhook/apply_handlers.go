@@ -499,12 +499,17 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 
 	// Check for active applies on any locked database. Even force-unlock should
 	// not break a lock while SchemaBot still has a non-terminal apply recorded
-	// for the same database/type.
+	// for the same database/type. When apply state cannot be read, the unlock
+	// fails closed: storage uncertainty must never release a lock that could be
+	// protecting an in-flight apply.
 	for _, lock := range locks {
 		applies, err := h.service.Storage().Applies().GetByDatabase(ctx, lock.DatabaseName, lock.DatabaseType, "")
 		if err != nil {
-			h.logger.Error("failed to check active applies", "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
-			continue
+			h.logger.Error("unlock refused: cannot verify active applies, no locks will be released",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
+			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
+				"Failed to verify active applies for database `"+lock.DatabaseName+"`: "+err.Error()+". No locks were released.")
+			return
 		}
 		for _, a := range applies {
 			if a.Database == lock.DatabaseName && !state.IsTerminalApplyState(a.State) {
