@@ -483,12 +483,29 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 	return stoppedCount, skippedCount, applyID
 }
 
+// firstFailedTaskError returns an apply-level failure reason derived from task
+// rows: the first failed task that recorded an error message, preferring
+// hard-failed tasks over retryable ones. Returns "" when no failed task
+// recorded a reason.
+func firstFailedTaskError(tasks []*storage.Task) string {
+	for _, failedState := range []string{state.Task.Failed, state.Task.FailedRetryable} {
+		for _, task := range tasks {
+			if state.IsState(task.State, failedState) && task.ErrorMessage != "" {
+				return fmt.Sprintf("table %s failed: %s", task.TableName, task.ErrorMessage)
+			}
+		}
+	}
+	return ""
+}
+
 // handleStopAllTasksTerminal handles the edge case where stop is requested but
 // every targeted task is already in a terminal state (completed, failed,
 // cancelled, or reverted). The apply row may still be non-terminal — e.g., a
 // worker exited after finalizing task rows but before the apply row — so the
 // apply's final state is derived from its task states rather than assumed.
-// A failed task must surface as a failed apply, never as a completed one.
+// A failed task must surface as a failed apply, never as a completed one, and
+// its failure reason is propagated so operators can triage from the apply
+// record. An ErrorMessage already on the apply is authoritative and kept.
 func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID int64, skippedCount int64) (*ternv1.StopResponse, error) {
 	apply, err := c.storage.Applies().Get(ctx, applyID)
 	if err != nil {
@@ -507,6 +524,9 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 		oldState := apply.State
 		now := time.Now()
 		apply.State = derivedState
+		if state.IsState(derivedState, state.Apply.Failed) && apply.ErrorMessage == "" {
+			apply.ErrorMessage = firstFailedTaskError(tasks)
+		}
 		if state.IsTerminalApplyState(derivedState) {
 			apply.CompletedAt = &now
 		}
