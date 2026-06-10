@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -239,6 +240,74 @@ func TestLocalClient_StopMarksMySQLApplyStopped(t *testing.T) {
 	assert.Equal(t, state.Apply.Stopped, apply.State)
 	assert.Nil(t, apply.CompletedAt)
 	require.NotNil(t, eng.stopReq, "stop should call the engine")
+}
+
+// A stop request can race with a worker that finalized all task rows but
+// exited before finalizing the apply row. When every targeted task is already
+// terminal, stop derives the apply's final state from its tasks: an apply
+// whose tasks failed must finish as failed, never as completed, so the
+// failure stays visible to operators instead of being masked as a success.
+func TestLocalClient_StopAllTasksTerminalDerivesApplyState(t *testing.T) {
+	testCases := []struct {
+		name           string
+		taskStates     []string
+		wantApplyState string
+	}{
+		{
+			name:           "all tasks completed",
+			taskStates:     []string{state.Task.Completed, state.Task.Completed},
+			wantApplyState: state.Apply.Completed,
+		},
+		{
+			name:           "all tasks failed",
+			taskStates:     []string{state.Task.Failed, state.Task.Failed},
+			wantApplyState: state.Apply.Failed,
+		},
+		{
+			name:           "failed task among completed tasks",
+			taskStates:     []string{state.Task.Completed, state.Task.Failed},
+			wantApplyState: state.Apply.Failed,
+		},
+		{
+			name:           "all tasks cancelled",
+			taskStates:     []string{state.Task.Cancelled, state.Task.Cancelled},
+			wantApplyState: state.Apply.Cancelled,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-mysql-stop-terminal",
+				State:           state.Apply.Running,
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+			}
+			tasks := make([]*storage.Task, 0, len(tc.taskStates))
+			for i, taskState := range tc.taskStates {
+				tasks = append(tasks, &storage.Task{
+					ID:             int64(i + 1),
+					ApplyID:        apply.ID,
+					TaskIdentifier: fmt.Sprintf("task-mysql-stop-terminal-%d", i+1),
+					Database:       "testdb",
+					State:          taskState,
+				})
+			}
+			client := newMySQLControlTestClient(apply, tasks, &controlCaptureEngine{})
+
+			resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+			require.NoError(t, err)
+			assert.True(t, resp.Accepted)
+			assert.Equal(t, int64(0), resp.StoppedCount)
+			assert.Equal(t, int64(len(tasks)), resp.SkippedCount)
+			assert.Equal(t, "Schema change already "+tc.wantApplyState, resp.ErrorMessage)
+			assert.Equal(t, tc.wantApplyState, apply.State)
+			require.NotNil(t, apply.CompletedAt)
+		})
+	}
 }
 
 // PlanetScale cutover must include the opaque resume state recorded for the

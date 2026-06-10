@@ -306,8 +306,9 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 		return nil, fmt.Errorf("no active schema change")
 	}
 
-	// Edge case: stop was requested but all tasks had already completed.
-	// Mark the apply as completed so the TUI sees a clean terminal state.
+	// Edge case: stop was requested but every targeted task is already
+	// terminal. Finalize the apply from its task states so the TUI sees an
+	// accurate terminal state.
 	if stoppedCount == 0 && skippedCount > 0 && applyID > 0 {
 		if targetApply != nil && state.IsTerminalApplyState(targetApply.State) && !state.IsState(targetApply.State, state.Apply.Completed) {
 			c.logger.Info("all tasks are terminal and apply is already terminal; preserving apply state during stop",
@@ -320,7 +321,7 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 				SkippedCount: skippedCount,
 			}, nil
 		}
-		return c.handleStopAllCompleted(ctx, applyID, skippedCount)
+		return c.handleStopAllTasksTerminal(ctx, applyID, skippedCount)
 	}
 
 	return &ternv1.StopResponse{
@@ -482,25 +483,50 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 	return stoppedCount, skippedCount, applyID
 }
 
-// handleStopAllCompleted handles the edge case where stop is requested but all tasks
-// had already completed. Marks the apply as completed so the TUI sees a clean state.
-func (c *LocalClient) handleStopAllCompleted(ctx context.Context, applyID int64, skippedCount int64) (*ternv1.StopResponse, error) {
-	if apply, err := c.storage.Applies().Get(ctx, applyID); err == nil && apply != nil && !state.IsTerminalApplyState(apply.State) {
+// handleStopAllTasksTerminal handles the edge case where stop is requested but
+// every targeted task is already in a terminal state (completed, failed,
+// cancelled, or reverted). The apply row may still be non-terminal — e.g., a
+// worker exited after finalizing task rows but before the apply row — so the
+// apply's final state is derived from its task states rather than assumed.
+// A failed task must surface as a failed apply, never as a completed one.
+func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID int64, skippedCount int64) (*ternv1.StopResponse, error) {
+	apply, err := c.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("load apply %d after stop found all tasks terminal: %w", applyID, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("load apply %d after stop found all tasks terminal: %w", applyID, storage.ErrApplyNotFound)
+	}
+
+	if !state.IsTerminalApplyState(apply.State) {
+		tasks, err := c.storage.Tasks().GetByApplyID(ctx, applyID)
+		if err != nil {
+			return nil, fmt.Errorf("load tasks for apply %s to derive final state: %w", apply.ApplyIdentifier, err)
+		}
+		derivedState := state.DeriveApplyState(taskStates(tasks))
+		oldState := apply.State
 		now := time.Now()
-		apply.State = state.Apply.Completed
-		apply.CompletedAt = &now
+		apply.State = derivedState
+		if state.IsTerminalApplyState(derivedState) {
+			apply.CompletedAt = &now
+		}
 		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
+			return nil, fmt.Errorf("update apply %s to derived state %s: %w", apply.ApplyIdentifier, derivedState, err)
 		}
 
+		c.logger.Info("stop found all tasks terminal; apply state derived from tasks",
+			"apply_id", apply.ApplyIdentifier,
+			"old_state", oldState,
+			"new_state", derivedState,
+			"skipped_count", skippedCount)
 		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			"All tasks completed before stop took effect", "", state.Apply.Completed)
+			fmt.Sprintf("All tasks terminal before stop took effect; apply state derived from tasks: %s", derivedState), oldState, derivedState)
 	}
 
 	return &ternv1.StopResponse{
 		Accepted:     true,
-		ErrorMessage: "Schema change already completed",
+		ErrorMessage: fmt.Sprintf("Schema change already %s", apply.State),
 		StoppedCount: 0,
 		SkippedCount: skippedCount,
 	}, nil
