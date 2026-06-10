@@ -173,7 +173,16 @@ func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID 
 	}
 	defer utils.CloseAndLog(rows)
 
-	return scanTasks(rows)
+	tasks, err := scanTasks(rows)
+	if err != nil {
+		return nil, err
+	}
+	if tasks == nil {
+		// Return a non-nil empty slice so callers can never confuse "operation
+		// has no tasks" with nil and fall back to the parent apply's tasks.
+		return []*storage.Task{}, nil
+	}
+	return tasks, nil
 }
 
 // GetByDatabase returns all tasks for a database.

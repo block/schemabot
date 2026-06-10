@@ -33,6 +33,10 @@ func TestTaskStore_GetByApplyOperationID(t *testing.T) {
 		ApplyID: apply.ID, Deployment: "region-b", Target: "payments",
 	})
 	require.NoError(t, err)
+	opEmpty, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-c", Target: "payments",
+	})
+	require.NoError(t, err)
 
 	createTask := func(identifier, table string, operationID int64) {
 		now := time.Now()
@@ -80,9 +84,10 @@ func TestTaskStore_GetByApplyOperationID(t *testing.T) {
 	require.NotNil(t, tasksB[0].ApplyOperationID)
 	assert.Equal(t, opB, *tasksB[0].ApplyOperationID)
 
-	// An operation with no tasks returns an empty slice — no fallback to the
-	// parent apply's tasks.
-	tasksNone, err := store.Tasks().GetByApplyOperationID(ctx, opB+1000)
+	// A real operation row that owns zero tasks returns a non-nil empty slice —
+	// never nil and never a fallback to the parent apply's tasks.
+	tasksEmpty, err := store.Tasks().GetByApplyOperationID(ctx, opEmpty)
 	require.NoError(t, err)
-	assert.Empty(t, tasksNone)
+	require.NotNil(t, tasksEmpty)
+	assert.Empty(t, tasksEmpty)
 }
