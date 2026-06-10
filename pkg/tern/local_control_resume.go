@@ -2,9 +2,11 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -521,35 +523,52 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		return nil
 	}
 
-	var ddls []string
-	for _, t := range tasks {
-		ddls = append(ddls, t.DDL)
+	resumeState, err := c.groupedResumeState(ctx, apply, tasks)
+	if err != nil {
+		return err
 	}
 
-	// Build table changes from the DDL list
-	var tableChanges []engine.TableChange
-	for _, ddl := range ddls {
-		tableChanges = append(tableChanges, engine.TableChange{DDL: ddl})
-	}
-
-	// Resume the grouped apply after restart. Use apply identifier as
-	// MigrationContext so Spirit can find existing checkpoint tables from the
-	// original run.
+	// Resume the grouped apply with the engine's persisted state so it
+	// reattaches to in-flight engine work instead of launching a duplicate
+	// schema change. The changes are rebuilt from the stored tasks so the
+	// engine keys per-table progress on the same namespace/table pairs the
+	// tasks carry.
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
-		Database: apply.Database,
-		Changes: []engine.SchemaChange{{
-			Namespace:    apply.Database,
-			TableChanges: tableChanges,
-		}},
+		Database:    apply.Database,
+		PlanID:      plan.PlanIdentifier,
+		Changes:     groupedResumeChanges(tasks),
+		SchemaFiles: plan.SchemaFiles,
 		Options:     options,
-		ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
+		ResumeState: resumeState,
 		Credentials: creds,
+		OnStateChange: func(rs *engine.ResumeState) {
+			if rs == nil {
+				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
+				return
+			}
+			if saveErr := c.saveEngineResumeState(ctx, tasks, rs); saveErr != nil {
+				c.logger.Warn("OnStateChange: failed to persist opaque resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
+			}
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("engine apply failed: %w", err)
 	}
 	if !result.Accepted {
 		return fmt.Errorf("engine did not accept apply: %s", result.Message)
+	}
+	if result.ResumeState != nil {
+		resumeState = result.ResumeState
+		if c.config.Type == storage.DatabaseTypeVitess {
+			if saveErr := c.saveEngineResumeState(ctx, tasks, resumeState); saveErr != nil {
+				return fmt.Errorf("save engine resume state after grouped resume of apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, saveErr)
+			}
+		}
+	}
+	// Progress polling for Vitess applies is driven entirely by resume state
+	// metadata; without it the poll loop can never observe the deploy request.
+	if c.config.Type == storage.DatabaseTypeVitess && resumeState.Metadata == "" {
+		return fmt.Errorf("engine accepted grouped resume of Vitess apply %s (database %s) without resume state metadata", apply.ApplyIdentifier, apply.Database)
 	}
 
 	now := time.Now()
@@ -587,7 +606,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		defer cancelPoll()
 		stopHeartbeat := c.startApplyHeartbeat(pollCtx, apply, cancelPoll)
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, nil)
+		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState)
 		return nil
 	}
 
@@ -596,9 +615,81 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	go func() {
 		defer cancelResume()
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, nil)
+		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState)
 	}()
 	return nil
+}
+
+// errGroupedResumeStateUnavailable marks a resume attempt that could not load
+// (or rule out) persisted engine resume state. The current apply owner must
+// exit without writing terminal state so a later attempt can retry against
+// intact storage — failing the apply here would abandon in-flight engine work.
+var errGroupedResumeStateUnavailable = errors.New("grouped resume state unavailable")
+
+// groupedResumeState returns the ResumeState handed to the engine when a
+// grouped apply is resumed. Recovery must reattach to the engine's existing
+// work via persisted resume state; launching fresh engine work would duplicate
+// the in-flight schema change. Absent persisted state is expected for engines
+// that reattach through durable database-side checkpoints keyed by the schema
+// change context alone (Spirit); a storage read failure fails the resume
+// attempt so a later attempt can retry with intact state.
+func (c *LocalClient) groupedResumeState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (*engine.ResumeState, error) {
+	contextOnly := &engine.ResumeState{MigrationContext: apply.ApplyIdentifier}
+
+	operationID, err := applyOperationIDForTasks(tasks)
+	if err != nil {
+		// Persisted engine resume state is scoped to an apply operation, so a
+		// Vitess apply whose tasks cannot be resolved to one leaves SchemaBot
+		// unable to prove there is no in-flight deploy request to reattach to.
+		if c.config.Type == storage.DatabaseTypeVitess {
+			return nil, fmt.Errorf("%w: resolve apply operation for grouped resume of apply %s (database %s): %w", errGroupedResumeStateUnavailable, apply.ApplyIdentifier, apply.Database, err)
+		}
+		c.logger.Info("tasks have no apply operation to hold persisted engine resume state; engine apply will start from the schema change context",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType)
+		return contextOnly, nil
+	}
+
+	stored, err := c.loadEngineResumeStateForOperation(ctx, operationID)
+	if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
+		c.logger.Info("no persisted engine resume state for apply operation; engine apply will start from the schema change context",
+			"apply_id", apply.ApplyIdentifier,
+			"apply_operation_id", operationID,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType)
+		return contextOnly, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: load engine resume state for grouped resume of apply %s operation %d (database %s): %w", errGroupedResumeStateUnavailable, apply.ApplyIdentifier, operationID, apply.Database, err)
+	}
+	if stored.MigrationContext == "" {
+		stored.MigrationContext = apply.ApplyIdentifier
+	}
+	return stored, nil
+}
+
+// groupedResumeChanges rebuilds the engine changes for a grouped resume from
+// the stored tasks, grouped per namespace. Tasks carry the authoritative
+// remaining work after re-planning, and engines key per-table progress on
+// namespace and table, so the rebuilt changes must preserve both.
+func groupedResumeChanges(tasks []*storage.Task) []engine.SchemaChange {
+	indexByNamespace := make(map[string]int, len(tasks))
+	var changes []engine.SchemaChange
+	for _, task := range tasks {
+		idx, ok := indexByNamespace[task.Namespace]
+		if !ok {
+			idx = len(changes)
+			indexByNamespace[task.Namespace] = idx
+			changes = append(changes, engine.SchemaChange{Namespace: task.Namespace})
+		}
+		changes[idx].TableChanges = append(changes[idx].TableChanges, engine.TableChange{
+			Table:     task.TableName,
+			DDL:       task.DDL,
+			Operation: ddl.OpToStatementType(task.DDLAction),
+		})
+	}
+	return changes
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
@@ -712,6 +803,14 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				defer c.clearApplyCancel(cancelGeneration)
 				defer cancelResume()
 				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering from checkpoint", true, false); err != nil {
+					if errors.Is(err, errGroupedResumeStateUnavailable) {
+						c.logger.Warn("deferred cutover recovery could not load persisted engine resume state; current apply owner will exit for operator retry",
+							"apply_id", apply.ApplyIdentifier,
+							"database", apply.Database,
+							"database_type", apply.DatabaseType,
+							"error", err)
+						return fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err)
+					}
 					return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err), false)
 				}
 				return ctx.Err()
@@ -780,12 +879,20 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 
 	options := buildApplyOptions(apply)
 
-	if apply.GetOptions().DeferCutover {
+	if c.usesGroupedApply(apply) {
 		resumeCtx, cancelResume := context.WithCancel(ctx)
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
 		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply)), true, startRequested); err != nil {
+			if errors.Is(err, errGroupedResumeStateUnavailable) {
+				c.logger.Warn("grouped resume could not load persisted engine resume state; current apply owner will exit for operator retry",
+					"apply_id", apply.ApplyIdentifier,
+					"database", apply.Database,
+					"database_type", apply.DatabaseType,
+					"error", err)
+				return err
+			}
 			return c.handleGroupedResumeFailure(ctx, apply, activeTasks, err, startRequested)
 		}
 	} else {

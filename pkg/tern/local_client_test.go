@@ -2,12 +2,14 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"reflect"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/statement"
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -474,6 +476,113 @@ func TestLocalClient_VitessProgressPassesAndPersistsEngineResumeState(t *testing
 	require.Len(t, progress.Tables, 1)
 	assert.Equal(t, int32(42), progress.Tables[0].PercentComplete)
 	assert.True(t, progress.Tables[0].IsInstant)
+}
+
+func groupedResumeStateClient(databaseType string, applyOperations storage.ApplyOperationStore) *LocalClient {
+	return &LocalClient{
+		config:  LocalConfig{Database: "testdb", Type: databaseType},
+		storage: &exactProgressStorage{applyOperations: applyOperations},
+		logger:  slog.Default(),
+	}
+}
+
+// A grouped resume must hand the engine its persisted state so the engine
+// reattaches to in-flight work instead of starting a duplicate schema change.
+func TestGroupedResumeStateUsesPersistedEngineState(t *testing.T) {
+	operationID := int64(11)
+	apply := &storage.Apply{ID: 4, ApplyIdentifier: "apply-resume-state", Database: "testdb", DatabaseType: storage.DatabaseTypeVitess}
+	tasks := []*storage.Task{{TaskIdentifier: "task-a", ApplyOperationID: &operationID}}
+	persistedMetadata := `{"branch_name":"branch-9","deploy_request_id":9}`
+	store := &exactProgressApplyOperationStore{data: &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: "ctx-resume",
+		Metadata:         persistedMetadata,
+	}}
+	client := groupedResumeStateClient(storage.DatabaseTypeVitess, store)
+
+	resumeState, err := client.groupedResumeState(t.Context(), apply, tasks)
+	require.NoError(t, err)
+	assert.Equal(t, "ctx-resume", resumeState.MigrationContext)
+	assert.JSONEq(t, persistedMetadata, resumeState.Metadata)
+}
+
+// Absent persisted state is expected for engines that reattach through durable
+// database-side checkpoints: the resume proceeds from the schema change
+// context alone instead of failing the recovery attempt.
+func TestGroupedResumeStateFallsBackToContextWhenAbsent(t *testing.T) {
+	operationID := int64(11)
+	apply := &storage.Apply{ID: 4, ApplyIdentifier: "apply-resume-absent", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	tasks := []*storage.Task{{TaskIdentifier: "task-a", ApplyOperationID: &operationID}}
+	client := groupedResumeStateClient(storage.DatabaseTypeMySQL, &exactProgressApplyOperationStore{})
+
+	resumeState, err := client.groupedResumeState(t.Context(), apply, tasks)
+	require.NoError(t, err)
+	assert.Equal(t, "apply-resume-absent", resumeState.MigrationContext)
+	assert.Empty(t, resumeState.Metadata)
+}
+
+// A storage read failure is distinct from absent state: the resume attempt
+// must fail so a later attempt can retry with intact persisted state, instead
+// of launching engine work that may duplicate an in-flight schema change.
+func TestGroupedResumeStateFailsOnStorageError(t *testing.T) {
+	operationID := int64(11)
+	apply := &storage.Apply{ID: 4, ApplyIdentifier: "apply-resume-storage-error", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	tasks := []*storage.Task{{TaskIdentifier: "task-a", ApplyOperationID: &operationID}}
+	storageErr := errors.New("storage unavailable")
+	client := groupedResumeStateClient(storage.DatabaseTypeMySQL, &exactProgressApplyOperationStore{err: storageErr})
+
+	_, err := client.groupedResumeState(t.Context(), apply, tasks)
+	require.ErrorIs(t, err, storageErr)
+	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.ErrorContains(t, err, "apply-resume-storage-error")
+}
+
+// A Vitess apply whose tasks cannot be resolved to an apply operation cannot
+// prove there is no in-flight deploy request to reattach to, so the resume
+// fails closed. Engines that reattach from the schema change context alone
+// proceed without an apply operation.
+func TestGroupedResumeStateRequiresApplyOperationForVitess(t *testing.T) {
+	tasks := []*storage.Task{{TaskIdentifier: "task-unlinked"}}
+
+	vitessApply := &storage.Apply{ApplyIdentifier: "apply-unlinked-vitess", Database: "testdb", DatabaseType: storage.DatabaseTypeVitess}
+	vitessClient := groupedResumeStateClient(storage.DatabaseTypeVitess, &exactProgressApplyOperationStore{})
+	_, err := vitessClient.groupedResumeState(t.Context(), vitessApply, tasks)
+	require.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.ErrorContains(t, err, "apply-unlinked-vitess")
+
+	mysqlApply := &storage.Apply{ApplyIdentifier: "apply-unlinked-mysql", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	mysqlClient := groupedResumeStateClient(storage.DatabaseTypeMySQL, &exactProgressApplyOperationStore{})
+	resumeState, err := mysqlClient.groupedResumeState(t.Context(), mysqlApply, tasks)
+	require.NoError(t, err)
+	assert.Equal(t, "apply-unlinked-mysql", resumeState.MigrationContext)
+	assert.Empty(t, resumeState.Metadata)
+}
+
+// Rebuilt resume changes must preserve each task's namespace and table so
+// engines key per-table progress on the same identity the stored tasks carry.
+func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
+	tasks := []*storage.Task{
+		{Namespace: "commerce", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter"},
+		{Namespace: "commerce", TableName: "orders", DDL: "CREATE TABLE `orders` (`id` bigint unsigned NOT NULL)", DDLAction: "create"},
+		{Namespace: "billing", TableName: "invoices", DDL: "ALTER TABLE `invoices` ADD COLUMN `due_at` datetime", DDLAction: "alter"},
+	}
+
+	changes := groupedResumeChanges(tasks)
+
+	require.Len(t, changes, 2)
+	assert.Equal(t, "commerce", changes[0].Namespace)
+	require.Len(t, changes[0].TableChanges, 2)
+	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
+	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
+	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
+	assert.Equal(t, "orders", changes[0].TableChanges[1].Table)
+	assert.Equal(t, tasks[1].DDL, changes[0].TableChanges[1].DDL)
+	assert.Equal(t, statement.StatementCreateTable, changes[0].TableChanges[1].Operation)
+	assert.Equal(t, "billing", changes[1].Namespace)
+	require.Len(t, changes[1].TableChanges, 1)
+	assert.Equal(t, "invoices", changes[1].TableChanges[0].Table)
+	assert.Equal(t, tasks[2].DDL, changes[1].TableChanges[0].DDL)
+	assert.Equal(t, statement.StatementAlterTable, changes[1].TableChanges[0].Operation)
 }
 
 func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {

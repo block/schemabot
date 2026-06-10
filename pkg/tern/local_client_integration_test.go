@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
@@ -325,7 +326,15 @@ type stagedGroupedResumeEngine struct {
 	applyCount  int
 	drainCount  int
 	applyErr    error
+	applyResult *engine.ApplyResult
 	progress    *engine.ProgressResult
+
+	// applyRequests records a snapshot of each ApplyRequest so tests can
+	// assert on the resume state and changes the resume path sends.
+	applyRequests []*engine.ApplyRequest
+	// progressResumeMetadata records the resume state metadata each Progress
+	// poll carries, in call order.
+	progressResumeMetadata []string
 }
 
 func (e *stagedGroupedResumeEngine) Name() string { return "staged-grouped-resume" }
@@ -342,15 +351,27 @@ func (e *stagedGroupedResumeEngine) Plan(context.Context, *engine.PlanRequest) (
 	return e.planResults[idx], nil
 }
 
-func (e *stagedGroupedResumeEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+func (e *stagedGroupedResumeEngine) Apply(_ context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
 	e.applyCount++
+	snapshot := *req
+	if req.ResumeState != nil {
+		resumeState := *req.ResumeState
+		snapshot.ResumeState = &resumeState
+	}
+	e.applyRequests = append(e.applyRequests, &snapshot)
 	if e.applyErr != nil {
 		return nil, e.applyErr
+	}
+	if e.applyResult != nil {
+		return e.applyResult, nil
 	}
 	return &engine.ApplyResult{Accepted: true}, nil
 }
 
-func (e *stagedGroupedResumeEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+func (e *stagedGroupedResumeEngine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	if req.ResumeState != nil {
+		e.progressResumeMetadata = append(e.progressResumeMetadata, req.ResumeState.Metadata)
+	}
 	if e.progress != nil {
 		return e.progress, nil
 	}
@@ -2008,6 +2029,314 @@ func TestLocalClient_ResumeApplyGroupedStartRequestFailsWhenEngineRejects(t *tes
 	logs, err := stor.ApplyLogs().GetByApply(ctx, applyID)
 	require.NoError(t, err)
 	assert.True(t, hasLogMessageContaining(logs, "Recovery failed: engine apply failed: engine refused grouped resume"))
+}
+
+// This scenario covers restart recovery of a grouped Vitess apply whose opaque
+// engine resume state was persisted before the worker died. Recovery must hand
+// that state back to the engine in exactly one grouped apply — even without
+// defer-cutover — so the engine reattaches to the in-flight deploy request
+// instead of opening a duplicate one. The rebuilt changes must keep the tasks'
+// namespace/table identity for per-table progress matching, and progress
+// polling must carry the engine's returned resume state so the deploy request
+// stays observable and updated state is persisted.
+func TestLocalClient_ResumeApplyVitessGroupedReattachesWithPersistedState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeVitess,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	usersDDL := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	ordersDDL := "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-vitess-resume-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Tables: []storage.TableChange{{Namespace: "commerce", Table: "users", DDL: usersDDL, Operation: "alter"}}},
+			"billing":  {Tables: []storage.TableChange{{Namespace: "billing", Table: "orders", DDL: ordersDDL, Operation: "alter"}}},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-vitess-resume-%d", now.UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Deployment:      "testdb",
+		Engine:          storage.EnginePlanetScale,
+		State:           state.Apply.Running,
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	tasks := []*storage.Task{
+		{
+			TaskIdentifier: fmt.Sprintf("task-vitess-resume-users-%d", now.UnixNano()),
+			PlanID:         planID,
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeVitess,
+			Engine:         storage.EnginePlanetScale,
+			State:          state.Task.Running,
+			Namespace:      "commerce",
+			TableName:      "users",
+			DDL:            usersDDL,
+			DDLAction:      "alter",
+			Environment:    localClientTestEnvironment,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+		{
+			TaskIdentifier: fmt.Sprintf("task-vitess-resume-orders-%d", now.UnixNano()),
+			PlanID:         planID,
+			Database:       "testdb",
+			DatabaseType:   storage.DatabaseTypeVitess,
+			Engine:         storage.EnginePlanetScale,
+			State:          state.Task.Running,
+			Namespace:      "billing",
+			TableName:      "orders",
+			DDL:            ordersDDL,
+			DDLAction:      "alter",
+			Environment:    localClientTestEnvironment,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		},
+	}
+	operation := &storage.ApplyOperation{
+		Deployment: "testdb",
+		State:      state.ApplyOperation.Running,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	applyID, err := stor.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, []*storage.ApplyOperation{operation})
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	persistedMetadata := `{"branch_name":"recovery-branch","deploy_request_id":42,"deploy_request_url":"https://example.test/deploys/42"}`
+	require.NoError(t, stor.ApplyOperations().SaveEngineResumeState(ctx, operation.ID, &storage.EngineResumeState{
+		ApplyOperationID: operation.ID,
+		MigrationContext: apply.ApplyIdentifier,
+		Metadata:         persistedMetadata,
+	}))
+
+	reattachedMetadata := `{"branch_name":"recovery-branch","deploy_request_id":42,"deploy_request_url":"https://example.test/deploys/42-reattached"}`
+	finalMetadata := `{"branch_name":"recovery-branch","deploy_request_id":42,"deploy_request_url":"https://example.test/deploys/42-final"}`
+	resumeEngine := &stagedGroupedResumeEngine{
+		planResults: []*engine.PlanResult{{
+			Changes: []engine.SchemaChange{
+				{Namespace: "commerce", TableChanges: []engine.TableChange{{Table: "users", DDL: usersDDL}}},
+				{Namespace: "billing", TableChanges: []engine.TableChange{{Table: "orders", DDL: ordersDDL}}},
+			},
+		}},
+		applyResult: &engine.ApplyResult{
+			Accepted:    true,
+			ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier, Metadata: reattachedMetadata},
+		},
+		progress: &engine.ProgressResult{
+			State:       engine.StateCompleted,
+			ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier, Metadata: finalMetadata},
+			Tables: []engine.TableProgress{
+				{Namespace: "commerce", Table: "users", State: state.Task.Completed, Progress: 100},
+				{Namespace: "billing", Table: "orders", State: state.Task.Completed, Progress: 100},
+			},
+		},
+	}
+	client.planetscaleEngine = resumeEngine
+
+	resumeCtx, cancelResume := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelResume()
+	require.NoError(t, client.ResumeApply(resumeCtx, apply))
+
+	require.Len(t, resumeEngine.applyRequests, 1, "grouped recovery must issue exactly one engine apply")
+	applyReq := resumeEngine.applyRequests[0]
+	require.NotNil(t, applyReq.ResumeState)
+	assert.Equal(t, apply.ApplyIdentifier, applyReq.ResumeState.MigrationContext)
+	assert.JSONEq(t, persistedMetadata, applyReq.ResumeState.Metadata)
+
+	require.Len(t, applyReq.Changes, 2)
+	changesByNamespace := make(map[string][]engine.TableChange, len(applyReq.Changes))
+	for _, sc := range applyReq.Changes {
+		changesByNamespace[sc.Namespace] = sc.TableChanges
+	}
+	require.Len(t, changesByNamespace["commerce"], 1)
+	assert.Equal(t, "users", changesByNamespace["commerce"][0].Table)
+	assert.Equal(t, usersDDL, changesByNamespace["commerce"][0].DDL)
+	require.Len(t, changesByNamespace["billing"], 1)
+	assert.Equal(t, "orders", changesByNamespace["billing"][0].Table)
+	assert.Equal(t, ordersDDL, changesByNamespace["billing"][0].DDL)
+
+	require.NotEmpty(t, resumeEngine.progressResumeMetadata)
+	assert.JSONEq(t, reattachedMetadata, resumeEngine.progressResumeMetadata[0])
+
+	storedState, err := stor.ApplyOperations().GetEngineResumeState(ctx, operation.ID)
+	require.NoError(t, err)
+	assert.JSONEq(t, finalMetadata, storedState.Metadata)
+
+	storedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Completed, storedApply.State)
+
+	for _, task := range tasks {
+		storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, storedTask)
+		assert.Equal(t, state.Task.Completed, storedTask.State)
+	}
+}
+
+// This scenario covers restart recovery of a grouped deferred-cutover apply
+// with no persisted engine resume state. The engine reattaches through its own
+// durable checkpoints keyed by the schema change context, so recovery issues
+// one grouped engine apply whose resume state carries the apply identifier and
+// whose rebuilt changes keep the tasks' namespace and table so per-table
+// progress matching still works.
+func TestLocalClient_ResumeApplyGroupedRebuildsChangesFromTasks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	ddl := "ALTER TABLE `users` ADD COLUMN `resume_note` varchar(255)"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-grouped-resume-changes-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {Tables: []storage.TableChange{{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"}}},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-grouped-resume-changes-%d", now.UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	task := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-grouped-resume-changes-users-%d", now.UnixNano()),
+		PlanID:         planID,
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		State:          state.Task.Running,
+		TableName:      "users",
+		Namespace:      "testdb",
+		DDL:            ddl,
+		DDLAction:      "alter",
+		Options:        storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	operation := &storage.ApplyOperation{
+		Deployment: "testdb",
+		State:      state.ApplyOperation.Running,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	applyID, err := stor.Applies().CreateWithTasksAndOperations(ctx, apply, []*storage.Task{task}, []*storage.ApplyOperation{operation})
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	resumeEngine := &stagedGroupedResumeEngine{
+		planResults: []*engine.PlanResult{{
+			Changes: []engine.SchemaChange{{
+				Namespace:    "testdb",
+				TableChanges: []engine.TableChange{{Table: "users", DDL: ddl}},
+			}},
+		}},
+		progress: &engine.ProgressResult{
+			State: engine.StateCompleted,
+			Tables: []engine.TableProgress{{
+				Namespace: "testdb",
+				Table:     "users",
+				State:     state.Task.Completed,
+				Progress:  100,
+			}},
+		},
+	}
+	client.spiritEngine = resumeEngine
+
+	resumeCtx, cancelResume := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelResume()
+	require.NoError(t, client.ResumeApply(resumeCtx, apply))
+
+	require.Len(t, resumeEngine.applyRequests, 1, "grouped recovery must issue exactly one engine apply")
+	applyReq := resumeEngine.applyRequests[0]
+	require.NotNil(t, applyReq.ResumeState)
+	assert.Equal(t, apply.ApplyIdentifier, applyReq.ResumeState.MigrationContext)
+	assert.Empty(t, applyReq.ResumeState.Metadata)
+
+	require.Len(t, applyReq.Changes, 1)
+	assert.Equal(t, "testdb", applyReq.Changes[0].Namespace)
+	require.Len(t, applyReq.Changes[0].TableChanges, 1)
+	assert.Equal(t, "users", applyReq.Changes[0].TableChanges[0].Table)
+	assert.Equal(t, ddl, applyReq.Changes[0].TableChanges[0].DDL)
+	assert.Equal(t, statement.StatementAlterTable, applyReq.Changes[0].TableChanges[0].Operation)
+
+	storedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Completed, storedApply.State)
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Completed, storedTask.State)
+	assert.Equal(t, 100, storedTask.ProgressPercent)
 }
 
 func TestLocalClient_Cutover_NoActiveMigration(t *testing.T) {
