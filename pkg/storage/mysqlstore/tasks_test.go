@@ -60,11 +60,13 @@ func TestTaskStore_GetByApplyOperationID(t *testing.T) {
 	createTask("task_b_users", "users", opB)
 
 	// region-a's operation returns only its two tasks, never region-b's.
+	// created_at is second-precision, so both tasks usually share a timestamp;
+	// the id DESC tiebreaker makes the order deterministic (newest id first).
 	tasksA, err := store.Tasks().GetByApplyOperationID(ctx, opA)
 	require.NoError(t, err)
 	require.Len(t, tasksA, 2)
-	identifiersA := []string{tasksA[0].TaskIdentifier, tasksA[1].TaskIdentifier}
-	assert.ElementsMatch(t, []string{"task_a_users", "task_a_orders"}, identifiersA)
+	assert.Equal(t, "task_a_orders", tasksA[0].TaskIdentifier)
+	assert.Equal(t, "task_a_users", tasksA[1].TaskIdentifier)
 	for _, task := range tasksA {
 		require.NotNil(t, task.ApplyOperationID)
 		assert.Equal(t, opA, *task.ApplyOperationID)

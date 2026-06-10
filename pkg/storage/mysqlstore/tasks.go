@@ -164,9 +164,9 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+taskColumns+`
-		FROM `+"`tasks`"+` FORCE INDEX (`+"`idx_apply_operation_id`"+`)
-		WHERE `+"`apply_operation_id`"+` = ?
-		ORDER BY `+"`created_at`"+` DESC
+		FROM tasks FORCE INDEX (idx_apply_operation_id)
+		WHERE apply_operation_id = ?
+		ORDER BY created_at DESC, id DESC
 	`, applyOperationID)
 	if err != nil {
 		return nil, fmt.Errorf("query tasks for apply_operation %d: %w", applyOperationID, err)
