@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -722,6 +723,72 @@ func TestEngine_Progress_NamespaceFromApplyChanges(t *testing.T) {
 	}
 }
 
+// TestEngine_Progress_ClosedRunnerIsNotCompletion verifies that a progress
+// poll observing a runner in teardown (Spirit status "close") reports the
+// tracked state instead of inferring terminal success. Terminal outcomes are
+// recorded before the runner is closed, so a closing runner alongside a
+// non-terminal tracked state means the apply is still in flight — for
+// example the stopped runner that stays registered while a volume change
+// restarts the schema change.
+func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
+	password := "testpassword"
+	runner, err := spiritmigration.NewRunner(&spiritmigration.Migration{
+		Host:      "localhost:3306",
+		Username:  "root",
+		Password:  &password,
+		Database:  "testdb",
+		Statement: "ALTER TABLE `progress_close` ADD COLUMN `email` varchar(255) NULL",
+	})
+	require.NoError(t, err, "NewRunner")
+	require.NoError(t, runner.Close(), "close runner")
+
+	t.Run("running state keeps reporting running", func(t *testing.T) {
+		eng := New(Config{})
+		eng.runningMigration = &runningMigration{
+			database: "testdb",
+			tables:   []string{"progress_close"},
+			state:    engine.StateRunning,
+			runners:  []*spiritmigration.Runner{runner},
+		}
+
+		result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+		require.NoError(t, err, "Progress()")
+		assert.Equal(t, engine.StateRunning, result.State)
+	})
+
+	t.Run("volume restart reports running", func(t *testing.T) {
+		eng := New(Config{})
+		eng.runningMigration = &runningMigration{
+			database:                "testdb",
+			tables:                  []string{"progress_close"},
+			state:                   engine.StateStopped,
+			volumeRestartInProgress: true,
+			runners:                 []*spiritmigration.Runner{runner},
+		}
+
+		result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+		require.NoError(t, err, "Progress()")
+		assert.Equal(t, engine.StateRunning, result.State)
+	})
+
+	t.Run("failed state keeps reporting failed", func(t *testing.T) {
+		eng := New(Config{})
+		eng.runningMigration = &runningMigration{
+			database:     "testdb",
+			tables:       []string{"progress_close"},
+			state:        engine.StateFailed,
+			errorMessage: "schema change failed: ddl error",
+			runners:      []*spiritmigration.Runner{runner},
+		}
+
+		result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+		require.NoError(t, err, "Progress()")
+		assert.Equal(t, engine.StateFailed, result.State)
+		assert.Equal(t, "schema change failed: ddl error", result.ErrorMessage)
+		assert.True(t, result.Retryable)
+	})
+}
+
 func TestEngine_FetchCurrentSchema_EmptyDatabase(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db) // Start with clean database
@@ -1008,6 +1075,69 @@ func TestEngine_ExecuteMigration_InvalidSQL(t *testing.T) {
 	eng.mu.Unlock()
 
 	assert.Equal(t, engine.StateFailed, finalState, "expected StateFailed for invalid SQL")
+}
+
+// TestEngine_Progress_FailingApplyNeverReportsCompleted verifies that a
+// schema change which fails against the database is never observable as
+// completed: progress polls taken at any point during the apply — including
+// while the failed runner is torn down — report running and then failed.
+func TestEngine_Progress_FailingApplyNeverReportsCompleted(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE fail_progress (id INT PRIMARY KEY)`)
+	require.NoError(t, err, "create table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	ddlStatements := []string{
+		"ALTER TABLE `fail_progress` DROP COLUMN `nonexistent_column`",
+	}
+
+	eng.mu.Lock()
+	eng.runningMigration = &runningMigration{
+		database: database,
+		tables:   []string{"fail_progress"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	ctx := t.Context()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		eng.executeMigration(ctx, host, username, password, database, ddlStatements, false)
+	}()
+
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for applyFinished := false; !applyFinished; {
+		select {
+		case <-done:
+			applyFinished = true
+		case <-deadline.C:
+			t.Fatal("timed out waiting for the schema change to fail")
+		case <-ticker.C:
+		}
+		result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+		require.NoError(t, err, "Progress()")
+		assert.NotEqual(t, engine.StateCompleted, result.State,
+			"failing schema change reported terminal success")
+	}
+
+	result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+	require.NoError(t, err, "Progress()")
+	assert.Equal(t, engine.StateFailed, result.State)
+	assert.Contains(t, result.ErrorMessage, "schema change failed")
+	assert.Contains(t, result.ErrorMessage, "nonexistent_column")
+	assert.True(t, result.Retryable)
 }
 
 // TestEngine_ExecuteMigration_MultipleStatements tests running multiple

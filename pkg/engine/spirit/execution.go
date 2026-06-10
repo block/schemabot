@@ -212,26 +212,30 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		"statement_len", len(combinedStatement),
 	)
 
+	// On every exit path the tracked state must be terminal before the runner
+	// is closed: Close() flips Spirit's status to close while teardown is
+	// still in flight, and a progress poll must observe the recorded outcome,
+	// never infer one from a runner mid-teardown.
 	if err := runner.Run(ctx); err != nil {
 		// Check if this was a cancellation (stop) vs a real failure
 		if ctx.Err() != nil {
 			e.logger.Info("schema change stopped",
 				"reason", ctx.Err(),
 			)
-			utils.CloseAndLog(runner)
 			// Don't change state - Stop() already set it to StateStopped
+			utils.CloseAndLog(runner)
 			return nil
 		}
-		utils.CloseAndLog(runner)
 		e.logger.Error("schema change failed",
 			"error", err,
 		)
 		e.setMigrationFailed(fmt.Errorf("schema change failed: %w", err))
+		utils.CloseAndLog(runner)
 		return err
 	}
 
-	utils.CloseAndLog(runner)
 	e.setMigrationState(engine.StateCompleted)
+	utils.CloseAndLog(runner)
 	e.logger.Info("schema change completed", "database", database, "tables", tables)
 	return nil
 }

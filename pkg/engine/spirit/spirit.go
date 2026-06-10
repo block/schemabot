@@ -505,20 +505,18 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
-	// Determine overall state from Spirit's state
-	// Preserve terminal states (stopped, failed) - don't overwrite them
+	// The tracked state is authoritative for terminal outcomes: completed,
+	// failed, and stopped are recorded before the runner is closed, so a
+	// runner observed mid-teardown never implies success on its own.
+	// Spirit's status only refines a non-terminal state, e.g. surfacing the
+	// sentinel wait for a deferred cutover.
 	state := rm.state
 	if state == engine.StateStopped && rm.volumeRestartInProgress {
 		state = engine.StateRunning
 	}
 	if state != engine.StateStopped && state != engine.StateFailed {
-		switch spiritState {
-		case status.WaitingOnSentinelTable:
-			if rm.deferCutover {
-				state = engine.StateWaitingForCutover
-			}
-		case status.Close:
-			state = engine.StateCompleted
+		if spiritState == status.WaitingOnSentinelTable && rm.deferCutover {
+			state = engine.StateWaitingForCutover
 		}
 	}
 
