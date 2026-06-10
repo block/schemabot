@@ -7,6 +7,7 @@
 - [Declarative Schema](#declarative-schema)
 - [Layers](#layers)
 - [User Layer (CLI / PR Comments / API)](#user-layer-cli-pr-comments-api)
+  - [Status Checks and Branch Protection](#status-checks-and-branch-protection)
   - [Apply Options](#apply-options)
   - [Unsafe Changes](#unsafe-changes)
   - [Control Operations](#control-operations)
@@ -109,9 +110,78 @@ schemabot skip-revert -e staging <apply_id> # Finalize (Vitess)
 
 Users can also run `schemabot plan` manually in a PR comment to re-plan without waiting for auto-plan.
 
-**Check Runs** — SchemaBot publishes aggregate GitHub checks that block merge until managed schema changes are applied. Per-database state is stored internally and rolled up into the aggregate check. Production applies require staging to be clean first when environments are ordered. See [`check-runs.md`](check-runs.md) for the full lifecycle, race-safety model, and branch protection setup.
+**Check Runs** — SchemaBot publishes aggregate GitHub checks that block merge until managed schema changes are applied. See [Status Checks and Branch Protection](#status-checks-and-branch-protection) below.
 
 **API** — HTTP endpoints that both CLI and webhook use internally. The SchemaBot server exposes `/v1/plan`, `/v1/apply`, `/v1/progress`, `/v1/cutover`, etc.
+
+### Status Checks and Branch Protection
+
+GitHub Check Runs are SchemaBot's merge gate: a required SchemaBot check blocks
+merge until every schema change represented by the PR has either been applied
+successfully or resolved by a new plan. Check runs are a tier-0 safety feature —
+without them, the PR workflow is advisory and developers can merge schema
+changes that were never applied.
+
+SchemaBot publishes **aggregate** checks, not one visible check per database.
+Internal per-database check state is stored in SchemaBot's `checks` table — one
+record per (repo, PR, environment, database type, database) — and rolled up into
+one stable check name that branch protection can require:
+
+- `SchemaBot` when one deployment owns all environments
+- `SchemaBot (staging)` / `SchemaBot (production)` when `allowed_environments`
+  scopes a deployment to specific environments
+
+```diagram
+╭───────────────────────────────────╮
+│ Stored check state                │
+│ (one row per database)            │
+│  db_a staging    success          │
+│  db_b staging    in_progress      │──── rollup ───╮
+│  db_b production action_required  │               ▼
+╰───────────────────────────────────╯      ╭───────────────────╮     ╭───────────────────╮
+                                           │ Aggregate Check   │────▶│ Branch protection │
+                                           │ Run on PR head    │     │ blocks/allows     │
+                                           │ commit            │     │ merge             │
+                                           ╰───────────────────╯     ╰───────────────────╯
+```
+
+The rollup is intentionally conservative — first match wins:
+
+| Internal state | Aggregate result | Merge |
+| --- | --- | --- |
+| Any record `in_progress` | `in_progress` | Blocked |
+| Any record `failure` | `failure` | Blocked |
+| Any record `action_required` | `action_required` (plan pending, confirmation needed, rollback completed, reconciliation needed) | Blocked |
+| All records `success` | `success` | Allowed |
+
+**Required checks must exist on every head commit.** GitHub enforces required
+checks by name on each PR head commit and treats a missing check as not passing
+— it cannot distinguish "SchemaBot had no work to do" from "SchemaBot failed to
+report". SchemaBot therefore creates the aggregate check on every PR head, and
+publishes a passing `No managed schema changes` aggregate on PRs that do not
+touch managed schema files so non-schema PRs are not blocked by a missing
+required check.
+
+**Fail closed.** When SchemaBot cannot safely discover config, read or write
+stored check state, verify the current PR head SHA, or reconcile an in-progress
+apply, it leaves branch protection blocked and surfaces an operator-visible
+error. Uncertainty is never converted into a passing check. A check run belongs
+to one commit SHA, so stale work from an older commit can never satisfy branch
+protection for a newer PR head.
+
+**Environment ordering.** PR comment applies follow the server-owned promotion
+order (`environment_order`, default staging before production). Production
+applies are blocked until the prior environment's check state is `success`. When
+another SchemaBot deployment owns the prior environment, the gate reads that
+environment's aggregate check run from GitHub — check runs are the shared
+cross-deployment authority, so environment-scoped deployments never need each
+other's credentials, storage, or targets.
+
+To make the gate enforceable, repository owners must require the aggregate check
+name(s) in branch protection. Without branch protection, SchemaBot's checks are
+informational only. See [`check-runs.md`](check-runs.md) for the full check
+lifecycle, edge cases, race-safety model, blocking reasons, and branch
+protection setup.
 
 ### Apply Options
 
