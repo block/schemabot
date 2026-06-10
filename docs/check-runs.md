@@ -87,6 +87,10 @@ For SchemaBot, the important mechanics are:
 
 - A check run belongs to one commit SHA. Updating a check run from an older SHA
   does not satisfy branch protection for a newer PR head.
+- GitHub required checks are enforced by check name on every PR head commit.
+  GitHub does not know whether SchemaBot had no work to do or failed to report;
+  if a required SchemaBot check run is missing from the current head commit,
+  branch protection blocks the merge.
 - A check run has a `status`, such as `in_progress` or `completed`.
 - A completed check run has a `conclusion`, such as `success`, `failure`, or
   `action_required`.
@@ -117,6 +121,13 @@ failure to represent safety, not a reason to skip.
 SchemaBot publishes aggregate GitHub checks, not one visible check per database.
 The aggregate check rolls up internal per-database state into one stable check
 name that can be required in branch protection.
+
+When the aggregate check is required by branch protection, SchemaBot must create
+a check run with that exact name on every PR head commit. That includes PRs that
+do not touch managed schema files. For those PRs, SchemaBot publishes a passing
+`No managed schema changes` aggregate so GitHub can satisfy the required check
+and allow the PR to merge. Skipping check creation would leave the required
+check missing, which GitHub treats as not passing.
 
 When all environments are owned by one SchemaBot deployment, require this check:
 
@@ -550,6 +561,11 @@ If the PR has no managed schema files, SchemaBot publishes passing aggregate
 checks on the current head SHA. This keeps branch protection from waiting for a
 SchemaBot check that would otherwise never be created.
 
+This check is intentionally published even though SchemaBot has no schema work to
+perform. Branch protection requires a passing check run by name on the current
+head commit; without this explicit success check, a required `SchemaBot` check
+would remain missing and the PR would be blocked from merging.
+
 This also covers SQL files outside an onboarded schema directory: without a
 matching `schemabot.yaml`, SchemaBot has no managed schema config to plan.
 
@@ -946,6 +962,12 @@ branch protection reflects the current database state.
 ## Branch Protection Setup
 
 Require the aggregate SchemaBot check in branch protection.
+
+Branch protection applies required checks to every PR head commit for the
+protected branch, not only to PRs that contain managed schema files. After the
+SchemaBot aggregate is required, SchemaBot will publish a passing no-op aggregate
+on PRs with no managed schema changes so non-schema PRs are not stuck waiting
+for a required check that never appears.
 
 When all environments are owned by one SchemaBot deployment, require:
 
