@@ -264,30 +264,31 @@ func closeApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, ope
 // 4-tuple, so this scoping is a no-op today; it only diverges once that
 // hard-block lifts and an environment fans out across deployments.
 func checkNoActiveApplyForTarget(ctx context.Context, tx *sql.Tx, database, dbType, environment, deployment string, excludeApplyID int64) error {
-	statePredicate, stateArgs := nonTerminalApplyStatePredicate("`state`")
+	statePredicate, stateArgs := nonTerminalApplyStatePredicate("state")
 	query := fmt.Sprintf(`
-		SELECT count(*) FROM `+"`applies`"+` FORCE INDEX (`+"`idx_database_env_deployment`"+`)
-		WHERE `+"`database_name`"+` = ?
-		AND `+"`database_type`"+` = ?
-		AND `+"`environment`"+` = ?
-		AND `+"`deployment`"+` = ?
+		SELECT 1 FROM applies FORCE INDEX (idx_database_env_deployment)
+		WHERE database_name = ?
+		AND database_type = ?
+		AND environment = ?
+		AND deployment = ?
 		AND %s
 	`, statePredicate)
 	args := append([]any{database, dbType, environment, deployment}, stateArgs...)
 	if excludeApplyID > 0 {
-		query += " AND `id` != ?"
+		query += " AND id != ?"
 		args = append(args, excludeApplyID)
 	}
+	query += " LIMIT 1"
 
-	var activeCount int64
-	err := tx.QueryRowContext(ctx, query, args...).Scan(&activeCount)
+	var exists int
+	err := tx.QueryRowContext(ctx, query, args...).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("check active applies for %s/%s/%s/%s: %w", database, dbType, environment, deployment, err)
 	}
-	if activeCount > 0 {
-		return fmt.Errorf("active apply exists for %s/%s/%s/%s: %w", database, dbType, environment, deployment, storage.ErrActiveApplyExists)
-	}
-	return nil
+	return fmt.Errorf("active apply exists for %s/%s/%s/%s: %w", database, dbType, environment, deployment, storage.ErrActiveApplyExists)
 }
 
 func applyLeaseFromContext(ctx context.Context, applyID int64) (storage.ApplyLease, bool, error) {
@@ -344,9 +345,9 @@ func applyTargetForUpdate(ctx context.Context, db queryRower, apply *storage.App
 
 	var database, dbType, environment, deployment string
 	err := db.QueryRowContext(ctx, `
-		SELECT `+"`database_name`, `database_type`, `environment`, `deployment`"+`
-		FROM `+"`applies`"+`
-		WHERE `+"`id`"+` = ?
+		SELECT database_name, database_type, environment, deployment
+		FROM applies
+		WHERE id = ?
 	`, apply.ID).Scan(&database, &dbType, &environment, &deployment)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", "", "", nil
