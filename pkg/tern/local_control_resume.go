@@ -612,12 +612,30 @@ func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*stor
 // Pending applies are dispatched for the first time; stale applies use the
 // engine's resume metadata to continue after a missed heartbeat.
 func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
-	// Get tasks for this apply
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
+	return c.resumeApplyWithTasks(ctx, apply, tasks)
+}
 
+// ResumeApplyOperation starts or resumes a single apply_operation (one
+// deployment of a multi-deployment apply), driving only that operation's tasks.
+// The drive logic is identical to ResumeApply; the only difference is that tasks
+// are loaded scoped to the operation rather than the whole apply, so a worker
+// can advance one deployment independently of its siblings.
+func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, applyOperationID)
+	if err != nil {
+		return fmt.Errorf("get tasks for apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
+	}
+	return c.resumeApplyWithTasks(ctx, apply, tasks)
+}
+
+// resumeApplyWithTasks drives an apply (or one of its operations) from the set
+// of tasks the caller has loaded. Callers choose whether tasks are scoped to the
+// whole apply or to a single operation.
+func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	if len(tasks) == 0 {
 		c.logger.Warn("no tasks found for apply, marking as failed",
 			"apply_id", apply.ApplyIdentifier)

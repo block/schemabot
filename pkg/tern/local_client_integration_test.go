@@ -807,6 +807,122 @@ func TestLocalClient_GroupedApplyKeepsClaimLeaseRunning(t *testing.T) {
 	assert.Equal(t, state.Apply.Completed, completed.State)
 }
 
+// An operator worker resumes a single apply_operation — one deployment of an
+// apply — rather than the whole apply. ResumeApplyOperation loads only that
+// operation's tasks (via the operation-scoped read primitive) and drives them
+// to completion through the same engine path as ResumeApply.
+func TestLocalClient_ResumeApplyOperationDrivesOperationTasks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-op-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{
+					{Namespace: "testdb", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN op_note VARCHAR(255)", Operation: "alter"},
+				},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-op-%d", time.Now().UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	operationID, err := stor.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: "testdb",
+		Target:     "testdb",
+		State:      state.Apply.Pending,
+	})
+	require.NoError(t, err)
+
+	task := &storage.Task{
+		TaskIdentifier:   fmt.Sprintf("task-op-users-%d", time.Now().UnixNano()),
+		ApplyID:          applyID,
+		ApplyOperationID: &operationID,
+		PlanID:           planID,
+		Database:         "testdb",
+		DatabaseType:     storage.DatabaseTypeMySQL,
+		Engine:           storage.EngineSpirit,
+		State:            state.Task.Pending,
+		TableName:        "users",
+		Namespace:        "testdb",
+		DDL:              "ALTER TABLE `users` ADD COLUMN op_note VARCHAR(255)",
+		DDLAction:        "alter",
+		Options:          storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Environment:      localClientTestEnvironment,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	taskID, err := stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, state.Apply.Pending, claimed.State)
+
+	client.spiritEngine = &leaseInspectingEngine{store: stor, applyID: applyID}
+
+	require.NoError(t, client.ResumeApplyOperation(ctx, claimed, operationID))
+
+	completed, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, completed)
+	assert.Equal(t, state.Apply.Completed, completed.State)
+
+	tasks, err := stor.Tasks().GetByApplyOperationID(ctx, operationID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, state.Task.Completed, tasks[0].State)
+	require.NotNil(t, tasks[0].ApplyOperationID)
+	assert.Equal(t, operationID, *tasks[0].ApplyOperationID)
+}
+
 // This scenario covers an operator-owned grouped start where the target schema
 // advances between the recovery re-plan and the final pre-dispatch schema check.
 // The operator should complete durable state without reissuing engine apply work.
