@@ -45,9 +45,14 @@ const ConfigFileName = "schemabot.yaml"
 
 // Config discovery errors.
 var (
-	ErrNoConfig          = fmt.Errorf("no schemabot.yaml config found")
-	ErrInvalidConfig     = fmt.Errorf("invalid schemabot.yaml config found")
-	ErrMultipleConfigs   = fmt.Errorf("multiple schemabot.yaml configs found - use -d flag to specify database")
+	ErrNoConfig        = fmt.Errorf("no schemabot.yaml config found")
+	ErrInvalidConfig   = fmt.Errorf("invalid schemabot.yaml config found")
+	ErrMultipleConfigs = fmt.Errorf("multiple schemabot.yaml configs found - use -d flag to specify database")
+)
+
+// Incomplete-data errors signal that GitHub returned a capped or truncated
+// listing, so the set of files or directories SchemaBot examined may be partial.
+var (
 	ErrGitTreeTruncated  = fmt.Errorf("GitHub returned a truncated repository tree; config discovery is incomplete")
 	ErrPRFilesIncomplete = fmt.Errorf("GitHub returned the maximum number of pull request files; config discovery is incomplete")
 	ErrDirListingCapped  = fmt.Errorf("GitHub returned the maximum number of directory entries; schema discovery is incomplete")
