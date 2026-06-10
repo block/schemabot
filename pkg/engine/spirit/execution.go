@@ -47,6 +47,16 @@ func (e *Engine) executeMigration(ctx context.Context, host, username, password,
 	// Execute CREATE TABLE statements first (each individually through Spirit)
 	for _, stmt := range createStatements {
 		if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
+			// A cancelled context means the operator stopped the change; engine
+			// state must remain Stopped and later phases must not run. Only a
+			// genuine failure (context still live) transitions to StateFailed.
+			if ctx.Err() != nil {
+				e.logger.Info("schema change stopped during CREATE TABLE",
+					"database", database,
+					"reason", ctx.Err(),
+				)
+				return
+			}
 			e.logger.Error("CREATE TABLE failed", "error", err)
 			e.setMigrationFailed(fmt.Errorf("CREATE TABLE failed: %w", err))
 			return
@@ -90,6 +100,16 @@ func (e *Engine) executeMigration(ctx context.Context, host, username, password,
 	for _, stmt := range dropStatements {
 		if e.disablePendingDrops {
 			if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
+				// A cancelled context means the operator stopped the change; engine
+				// state must remain Stopped and later phases must not run. Only a
+				// genuine failure (context still live) transitions to StateFailed.
+				if ctx.Err() != nil {
+					e.logger.Info("schema change stopped during DROP TABLE",
+						"database", database,
+						"reason", ctx.Err(),
+					)
+					return
+				}
 				e.logger.Error("DROP TABLE failed", "error", err)
 				e.setMigrationFailed(fmt.Errorf("DROP TABLE failed: %w", err))
 				return
@@ -97,10 +117,30 @@ func (e *Engine) executeMigration(ctx context.Context, host, username, password,
 			continue
 		}
 		if err := e.quarantineDroppedTables(ctx, host, username, password, database, stmt); err != nil {
+			// A cancelled context means the operator stopped the change; engine
+			// state must remain Stopped and later phases must not run. Only a
+			// genuine failure (context still live) transitions to StateFailed.
+			if ctx.Err() != nil {
+				e.logger.Info("schema change stopped during DROP TABLE",
+					"database", database,
+					"reason", ctx.Err(),
+				)
+				return
+			}
 			e.logger.Error("DROP TABLE quarantine failed", "error", err)
 			e.setMigrationFailed(fmt.Errorf("DROP TABLE quarantine failed: %w", err))
 			return
 		}
+	}
+
+	// A cancelled context means the operator stopped the change; engine state
+	// must remain Stopped, so do not overwrite it with StateCompleted.
+	if ctx.Err() != nil {
+		e.logger.Info("schema change stopped before completion",
+			"database", database,
+			"reason", ctx.Err(),
+		)
+		return
 	}
 
 	// If we had no ALTER statements (only CREATE/DROP), mark as completed
