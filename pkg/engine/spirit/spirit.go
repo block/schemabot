@@ -14,7 +14,6 @@ package spirit
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -541,7 +540,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // fetchCurrentSchema retrieves table schemas from the database, filtering out
 // internal tables (Spirit shadow/checkpoint tables and other _-prefixed tables).
 func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, _ string) ([]table.TableSchema, error) {
-	db, err := sql.Open("mysql", dsn)
+	db, err := openMySQL(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
