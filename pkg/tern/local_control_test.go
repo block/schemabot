@@ -491,7 +491,8 @@ func TestLocalClient_StopWaitingForDeployCancelsDeployRequest(t *testing.T) {
 // A task in the revert window has already cut over: the new schema is live.
 // Stop must reject rather than record it as cancelled, so an operator chooses
 // explicitly between reverting (undo) and skip-revert (finalize). The engine is
-// not touched and the task state is preserved.
+// not touched and the task state is preserved. The rejection names the
+// apply-level identifier the operator supplied, not the per-table task id.
 func TestLocalClient_StopRejectsRevertWindow(t *testing.T) {
 	operationID := int64(99)
 	apply := &storage.Apply{
@@ -518,9 +519,9 @@ func TestLocalClient_StopRejectsRevertWindow(t *testing.T) {
 	_, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
 
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "revert window")
-	assert.ErrorContains(t, err, "revert")
-	assert.ErrorContains(t, err, "skip-revert")
+	assert.ErrorContains(t, err, "schema change apply-vitess-revert-window is in the revert window and has already been applied")
+	assert.ErrorContains(t, err, "use revert to undo it or skip-revert to finalize it")
+	assert.NotContains(t, err.Error(), task.TaskIdentifier, "rejection must name the apply identifier, not the per-table task id")
 	assert.Nil(t, eng.stopReq, "stop must not touch the engine for a revert-window task")
 	assert.Equal(t, state.Task.RevertWindow, task.State, "revert-window task must not be marked cancelled by stop")
 	assert.Equal(t, state.Apply.RevertWindow, apply.State, "revert-window apply must not be marked cancelled by stop")

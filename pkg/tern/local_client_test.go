@@ -510,6 +510,71 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
 }
 
+// A revert-window apply has already cut over, so a durable stop request against
+// it is a permanent rejection. Processing it must resolve the request terminally
+// (failed) with the operator-facing reason instead of bubbling a retryable error
+// that keeps the request pending and spins the operator-owned retry loop forever.
+// The apply stays in the revert window for the operator to revert or skip-revert.
+func TestLocalClient_ProcessPendingStopControlRequestRejectsRevertWindow(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              321,
+		ApplyIdentifier: "apply-revert-window-stop",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.RevertWindow,
+	}
+	task := &storage.Task{
+		ID:             654,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-revert-window-stop",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		TableName:      "users",
+		State:          state.Task.RevertWindow,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		planetscaleEngine: fakeEngine,
+		logger:            slog.Default(),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+
+	require.NoError(t, err, "a permanent rejection must not bubble a retryable error")
+	assert.True(t, handled, "the durable request is resolved, so the owner must not retry")
+	assert.Equal(t, 0, fakeEngine.stopCount, "stop must not touch the engine for a revert-window apply")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "revert-window apply must not be recorded as cancelled or stopped")
+	assert.Equal(t, state.Task.RevertWindow, task.State, "revert-window task must be preserved")
+
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the stop request must not be left pending")
+
+	require.Len(t, controlRequests.requests, 1)
+	resolved := controlRequests.requests[0]
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "the stop request must be terminally failed, not retried")
+	assert.Equal(t, "schema change apply-revert-window-stop is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", resolved.ErrorMessage)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Pending stop request rejected: schema change apply-revert-window-stop is in the revert window"))
+}
+
 func TestLocalClient_ProcessPendingCutoverControlRequest(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              125,

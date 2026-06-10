@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -255,9 +256,10 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 	// change as if nothing happened. Reject so the operator chooses explicitly
 	// between revert (undo the deployed change) and skip-revert (finalize it).
 	if revertTask := firstRevertWindowTask(tasks, targetApplyID); revertTask != nil {
-		c.logger.Warn("stop rejected: task is in the revert window and has already cut over",
-			"task_id", revertTask.TaskIdentifier, "apply_id", revertTask.ApplyID, "state", revertTask.State)
-		return nil, fmt.Errorf("schema change %s is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", revertTask.TaskIdentifier)
+		applyIdentifier := c.resolveRevertWindowApplyIdentifier(ctx, req, targetApply, revertTask)
+		c.logger.Warn("stop rejected: schema change is in the revert window and has already cut over",
+			"apply_id", applyIdentifier, "task_id", revertTask.TaskIdentifier, "state", revertTask.State)
+		return nil, errors.New(revertWindowStopRejectionMessage(applyIdentifier))
 	}
 
 	creds := c.credentials()
@@ -372,6 +374,26 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		return true, nil
 	}
 
+	// A revert-window apply has already cut over. Stop is a permanent rejection,
+	// not a retryable error: failing the durable request resolves it terminally
+	// so the operator-owned retry loop stops re-running stop. The operator must
+	// revert (undo) or skip-revert (finalize) instead.
+	if revertWindow, err := c.applyHasRevertWindowTask(ctx, apply); err != nil {
+		return true, err
+	} else if revertWindow {
+		message := revertWindowStopRejectionMessage(apply.ApplyIdentifier)
+		c.logger.Warn("rejecting pending stop request: schema change is in the revert window and has already cut over",
+			"apply_id", apply.ApplyIdentifier,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Pending stop request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		if err := failPendingStopControlRequests(ctx, c.storage, apply, message); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+
 	stopCtx := context.WithoutCancel(ctx)
 	resp, err := c.stop(stopCtx, &ternv1.StopRequest{
 		ApplyId:     apply.ApplyIdentifier,
@@ -410,6 +432,50 @@ func firstRevertWindowTask(tasks []*storage.Task, targetApplyID int64) *storage.
 		}
 	}
 	return nil
+}
+
+// revertWindowStopRejectionMessage is the operator-facing reason a stop targeting
+// a revert-window schema change is permanently rejected. The change has already
+// cut over, so the operator must choose revert or skip-revert.
+func revertWindowStopRejectionMessage(applyIdentifier string) string {
+	return fmt.Sprintf("schema change %s is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", applyIdentifier)
+}
+
+// resolveRevertWindowApplyIdentifier returns the apply-level identifier an
+// operator supplied or recognizes, not the per-table task identifier. It prefers
+// the requested apply id, then the resolved target apply, then a lookup of the
+// revert task's apply, falling back to the task identifier only if the apply
+// cannot be loaded.
+func (c *LocalClient) resolveRevertWindowApplyIdentifier(ctx context.Context, req *ternv1.StopRequest, targetApply *storage.Apply, revertTask *storage.Task) string {
+	if req.ApplyId != "" {
+		return req.ApplyId
+	}
+	if targetApply != nil && targetApply.ApplyIdentifier != "" {
+		return targetApply.ApplyIdentifier
+	}
+	apply, err := c.storage.Applies().Get(ctx, revertTask.ApplyID)
+	if err != nil {
+		c.logger.Warn("could not load apply to resolve revert-window stop identifier; using task identifier",
+			"apply_db_id", revertTask.ApplyID, "task_id", revertTask.TaskIdentifier, "error", err)
+		return revertTask.TaskIdentifier
+	}
+	if apply == nil {
+		c.logger.Warn("apply not found while resolving revert-window stop identifier; using task identifier",
+			"apply_db_id", revertTask.ApplyID, "task_id", revertTask.TaskIdentifier)
+		return revertTask.TaskIdentifier
+	}
+	return apply.ApplyIdentifier
+}
+
+// applyHasRevertWindowTask reports whether any task for the apply is in the
+// revert window. It reads the stored tasks directly so the durable stop path
+// detects the same cut-over condition the synchronous stop path rejects on.
+func (c *LocalClient) applyHasRevertWindowTask(ctx context.Context, apply *storage.Apply) (bool, error) {
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("load tasks for apply %s to detect revert window before stop: %w", apply.ApplyIdentifier, err)
+	}
+	return firstRevertWindowTask(tasks, apply.ID) != nil, nil
 }
 
 // hasLiveEngineWork reports whether a task in this state has live engine or
