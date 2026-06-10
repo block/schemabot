@@ -499,7 +499,7 @@ func (c *GRPCClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1
 	return c.client.Stop(ctx, req)
 }
 
-func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
 	controlReq, err := pendingStopControlRequest(ctx, c.storage, apply)
 	if err != nil {
 		return false, err
@@ -537,7 +537,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		return true, nil
 	}
 	if apply.ExternalID == "" {
-		if err := c.stopUndispatchedApply(ctx, apply, controlRequestCaller(controlReq)); err != nil {
+		if err := c.stopUndispatchedApply(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
 			return true, err
 		}
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
@@ -551,7 +551,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		Environment: apply.Environment,
 	})
 	if err != nil {
-		if completed, completeErr := c.completeRemoteStopFromTerminalProgress(ctx, apply, controlReq); completeErr == nil && completed {
+		if completed, completeErr := c.completeRemoteStopFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
 			return true, nil
 		} else if completeErr != nil {
 			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w; terminal progress reconciliation also failed: %w", apply.ApplyIdentifier, apply.ExternalID, err, completeErr)
@@ -589,7 +589,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
 	apply.UpdatedAt = now
 	if isTerminalProtoState(progress.State) {
-		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now); err != nil {
+		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 			return true, err
 		}
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
@@ -598,7 +598,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		return true, nil
 	}
 
-	storedTasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	storedTasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
 		return true, fmt.Errorf("load tasks to sync remote gRPC stop for %s: %w", apply.ApplyIdentifier, err)
 	}
@@ -611,7 +611,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	return true, fmt.Errorf("remote gRPC stop for apply %s accepted but remote state is still %s", apply.ApplyIdentifier, remoteState)
 }
 
-func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest) (bool, error) {
+func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope) (bool, error) {
 	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
 		ApplyId:     apply.ExternalID,
 		Environment: apply.Environment,
@@ -647,7 +647,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	}
 	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
 	apply.UpdatedAt = now
-	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now); err != nil {
+	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 		return false, err
 	}
 	if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
@@ -658,7 +658,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	return true, nil
 }
 
-func (c *GRPCClient) stopUndispatchedApply(ctx context.Context, apply *storage.Apply, caller string) error {
+func (c *GRPCClient) stopUndispatchedApply(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope) error {
 	now := time.Now()
 	taskState := state.Task.Stopped
 	applyState := state.Apply.Stopped
@@ -666,7 +666,7 @@ func (c *GRPCClient) stopUndispatchedApply(ctx context.Context, apply *storage.A
 		taskState = state.Task.Cancelled
 		applyState = state.Apply.Cancelled
 	}
-	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
 		return fmt.Errorf("load tasks for undispatched stop %s: %w", apply.ApplyIdentifier, err)
 	}
@@ -730,18 +730,75 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 	return err
 }
 
-// ResumeApply runs work claimed by the operator. Fresh queued applies have no
-// external_id yet, so this method first dispatches them to remote Tern and
-// stores the returned ID. The call then polls until the apply reaches a stored
-// terminal state or the operator context is canceled.
+// applyTaskScope selects which task rows the remote drive re-queries. The zero
+// value scopes to the whole apply (all its operations); an operation-scoped
+// value restricts the drive to a single apply_operation (one deployment), so a
+// worker can advance one deployment independently of its siblings.
+type applyTaskScope struct {
+	applyOperationID int64
+}
+
+func wholeApplyTaskScope() applyTaskScope {
+	return applyTaskScope{}
+}
+
+func operationApplyTaskScope(applyOperationID int64) applyTaskScope {
+	return applyTaskScope{applyOperationID: applyOperationID}
+}
+
+func (s applyTaskScope) isOperationScoped() bool {
+	return s.applyOperationID > 0
+}
+
+// loadApplyTasks loads the task rows the remote drive operates on, scoped either
+// to the whole apply or to a single apply_operation. It never widens an
+// operation-scoped query back to the whole apply.
+func (c *GRPCClient) loadApplyTasks(ctx context.Context, apply *storage.Apply, scope applyTaskScope) ([]*storage.Task, error) {
+	if scope.isOperationScoped() {
+		tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, scope.applyOperationID)
+		if err != nil {
+			return nil, fmt.Errorf("load tasks for apply %s apply_operation %d: %w", apply.ApplyIdentifier, scope.applyOperationID, err)
+		}
+		return tasks, nil
+	}
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load tasks for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return tasks, nil
+}
+
+// ResumeApply starts or resumes a remote (gRPC) apply by driving the whole
+// apply — all of its operations.
 func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+	return c.resumeApply(ctx, apply, wholeApplyTaskScope())
+}
+
+// ResumeApplyOperation starts or resumes a single apply_operation (one
+// deployment of a multi-deployment apply) over the remote (gRPC) path. The drive
+// logic is identical to ResumeApply; the operation scope only narrows the task
+// re-query sites (dispatch, progress poll, terminal reconcile, failure, stop) so
+// a worker advances one deployment independently of its siblings.
+func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	if applyOperationID <= 0 {
+		return fmt.Errorf("apply operation id is required")
+	}
+	return c.resumeApply(ctx, apply, operationApplyTaskScope(applyOperationID))
+}
+
+// resumeApply runs work claimed by the operator. Fresh queued applies have no
+// external_id yet, so this first dispatches them to remote Tern and stores the
+// returned ID. The call then polls until the apply reaches a stored terminal
+// state or the operator context is canceled. The scope selects whether the
+// drive re-queries tasks for the whole apply or a single operation.
+func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	if c.storage == nil {
 		return fmt.Errorf("storage not configured for GRPCClient")
 	}
 	if apply == nil {
 		return fmt.Errorf("apply is required")
 	}
-	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+	if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
 		return err
 	}
 	if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
@@ -749,11 +806,11 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 	}
 
 	if shouldDispatchQueuedRemoteApply(apply) {
-		return c.dispatchPendingApply(ctx, apply)
+		return c.dispatchPendingApply(ctx, apply, scope)
 	}
 	if hasAmbiguousRemoteDispatchState(apply) {
 		errMsg := fmt.Sprintf("gRPC apply %s is %s without external_id; remote dispatch state is ambiguous", apply.ApplyIdentifier, apply.State)
-		if err := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false); err != nil {
+		if err := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); err != nil {
 			return fmt.Errorf("%s; persist failure state: %w", errMsg, err)
 		}
 		return errors.New(errMsg)
@@ -766,7 +823,7 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 	startRequested := startControlReq != nil
 
 	if apply.ExternalID != "" && state.IsState(apply.State, state.Apply.Pending) && !startRequested {
-		if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
 			return err
 		}
 		_, err := c.client.Start(ctx, &ternv1.StartRequest{
@@ -805,7 +862,7 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 					"database", apply.Database,
 					"environment", apply.Environment,
 					"stored_state", apply.State)
-				return c.failMissingStoppedRemoteApply(ctx, apply, message, nil)
+				return c.failMissingStoppedRemoteApply(ctx, apply, message, nil, scope)
 			}
 			remoteState := ProtoStateToStorage(resp.State)
 			if remoteState == "" {
@@ -828,16 +885,16 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 				if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 					apply.StartedAt = &now
 				}
-				return c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now)
+				return c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope)
 			}
 		} else {
 			if status.Code(err) == codes.NotFound {
 				message := fmt.Sprintf("remote apply %s was not found by data plane during stopped-state check", apply.ExternalID)
-				return c.failMissingStoppedRemoteApply(ctx, apply, message, err)
+				return c.failMissingStoppedRemoteApply(ctx, apply, message, err, scope)
 			}
 			if isTerminalRemoteProgressError(err) {
 				message := fmt.Sprintf("remote stopped-state check failed for remote apply %s: %v", apply.ExternalID, err)
-				if markErr := c.markStoppedRemoteApplyFailed(ctx, apply, message, false); markErr != nil {
+				if markErr := c.markStoppedRemoteApplyFailed(ctx, apply, message, false, scope); markErr != nil {
 					return fmt.Errorf("mark remote apply %s failed after stopped-state check error: %w", apply.ApplyIdentifier, markErr)
 				}
 				return fmt.Errorf("check stopped gRPC apply %s before start: %w", apply.ApplyIdentifier, err)
@@ -855,7 +912,7 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 
 		// Only call Start if Tern confirms the apply is actually stopped.
 		if state.IsState(apply.State, state.Apply.Stopped) {
-			if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+			if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
 				return err
 			}
 			_, err := c.client.Start(ctx, &ternv1.StartRequest{
@@ -873,7 +930,7 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 				c.logApplyWarning(ctx, apply, message)
 				apply.State = state.Apply.Stopped
 				apply.ErrorMessage = message
-				if reconcileErr := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, time.Now()); reconcileErr != nil {
+				if reconcileErr := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, time.Now(), scope); reconcileErr != nil {
 					return fmt.Errorf("persist stopped gRPC apply %s after start failure: %w", apply.ApplyIdentifier, reconcileErr)
 				}
 				if startRequested {
@@ -906,7 +963,7 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 		}
 	}
 
-	return c.pollForCompletion(ctx, apply, startRequested)
+	return c.pollForCompletion(ctx, apply, startRequested, scope)
 }
 
 func shouldDispatchQueuedRemoteApply(apply *storage.Apply) bool {
@@ -925,32 +982,32 @@ func hasAmbiguousRemoteDispatchState(apply *storage.Apply) bool {
 		!shouldDispatchQueuedRemoteApply(apply)
 }
 
-func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Apply) error {
+func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load plan %d: %v", apply.PlanID, err), false); markErr != nil {
+		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load plan %d: %v", apply.PlanID, err), false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after plan load error: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("load plan %d for queued gRPC apply %s: %w", apply.PlanID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
 		errMsg := fmt.Sprintf("queued gRPC apply failed: plan %d not found", apply.PlanID)
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false); markErr != nil {
+		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing plan: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 
-	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load tasks: %v", err), false); markErr != nil {
+		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, fmt.Sprintf("queued gRPC apply failed: load tasks: %v", err), false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after task load error: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("load tasks for queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if len(tasks) == 0 {
 		errMsg := "queued gRPC apply failed: no tasks found"
-		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false); markErr != nil {
+		if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing tasks: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
@@ -964,7 +1021,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	if target == "" {
 		target = apply.Database
 	}
-	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+	if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
 		return err
 	}
 
@@ -983,14 +1040,14 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		if isAmbiguousRemoteApplyDispatchError(err) {
 			return fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err)
 		}
-		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, err.Error(), isRetryableRemoteApplyError(err)); markErr != nil {
+		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after remote apply error: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("apply queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil {
 		errMsg := "remote apply returned nil response"
-		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false); markErr != nil {
+		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after nil response: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
@@ -1000,14 +1057,14 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		if errMsg == "" {
 			errMsg = "remote apply was not accepted"
 		}
-		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false); markErr != nil {
+		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after rejection: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 	if resp.ApplyId == "" {
 		errMsg := "remote apply accepted without apply_id"
-		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false); markErr != nil {
+		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing remote apply id: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
@@ -1030,7 +1087,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		fmt.Sprintf("Apply dispatched to remote Tern: target=%s deployment=%s remote_apply_id=%s", target, apply.Deployment, apply.ExternalID),
 		oldApplyState)
 
-	return c.pollForCompletion(ctx, apply, false)
+	return c.pollForCompletion(ctx, apply, false, scope)
 }
 
 func isAmbiguousRemoteApplyDispatchError(err error) bool {
@@ -1188,15 +1245,15 @@ func logSkippedRemoteApplyTransition(operation string, remoteApply, storedApply 
 	}
 }
 
-func (c *GRPCClient) markRemoteApplyFailed(ctx context.Context, remoteApply *storage.Apply, storedTasks []*storage.Task, message string, retryable bool) error {
-	return c.markRemoteApplyFailedWithOptions(ctx, remoteApply, storedTasks, message, retryable, false)
+func (c *GRPCClient) markRemoteApplyFailed(ctx context.Context, remoteApply *storage.Apply, storedTasks []*storage.Task, message string, retryable bool, scope applyTaskScope) error {
+	return c.markRemoteApplyFailedWithOptions(ctx, remoteApply, storedTasks, message, retryable, false, scope)
 }
 
-func (c *GRPCClient) markStoppedRemoteApplyFailed(ctx context.Context, remoteApply *storage.Apply, message string, retryable bool) error {
-	return c.markRemoteApplyFailedWithOptions(ctx, remoteApply, nil, message, retryable, true)
+func (c *GRPCClient) markStoppedRemoteApplyFailed(ctx context.Context, remoteApply *storage.Apply, message string, retryable bool, scope applyTaskScope) error {
+	return c.markRemoteApplyFailedWithOptions(ctx, remoteApply, nil, message, retryable, true, scope)
 }
 
-func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remoteApply *storage.Apply, storedTasks []*storage.Task, message string, retryable, allowStoppedStoredApply bool) error {
+func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remoteApply *storage.Apply, storedTasks []*storage.Task, message string, retryable, allowStoppedStoredApply bool, scope applyTaskScope) error {
 	storedApply, transitionStatus, err := c.reloadStoredApplyForRemoteTransition(ctx, remoteApply, allowStoppedStoredApply)
 	if transitionStatus != storedApplyTransitionReady {
 		logSkippedRemoteApplyTransition("mark remote gRPC apply failed", remoteApply, storedApply, transitionStatus, err)
@@ -1209,7 +1266,7 @@ func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remot
 	now := time.Now()
 	if storedTasks == nil {
 		var taskErr error
-		storedTasks, taskErr = c.storage.Tasks().GetByApplyID(ctx, storedApply.ID)
+		storedTasks, taskErr = c.loadApplyTasks(ctx, storedApply, scope)
 		if taskErr != nil {
 			return fmt.Errorf("load tasks after remote gRPC apply failed %s: %w", storedApply.ApplyIdentifier, taskErr)
 		}
@@ -1262,8 +1319,8 @@ func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remot
 	return nil
 }
 
-func (c *GRPCClient) failMissingRemoteApply(ctx context.Context, remoteApply *storage.Apply, message string, cause error) error {
-	if err := c.markRemoteApplyFailed(ctx, remoteApply, nil, message, false); err != nil {
+func (c *GRPCClient) failMissingRemoteApply(ctx context.Context, remoteApply *storage.Apply, message string, cause error, scope applyTaskScope) error {
+	if err := c.markRemoteApplyFailed(ctx, remoteApply, nil, message, false, scope); err != nil {
 		return fmt.Errorf("mark missing remote apply %s failed: %w", remoteApply.ApplyIdentifier, err)
 	}
 	if cause != nil {
@@ -1272,8 +1329,8 @@ func (c *GRPCClient) failMissingRemoteApply(ctx context.Context, remoteApply *st
 	return fmt.Errorf("poll remote apply %s for %s: %s", remoteApply.ExternalID, remoteApply.ApplyIdentifier, message)
 }
 
-func (c *GRPCClient) failMissingStoppedRemoteApply(ctx context.Context, remoteApply *storage.Apply, message string, cause error) error {
-	if err := c.markStoppedRemoteApplyFailed(ctx, remoteApply, message, false); err != nil {
+func (c *GRPCClient) failMissingStoppedRemoteApply(ctx context.Context, remoteApply *storage.Apply, message string, cause error, scope applyTaskScope) error {
+	if err := c.markStoppedRemoteApplyFailed(ctx, remoteApply, message, false, scope); err != nil {
 		return fmt.Errorf("mark missing stopped remote apply %s failed: %w", remoteApply.ApplyIdentifier, err)
 	}
 	if cause != nil {
@@ -1282,7 +1339,7 @@ func (c *GRPCClient) failMissingStoppedRemoteApply(ctx context.Context, remoteAp
 	return fmt.Errorf("check stopped remote apply %s for %s: %s", remoteApply.ExternalID, remoteApply.ApplyIdentifier, message)
 }
 
-func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remoteApply *storage.Apply, remoteTasks []*ternv1.TableProgress, now time.Time) error {
+func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remoteApply *storage.Apply, remoteTasks []*ternv1.TableProgress, now time.Time, scope applyTaskScope) error {
 	// reloadStoredApplyForRemoteTransition may overwrite remoteApply with the
 	// stored row when it finds an already-terminal stored apply. Keep the remote
 	// Progress result available for the stopped-row exception below.
@@ -1313,7 +1370,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	// Keep the stored apply active until stored task rows are written. If task
 	// storage is unavailable, the operator can retry this worker instead of
 	// treating a terminal apply as fully reconciled.
-	storedTasks, err := c.storage.Tasks().GetByApplyID(ctx, storedApply.ID)
+	storedTasks, err := c.loadApplyTasks(ctx, storedApply, scope)
 	if err != nil {
 		return fmt.Errorf("load tasks to sync terminal gRPC progress for %s: %w", storedApply.ApplyIdentifier, err)
 	}
@@ -1552,7 +1609,7 @@ func applyProgressRank(applyState string) int {
 
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
 // Also maintains heartbeat to keep the lease on the apply.
-func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply, allowStoppedAfterStart bool) error {
+func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply, allowStoppedAfterStart bool, scope applyTaskScope) error {
 	ticker := time.NewTicker(grpcProgressPollInterval)
 	defer ticker.Stop()
 
@@ -1572,7 +1629,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				return fmt.Errorf("heartbeat gRPC apply %s: %w", apply.ApplyIdentifier, err)
 			}
 		case <-ticker.C:
-			if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
+			if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); err != nil {
 				slog.Warn("pending gRPC stop request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
@@ -1601,11 +1658,11 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			if err != nil {
 				if status.Code(err) == codes.NotFound {
 					message := fmt.Sprintf("remote apply %s was not found by data plane", apply.ExternalID)
-					return c.failMissingRemoteApply(ctx, apply, message, err)
+					return c.failMissingRemoteApply(ctx, apply, message, err, scope)
 				}
 				if isTerminalRemoteProgressError(err) {
 					message := fmt.Sprintf("remote progress failed for remote apply %s: %v", apply.ExternalID, err)
-					if markErr := c.markRemoteApplyFailed(ctx, apply, nil, message, false); markErr != nil {
+					if markErr := c.markRemoteApplyFailed(ctx, apply, nil, message, false, scope); markErr != nil {
 						return fmt.Errorf("mark remote apply %s failed after terminal progress error: %w", apply.ApplyIdentifier, markErr)
 					}
 					return fmt.Errorf("poll remote apply %s for %s: %w", apply.ExternalID, apply.ApplyIdentifier, err)
@@ -1622,7 +1679,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				if consecutiveProgressErrors >= maxGRPCProgressPollErrorStreak {
 					message := fmt.Sprintf("remote progress polling failed after %d consecutive errors for remote apply %s: %v",
 						consecutiveProgressErrors, apply.ExternalID, err)
-					if markErr := c.markRemoteApplyFailed(ctx, apply, nil, message, true); markErr != nil {
+					if markErr := c.markRemoteApplyFailed(ctx, apply, nil, message, true, scope); markErr != nil {
 						return fmt.Errorf("mark remote apply %s retryable after progress polling errors: %w", apply.ApplyIdentifier, markErr)
 					}
 					return fmt.Errorf("poll remote apply %s for %s: %w", apply.ExternalID, apply.ApplyIdentifier, err)
@@ -1632,7 +1689,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			consecutiveProgressErrors = 0
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id", apply.ExternalID)
-				return c.failMissingRemoteApply(ctx, apply, message, nil)
+				return c.failMissingRemoteApply(ctx, apply, message, nil, scope)
 			}
 
 			// Update apply state from the remote response. An exact apply-id poll
@@ -1683,7 +1740,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					c.logApplyWarning(ctx, apply, message)
 					apply.State = state.Apply.Stopped
 					apply.ErrorMessage = message
-					if err := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now); err != nil {
+					if err := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope); err != nil {
 						return fmt.Errorf("persist stopped gRPC apply %s after start grace period: %w", apply.ApplyIdentifier, err)
 					}
 					if err := failPendingStartControlRequests(ctx, c.storage, apply, message); err != nil {
@@ -1709,9 +1766,9 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 
 			terminal := isTerminalProtoState(resp.State)
 			if terminal {
-				return c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now)
+				return c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope)
 			}
-			storedTasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+			storedTasks, err := c.loadApplyTasks(ctx, apply, scope)
 			if err != nil {
 				return fmt.Errorf("load tasks to sync gRPC progress for %s: %w", apply.ApplyIdentifier, err)
 			}

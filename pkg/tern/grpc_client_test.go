@@ -512,13 +512,23 @@ func (m *mockApplyStore) CheckLease(context.Context, storage.ApplyLease) error {
 // mockTaskStore is a minimal TaskStore for testing pollForCompletion.
 type mockTaskStore struct {
 	storage.TaskStore
-	tasks           []*storage.Task
-	getByApplyIDErr error
+	tasks               []*storage.Task
+	getByApplyIDErr     error
+	getByOperationIDErr error
+	lastOperationID     int64
 }
 
 func (m *mockTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
 	if m.getByApplyIDErr != nil {
 		return nil, m.getByApplyIDErr
+	}
+	return m.tasks, nil
+}
+
+func (m *mockTaskStore) GetByApplyOperationID(_ context.Context, applyOperationID int64) ([]*storage.Task, error) {
+	m.lastOperationID = applyOperationID
+	if m.getByOperationIDErr != nil {
+		return nil, m.getByOperationIDErr
 	}
 	return m.tasks, nil
 }
@@ -687,6 +697,83 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 	require.NotNil(t, progressReq)
 	assert.Equal(t, "remote-dispatched-123", progressReq.ApplyId)
 	assert.Equal(t, "staging", progressReq.Environment)
+}
+
+func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
+	// An operator worker resumes a single apply_operation over the remote path.
+	// The drive loads tasks scoped to that operation (GetByApplyOperationID) and
+	// dispatches only those, never widening to the whole apply's tasks.
+	server := &capturingTernServer{
+		remoteApplyID: "remote-op-dispatched-1",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-op-scoped",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target", DeferCutover: true})
+	operationID := int64(42)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:        "alter",
+		Namespace:        "default",
+		State:            state.Task.Pending,
+	}
+	// Fail any whole-apply task load so the test proves the drive stays scoped to
+	// the operation rather than falling back to GetByApplyID.
+	taskStore := &mockTaskStore{
+		tasks:           []*storage.Task{task},
+		getByApplyIDErr: errors.New("whole-apply task load must not be used for operation-scoped resume"),
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   taskStore,
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-op-scoped",
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.NoError(t, err)
+
+	assert.Equal(t, operationID, taskStore.lastOperationID)
+	assert.Equal(t, "remote-op-dispatched-1", apply.ExternalID)
+	assert.Equal(t, state.Apply.Completed, apply.State)
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected operation-scoped apply to be dispatched to remote Tern")
+	require.Len(t, req.DdlChanges, 1)
+	assert.Equal(t, "users", req.DdlChanges[0].TableName)
+}
+
+func TestGRPCClient_ResumeApplyOperationRejectsMissingOperationID(t *testing.T) {
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
+	defer cleanup()
+
+	err := client.ResumeApplyOperation(t.Context(), &storage.Apply{ApplyIdentifier: "apply-x"}, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "apply operation id is required")
 }
 
 func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
@@ -875,7 +962,7 @@ func TestGRPCClient_ProgressPollTerminalErrorFailsApply(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid apply_id")
 
@@ -922,7 +1009,7 @@ func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "remote service unavailable")
 
@@ -984,7 +1071,7 @@ func TestGRPCClient_ProgressPollBoundsStoppedAfterStart(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, true)
+	err := client.pollForCompletion(ctx, apply, true, wholeApplyTaskScope())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "start accepted")
 	assert.Contains(t, err.Error(), "remained stopped after start grace period")
@@ -1361,7 +1448,7 @@ func TestGRPCClient_PollSetsTerminalTaskMetadataFromRemoteTaskProgress(t *testin
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Task.Completed, task.State)
@@ -1403,7 +1490,7 @@ func TestGRPCClient_PollReturnsErrorWhenTerminalRemoteApplyLeavesStoredTaskActiv
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "stored task task-terminal-missing-state is still running")
 	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
@@ -1448,7 +1535,7 @@ func TestGRPCClient_PollReturnsTerminalStorageUpdateError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "update terminal remote gRPC apply")
 	assert.Contains(t, err.Error(), "storage unavailable")
@@ -1484,7 +1571,7 @@ func TestGRPCClient_PollKeepsApplyActiveWhenTerminalTaskLoadFails(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "load tasks to sync terminal gRPC progress")
 	assert.Contains(t, err.Error(), "task storage unavailable")
@@ -1527,7 +1614,7 @@ func TestGRPCClient_PollSkipsTaskFinalizationWhenStoredApplyAlreadyTerminal(t *t
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Apply.Failed, apply.State)
@@ -1558,7 +1645,7 @@ func TestGRPCClient_MarkRemoteApplyFailedReturnsTaskLoadError(t *testing.T) {
 		},
 	}
 
-	err := client.markRemoteApplyFailed(t.Context(), apply, nil, "remote failed", false)
+	err := client.markRemoteApplyFailed(t.Context(), apply, nil, "remote failed", false, wholeApplyTaskScope())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "load tasks after remote gRPC apply failed")
 	assert.Contains(t, err.Error(), "task storage unavailable")
@@ -2291,7 +2378,7 @@ func TestGRPCClient_ReconcileStoppedRemoteProgressKeepsQueuedStartPending(t *tes
 		Namespace: "default",
 		TableName: "users",
 		Status:    state.Task.Stopped,
-	}}, now)
+	}}, now, wholeApplyTaskScope())
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Apply.Stopped, remoteApply.State)
@@ -2525,7 +2612,7 @@ func TestGRPCClient_PollFailsWhenRemoteApplyIsNotFound(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "remote-not-found")
 
@@ -2566,7 +2653,7 @@ func TestGRPCClient_PollFailsWhenExactRemoteApplyHasNoActiveProgress(t *testing.
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no active schema change")
 
@@ -2604,7 +2691,7 @@ func TestGRPCClient_PollFailsWhenRemoteApplyStateIsUnmapped(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unmapped remote state")
 	assert.Equal(t, state.Apply.Running, apply.State)
@@ -2648,7 +2735,7 @@ func TestGRPCClient_RemoteProgressLossDoesNotOverwriteTerminalApply(t *testing.T
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false)
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.Error(t, err)
 
 	assert.Equal(t, state.Apply.Completed, apply.State)
