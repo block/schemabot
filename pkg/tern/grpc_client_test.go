@@ -936,7 +936,7 @@ func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) 
 }
 
 func TestGRPCClient_ProgressPollBoundsStoppedAfterStart(t *testing.T) {
-	// A operator-owned start may briefly see the remote stopped state from the
+	// An operator-owned start may briefly see the remote stopped state from the
 	// preceding stop, but that grace period must end with a stored stopped result
 	// instead of an unbounded polling loop.
 	originalGracePeriod := grpcStoppedAfterStartGracePeriod
@@ -1122,7 +1122,7 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 
 	assert.Equal(t, state.Apply.Running,
 		applyStateFromRemoteProgress(state.Apply.Stopped, state.Apply.Running, true),
-		"a operator-owned start may adopt active remote progress after a stale stopped write")
+		"an operator-owned start may adopt active remote progress after a stale stopped write")
 }
 
 func TestGRPCClient_SyncStoredTasksFromRemoteTasksUsesRemoteTaskState(t *testing.T) {
@@ -1820,7 +1820,7 @@ func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 }
 
 func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
-	// A operator claim can move the apply row before the worker calls remote
+	// An operator claim can move the apply row before the worker calls remote
 	// Start. The durable control request lets a later worker recover that
 	// intent and validate the remote stopped state.
 	server := &capturingTernServer{

@@ -509,7 +509,7 @@ const (
 type ControlRequestStatus string
 
 const (
-	// ControlRequestPending means a operator worker still needs to act.
+	// ControlRequestPending means an operator worker still needs to act.
 	ControlRequestPending ControlRequestStatus = "pending"
 	// ControlRequestCompleted means the requested operation has been accepted.
 	ControlRequestCompleted ControlRequestStatus = "completed"

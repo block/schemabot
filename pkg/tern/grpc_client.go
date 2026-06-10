@@ -1289,7 +1289,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	remoteApplyFromProgress := *remoteApply
 	storedApply, transitionStatus, err := c.reloadStoredApplyForRemoteTransition(ctx, remoteApply, false)
 
-	// A operator claim can start from a stale stored "stopped" row. If the
+	// An operator claim can start from a stale stored "stopped" row. If the
 	// exact remote apply has already advanced to another terminal state, the
 	// remote result is the newer truth and should replace the stored stopped row.
 	if transitionStatus == storedApplyTransitionAlreadyTerminal && storedStoppedApplyCanAdoptRemoteTerminalState(storedApply, &remoteApplyFromProgress) {

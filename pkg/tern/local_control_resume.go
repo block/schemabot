@@ -415,7 +415,7 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 	}
 }
 
-// prepareStoppedTasksForResume turns a operator-claimed start request back into
+// prepareStoppedTasksForResume turns an operator-claimed start request back into
 // runnable task work. The start intent stays pending until stopped task rows are
 // requeued and the apply is ready for execution, so a worker crash can still be
 // recovered by another operator worker.
@@ -608,7 +608,7 @@ func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*stor
 	}
 }
 
-// ResumeApply starts or resumes an apply claimed by a operator worker.
+// ResumeApply starts or resumes an apply claimed by an operator worker.
 // Pending applies are dispatched for the first time; stale applies use the
 // engine's resume metadata to continue after a missed heartbeat.
 func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {

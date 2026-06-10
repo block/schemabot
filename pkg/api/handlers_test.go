@@ -2273,7 +2273,7 @@ func TestStartHandler(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, resp.Accepted)
 		assert.Equal(t, "already_requested", resp.Status)
-		assert.Equal(t, state.Apply.Running, apply.State, "duplicate start must not rewind a operator-claimed apply")
+		assert.Equal(t, state.Apply.Running, apply.State, "duplicate start must not rewind an operator-claimed apply")
 	})
 
 	t.Run("queues stopped tasks when stored apply row is still running", func(t *testing.T) {

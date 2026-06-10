@@ -51,7 +51,7 @@ type Client interface {
 	// Health checks the service health.
 	Health(ctx context.Context) error
 
-	// ResumeApply starts or resumes work claimed by a operator worker.
+	// ResumeApply starts or resumes work claimed by an operator worker.
 	// Fresh pending applies are dispatched for the first time; stale applies
 	// use checkpoint/resume capabilities of the underlying engine.
 	ResumeApply(ctx context.Context, apply *storage.Apply) error

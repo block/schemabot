@@ -364,7 +364,7 @@ func applyMetricStatusForError(err error) string {
 //  2. Resolve the Tern client to validate the deployment/environment.
 //  3. Create a pending Apply record and pending Task records from the plan.
 //  4. Attach any pending observer to the stored apply before dispatch can start.
-//  5. Wake a operator worker so fresh applies usually start immediately.
+//  5. Wake an operator worker so fresh applies usually start immediately.
 //  6. Return the SchemaBot apply_identifier to the HTTP caller.
 //
 // Returns the API response, the stored apply ID (0 if not stored), and any error.

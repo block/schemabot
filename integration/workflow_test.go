@@ -1336,7 +1336,7 @@ func TestFullWorkflow_Spirit_PartialFailure(t *testing.T) {
 	ctx := t.Context()
 
 	appDBName, _ := createTestDB(t, "partialfail_")
-	// The first queued apply starts through a operator wake, so this test can
+	// The first queued apply starts through an operator wake, so this test can
 	// use a slower poll interval to observe the retryable pause before the next
 	// operator retry consumes it.
 	ts := startTestServerWithOperatorInterval(t, appDBName, strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1), 5*time.Second)

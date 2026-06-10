@@ -807,7 +807,7 @@ func TestLocalClient_GroupedApplyKeepsClaimLeaseRunning(t *testing.T) {
 	assert.Equal(t, state.Apply.Completed, completed.State)
 }
 
-// This scenario covers a operator-owned grouped start where the target schema
+// This scenario covers an operator-owned grouped start where the target schema
 // advances between the recovery re-plan and the final pre-dispatch schema check.
 // The operator should complete durable state without reissuing engine apply work.
 func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t *testing.T) {
@@ -1528,7 +1528,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelFailsWhenWorkRemain
 	assert.True(t, hasLogMessageContaining(logs, "manual reconciliation required"))
 }
 
-// This scenario covers a operator-owned grouped start where remote execution is
+// This scenario covers an operator-owned grouped start where remote execution is
 // rejected after the durable start request was claimed. The start request should
 // fail visibly instead of being marked completed before engine acceptance.
 func TestLocalClient_ResumeApplyGroupedStartRequestFailsWhenEngineRejects(t *testing.T) {

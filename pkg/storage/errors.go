@@ -29,7 +29,7 @@ var (
 	// for the same database, type, and environment.
 	ErrActiveApplyExists = errors.New("active apply already exists")
 
-	// ErrApplyLeaseLost is returned when a operator-owned write no longer
+	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
 

@@ -244,7 +244,7 @@ type ApplyStore interface {
 	// If not called for > 1 minute, another worker can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
 
-	// CheckLease verifies that a operator apply lease is still current without
+	// CheckLease verifies that an operator apply lease is still current without
 	// mutating the apply row.
 	CheckLease(ctx context.Context, lease ApplyLease) error
 
@@ -401,7 +401,7 @@ type ApplyOperationStore interface {
 	//
 	// Returns the claimed row, or nil if nothing needs work.
 	//
-	// Pure storage primitive: no operator/operator loop calls this yet —
+	// Pure storage primitive: no operator loop calls this yet —
 	// the per-deployment claim loop arrives in a subsequent PR in the
 	// multi-deployment apply workstream.
 	FindNextApplyOperation(ctx context.Context) (*ApplyOperation, error)
