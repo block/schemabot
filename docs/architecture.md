@@ -15,7 +15,7 @@
   - [Apply](#apply)
   - [Apply vs Task](#apply-vs-task)
   - [Progress Flow And Observers](#progress-flow-and-observers)
-  - [Scheduler](#scheduler)
+  - [Operator](#operator)
   - [Execution Modes](#execution-modes)
   - [Integration Modes](#integration-modes)
 - [Engine Layer (Executor)](#engine-layer-executor)
@@ -177,13 +177,13 @@ SchemaBot also stores durable control requests for operations whose accepted
 intent must survive API handler exits or process restarts. `stop`, stopped-state
 `start`, and cutover requests are recorded in
 `apply_control_requests` before the engine side effect is performed. The active
-scheduler-owned apply worker consumes the request, performs or forwards the
+operator-owned apply worker consumes the request, performs or forwards the
 engine control operation, syncs SchemaBot storage to the resulting state, and
 only then marks the control request completed.
 
 ```
 ┌──────────────┐     ┌────────────────────────┐     ┌──────────────┐
-│ CLI / API    │────▶│ apply_control_requests │────▶│ Scheduler    │
+│ CLI / API    │────▶│ apply_control_requests │────▶│ Operator     │
 │ accepts user │     │ pending intent         │     │ apply owner  │
 │ control op   │     └────────────────────────┘     └──────┬───────┘
 └──────────────┘                                           │
@@ -208,15 +208,15 @@ completion until the stop request has been observed and processed. The API
 therefore records the durable stop request first, then immediately attempts a
 safe engine stop as a fast path for local/in-process Tern clients. If the
 immediate stop succeeds, the active engine is interrupted without waiting for the
-scheduler owner's next poll. If it fails or is not accepted, SchemaBot logs the
+operator owner's next poll. If it fails or is not accepted, SchemaBot logs the
 result and leaves the durable request pending so the current owner, or a later
 recovered owner, can retry and reconcile final state. Remote gRPC Tern clients
-skip the API fast path because the scheduler owner must both stop the remote
+skip the API fast path because the operator owner must both stop the remote
 data plane and reconcile SchemaBot's local storage in one owner-controlled flow.
 
 Forward-progress controls must fail closed while a stop is pending. User-driven
 cutover is rejected when a pending stop request exists, whether the request came
-from the CLI/API path or a PR comment, and scheduler-owned pollers check for
+from the CLI/API path or a PR comment, and operator-owned pollers check for
 pending stops before continuing progress work. This avoids the unsafe
 interleaving where `/api/stop` returns accepted while another path moves the
 same apply from `waiting_for_cutover` into cutover or completion before the stop
@@ -224,8 +224,8 @@ can be applied.
 
 Cutover requests follow the same durable-owner model. The API accepts cutover
 when the apply is ready for cutover, records a pending cutover request, and wakes
-the scheduler instead of depending on the API handler to reach the active engine
-process. The scheduler owner then sends the local engine request or remote gRPC
+the operator instead of depending on the API handler to reach the active engine
+process. The operator owner then sends the local engine request or remote gRPC
 `Cutover` request. If the engine accepts, the cutover request is completed; if
 the request fails or is rejected, the request is marked failed with the
 operator-visible reason so a later retry requires a new operator request.
@@ -233,7 +233,7 @@ operator-visible reason so a later retry requires a new operator request.
 Restart recovery has a separate visible phase while SchemaBot reattaches to an
 engine after owner loss. If storage says a MySQL/Spirit apply was
 `waiting_for_cutover` and Spirit's `_spirit_sentinel` table still exists, the
-scheduler marks the apply `recovering` before cutover is safe again. Cutover
+operator marks the apply `recovering` before cutover is safe again. Cutover
 requests are rejected in this phase. Once progress reports concrete engine work,
 SchemaBot returns the apply to the normal state for that work: `running` for row
 copy or `waiting_for_cutover` when Spirit has re-reached the sentinel wait. The
@@ -242,7 +242,7 @@ outcome/status API; sentinel presence is enough to block cutover safely, but it
 does not prove Spirit reused prior row-copy progress.
 
 If the sentinel is already absent when SchemaBot restarts, recovery does not
-enter `recovering`. The scheduler re-plans against the live schema; if
+enter `recovering`. The operator re-plans against the live schema; if
 the desired schema is already present, the apply is marked completed, otherwise
 the remaining work is resumed through the normal checkpoint recovery path.
 
@@ -269,8 +269,8 @@ the remaining work is resumed through the normal checkpoint recovery path.
 
 This preserves single-owner semantics for running applies: a fresh running apply
 with a pending stop request is still owned by its current worker, not claimed by
-a second scheduler worker. If that worker or process exits before acting, the
-stale heartbeat makes the apply claimable through the normal scheduler recovery
+a second operator worker. If that worker or process exits before acting, the
+stale heartbeat makes the apply claimable through the normal operator recovery
 path, and the next worker processes the pending control request before resuming
 or dispatching more work.
 
@@ -385,16 +385,16 @@ Persist applies + tasks
           - terminal summary comment
 ```
 
-State authority is intentionally one-way: engine progress is an input, not the durable source of truth. Raw engine states are first normalized into canonical task states. The poller then reconciles that normalized engine task state with the stored task row: terminal stored tasks stay terminal, scheduler/control-owned states such as `stopped` and `failed_retryable` are not overwritten by stale active engine polls, and ordinary active states can move forward but not backward. Apply state is derived after task rows are coherent, so PR comments, CLI progress, and scheduler checks never need to reason about raw engine states directly.
+State authority is intentionally one-way: engine progress is an input, not the durable source of truth. Raw engine states are first normalized into canonical task states. The poller then reconciles that normalized engine task state with the stored task row: terminal stored tasks stay terminal, operator/control-owned states such as `stopped` and `failed_retryable` are not overwritten by stale active engine polls, and ordinary active states can move forward but not backward. Apply state is derived after task rows are coherent, so PR comments, CLI progress, and operator checks never need to reason about raw engine states directly.
 
 Unknown raw engine states normalize to `running`. This keeps unfamiliar in-flight work visible and blocking without leaking engine-specific strings into SchemaBot state or UI. Once the engine state is understood, update `NormalizeTaskStatus()` and the state-policy tests so the new state has an explicit task-state mapping and ordering policy.
 
 #### Remote gRPC Progress Synchronization
 
-Remote gRPC progress is core Tern scheduler behavior. In gRPC mode, the
+Remote gRPC progress is core Tern operator behavior. In gRPC mode, the
 SchemaBot API queues and tracks applies in control-plane storage, while a remote
 Tern deployment executes the schema change and reports progress for its own
-apply ID. The scheduler worker that claims the stored apply also owns the
+apply ID. The operator worker that claims the stored apply also owns the
 durable progress polling loop for that remote apply.
 
 ```
@@ -404,7 +404,7 @@ CLI / webhook apply request
 SchemaBot API creates stored apply + tasks
         |
         v
-Scheduler worker claims apply
+Operator worker claims apply
         |
         v
 GRPCClient.ResumeApply()
@@ -413,14 +413,14 @@ GRPCClient.ResumeApply()
         |                        and store remote apply_id as external_id
         |
         v
-Same scheduler worker polls Progress(apply_id=external_id, environment)
+Same operator worker polls Progress(apply_id=external_id, environment)
         |
         v
 Stored apply/task rows are updated for status, logs, recovery, and UI
 ```
 
 HTTP progress endpoints and the CLI/TUI may also request progress, but those
-request-time reads are not the durable synchronization path. The scheduler
+request-time reads are not the durable synchronization path. The operator
 worker's polling loop is what keeps SchemaBot storage reconciled with the remote
 data plane.
 
@@ -443,10 +443,10 @@ Transient progress RPC errors do not cause SchemaBot to send a remote `Stop`
 request. A progress outage only proves the control plane cannot observe the
 remote apply; it does not prove the remote apply should be stopped.
 
-Instead, the scheduler worker counts consecutive progress polling errors:
+Instead, the operator worker counts consecutive progress polling errors:
 
 ```
-Scheduler worker polls remote Progress
+Operator worker polls remote Progress
         |
         +-- NotFound / no active change
         |       |
@@ -473,7 +473,7 @@ Scheduler worker polls remote Progress
             reset consecutive error count and sync storage
 ```
 
-`failed_retryable` pauses the current scheduler attempt and keeps the apply
+`failed_retryable` pauses the current operator attempt and keeps the apply
 visible and blocking until recovery retries it. The remote data-plane apply may
 still be running; SchemaBot deliberately avoids issuing a stop command when the
 only problem is repeated inability to read progress.
@@ -498,11 +498,11 @@ Webhook handler: "someone commented schemabot apply"
             |
             v
         store pending apply + tasks
-            +-- Registers Observer on the apply before scheduler dispatch
-            +-- Wakes scheduler
+            +-- Registers Observer on the apply before operator dispatch
+            +-- Wakes operator
                     |
                     v
-                Scheduler worker claims apply
+                Operator worker claims apply
                     |
                     v
                 Client.ResumeApply()
@@ -541,20 +541,20 @@ but no summary comment. That means `OnTerminal` was missed during a process
 restart. The webhook runtime posts the missing summary from the apply record's
 stored GitHub context, and errors never fail server startup.
 
-### Scheduler
+### Operator
 
-The scheduler is part of Tern orchestration. The API service starts it on server startup because the server owns process lifecycle, configuration, and the Tern client pool, but the scheduler's work is to coordinate applies: claim storage records, refresh their heartbeat lease, and call `ResumeApply()` on the right Tern client.
+The operator is part of Tern orchestration. The API service starts it on server startup because the server owns process lifecycle, configuration, and the Tern client pool, but the operator's work is to coordinate applies: claim storage records, refresh their heartbeat lease, and call `ResumeApply()` on the right Tern client.
 
-Each scheduler worker runs immediately on startup, then polls every 10 seconds. The worker claims at most one apply per tick and resumes it through the Tern client for that apply's deployment and environment. Fresh applies also send a best-effort wake signal after their apply and task rows are committed, so a worker can claim them immediately instead of waiting for the next poll tick.
+Each operator worker runs immediately on startup, then polls every 10 seconds. The worker claims at most one apply per tick and resumes it through the Tern client for that apply's deployment and environment. Fresh applies also send a best-effort wake signal after their apply and task rows are committed, so a worker can claim them immediately instead of waiting for the next poll tick.
 
-`scheduler_workers` controls scheduler concurrency. The default is four workers, so an untuned server can still make progress across independent databases and environments concurrently. More workers help larger installations with many independent schema changes because each worker can claim and resume a different target during the same scheduler tick.
+`operator_workers` controls operator concurrency (the deprecated `operator_workers` alias is still accepted for one release). The default is four workers, so an untuned server can still make progress across independent databases and environments concurrently. More workers help larger installations with many independent schema changes because each worker can claim and resume a different target during the same operator tick.
 
-In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each scheduler has its own configurable worker pool, and every worker coordinates through shared storage before resuming an apply. When a recovered apply came from a PR comment, the worker attaches a reconstructed `ProgressObserver` before calling `ResumeApply()` so the resumed progress poller can keep updating PR comments.
+In a multi-pod deployment, every SchemaBot pod runs its own operator. Each operator has its own configurable worker pool, and every worker coordinates through shared storage before resuming an apply. When a recovered apply came from a PR comment, the worker attaches a reconstructed `ProgressObserver` before calling `ResumeApply()` so the resumed progress poller can keep updating PR comments.
 
 ```
 +--------------------------+      +--------------------------+
 | SchemaBot pod A          |      | SchemaBot pod B          |
-| Scheduler                |      | Scheduler                |
+| Operator                 |      | Operator                 |
 | +----------------------+ |      | +----------------------+ |
 | | worker 0             | |      | | worker 0             | |
 | | claim apply work     | |      | | claim apply work     | |
@@ -586,7 +586,7 @@ In a multi-pod deployment, every SchemaBot pod runs its own scheduler. Each sche
         +-----------------------------------------------+
 ```
 
-The storage arrows represent scheduler coordination. The GitHub arrows represent optional observer notifications; CLI applies simply run without an observer.
+The storage arrows represent operator coordination. The GitHub arrows represent optional observer notifications; CLI applies simply run without an observer.
 
 A **claim** is an atomic storage operation: it selects one apply that needs work,
 refreshes its `updated_at` heartbeat, and rotates an apply lease token in the
@@ -631,11 +631,11 @@ state.
    ╰──────────╯                       ╰──────────────────────────╯
 ```
 
-Claims use `FOR UPDATE SKIP LOCKED` so multiple scheduler workers can run concurrently without taking the same apply.
+Claims use `FOR UPDATE SKIP LOCKED` so multiple operator workers can run concurrently without taking the same apply.
 
 A running apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
 
-Freshly queued applies are also claimable once their task rows exist. `ExecuteApply` stores the pending apply and its initial tasks in one transaction, then sends a best-effort wake signal to the scheduler. The wake path is only a latency optimization: it nudges one worker to call the same claim path immediately instead of waiting for the next poll tick. It never bypasses storage claims or creates a second queue. If the scheduler is stopped or a wake is already pending, the signal is skipped and the normal poll loop still finds the apply.
+Freshly queued applies are also claimable once their task rows exist. `ExecuteApply` stores the pending apply and its initial tasks in one transaction, then sends a best-effort wake signal to the operator. The wake path is only a latency optimization: it nudges one worker to call the same claim path immediately instead of waiting for the next poll tick. It never bypasses storage claims or creates a second queue. If the operator is stopped or a wake is already pending, the signal is skipped and the normal poll loop still finds the apply.
 
 ```
 HTTP apply request
@@ -644,7 +644,7 @@ HTTP apply request
 store pending apply + tasks
       |
       v
-best-effort scheduler wake
+best-effort operator wake
       |
       v
 worker calls FindNextApply()
@@ -670,7 +670,7 @@ The named lock is internal storage infrastructure, not user-facing lock state or
 
 If storage cannot acquire the named lock within the bounded wait, the write fails before changing `applies`. If storage cannot confirm lock release, it discards the connection so MySQL releases the session-scoped lock.
 
-The scheduler relies on that invariant. Additional workers increase concurrency across independent targets; they do not make one database/environment run multiple applies at once.
+The operator relies on that invariant. Additional workers increase concurrency across independent targets; they do not make one database/environment run multiple applies at once.
 
 If a worker finds no claimable apply, it waits briefly and retries once during the same tick. This lets another worker that lost a claim race pick up a different target without waiting for the next 10-second poll.
 
@@ -753,7 +753,7 @@ There are two ways to deploy the tern layer:
 
 Used for: local development, self-hosted deployments, single-binary setups.
 
-**gRPC Mode** (`GRPCClient`) — SchemaBot delegates execution to an external Tern service over gRPC. SchemaBot still maintains its own storage for locks, plans, applies, and tasks. HTTP apply requests queue durable control-plane rows first; scheduler workers dispatch the queued apply to the remote Tern service and then poll it until terminal.
+**gRPC Mode** (`GRPCClient`) — SchemaBot delegates execution to an external Tern service over gRPC. SchemaBot still maintains its own storage for locks, plans, applies, and tasks. HTTP apply requests queue durable control-plane rows first; operator workers dispatch the queued apply to the remote Tern service and then poll it until terminal.
 
 ```
 ┌──────────────────────────────┐        ┌──────────────────────────────┐
@@ -766,7 +766,7 @@ Used for: local development, self-hosted deployments, single-binary setups.
 │ (locks, plans, applies)      │        │ (remote apply rows)          │
 │      │                       │        │      │                       │
 │      ▼                       │        │      ▼                       │
-│ Scheduler worker             │        │ Tern Proto Interface         │
+│ Operator worker              │        │ Tern Proto Interface         │
 │      │                       │        │      │                       │
 │      ▼                       │        │      ▼                       │
 │ GRPCClient ──────────────────┼────────▶ Engine ─────────────────────▶│ Target DB
@@ -777,7 +777,7 @@ Used for: distributed deployments where SchemaBot and the database engine run on
 
 **Identity resolution (`apply_identifier` vs `external_id`):**
 
-In gRPC mode, SchemaBot and Tern maintain separate storage with separate IDs. SchemaBot generates an `apply_identifier` for HTTP callers when it queues the apply. The scheduler later calls remote Tern, receives Tern's own apply ID, and stores that remote ID as `external_id`:
+In gRPC mode, SchemaBot and Tern maintain separate storage with separate IDs. SchemaBot generates an `apply_identifier` for HTTP callers when it queues the apply. The operator later calls remote Tern, receives Tern's own apply ID, and stores that remote ID as `external_id`:
 
 An accepted apply must return an apply ID and must be represented in SchemaBot
 storage before webhook progress tracking or Check Run ownership can proceed.
@@ -788,10 +788,10 @@ to the PR check that started the work.
 Apply flow:
   ExecuteApply
     → stores apply_identifier="apply-abc123", external_id=""
-    → wakes scheduler
+    → wakes operator
     → returns apply_id="apply-abc123" to HTTP caller
 
-  Scheduler worker claims apply "apply-abc123"
+  Operator worker claims apply "apply-abc123"
     → GRPCClient.ResumeApply() calls remote Apply()
     → Tern returns ApplyId:"tern-42"
     → SchemaBot stores external_id="tern-42"
@@ -810,10 +810,10 @@ In local mode (`client.IsRemote() == false`), `LocalClient` runs in the same pro
 Apply flow (local):
   ExecuteApply
     → stores apply_identifier="apply-def456", external_id=""
-    → wakes scheduler
+    → wakes operator
     → returns apply_id="apply-def456" to HTTP caller
 
-  Scheduler worker claims apply "apply-def456"
+  Operator worker claims apply "apply-def456"
     → LocalClient.ResumeApply() runs the engine locally
     → external_id remains empty
 
