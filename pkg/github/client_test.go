@@ -1,6 +1,7 @@
 package github
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -222,6 +223,68 @@ func TestFindCheckRunByNameErrorsWhenOwnAppSlugUnknown(t *testing.T) {
 	assert.Contains(t, err.Error(), "abc123")
 	assert.Nil(t, result)
 	assert.Equal(t, int64(0), requests.Load())
+}
+
+// A schema directory listed via the GitHub Contents API at the documented
+// 1000-entry cap is treated as truncated: schema discovery fails closed with an
+// error naming the directory rather than proceeding with a possibly-incomplete
+// list, which would otherwise surface as spurious DROP TABLE proposals or missed
+// changes in the declarative differ.
+func TestFetchSchemaFilesOptimizedFailsClosedWhenDirectoryAtCap(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+
+	entries := make([]gh.RepositoryContent, 0, maxGitHubDirEntries)
+	for i := range maxGitHubDirEntries {
+		name := "t" + strconv.Itoa(i) + ".sql"
+		entries = append(entries, gh.RepositoryContent{
+			Type: new("file"),
+			Name: new(name),
+			Path: new("schema/" + name),
+		})
+	}
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(entries))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	files, err := ic.FetchSchemaFilesOptimized(t.Context(), "octocat/hello-world", "abc123", "schema", "mysql")
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrDirListingCapped)
+	assert.Contains(t, err.Error(), "schema")
+	assert.Nil(t, files)
+}
+
+// A schema directory below the Contents API cap is listed and its managed
+// schema files are fetched unchanged.
+func TestFetchSchemaFilesOptimizedSmallDirectory(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema", func(w http.ResponseWriter, _ *http.Request) {
+		entries := []gh.RepositoryContent{
+			{Type: new("file"), Name: new("users.sql"), Path: new("schema/users.sql")},
+			{Type: new("file"), Name: new("README.md"), Path: new("schema/README.md")},
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(entries))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema/users.sql", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Type:     new("file"),
+			Name:     new("users.sql"),
+			Path:     new("schema/users.sql"),
+			Encoding: new("base64"),
+			Content:  new(base64.StdEncoding.EncodeToString([]byte("CREATE TABLE users (id INT);"))),
+		}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	files, err := ic.FetchSchemaFilesOptimized(t.Context(), "octocat/hello-world", "abc123", "schema", "mysql")
+
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	assert.Equal(t, "users.sql", files[0].Name)
+	assert.Equal(t, "schema/users.sql", files[0].Path)
+	assert.Equal(t, "CREATE TABLE users (id INT);", files[0].Content)
 }
 
 func setupRateLimitedTestGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {

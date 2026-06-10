@@ -50,6 +50,7 @@ var (
 	ErrMultipleConfigs   = fmt.Errorf("multiple schemabot.yaml configs found - use -d flag to specify database")
 	ErrGitTreeTruncated  = fmt.Errorf("GitHub returned a truncated repository tree; config discovery is incomplete")
 	ErrPRFilesIncomplete = fmt.Errorf("GitHub returned the maximum number of pull request files; config discovery is incomplete")
+	ErrDirListingCapped  = fmt.Errorf("GitHub returned the maximum number of directory entries; schema discovery is incomplete")
 )
 
 // DatabaseNotFoundError indicates the specified database was not found in any config.

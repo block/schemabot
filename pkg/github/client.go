@@ -976,6 +976,13 @@ func (ic *InstallationClient) FetchFileContent(ctx context.Context, repo, filePa
 	return content, nil
 }
 
+// GitHub caps the Contents API directory listing at this documented maximum and
+// does not paginate or provide a completeness marker for larger directories.
+// Treat reaching the cap as incomplete so schema discovery fails closed instead
+// of silently dropping the lexicographic tail, which would surface as spurious
+// DROP TABLE proposals or missed changes in the declarative differ.
+const maxGitHubDirEntries = 1000
+
 func (ic *InstallationClient) fetchDirectoryContents(ctx context.Context, repo, dirPath, ref string) ([]*gh.RepositoryContent, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.RepositoryContentGetOptions{Ref: ref}
@@ -985,6 +992,9 @@ func (ic *InstallationClient) fetchDirectoryContents(ctx context.Context, repo, 
 	}
 	if fileContent != nil {
 		return nil, fmt.Errorf("expected directory at %s, found file", dirPath)
+	}
+	if len(directoryContent) >= maxGitHubDirEntries {
+		return nil, fmt.Errorf("list schema directory %s in repo %s ref %s reached GitHub Contents API limit: %w", dirPath, repo, ref, ErrDirListingCapped)
 	}
 	return directoryContent, nil
 }
