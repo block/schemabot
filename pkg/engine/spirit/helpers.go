@@ -3,7 +3,6 @@ package spirit
 import (
 	"database/sql"
 	"fmt"
-	"net"
 	"strings"
 
 	"github.com/block/spirit/pkg/dbconn"
@@ -13,8 +12,6 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/schema"
 )
-
-var lookupCNAME = net.LookupCNAME
 
 // parseDSN extracts connection info from a MySQL DSN using the mysql driver's parser.
 func parseDSN(dsn string) (host, username, password, database string, err error) {
@@ -62,20 +59,7 @@ func mysqlTLSModeForHost(addr string) (string, bool) {
 	if dbconn.IsRDSHost(addr) {
 		return "REQUIRED", true
 	}
-
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-	canonicalHost, err := lookupCNAME(host)
-	if err != nil {
-		return "", false
-	}
-	canonicalHost = strings.TrimSuffix(canonicalHost, ".")
-	if !dbconn.IsRDSHost(canonicalHost) {
-		return "", false
-	}
-	return "VERIFY_CA", true
+	return "", false
 }
 
 // namespaceForTable finds which namespace a table belongs to by checking

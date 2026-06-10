@@ -14,8 +14,6 @@ func TestMySQLConnectionDSN(t *testing.T) {
 	tests := []struct {
 		name       string
 		dsn        string
-		cname      string
-		cnameErr   error
 		wantTLS    string
 		wantSame   bool
 		wantErrSub string
@@ -31,21 +29,8 @@ func TestMySQLConnectionDSN(t *testing.T) {
 			wantSame: true,
 		},
 		{
-			name:    "CNAME resolving to RDS gets CA verification",
-			dsn:     "spirit:secret@tcp(database.example.com:3306)/app?parseTime=true",
-			cname:   "database.cluster-abc123.us-west-2.rds.amazonaws.com.",
-			wantTLS: "verify_ca",
-		},
-		{
-			name:     "CNAME resolving outside RDS is unchanged",
+			name:     "database alias is unchanged",
 			dsn:      "spirit:secret@tcp(database.example.com:3306)/app?parseTime=true",
-			cname:    "database.internal.example.com.",
-			wantSame: true,
-		},
-		{
-			name:     "CNAME lookup failure is unchanged",
-			dsn:      "spirit:secret@tcp(database.example.com:3306)/app?parseTime=true",
-			cnameErr: assert.AnError,
 			wantSame: true,
 		},
 		{
@@ -69,12 +54,6 @@ func TestMySQLConnectionDSN(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			previousLookupCNAME := lookupCNAME
-			lookupCNAME = func(string) (string, error) {
-				return tt.cname, tt.cnameErr
-			}
-			t.Cleanup(func() { lookupCNAME = previousLookupCNAME })
-
 			got, err := mysqlConnectionDSN(tt.dsn)
 			if tt.wantErrSub != "" {
 				require.Error(t, err)
