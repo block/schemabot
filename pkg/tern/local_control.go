@@ -250,6 +250,16 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 		targetApply = apply
 	}
 
+	// A task in the revert window has already cut over: the new schema is live.
+	// Stop must not finalize it as cancelled — that would record a deployed
+	// change as if nothing happened. Reject so the operator chooses explicitly
+	// between revert (undo the deployed change) and skip-revert (finalize it).
+	if revertTask := firstRevertWindowTask(tasks, targetApplyID); revertTask != nil {
+		c.logger.Warn("stop rejected: task is in the revert window and has already cut over",
+			"task_id", revertTask.TaskIdentifier, "apply_id", revertTask.ApplyID, "state", revertTask.State)
+		return nil, fmt.Errorf("schema change %s is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", revertTask.TaskIdentifier)
+	}
+
 	creds := c.credentials()
 	eng := c.getEngine()
 	applyCancel := c.currentApplyCancel()
@@ -387,7 +397,43 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	return true, nil
 }
 
-// stopEngineForTasks calls eng.Stop() if any targeted task is actively running.
+// firstRevertWindowTask returns the first targeted task that is in the revert
+// window, or nil if none are. A revert-window task has already cut over, so the
+// stop path must reject rather than treat it as a cancellable in-flight change.
+func firstRevertWindowTask(tasks []*storage.Task, targetApplyID int64) *storage.Task {
+	for _, task := range tasks {
+		if targetApplyID > 0 && task.ApplyID != targetApplyID {
+			continue
+		}
+		if state.IsState(task.State, state.Task.RevertWindow) {
+			return task
+		}
+	}
+	return nil
+}
+
+// hasLiveEngineWork reports whether a task in this state has live engine or
+// remote work that eng.Stop must terminate before storage records the stop.
+// These are the non-terminal states where a Spirit runner is copying rows or a
+// PlanetScale deploy request is created and can be cancelled:
+//   - Running / CuttingOver: Spirit runner or PlanetScale deploy actively executing.
+//   - WaitingForCutover: Spirit runner alive, holding connections until cutover.
+//   - Recovering: Spirit's runner is restarted with a detached context during
+//     recovery; only eng.Stop kills it, so without this the runner keeps copying
+//     rows while storage reports stopped and a later resume blocks in Drain()
+//     behind the abandoned runner.
+//   - WaitingForDeploy: the PlanetScale deferred deploy request exists and stays
+//     startable from the PlanetScale UI until eng.Stop cancels it.
+func hasLiveEngineWork(taskState string) bool {
+	return state.IsState(taskState,
+		state.Task.Running,
+		state.Task.WaitingForCutover,
+		state.Task.CuttingOver,
+		state.Task.Recovering,
+		state.Task.WaitingForDeploy)
+}
+
+// stopEngineForTasks calls eng.Stop() if any targeted task has live engine work.
 // Returns an error if the engine stop fails (e.g., PlanetScale deploy request
 // cancellation failed). For Spirit, stop errors are non-fatal since the runner
 // may have already exited.
@@ -404,22 +450,23 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 			c.logger.Info("skipping terminal task in stop", "task_id", task.TaskIdentifier, "state", task.State)
 			continue
 		}
-		if task.State == state.Task.Running ||
-			task.State == state.Task.WaitingForCutover ||
-			task.State == state.Task.CuttingOver {
-			req, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlStop)
-			if err != nil {
-				return fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
-			}
-			if _, err := eng.Stop(ctx, req); err != nil {
-				if c.config.Type == storage.DatabaseTypeVitess {
-					return fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, err)
-				}
-				c.logger.Warn("engine stop returned error (runner may have already exited)",
-					"task_id", task.TaskIdentifier, "error", err)
-			}
-			return nil
+		if !hasLiveEngineWork(task.State) {
+			c.logger.Debug("skipping engine stop for task with no live engine work",
+				"task_id", task.TaskIdentifier, "state", task.State)
+			continue
 		}
+		req, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlStop)
+		if err != nil {
+			return fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
+		}
+		if _, err := eng.Stop(ctx, req); err != nil {
+			if c.config.Type == storage.DatabaseTypeVitess {
+				return fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, err)
+			}
+			c.logger.Warn("engine stop returned error (runner may have already exited)",
+				"task_id", task.TaskIdentifier, "error", err)
+		}
+		return nil
 	}
 	return nil
 }

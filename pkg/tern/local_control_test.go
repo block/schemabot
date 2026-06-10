@@ -129,6 +129,10 @@ type controlCaptureEngine struct {
 	cutoverReq *engine.ControlRequest
 	stopReq    *engine.ControlRequest
 	stopErr    error
+	// onStop runs when Stop is invoked, before it returns. Used to observe
+	// storage state at the moment of the engine stop (e.g. to assert the engine
+	// is stopped before tasks are marked stopped/cancelled).
+	onStop func()
 }
 
 func (e *controlCaptureEngine) Name() string {
@@ -142,6 +146,9 @@ func (e *controlCaptureEngine) Cutover(_ context.Context, req *engine.ControlReq
 
 func (e *controlCaptureEngine) Stop(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.stopReq = req
+	if e.onStop != nil {
+		e.onStop()
+	}
 	if e.stopErr != nil {
 		return nil, e.stopErr
 	}
@@ -400,4 +407,121 @@ func TestLocalClient_StopReturnsVitessEngineStopError(t *testing.T) {
 	require.ErrorIs(t, err, stopErr)
 	require.NotNil(t, eng.stopReq, "stop should call the engine with deploy metadata")
 	assert.Equal(t, state.Task.Running, task.State)
+}
+
+// A recovering Spirit task still has a live runner copying rows under a detached
+// context, so stop must kill it via the engine before storage records the stop.
+// Otherwise storage reports stopped while the runner keeps working and a later
+// resume blocks behind the abandoned runner.
+func TestLocalClient_StopRecoveringMySQLStopsEngineBeforeStorage(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-recovering",
+		State:           state.Apply.Recovering,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-recovering",
+		Database:       "testdb",
+		State:          state.Task.Recovering,
+	}
+	eng := &controlCaptureEngine{}
+	stateAtEngineStop := ""
+	eng.onStop = func() { stateAtEngineStop = task.State }
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.StoppedCount)
+	require.NotNil(t, eng.stopReq, "stop should call the engine for a recovering task")
+	assert.Equal(t, state.Task.Recovering, stateAtEngineStop, "engine must be stopped before the task is marked stopped")
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+}
+
+// A PlanetScale waiting-for-deploy task has a created, startable deploy request.
+// Stop must cancel that deploy request via the engine before recording the
+// cancellation, otherwise the deploy stays startable from the PlanetScale UI
+// while SchemaBot reports it cancelled.
+func TestLocalClient_StopWaitingForDeployCancelsDeployRequest(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-waiting-deploy",
+		State:           state.Apply.WaitingForDeploy,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-waiting-deploy",
+		State:            state.Task.WaitingForDeploy,
+	}
+	resumeData := planetscale.ResumeData{
+		BranchName:       "branch-123",
+		DeployRequestID:  321,
+		MigrationContext: "ctx-123",
+		DeployRequestURL: "https://example.test/deploys/321",
+		DeferredDeploy:   true,
+	}
+	resumeState := engineResumeStateFromPlanetScaleData(t, operationID, resumeData)
+	eng := &controlCaptureEngine{}
+	stateAtEngineStop := ""
+	eng.onStop = func() { stateAtEngineStop = task.State }
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
+
+	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	require.NotNil(t, eng.stopReq, "stop must cancel the deploy request for a waiting-for-deploy task")
+	require.NotNil(t, eng.stopReq.ResumeState)
+	assert.Equal(t, resumeData.MigrationContext, eng.stopReq.ResumeState.MigrationContext)
+	assert.Equal(t, state.Task.WaitingForDeploy, stateAtEngineStop, "deploy request must be cancelled before the task is marked cancelled")
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+}
+
+// A task in the revert window has already cut over: the new schema is live.
+// Stop must reject rather than record it as cancelled, so an operator chooses
+// explicitly between reverting (undo) and skip-revert (finalize). The engine is
+// not touched and the task state is preserved.
+func TestLocalClient_StopRejectsRevertWindow(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-revert-window",
+		State:           state.Apply.RevertWindow,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-revert-window",
+		State:            state.Task.RevertWindow,
+	}
+	resumeState := engineResumeStateFromPlanetScaleData(t, operationID, planetscale.ResumeData{
+		BranchName:       "branch-123",
+		DeployRequestID:  321,
+		MigrationContext: "ctx-123",
+		DeployRequestURL: "https://example.test/deploys/321",
+	})
+	eng := &controlCaptureEngine{}
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
+
+	_, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "revert window")
+	assert.ErrorContains(t, err, "revert")
+	assert.ErrorContains(t, err, "skip-revert")
+	assert.Nil(t, eng.stopReq, "stop must not touch the engine for a revert-window task")
+	assert.Equal(t, state.Task.RevertWindow, task.State, "revert-window task must not be marked cancelled by stop")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "revert-window apply must not be marked cancelled by stop")
 }
