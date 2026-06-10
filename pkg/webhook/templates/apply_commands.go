@@ -344,9 +344,10 @@ func RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, actio
 }
 
 // BlockingCheck represents a PR check that is blocking apply, either because
-// it failed or because it is still running. State holds the GitHub-reported
-// conclusion (e.g. "failure", "error", "timed_out") for failed checks, or the
-// status (e.g. "in_progress", "queued", "pending") for in-progress checks.
+// it completed without passing or because it is still running. State holds the
+// GitHub-reported conclusion (e.g. "failure", "timed_out", "cancelled") for
+// completed checks, or the status (e.g. "in_progress", "queued", "pending")
+// for in-progress checks.
 type BlockingCheck struct {
 	Name  string
 	State string

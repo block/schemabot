@@ -325,14 +325,14 @@ If `repos` is not configured or empty, all repositories are allowed.
 
 ## PR Checks Gate
 
-By default, SchemaBot blocks `apply` and `apply-confirm` when non-SchemaBot PR checks are failing. This prevents applying schema changes on a PR with broken CI, linters, or security scans.
+By default, SchemaBot blocks `apply` and `apply-confirm` when non-SchemaBot PR checks are not passing. This prevents applying schema changes on a PR with broken, cancelled, or incomplete CI, linters, or security scans.
 
 ```yaml
 # Block apply when PR checks are failing (default: true)
 require_passing_checks: true
 ```
 
-Apply is blocked in two cases: checks that have **failed** (`failure`, `error`, `timed_out`) and checks that are **still running** (`in_progress`, `queued`, `pending`). Each case shows a distinct message — failing checks prompt the user to fix them, while in-progress checks prompt the user to wait. Checks with conclusion `neutral` or `skipped` are ignored. SchemaBot's own checks (names starting with "SchemaBot") are always excluded.
+Apply is blocked in two cases: completed checks that did not **pass** and checks that are **still running** (`in_progress`, `queued`, `pending`). A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — failing checks prompt the user to fix them, while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
 
 For repositories with many optional checks, `required_checks` can narrow the gate to specific check names:
 

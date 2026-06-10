@@ -15,10 +15,11 @@ import (
 
 func TestFilterFailingNonSchemaBotChecks(t *testing.T) {
 	tests := []struct {
-		name      string
-		statuses  []ghclient.PRCheckStatus
-		wantLen   int
-		wantNames []string
+		name       string
+		statuses   []ghclient.PRCheckStatus
+		wantLen    int
+		wantNames  []string
+		wantStates []string
 	}{
 		{
 			name:     "empty statuses returns nil",
@@ -48,8 +49,38 @@ func TestFilterFailingNonSchemaBotChecks(t *testing.T) {
 				{Name: "security-scan", Status: "completed", Conclusion: "error"},
 				{Name: "CI / integration", Status: "completed", Conclusion: "timed_out"},
 			},
-			wantLen:   2,
-			wantNames: []string{"security-scan", "CI / integration"},
+			wantLen:    2,
+			wantNames:  []string{"security-scan", "CI / integration"},
+			wantStates: []string{"error", "timed_out"},
+		},
+		{
+			// A check whose run was cancelled, never started, went stale, or
+			// stopped awaiting action has not verified the PR. Each of these
+			// conclusions blocks apply, while SchemaBot's own checks remain
+			// excluded.
+			name: "checks completed without success block apply",
+			statuses: []ghclient.PRCheckStatus{
+				{Name: "CI / unit-tests", Status: "completed", Conclusion: "cancelled"},
+				{Name: "CI / lint", Status: "completed", Conclusion: "action_required"},
+				{Name: "CI / integration", Status: "completed", Conclusion: "stale"},
+				{Name: "CI / build", Status: "completed", Conclusion: "startup_failure"},
+				{Name: "SchemaBot (staging)", Status: "completed", Conclusion: "cancelled", IsSchemaBot: true},
+				{Name: "CI / docs", Status: "completed", Conclusion: "success"},
+			},
+			wantLen:    4,
+			wantNames:  []string{"CI / unit-tests", "CI / lint", "CI / integration", "CI / build"},
+			wantStates: []string{"cancelled", "action_required", "stale", "startup_failure"},
+		},
+		{
+			// Conclusions SchemaBot does not recognize block apply, so the
+			// gate fails closed if GitHub introduces a new conclusion.
+			name: "unknown conclusion blocks apply",
+			statuses: []ghclient.PRCheckStatus{
+				{Name: "CI / new-check", Status: "completed", Conclusion: "some_future_conclusion"},
+			},
+			wantLen:    1,
+			wantNames:  []string{"CI / new-check"},
+			wantStates: []string{"some_future_conclusion"},
 		},
 		{
 			name: "SchemaBot checks are excluded",
@@ -100,6 +131,9 @@ func TestFilterFailingNonSchemaBotChecks(t *testing.T) {
 			require.Len(t, failing, tt.wantLen)
 			for i, name := range tt.wantNames {
 				assert.Equal(t, name, failing[i].Name)
+			}
+			for i, state := range tt.wantStates {
+				assert.Equal(t, state, failing[i].State)
 			}
 		})
 	}
@@ -423,6 +457,51 @@ func TestEnforcePassingChecks(t *testing.T) {
 			assert.Contains(t, body, "failure")
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for failing-checks comment")
+		}
+	})
+
+	// A push or concurrency-group rule can cancel a CI run after the apply
+	// command was issued. The cancelled run never verified the PR, so the
+	// apply is blocked and the comment names the cancelled check.
+	t.Run("cancelled checks block apply", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 10)
+
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "CI / tests", Status: "completed", Conclusion: "cancelled", AppSlug: "github-actions"},
+			{Typename: "CheckRun", Name: "CI / lint", Status: "completed", Conclusion: "success", AppSlug: "github-actions"},
+		})
+
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{}, nil, testLogger())
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+
+		ctx := t.Context()
+		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		assert.True(t, blocked, "should block when a check was cancelled")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "CI / tests")
+			assert.Contains(t, body, "cancelled")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for cancelled-checks comment")
 		}
 	})
 

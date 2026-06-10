@@ -9,10 +9,11 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// filterFailingNonSchemaBotChecks returns checks that are failing, excluding
-// SchemaBot's own checks and checks with conclusion "neutral", "skipped", or "success".
-// Only checks with completed status and conclusion "failure", "error", or "timed_out"
-// are considered failing.
+// filterFailingNonSchemaBotChecks returns completed checks that block apply,
+// excluding SchemaBot's own checks. A completed check is ignored only when its
+// conclusion is "success", "neutral", or "skipped"; every other conclusion
+// (such as "failure", "timed_out", "cancelled", "action_required", "stale",
+// or "startup_failure") blocks apply, so unrecognized conclusions fail closed.
 func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var failing []templates.BlockingCheck
 	filterRequiredChecks := statusesContainRequiredCheck(statuses, config)
@@ -26,15 +27,27 @@ func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *
 		if s.Status != "completed" {
 			continue
 		}
-		switch s.Conclusion {
-		case "failure", "error", "timed_out":
-			failing = append(failing, templates.BlockingCheck{
-				Name:  s.Name,
-				State: s.Conclusion,
-			})
+		if isPassingCheckConclusion(s.Conclusion) {
+			continue
 		}
+		failing = append(failing, templates.BlockingCheck{
+			Name:  s.Name,
+			State: s.Conclusion,
+		})
 	}
 	return failing
+}
+
+// isPassingCheckConclusion reports whether a completed check's conclusion
+// allows apply to proceed. Only "success", "neutral", and "skipped" pass;
+// every other conclusion blocks apply.
+func isPassingCheckConclusion(conclusion string) bool {
+	switch conclusion {
+	case "success", "neutral", "skipped":
+		return true
+	default:
+		return false
+	}
 }
 
 // enforcePassingChecks verifies that all non-SchemaBot PR checks are passing.
