@@ -64,6 +64,8 @@ func TestMySQLConnectionDSN(t *testing.T) {
 			cfg, err := mysql.ParseDSN(got)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantTLS, cfg.TLSConfig)
+			_, err = mysql.NewConnector(cfg)
+			require.NoError(t, err)
 		})
 	}
 }
