@@ -776,6 +776,55 @@ func TestGRPCClient_ResumeApplyOperationRejectsMissingOperationID(t *testing.T) 
 	assert.Contains(t, err.Error(), "apply operation id is required")
 }
 
+func TestGRPCClient_ResumeApplyOperationRejectsTasksFromAnotherApply(t *testing.T) {
+	// Guard the (apply, apply_operation) trust boundary: if the operation ID
+	// resolves to tasks owned by a different apply (mismatched pair, stale
+	// claim), the drive must refuse rather than dispatch/reconcile foreign tasks
+	// under this apply's state.
+	server := &capturingTernServer{remoteApplyID: "remote-should-not-dispatch"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-op-scoped",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target", DeferCutover: true})
+	operationID := int64(42)
+	foreignApplyID := apply.ID + 1
+	foreignTask := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-foreign",
+		ApplyID:          foreignApplyID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		State:            state.Task.Pending,
+	}
+	taskStore := &mockTaskStore{tasks: []*storage.Task{foreignTask}}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   taskStore,
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-op-scoped",
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "task-foreign")
+	assert.Contains(t, err.Error(), "belongs to apply")
+
+	assert.Nil(t, server.getApplyRequest(), "foreign tasks must not be dispatched to remote Tern")
+}
+
 func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
 	// gRPC mode keeps the stored apply history in the control plane. When the
 	// operator dispatches work to a remote Tern service, operators should still

@@ -759,6 +759,17 @@ func (c *GRPCClient) loadApplyTasks(ctx context.Context, apply *storage.Apply, s
 		if err != nil {
 			return nil, fmt.Errorf("load tasks for apply %s apply_operation %d: %w", apply.ApplyIdentifier, scope.applyOperationID, err)
 		}
+		// Guard the (apply, apply_operation) trust boundary: the caller passes
+		// both an apply and an operation ID, but the query keys only on the
+		// operation. A mismatched pair (programming error, stale claim) would
+		// otherwise let the drive dispatch and reconcile another apply's tasks
+		// under this apply's state. Refuse rather than corrupt cross-apply state.
+		for _, task := range tasks {
+			if task.ApplyID != apply.ID {
+				return nil, fmt.Errorf("apply_operation %d task %s belongs to apply %d, not %s (%d)",
+					scope.applyOperationID, task.TaskIdentifier, task.ApplyID, apply.ApplyIdentifier, apply.ID)
+			}
+		}
 		return tasks, nil
 	}
 	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
