@@ -243,6 +243,79 @@ func waitForControlPlaneApplyLogs(t *testing.T, endpoint string, applyID, tableN
 		})
 }
 
+// TestK8s_ApplyLinksTasksToApplyOperation verifies that an apply run through the
+// two-tier gRPC stack records its per-deployment apply_operations row and links
+// every task to it on the control plane. Under the single-deployment constraint
+// each apply owns exactly one operation, so the operation-scoped task lookup the
+// operator claim loop relies on returns that apply's full task set. This locks
+// in the data model that operation-scoped resume builds on.
+func TestK8s_ApplyLinksTasksToApplyOperation(t *testing.T) {
+	cleanupState(t)
+
+	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
+	tableName := testutil.UniqueTableName("k8s_applyop")
+
+	testutil.CreateTestTableWithCleanup(t, dsn, tableName, fmt.Sprintf(
+		`CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL)`, tableName),
+		storageDSNs(t)...)
+
+	schemaFiles := map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			`CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) DEFAULT NULL);`, tableName),
+	}
+
+	planResp, err := client.CallPlanAPIWithFiles(ep, "testapp", "mysql", "staging",
+		map[string]*apitypes.SchemaFiles{"testapp": {Files: schemaFiles}}, "", 0)
+	require.NoError(t, err)
+	require.NotEmpty(t, planResp.PlanID)
+
+	applyResp, err := client.CallApplyAPI(ep, planResp.PlanID, "staging", "", nil)
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted, "apply not accepted: %s", applyResp.ErrorMessage)
+
+	testutil.WaitForState(t, ep, applyResp.ApplyID, state.Apply.Completed, testutil.PollDeadline)
+
+	// The control plane owns the apply, its apply_operations rows, and the
+	// tasks. Inspect that storage directly to prove the per-operation linkage.
+	sbDB, err := sql.Open("mysql", testutil.SchemabotDSN(t))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(sbDB)
+	require.NoError(t, sbDB.PingContext(t.Context()))
+	store := mysqlstore.New(sbDB)
+
+	apply, err := store.Applies().GetByApplyIdentifier(t.Context(), applyResp.ApplyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply, "apply %s should exist in control-plane storage", applyResp.ApplyID)
+
+	ops, err := store.ApplyOperations().ListByApply(t.Context(), apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 1, "single-deployment apply should own exactly one apply_operations row")
+	assert.Equal(t, apply.Deployment, ops[0].Deployment, "operation deployment should match the apply")
+
+	tasksByApply, err := store.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, tasksByApply, "apply should have at least one task")
+	for _, task := range tasksByApply {
+		require.NotNil(t, task.ApplyOperationID, "task %s must be linked to an apply_operation", task.TaskIdentifier)
+		assert.Equal(t, ops[0].ID, *task.ApplyOperationID, "task %s should link to the apply's operation", task.TaskIdentifier)
+	}
+
+	// The operation-scoped lookup must return exactly the apply's tasks — the
+	// invariant operation-scoped resume depends on.
+	tasksByOp, err := store.Tasks().GetByApplyOperationID(t.Context(), ops[0].ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, taskIdentifiers(tasksByApply), taskIdentifiers(tasksByOp),
+		"operation-scoped lookup should return the same tasks as the whole apply")
+}
+
+func taskIdentifiers(tasks []*storage.Task) []string {
+	ids := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		ids = append(ids, task.TaskIdentifier)
+	}
+	return ids
+}
+
 // TestK8s_RemoteFailureErrorVisibleInControlPlaneStatus verifies that a remote
 // terminal failure observed over gRPC is copied into the control plane's status
 // and logs. Operators should not need data-plane access to see why the apply
