@@ -252,28 +252,40 @@ func closeApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, ope
 	}
 }
 
-func checkNoActiveApplyForTarget(ctx context.Context, tx *sql.Tx, database, dbType, environment string, excludeApplyID int64) error {
-	statePredicate, stateArgs := nonTerminalApplyStatePredicate("state")
+// checkNoActiveApplyForTarget enforces the "one active apply per target"
+// invariant, scoped to the 4-tuple (database, type, environment, deployment).
+// Deployment is part of the identity because each deployment is a distinct
+// physical target (its own Tern endpoint): two applies for the same
+// environment but different deployments touch different databases and may run
+// concurrently, while a second apply for the same deployment is rejected.
+//
+// While the config layer hard-blocks more than one deployment per environment
+// there is a 1-to-1 mapping between (database, type, environment) and the
+// 4-tuple, so this scoping is a no-op today; it only diverges once that
+// hard-block lifts and an environment fans out across deployments.
+func checkNoActiveApplyForTarget(ctx context.Context, tx *sql.Tx, database, dbType, environment, deployment string, excludeApplyID int64) error {
+	statePredicate, stateArgs := nonTerminalApplyStatePredicate("`state`")
 	query := fmt.Sprintf(`
-		SELECT count(*) FROM applies FORCE INDEX (idx_database_env)
-		WHERE database_name = ?
-		AND database_type = ?
-		AND environment = ?
+		SELECT count(*) FROM `+"`applies`"+` FORCE INDEX (`+"`idx_database_env_deployment`"+`)
+		WHERE `+"`database_name`"+` = ?
+		AND `+"`database_type`"+` = ?
+		AND `+"`environment`"+` = ?
+		AND `+"`deployment`"+` = ?
 		AND %s
 	`, statePredicate)
-	args := append([]any{database, dbType, environment}, stateArgs...)
+	args := append([]any{database, dbType, environment, deployment}, stateArgs...)
 	if excludeApplyID > 0 {
-		query += " AND id != ?"
+		query += " AND `id` != ?"
 		args = append(args, excludeApplyID)
 	}
 
 	var activeCount int64
 	err := tx.QueryRowContext(ctx, query, args...).Scan(&activeCount)
 	if err != nil {
-		return fmt.Errorf("check active applies for %s/%s/%s: %w", database, dbType, environment, err)
+		return fmt.Errorf("check active applies for %s/%s/%s/%s: %w", database, dbType, environment, deployment, err)
 	}
 	if activeCount > 0 {
-		return fmt.Errorf("active apply exists for %s/%s/%s: %w", database, dbType, environment, storage.ErrActiveApplyExists)
+		return fmt.Errorf("active apply exists for %s/%s/%s/%s: %w", database, dbType, environment, deployment, storage.ErrActiveApplyExists)
 	}
 	return nil
 }
@@ -319,24 +331,30 @@ func ensureApplyLeaseStillOwned(ctx context.Context, db queryRower, lease storag
 	return nil
 }
 
-func applyTargetForUpdate(ctx context.Context, db queryRower, apply *storage.Apply) (string, string, string, error) {
-	if hasApplyTarget(apply.Database, apply.DatabaseType, apply.Environment) {
-		return apply.Database, apply.DatabaseType, apply.Environment, nil
+// applyTargetForUpdate resolves the (database, type, environment, deployment)
+// target an update should lock and check against. The stored row is
+// authoritative, so it is reloaded whenever the in-memory apply is missing the
+// 3-tuple target or carries an empty deployment (the Go zero value is
+// indistinguishable from "not populated", and deployment is part of the active
+// target identity).
+func applyTargetForUpdate(ctx context.Context, db queryRower, apply *storage.Apply) (string, string, string, string, error) {
+	if hasApplyTarget(apply.Database, apply.DatabaseType, apply.Environment) && apply.Deployment != "" {
+		return apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment, nil
 	}
 
-	var database, dbType, environment string
+	var database, dbType, environment, deployment string
 	err := db.QueryRowContext(ctx, `
-		SELECT database_name, database_type, environment
-		FROM applies
-		WHERE id = ?
-	`, apply.ID).Scan(&database, &dbType, &environment)
+		SELECT `+"`database_name`, `database_type`, `environment`, `deployment`"+`
+		FROM `+"`applies`"+`
+		WHERE `+"`id`"+` = ?
+	`, apply.ID).Scan(&database, &dbType, &environment, &deployment)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", "", nil
+		return "", "", "", "", nil
 	}
 	if err != nil {
-		return "", "", "", fmt.Errorf("load apply target for update %d: %w", apply.ID, err)
+		return "", "", "", "", fmt.Errorf("load apply target for update %d: %w", apply.ID, err)
 	}
-	return database, dbType, environment, nil
+	return database, dbType, environment, deployment, nil
 }
 
 // Create stores a new apply and returns its ID.
@@ -364,7 +382,7 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	defer writeTx.close(ctx, "create apply")
 
 	if lockTarget {
-		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, 0); err != nil {
+		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment, 0); err != nil {
 			return 0, err
 		}
 	}
@@ -435,7 +453,7 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 	defer writeTx.close(ctx, opName)
 
 	if lockTarget {
-		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, 0); err != nil {
+		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment, 0); err != nil {
 			return 0, err
 		}
 	}
@@ -599,9 +617,9 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 		return err
 	}
 	lockTarget := isActiveApplyState(apply.State)
-	database, dbType, environment := apply.Database, apply.DatabaseType, apply.Environment
-	if lockTarget && !hasApplyTarget(database, dbType, environment) {
-		database, dbType, environment, err = applyTargetForUpdate(ctx, s.db, apply)
+	database, dbType, environment, deployment := apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment
+	if lockTarget && (!hasApplyTarget(database, dbType, environment) || deployment == "") {
+		database, dbType, environment, deployment, err = applyTargetForUpdate(ctx, s.db, apply)
 		if err != nil {
 			return err
 		}
@@ -623,7 +641,7 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	defer writeTx.close(ctx, "update apply")
 
 	if shouldLockTarget {
-		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, database, dbType, environment, apply.ID); err != nil {
+		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, database, dbType, environment, deployment, apply.ID); err != nil {
 			return err
 		}
 	}

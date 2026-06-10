@@ -515,6 +515,47 @@ func TestApplyStore_CreateBlocksActiveApplyForSameTarget(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestApplyStore_CreateScopesActiveApplyByDeployment verifies the active-apply
+// invariant is keyed on the full (database, type, environment, deployment)
+// target. Two deployments under the same environment are distinct physical
+// targets, so both may be active at once; a second active apply for the same
+// deployment is still rejected.
+func TestApplyStore_CreateScopesActiveApplyByDeployment(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+
+	newApply := func(identifier, deployment string, planID int64) *storage.Apply {
+		return &storage.Apply{
+			ApplyIdentifier: identifier,
+			LockID:          lock.ID,
+			PlanID:          planID,
+			Database:        "testdb",
+			DatabaseType:    "mysql",
+			Repository:      "org/repo",
+			PullRequest:     123,
+			Environment:     "staging",
+			Deployment:      deployment,
+			Engine:          "spirit",
+			State:           state.Apply.Running,
+		}
+	}
+
+	// First deployment becomes active.
+	_, err := store.Applies().Create(ctx, newApply("apply_region_a", "region-a", 1))
+	require.NoError(t, err)
+
+	// A different deployment under the same environment is allowed concurrently.
+	_, err = store.Applies().Create(ctx, newApply("apply_region_b", "region-b", 2))
+	require.NoError(t, err, "different deployments are distinct targets and may be active together")
+
+	// A second active apply for an already-active deployment is rejected.
+	_, err = store.Applies().Create(ctx, newApply("apply_region_a_again", "region-a", 3))
+	require.ErrorIs(t, err, storage.ErrActiveApplyExists, "same 4-tuple target must still be exclusive")
+}
+
 func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
