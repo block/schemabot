@@ -93,6 +93,13 @@ type CheckStore interface {
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
 	RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *Check) (bool, error)
 
+	// MarkStalePlanSuccessful marks plan-only stored check state successful when
+	// the database it covers is no longer in the PR. It fails closed: the update
+	// is skipped when the row is in_progress or owns an apply ID, so a started
+	// apply that began after stale cleanup read the row keeps blocking the PR.
+	// Returns true when the row was marked successful.
+	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
+
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
 	// same PR/environment/database. Returns false when another worker changed

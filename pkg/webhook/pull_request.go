@@ -399,13 +399,19 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 }
 
 func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
+	priorApplyID := check.ApplyID
 	check.HeadSHA = headSHA
 	check.Conclusion = checkConclusionSuccess
 	check.HasChanges = false
 	check.Status = checkStatusCompleted
+	check.ApplyID = 0
 	check.BlockingReason = ""
 	check.ErrorMessage = ""
-	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
+
+	// The success write is guarded against in-flight apply-owned rows: an apply
+	// that started after this cleanup read the row must keep blocking the PR.
+	marked, err := h.service.Storage().Checks().MarkStalePlanSuccessful(ctx, check)
+	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "stale_check_cleanup",
 			Repository:   repo,
@@ -418,9 +424,30 @@ func (h *Handler) markStalePlanOnlyCheckStateSuccessful(ctx context.Context, rep
 			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
 			"environment", check.Environment, "check_id", check.ID,
-			"error", err)
+			"apply_id", priorApplyID, "error", err)
 		return false
 	}
+
+	if !marked {
+		// A concurrent apply claimed the row between the cleanup read and this
+		// write. Leave it in_progress and apply-owned so it keeps blocking until
+		// an operator reconciles the target environment.
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "stale_check_cleanup",
+			Repository:   repo,
+			Database:     check.DatabaseName,
+			DatabaseType: check.DatabaseType,
+			Environment:  check.Environment,
+			Status:       "blocked",
+		})
+		h.logger.Warn("stale plan check left blocking because an apply started concurrently; the check gate will block PR applies until an operator reconciles the target",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"apply_id", priorApplyID)
+		return true
+	}
+
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:    "stale_check_cleanup",
 		Repository:   repo,

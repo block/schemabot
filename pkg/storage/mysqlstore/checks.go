@@ -152,6 +152,44 @@ func successfulNoOpPlanResult(check *storage.Check) bool {
 		!check.HasChanges
 }
 
+// MarkStalePlanSuccessful marks plan-only stored check state successful when its
+// database is no longer in the PR. The update is guarded so a started apply that
+// claimed the row after stale cleanup read it keeps blocking: a row that is
+// in_progress or owns an apply ID is left untouched, because a passing check must
+// never be derived from cleanup alone while an apply may have reached the live
+// database. Returns true when the row was marked successful.
+func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
+	var checkRunID any
+	if check.CheckRunID != 0 {
+		checkRunID = check.CheckRunID
+	}
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET head_sha = ?,
+		    check_run_id = ?,
+		    apply_id = NULL,
+		    has_changes = ?,
+		    status = ?,
+		    conclusion = ?,
+		    blocking_reason = ?,
+		    error_message = ?
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND status != ? AND apply_id IS NULL
+	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		checkStatusInProgress)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 // CompleteForApply updates stored check state to a terminal state only if it
 // still belongs to the apply being completed.
 func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {

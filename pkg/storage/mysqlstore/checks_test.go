@@ -564,6 +564,147 @@ func TestCheckStore_RecoverApplyOwnedCheckWithNoOpPlanRequiresNoOpSuccess(t *tes
 	}
 }
 
+// When a database drops out of a PR and its stored check state is a plan-only
+// result with no started apply, stale cleanup marks it successful so the PR is
+// no longer blocked by a database it no longer touches.
+func TestCheckStore_MarkStalePlanSuccessfulMarksPlanOnlyCheck(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:     "org/repo",
+		PullRequest:    123,
+		HeadSHA:        "oldsha",
+		Environment:    "staging",
+		DatabaseType:   "mysql",
+		DatabaseName:   "testdb",
+		HasChanges:     true,
+		Status:         "completed",
+		Conclusion:     "action_required",
+		BlockingReason: "schema_change_pending",
+		ErrorMessage:   "schema change pending apply",
+	}))
+
+	marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "newsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	})
+	require.NoError(t, err)
+	require.True(t, marked)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "newsha", retrieved.HeadSHA)
+	require.Equal(t, "completed", retrieved.Status)
+	require.Equal(t, "success", retrieved.Conclusion)
+	require.False(t, retrieved.HasChanges)
+	require.Equal(t, int64(0), retrieved.ApplyID)
+	require.Empty(t, retrieved.BlockingReason)
+	require.Empty(t, retrieved.ErrorMessage)
+}
+
+// A database can drop out of a PR at the same moment an apply for it begins. If
+// the apply claims the stored check state after stale cleanup read it, the row
+// is in_progress and apply-owned. Stale cleanup must not convert that into a
+// passing check: the apply may already have reached the live database, so the
+// row stays blocking until an operator reconciles the target.
+func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlocking(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-claimed-after-cleanup-read", state.Apply.Running)
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "oldsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		CheckRunID:   100,
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       "in_progress",
+		Conclusion:   "",
+	}))
+
+	marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "newsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	})
+	require.NoError(t, err)
+	require.False(t, marked, "in-flight apply-owned check must not be marked successful by stale cleanup")
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "oldsha", retrieved.HeadSHA)
+	require.Equal(t, "in_progress", retrieved.Status)
+	require.Empty(t, retrieved.Conclusion)
+	require.True(t, retrieved.HasChanges)
+	require.Equal(t, apply.ID, retrieved.ApplyID)
+}
+
+// A terminal apply-owned row (apply ID still set after the apply finished) keeps
+// blocking under stale cleanup. The apply already touched the live database, so a
+// later commit dropping the database must not derive a passing check by cleanup
+// alone.
+func TestCheckStore_MarkStalePlanSuccessfulLeavesTerminalApplyOwnedBlocking(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-terminal-owned", state.Apply.Completed)
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "oldsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       "completed",
+		Conclusion:   "success",
+	}))
+
+	marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "newsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	})
+	require.NoError(t, err)
+	require.False(t, marked, "terminal apply-owned check must not be cleaned to success by stale cleanup")
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.Equal(t, "oldsha", retrieved.HeadSHA)
+	require.Equal(t, apply.ID, retrieved.ApplyID)
+}
+
 func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheck(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
