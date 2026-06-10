@@ -96,7 +96,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyBlocked, templates.PreviewCommentApplyBlockedCLI,
 		templates.PreviewCommentApplyActive,
 		templates.PreviewCommentApplyNoLock, templates.PreviewCommentApplyAllType,
-		templates.PreviewCommentChecksGateFailing, templates.PreviewCommentChecksGateInProgress,
+		templates.PreviewCommentChecksGateNotPassing, templates.PreviewCommentChecksGateInProgress,
 		templates.PreviewCommentActorNotAuthorized, templates.PreviewCommentActorAuthUnavailable,
 		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive:
 		templates.PreviewCLIOutput(previewType)

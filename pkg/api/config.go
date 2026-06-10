@@ -1060,7 +1060,7 @@ func (c *ServerConfig) ShouldRespondToUnscoped() bool {
 }
 
 // ShouldRequirePassingChecks returns whether apply should be blocked when
-// non-SchemaBot PR checks are failing. Defaults to true when not configured.
+// non-SchemaBot PR checks are not passing. Defaults to true when not configured.
 func (c *ServerConfig) ShouldRequirePassingChecks() bool {
 	if c == nil || c.RequirePassingChecks == nil {
 		return true

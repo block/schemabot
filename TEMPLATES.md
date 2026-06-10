@@ -4261,21 +4261,21 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 </details>
 
 <details>
-<summary><a name="checks-gate-failing"></a><strong>Checks Gate: Failing</strong></summary>
+<summary><a name="checks-gate-not-passing"></a><strong>Checks Gate: Not Passing</strong></summary>
 
 
 ## ❌ Apply Blocked
 
 **Environment**: `staging`
 
-Cannot apply while PR checks are failing:
+Cannot apply while PR checks are not passing:
 
 | Check | Status |
 |-------|--------|
 | `CI / unit-tests` | failure |
 | `CI / lint` | timed_out |
 
-Fix the failing checks and retry:
+Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:
 ```
 schemabot apply -e staging
 ```

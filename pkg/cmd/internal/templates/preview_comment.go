@@ -105,8 +105,8 @@ func previewApplyCommandAllOutput() {
 		{"ACTOR AUTHORIZATION: UNAVAILABLE", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
-		{"CHECKS GATE: FAILING", func() {
-			fmt.Print(webhooktemplates.RenderApplyBlockedByFailingChecks("staging", []webhooktemplates.BlockingCheck{
+		{"CHECKS GATE: NOT PASSING", func() {
+			fmt.Print(webhooktemplates.RenderApplyBlockedByNonPassingChecks("staging", []webhooktemplates.BlockingCheck{
 				{Name: "CI / unit-tests", State: "failure"},
 				{Name: "CI / lint", State: "timed_out"},
 			}))

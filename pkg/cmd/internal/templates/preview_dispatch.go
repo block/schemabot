@@ -200,8 +200,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentReviewRequired())
 	case PreviewCommentReviewGateError:
 		fmt.Print(webhooktemplates.PreviewCommentReviewGateError())
-	case PreviewCommentChecksGateFailing:
-		fmt.Print(webhooktemplates.RenderApplyBlockedByFailingChecks("staging", []webhooktemplates.BlockingCheck{
+	case PreviewCommentChecksGateNotPassing:
+		fmt.Print(webhooktemplates.RenderApplyBlockedByNonPassingChecks("staging", []webhooktemplates.BlockingCheck{
 			{Name: "CI / unit-tests", State: "failure"},
 			{Name: "CI / lint", State: "timed_out"},
 		}))

@@ -9,13 +9,13 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// filterFailingNonSchemaBotChecks returns completed checks that block apply,
+// filterNonPassingNonSchemaBotChecks returns completed checks that block apply,
 // excluding SchemaBot's own checks. A completed check is ignored only when its
 // conclusion is "success", "neutral", or "skipped"; every other conclusion
 // (such as "failure", "timed_out", "cancelled", "action_required", "stale",
 // or "startup_failure") blocks apply, so unrecognized conclusions fail closed.
-func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
-	var failing []templates.BlockingCheck
+func filterNonPassingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
+	var notPassing []templates.BlockingCheck
 	filterRequiredChecks := statusesContainRequiredCheck(statuses, config)
 	for _, s := range statuses {
 		if s.IsSchemaBot {
@@ -30,12 +30,12 @@ func filterFailingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *
 		if isPassingCheckConclusion(s.Conclusion) {
 			continue
 		}
-		failing = append(failing, templates.BlockingCheck{
+		notPassing = append(notPassing, templates.BlockingCheck{
 			Name:  s.Name,
 			State: s.Conclusion,
 		})
 	}
-	return failing
+	return notPassing
 }
 
 // isPassingCheckConclusion reports whether a completed check's conclusion
@@ -52,7 +52,8 @@ func isPassingCheckConclusion(conclusion string) bool {
 
 // enforcePassingChecks verifies that all non-SchemaBot PR checks are passing.
 // Returns true if apply was blocked (caller should return), false if it may proceed.
-// Blocks on both failing checks and in-progress checks with distinct messages.
+// Blocks on both non-passing completed checks and in-progress checks with
+// distinct messages.
 func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, headSHA, environment string) bool {
 	config := h.service.Config()
 	if !config.ShouldRequirePassingChecks() {
@@ -93,15 +94,15 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 		return true
 	}
 
-	failing := filterFailingNonSchemaBotChecks(statuses, config)
+	notPassing := filterNonPassingNonSchemaBotChecks(statuses, config)
 	inProgress := filterInProgressNonSchemaBotChecks(statuses, config)
 
-	if len(failing) > 0 {
-		h.logger.Info("apply blocked by failing PR checks",
+	if len(notPassing) > 0 {
+		h.logger.Info("apply blocked by non-passing PR checks",
 			"repo", repo, "pr", pr, "environment", environment,
-			"failing_count", len(failing))
+			"not_passing_count", len(notPassing))
 		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByFailingChecks(environment, failing))
+			templates.RenderApplyBlockedByNonPassingChecks(environment, notPassing))
 		return true
 	}
 

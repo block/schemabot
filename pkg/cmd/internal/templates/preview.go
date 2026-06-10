@@ -157,7 +157,7 @@ const (
 	PreviewCommentBlockedByPriorInProg PreviewType = "comment_blocked_prior_env_inprogress" // Blocked by staging (in progress)
 	PreviewCommentReviewRequired       PreviewType = "comment_review_required"              // Review gate: approval needed
 	PreviewCommentReviewGateError      PreviewType = "comment_review_gate_error"            // Review gate: fail-closed error
-	PreviewCommentChecksGateFailing    PreviewType = "comment_checks_gate_failing"          // Checks gate: failing CI/lint
+	PreviewCommentChecksGateNotPassing PreviewType = "comment_checks_gate_not_passing"      // Checks gate: non-passing CI/lint
 	PreviewCommentChecksGateInProgress PreviewType = "comment_checks_gate_in_progress"      // Checks gate: CI still running
 	PreviewCommentActorNotAuthorized   PreviewType = "comment_actor_not_authorized"         // Actor authorization: user is not allowed
 	PreviewCommentActorAuthUnavailable PreviewType = "comment_actor_auth_unavailable"       // Actor authorization: fail-closed error

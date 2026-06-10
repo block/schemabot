@@ -172,7 +172,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 			c.fetchAppSlug()
 		}
 		if c.loadAppSlug() == "" {
-			c.logger.Error("app slug unavailable — check gate will block PR applies if own checks are failing")
+			c.logger.Error("app slug unavailable — check gate will block PR applies if own checks are not passing")
 		}
 	}
 

@@ -53,7 +53,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		return
 	}
 
-	// Tier 2: PR checks gate — block if non-SchemaBot checks are failing
+	// Tier 2: PR checks gate — block if non-SchemaBot checks are not passing
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR for checks gate", "error", err)

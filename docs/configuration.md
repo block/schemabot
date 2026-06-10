@@ -328,11 +328,11 @@ If `repos` is not configured or empty, all repositories are allowed.
 By default, SchemaBot blocks `apply` and `apply-confirm` when non-SchemaBot PR checks are not passing. This prevents applying schema changes on a PR with broken, cancelled, or incomplete CI, linters, or security scans.
 
 ```yaml
-# Block apply when PR checks are failing (default: true)
+# Block apply when PR checks are not passing (default: true)
 require_passing_checks: true
 ```
 
-Apply is blocked in two cases: completed checks that did not **pass** and checks that are **still running** (`in_progress`, `queued`, `pending`). A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — failing checks prompt the user to fix them, while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
+Apply is blocked in two cases: completed checks that did not **pass** and checks that are **still running** (`in_progress`, `queued`, `pending`). A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — completed checks that are not passing prompt the user to get them passing (fix failures and re-run cancelled or stale checks), while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
 
 For repositories with many optional checks, `required_checks` can narrow the gate to specific check names:
 
@@ -347,7 +347,7 @@ When any configured check appears in the PR check statuses, only configured chec
 
 `required_checks` names must exactly match GitHub check run names or commit status contexts. Matching is case-sensitive, and config validation rejects names with leading or trailing whitespace.
 
-When checks are failing, SchemaBot posts a comment listing the failing checks and instructs the user to fix them before retrying.
+When checks are not passing, SchemaBot posts a comment listing the non-passing checks and instructs the user to get them passing — fixing failures and re-running cancelled or stale checks — before retrying.
 
 If the GitHub API is unreachable when checking statuses, the apply is blocked (fail-closed). SchemaBot posts a comment explaining the error and suggests retrying.
 

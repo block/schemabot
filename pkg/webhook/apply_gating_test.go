@@ -13,7 +13,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 )
 
-func TestFilterFailingNonSchemaBotChecks(t *testing.T) {
+func TestFilterNonPassingNonSchemaBotChecks(t *testing.T) {
 	tests := []struct {
 		name       string
 		statuses   []ghclient.PRCheckStatus
@@ -27,7 +27,7 @@ func TestFilterFailingNonSchemaBotChecks(t *testing.T) {
 			wantLen:  0,
 		},
 		{
-			name: "all passing checks returns no failures",
+			name: "all passing checks block nothing",
 			statuses: []ghclient.PRCheckStatus{
 				{Name: "CI / unit-tests", Status: "completed", Conclusion: "success"},
 				{Name: "CI / lint", Status: "completed", Conclusion: "success"},
@@ -103,7 +103,7 @@ func TestFilterFailingNonSchemaBotChecks(t *testing.T) {
 			wantNames: []string{"CI / lint"},
 		},
 		{
-			name: "in-progress checks are not considered failing",
+			name: "in-progress checks are excluded from the completed-check filter",
 			statuses: []ghclient.PRCheckStatus{
 				{Name: "CI / unit-tests", Status: "in_progress", Conclusion: ""},
 				{Name: "CI / lint", Status: "queued", Conclusion: ""},
@@ -127,19 +127,19 @@ func TestFilterFailingNonSchemaBotChecks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			failing := filterFailingNonSchemaBotChecks(tt.statuses, nil)
-			require.Len(t, failing, tt.wantLen)
+			notPassing := filterNonPassingNonSchemaBotChecks(tt.statuses, nil)
+			require.Len(t, notPassing, tt.wantLen)
 			for i, name := range tt.wantNames {
-				assert.Equal(t, name, failing[i].Name)
+				assert.Equal(t, name, notPassing[i].Name)
 			}
 			for i, state := range tt.wantStates {
-				assert.Equal(t, state, failing[i].State)
+				assert.Equal(t, state, notPassing[i].State)
 			}
 		})
 	}
 }
 
-func TestFilterFailingNonSchemaBotChecks_RequiredChecks(t *testing.T) {
+func TestFilterNonPassingNonSchemaBotChecks_RequiredChecks(t *testing.T) {
 	tests := []struct {
 		name      string
 		config    *api.ServerConfig
@@ -194,10 +194,10 @@ func TestFilterFailingNonSchemaBotChecks_RequiredChecks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			failing := filterFailingNonSchemaBotChecks(tt.statuses, tt.config)
-			require.Len(t, failing, len(tt.wantNames))
+			notPassing := filterNonPassingNonSchemaBotChecks(tt.statuses, tt.config)
+			require.Len(t, notPassing, len(tt.wantNames))
 			for i, name := range tt.wantNames {
-				assert.Equal(t, name, failing[i].Name)
+				assert.Equal(t, name, notPassing[i].Name)
 			}
 		})
 	}

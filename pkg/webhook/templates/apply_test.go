@@ -491,47 +491,47 @@ func TestPreviewCommentSummaryCompletedLargeSingleNamespaceKeepsApplyIDInsideSec
 	assert.Equal(t, 0, strings.Count(result, "</details>"))
 }
 
-func TestRenderApplyBlockedByFailingChecks(t *testing.T) {
-	failing := []BlockingCheck{
+func TestRenderApplyBlockedByNonPassingChecks(t *testing.T) {
+	notPassing := []BlockingCheck{
 		{Name: "CI / unit-tests", State: "failure"},
 		{Name: "CI / lint", State: "timed_out"},
 	}
 
-	result := RenderApplyBlockedByFailingChecks("staging", failing)
+	result := RenderApplyBlockedByNonPassingChecks("staging", notPassing)
 
 	assert.Contains(t, result, "## ❌ Apply Blocked")
 	assert.Contains(t, result, "`staging`")
-	assert.Contains(t, result, "Cannot apply while PR checks are failing")
+	assert.Contains(t, result, "Cannot apply while PR checks are not passing")
 	assert.Contains(t, result, "| Check | Status |")
 	assert.Contains(t, result, "| `CI / unit-tests` | failure |")
 	assert.Contains(t, result, "| `CI / lint` | timed_out |")
 	assert.Contains(t, result, "schemabot apply -e staging")
 }
 
-func TestRenderApplyBlockedByFailingChecks_SingleCheck(t *testing.T) {
-	failing := []BlockingCheck{
+func TestRenderApplyBlockedByNonPassingChecks_SingleCheck(t *testing.T) {
+	notPassing := []BlockingCheck{
 		{Name: "security-scan", State: "error"},
 	}
 
-	result := RenderApplyBlockedByFailingChecks("production", failing)
+	result := RenderApplyBlockedByNonPassingChecks("production", notPassing)
 
 	assert.Contains(t, result, "`production`")
 	assert.Contains(t, result, "| `security-scan` | error |")
 	assert.Contains(t, result, "schemabot apply -e production")
 }
 
-func TestRenderApplyBlockedByFailingChecks_EmptyList(t *testing.T) {
+func TestRenderApplyBlockedByNonPassingChecks_EmptyList(t *testing.T) {
 	// Defensive guard: rendering with an empty slice must not emit an empty
 	// Markdown table (header row with zero data rows). It should fall back
 	// to a generic message that still preserves the header, environment,
 	// and retry block.
-	for _, failing := range [][]BlockingCheck{nil, {}} {
-		result := RenderApplyBlockedByFailingChecks("staging", failing)
+	for _, notPassing := range [][]BlockingCheck{nil, {}} {
+		result := RenderApplyBlockedByNonPassingChecks("staging", notPassing)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "**Environment**: `staging`")
-		assert.Contains(t, result, "Cannot apply while PR checks are failing.")
-		assert.Contains(t, result, "Fix the failing checks and retry:\n```\nschemabot apply -e staging\n```",
+		assert.Contains(t, result, "Cannot apply while PR checks are not passing.")
+		assert.Contains(t, result, "Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
 		assert.NotContains(t, result, "| Check | Status |",
 			"empty-list branch must not emit a table header with no data rows")

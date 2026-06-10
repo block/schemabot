@@ -353,29 +353,29 @@ type BlockingCheck struct {
 	State string
 }
 
-// RenderApplyBlockedByFailingChecks renders a comment when apply is blocked
-// because non-SchemaBot PR checks are failing.
-func RenderApplyBlockedByFailingChecks(environment string, failing []BlockingCheck) string {
+// RenderApplyBlockedByNonPassingChecks renders a comment when apply is blocked
+// because non-SchemaBot PR checks completed without passing.
+func RenderApplyBlockedByNonPassingChecks(environment string, notPassing []BlockingCheck) string {
 	var sb strings.Builder
 
 	sb.WriteString("## ❌ Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", environment)
-	if len(failing) == 0 {
+	if len(notPassing) == 0 {
 		// Defensive: callers should only invoke this template when at least
-		// one failing check has been identified. Render a generic message
+		// one non-passing check has been identified. Render a generic message
 		// rather than an empty Markdown table with column headers but no rows.
-		sb.WriteString("Cannot apply while PR checks are failing.\n\n")
-		sb.WriteString("Fix the failing checks and retry:\n")
+		sb.WriteString("Cannot apply while PR checks are not passing.\n\n")
+		sb.WriteString("Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:\n")
 		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 		return sb.String()
 	}
-	sb.WriteString("Cannot apply while PR checks are failing:\n\n")
+	sb.WriteString("Cannot apply while PR checks are not passing:\n\n")
 	sb.WriteString("| Check | Status |\n")
 	sb.WriteString("|-------|--------|\n")
-	for _, f := range failing {
+	for _, f := range notPassing {
 		fmt.Fprintf(&sb, "| `%s` | %s |\n", f.Name, f.State)
 	}
-	sb.WriteString("\nFix the failing checks and retry:\n")
+	sb.WriteString("\nGet the checks passing — fix failures and re-run cancelled or stale checks — then retry:\n")
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 
 	return sb.String()
@@ -385,7 +385,7 @@ func RenderApplyBlockedByFailingChecks(environment string, failing []BlockingChe
 // because the GitHub API returned an error while fetching PR check statuses.
 // The function recognises the "Resource not accessible" permission error and
 // surfaces a targeted hint; all other errors are shown verbatim. Both branches
-// include a fenced retry command, matching the failing/in-progress siblings.
+// include a fenced retry command, matching the non-passing/in-progress siblings.
 type CheckStatusAccessDetails struct {
 	GitHubApp              string
 	MissingPermissions     []string
