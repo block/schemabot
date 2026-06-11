@@ -13,9 +13,10 @@ type Request struct {
 	Environment string
 }
 
-// ExecutionTarget is one execution target returned by a Resolver. A single
-// logical request can resolve to multiple targets when an environment fans out
-// across deployments.
+// ExecutionTarget is one physical/data-plane target returned by a Resolver. A
+// single logical request can resolve to multiple targets when an environment
+// fans out across deployments. It is not an operation identity: one execution
+// target can have multiple concurrent operations.
 type ExecutionTarget struct {
 	DatabaseType string
 	Deployment   string
