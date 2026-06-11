@@ -65,10 +65,12 @@ func (h *Handler) executePlanWithTransientRetry(ctx context.Context, planReq api
 		"retry_delay", delay,
 		"error", err)
 
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return nil, fmt.Errorf("plan retry for %s/%s cancelled: %w", planReq.Database, planReq.Environment, ctx.Err())
-	case <-time.After(delay):
+	case <-timer.C:
 	}
 
 	planResp, retryErr := h.service.ExecutePlan(ctx, planReq)
