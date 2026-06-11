@@ -827,6 +827,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 
 	migrationContext := e.resolveResumeMigrationContext(ctx, client, req, existingContexts)
 
+	// Persist the rediscovered context now so a crash before this function
+	// returns does not lose it — the returned ResumeState alone is not durable.
+	e.persistResumeMigrationContext(req, migrationContext, persistMeta)
+
 	e.logger.Info("resumed and deployed", "number", dr.Number, "branch", meta.BranchName, "migration_context", migrationContext)
 	return &engine.ApplyResult{
 		Accepted: true,
@@ -893,6 +897,10 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 
 		migrationContext = e.resolveResumeMigrationContext(ctx, client, req, existingContexts)
 
+		// Persist the rediscovered context now so a crash before this function
+		// returns does not lose it — the returned ResumeState alone is not durable.
+		e.persistResumeMigrationContext(req, migrationContext, updatedMeta)
+
 		e.logger.Info("resumed and deployed recovered deploy request",
 			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "migration_context", migrationContext)
 		return &engine.ApplyResult{
@@ -903,6 +911,28 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 				Metadata:         updatedMeta,
 			},
 		}, nil
+	}
+
+	// Reattach-only path: no deploy was started here. If the stored context is
+	// still the tern apply identifier (not a real Vitess context), an earlier
+	// crash lost the discovered context, so per-shard progress would stay empty
+	// for the rest of the apply. Rediscover it from the current migrations and
+	// persist the result. A stored value that is already a real Vitess context is
+	// kept as-is.
+	if !isRealVitessContext(migrationContext) {
+		e.logger.Info("rediscovering Vitess context on reattach; stored value is not a real context",
+			"database", req.Database, "deploy_request", dr.Number, "stored_context", migrationContext)
+		// The deploy already ran in a prior process, so its Vitess context is
+		// already present in SHOW VITESS_MIGRATIONS. Discover against an empty
+		// baseline so any existing context counts as a match.
+		rediscovered := e.discoverMigrationContextWithRetry(ctx, client, req.Database, req.Credentials, map[string]bool{})
+		if rediscovered != "" {
+			migrationContext = rediscovered
+			e.persistResumeMigrationContext(req, migrationContext, updatedMeta)
+		} else {
+			e.logger.Warn("Vitess context not found on reattach; per-shard progress will be empty until it is found",
+				"database", req.Database, "deploy_request", dr.Number, "stored_context", migrationContext)
+		}
 	}
 
 	e.logger.Info("reattached to deploy request on resume",
@@ -953,4 +983,39 @@ func (e *Engine) resolveResumeMigrationContext(ctx context.Context, client pscli
 	e.logger.Warn("Vitess context not discovered on resume; per-shard progress will be empty until it is found",
 		"database", req.Database, "stored_context", stored)
 	return stored
+}
+
+// isRealVitessContext reports whether a migration_context value is a real Vitess
+// context (the "<system>:<uuid>" form that appears in SHOW VITESS_MIGRATIONS,
+// e.g. "singularity:17694ee9-...") rather than the tern-assigned apply identifier
+// (e.g. "apply-1a2b3c..."). The apply identifier never matches a Vitess migration
+// row, so per-shard progress stays empty until a real context is resolved. The
+// colon separating system and uuid is the distinguishing marker — tern identifiers
+// never contain one.
+func isRealVitessContext(migrationContext string) bool {
+	return strings.Contains(migrationContext, ":")
+}
+
+// persistResumeMigrationContext durably records a freshly resolved Vitess context
+// via OnStateChange so a crash after deploy (but before the resume function
+// returns) does not lose it — without persistence the stored ResumeState would
+// still hold the tern apply identifier, leaving the next resume with no per-shard
+// Vitess progress. It only persists a real Vitess context; an empty or
+// apply-identifier value carries no per-shard progress and is left untouched so a
+// previously persisted real context is never clobbered.
+func (e *Engine) persistResumeMigrationContext(req *engine.ApplyRequest, migrationContext, metadata string) {
+	if req.OnStateChange == nil {
+		return
+	}
+	if !isRealVitessContext(migrationContext) {
+		e.logger.Debug("not persisting resume context: not a real Vitess context yet",
+			"database", req.Database, "context", migrationContext)
+		return
+	}
+	e.logger.Info("persisting rediscovered Vitess context on resume",
+		"database", req.Database, "context", migrationContext)
+	req.OnStateChange(&engine.ResumeState{
+		MigrationContext: migrationContext,
+		Metadata:         metadata,
+	})
 }

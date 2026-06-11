@@ -219,6 +219,17 @@ func resumeRequest(t *testing.T, meta *psMetadata, migrationContext string) *eng
 	}
 }
 
+// captureStateChanges installs an OnStateChange callback on req that records every
+// persisted ResumeState, so resume tests can assert the engine durably persists a
+// rediscovered Vitess context rather than only returning it in the ApplyResult.
+func captureStateChanges(req *engine.ApplyRequest) *[]*engine.ResumeState {
+	var persisted []*engine.ResumeState
+	req.OnStateChange = func(state *engine.ResumeState) {
+		persisted = append(persisted, state)
+	}
+	return &persisted
+}
+
 // deployRequestNeedsResumeDeploy gates the resume path that starts a deploy the
 // crashed worker never began. It must fire only for a non-deferred deploy
 // request that finished validation ("ready") and was never deployed.
@@ -280,7 +291,7 @@ func TestResumeExistingDeployRequest_DeploysReadyNeverStarted(t *testing.T) {
 	}
 
 	meta := &psMetadata{BranchName: "schemabot-testdb-abc", DeployRequestID: 42, IsInstant: true}
-	req := resumeRequest(t, meta, "singularity-apply-id")
+	req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
 
 	result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
 
@@ -305,6 +316,7 @@ func TestResumeExistingDeployRequest_InFlightIsNotRedeployed(t *testing.T) {
 
 	meta := &psMetadata{BranchName: "schemabot-testdb-xyz", DeployRequestID: 7}
 	req := resumeRequest(t, meta, "singularity:real-context")
+	persisted := captureStateChanges(req)
 
 	result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
 
@@ -315,6 +327,9 @@ func TestResumeExistingDeployRequest_InFlightIsNotRedeployed(t *testing.T) {
 	require.NotNil(t, result.ResumeState)
 	assert.Equal(t, "singularity:real-context", result.ResumeState.MigrationContext)
 	assert.Contains(t, result.Message, "Resumed deploy request #7")
+	// A stored real Vitess context is authoritative — resume neither rediscovers
+	// nor re-persists it.
+	assert.Empty(t, *persisted)
 }
 
 // A deferred deploy request recovered on resume must wait for the
@@ -326,7 +341,7 @@ func TestResumeExistingDeployRequest_DeferredIsNotDeployed(t *testing.T) {
 	}
 
 	meta := &psMetadata{BranchName: "schemabot-testdb-def", DeployRequestID: 9, DeferredDeploy: true}
-	req := resumeRequest(t, meta, "singularity-apply-id")
+	req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
 
 	result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
 
@@ -349,7 +364,7 @@ func TestResumeExistingDeployRequest_ErrorStateStartsFresh(t *testing.T) {
 	}
 
 	meta := &psMetadata{BranchName: "schemabot-testdb-err", DeployRequestID: 5}
-	req := resumeRequest(t, meta, "singularity-apply-id")
+	req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
 
 	_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
 
@@ -368,10 +383,135 @@ func TestResolveResumeMigrationContext_PreservesStoredWithoutDSN(t *testing.T) {
 	req := &engine.ApplyRequest{
 		Database:    "testdb",
 		Credentials: &engine.Credentials{Metadata: map[string]string{"organization": "org", "main_branch": "main"}},
-		ResumeState: &engine.ResumeState{MigrationContext: "singularity-apply-id"},
+		ResumeState: &engine.ResumeState{MigrationContext: "apply-1a2b3c4d5e6f7890"},
 	}
 
 	got := e.resolveResumeMigrationContext(t.Context(), client, req, map[string]bool{})
 
-	assert.Equal(t, "singularity-apply-id", got)
+	assert.Equal(t, "apply-1a2b3c4d5e6f7890", got)
+}
+
+// A real Vitess context carries the "<system>:<uuid>" form that appears in SHOW
+// VITESS_MIGRATIONS, while the tern-assigned apply identifier ("apply-<hex>")
+// does not. Only the former drives per-shard progress, so the two must be
+// distinguishable by the colon separator.
+func TestIsRealVitessContext(t *testing.T) {
+	cases := []struct {
+		name             string
+		migrationContext string
+		want             bool
+	}{
+		{name: "singularity context is real", migrationContext: "singularity:17694ee9-aaaa-bbbb", want: true},
+		{name: "revert context is real", migrationContext: "revert:singularity:17694ee9", want: true},
+		{name: "tern apply identifier is not real", migrationContext: "apply-1a2b3c4d5e6f7890", want: false},
+		{name: "tern task identifier is not real", migrationContext: "task-1a2b3c4d5e6f7890", want: false},
+		{name: "empty is not real", migrationContext: "", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isRealVitessContext(tc.migrationContext))
+		})
+	}
+}
+
+// persistResumeMigrationContext must durably record only a real Vitess context.
+// Persisting the tern apply identifier or an empty value would carry no per-shard
+// progress and could clobber a previously persisted real context.
+func TestPersistResumeMigrationContext(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+
+	t.Run("persists real context", func(t *testing.T) {
+		req := resumeRequest(t, &psMetadata{}, "")
+		persisted := captureStateChanges(req)
+
+		e.persistResumeMigrationContext(req, "singularity:real-context", "encoded-meta")
+
+		require.Len(t, *persisted, 1)
+		assert.Equal(t, "singularity:real-context", (*persisted)[0].MigrationContext)
+		assert.Equal(t, "encoded-meta", (*persisted)[0].Metadata)
+	})
+
+	t.Run("skips apply identifier", func(t *testing.T) {
+		req := resumeRequest(t, &psMetadata{}, "")
+		persisted := captureStateChanges(req)
+
+		e.persistResumeMigrationContext(req, "apply-1a2b3c4d5e6f7890", "encoded-meta")
+
+		assert.Empty(t, *persisted)
+	})
+
+	t.Run("skips empty context", func(t *testing.T) {
+		req := resumeRequest(t, &psMetadata{}, "")
+		persisted := captureStateChanges(req)
+
+		e.persistResumeMigrationContext(req, "", "encoded-meta")
+
+		assert.Empty(t, *persisted)
+	})
+
+	t.Run("no-op when callback is nil", func(t *testing.T) {
+		req := resumeRequest(t, &psMetadata{}, "")
+		req.OnStateChange = nil
+
+		assert.NotPanics(t, func() {
+			e.persistResumeMigrationContext(req, "singularity:real-context", "encoded-meta")
+		})
+	})
+}
+
+// When the resume deploy path resolves a real Vitess context, it must persist
+// that context via OnStateChange before returning. Otherwise a crash after the
+// deploy starts but before the apply returns would leave storage holding the
+// tern apply identifier, with no per-shard Vitess progress for the rest of the
+// apply. The stored value here is already a real context, so resolution returns
+// it deterministically without a live vtgate, and the persist must fire.
+func TestResumeExistingDeployRequest_PersistsRealContextOnDeploy(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &resumeDeployClient{
+		recovered: &ps.DeployRequest{DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/42"},
+	}
+
+	meta := &psMetadata{BranchName: "schemabot-testdb-abc", DeployRequestID: 42}
+	req := resumeRequest(t, meta, "singularity:real-context")
+	persisted := captureStateChanges(req)
+
+	result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, 1, client.deployCalls)
+	assert.Equal(t, "singularity:real-context", result.ResumeState.MigrationContext)
+
+	require.Len(t, *persisted, 1)
+	assert.Equal(t, "singularity:real-context", (*persisted)[0].MigrationContext)
+	assert.NotEmpty(t, (*persisted)[0].Metadata)
+}
+
+// On the reattach-only path (deploy already in flight from a prior process), a
+// stored value that is still the tern apply identifier means an earlier crash
+// lost the discovered Vitess context. Resume must attempt rediscovery so
+// per-shard progress can recover. Without a vtgate DSN discovery turns up
+// nothing, so the stored identifier is preserved and nothing is persisted —
+// proving the rediscovery branch is gated on the value being a non-real context
+// without clobbering it.
+func TestResumeExistingDeployRequest_ReattachRediscoversWhenApplyIdentifier(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &resumeDeployClient{
+		recovered: &ps.DeployRequest{DeploymentState: deployState.InProgress, HtmlURL: "https://app/dr/7"},
+	}
+
+	meta := &psMetadata{BranchName: "schemabot-testdb-xyz", DeployRequestID: 7}
+	req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+	persisted := captureStateChanges(req)
+
+	result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, 0, client.deployCalls)
+	require.NotNil(t, result.ResumeState)
+	assert.Equal(t, "apply-1a2b3c4d5e6f7890", result.ResumeState.MigrationContext)
+	// Discovery found no real context (no DSN), so the apply identifier is kept
+	// rather than persisted.
+	assert.Empty(t, *persisted)
 }
