@@ -2,6 +2,7 @@ package templates
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -590,8 +591,37 @@ func TestPreviewCommentSummaryCompletedLargeSingleNamespaceKeepsApplyIDInsideSec
 	result := PreviewCommentSummaryCompletedLarge()
 
 	assert.Contains(t, result, "All 8 tables applied successfully")
-	assert.Contains(t, result, "_Apply ID: apply-a1b2c3d4e5f6_")
+	assert.Contains(t, result, "_Apply ID: `apply-a1b2c3d4e5f6`_")
 	assert.Equal(t, 0, strings.Count(result, "</details>"))
+}
+
+func TestRenderApplySummaryCommentCompletedCollapsedGroupSeparatesApplyID(t *testing.T) {
+	tableNames := []string{"users", "orders", "products", "invoices", "payments", "shipments"}
+	tables := make([]TableProgressData, 0, len(tableNames))
+	for _, tableName := range tableNames {
+		tables = append(tables, TableProgressData{
+			Namespace: "testapp_primary",
+			TableName: tableName,
+			DDL: fmt.Sprintf(
+				"CREATE TABLE `%s` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+				tableName,
+			),
+			Status: state.Task.Completed,
+		})
+	}
+	data := ApplyStatusCommentData{
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Completed,
+		Tables:      tables,
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.Contains(t, result, "<details><summary>✅ <strong>testapp_primary</strong> (6 tables)</summary>")
+	assert.Contains(t, result, "</details>\n\n_Apply ID: `apply-a1b2c3d4e5f6`_")
+	assert.NotContains(t, result, "</details>\n_Apply ID")
 }
 
 func TestRenderApplyBlockedByNonPassingChecks(t *testing.T) {

@@ -577,7 +577,10 @@ func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, tot
 	writeSuccessBlock(sb, msg)
 	writeSummaryTableList(sb, data)
 	if data.ApplyID != "" {
-		fmt.Fprintf(sb, "_Apply ID: %s_\n", data.ApplyID)
+		if !strings.HasSuffix(sb.String(), "\n\n") {
+			sb.WriteString("\n")
+		}
+		fmt.Fprintf(sb, "_Apply ID: `%s`_\n", data.ApplyID)
 	}
 }
 

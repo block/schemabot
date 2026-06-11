@@ -2177,7 +2177,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
-_Apply ID: apply-a1b2c3d4e5f6_
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 </details>
 
@@ -2311,7 +2311,7 @@ ALTER TABLE `audit_logs` ADD INDEX `idx_created_at`(`created_at`);
 ALTER TABLE `notifications` ADD INDEX `idx_user_status`(`user_id`, `status`);
 ```
 
-_Apply ID: apply-a1b2c3d4e5f6_
+_Apply ID: `apply-a1b2c3d4e5f6`_
 
 </details>
 
@@ -2480,7 +2480,7 @@ ALTER TABLE `addresses` ADD INDEX `idx_zip`(`zip_code`);
 ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 ```
 
-_Apply ID: apply-a1b2c3d4e5f6_
+_Apply ID: `apply-a1b2c3d4e5f6`_
 </details>
 
 ### CLI Output
