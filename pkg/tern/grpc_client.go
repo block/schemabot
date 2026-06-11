@@ -812,7 +812,7 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 		return err
 	}
 	if len(tasks) == 0 {
-		return fmt.Errorf("no tasks found for apply_operation %d (apply %s)", applyOperationID, apply.ApplyIdentifier)
+		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 	}
 	return c.resumeApply(ctx, apply, scope)
 }

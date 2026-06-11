@@ -923,6 +923,71 @@ func TestLocalClient_ResumeApplyOperationDrivesOperationTasks(t *testing.T) {
 	assert.Equal(t, operationID, *tasks[0].ApplyOperationID)
 }
 
+// An operation that resolves to no tasks is an invalid or stale claim. The local
+// drive must fail closed with ErrNoTasksForApplyOperation — matchable with
+// errors.Is — without mutating the parent apply, so the operator can terminalize
+// just that operation rather than marking the whole apply failed.
+func TestLocalClient_ResumeApplyOperationFailsClosedOnNoTasks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-op-notasks-%d", time.Now().UnixNano()),
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	// Insert an operation but deliberately no tasks scoped to it.
+	operationID, err := stor.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: "testdb",
+		Target:     "testdb",
+		State:      state.ApplyOperation.Running,
+	})
+	require.NoError(t, err)
+
+	err = client.ResumeApplyOperation(ctx, apply, operationID)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrNoTasksForApplyOperation, "the empty-operation fail-closed signal must be matchable with errors.Is")
+
+	// The parent apply must be untouched: the empty lookup is scoped to the one
+	// operation, not the whole apply.
+	after, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, state.Apply.Running, after.State, "a task-less operation must not mutate the parent apply state")
+}
+
 // This scenario covers an operator-owned grouped start where the target schema
 // advances between the recovery re-plan and the final pre-dispatch schema check.
 // The operator should complete durable state without reissuing engine apply work.

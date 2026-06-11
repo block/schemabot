@@ -334,6 +334,233 @@ func TestOperator_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
 	assert.Equal(t, derived, parent.State, "parent apply state is derived from its child operations")
 }
 
+// TestOperator_OperationDeploymentMismatchFailsClosed covers the safety guard
+// on the operation-claim path. The claimed apply_operations row's deployment is
+// the authoritative routing key for the drive, but the shared resume path
+// selects the Tern client from the parent apply's stored deployment. While one
+// operation maps to one apply these are always identical; if they ever diverge
+// (data corruption, or a future multi-deployment fan-out), driving via the
+// parent deployment would run the wrong deployment. The operator must fail
+// closed: it claims the operation but never drives it to a terminal state.
+func TestOperator_OperationDeploymentMismatchFailsClosed(t *testing.T) {
+	ctx := t.Context()
+	schemaSQL, err := os.ReadFile("testdata/myapp/mysql/schema/users.sql")
+	require.NoError(t, err)
+
+	appDBName, appDSN := createTestDB(t, "op_deploy_mismatch_")
+	ts := startTestServerOperator(t, appDBName, appDSN)
+
+	// Apply the schema normally so the target reaches the desired state, then
+	// drop the table so a replan yields DDL a resumed operation could run.
+	planResp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID, _ := planResp["plan_id"].(string)
+	require.NotEmpty(t, planID)
+	applyResp := postJSON(t, "http://"+ts.Addr+"/api/apply", map[string]any{
+		"plan_id": planID, "environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true)
+	applyID, _ := applyResp["apply_id"].(string)
+	require.NotEmpty(t, applyID)
+	waitForState(t, "http://"+ts.Addr, applyID, "completed", 20*time.Second)
+	ts.Service.StopOperator()
+
+	targetConn, err := sql.Open("mysql", appDSN)
+	require.NoError(t, err)
+	require.NoError(t, targetConn.PingContext(ctx))
+	defer utils.CloseAndLog(targetConn)
+	_, err = targetConn.ExecContext(ctx, "DROP TABLE IF EXISTS users")
+	require.NoError(t, err)
+
+	plan2Resp := postJSON(t, "http://"+ts.Addr+"/api/plan", map[string]any{
+		"database": appDBName, "environment": "staging", "type": "mysql",
+		"schema_files": map[string]any{"default": map[string]any{"files": map[string]string{"users.sql": string(schemaSQL)}}},
+	})
+	planID2, _ := plan2Resp["plan_id"].(string)
+	plan2, err := ts.Storage.Plans().Get(ctx, planID2)
+	require.NoError(t, err)
+
+	// Seed a resumable apply whose stored deployment is the real, routable
+	// target, but a child operation whose deployment deliberately diverges. The
+	// operation's tasks are present and runnable, so the only thing stopping the
+	// drive is the deployment-mismatch guard.
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-deploy-mismatch-%d", now.UnixNano()%100000),
+		PlanID:          plan2.ID,
+		Database:        appDBName,
+		DatabaseType:    "mysql",
+		Deployment:      appDBName,
+		Engine:          "spirit",
+		State:           state.Apply.Running,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		StartedAt:       &now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyDBID, err := ts.Storage.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyDBID,
+		Deployment: appDBName + "-divergent",
+		Target:     appDBName,
+		State:      state.ApplyOperation.Running,
+		StartedAt:  &now,
+	})
+	require.NoError(t, err)
+
+	for _, tc := range plan2.FlatDDLChanges() {
+		_, err := ts.Storage.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier:   fmt.Sprintf("task-mismatch-%d", time.Now().UnixNano()),
+			ApplyID:          applyDBID,
+			ApplyOperationID: &opID,
+			PlanID:           plan2.ID,
+			Database:         appDBName,
+			DatabaseType:     "mysql",
+			Engine:           "spirit",
+			State:            state.Task.Running,
+			TableName:        tc.Table,
+			DDL:              tc.DDL,
+			DDLAction:        tc.Operation,
+			Options:          []byte("{}"),
+			Environment:      "staging",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		})
+		require.NoError(t, err)
+	}
+
+	// Age both rows so the operation-claim loop leases the operation on its
+	// first poll.
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+	defer utils.CloseAndLog(schemabotDB)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 10 MINUTE WHERE id = ?", applyDBID)
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 10 MINUTE WHERE id = ?", opID)
+	require.NoError(t, err)
+
+	staleOp, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+	require.NoError(t, err)
+	require.NotNil(t, staleOp)
+	seededUpdatedAt := staleOp.UpdatedAt
+
+	ts.Service.StartOperator(t.Context())
+	defer ts.Service.StopOperator()
+
+	// The operator must actually claim the operation — claiming refreshes its
+	// heartbeat — so we know the deployment-mismatch guard was reached.
+	require.Eventually(t, func() bool {
+		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		return op != nil && op.UpdatedAt.After(seededUpdatedAt)
+	}, 10*time.Second, 200*time.Millisecond,
+		"operator should claim the stale operation, reaching the deployment-mismatch guard")
+
+	// Having reached the guard, it must never drive the operation to a terminal
+	// state, because its deployment diverges from the parent apply's.
+	require.Never(t, func() bool {
+		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		return op != nil && state.IsTerminalApplyState(op.State)
+	}, 3*time.Second, 200*time.Millisecond,
+		"operator must fail closed and never drive an operation whose deployment diverges from its parent apply")
+
+	op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+	require.NoError(t, err)
+	require.NotNil(t, op)
+	assert.Nil(t, op.CompletedAt, "failed-closed operation must not stamp completed_at")
+
+	parent, err := ts.Storage.Applies().Get(ctx, applyDBID)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	assert.NotEqual(t, state.Apply.Completed, parent.State,
+		"parent apply must not be driven to completion through a mismatched operation")
+}
+
+// TestOperator_OperationWithoutTasksFailsClosed covers the fail-closed
+// terminalization on the operation-claim path. When a claimed operation resolves
+// to no tasks, the drive cannot make progress: the operator must mark that
+// operation failed (so it is not re-leased forever once its heartbeat goes
+// stale) and re-derive the parent apply's state from its operations, rather than
+// leaving the operation running indefinitely.
+func TestOperator_OperationWithoutTasksFailsClosed(t *testing.T) {
+	ctx := t.Context()
+	appDBName, appDSN := createTestDB(t, "op_no_tasks_")
+	ts := startTestServerOperator(t, appDBName, appDSN)
+	ts.Service.StopOperator()
+
+	// Seed a resumable apply and a child operation whose deployment matches the
+	// parent (so the drive is attempted) but with no tasks scoped to it.
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-no-tasks-%d", now.UnixNano()%100000),
+		Database:        appDBName,
+		DatabaseType:    "mysql",
+		Deployment:      appDBName,
+		Engine:          "spirit",
+		State:           state.Apply.Running,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		StartedAt:       &now,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyDBID, err := ts.Storage.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyDBID,
+		Deployment: appDBName,
+		Target:     appDBName,
+		State:      state.ApplyOperation.Running,
+		StartedAt:  &now,
+	})
+	require.NoError(t, err)
+
+	// Age both rows so the operation-claim loop leases the operation and its
+	// parent apply on the first poll.
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+	defer utils.CloseAndLog(schemabotDB)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 10 MINUTE WHERE id = ?", applyDBID)
+	require.NoError(t, err)
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 10 MINUTE WHERE id = ?", opID)
+	require.NoError(t, err)
+
+	ts.Service.StartOperator(t.Context())
+	defer ts.Service.StopOperator()
+
+	// The operator must terminalize the task-less operation as failed rather
+	// than re-leasing it forever.
+	require.Eventually(t, func() bool {
+		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		return op != nil && state.IsState(op.State, state.ApplyOperation.Failed)
+	}, 10*time.Second, 200*time.Millisecond,
+		"operator should fail closed and mark a task-less operation failed")
+
+	op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+	require.NoError(t, err)
+	require.NotNil(t, op)
+	assert.Equal(t, state.ApplyOperation.Failed, op.State)
+	require.NotNil(t, op.CompletedAt, "a failed operation stamps completed_at")
+
+	// The parent apply state is derived from its child operations, so a single
+	// failed operation drives the parent to failed.
+	parent, err := ts.Storage.Applies().Get(ctx, applyDBID)
+	require.NoError(t, err)
+	require.NotNil(t, parent)
+	assert.Equal(t, state.Apply.Failed, parent.State,
+		"parent apply is derived from its operations and must reflect the failed child")
+}
+
 func TestOperator_ClaimOrdering(t *testing.T) {
 	ctx := t.Context()
 

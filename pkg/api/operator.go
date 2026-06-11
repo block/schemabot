@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // Operator constants.
@@ -206,7 +207,9 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 	}
 	ctx = storage.WithApplyLease(ctx, lease)
 	// Legacy FindNextApply path drives the whole apply (applyOperationID == 0).
-	s.resumeClaimedApply(ctx, workerID, apply, 0)
+	// Failures are handled inside resumeClaimedApply; the whole-apply path has no
+	// operation row to terminalize, so the return values are not needed here.
+	_, _ = s.resumeClaimedApply(ctx, workerID, apply, 0)
 }
 
 // recoverApplyOperation claims work at the apply_operations (per-deployment)
@@ -272,6 +275,25 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 	}
 	leasedCtx := storage.WithApplyLease(ctx, lease)
 
+	// The claimed operation row's deployment is the authoritative routing key
+	// for the drive, but resumeClaimedApply selects the Tern client from the
+	// parent apply's stored deployment. These are identical while one operation
+	// maps to one apply; if they ever diverge the worker would drive the wrong
+	// deployment, so fail closed rather than route to the parent's deployment.
+	if op.Deployment != apply.Deployment {
+		s.logger.Error("operator: claimed operation deployment does not match parent apply deployment; operation will not be driven",
+			"worker", workerID,
+			"lease_owner", owner,
+			"apply_operation_id", op.ID,
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"operation_deployment", op.Deployment,
+			"apply_deployment", apply.Deployment,
+			"environment", apply.Environment)
+		metrics.RecordOperatorClaimFailure(ctx, "deployment_mismatch")
+		return
+	}
+
 	// Heartbeat the operation row on the apply heartbeat cadence so a peer
 	// worker does not re-claim it during a long ResumeApply. A lost parent lease
 	// cancels the run so the displaced worker stops writing.
@@ -280,9 +302,15 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 	stopHeartbeat := s.startApplyOperationHeartbeat(runCtx, workerID, op, apply, cancelRun)
 	defer stopHeartbeat()
 
-	resumed := s.resumeClaimedApply(runCtx, workerID, apply, op.ID)
+	resumed, resumeErr := s.resumeClaimedApply(runCtx, workerID, apply, op.ID)
 	stopHeartbeat()
 	if !resumed {
+		if errors.Is(resumeErr, tern.ErrNoTasksForApplyOperation) {
+			// The drive failed closed: the operation has no tasks, so it can
+			// never make progress. Terminalize it now rather than leaving it to
+			// be re-leased on every poll once its heartbeat goes stale.
+			s.failOperationWithoutTasks(leasedCtx, workerID, op, apply)
+		}
 		return
 	}
 
@@ -391,6 +419,29 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 }
 
+// failOperationWithoutTasks terminalizes an operation whose drive failed closed
+// because no tasks scope to it. Such a claim is invalid or stale: the operation
+// can never make progress, so leaving the row non-terminal would re-lease it on
+// every poll once its heartbeat goes stale. Mark it failed and re-derive the
+// parent apply state from its operations so the parent reflects the terminal
+// child. The caller passes a lease-scoped context so the writes fail closed if
+// ownership has since changed.
+func (s *Service) failOperationWithoutTasks(ctx context.Context, workerID int, op *storage.ApplyOperation, apply *storage.Apply) {
+	const reason = "operation has no tasks; invalid or stale claim"
+	if err := s.storage.ApplyOperations().MarkFailed(ctx, op.ID, reason); err != nil {
+		s.logger.Error("operator: failed to mark task-less apply_operation failed; operation will be retried",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+		return
+	}
+	if err := s.updateApplyStateFromOperations(ctx, workerID, apply); err != nil {
+		s.logger.Error("operator: failed to update derived apply state after failing task-less operation",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+		return
+	}
+}
+
 // resumeClaimedApply drives claimed work through the engine with the apply lease
 // already attached to ctx. When applyOperationID is set (the operation-claim
 // path) it drives only that deployment's tasks via ResumeApplyOperation, so
@@ -398,8 +449,9 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 // it drives every task of the apply via ResumeApply. Returns true when the work
 // resumed without error. Failures are logged and recorded as metrics internally;
 // the bool lets the operation-level claim loop decide whether to mark its
-// operation terminal.
-func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *storage.Apply, applyOperationID int64) bool {
+// operation terminal, and the returned error lets it distinguish the fail-closed
+// no-tasks case (tern.ErrNoTasksForApplyOperation) from transient failures.
+func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *storage.Apply, applyOperationID int64) (bool, error) {
 	lease := apply.Lease()
 	start := s.clock.Now()
 	s.logger.Info("operator: claimed apply",
@@ -423,7 +475,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 			"environment", apply.Environment,
 			"error", err)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, "", apply.Environment, "missing_deployment")
-		return false
+		return false, err
 	}
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
@@ -435,7 +487,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 			"environment", apply.Environment,
 			"error", err)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "no_client")
-		return false
+		return false, err
 	}
 
 	if s.OnApplyRecovered != nil {
@@ -469,7 +521,26 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}
-			return false
+			return false, err
+		}
+		if errors.Is(err, tern.ErrNoTasksForApplyOperation) {
+			// Fail-closed: no tasks scope to the operation, so it is an invalid
+			// or stale claim that can never make progress. The drive mutated
+			// nothing; the caller terminalizes the operation row so it is not
+			// re-leased on every poll once its heartbeat goes stale.
+			s.logger.Error("operator: claimed operation has no tasks; failing it closed",
+				"worker", workerID,
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"deployment", deployment,
+				"environment", apply.Environment,
+				"apply_operation_id", applyOperationID,
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "operation_no_tasks")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			s.logger.Debug("operator: stopped while running claimed apply",
@@ -482,7 +553,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}
-			return false
+			return false, err
 		}
 		s.logger.Error("operator: failed to resume apply",
 			"worker", workerID,
@@ -495,7 +566,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 		if retryableClaim {
 			metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 		}
-		return false
+		return false, err
 	}
 
 	duration := s.clock.Now().Sub(start)
@@ -509,7 +580,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 		"duration", duration)
 	metrics.RecordOperatorResume(ctx, apply.Database, deployment, apply.Environment, previousState)
 	metrics.RecordOperatorClaimDuration(ctx, duration, apply.Database, deployment, apply.Environment, previousState)
-	return true
+	return true, nil
 }
 
 // startApplyOperationHeartbeat refreshes the claimed operation row's lease while

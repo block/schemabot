@@ -861,7 +861,8 @@ func TestGRPCClient_ResumeApplyOperationFailsClosedOnNoTasks(t *testing.T) {
 	defer cancel()
 	err := client.ResumeApplyOperation(ctx, apply, operationID)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no tasks found for apply_operation 42")
+	require.ErrorIs(t, err, ErrNoTasksForApplyOperation, "the empty-operation fail-closed signal must be matchable with errors.Is")
+	assert.Contains(t, err.Error(), "apply_operation 42")
 
 	assert.Equal(t, operationID, taskStore.lastOperationID, "drive must look up tasks scoped to the operation")
 	assert.Nil(t, server.getApplyRequest(), "an operation with no tasks must not be dispatched to remote Tern")

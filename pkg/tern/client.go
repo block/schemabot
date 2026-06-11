@@ -3,10 +3,19 @@ package tern
 
 import (
 	"context"
+	"errors"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+// ErrNoTasksForApplyOperation is returned by ResumeApplyOperation when no tasks
+// scope to the requested operation. It is the fail-closed signal for an invalid
+// or stale operation claim: the operation cannot make progress, so the operator
+// terminalizes it rather than retrying it forever. Both the local and remote
+// clients detect this from storage before any dispatch or state mutation, so
+// callers can match it with errors.Is regardless of the transport.
+var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
 
 // Client defines the interface for schema change operations.
 // Uses proto-generated types for type safety.
