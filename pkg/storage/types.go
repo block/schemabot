@@ -466,6 +466,21 @@ type ApplyOperation struct {
 	// an empty value as "rolling", matching the column's NOT NULL DEFAULT.
 	CutoverPolicy string
 
+	// HaltOnFailure is the rollout policy captured for this operation's parent
+	// apply at apply-create time, drawn from the resolved environment config.
+	// When true, a failed earlier sibling blocks every later deployment of the
+	// same apply — the rollout stops at the first failure. When false, a
+	// terminal-failed earlier sibling no longer blocks later siblings, so the
+	// rollout attempts every deployment instead of halting. It governs only
+	// rollout continuation, never the apply's pass/fail verdict or the merge
+	// gate, which stay fail-closed on any failed deployment.
+	//
+	// A pointer so an unset value is distinguishable from an explicit false:
+	// Insert treats nil as halt-on-failure (the safe default, matching the
+	// column's NOT NULL DEFAULT 1), so a caller that omits the policy never
+	// silently degrades to the less-safe non-halting behaviour.
+	HaltOnFailure *bool
+
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time
 

@@ -669,11 +669,13 @@ func (s *Service) createStoredApply(
 	// routing. The data shape is what the operator claim-loop PR consumes
 	// once that gate is lifted and plans become deployment-agnostic.
 	cutoverPolicy := s.config.CutoverPolicyFor(plan.Database, req.Environment)
+	haltOnFailure := s.config.HaltOnFailureEnabled(plan.Database, req.Environment)
 	operations := []*storage.ApplyOperation{{
 		Deployment:    apply.Deployment,
 		Target:        plan.Target,
 		State:         state.ApplyOperation.Pending,
 		CutoverPolicy: cutoverPolicy,
+		HaltOnFailure: &haltOnFailure,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}}

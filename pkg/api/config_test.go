@@ -19,6 +19,30 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+// TestServerConfig_HaltOnFailureEnabled verifies the rollout-policy resolver:
+// it defaults to halting (true) when unset or unconfigured, and honours an
+// explicit false so a failed deployment no longer halts later ones.
+func TestServerConfig_HaltOnFailureEnabled(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"halt-unset": {Target: "payments", Deployment: "payments-a"},
+					"halt-true":  {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, HaltOnFailure: new(true)},
+					"halt-false": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, HaltOnFailure: new(false)},
+				},
+			},
+		},
+	}
+
+	assert.True(t, cfg.HaltOnFailureEnabled("payments", "halt-unset"), "unset defaults to halting")
+	assert.True(t, cfg.HaltOnFailureEnabled("payments", "halt-true"), "explicit true halts")
+	assert.False(t, cfg.HaltOnFailureEnabled("payments", "halt-false"), "explicit false does not halt")
+	assert.True(t, cfg.HaltOnFailureEnabled("payments", "missing-env"), "unconfigured env defaults to halting")
+	assert.True(t, cfg.HaltOnFailureEnabled("missing-db", "halt-false"), "unconfigured database defaults to halting")
+}
+
 func TestLoadServerConfig(t *testing.T) {
 	// Create temp config file
 	dir := t.TempDir()
@@ -1371,6 +1395,26 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 					"payments-a": {Target: "payments"},
 				},
 				CutoverPolicy: storage.CutoverPolicyBarrier,
+			},
+			tern: baseTern,
+		},
+		{
+			name: "halt_on_failure without a deployments map is rejected",
+			envConfig: EnvironmentConfig{
+				Target:        "payments",
+				Deployment:    "payments-a",
+				HaltOnFailure: new(false),
+			},
+			tern:       baseTern,
+			wantErrSub: "sets halt_on_failure without a deployments map",
+		},
+		{
+			name: "halt_on_failure with a deployments map is accepted",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+				HaltOnFailure: new(false),
 			},
 			tern: baseTern,
 		},

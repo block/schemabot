@@ -459,6 +459,16 @@ type EnvironmentConfig struct {
 	// Only meaningful alongside a Deployments map.
 	CutoverPolicy string `yaml:"cutover_policy,omitempty"`
 
+	// HaltOnFailure controls multi-deployment rollout behaviour when a
+	// deployment fails. When true or unset (the default), a failed deployment
+	// halts the rollout — later deployments in deployment_order are not started.
+	// When false, a failed deployment no longer blocks later deployments, so
+	// the rollout attempts every deployment instead of stopping at the first
+	// failure. It governs only rollout continuation; the apply's pass/fail
+	// verdict and the merge gate stay fail-closed on any failed deployment.
+	// Only meaningful alongside a Deployments map.
+	HaltOnFailure *bool `yaml:"halt_on_failure,omitempty"`
+
 	// For PlanetScale/Vitess:
 	// Organization is the PlanetScale organization name.
 	// sadscan:disable kingfisher.planetscale.2
@@ -654,6 +664,9 @@ func (c *ServerConfig) Validate() error {
 				default:
 					return fmt.Errorf("database %q environment %q has invalid cutover_policy %q (want %q or %q)", name, env, envConfig.CutoverPolicy, storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier)
 				}
+			}
+			if envConfig.HaltOnFailure != nil && !hasMapRouting {
+				return fmt.Errorf("database %q environment %q sets halt_on_failure without a deployments map", name, env)
 			}
 			switch {
 			case hasDSN && (hasScalarRouting || hasMapRouting):
@@ -916,6 +929,18 @@ func (c *ServerConfig) CutoverPolicyFor(database, environment string) string {
 		return storage.CutoverPolicyRolling
 	}
 	return env.CutoverPolicy
+}
+
+// HaltOnFailureEnabled reports whether a failed deployment should halt the
+// rollout of later deployments for this database+environment. Defaults to true
+// (halt) when the environment is unconfigured or leaves halt_on_failure unset,
+// preserving stop-at-first-failure as the safe default.
+func (c *ServerConfig) HaltOnFailureEnabled(database, environment string) bool {
+	env := c.DatabaseEnvironment(database, environment)
+	if env == nil || env.HaltOnFailure == nil {
+		return true
+	}
+	return *env.HaltOnFailure
 }
 
 // DatabaseEnvironments returns the environments configured server-side for a

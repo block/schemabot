@@ -20,7 +20,7 @@ import (
 
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, deployment, target, state, error_message,
-	cutover_policy, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
+	cutover_policy, halt_on_failure, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
 // mysqlErrDupEntry is MySQL's error number for a duplicate-key violation.
@@ -64,13 +64,21 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		cutoverPolicy = storage.CutoverPolicyRolling
 	}
 
+	// nil policy means the caller did not resolve a halt_on_failure preference,
+	// so fall back to halting — the safe default that matches the column's
+	// NOT NULL DEFAULT 1 and never silently degrades to non-halting behaviour.
+	haltOnFailure := true
+	if ad.HaltOnFailure != nil {
+		haltOnFailure = *ad.HaltOnFailure
+	}
+
 	result, err := exec.ExecContext(ctx, `
 		INSERT INTO apply_operations (
-			apply_id, deployment, target, state, error_message, cutover_policy,
+			apply_id, deployment, target, state, error_message, cutover_policy, halt_on_failure,
 			started_at, completed_at, engine_resume_context, engine_resume_metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		ad.ApplyID, ad.Deployment, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy,
+		ad.ApplyID, ad.Deployment, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy, haltOnFailure,
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
@@ -534,11 +542,20 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // sibling of the same apply (lower created_at, id) has reached completed.
 // This serializes a multi-deployment apply along its deployment_order — the
 // order materialized by the apply-create dual-write into row insertion order
-// — and halts the rollout on the first non-completed sibling (e.g. a failed
-// deployment), since any earlier non-completed row blocks every later one.
-// The gate applies only to starting a pending row; an already-active row
-// re-leasing a stale heartbeat is recovering work it already started, so it
-// is never re-gated.
+// — so deployments roll out in order. The gate applies only to starting a
+// pending row; an already-active row re-leasing a stale heartbeat is
+// recovering work it already started, so it is never re-gated.
+//
+// halt_on_failure (per-apply policy, captured on each row at create): when
+// true (the default), an earlier sibling that is anything other than
+// completed — including terminal-failed — blocks every later sibling, so the
+// rollout halts on the first failure. When false, a terminal-failed earlier
+// sibling is treated as settled and no longer blocks: later deployments are
+// still claimed and attempted. Only terminal `failed` is exempted — pending,
+// running, failed_retryable, and stopped earlier siblings still block under
+// both policies (work is in-flight or recoverable). The policy governs only
+// rollout continuation; the apply's pass/fail verdict and the merge gate stay
+// fail-closed on any failed deployment.
 //
 // Mirrors ApplyStore.FindNextApply: SELECT ... FOR UPDATE SKIP LOCKED to
 // avoid worker races, READ COMMITTED isolation to prevent next-key range
@@ -562,7 +579,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
 
-	queryArgs := []any{state.ApplyOperation.Pending, state.ApplyOperation.Completed}
+	queryArgs := []any{state.ApplyOperation.Pending, state.ApplyOperation.Completed, state.ApplyOperation.Failed}
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
@@ -618,6 +635,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					WHERE earlier.apply_id = apply_operations.apply_id
 						AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 						AND earlier.state <> ?
+						AND NOT (apply_operations.halt_on_failure = 0 AND earlier.state = ?)
 				)
 			)
 			OR (state IN (%s) AND updated_at < NOW() - INTERVAL %s)
@@ -801,14 +819,18 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var errMsg sql.NullString
 	var engineResumeContext, engineResumeMetadata sql.NullString
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
+	var haltOnFailure bool
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.Target, &ad.State, &errMsg,
-		&ad.CutoverPolicy, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
+		&ad.CutoverPolicy, &haltOnFailure, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
+
+	// The column is NOT NULL, so a stored row always carries an explicit policy.
+	ad.HaltOnFailure = &haltOnFailure
 
 	if errMsg.Valid {
 		ad.ErrorMessage = errMsg.String

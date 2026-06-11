@@ -1149,6 +1149,92 @@ func TestApplyOperationStore_FindNextApplyOperation_HaltsOnFailedSibling(t *test
 	assert.Nil(t, claimed, "later siblings must not be claimed once an earlier deployment failed")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_HaltOnFailureDisabledClaimsPastFailedSibling
+// verifies that when an apply's halt_on_failure policy is disabled, a
+// terminal-failed earlier deployment no longer blocks later siblings: the
+// rollout continues and the next ordered deployment is claimed instead of
+// stalling at the first failure. Only terminal `failed` is exempted — the
+// policy controls rollout continuation, not the apply's verdict.
+func TestApplyOperationStore_FindNextApplyOperation_HaltOnFailureDisabledClaimsPastFailedSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_no_halt", 1)
+
+	// region-a failed; region-b and region-c are pending behind it. With
+	// halt_on_failure disabled on every row, the failed sibling is treated as
+	// settled and the rollout proceeds to region-b.
+	noHalt := false
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, HaltOnFailure: &noHalt,
+	})
+	require.NoError(t, err)
+	for _, deployment := range []string{"region-b", "region-c"} {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: deployment, HaltOnFailure: &noHalt,
+		})
+		require.NoError(t, err)
+	}
+
+	// Backdate the failed row so staleness can't be the reason it's skipped.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "halt_on_failure disabled must let the rollout proceed past a failed sibling")
+	assert.Equal(t, "region-b", claimed.Deployment, "the next ordered deployment after the failed one is claimed")
+	assert.Equal(t, "test-operator", claimed.LeaseOwner, "claim must record the lease owner")
+
+	// The pending → running transition is persisted on the row, even though the
+	// returned struct reflects the pre-claim state read by the SELECT.
+	stored, err := store.ApplyOperations().Get(ctx, claimed.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.ApplyOperation.Running, stored.State, "the claimed pending row is transitioned to running")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_HaltOnFailureDisabledStillBlocksOnRunningSibling
+// verifies that disabling halt_on_failure only exempts terminal `failed` — an
+// earlier sibling that is still in-flight (running) continues to block later
+// deployments, because reordering around work that has not settled would race
+// the rollout.
+func TestApplyOperationStore_FindNextApplyOperation_HaltOnFailureDisabledStillBlocksOnRunningSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_no_halt_running", 1)
+
+	// region-a is running (fresh, so not stale-claimable); region-b is pending
+	// behind it. Even with halt_on_failure disabled, an in-flight sibling gates
+	// the later pending one — only terminal failure is exempted.
+	noHalt := false
+	runningID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Running, HaltOnFailure: &noHalt,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", HaltOnFailure: &noHalt,
+	})
+	require.NoError(t, err)
+
+	// Keep region-a fresh so it is not stale-reclaimable; the only thing that
+	// could surface region-b is the (absent) failure exemption.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() WHERE id = ?
+	`, runningID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a running earlier sibling still blocks even with halt_on_failure disabled")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_PendingStartRequestDoesNotBypassSiblingGate
 // verifies that a parent apply's pending start request does not let a later
 // pending deployment jump the deployment-order gate. Start requests resume
