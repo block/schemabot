@@ -87,6 +87,7 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 	}
 	ad.ID = id
 	ad.State = stateVal
+	ad.CutoverPolicy = cutoverPolicy
 	return id, nil
 }
 

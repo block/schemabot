@@ -74,12 +74,14 @@ func TestApplyOperationStore_CutoverPolicyRoundTrip(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	defaultedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+	defaultedOp := &storage.ApplyOperation{
 		ApplyID:    apply.ID,
 		Deployment: "region-b",
 		Target:     "payments",
-	})
+	}
+	defaultedID, err := store.ApplyOperations().Insert(ctx, defaultedOp)
 	require.NoError(t, err)
+	assert.Equal(t, storage.CutoverPolicyRolling, defaultedOp.CutoverPolicy, "Insert normalizes an empty policy to rolling on the passed struct")
 
 	barrier, err := store.ApplyOperations().Get(ctx, barrierID)
 	require.NoError(t, err)
