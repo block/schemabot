@@ -193,7 +193,7 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 		"environment": "staging",
 		"type":        "mysql",
 		"schema_files": map[string]any{
-			"default": map[string]any{
+			grpcDBName: map[string]any{
 				"files": map[string]string{
 					"grpc_items.sql": grpcSchemaSQL,
 				},

@@ -669,6 +669,138 @@ func newTestService() *Service {
 	return New(&mockStorage{}, testServerConfig(), nil, logger)
 }
 
+// For MySQL, the namespace key is the schema name a connection will target.
+// Ambiguous layouts (multiple namespaces, or "default" meaning the schema
+// name is unknown) are rejected at plan time with an actionable error, before
+// the request is dispatched to any executing deployment. Vitess plans keep
+// multiple namespaces — keyspaces are inherently plural.
+func TestExecutePlanValidatesMySQLNamespaces(t *testing.T) {
+	newNamespaceService := func(dbType string) (*Service, *mockTernClient) {
+		t.Helper()
+		mockClient := &mockTernClient{
+			planResp: &ternv1.PlanResponse{PlanId: "plan-namespaces"},
+		}
+		cfg := &ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type: dbType,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment},
+					},
+				},
+			},
+			TernDeployments: TernConfig{
+				DefaultDeployment: {"staging": "localhost:9090"},
+			},
+		}
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorageWithPlanLookup{plans: &capturingPlanStore{}}, cfg, map[string]tern.Client{
+			DefaultDeployment + "/staging": mockClient,
+		}, logger)
+		return svc, mockClient
+	}
+
+	planFiles := func(namespaces ...string) map[string]*ternv1.SchemaFiles {
+		files := make(map[string]*ternv1.SchemaFiles, len(namespaces))
+		for _, ns := range namespaces {
+			files[ns] = &ternv1.SchemaFiles{Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}}
+		}
+		return files
+	}
+
+	t.Run("multiple MySQL namespaces are rejected before dispatch", func(t *testing.T) {
+		svc, mockClient := newNamespaceService(storage.DatabaseTypeMySQL)
+
+		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: planFiles("payments", "payments_audit"),
+		})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "multiple MySQL namespaces")
+		assert.Nil(t, resp)
+		assert.Nil(t, mockClient.planReq, "invalid namespaces must not be dispatched")
+	})
+
+	t.Run("default namespace is rejected before dispatch", func(t *testing.T) {
+		svc, mockClient := newNamespaceService(storage.DatabaseTypeMySQL)
+
+		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: planFiles("default"),
+		})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `"default" is not a valid MySQL schema name`)
+		assert.Nil(t, resp)
+		assert.Nil(t, mockClient.planReq, "invalid namespaces must not be dispatched")
+	})
+
+	t.Run("single MySQL namespace dispatches", func(t *testing.T) {
+		svc, mockClient := newNamespaceService(storage.DatabaseTypeMySQL)
+
+		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: planFiles("payments_staging"),
+		})
+
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.Equal(t, "plan-namespaces", resp.PlanID)
+		require.NotNil(t, mockClient.planReq)
+	})
+
+	t.Run("multiple Vitess keyspaces dispatch", func(t *testing.T) {
+		svc, mockClient := newNamespaceService(storage.DatabaseTypeVitess)
+
+		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeVitess,
+			SchemaFiles: planFiles("commerce", "customers"),
+		})
+
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.NotNil(t, mockClient.planReq, "multi-keyspace Vitess plans must dispatch")
+	})
+
+	t.Run("multiple MySQL namespaces dispatch for local-DSN targets", func(t *testing.T) {
+		mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-namespaces"}}
+		cfg := &ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:test@tcp(localhost:3306)/payments?parseTime=true"},
+					},
+				},
+			},
+		}
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorageWithPlanLookup{plans: &capturingPlanStore{}}, cfg, map[string]tern.Client{
+			"payments/staging": mockClient,
+		}, logger)
+
+		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: planFiles("payments", "payments_audit"),
+		})
+
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.NotNil(t, mockClient.planReq, "local-DSN targets treat namespaces as labels and must dispatch")
+	})
+}
+
 func TestExecutePlanSourcePolicy(t *testing.T) {
 	newPolicyService := func() (*Service, *mockTernClient, *capturingPlanStore) {
 		t.Helper()

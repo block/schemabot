@@ -98,7 +98,7 @@ func TestRemoteApplyID_ControlOperations(t *testing.T) {
 		"environment": "staging",
 		"type":        "mysql",
 		"schema_files": map[string]any{
-			"default": map[string]any{
+			appDBName: map[string]any{
 				"files": map[string]string{
 					tableName + ".sql": schemaSQL,
 				},

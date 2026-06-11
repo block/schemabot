@@ -6,6 +6,39 @@ import (
 	"strings"
 )
 
+// MySQLSchemaName returns the MySQL schema name for a schema-files map.
+//
+// For MySQL, the namespace key is the actual schema name (the value from
+// SHOW DATABASES), which may differ from the database routing identifier —
+// for example namespace "payments_staging" for database "payments" after
+// $ENV substitution. The schema name decides which schema a connection
+// targets, so it must be unambiguous:
+//
+//   - "default" is rejected: it means schema files were at the directory
+//     root instead of inside a schema-named subdirectory, so the schema name
+//     is unknown.
+//   - Multiple namespaces in one plan are rejected: executing them requires
+//     a separate connection per schema, which is not yet supported for MySQL.
+//
+// Returns "" for an empty map. The map value type is generic because the
+// same namespace contract travels in several shapes (wire schema files,
+// stored schema files) and only the keys carry the schema name.
+func MySQLSchemaName[V any](schemaFiles map[string]V) (string, error) {
+	if len(schemaFiles) > 1 {
+		return "", fmt.Errorf("multiple MySQL namespaces in a single plan are not yet supported (got %d)", len(schemaFiles))
+	}
+	for namespace := range schemaFiles {
+		if namespace == "default" {
+			return "", fmt.Errorf(
+				`namespace "default" is not a valid MySQL schema name — ` +
+					`schema files must be in a subdirectory named after the MySQL schema ` +
+					`(the value from SHOW DATABASES), e.g. schema/testapp/users.sql where "testapp" is the schema name`)
+		}
+		return namespace, nil
+	}
+	return "", nil
+}
+
 // GroupFilesByNamespace groups schema files by namespace using their relative paths.
 // Two layouts are supported:
 //

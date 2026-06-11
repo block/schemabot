@@ -259,7 +259,7 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 		"environment": "staging",
 		"type":        "mysql",
 		"schema_files": map[string]any{
-			"default": map[string]any{
+			appDBName: map[string]any{
 				"files": map[string]string{
 					"items.sql": schemaSQL,
 				},
@@ -406,7 +406,7 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 		"environment": "staging",
 		"type":        "mysql",
 		"schema_files": map[string]any{
-			"default": map[string]any{
+			appDBName: map[string]any{
 				"files": map[string]string{
 					"task_state_test.sql": schemaSQL,
 				},
@@ -474,7 +474,7 @@ func TestGRPC_ServerSideTargetPlan(t *testing.T) {
 		"environment": "staging",
 		"type":        "mysql",
 		"schema_files": map[string]any{
-			"default": map[string]any{
+			"testapp": map[string]any{
 				"files": map[string]string{
 					"target_test.sql": schemaSQL,
 				},
@@ -590,7 +590,7 @@ func TestGRPC_ServerSideDeploymentStoredOnApply(t *testing.T) {
 		"environment": "staging",
 		"type":        "mysql",
 		"schema_files": map[string]any{
-			"default": map[string]any{
+			appDBName: map[string]any{
 				"files": map[string]string{"widgets.sql": schemaSQL},
 			},
 		},

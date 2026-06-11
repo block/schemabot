@@ -1012,9 +1012,9 @@ func TestServerConfig_ResolveDatabaseTargets(t *testing.T) {
 		got, err := cfg.ResolveDatabaseTargets("multidb", "production")
 		require.NoError(t, err)
 		assert.Equal(t, []ResolvedDatabaseTarget{
-			{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments"},
-			{DatabaseType: "mysql", Deployment: "payments-b", Target: "payments"},
-			{DatabaseType: "mysql", Deployment: "payments-c", Target: "payments"},
+			{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments", RequiresSingleConcreteNamespace: true},
+			{DatabaseType: "mysql", Deployment: "payments-b", Target: "payments", RequiresSingleConcreteNamespace: true},
+			{DatabaseType: "mysql", Deployment: "payments-c", Target: "payments", RequiresSingleConcreteNamespace: true},
 		}, got)
 	})
 

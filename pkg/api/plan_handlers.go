@@ -21,6 +21,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -202,6 +203,28 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 				"reason", reason,
 				"error", err)
 			return nil, fmt.Errorf("source policy: %w", err)
+		}
+	}
+
+	// Some execution paths cannot yet fan one plan out across multiple namespace
+	// scopes. Validate before dispatch so a bad layout fails here with an
+	// actionable error instead of a remote routing error. Local-DSN MySQL targets
+	// skip this because sequential applies can handle multiple namespace labels;
+	// atomic/defer-cutover mode still enforces its own single-namespace guard.
+	if resolvedTarget.RequiresSingleConcreteNamespace && resolvedTarget.DatabaseType == storage.DatabaseTypeMySQL {
+		if _, err := schema.MySQLSchemaName(req.SchemaFiles); err != nil {
+			span.RecordError(err)
+			span.SetStatus(otelcodes.Error, "invalid namespaces")
+			metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
+			metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
+			s.logger.Warn("plan rejected: target requires one concrete namespace",
+				"database", req.Database,
+				"environment", req.Environment,
+				"repository", req.Repository,
+				"deployment", deployment,
+				"namespace_count", len(req.SchemaFiles),
+				"error", err)
+			return nil, fmt.Errorf("validate schema namespaces for database %q: %w", req.Database, err)
 		}
 	}
 

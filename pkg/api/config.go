@@ -481,6 +481,13 @@ type ResolvedDatabaseTarget struct {
 	DatabaseType string
 	Deployment   string
 	Target       string
+
+	// RequiresSingleConcreteNamespace is a bridge constraint for execution paths
+	// that cannot yet fan one plan out across multiple namespace scopes. The
+	// future resolver/composer model should replace this with resolved namespace
+	// scopes; until then, remote MySQL dispatch requires exactly one real
+	// namespace so the executing deployment can target the right schema.
+	RequiresSingleConcreteNamespace bool
 }
 
 // DeploymentTarget is one entry in EnvironmentConfig.Deployments. It carries
@@ -939,9 +946,10 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]R
 				return nil, fmt.Errorf("database %q environment %q deployment %q missing target", database, environment, deployment)
 			}
 			out = append(out, ResolvedDatabaseTarget{
-				DatabaseType: dbConfig.Type,
-				Deployment:   deployment,
-				Target:       dt.Target,
+				DatabaseType:                    dbConfig.Type,
+				Deployment:                      deployment,
+				Target:                          dt.Target,
+				RequiresSingleConcreteNamespace: dbConfig.Type == storage.DatabaseTypeMySQL,
 			})
 		}
 		return out, nil
@@ -954,9 +962,10 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]R
 		return nil, fmt.Errorf("database %q environment %q missing server-side deployment", database, environment)
 	}
 	return []ResolvedDatabaseTarget{{
-		DatabaseType: dbConfig.Type,
-		Deployment:   envConfig.Deployment,
-		Target:       envConfig.Target,
+		DatabaseType:                    dbConfig.Type,
+		Deployment:                      envConfig.Deployment,
+		Target:                          envConfig.Target,
+		RequiresSingleConcreteNamespace: dbConfig.Type == storage.DatabaseTypeMySQL,
 	}}, nil
 }
 

@@ -213,3 +213,43 @@ func TestGroupFilesByNamespace_EnvSubstitution_MultipleNamespaces(t *testing.T) 
 	assert.Contains(t, result, "app_staging")
 	assert.Contains(t, result, "analytics")
 }
+
+func TestMySQLSchemaName(t *testing.T) {
+	tests := []struct {
+		name       string
+		namespaces []string
+		wantSchema string
+		wantErr    string
+	}{
+		{name: "single namespace is the schema name", namespaces: []string{"bikeshare_staging"}, wantSchema: "bikeshare_staging"},
+		{name: "empty map has no schema name", namespaces: nil, wantSchema: ""},
+		{name: "multiple namespaces are rejected", namespaces: []string{"payments", "payments_audit"}, wantErr: "multiple MySQL namespaces"},
+		{name: "default namespace is rejected", namespaces: []string{"default"}, wantErr: `"default" is not a valid MySQL schema name`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			files := make(map[string]*Namespace, len(tc.namespaces))
+			for _, ns := range tc.namespaces {
+				files[ns] = &Namespace{}
+			}
+
+			schemaName, err := MySQLSchemaName(files)
+
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantSchema, schemaName)
+		})
+	}
+}
+
+// The namespace contract travels in several map shapes; only the keys carry
+// the schema name, so any value type resolves identically.
+func TestMySQLSchemaNameIsValueTypeAgnostic(t *testing.T) {
+	schemaName, err := MySQLSchemaName(map[string]string{"testapp": "ignored"})
+	require.NoError(t, err)
+	assert.Equal(t, "testapp", schemaName)
+}
