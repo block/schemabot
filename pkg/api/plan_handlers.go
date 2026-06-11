@@ -377,18 +377,73 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 	)
 	defer span.End()
 
+	plan, err := s.loadPlanForApply(ctx, span, req)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := s.authorizeStoredPlanSource(ctx, span, plan, req); err != nil {
+		return nil, 0, err
+	}
+	return s.queueValidatedApply(ctx, span, plan, req)
+}
+
+// EnqueueAuthorizedApply queues an apply for a stored plan without evaluating
+// source policy. The caller asserts that source authorization for this apply
+// already happened — for example, a control plane that evaluated source policy
+// against its own database config before dispatching to this deployment, or a
+// host process that gates its own callers.
+//
+// This entry point exists because source policy can only be evaluated where
+// the database config lives. A deployment that executes applies dispatched by
+// a separate control plane has no database config, so re-evaluating the
+// policy there can only fail closed.
+//
+// It is intentionally not reachable from SchemaBot's HTTP API. All execution
+// invariants still apply: the plan must exist, match the requested
+// environment, and carry stored routing metadata, and storage still enforces
+// one active apply per target.
+func (s *Service) EnqueueAuthorizedApply(ctx context.Context, req ApplyRequest) (*apitypes.ApplyResponse, int64, error) {
+	ctx, span := otel.Tracer("schemabot").Start(ctx, "EnqueueAuthorizedApply",
+		trace.WithAttributes(
+			attribute.String("plan_id", req.PlanID),
+			attribute.String("environment", req.Environment),
+		),
+	)
+	defer span.End()
+
+	plan, err := s.loadPlanForApply(ctx, span, req)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.logger.Info("queueing apply without source policy evaluation; caller asserted source authorization",
+		"plan_id", req.PlanID,
+		"database", plan.Database,
+		"deployment", plan.Deployment,
+		"environment", req.Environment,
+		"repository", plan.Repository,
+		"pull_request", plan.PullRequest,
+		"schema_path", plan.SchemaPath,
+		"caller", req.Caller)
+	return s.queueValidatedApply(ctx, span, plan, req)
+}
+
+// loadPlanForApply loads the stored plan for an apply request and enforces the
+// execution invariants every queue path requires: the plan exists, was created
+// for the requested environment, and carries the server-side routing metadata
+// (deployment, target) the operator needs to dispatch it.
+func (s *Service) loadPlanForApply(ctx context.Context, span trace.Span, req ApplyRequest) (*storage.Plan, error) {
 	// Load plan first; it is the source of truth for database, type, and routing.
 	plan, err := s.storage.Plans().Get(ctx, req.PlanID)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "get plan")
-		return nil, 0, fmt.Errorf("get plan: %w", err)
+		return nil, fmt.Errorf("get plan: %w", err)
 	}
 	if plan == nil {
 		planErr := fmt.Errorf("plan not found: %s", req.PlanID)
 		span.RecordError(planErr)
 		span.SetStatus(otelcodes.Error, "plan not found")
-		return nil, 0, planErr
+		return nil, planErr
 	}
 	span.SetAttributes(attribute.String("database", plan.Database))
 	if plan.Environment != req.Environment {
@@ -396,26 +451,31 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "environment mismatch")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
-		return nil, 0, applyErr
+		return nil, applyErr
 	}
 	if plan.Deployment == "" {
 		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "deployment")
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "missing stored deployment")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
-		return nil, 0, applyErr
+		return nil, applyErr
 	}
 	if plan.Target == "" {
 		applyErr := fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply", req.PlanID, "target")
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "missing stored target")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
-		return nil, 0, applyErr
+		return nil, applyErr
 	}
-	// Source policy is evaluated for plans created from SchemaBot's trusted
-	// GitHub PR discovery path. Direct operator/API plans do not have a
-	// server-discovered schema path today; those remain governed by endpoint
-	// access until the dedicated auth layer is added.
+	return plan, nil
+}
+
+// authorizeStoredPlanSource evaluates source policy for a stored plan before
+// it is queued. Source policy is evaluated for plans created from SchemaBot's
+// trusted GitHub PR discovery path. Direct operator/API plans do not have a
+// server-discovered schema path today; those remain governed by endpoint
+// access until the dedicated auth layer is added.
+func (s *Service) authorizeStoredPlanSource(ctx context.Context, span trace.Span, plan *storage.Plan, req ApplyRequest) error {
 	if plan.SchemaPath == "" {
 		s.logger.Debug("skipping source policy for apply because stored plan has no trusted schema path",
 			"plan_id", req.PlanID,
@@ -424,32 +484,38 @@ func (s *Service) ExecuteApply(ctx context.Context, req ApplyRequest) (*apitypes
 			"environment", req.Environment,
 			"repository", plan.Repository,
 			"pull_request", plan.PullRequest)
-	} else {
-		if err := s.config.AuthorizePlanSource(PlanSourcePolicyRequest{
-			Database:    plan.Database,
-			Repository:  plan.Repository,
-			PullRequest: plan.PullRequest,
-			SchemaPath:  plan.SchemaPath,
-		}); err != nil {
-			reason := sourcePolicyReason(err)
-			span.RecordError(err)
-			span.SetStatus(otelcodes.Error, "source policy")
-			metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
-			metrics.RecordSourcePolicyBlock(ctx, "apply", plan.Database, req.Environment, reason)
-			s.logger.Warn("apply blocked by source policy",
-				"plan_id", req.PlanID,
-				"database", plan.Database,
-				"deployment", plan.Deployment,
-				"environment", req.Environment,
-				"repository", plan.Repository,
-				"pull_request", plan.PullRequest,
-				"schema_path", plan.SchemaPath,
-				"reason", reason,
-				"error", err)
-			return nil, 0, fmt.Errorf("source policy for plan %s: %w", req.PlanID, err)
-		}
+		return nil
 	}
+	if err := s.config.AuthorizePlanSource(PlanSourcePolicyRequest{
+		Database:    plan.Database,
+		Repository:  plan.Repository,
+		PullRequest: plan.PullRequest,
+		SchemaPath:  plan.SchemaPath,
+	}); err != nil {
+		reason := sourcePolicyReason(err)
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "source policy")
+		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
+		metrics.RecordSourcePolicyBlock(ctx, "apply", plan.Database, req.Environment, reason)
+		s.logger.Warn("apply blocked by source policy",
+			"plan_id", req.PlanID,
+			"database", plan.Database,
+			"deployment", plan.Deployment,
+			"environment", req.Environment,
+			"repository", plan.Repository,
+			"pull_request", plan.PullRequest,
+			"schema_path", plan.SchemaPath,
+			"reason", reason,
+			"error", err)
+		return fmt.Errorf("source policy for plan %s: %w", req.PlanID, err)
+	}
+	return nil
+}
 
+// queueValidatedApply stores the pending apply and tasks for a validated plan
+// and wakes an operator worker. Callers must have run loadPlanForApply first;
+// gated entry points also run authorizeStoredPlanSource before queueing.
+func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan *storage.Plan, req ApplyRequest) (*apitypes.ApplyResponse, int64, error) {
 	deployment := plan.Deployment
 
 	client, err := s.TernClient(deployment, req.Environment)

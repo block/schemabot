@@ -628,13 +628,17 @@ func stoppedTestApply(applyID string) *storage.Apply {
 }
 
 func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) (*Service, *capturingTaskStore) {
+	return newQueueApplyTestService(executeApplyTestPlan(), client, applies)
+}
+
+func newQueueApplyTestService(plan *storage.Plan, client tern.Client, applies storage.ApplyStore) (*Service, *capturingTaskStore) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	tasks := &capturingTaskStore{}
 	if capturingApplies, ok := applies.(*capturingApplyStore); ok {
 		capturingApplies.taskStore = tasks
 	}
 	return New(&mockStorageWithApplyStores{
-		plans:     &staticPlanStore{plan: executeApplyTestPlan()},
+		plans:     &staticPlanStore{plan: plan},
 		applies:   applies,
 		tasks:     tasks,
 		locks:     &emptyLockStore{},
@@ -972,6 +976,147 @@ func TestExecuteApplySourcePolicyBlocksMissingDatabaseConfig(t *testing.T) {
 	var policyErr *SourcePolicyError
 	require.True(t, errors.As(err, &policyErr), "expected SourcePolicyError")
 	assert.Equal(t, SourcePolicyReasonMissingDatabaseConfig, policyErr.Reason)
+}
+
+// trustedQueueApplyTestPlan returns a stored plan created from the trusted PR
+// discovery path (repository, pull request, and schema path recorded) so
+// queue-path tests can exercise source-policy behavior.
+func trustedQueueApplyTestPlan() *storage.Plan {
+	plan := executeApplyTestPlan()
+	plan.Repository = "octocat/hello-world"
+	plan.PullRequest = 1
+	plan.SchemaPath = "schema/testdb"
+	return plan
+}
+
+// A data-plane deployment executes applies dispatched by a control plane that
+// already evaluated source policy against its own database config. The data
+// plane has no database config of its own, so EnqueueAuthorizedApply queues the trusted
+// plan without re-evaluating source policy, while ExecuteApply on the same
+// service keeps failing closed.
+func TestEnqueueAuthorizedApplyQueuesTrustedPlanWithoutDatabaseConfig(t *testing.T) {
+	applies := &capturingApplyStore{}
+	mockClient := &mockTernClient{isRemote: true}
+	svc, tasks := newQueueApplyTestService(trustedQueueApplyTestPlan(), mockClient, applies)
+
+	_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+	var policyErr *SourcePolicyError
+	require.True(t, errors.As(err, &policyErr), "ExecuteApply must fail closed without database config")
+	assert.Equal(t, SourcePolicyReasonMissingDatabaseConfig, policyErr.Reason)
+
+	resp, applyID, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(123), applyID)
+	assert.Nil(t, mockClient.applyReq, "queued apply must wait for operator dispatch")
+	require.NotNil(t, applies.apply)
+	assert.Equal(t, state.Apply.Pending, applies.apply.State)
+	assert.Equal(t, "testdb", applies.apply.GetOptions().Target)
+	require.Len(t, tasks.tasks, 1)
+	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
+	assert.Equal(t, "users", tasks.tasks[0].TableName)
+}
+
+// EnqueueAuthorizedApply skips only source policy. Execution invariants still reject a
+// dispatch whose stored plan was created for a different environment.
+func TestEnqueueAuthorizedApplyRejectsEnvironmentMismatch(t *testing.T) {
+	applies := &capturingApplyStore{}
+	mockClient := &mockTernClient{isRemote: true}
+	svc, tasks := newQueueApplyTestService(trustedQueueApplyTestPlan(), mockClient, applies)
+
+	resp, applyID, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "production",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `created for environment "staging"`)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Nil(t, applies.apply, "mismatched environment must not store an apply")
+	assert.Empty(t, tasks.tasks)
+}
+
+// EnqueueAuthorizedApply enforces the same stored-plan execution invariants as gated
+// applies: the plan must exist and carry server-side routing metadata.
+func TestEnqueueAuthorizedApplyRejectsInvalidStoredPlan(t *testing.T) {
+	missingDeployment := trustedQueueApplyTestPlan()
+	missingDeployment.Deployment = ""
+	missingTarget := trustedQueueApplyTestPlan()
+	missingTarget.Target = ""
+
+	tests := []struct {
+		name    string
+		plan    *storage.Plan
+		wantErr string
+	}{
+		{name: "plan not found", plan: nil, wantErr: "plan not found"},
+		{name: "missing deployment", plan: missingDeployment, wantErr: `missing server-side routing metadata field "deployment"`},
+		{name: "missing target", plan: missingTarget, wantErr: `missing server-side routing metadata field "target"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			applies := &capturingApplyStore{}
+			svc, tasks := newQueueApplyTestService(tc.plan, &mockTernClient{}, applies)
+
+			resp, applyID, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{
+				PlanID:      "plan-1",
+				Environment: "staging",
+			})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.Nil(t, resp)
+			assert.Zero(t, applyID)
+			assert.Nil(t, applies.apply, "invalid stored plan must not store an apply")
+			assert.Empty(t, tasks.tasks)
+		})
+	}
+}
+
+// A queued trusted dispatch follows the same durable operator path as gated
+// applies: EnqueueAuthorizedApply stores the pending apply, wakes a worker, and the
+// worker claims and resumes it.
+func TestEnqueueAuthorizedApplyWakesOperatorForQueuedApply(t *testing.T) {
+	applies := &capturingApplyStore{findCh: make(chan struct{}, 1)}
+	mock := &mockTernClient{resumeCh: make(chan *storage.Apply, 1)}
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), mock, applies)
+	svc.config.OperatorWorkers = 1
+	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
+	svc.StartOperator(t.Context())
+	t.Cleanup(svc.StopOperator)
+
+	select {
+	case <-applies.findCh:
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "operator did not perform startup claim")
+	}
+
+	resp, applyID, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.NoError(t, err)
+	require.True(t, resp.Accepted)
+	assert.Equal(t, int64(123), applyID)
+
+	select {
+	case resumedApply := <-mock.resumeCh:
+		assert.Equal(t, int64(123), resumedApply.ID)
+		assert.Equal(t, state.Apply.Pending, resumedApply.State)
+		assert.Equal(t, "testdb", resumedApply.Database)
+	case <-time.After(2 * time.Second):
+		require.Fail(t, "operator did not resume queued apply after wake")
+	}
 }
 
 func TestPlanHandlerRejectsClientSuppliedSchemaPath(t *testing.T) {
