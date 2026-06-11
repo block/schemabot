@@ -39,6 +39,7 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task) template
 			ETASeconds:      int64(t.ETASeconds),
 			IsInstant:       t.IsInstant,
 			ReadyToComplete: t.ReadyToComplete,
+			ErrorMessage:    t.ErrorMessage,
 		})
 	}
 	return data

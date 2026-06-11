@@ -2,6 +2,7 @@ package templates
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -178,6 +179,83 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 	assert.Contains(t, result, "1 cancelled")
 	assert.Contains(t, result, "To retry:")
 	assert.Contains(t, result, "schemabot apply -e staging")
+}
+
+// A retryable failure is operator-recovery state, not a user-facing outcome:
+// the comment keeps the in-progress headline, surfaces the retry and its last
+// error on the affected table, and tells the user SchemaBot retries
+// automatically.
+func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.FailedRetryable,
+		Engine:      "Spirit",
+		ApplyID:     "apply-abc123",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Task.Completed},
+			{
+				TableName:       "users",
+				DDL:             "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Status:          state.Task.FailedRetryable,
+				PercentComplete: 35,
+				ErrorMessage:    "remote deployment unavailable",
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## Schema Change In Progress")
+	assert.NotContains(t, result, "Failed_retryable")
+	assert.NotContains(t, result, "failed_retryable")
+	// The retry detail lives on the affected table, not in the headline.
+	assert.Contains(t, result, "🔄 Interrupted — retrying automatically")
+	assert.Contains(t, result, "Last error: remote deployment unavailable")
+	assert.Contains(t, result, "🟧") // orange bar for the interrupted table
+	// Progress summary counts the retrying table.
+	assert.Contains(t, result, "1/2 complete")
+	assert.Contains(t, result, "1 retrying")
+	// Footer explains automatic retry and offers stop, not a manual re-apply.
+	assert.Contains(t, result, "SchemaBot retries automatically")
+	assert.Contains(t, result, "schemabot stop apply-abc123")
+	assert.NotContains(t, result, "schemabot apply -e staging")
+}
+
+// Every apply state must render a human-readable headline. Raw snake_case
+// state constants are internal vocabulary and must never appear in a PR
+// comment title, including for states added after this test.
+func TestApplyHeaderNeverLeaksRawStateConstants(t *testing.T) {
+	applyStates := reflect.ValueOf(state.Apply)
+	for _, field := range applyStates.Fields() {
+		stateValue := field.String()
+		t.Run(stateValue, func(t *testing.T) {
+			var sb strings.Builder
+			writeApplyHeader(&sb, ApplyStatusCommentData{State: stateValue})
+			header := sb.String()
+			require.NotEmpty(t, header)
+			assert.NotContains(t, header, "_", "header for state %q leaks a raw state constant", stateValue)
+		})
+	}
+}
+
+// Storage task states arrive uppercase; the renderer must normalize them so a
+// retrying task never falls through to the running renderer.
+func TestRenderApplyStatusComment_FailedRetryableUppercaseStatus(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.FailedRetryable,
+		Tables: []TableProgressData{
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Status: "FAILED_RETRYABLE"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "🔄 Interrupted — retrying automatically")
+	assert.NotContains(t, result, "Running...")
 }
 
 func TestRenderApplyStatusComment_Stopped(t *testing.T) {

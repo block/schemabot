@@ -14,6 +14,14 @@ func capitalizeFirst(s string) string {
 	return strings.ToUpper(s[:1]) + s[1:]
 }
 
+// humanizeState renders a canonical snake_case state constant as a
+// human-readable label (e.g. "waiting_for_cutover" → "Waiting for cutover").
+// Used by default branches so a state without an explicit template never
+// leaks a raw constant into a PR comment.
+func humanizeState(s string) string {
+	return capitalizeFirst(strings.ReplaceAll(s, "_", " "))
+}
+
 // TimestampFunc is the function used to generate timestamps in templates.
 // Override in previews/tests to produce deterministic output.
 var TimestampFunc = func() string {

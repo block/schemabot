@@ -25,6 +25,10 @@ type TableProgressData struct {
 	ETASeconds      int64
 	IsInstant       bool
 	ReadyToComplete bool
+
+	// ErrorMessage is the task's last error. Rendered for states where the
+	// per-table error explains what the user is seeing (e.g. a retrying task).
+	ErrorMessage string
 }
 
 // ApplyStatusCommentData contains all data needed to render an apply status PR comment.
@@ -81,6 +85,11 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("## Schema Change Starting\n\n")
 	case state.Apply.Running:
 		sb.WriteString("## Schema Change In Progress\n\n")
+	case state.Apply.FailedRetryable:
+		// Operator recovery retries the apply automatically, so it is still
+		// in progress from the user's perspective. The retry detail is
+		// surfaced per table in the progress section, not in the headline.
+		sb.WriteString("## Schema Change In Progress\n\n")
 	case state.Apply.WaitingForDeploy:
 		sb.WriteString("## Schema Change — Waiting for Deploy\n\n")
 	case state.Apply.WaitingForCutover:
@@ -112,7 +121,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.ValidatingDeployRequest:
 		sb.WriteString("## Schema Change — Validating Deploy Request\n\n")
 	default:
-		fmt.Fprintf(sb, "## Schema Change — %s\n\n", capitalizeFirst(data.State))
+		fmt.Fprintf(sb, "## Schema Change — %s\n\n", humanizeState(data.State))
 	}
 }
 
@@ -186,7 +195,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, queued, failed, stopped, waiting, recovering, cutting, cancelled int
+	var completed, running, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
 	var runningPct int
 	var runningEstimateExceeded bool
 
@@ -211,6 +220,8 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			cutting++
 		case state.Task.Failed:
 			failed++
+		case state.Task.FailedRetryable:
+			retrying++
 		case state.Task.Stopped:
 			stopped++
 		case state.Task.Cancelled:
@@ -267,6 +278,13 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			parts = append(parts, fmt.Sprintf("%d failed", failed))
 		} else {
 			parts = append(parts, "failed")
+		}
+	}
+	if retrying > 0 {
+		if multi {
+			parts = append(parts, fmt.Sprintf("%d retrying", retrying))
+		} else {
+			parts = append(parts, "retrying")
 		}
 	}
 	if stopped > 0 {
@@ -354,6 +372,14 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 		bar := ui.ProgressBarFailed(table.PercentComplete)
 		fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
+
+	case state.Task.FailedRetryable:
+		bar := ui.ProgressBarStopped(ui.ClampPercent(table.PercentComplete))
+		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically\n", table.TableName, bar)
+		writeDDLLine(sb, table.DDL)
+		if table.ErrorMessage != "" {
+			fmt.Fprintf(sb, "Last error: %s\n", table.ErrorMessage)
+		}
 
 	case state.Task.Cancelled:
 		fmt.Fprintf(sb, "**`%s`**: \u2298 Cancelled (not started)\n", table.TableName)
@@ -484,6 +510,8 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
 	case state.Apply.Running:
 		writeFooterAction(sb, "To stop this schema change:", fmt.Sprintf("schemabot stop %s", data.ApplyID))
+	case state.Apply.FailedRetryable:
+		writeFooterAction(sb, "A transient error interrupted this schema change; SchemaBot retries automatically. To stop instead:", fmt.Sprintf("schemabot stop %s", data.ApplyID))
 	case state.Apply.Stopped:
 		writeFooterAction(sb, "To resume:", fmt.Sprintf("schemabot start %s", data.ApplyID))
 	case state.Apply.Failed:
@@ -517,7 +545,7 @@ func RenderApplySummaryComment(data ApplyStatusCommentData) string {
 	case state.Apply.Stopped:
 		writeSummaryStopped(&sb, data, completedCount, totalTables)
 	default:
-		fmt.Fprintf(&sb, "## Schema Change \u2014 %s\n\n", capitalizeFirst(data.State))
+		fmt.Fprintf(&sb, "## Schema Change \u2014 %s\n\n", humanizeState(data.State))
 		writeSummaryMetadata(&sb, data)
 	}
 
