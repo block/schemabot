@@ -17,6 +17,7 @@ import (
 
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/targetresolver"
 )
 
 func TestLoadServerConfig(t *testing.T) {
@@ -998,24 +999,33 @@ func TestServerConfig_ResolveDatabaseTargets(t *testing.T) {
 		got, err := cfg.ResolveDatabaseTargets("localdb", "staging")
 		require.NoError(t, err)
 		require.Len(t, got, 1)
-		assert.Equal(t, ResolvedDatabaseTarget{DatabaseType: "mysql", Deployment: "localdb", Target: "localdb"}, got[0])
+		assert.Equal(t, targetresolver.Target{DatabaseType: "mysql", Deployment: "localdb", Target: "localdb"}, got[0])
 	})
 
 	t.Run("scalar remote returns single element", func(t *testing.T) {
 		got, err := cfg.ResolveDatabaseTargets("scalardb", "production")
 		require.NoError(t, err)
 		require.Len(t, got, 1)
-		assert.Equal(t, ResolvedDatabaseTarget{DatabaseType: "vitess", Deployment: "tenant-a", Target: "cluster-production-001"}, got[0])
+		assert.Equal(t, targetresolver.Target{DatabaseType: "vitess", Deployment: "tenant-a", Target: "cluster-production-001"}, got[0])
 	})
 
 	t.Run("deployments map returns sorted slice", func(t *testing.T) {
 		got, err := cfg.ResolveDatabaseTargets("multidb", "production")
 		require.NoError(t, err)
-		assert.Equal(t, []ResolvedDatabaseTarget{
+		assert.Equal(t, []targetresolver.Target{
 			{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments"},
 			{DatabaseType: "mysql", Deployment: "payments-b", Target: "payments"},
 			{DatabaseType: "mysql", Deployment: "payments-c", Target: "payments"},
 		}, got)
+	})
+
+	t.Run("implements targetresolver interface", func(t *testing.T) {
+		var resolver targetresolver.Resolver = &cfg
+		got, err := resolver.ResolveTargets(t.Context(), targetresolver.Request{Database: "scalardb", Environment: "production"})
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, "tenant-a", got[0].Deployment)
+		assert.Equal(t, "cluster-production-001", got[0].Target)
 	})
 
 	t.Run("unknown database errors", func(t *testing.T) {
@@ -1107,7 +1117,7 @@ func TestServerConfig_ResolveDatabaseTargets_DeploymentOrder(t *testing.T) {
 		"payments-b": {Target: "payments"},
 		"payments-c": {Target: "payments"},
 	}
-	resolvedOrder := func(t *testing.T, targets []ResolvedDatabaseTarget) []string {
+	resolvedOrder := func(t *testing.T, targets []targetresolver.Target) []string {
 		t.Helper()
 		order := make([]string, 0, len(targets))
 		for _, rt := range targets {

@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/targetresolver"
 	gomysql "github.com/go-sql-driver/mysql"
 	"gopkg.in/yaml.v3"
 )
@@ -487,13 +489,6 @@ type RepoConfig struct {
 	GitHubApp string `yaml:"github_app,omitempty"`
 }
 
-// ResolvedDatabaseTarget is the server-owned routing decision for plan/apply.
-type ResolvedDatabaseTarget struct {
-	DatabaseType string
-	Deployment   string
-	Target       string
-}
-
 // DeploymentTarget is one entry in EnvironmentConfig.Deployments. It carries
 // the per-deployment override values for a multi-deployment environment. The
 // enclosing map key identifies the Tern deployment (and must also appear in
@@ -850,13 +845,13 @@ func (c *ServerConfig) DatabaseEnvironments(database string) ([]string, error) {
 // For environments configured with a deployments map (multi-deployment), this
 // returns the single deployment when exactly one is configured and otherwise
 // errors. Callers that need the full set MUST use ResolveDatabaseTargets.
-func (c *ServerConfig) ResolveDatabaseTarget(database, environment string) (ResolvedDatabaseTarget, error) {
+func (c *ServerConfig) ResolveDatabaseTarget(database, environment string) (targetresolver.Target, error) {
 	targets, err := c.ResolveDatabaseTargets(database, environment)
 	if err != nil {
-		return ResolvedDatabaseTarget{}, err
+		return targetresolver.Target{}, err
 	}
 	if len(targets) != 1 {
-		return ResolvedDatabaseTarget{}, fmt.Errorf("database %q environment %q resolves to %d deployments; use ResolveDatabaseTargets", database, environment, len(targets))
+		return targetresolver.Target{}, fmt.Errorf("database %q environment %q resolves to %d deployments; use ResolveDatabaseTargets", database, environment, len(targets))
 	}
 	return targets[0], nil
 }
@@ -914,12 +909,18 @@ func validateDeploymentOrder(deployments map[string]DeploymentTarget, order []st
 	return nil
 }
 
+// ResolveTargets implements targetresolver.Resolver using this server's static
+// configuration.
+func (c *ServerConfig) ResolveTargets(_ context.Context, req targetresolver.Request) ([]targetresolver.Target, error) {
+	return c.ResolveDatabaseTargets(req.Database, req.Environment)
+}
+
 // ResolveDatabaseTargets returns the complete routing metadata for a configured
 // database/environment as one or more deployment slices. Single-deployment
 // configurations (scalar target/deployment or local DSN) return a one-element
 // slice; multi-deployment environments return one element per entry in the
 // deployments map, ordered deterministically by deployment key.
-func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]ResolvedDatabaseTarget, error) {
+func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]targetresolver.Target, error) {
 	if c == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
@@ -933,7 +934,7 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]R
 	}
 
 	if envConfig.HasLocalDSN() {
-		return []ResolvedDatabaseTarget{{
+		return []targetresolver.Target{{
 			DatabaseType: dbConfig.Type,
 			Deployment:   database,
 			Target:       database,
@@ -952,13 +953,13 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]R
 		if err != nil {
 			return nil, err
 		}
-		out := make([]ResolvedDatabaseTarget, 0, len(deployments))
+		out := make([]targetresolver.Target, 0, len(deployments))
 		for _, deployment := range deployments {
 			dt := envConfig.Deployments[deployment]
 			if dt.Target == "" {
 				return nil, fmt.Errorf("database %q environment %q deployment %q missing target", database, environment, deployment)
 			}
-			out = append(out, ResolvedDatabaseTarget{
+			out = append(out, targetresolver.Target{
 				DatabaseType: dbConfig.Type,
 				Deployment:   deployment,
 				Target:       dt.Target,
@@ -973,7 +974,7 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]R
 	if envConfig.Deployment == "" {
 		return nil, fmt.Errorf("database %q environment %q missing server-side deployment", database, environment)
 	}
-	return []ResolvedDatabaseTarget{{
+	return []targetresolver.Target{{
 		DatabaseType: dbConfig.Type,
 		Deployment:   envConfig.Deployment,
 		Target:       envConfig.Target,
