@@ -538,24 +538,40 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // staleness window) are re-leased without changing their state. Terminal
 // rows are never claimed.
 //
-// Sibling ordering: a pending row is only claimable once every earlier
-// sibling of the same apply (lower created_at, id) has reached completed.
-// This serializes a multi-deployment apply along its deployment_order — the
-// order materialized by the apply-create dual-write into row insertion order
-// — so deployments roll out in order. The gate applies only to starting a
-// pending row; an already-active row re-leasing a stale heartbeat is
-// recovering work it already started, so it is never re-gated.
+// Sibling ordering: a pending row's claimability is gated on its earlier
+// siblings of the same apply (lower created_at, id) along deployment_order —
+// the order materialized by the apply-create dual-write into row insertion
+// order. The gate is cutover_policy-aware (the policy is captured per row at
+// apply-create):
 //
-// halt_on_failure (per-apply policy, captured on each row at create): when
-// true (the default), an earlier sibling that is anything other than
-// completed — including terminal-failed — blocks every later sibling, so the
-// rollout halts on the first failure. When false, a terminal-failed earlier
-// sibling is treated as settled and no longer blocks: later deployments are
-// still claimed and attempted. Only terminal `failed` is exempted — pending,
-// running, failed_retryable, and stopped earlier siblings still block under
-// both policies (work is in-flight or recoverable). The policy governs only
-// rollout continuation; the apply's pass/fail verdict and the merge gate stay
+//   - rolling (the default, and any non-barrier value — which fails closed to
+//     the serial gate): a pending row is claimable only once every earlier
+//     sibling has reached completed. This serializes the rollout and halts it
+//     on the first non-completed sibling (e.g. a failed deployment).
+//   - barrier: an earlier sibling stops blocking once it reaches the cutover
+//     barrier or succeeds (waiting_for_cutover, cutting_over, completed), so a
+//     later deployment may start its copy phase while earlier siblings sit at
+//     the barrier. Earlier siblings that are still in-flight or not yet at the
+//     barrier (pending, running, failed_retryable, stopped) — and terminal
+//     non-success states (failed, cancelled, reverted) — still block, so a
+//     failed earlier deployment still halts the rollout.
+//
+// halt_on_failure (per-apply policy, also captured on each row at create)
+// layers on top of both policies: when true (the default), a terminal-failed
+// earlier sibling blocks every later sibling, so the rollout halts on the
+// first failure. When false, a terminal `failed` earlier sibling is treated as
+// settled and no longer blocks: later deployments are still claimed and
+// attempted. Only terminal `failed` is exempted — pending, running,
+// failed_retryable, and stopped earlier siblings still block under both
+// policies (work is in-flight or recoverable). The policy governs only rollout
+// continuation; the apply's pass/fail verdict and the merge gate stay
 // fail-closed on any failed deployment.
+//
+// The gate applies only to starting a pending row; an already-active row
+// re-leasing a stale heartbeat is recovering work it already started, so it
+// is never re-gated. While the operator flag is off and the single-deployment
+// hard-block stands, an apply has exactly one operation with no earlier
+// siblings, so this gate is dormant regardless of policy.
 //
 // Mirrors ApplyStore.FindNextApply: SELECT ... FOR UPDATE SKIP LOCKED to
 // avoid worker races, READ COMMITTED isolation to prevent next-key range
@@ -579,7 +595,23 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	activeStates := claimableApplyStates()
 	activeStatePlaceholders := placeholders(len(activeStates))
 
-	queryArgs := []any{state.ApplyOperation.Pending, state.ApplyOperation.Completed, state.ApplyOperation.Failed}
+	queryArgs := []any{state.ApplyOperation.Pending}
+	// Sibling-gate args for the pending claim, cutover_policy-aware (see the
+	// gate SQL below). Under barrier, an earlier sibling stops blocking once it
+	// reaches the cutover barrier or succeeds (waiting_for_cutover, cutting_over,
+	// completed); under rolling — and any non-barrier value, which fails closed
+	// to the serial gate — only a completed earlier sibling stops blocking. The
+	// trailing Failed arg drives the halt_on_failure exemption: when the policy
+	// is off, a terminal-failed earlier sibling no longer blocks later ones.
+	queryArgs = append(queryArgs,
+		storage.CutoverPolicyBarrier,
+		state.ApplyOperation.WaitingForCutover,
+		state.ApplyOperation.CuttingOver,
+		state.ApplyOperation.Completed,
+		storage.CutoverPolicyBarrier,
+		state.ApplyOperation.Completed,
+		state.ApplyOperation.Failed,
+	)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
@@ -634,7 +666,16 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					FROM apply_operations AS earlier
 					WHERE earlier.apply_id = apply_operations.apply_id
 						AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-						AND earlier.state <> ?
+						AND (
+							(
+								apply_operations.cutover_policy = ?
+								AND earlier.state NOT IN (?, ?, ?)
+							)
+							OR (
+								apply_operations.cutover_policy <> ?
+								AND earlier.state <> ?
+							)
+						)
 						AND NOT (apply_operations.halt_on_failure = 0 AND earlier.state = ?)
 				)
 			)

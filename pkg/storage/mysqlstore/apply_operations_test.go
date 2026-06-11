@@ -1235,6 +1235,131 @@ func TestApplyOperationStore_FindNextApplyOperation_HaltOnFailureDisabledStillBl
 	assert.Nil(t, claimed, "a running earlier sibling still blocks even with halt_on_failure disabled")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_BarrierClaimsPastSiblingAtCutoverBarrier
+// verifies the barrier cutover policy: a later deployment may start its copy
+// phase once an earlier sibling has reached the cutover barrier
+// (waiting_for_cutover), rather than waiting for it to fully complete. This is
+// the parallel-copy relaxation the barrier policy enables.
+func TestApplyOperationStore_FindNextApplyOperation_BarrierClaimsPastSiblingAtCutoverBarrier(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_barrier_claims", 1)
+
+	// region-a has finished copying and is parked at the cutover barrier;
+	// region-b is pending behind it. Both rows carry the barrier policy.
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	regionBID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	// region-a stays fresh so the stale-reclaim clause can't surface it — the
+	// only row that should be claimable is region-b, via the barrier relaxation.
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "barrier must let a later deployment copy once an earlier sibling reaches the cutover barrier")
+	assert.Equal(t, regionBID, claimed.ID)
+	assert.Equal(t, "region-b", claimed.Deployment)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_RollingBlocksOnSiblingAtCutoverBarrier
+// verifies that the default rolling policy keeps the fully serial gate: an
+// earlier sibling parked at the cutover barrier (waiting_for_cutover) still
+// blocks a later pending deployment, which is only released once the earlier
+// sibling completes.
+func TestApplyOperationStore_FindNextApplyOperation_RollingBlocksOnSiblingAtCutoverBarrier(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_rolling_blocks", 1)
+
+	// Default (rolling) policy: leave CutoverPolicy unset so it resolves to rolling.
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.WaitingForCutover,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "rolling must keep a later deployment blocked until the earlier sibling completes")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_BarrierStillBlocksOnRunningSibling
+// verifies that barrier only relaxes the gate for siblings that have reached
+// the cutover barrier — an earlier sibling still copying (running) continues to
+// block later deployments, because nothing past the barrier has settled yet.
+func TestApplyOperationStore_FindNextApplyOperation_BarrierStillBlocksOnRunningSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_barrier_running", 1)
+
+	// region-a is still copying (running, fresh so not stale-reclaimable);
+	// region-b is pending behind it. Both carry the barrier policy.
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "barrier must still block a later deployment while an earlier sibling is still copying")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_BarrierHaltsOnFailedSibling
+// verifies that barrier does not weaken halt-on-first-failure: a terminal-failed
+// earlier sibling still blocks later deployments under barrier, so a failed
+// region halts the rollout rather than letting later regions race ahead.
+func TestApplyOperationStore_FindNextApplyOperation_BarrierHaltsOnFailedSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_barrier_failed", 1)
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	// Backdate the failed row so staleness can't be mistaken for the reason it
+	// is skipped; a failed earlier sibling must block regardless.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "barrier must still halt the rollout on a failed earlier deployment")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_PendingStartRequestDoesNotBypassSiblingGate
 // verifies that a parent apply's pending start request does not let a later
 // pending deployment jump the deployment-order gate. Start requests resume
