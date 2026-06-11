@@ -216,6 +216,45 @@ func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.P
 	return ""
 }
 
+// migrationContextDiscoveryAttempts and migrationContextDiscoveryInterval bound
+// how long discoverMigrationContextWithRetry waits for Vitess to create
+// migrations after a deploy request is submitted. Vitess does not always create
+// them immediately, so the first poll can legitimately return nothing.
+const (
+	migrationContextDiscoveryAttempts = 10
+	migrationContextDiscoveryInterval = 500 * time.Millisecond
+)
+
+// discoverMigrationContextWithRetry polls discoverMigrationContext until a new
+// Vitess context appears or the bounded attempts are exhausted. Vitess may not
+// have created migrations immediately after the deploy request is submitted, so
+// a single poll can miss the context. Returns "" if no new context was found
+// within the window; respects ctx cancellation between attempts.
+func (e *Engine) discoverMigrationContextWithRetry(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]bool) string {
+	// Without a vtgate DSN there is nothing to poll; retrying would only burn the
+	// discovery window on a query that can never succeed.
+	if creds.DSN == "" {
+		e.logger.Debug("skipping schema change context discovery, no DSN configured", "database", database)
+		return ""
+	}
+
+	for attempt := range migrationContextDiscoveryAttempts {
+		migrationContext := e.discoverMigrationContext(ctx, client, database, creds, existingContexts)
+		if migrationContext != "" {
+			return migrationContext
+		}
+		if attempt < migrationContextDiscoveryAttempts-1 {
+			select {
+			case <-ctx.Done():
+				e.logger.Debug("schema change context discovery cancelled", "database", database, "error", ctx.Err())
+				return ""
+			case <-time.After(migrationContextDiscoveryInterval):
+			}
+		}
+	}
+	return ""
+}
+
 // vitessMigrationRow holds a single row from SHOW VITESS_MIGRATIONS.
 type vitessMigrationRow struct {
 	MigrationUUID    string
