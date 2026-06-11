@@ -125,22 +125,21 @@ func (s *applyOperationStore) ListByApply(ctx context.Context, applyID int64) ([
 // MySQL's RowsAffected reports rows *changed* (not matched) by default, so a
 // repeat call would report 0; we disambiguate with an existence check.
 func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newState string) error {
-	lease, hasLease, err := applyOperationLeaseFromContext(ctx)
+	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	leaseJoin, leasePredicate, leaseArgs := applyOperationLeaseSQL(lease, hasLease)
-	args := append([]any{newState, id}, leaseArgs...)
+	args := append([]any{newState, id}, guard.args()...)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
-		`+leaseJoin+`
+		`+guard.join()+`
 		SET ao.state = ?
-		WHERE ao.id = ?`+leasePredicate+`
+		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
 		return fmt.Errorf("update apply_operations state (id=%d): %w", id, err)
 	}
-	return s.checkUpdatedOrExists(ctx, result, id, lease, hasLease, false)
+	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
 }
 
 // MarkStarted sets state=running and stamps started_at=NOW().
@@ -149,22 +148,21 @@ func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newStat
 // Idempotent: COALESCE preserves started_at on repeat calls, so a re-issue
 // against an already-started row is a no-op and returns nil.
 func (s *applyOperationStore) MarkStarted(ctx context.Context, id int64) error {
-	lease, hasLease, err := applyOperationLeaseFromContext(ctx)
+	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	leaseJoin, leasePredicate, leaseArgs := applyOperationLeaseSQL(lease, hasLease)
-	args := append([]any{state.ApplyOperation.Running, id}, leaseArgs...)
+	args := append([]any{state.ApplyOperation.Running, id}, guard.args()...)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
-		`+leaseJoin+`
+		`+guard.join()+`
 		SET ao.state = ?, ao.started_at = COALESCE(ao.started_at, NOW())
-		WHERE ao.id = ?`+leasePredicate+`
+		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
 		return fmt.Errorf("mark apply_operation started (id=%d): %w", id, err)
 	}
-	return s.checkUpdatedOrExists(ctx, result, id, lease, hasLease, false)
+	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
 }
 
 // checkUpdatedOrExists returns nil if the UPDATE affected at least one row,
@@ -173,7 +171,7 @@ func (s *applyOperationStore) MarkStarted(ctx context.Context, id int64) error {
 //
 // Needed for idempotent UPDATEs where MySQL's default RowsAffected ("changed"
 // rather than "matched") can return 0 for a successful no-op write.
-func (s *applyOperationStore) checkUpdatedOrExists(ctx context.Context, result sql.Result, id int64, lease storage.ApplyLease, hasLease bool, missingOK bool) error {
+func (s *applyOperationStore) checkUpdatedOrExists(ctx context.Context, result sql.Result, id int64, guard operationWriteGuard, missingOK bool) error {
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("read apply_operation update rows affected (id=%d): %w", id, err)
@@ -181,11 +179,31 @@ func (s *applyOperationStore) checkUpdatedOrExists(ctx context.Context, result s
 	if rows > 0 {
 		return nil
 	}
-	if hasLease {
-		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+	switch guard.kind {
+	case operationGuardOperation:
+		// Zero rows under an operation lease is either an idempotent no-op (the
+		// row is still ours but no column changed) or a lost lease. Re-checking
+		// the token disambiguates the two.
+		ownsRow, err := operationLeaseOwnsRow(ctx, s.db, id, guard.opLease.Token)
+		if err != nil {
 			return err
 		}
-		match, err := s.applyOperationLeaseMatch(ctx, id, lease)
+		if ownsRow {
+			return nil
+		}
+		exists, err := s.applyOperationExists(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return applyOperationMissingResult(id, missingOK)
+		}
+		return fmt.Errorf("apply_operation %d is no longer owned by its operation lease: %w", id, storage.ErrApplyLeaseLost)
+	case operationGuardApply:
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, guard.applyLease); err != nil {
+			return err
+		}
+		match, err := s.applyOperationLeaseMatch(ctx, id, guard.applyLease)
 		if err != nil {
 			return err
 		}
@@ -193,18 +211,58 @@ func (s *applyOperationStore) checkUpdatedOrExists(ctx context.Context, result s
 			return applyOperationMissingResult(id, missingOK)
 		}
 		if !match.BelongsToLease {
-			return fmt.Errorf("apply_operation %d is not owned by apply lease %d: %w", id, lease.ApplyID, storage.ErrApplyLeaseLost)
+			return fmt.Errorf("apply_operation %d is not owned by apply lease %d: %w", id, guard.applyLease.ApplyID, storage.ErrApplyLeaseLost)
+		}
+		return nil
+	default:
+		exists, err := s.applyOperationExists(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return applyOperationMissingResult(id, missingOK)
 		}
 		return nil
 	}
+}
+
+// applyOperationExists reports whether an apply_operations row exists by id.
+func (s *applyOperationStore) applyOperationExists(ctx context.Context, id int64) (bool, error) {
 	var exists bool
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM apply_operations WHERE id = ?)`, id,
 	).Scan(&exists); err != nil {
-		return fmt.Errorf("verify apply_operation exists (id=%d): %w", id, err)
+		return false, fmt.Errorf("verify apply_operation exists (id=%d): %w", id, err)
 	}
-	if !exists {
-		return applyOperationMissingResult(id, missingOK)
+	return exists, nil
+}
+
+// operationLeaseOwnsRow reports whether the apply_operations row still carries
+// the given lease token, i.e. the operation lease is current.
+func operationLeaseOwnsRow(ctx context.Context, db queryRower, id int64, token string) (bool, error) {
+	var x int
+	err := db.QueryRowContext(ctx,
+		`SELECT 1 FROM apply_operations WHERE id = ? AND lease_token = ?`,
+		id, token,
+	).Scan(&x)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("verify operation lease for apply_operation %d: %w", id, err)
+	}
+	return true, nil
+}
+
+// ensureOperationLeaseStillOwned returns ErrApplyLeaseLost if the operation row
+// no longer carries the lease's token, mirroring ensureApplyLeaseStillOwned.
+func ensureOperationLeaseStillOwned(ctx context.Context, db queryRower, lease storage.OperationLease) error {
+	owns, err := operationLeaseOwnsRow(ctx, db, lease.OperationID, lease.Token)
+	if err != nil {
+		return err
+	}
+	if !owns {
+		return fmt.Errorf("operation lease for apply_operation %d is no longer current: %w", lease.OperationID, storage.ErrApplyLeaseLost)
 	}
 	return nil
 }
@@ -240,22 +298,80 @@ func (s *applyOperationStore) applyOperationLeaseMatch(ctx context.Context, id i
 	}, nil
 }
 
-func applyOperationLeaseFromContext(ctx context.Context) (storage.ApplyLease, bool, error) {
-	lease, ok := storage.ApplyLeaseFromContext(ctx)
-	if !ok {
-		return storage.ApplyLease{}, false, nil
-	}
-	if !lease.Valid() {
-		return storage.ApplyLease{}, true, fmt.Errorf("invalid apply_operation lease: %w", storage.ErrApplyLeaseLost)
-	}
-	return lease, true, nil
+// operationGuardKind selects which lease (if any) guards an operation write.
+type operationGuardKind int
+
+const (
+	// operationGuardNone performs an unguarded write (no lease in context).
+	operationGuardNone operationGuardKind = iota
+	// operationGuardApply guards on the parent apply's lease token.
+	operationGuardApply
+	// operationGuardOperation guards on the operation row's own lease token.
+	operationGuardOperation
+)
+
+// operationWriteGuard carries the lease that authorizes a write to an
+// apply_operations row, plus the SQL fragments needed to enforce it. An
+// operation lease takes precedence over the parent apply lease so the operator
+// can move to operation-scoped writes while still falling back to the apply
+// lease for callers that have not adopted operation leases yet.
+type operationWriteGuard struct {
+	kind       operationGuardKind
+	applyLease storage.ApplyLease
+	opLease    storage.OperationLease
 }
 
-func applyOperationLeaseSQL(lease storage.ApplyLease, hasLease bool) (string, string, []any) {
-	if !hasLease {
-		return "", "", nil
+// join returns the extra FROM/JOIN fragment the guard needs in an UPDATE.
+func (g operationWriteGuard) join() string {
+	if g.kind == operationGuardApply {
+		return " JOIN applies a ON a.id = ao.apply_id"
 	}
-	return " JOIN applies a ON a.id = ao.apply_id", " AND ao.apply_id = ? AND a.lease_token = ?", []any{lease.ApplyID, lease.Token}
+	return ""
+}
+
+// predicate returns the extra WHERE fragment that enforces lease ownership.
+func (g operationWriteGuard) predicate() string {
+	switch g.kind {
+	case operationGuardOperation:
+		return " AND ao.lease_token = ?"
+	case operationGuardApply:
+		return " AND ao.apply_id = ? AND a.lease_token = ?"
+	default:
+		return ""
+	}
+}
+
+// args returns the bind args matching predicate(), to append after the
+// statement's own arguments.
+func (g operationWriteGuard) args() []any {
+	switch g.kind {
+	case operationGuardOperation:
+		return []any{g.opLease.Token}
+	case operationGuardApply:
+		return []any{g.applyLease.ApplyID, g.applyLease.Token}
+	default:
+		return nil
+	}
+}
+
+// operationWriteGuardFromContext resolves the guard for an operation write,
+// preferring an operation lease over the parent apply lease. An invalid lease
+// is fail-closed: it returns an error rather than degrading to an unguarded
+// write.
+func operationWriteGuardFromContext(ctx context.Context) (operationWriteGuard, error) {
+	if lease, ok := storage.OperationLeaseFromContext(ctx); ok {
+		if !lease.Valid() {
+			return operationWriteGuard{}, fmt.Errorf("invalid operation lease: %w", storage.ErrApplyLeaseLost)
+		}
+		return operationWriteGuard{kind: operationGuardOperation, opLease: lease}, nil
+	}
+	if lease, ok := storage.ApplyLeaseFromContext(ctx); ok {
+		if !lease.Valid() {
+			return operationWriteGuard{}, fmt.Errorf("invalid apply_operation lease: %w", storage.ErrApplyLeaseLost)
+		}
+		return operationWriteGuard{kind: operationGuardApply, applyLease: lease}, nil
+	}
+	return operationWriteGuard{kind: operationGuardNone}, nil
 }
 
 // MarkCompleted sets state=completed and stamps completed_at=NOW().
@@ -266,22 +382,21 @@ func applyOperationLeaseSQL(lease storage.ApplyLease, hasLease bool) (string, st
 // checkUpdatedOrExists disambiguates that no-op from a missing row so we
 // don't spuriously return ErrApplyOperationNotFound.
 func (s *applyOperationStore) MarkCompleted(ctx context.Context, id int64) error {
-	lease, hasLease, err := applyOperationLeaseFromContext(ctx)
+	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	leaseJoin, leasePredicate, leaseArgs := applyOperationLeaseSQL(lease, hasLease)
-	args := append([]any{state.ApplyOperation.Completed, id}, leaseArgs...)
+	args := append([]any{state.ApplyOperation.Completed, id}, guard.args()...)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
-		`+leaseJoin+`
+		`+guard.join()+`
 		SET ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())
-		WHERE ao.id = ?`+leasePredicate+`
+		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
 		return fmt.Errorf("mark apply_operation completed (id=%d): %w", id, err)
 	}
-	return s.checkUpdatedOrExists(ctx, result, id, lease, hasLease, false)
+	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
 }
 
 // MarkFailed sets state=failed, error_message, and stamps completed_at=NOW().
@@ -292,22 +407,21 @@ func (s *applyOperationStore) MarkCompleted(ctx context.Context, id int64) error
 // produce RowsAffected=0, which checkUpdatedOrExists disambiguates from
 // a missing row.
 func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg string) error {
-	lease, hasLease, err := applyOperationLeaseFromContext(ctx)
+	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	leaseJoin, leasePredicate, leaseArgs := applyOperationLeaseSQL(lease, hasLease)
-	args := append([]any{state.ApplyOperation.Failed, nullString(errMsg), id}, leaseArgs...)
+	args := append([]any{state.ApplyOperation.Failed, nullString(errMsg), id}, guard.args()...)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
-		`+leaseJoin+`
+		`+guard.join()+`
 		SET ao.state = ?, ao.error_message = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())
-		WHERE ao.id = ?`+leasePredicate+`
+		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
 		return fmt.Errorf("mark apply_operation failed (id=%d): %w", id, err)
 	}
-	return s.checkUpdatedOrExists(ctx, result, id, lease, hasLease, false)
+	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
 }
 
 // MarkTerminal sets the given terminal state and stamps completed_at=NOW().
@@ -319,22 +433,21 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 // Idempotent: COALESCE preserves completed_at, and re-applying the same state
 // is a no-op, so a re-issue against an already-terminal row returns nil.
 func (s *applyOperationStore) MarkTerminal(ctx context.Context, id int64, newState string) error {
-	lease, hasLease, err := applyOperationLeaseFromContext(ctx)
+	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	leaseJoin, leasePredicate, leaseArgs := applyOperationLeaseSQL(lease, hasLease)
-	args := append([]any{newState, id}, leaseArgs...)
+	args := append([]any{newState, id}, guard.args()...)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
-		`+leaseJoin+`
+		`+guard.join()+`
 		SET ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())
-		WHERE ao.id = ?`+leasePredicate+`
+		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
 		return fmt.Errorf("mark apply_operation terminal (id=%d, state=%s): %w", id, newState, err)
 	}
-	return s.checkUpdatedOrExists(ctx, result, id, lease, hasLease, false)
+	return s.checkUpdatedOrExists(ctx, result, id, guard, false)
 }
 
 // SaveEngineResumeState stores opaque engine state on the operation that owns
@@ -347,7 +460,7 @@ func (s *applyOperationStore) SaveEngineResumeState(ctx context.Context, operati
 	if resumeState.ApplyOperationID != 0 && resumeState.ApplyOperationID != operationID {
 		return fmt.Errorf("save engine resume state for apply_operation %d: resume state belongs to apply_operation %d", operationID, resumeState.ApplyOperationID)
 	}
-	lease, hasLease, err := applyOperationLeaseFromContext(ctx)
+	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -355,18 +468,17 @@ func (s *applyOperationStore) SaveEngineResumeState(ctx context.Context, operati
 	if metadata == "" {
 		metadata = "{}"
 	}
-	leaseJoin, leasePredicate, leaseArgs := applyOperationLeaseSQL(lease, hasLease)
-	args := append([]any{nullString(resumeState.MigrationContext), metadata, operationID}, leaseArgs...)
+	args := append([]any{nullString(resumeState.MigrationContext), metadata, operationID}, guard.args()...)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
-		`+leaseJoin+`
+		`+guard.join()+`
 		SET ao.engine_resume_context = ?, ao.engine_resume_metadata = ?
-		WHERE ao.id = ?`+leasePredicate+`
+		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
 		return fmt.Errorf("save engine resume state for apply_operation %d: %w", operationID, err)
 	}
-	return s.checkUpdatedOrExists(ctx, result, operationID, lease, hasLease, false)
+	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
 }
 
 // GetEngineResumeState returns opaque engine state for an operation. Missing
@@ -601,22 +713,21 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 // called periodically by a worker holding the lease. Silent no-op when the
 // row no longer exists (mirrors ApplyStore.Heartbeat).
 func (s *applyOperationStore) Heartbeat(ctx context.Context, id int64) error {
-	lease, hasLease, err := applyOperationLeaseFromContext(ctx)
+	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	leaseJoin, leasePredicate, leaseArgs := applyOperationLeaseSQL(lease, hasLease)
-	args := append([]any{id}, leaseArgs...)
+	args := append([]any{id}, guard.args()...)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
-		`+leaseJoin+`
+		`+guard.join()+`
 		SET ao.updated_at = NOW()
-		WHERE ao.id = ?`+leasePredicate+`
+		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
 		return fmt.Errorf("heartbeat apply_operation %d: %w", id, err)
 	}
-	return s.checkUpdatedOrExists(ctx, result, id, lease, hasLease, true)
+	return s.checkUpdatedOrExists(ctx, result, id, guard, true)
 }
 
 // DeleteByApply removes all child rows for an apply.

@@ -3,6 +3,7 @@
 package mysqlstore
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sync"
@@ -1338,6 +1339,131 @@ func TestApplyOperationStore_LeaseGuardsWrites(t *testing.T) {
 	remaining, err = store.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Empty(t, remaining)
+}
+
+// An operation lease guards writes on the operation's own token, independent of
+// the parent apply lease. A write under a stale operation token must fail closed
+// and leave the row untouched, and an operation lease must be enforced even when
+// the parent apply lease in context is current.
+func TestApplyOperationStore_OperationLeaseGuardsWrites(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_oplease", 1)
+
+	// The parent apply holds a current lease the whole time, so any write that
+	// succeeds proves the operation token (not the apply token) is enforced.
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, "current-worker", "apply-token", apply.ID)
+	require.NoError(t, err)
+
+	opCtx := func(id int64, token string) context.Context {
+		return storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID:     apply.ID,
+			OperationID: id,
+			Owner:       "worker",
+			Token:       token,
+		})
+	}
+
+	updateID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-update")
+	stampOperationLease(t, updateID, "worker", "op-token")
+	require.ErrorIs(t, store.ApplyOperations().UpdateState(opCtx(updateID, "stale-op-token"), updateID, state.ApplyOperation.Running), storage.ErrApplyLeaseLost)
+	assertApplyOperationState(t, store, updateID, state.ApplyOperation.Pending)
+	require.NoError(t, store.ApplyOperations().UpdateState(opCtx(updateID, "op-token"), updateID, state.ApplyOperation.Running))
+	assertApplyOperationState(t, store, updateID, state.ApplyOperation.Running)
+
+	startedID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-started")
+	stampOperationLease(t, startedID, "worker", "op-token")
+	require.ErrorIs(t, store.ApplyOperations().MarkStarted(opCtx(startedID, "stale-op-token"), startedID), storage.ErrApplyLeaseLost)
+	assertApplyOperationState(t, store, startedID, state.ApplyOperation.Pending)
+	require.NoError(t, store.ApplyOperations().MarkStarted(opCtx(startedID, "op-token"), startedID))
+	assertApplyOperationState(t, store, startedID, state.ApplyOperation.Running)
+
+	completedID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-completed")
+	stampOperationLease(t, completedID, "worker", "op-token")
+	require.ErrorIs(t, store.ApplyOperations().MarkCompleted(opCtx(completedID, "stale-op-token"), completedID), storage.ErrApplyLeaseLost)
+	assertApplyOperationState(t, store, completedID, state.ApplyOperation.Pending)
+	require.NoError(t, store.ApplyOperations().MarkCompleted(opCtx(completedID, "op-token"), completedID))
+	assertApplyOperationState(t, store, completedID, state.ApplyOperation.Completed)
+
+	failedID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-failed")
+	stampOperationLease(t, failedID, "worker", "op-token")
+	require.ErrorIs(t, store.ApplyOperations().MarkFailed(opCtx(failedID, "stale-op-token"), failedID, "stale failure"), storage.ErrApplyLeaseLost)
+	failed, err := store.ApplyOperations().Get(ctx, failedID)
+	require.NoError(t, err)
+	require.NotNil(t, failed)
+	assert.Equal(t, state.ApplyOperation.Pending, failed.State)
+	assert.Empty(t, failed.ErrorMessage)
+	require.NoError(t, store.ApplyOperations().MarkFailed(opCtx(failedID, "op-token"), failedID, "current failure"))
+	failed, err = store.ApplyOperations().Get(ctx, failedID)
+	require.NoError(t, err)
+	require.NotNil(t, failed)
+	assert.Equal(t, state.ApplyOperation.Failed, failed.State)
+	assert.Equal(t, "current failure", failed.ErrorMessage)
+
+	heartbeatID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-heartbeat")
+	stampOperationLease(t, heartbeatID, "worker", "op-token")
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 5 MINUTE WHERE id = ?
+	`, heartbeatID)
+	require.NoError(t, err)
+	beforeHeartbeat, err := store.ApplyOperations().Get(ctx, heartbeatID)
+	require.NoError(t, err)
+	require.ErrorIs(t, store.ApplyOperations().Heartbeat(opCtx(heartbeatID, "stale-op-token"), heartbeatID), storage.ErrApplyLeaseLost)
+	afterStaleHeartbeat, err := store.ApplyOperations().Get(ctx, heartbeatID)
+	require.NoError(t, err)
+	assert.Equal(t, beforeHeartbeat.UpdatedAt, afterStaleHeartbeat.UpdatedAt)
+	require.NoError(t, store.ApplyOperations().Heartbeat(opCtx(heartbeatID, "op-token"), heartbeatID))
+	afterCurrentHeartbeat, err := store.ApplyOperations().Get(ctx, heartbeatID)
+	require.NoError(t, err)
+	assert.True(t, afterCurrentHeartbeat.UpdatedAt.After(beforeHeartbeat.UpdatedAt))
+
+	resumeID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-resume-state")
+	stampOperationLease(t, resumeID, "worker", "op-token")
+	require.ErrorIs(t, store.ApplyOperations().SaveEngineResumeState(opCtx(resumeID, "stale-op-token"), resumeID, &storage.EngineResumeState{
+		ApplyOperationID: resumeID,
+		MigrationContext: "stale-context",
+		Metadata:         `{"deploy_request_id":123}`,
+	}), storage.ErrApplyLeaseLost)
+	resumeAfterStale, err := store.ApplyOperations().Get(ctx, resumeID)
+	require.NoError(t, err)
+	require.NotNil(t, resumeAfterStale)
+	assert.Empty(t, resumeAfterStale.EngineResumeContext)
+	require.NoError(t, store.ApplyOperations().SaveEngineResumeState(opCtx(resumeID, "op-token"), resumeID, &storage.EngineResumeState{
+		ApplyOperationID: resumeID,
+		MigrationContext: "current-context",
+		Metadata:         `{"deploy_request_id":456}`,
+	}))
+	resumeAfterCurrent, err := store.ApplyOperations().Get(ctx, resumeID)
+	require.NoError(t, err)
+	require.NotNil(t, resumeAfterCurrent)
+	assert.Equal(t, "current-context", resumeAfterCurrent.EngineResumeContext)
+
+	// Operation lease takes precedence: even with a current apply lease also on
+	// the context, a stale operation token must fail closed.
+	precedenceID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-precedence")
+	stampOperationLease(t, precedenceID, "worker", "op-token")
+	bothCtx := storage.WithApplyLease(opCtx(precedenceID, "stale-op-token"), storage.ApplyLease{
+		ApplyID: apply.ID, Owner: "current-worker", Token: "apply-token",
+	})
+	require.ErrorIs(t, store.ApplyOperations().UpdateState(bothCtx, precedenceID, state.ApplyOperation.Running), storage.ErrApplyLeaseLost)
+	assertApplyOperationState(t, store, precedenceID, state.ApplyOperation.Pending)
+}
+
+func stampOperationLease(t *testing.T, id int64, owner, token string) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(), `
+		UPDATE apply_operations
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, owner, token, id)
+	require.NoError(t, err)
 }
 
 func createApplyOperationForLeaseTest(t *testing.T, store *Storage, applyID int64, deployment string) int64 {

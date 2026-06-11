@@ -94,11 +94,13 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 }
 
 // Update updates an existing task.
+//
+// The write is guarded by whichever lease is on the context: an operation lease
+// takes precedence over the parent apply lease so the operator can move to
+// operation-scoped writes while callers that have not adopted operation leases
+// keep falling back to the apply lease. An operation lease scopes the write to
+// the task's own operation; the apply lease scopes it to the parent apply.
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
-	lease, hasLease, err := applyLeaseFromContext(ctx, task.ApplyID)
-	if err != nil {
-		return err
-	}
 	args := []any{
 		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds,
@@ -106,15 +108,33 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 		task.StartedAt, task.CompletedAt,
 		task.ID,
 	}
+
 	leasePredicate := ""
-	if hasLease {
+	var verifyLeaseStillOwned func() error
+	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
+		if !opLease.Valid() {
+			return fmt.Errorf("invalid operation lease for task %d: %w", task.ID, storage.ErrApplyLeaseLost)
+		}
+		leasePredicate = `
+			AND tasks.apply_operation_id = ?
+			AND EXISTS (
+				SELECT 1 FROM apply_operations ao
+				WHERE ao.id = ? AND ao.lease_token = ?
+			)`
+		args = append(args, opLease.OperationID, opLease.OperationID, opLease.Token)
+		verifyLeaseStillOwned = func() error { return ensureOperationLeaseStillOwned(ctx, s.db, opLease) }
+	} else if lease, hasLease, err := applyLeaseFromContext(ctx, task.ApplyID); err != nil {
+		return err
+	} else if hasLease {
 		leasePredicate = `
 			AND EXISTS (
 				SELECT 1 FROM applies a
 				WHERE a.id = tasks.apply_id AND a.lease_token = ?
 			)`
 		args = append(args, lease.Token)
+		verifyLeaseStillOwned = func() error { return ensureApplyLeaseStillOwned(ctx, s.db, lease) }
 	}
+
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE tasks SET
 			state = ?, error_message = ?, options = ?, attempt = ?,
@@ -126,16 +146,15 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	if err != nil {
 		return err
 	}
-	if hasLease {
-		rows, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("read task update rows affected for task %d: %w", task.ID, err)
-		}
-		if rows == 0 {
-			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
-				return err
-			}
-		}
+	if verifyLeaseStillOwned == nil {
+		return nil
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read task update rows affected for task %d: %w", task.ID, err)
+	}
+	if rows == 0 {
+		return verifyLeaseStillOwned()
 	}
 	return nil
 }

@@ -3,6 +3,7 @@
 package mysqlstore
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -12,6 +13,87 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+// An operation lease scopes a task update to the task's own operation and is
+// enforced on the operation's token, taking precedence over a current parent
+// apply lease. A stale operation token must fail closed and leave the task row
+// untouched.
+func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_task_oplease", 1)
+
+	// Parent apply holds a current lease throughout; a successful update proves
+	// the operation token is enforced, not the apply token.
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, "current-worker", "apply-token", apply.ID)
+	require.NoError(t, err)
+
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	stampOperationLease(t, opID, "worker", "op-token")
+
+	now := time.Now()
+	taskID, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier:   "task_oplease_users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &opID,
+		PlanID:           apply.PlanID,
+		Database:         apply.Database,
+		DatabaseType:     apply.DatabaseType,
+		Engine:           storage.EngineSpirit,
+		Environment:      apply.Environment,
+		State:            state.Task.Pending,
+		TableName:        "users",
+		DDL:              "ALTER TABLE `users` ADD COLUMN email VARCHAR(255)",
+		DDLAction:        "ALTER",
+		Options:          []byte("{}"),
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	})
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(ctx, "task_oplease_users")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	task.ID = taskID
+
+	opCtx := func(token string) context.Context {
+		return storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: "worker", Token: token,
+		})
+	}
+
+	task.State = state.Task.Completed
+	require.ErrorIs(t, store.Tasks().Update(opCtx("stale-op-token"), task), storage.ErrApplyLeaseLost)
+	reloaded, err := store.Tasks().Get(ctx, "task_oplease_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Pending, reloaded.State)
+
+	require.NoError(t, store.Tasks().Update(opCtx("op-token"), task))
+	reloaded, err = store.Tasks().Get(ctx, "task_oplease_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Completed, reloaded.State)
+
+	// Operation lease takes precedence: a stale operation token fails closed even
+	// when a current apply lease is also on the context.
+	task.State = state.Task.Failed
+	bothCtx := storage.WithApplyLease(opCtx("stale-op-token"), storage.ApplyLease{
+		ApplyID: apply.ID, Owner: "current-worker", Token: "apply-token",
+	})
+	require.ErrorIs(t, store.Tasks().Update(bothCtx, task), storage.ErrApplyLeaseLost)
+	reloaded, err = store.Tasks().Get(ctx, "task_oplease_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Completed, reloaded.State)
+}
 
 // TestTaskStore_GetByApplyOperationID verifies that tasks can be loaded for a
 // single apply_operation (one deployment) independently of its sibling
