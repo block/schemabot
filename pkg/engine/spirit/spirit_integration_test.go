@@ -1301,8 +1301,8 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		var afterCreate int
 		require.NoError(t, db.QueryRowContext(t.Context(), `
 			SELECT COUNT(*) FROM information_schema.TABLES
-			WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = ?
-		`, table).Scan(&afterCreate), "check table exists after CREATE")
+			WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+		`, database, table).Scan(&afterCreate), "check table exists after CREATE")
 		require.Equal(t, 1, afterCreate, "expected table %s to exist after CREATE", table)
 
 		dropDDL := fmt.Sprintf("DROP TABLE `%s`", table)
@@ -1326,8 +1326,8 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		var afterDrop int
 		require.NoError(t, db.QueryRowContext(t.Context(), `
 			SELECT COUNT(*) FROM information_schema.TABLES
-			WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = ?
-		`, table).Scan(&afterDrop), "check table dropped")
+			WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+		`, database, table).Scan(&afterDrop), "check table dropped")
 		require.Equal(t, 0, afterDrop, "expected table %s to be dropped", table)
 	}
 
