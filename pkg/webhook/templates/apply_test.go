@@ -217,9 +217,11 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	// Progress summary counts the retrying table.
 	assert.Contains(t, result, "1/2 complete")
 	assert.Contains(t, result, "1 retrying")
-	// Footer explains automatic retry and offers stop, not a manual re-apply.
-	assert.Contains(t, result, "SchemaBot retries automatically")
+	// Footer explains automatic retry — including the failure outcome when
+	// retries are exhausted — and offers stop, not a manual re-apply.
+	assert.Contains(t, result, "SchemaBot retries automatically and marks it failed if retries are exhausted")
 	assert.Contains(t, result, "schemabot stop apply-abc123")
+	assert.NotContains(t, result, "transient")
 	assert.NotContains(t, result, "schemabot apply -e staging")
 }
 

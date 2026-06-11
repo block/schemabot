@@ -511,7 +511,7 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Running:
 		writeFooterAction(sb, "To stop this schema change:", fmt.Sprintf("schemabot stop %s", data.ApplyID))
 	case state.Apply.FailedRetryable:
-		writeFooterAction(sb, "A transient error interrupted this schema change; SchemaBot retries automatically. To stop instead:", fmt.Sprintf("schemabot stop %s", data.ApplyID))
+		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", fmt.Sprintf("schemabot stop %s", data.ApplyID))
 	case state.Apply.Stopped:
 		writeFooterAction(sb, "To resume:", fmt.Sprintf("schemabot start %s", data.ApplyID))
 	case state.Apply.Failed:
