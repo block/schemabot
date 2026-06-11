@@ -10,6 +10,21 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
+// Cutover policies control how a multi-deployment rollout sequences the copy
+// and cutover phases of its deployments. The value is resolved from the
+// environment config at apply-create time and persisted on each apply_operations
+// row so the policy in force when the apply was created travels with it.
+const (
+	// CutoverPolicyRolling is the default: a later deployment does not start
+	// until every earlier sibling in deployment_order has completed, keeping the
+	// rollout fully serial.
+	CutoverPolicyRolling = "rolling"
+
+	// CutoverPolicyBarrier lets later deployments run their copy phase once
+	// earlier siblings reach the cutover barrier, while cutover stays ordered.
+	CutoverPolicyBarrier = "barrier"
+)
+
 // Lock represents a database-level deployment lock.
 // Locks prevent concurrent schema changes to the same database across
 // all environments and PRs. Lock key is database:type (no environment).
@@ -440,6 +455,16 @@ type ApplyOperation struct {
 
 	// ErrorMessage contains error details if state is failed.
 	ErrorMessage string
+
+	// CutoverPolicy is the rollout sequencing policy captured for this
+	// operation's parent apply at apply-create time, drawn from the resolved
+	// environment config. "rolling" (the default) keeps the fully serial
+	// rollout — a later deployment waits for every earlier sibling to complete.
+	// "barrier" allows later deployments to run their copy phase once earlier
+	// siblings reach the cutover barrier. Persisted on each row so the policy in
+	// force when the apply was created travels with the operation. Insert treats
+	// an empty value as "rolling", matching the column's NOT NULL DEFAULT.
+	CutoverPolicy string
 
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time

@@ -1183,6 +1183,30 @@ func TestValidateDeploymentOrder_EmptyMapKey(t *testing.T) {
 	assert.NotContains(t, err.Error(), `missing deployment ""`)
 }
 
+// TestServerConfig_CutoverPolicyFor verifies the cutover-policy resolver:
+// it defaults to rolling (today's serial rollout) when unset or unconfigured,
+// and honours an explicit barrier policy.
+func TestServerConfig_CutoverPolicyFor(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"policy-unset":   {Target: "payments", Deployment: "payments-a"},
+					"policy-rolling": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyRolling},
+					"policy-barrier": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyBarrier},
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-unset"), "unset defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-rolling"), "explicit rolling is rolling")
+	assert.Equal(t, storage.CutoverPolicyBarrier, cfg.CutoverPolicyFor("payments", "policy-barrier"), "explicit barrier is barrier")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "missing-env"), "unconfigured env defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("missing-db", "policy-barrier"), "unconfigured database defaults to rolling")
+}
+
 func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 	baseTern := TernConfig{
 		"payments-a": {"production": "tern-a:9090"},
@@ -1308,6 +1332,47 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			},
 			tern:       baseTern,
 			wantErrSub: "sets deployment_order without a deployments map",
+		},
+		{
+			name: "cutover_policy without a deployments map is rejected",
+			envConfig: EnvironmentConfig{
+				Target:        "payments",
+				Deployment:    "payments-a",
+				CutoverPolicy: storage.CutoverPolicyBarrier,
+			},
+			tern:       baseTern,
+			wantErrSub: "sets cutover_policy without a deployments map",
+		},
+		{
+			name: "invalid cutover_policy value is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+				CutoverPolicy: "warp-speed",
+			},
+			tern:       baseTern,
+			wantErrSub: `invalid cutover_policy "warp-speed"`,
+		},
+		{
+			name: "cutover_policy rolling with a deployments map is accepted",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+				CutoverPolicy: storage.CutoverPolicyRolling,
+			},
+			tern: baseTern,
+		},
+		{
+			name: "cutover_policy barrier with a deployments map is accepted",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+				CutoverPolicy: storage.CutoverPolicyBarrier,
+			},
+			tern: baseTern,
 		},
 	}
 

@@ -7,6 +7,7 @@ CREATE TABLE `apply_operations` (
   `engine_resume_metadata` json DEFAULT NULL,
   `state` varchar(100) NOT NULL DEFAULT 'pending',
   `error_message` text,
+  `cutover_policy` varchar(16) NOT NULL DEFAULT 'rolling',
   `lease_owner` varchar(255) NOT NULL DEFAULT '',
   `lease_token` varchar(64) NOT NULL DEFAULT '',
   `lease_acquired_at` datetime DEFAULT NULL,

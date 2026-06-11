@@ -20,7 +20,7 @@ import (
 
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, deployment, target, state, error_message,
-	started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
+	cutover_policy, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
 // mysqlErrDupEntry is MySQL's error number for a duplicate-key violation.
@@ -56,13 +56,21 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		stateVal = state.ApplyOperation.Pending
 	}
 
+	// An empty policy means the caller did not resolve a cutover_policy, so fall
+	// back to rolling — the serial default that matches the column's NOT NULL
+	// DEFAULT 'rolling'.
+	cutoverPolicy := ad.CutoverPolicy
+	if cutoverPolicy == "" {
+		cutoverPolicy = storage.CutoverPolicyRolling
+	}
+
 	result, err := exec.ExecContext(ctx, `
 		INSERT INTO apply_operations (
-			apply_id, deployment, target, state, error_message,
+			apply_id, deployment, target, state, error_message, cutover_policy,
 			started_at, completed_at, engine_resume_context, engine_resume_metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		ad.ApplyID, ad.Deployment, ad.Target, stateVal, nullString(ad.ErrorMessage),
+		ad.ApplyID, ad.Deployment, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy,
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
@@ -795,7 +803,7 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.Target, &ad.State, &errMsg,
-		&startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
+		&ad.CutoverPolicy, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err

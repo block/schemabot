@@ -450,6 +450,15 @@ type EnvironmentConfig struct {
 	// alphabetical key order. Only meaningful alongside a Deployments map.
 	DeploymentOrder []string `yaml:"deployment_order,omitempty"`
 
+	// CutoverPolicy controls how a multi-deployment rollout sequences the copy
+	// and cutover phases of its deployments. "rolling" (the default, also used
+	// when unset) keeps today's fully serial behaviour: a later deployment does
+	// not start until every earlier sibling in deployment_order has completed.
+	// "barrier" lets later deployments run their copy phase once earlier
+	// siblings reach the cutover barrier, while cutover itself stays ordered.
+	// Only meaningful alongside a Deployments map.
+	CutoverPolicy string `yaml:"cutover_policy,omitempty"`
+
 	// For PlanetScale/Vitess:
 	// Organization is the PlanetScale organization name.
 	// sadscan:disable kingfisher.planetscale.2
@@ -635,6 +644,16 @@ func (c *ServerConfig) Validate() error {
 			hasMapRouting := envConfig.Deployments != nil
 			if len(envConfig.DeploymentOrder) > 0 && !hasMapRouting {
 				return fmt.Errorf("database %q environment %q sets deployment_order without a deployments map", name, env)
+			}
+			if envConfig.CutoverPolicy != "" {
+				if !hasMapRouting {
+					return fmt.Errorf("database %q environment %q sets cutover_policy without a deployments map", name, env)
+				}
+				switch envConfig.CutoverPolicy {
+				case storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier:
+				default:
+					return fmt.Errorf("database %q environment %q has invalid cutover_policy %q (want %q or %q)", name, env, envConfig.CutoverPolicy, storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier)
+				}
 			}
 			switch {
 			case hasDSN && (hasScalarRouting || hasMapRouting):
@@ -885,6 +904,18 @@ func (c *ServerConfig) DatabaseEnvironment(database, environment string) *Enviro
 		return &env
 	}
 	return nil
+}
+
+// CutoverPolicyFor returns the resolved cutover policy for a database+environment.
+// It defaults to CutoverPolicyRolling (today's serial behaviour) when the
+// environment is unconfigured or leaves cutover_policy unset, preserving the
+// conservative rolling rollout as the safe default.
+func (c *ServerConfig) CutoverPolicyFor(database, environment string) string {
+	env := c.DatabaseEnvironment(database, environment)
+	if env == nil || env.CutoverPolicy == "" {
+		return storage.CutoverPolicyRolling
+	}
+	return env.CutoverPolicy
 }
 
 // DatabaseEnvironments returns the environments configured server-side for a

@@ -44,6 +44,7 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.Equal(t, "region-a", got.Deployment)
 	assert.Equal(t, "payments", got.Target)
 	assert.Equal(t, state.ApplyOperation.Pending, got.State)
+	assert.Equal(t, storage.CutoverPolicyRolling, got.CutoverPolicy, "an unset cutover_policy defaults to rolling")
 	assert.Empty(t, got.ErrorMessage)
 	assert.Nil(t, got.StartedAt)
 	assert.Nil(t, got.CompletedAt)
@@ -51,6 +52,44 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.Empty(t, got.EngineResumeMetadata)
 	assert.NotZero(t, got.CreatedAt)
 	assert.NotZero(t, got.UpdatedAt)
+}
+
+// TestApplyOperationStore_CutoverPolicyRoundTrip verifies that an explicit
+// cutover_policy is persisted and read back unchanged, and that an empty policy
+// falls back to rolling on insert — matching the column's NOT NULL default so a
+// caller that omits the policy never silently degrades the rollout.
+func TestApplyOperationStore_CutoverPolicyRoundTrip(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_policy", 1)
+
+	barrierID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:       apply.ID,
+		Deployment:    "region-a",
+		Target:        "payments",
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	defaultedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: "region-b",
+		Target:     "payments",
+	})
+	require.NoError(t, err)
+
+	barrier, err := store.ApplyOperations().Get(ctx, barrierID)
+	require.NoError(t, err)
+	require.NotNil(t, barrier)
+	assert.Equal(t, storage.CutoverPolicyBarrier, barrier.CutoverPolicy, "an explicit barrier policy round-trips unchanged")
+
+	defaulted, err := store.ApplyOperations().Get(ctx, defaultedID)
+	require.NoError(t, err)
+	require.NotNil(t, defaulted)
+	assert.Equal(t, storage.CutoverPolicyRolling, defaulted.CutoverPolicy, "an omitted policy is stored as rolling")
 }
 
 func TestApplyOperationStore_Get_NotFound(t *testing.T) {

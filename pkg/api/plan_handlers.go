@@ -668,12 +668,14 @@ func (s *Service) createStoredApply(
 	// always write exactly one operation row that mirrors the apply's own
 	// routing. The data shape is what the operator claim-loop PR consumes
 	// once that gate is lifted and plans become deployment-agnostic.
+	cutoverPolicy := s.config.CutoverPolicyFor(plan.Database, req.Environment)
 	operations := []*storage.ApplyOperation{{
-		Deployment: apply.Deployment,
-		Target:     plan.Target,
-		State:      state.ApplyOperation.Pending,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Deployment:    apply.Deployment,
+		Target:        plan.Target,
+		State:         state.ApplyOperation.Pending,
+		CutoverPolicy: cutoverPolicy,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}}
 
 	storedApplyID, err := s.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
