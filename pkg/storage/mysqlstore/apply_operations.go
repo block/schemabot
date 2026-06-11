@@ -423,9 +423,11 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // avoid worker races, READ COMMITTED isolation to prevent next-key range
 // locks from serializing claims across otherwise independent rows.
 //
-// Pure storage primitive: no caller wires this in yet. The per-deployment
-// claim loop arrives in a subsequent PR in the multi-deployment apply
-// workstream.
+// Caller: the operator's per-poll recovery (Service.recoverApplyOperation)
+// claims one operation per tick through this primitive when operation-level
+// claiming is enabled. The per-deployment fan-out loop — driving multiple
+// sibling operations of the same apply concurrently — is deferred to the
+// multi-deployment apply workstream.
 func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
