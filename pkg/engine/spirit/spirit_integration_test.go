@@ -1235,6 +1235,116 @@ func TestEngine_ExecuteMigration_MultipleStatements(t *testing.T) {
 	assert.Equal(t, 1, columnCountB, "expected 1 new column in test_multi_b")
 }
 
+// threadsConnected reports MySQL's current server-side connection count, used to
+// observe whether the Spirit runner driving a single DDL statement releases its
+// connection pool once the statement finishes.
+func threadsConnected(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	var name string
+	var value int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW STATUS LIKE 'Threads_connected'").Scan(&name, &value), "read Threads_connected")
+	return value
+}
+
+// TestEngine_ExecuteMigration_SingleStatementReleasesConnections applies many
+// CREATE TABLE and direct DROP TABLE statements in sequence on one engine. Each
+// statement runs through Spirit's single-statement path, which opens a connection
+// pool and background routines per runner that only the runner's Close releases.
+// Every statement completes and the server connection count stays bounded across
+// the whole sequence, so a long run of single-statement applies neither leaks
+// connections nor exhausts the server connection limit.
+func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger, DisablePendingDrops: true})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	// Record a stable baseline once connection churn from setup has settled, so
+	// the post-sequence comparison reflects only what the applies leave behind.
+	var baseline int
+	require.Eventually(t, func() bool {
+		first := threadsConnected(t, db)
+		time.Sleep(200 * time.Millisecond)
+		second := threadsConnected(t, db)
+		if first == second {
+			baseline = second
+			return true
+		}
+		return false
+	}, 10*time.Second, 200*time.Millisecond, "wait for connections to settle")
+
+	const iterations = 12
+	for i := range iterations {
+		table := fmt.Sprintf("seq_table_%d", i)
+		createDDL := fmt.Sprintf("CREATE TABLE `%s` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `name` varchar(100) NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", table)
+
+		eng.mu.Lock()
+		eng.runningMigration = &runningMigration{
+			database: database,
+			tables:   []string{table},
+			state:    engine.StateRunning,
+			started:  time.Now(),
+		}
+		eng.mu.Unlock()
+
+		eng.executeMigration(t.Context(), host, username, password, database, []string{createDDL}, false)
+
+		eng.mu.Lock()
+		createState := eng.runningMigration.state
+		eng.mu.Unlock()
+		require.Equal(t, engine.StateCompleted, createState, "CREATE TABLE %s did not complete", table)
+
+		var afterCreate int
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			SELECT COUNT(*) FROM information_schema.TABLES
+			WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = ?
+		`, table).Scan(&afterCreate), "check table exists after CREATE")
+		require.Equal(t, 1, afterCreate, "expected table %s to exist after CREATE", table)
+
+		dropDDL := fmt.Sprintf("DROP TABLE `%s`", table)
+
+		eng.mu.Lock()
+		eng.runningMigration = &runningMigration{
+			database: database,
+			tables:   []string{table},
+			state:    engine.StateRunning,
+			started:  time.Now(),
+		}
+		eng.mu.Unlock()
+
+		eng.executeMigration(t.Context(), host, username, password, database, []string{dropDDL}, false)
+
+		eng.mu.Lock()
+		dropState := eng.runningMigration.state
+		eng.mu.Unlock()
+		require.Equal(t, engine.StateCompleted, dropState, "DROP TABLE %s did not complete", table)
+
+		var afterDrop int
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			SELECT COUNT(*) FROM information_schema.TABLES
+			WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = ?
+		`, table).Scan(&afterDrop), "check table dropped")
+		require.Equal(t, 0, afterDrop, "expected table %s to be dropped", table)
+	}
+
+	// A leaked pool would hold open roughly one connection per runner, so 24
+	// applies would push the count far above the baseline. Once the runners are
+	// closed the count returns near the baseline; allow a small margin for the
+	// server's own background churn.
+	var settled int
+	require.Eventually(t, func() bool {
+		settled = threadsConnected(t, db)
+		return settled <= baseline+5
+	}, 15*time.Second, 250*time.Millisecond, "connections did not return near baseline (baseline=%d)", baseline)
+	assert.LessOrEqual(t, settled, baseline+5,
+		"server connections grew far beyond baseline after %d single-statement applies (baseline=%d, settled=%d)",
+		iterations*2, baseline, settled)
+}
+
 // TestEngine_Apply_StartsGoroutine tests that Apply starts a schema change goroutine
 // when there are changes to apply. We test this by checking that state transitions happen.
 func TestEngine_Apply_StartsGoroutine(t *testing.T) {

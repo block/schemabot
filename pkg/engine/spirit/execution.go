@@ -278,6 +278,10 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 	if err != nil {
 		return fmt.Errorf("create runner: %w", err)
 	}
+	// Run opens the runner's connection pool and background routines; they are
+	// only released by Close. Close on every return path so each single DDL
+	// statement leaves no leaked connections or goroutines behind.
+	defer utils.CloseAndLog(runner)
 
 	if err := runner.Run(ctx); err != nil {
 		return fmt.Errorf("run Spirit: %w", err)
