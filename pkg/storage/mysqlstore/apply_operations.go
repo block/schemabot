@@ -8,8 +8,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -18,8 +20,8 @@ import (
 
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, deployment, target, state, error_message,
-	started_at, completed_at, engine_resume_context, engine_resume_metadata,
-	created_at, updated_at`
+	started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
+	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
 // mysqlErrDupEntry is MySQL's error number for a duplicate-key violation.
 // Used to translate unique-index conflicts into typed storage errors.
@@ -424,7 +426,10 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // Pure storage primitive: no caller wires this in yet. The per-deployment
 // claim loop arrives in a subsequent PR in the multi-deployment apply
 // workstream.
-func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*storage.ApplyOperation, error) {
+func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply_operation transaction: %w", err)
@@ -536,16 +541,23 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 		return nil, fmt.Errorf("query next claimable apply_operation: %w", err)
 	}
 
+	// Rotate a fresh operation lease onto the claimed row so the claiming worker
+	// can guard operation-scoped writes on this token. Mirrors persistApplyClaim
+	// at the apply level.
+	leaseToken := uuid.NewString()
+	leaseAcquiredAt := time.Now()
+
 	if ad.State == state.ApplyOperation.Pending {
-		// Pending → running: stamp started_at and update the heartbeat in the
-		// same write. WHERE state = ? guards against a concurrent transition
-		// landing between the SELECT and this UPDATE; RowsAffected == 0 means
-		// another writer already moved the row, so we back off cleanly.
+		// Pending → running: stamp started_at, rotate the lease, and update the
+		// heartbeat in the same write. WHERE state = ? guards against a concurrent
+		// transition landing between the SELECT and this UPDATE; RowsAffected == 0
+		// means another writer already moved the row, so we back off cleanly.
 		result, err := tx.ExecContext(ctx, `
 			UPDATE apply_operations
-			SET state = ?, started_at = COALESCE(started_at, NOW()), updated_at = NOW()
+			SET state = ?, started_at = COALESCE(started_at, NOW()), updated_at = NOW(),
+			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
 			WHERE id = ? AND state = ?
-		`, state.ApplyOperation.Running, ad.ID, state.ApplyOperation.Pending)
+		`, state.ApplyOperation.Running, owner, leaseToken, ad.ID, state.ApplyOperation.Pending)
 		if err != nil {
 			return nil, fmt.Errorf("claim pending apply_operation %d: %w", ad.ID, err)
 		}
@@ -559,11 +571,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 	} else {
 		// Re-leasing a row that already started: a stale active heartbeat, or a
 		// stopped operation whose parent apply has a pending start request. Both
-		// keep their current state and are driven by the caller, so just refresh
-		// the heartbeat as our lease.
+		// keep their current state and are driven by the caller, so rotate the
+		// lease onto this worker and refresh the heartbeat.
 		_, err = tx.ExecContext(ctx, `
-			UPDATE apply_operations SET updated_at = NOW() WHERE id = ?
-		`, ad.ID)
+			UPDATE apply_operations
+			SET updated_at = NOW(),
+			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+			WHERE id = ?
+		`, owner, leaseToken, ad.ID)
 		if err != nil {
 			return nil, fmt.Errorf("refresh heartbeat for claimed apply_operation %d: %w", ad.ID, err)
 		}
@@ -572,6 +587,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit claim apply_operation %d: %w", ad.ID, err)
 	}
+
+	ad.LeaseOwner = owner
+	ad.LeaseToken = leaseToken
+	ad.LeaseAcquiredAt = &leaseAcquiredAt
 
 	return ad, nil
 }
@@ -659,12 +678,12 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var ad storage.ApplyOperation
 	var errMsg sql.NullString
 	var engineResumeContext, engineResumeMetadata sql.NullString
-	var startedAt, completedAt sql.NullTime
+	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.Target, &ad.State, &errMsg,
-		&startedAt, &completedAt, &engineResumeContext, &engineResumeMetadata,
-		&ad.CreatedAt, &ad.UpdatedAt,
+		&startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
+		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -679,6 +698,10 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	if completedAt.Valid {
 		t := completedAt.Time
 		ad.CompletedAt = &t
+	}
+	if leaseAcquiredAt.Valid {
+		t := leaseAcquiredAt.Time
+		ad.LeaseAcquiredAt = &t
 	}
 	if engineResumeContext.Valid {
 		ad.EngineResumeContext = engineResumeContext.String

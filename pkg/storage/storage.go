@@ -397,19 +397,18 @@ type ApplyOperationStore interface {
 	GetEngineResumeState(ctx context.Context, operationID int64) (*EngineResumeState, error)
 
 	// FindNextApplyOperation atomically claims the next child row that needs
-	// attention and refreshes its heartbeat in the same transaction.
+	// attention and rotates a fresh operation lease (owner + token) onto it in
+	// the same transaction, returning the row populated with that lease.
 	//
 	// Pending rows are transitioned to running and stamped with started_at;
 	// already-active rows whose heartbeat has been stale for more than one
 	// minute are re-leased without changing their state. Terminal rows
 	// (completed/failed/cancelled/stopped/reverted) are never claimed.
 	//
-	// Returns the claimed row, or nil if nothing needs work.
-	//
-	// Pure storage primitive: no operator loop calls this yet —
-	// the per-deployment claim loop arrives in a subsequent PR in the
-	// multi-deployment apply workstream.
-	FindNextApplyOperation(ctx context.Context) (*ApplyOperation, error)
+	// owner identifies the claiming worker and is required; it is recorded as
+	// the operation's lease owner. Returns the claimed row, or nil if nothing
+	// needs work.
+	FindNextApplyOperation(ctx context.Context, owner string) (*ApplyOperation, error)
 
 	// Heartbeat refreshes the child row's updated_at timestamp to extend the
 	// claim's lease while a worker is acting on it. Mirrors ApplyStore.Heartbeat

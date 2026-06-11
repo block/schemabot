@@ -450,6 +450,15 @@ type ApplyOperation struct {
 	// still resume.
 	CompletedAt *time.Time
 
+	// LeaseOwner, LeaseToken, and LeaseAcquiredAt are the operation's own claim
+	// lease, rotated when a worker claims the row via FindNextApplyOperation and
+	// refreshed by its heartbeat. They mirror the apply-level lease columns so a
+	// worker can guard operation-scoped writes on this row's token instead of the
+	// parent apply's, letting sibling deployments run independently.
+	LeaseOwner      string
+	LeaseToken      string
+	LeaseAcquiredAt *time.Time
+
 	// EngineResumeContext and EngineResumeMetadata are opaque state owned by the
 	// engine package and scoped to this execution operation. SchemaBot stores and
 	// replays them but does not interpret them for control/progress calls.
@@ -461,6 +470,19 @@ type ApplyOperation struct {
 
 	// UpdatedAt is when the child row was last updated.
 	UpdatedAt time.Time
+}
+
+// Lease returns the ownership token for this apply_operation.
+func (op *ApplyOperation) Lease() OperationLease {
+	if op == nil {
+		return OperationLease{}
+	}
+	return OperationLease{
+		ApplyID:     op.ApplyID,
+		OperationID: op.ID,
+		Owner:       op.LeaseOwner,
+		Token:       op.LeaseToken,
+	}
 }
 
 // ApplyOptions contains durable user and engine options for an apply.

@@ -562,20 +562,29 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsPending(t *testing.T) 
 	})
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, id, claimed.ID)
 	assert.Equal(t, "region-a", claimed.Deployment)
+	assert.Equal(t, "test-operator", claimed.LeaseOwner, "claim must record the lease owner")
+	assert.NotEmpty(t, claimed.LeaseToken, "claim must rotate a lease token onto the row")
+	require.NotNil(t, claimed.LeaseAcquiredAt, "claim must stamp lease_acquired_at")
+	opLease := claimed.Lease()
+	assert.True(t, opLease.Valid(), "claimed operation must expose a valid lease")
+	assert.Equal(t, claimed.ID, opLease.OperationID)
+	assert.Equal(t, apply.ID, opLease.ApplyID)
 
 	persisted, err := store.ApplyOperations().Get(ctx, id)
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
 	assert.Equal(t, state.ApplyOperation.Running, persisted.State, "pending claim must transition to running")
 	require.NotNil(t, persisted.StartedAt, "pending claim must stamp started_at")
+	assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken, "rotated lease token must be persisted")
+	assert.Equal(t, "test-operator", persisted.LeaseOwner)
 
 	// No other claimable rows → second call returns nil cleanly.
-	again, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, again)
 }
@@ -597,7 +606,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsFreshRunning(t *testing
 	require.NoError(t, err)
 	require.NoError(t, store.ApplyOperations().MarkStarted(ctx, id))
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "fresh running rows must not be re-claimed")
 }
@@ -626,16 +635,20 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleRunning(t *testin
 	`, id)
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "recovery-operator")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, id, claimed.ID)
 	assert.Equal(t, state.ApplyOperation.Running, claimed.State, "stale running row must keep its state on re-claim")
+	assert.Equal(t, "recovery-operator", claimed.LeaseOwner, "re-claim must rotate the lease to the new owner")
+	assert.NotEmpty(t, claimed.LeaseToken, "re-claim must rotate a lease token")
 
 	persisted, err := store.ApplyOperations().Get(ctx, id)
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
 	assert.Equal(t, state.ApplyOperation.Running, persisted.State)
+	assert.Equal(t, "recovery-operator", persisted.LeaseOwner, "rotated lease owner must be persisted")
+	assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken)
 	// Heartbeat refreshed inside the claim transaction.
 	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second)
 }
@@ -685,7 +698,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsTerminal(t *testing.T) 
 	`, placeholders(len(ids))), args...)
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "terminal rows must never be re-claimed (full vocabulary)")
 }
@@ -717,7 +730,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingStar
 	})
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "stopped operation with a pending start request must be reclaimable")
 	assert.Equal(t, id, claimed.ID)
@@ -760,7 +773,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithCompletedSta
 	`, storage.ControlRequestCompleted, apply.ID, storage.ControlOperationStart)
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "stopped operation must not be reclaimed once its start request is no longer pending")
 }
@@ -789,7 +802,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinB
 	})
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "failed_retryable operation within budget must be reclaimable")
 	assert.Equal(t, id, claimed.ID)
@@ -823,7 +836,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetEx
 	})
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "failed_retryable operation must not be reclaimed once the recovery budget is spent")
 }
@@ -849,7 +862,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableStale(t 
 	})
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "failed_retryable operation must not be reclaimed once the failure is stale")
 }
@@ -878,7 +891,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableParentAc
 	})
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "a failed_retryable child must not be re-claimed while its parent is actively (and freshly) retrying")
 }
@@ -906,7 +919,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableParentA
 	})
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "a failed_retryable child must be reclaimable when its parent retry crashed (active + stale)")
 	assert.Equal(t, id, claimed.ID)
@@ -936,7 +949,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableParentA
 	})
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "a crashed retry must be recoverable even with the budget spent; the attempt was already counted")
 	assert.Equal(t, id, claimed.ID)
@@ -980,9 +993,10 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims(t *testing.
 
 	for i := range workers {
 		workerStore := stores[i]
+		workerOwner := fmt.Sprintf("operator-%d", i)
 		wg.Go(func() {
 			<-start
-			got, claimErr := workerStore.ApplyOperations().FindNextApplyOperation(ctx)
+			got, claimErr := workerStore.ApplyOperations().FindNextApplyOperation(ctx, workerOwner)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -1036,7 +1050,7 @@ func TestApplyOperationStore_FindNextApplyOperation_OrdersSiblings(t *testing.T)
 	// Each claim returns the next deployment in order; the rollout only
 	// advances once the prior deployment is marked completed.
 	for i, deployment := range deployments {
-		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 		require.NoError(t, err)
 		require.NotNil(t, claimed, "deployment %q should be claimable once earlier siblings completed", deployment)
 		assert.Equal(t, ids[i], claimed.ID)
@@ -1044,7 +1058,7 @@ func TestApplyOperationStore_FindNextApplyOperation_OrdersSiblings(t *testing.T)
 
 		// A second claim before completing the current row yields nothing:
 		// the claimed row is running (not completed), so it gates its siblings.
-		blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+		blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 		require.NoError(t, err)
 		assert.Nil(t, blocked, "later siblings must wait while %q is still running", deployment)
 
@@ -1052,7 +1066,7 @@ func TestApplyOperationStore_FindNextApplyOperation_OrdersSiblings(t *testing.T)
 	}
 
 	// All deployments completed → nothing left to claim.
-	done, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	done, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, done)
 }
@@ -1088,7 +1102,7 @@ func TestApplyOperationStore_FindNextApplyOperation_HaltsOnFailedSibling(t *test
 	`, failedID)
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "later siblings must not be claimed once an earlier deployment failed")
 }
@@ -1126,14 +1140,14 @@ func TestApplyOperationStore_FindNextApplyOperation_PendingStartRequestDoesNotBy
 	})
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "a pending start request must not let a later pending sibling bypass the deployment-order gate")
 
 	// Sanity: once the earlier sibling completes, the gate opens normally —
 	// confirming the nil above was the order gate, not an unrelated skip.
 	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, runningID))
-	next, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	require.NotNil(t, next, "region-b must be claimable once region-a completes")
 	assert.Equal(t, "region-b", next.Deployment)
@@ -1171,7 +1185,7 @@ func TestApplyOperationStore_FindNextApplyOperation_IsolatesApplies(t *testing.T
 	})
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "an unrelated apply's first deployment must still be claimable")
 	assert.Equal(t, bID, claimed.ID, "the only claimable row is apply B's first deployment")
@@ -1185,7 +1199,7 @@ func TestApplyOperationStore_FindNextApplyOperation_DBError(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	store := New(db)
-	_, err = store.ApplyOperations().FindNextApplyOperation(t.Context())
+	_, err = store.ApplyOperations().FindNextApplyOperation(t.Context(), "test-operator")
 	require.Error(t, err)
 }
 

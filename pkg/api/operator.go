@@ -222,7 +222,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 // emits exactly one operation per apply, the operation-scoped drive resolves to
 // the same tasks as the whole apply.
 func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner string) {
-	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx)
+	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner)
 	if err != nil {
 		s.logger.Error("operator: failed to claim apply_operation", "worker", workerID, "lease_owner", owner, "error", err)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_storage_error")
