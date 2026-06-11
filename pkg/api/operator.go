@@ -571,6 +571,16 @@ func (s *Service) markOperationFromApplyState(ctx context.Context, workerID int,
 			return false, fmt.Errorf("update stopped apply_operation %d state (deployment %q): %w", op.ID, op.Deployment, err)
 		}
 		return true, nil
+	case state.IsState(apply.State, state.Apply.FailedRetryable):
+		// failed_retryable is resumable like stopped: mirror the state (leaving
+		// completed_at nil) so FindNextApplyOperation reclaims it under the
+		// parent apply's recovery budget. Leaving the row in its active state
+		// would instead make recovery depend on the stale-heartbeat path, which
+		// has no budget and would re-claim it forever once retries are exhausted.
+		if err := opStore.UpdateState(ctx, op.ID, apply.State); err != nil {
+			return false, fmt.Errorf("update failed_retryable apply_operation %d state (deployment %q): %w", op.ID, op.Deployment, err)
+		}
+		return true, nil
 	case state.IsTerminalApplyState(apply.State):
 		// cancelled / reverted — non-resumable terminal states; stamp completed_at.
 		if err := opStore.MarkTerminal(ctx, op.ID, apply.State); err != nil {

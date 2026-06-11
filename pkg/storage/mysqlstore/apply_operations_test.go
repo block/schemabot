@@ -765,6 +765,95 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithCompletedSta
 	assert.Nil(t, claimed, "stopped operation must not be reclaimed once its start request is no longer pending")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinBudget
+// verifies recovery parity with ApplyStore.FindNextApply: a failed_retryable
+// operation is reclaimable while its parent apply still has recovery budget
+// (attempt < max) and the failure is recent. The re-claim keeps the row's
+// failed_retryable state (the resume drive transitions it) and refreshes the
+// heartbeat.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_retryable_ok", 1, state.Apply.FailedRetryable, "staging")
+	// Budget remaining and a recent failure: the parent is reclaimable.
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "failed_retryable operation within budget must be reclaimable")
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, claimed.State, "re-claim must keep failed_retryable for the resume drive to transition")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, persisted.State)
+	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetExhausted
+// verifies the recovery budget is enforced: once the parent apply's attempt
+// count reaches the limit, the failed_retryable operation is no longer
+// reclaimable and stays quiet rather than being re-claimed forever.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetExhausted(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_retryable_spent", 1, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts, apply.ID)
+	require.NoError(t, err)
+
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "failed_retryable operation must not be reclaimed once the recovery budget is spent")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableStale
+// verifies the freshness window is enforced: an old failed_retryable failure is
+// not reclaimed, matching ApplyStore.FindNextApply's recovery-freshness gate.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableStale(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_retryable_stale", 1, state.Apply.FailedRetryable, "staging")
+	// Budget remains, but the failure is older than the freshness window.
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = 1, updated_at = NOW() - INTERVAL ? DAY WHERE id = ?
+	`, retryableRecoveryFreshnessDays+1, apply.ID)
+	require.NoError(t, err)
+
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "failed_retryable operation must not be reclaimed once the failure is stale")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims verifies
 // the SKIP LOCKED contract on a contended row: N workers race to claim a
 // single pending child row, and exactly one wins. Mirrors the apply-level

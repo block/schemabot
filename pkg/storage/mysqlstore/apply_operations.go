@@ -439,12 +439,21 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.FailedRetryable,
+		maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 
-	// The stopped-row clause mirrors ApplyStore.FindNextApply: a stopped
-	// operation whose parent apply has a pending start request is reclaimable
-	// so the operator can resume it. Like the stale-active clause, it carries
-	// no deployment-order gate — a stopped row already ran, so resuming it is
-	// recovering work it started rather than starting a new deployment.
+	// The stopped-row and failed_retryable clauses mirror ApplyStore.FindNextApply:
+	//   - a stopped operation whose parent apply has a pending start request is
+	//     reclaimable so the operator can resume it;
+	//   - a failed_retryable operation is reclaimable while the parent apply still
+	//     has recovery budget (attempt < max) and the failure is recent.
+	// Both carry no deployment-order gate — these rows already ran, so resuming
+	// them is recovering work they started rather than starting a new deployment.
+	// The recovery budget lives on the parent applies row (each retry claim
+	// increments applies.attempt), so the predicate joins to it; once the budget
+	// is spent the clause stops matching and the operation stays quiet instead of
+	// being re-claimed forever.
 	//
 	// There is intentionally no "pending + pending start request" clause to
 	// match ApplyStore.FindNextApply's pending-start clause. That apply-level
@@ -481,6 +490,16 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 					WHERE cr.apply_id = apply_operations.apply_id
 						AND cr.operation = ?
 						AND cr.status = ?
+				)
+			)
+			OR (
+				state = ?
+				AND EXISTS (
+					SELECT 1
+					FROM applies a
+					WHERE a.id = apply_operations.apply_id
+						AND a.attempt < ?
+						AND a.updated_at >= NOW() - INTERVAL ? DAY
 				)
 			)
 		)
