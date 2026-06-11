@@ -536,3 +536,22 @@ func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv stri
 
 	return sb.String()
 }
+
+// RenderApplyBlockedByUnlistedEnvironment renders a comment when an apply is
+// blocked because this scoped SchemaBot instance cannot enforce staging-first
+// promotion ordering: the target environment is not part of the configured
+// promotion order, so SchemaBot cannot determine which environments must be
+// applied before it. This is a configuration error that an operator must fix.
+func RenderApplyBlockedByUnlistedEnvironment(environment string, promotionOrder []string) string {
+	var sb strings.Builder
+
+	sb.WriteString("## ❌ Apply Blocked\n\n")
+	fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", environment)
+	fmt.Fprintf(&sb, "`%s` is not in the configured promotion order, so SchemaBot cannot determine which environments must be applied before it and cannot enforce staging-first ordering.\n\n", environment)
+	if len(promotionOrder) > 0 {
+		fmt.Fprintf(&sb, "Configured promotion order: `%s`\n\n", strings.Join(promotionOrder, "` → `"))
+	}
+	fmt.Fprintf(&sb, "Add `%s` to `environment_order` so SchemaBot knows where it sits in the promotion sequence, then retry the apply.\n", environment)
+
+	return sb.String()
+}
