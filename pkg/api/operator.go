@@ -233,9 +233,26 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
-	// All lease-guarded writes (ResumeApply, MarkCompleted/MarkFailed, the
-	// operation Heartbeat) key off applies.lease_token, so the operation claim
-	// alone is not enough to write safely — acquire the parent apply lease.
+	// The claim rotated a fresh operation lease onto the row. It is the
+	// capability that guards this operation's own writes — its state
+	// transitions, heartbeat, and task updates — so fail closed if it is
+	// missing rather than silently degrading to the parent apply lease.
+	opLease := op.Lease()
+	if !opLease.Valid() {
+		s.logger.Error("operator: claimed apply_operation without a valid operation lease token; operation will not be driven",
+			"worker", workerID,
+			"lease_owner", owner,
+			"apply_operation_id", op.ID,
+			"apply_db_id", op.ApplyID,
+			"deployment", op.Deployment)
+		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_lease_token")
+		return
+	}
+
+	// The engine drive still writes the parent applies row (state RUNNING /
+	// COMPLETED / FAILED), and the derived-state reconcile updates
+	// applies.state, so the worker must also hold the parent apply lease — the
+	// operation lease alone does not authorize parent-apply writes.
 	apply, err := s.storage.Applies().ClaimApplyByID(ctx, op.ApplyID, owner)
 	if err != nil {
 		s.logger.Error("operator: failed to claim parent apply for operation",
@@ -260,8 +277,8 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
-	lease := apply.Lease()
-	if !lease.Valid() {
+	applyLease := apply.Lease()
+	if !applyLease.Valid() {
 		s.logger.Error("operator: claimed parent apply without a valid lease token; operation will not be driven",
 			"worker", workerID,
 			"lease_owner", owner,
@@ -273,7 +290,19 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		metrics.RecordOperatorClaimFailure(ctx, "missing_lease_token")
 		return
 	}
-	leasedCtx := storage.WithApplyLease(ctx, lease)
+
+	// Two capabilities, two scopes:
+	//   - applyLeaseCtx guards parent applies writes — the engine's state
+	//     transitions and the derived-state reconcile.
+	//   - operationLeaseCtx guards this operation's own row and its tasks
+	//     (operation state, heartbeat, task updates); the storage lease
+	//     precedence prefers the operation token, so sibling operations no
+	//     longer serialize on the shared parent token.
+	//   - dualLeaseCtx carries both for the engine run, which writes both the
+	//     operation's tasks and the parent applies row.
+	applyLeaseCtx := storage.WithApplyLease(ctx, applyLease)
+	operationLeaseCtx := storage.WithOperationLease(ctx, opLease)
+	dualLeaseCtx := storage.WithOperationLease(applyLeaseCtx, opLease)
 
 	// The claimed operation row's deployment is the authoritative routing key
 	// for the drive, but resumeClaimedApply selects the Tern client from the
@@ -295,9 +324,10 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 	}
 
 	// Heartbeat the operation row on the apply heartbeat cadence so a peer
-	// worker does not re-claim it during a long ResumeApply. A lost parent lease
-	// cancels the run so the displaced worker stops writing.
-	runCtx, cancelRun := context.WithCancel(leasedCtx)
+	// worker does not re-claim it during a long drive. The heartbeat writes
+	// under the operation lease, so a lost operation lease cancels the run and
+	// the displaced worker stops writing.
+	runCtx, cancelRun := context.WithCancel(dualLeaseCtx)
 	defer cancelRun()
 	stopHeartbeat := s.startApplyOperationHeartbeat(runCtx, workerID, op, apply, cancelRun)
 	defer stopHeartbeat()
@@ -309,7 +339,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 			// The drive failed closed: the operation has no tasks, so it can
 			// never make progress. Terminalize it now rather than leaving it to
 			// be re-leased on every poll once its heartbeat goes stale.
-			s.failOperationWithoutTasks(leasedCtx, workerID, op, apply)
+			s.failOperationWithoutTasks(operationLeaseCtx, applyLeaseCtx, workerID, op, apply)
 		}
 		return
 	}
@@ -317,7 +347,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 	// Reload the parent apply: ResumeApply persists the final state to storage,
 	// and the operation row must mirror the durable outcome, not the in-memory
 	// object the resume path started from.
-	finalApply, err := s.storage.Applies().Get(leasedCtx, apply.ID)
+	finalApply, err := s.storage.Applies().Get(applyLeaseCtx, apply.ID)
 	if err != nil {
 		s.logger.Error("operator: failed to reload parent apply after resume; operation state not updated",
 			"worker", workerID,
@@ -336,7 +366,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
-	marked, err := s.markOperationFromApplyState(leasedCtx, workerID, op, finalApply)
+	marked, err := s.markOperationFromApplyState(operationLeaseCtx, workerID, op, finalApply)
 	if err != nil {
 		s.logger.Error("operator: failed to update apply_operation from parent apply state; derived apply state not updated",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
@@ -347,7 +377,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
-	if err := s.updateApplyStateFromOperations(leasedCtx, workerID, finalApply); err != nil {
+	if err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply); err != nil {
 		s.logger.Error("operator: failed to update derived apply state from apply_operations",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
@@ -422,19 +452,20 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 // failOperationWithoutTasks terminalizes an operation whose drive failed closed
 // because no tasks scope to it. Such a claim is invalid or stale: the operation
 // can never make progress, so leaving the row non-terminal would re-lease it on
-// every poll once its heartbeat goes stale. Mark it failed and re-derive the
-// parent apply state from its operations so the parent reflects the terminal
-// child. The caller passes a lease-scoped context so the writes fail closed if
-// ownership has since changed.
-func (s *Service) failOperationWithoutTasks(ctx context.Context, workerID int, op *storage.ApplyOperation, apply *storage.Apply) {
+// every poll once its heartbeat goes stale. It marks the operation row failed
+// under its own operation lease (opCtx), then re-derives the parent applies.state
+// under the parent apply lease (applyCtx). The two writes target different rows
+// with different guards, so they take separate lease-scoped contexts and fail
+// closed if ownership has since changed.
+func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, workerID int, op *storage.ApplyOperation, apply *storage.Apply) {
 	const reason = "operation has no tasks; invalid or stale claim"
-	if err := s.storage.ApplyOperations().MarkFailed(ctx, op.ID, reason); err != nil {
+	if err := s.storage.ApplyOperations().MarkFailed(opCtx, op.ID, reason); err != nil {
 		s.logger.Error("operator: failed to mark task-less apply_operation failed; operation will be retried",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
 		return
 	}
-	if err := s.updateApplyStateFromOperations(ctx, workerID, apply); err != nil {
+	if err := s.updateApplyStateFromOperations(applyCtx, workerID, apply); err != nil {
 		s.logger.Error("operator: failed to update derived apply state after failing task-less operation",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
@@ -442,11 +473,13 @@ func (s *Service) failOperationWithoutTasks(ctx context.Context, workerID int, o
 	}
 }
 
-// resumeClaimedApply drives claimed work through the engine with the apply lease
-// already attached to ctx. When applyOperationID is set (the operation-claim
-// path) it drives only that deployment's tasks via ResumeApplyOperation, so
-// sibling deployments are unaffected; when it is 0 (the legacy whole-apply path)
-// it drives every task of the apply via ResumeApply. Returns true when the work
+// resumeClaimedApply drives claimed work through the engine. When
+// applyOperationID is set (the operation-claim path) it drives only that
+// deployment's tasks via ResumeApplyOperation with both the operation lease (for
+// the operation's tasks) and the parent apply lease (for the applies.state the
+// engine still writes) attached to ctx, so sibling deployments are unaffected;
+// when it is 0 (the legacy whole-apply path) it drives every task of the apply
+// via ResumeApply with only the apply lease attached. Returns true when the work
 // resumed without error. Failures are logged and recorded as metrics internally;
 // the bool lets the operation-level claim loop decide whether to mark its
 // operation terminal, and the returned error lets it distinguish the fail-closed
@@ -586,8 +619,9 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 // startApplyOperationHeartbeat refreshes the claimed operation row's lease while
 // ResumeApply runs, at min(operatorPollInterval, ApplyOperationHeartbeatInterval)
 // so the row cannot go stale and be re-claimed by a peer even when the poll
-// interval is large. A lost parent apply lease cancels the run so the displaced
-// worker stops; other heartbeat errors are logged and retried on the next tick.
+// interval is large. The heartbeat writes under the operation lease, so a lost
+// operation lease cancels the run and the displaced worker stops; other
+// heartbeat errors are logged and retried on the next tick.
 // Returns a stop func that is safe to call more than once.
 func (s *Service) startApplyOperationHeartbeat(ctx context.Context, workerID int, op *storage.ApplyOperation, apply *storage.Apply, cancelRun context.CancelFunc) func() {
 	hbCtx, stop := context.WithCancel(ctx)
@@ -602,7 +636,7 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, workerID int
 			case <-ticker.C:
 				if err := s.storage.ApplyOperations().Heartbeat(hbCtx, op.ID); err != nil {
 					if errors.Is(err, storage.ErrApplyLeaseLost) {
-						s.logger.Warn("operator: apply_operation heartbeat lost parent apply lease; worker will stop",
+						s.logger.Warn("operator: apply_operation heartbeat lost operation lease; worker will stop",
 							"worker", workerID,
 							"apply_operation_id", op.ID,
 							"apply_id", apply.ApplyIdentifier,
