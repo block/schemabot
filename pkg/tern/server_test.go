@@ -34,6 +34,15 @@ func (c applyErrorClient) Apply(context.Context, *ternv1.ApplyRequest) (*ternv1.
 	return nil, c.err
 }
 
+type pullSchemaErrorClient struct {
+	Client
+	err error
+}
+
+func (c pullSchemaErrorClient) PullSchema(context.Context, *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	return nil, c.err
+}
+
 type noopControlClient struct {
 	Client
 }
@@ -93,6 +102,40 @@ func TestServerApplyMapsEngineRetryabilityToStatusCode(t *testing.T) {
 			server := NewServer(applyErrorClient{err: tc.err})
 
 			_, err := server.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: "plan-123"})
+			require.Error(t, err)
+			assert.Equal(t, tc.want, status.Code(err))
+		})
+	}
+}
+
+func TestServerPullSchemaMapsKnownErrorsToStatusCode(t *testing.T) {
+	testCases := []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{
+			name: "unsupported type",
+			err:  fmt.Errorf("vitess is not supported yet: %w", ErrPullSchemaUnsupportedType),
+			want: codes.Unimplemented,
+		},
+		{
+			name: "invalid request",
+			err:  fmt.Errorf("request type mismatch: %w", ErrPullSchemaInvalidRequest),
+			want: codes.InvalidArgument,
+		},
+		{
+			name: "unexpected error",
+			err:  errors.New("database unavailable"),
+			want: codes.Internal,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := NewServer(pullSchemaErrorClient{err: tc.err})
+
+			_, err := server.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
 			require.Error(t, err)
 			assert.Equal(t, tc.want, status.Code(err))
 		})

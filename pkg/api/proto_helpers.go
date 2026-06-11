@@ -13,6 +13,30 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+func pullSchemaResponseFromProto(resp *ternv1.PullSchemaResponse) *apitypes.PullSchemaResponse {
+	return &apitypes.PullSchemaResponse{
+		Database:    resp.Database,
+		Type:        resp.Type,
+		Environment: resp.Environment,
+		SchemaFiles: protoSchemaFilesToAPI(resp.SchemaFiles),
+		TableCount:  resp.TableCount,
+	}
+}
+
+func protoSchemaFilesToAPI(sf map[string]*ternv1.SchemaFiles) map[string]*apitypes.SchemaFiles {
+	result := make(map[string]*apitypes.SchemaFiles, len(sf))
+	for namespace, nsFiles := range sf {
+		if nsFiles == nil {
+			result[namespace] = &apitypes.SchemaFiles{Files: map[string]string{}}
+			continue
+		}
+		files := make(map[string]string, len(nsFiles.Files))
+		maps.Copy(files, nsFiles.Files)
+		result[namespace] = &apitypes.SchemaFiles{Files: files}
+	}
+	return result
+}
+
 // planResponseFromProto converts a protobuf PlanResponse to an HTTP PlanResponse.
 func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 	httpResp := &apitypes.PlanResponse{

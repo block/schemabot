@@ -46,6 +46,24 @@ type PlanRequest struct {
 	SourceTrusted bool `json:"-"`
 }
 
+type unsupportedPullSchemaError struct {
+	DatabaseType string
+}
+
+func (e *unsupportedPullSchemaError) Error() string {
+	return fmt.Sprintf("pull schema supports %s databases; got %s", storage.DatabaseTypeMySQL, e.DatabaseType)
+}
+
+type ambiguousPullSchemaTargetError struct {
+	Database    string
+	Environment string
+	Count       int
+}
+
+func (e *ambiguousPullSchemaTargetError) Error() string {
+	return fmt.Sprintf("pull schema for database %q environment %q resolves to %d deployments; pull schema currently requires an environment with exactly one deployment", e.Database, e.Environment, e.Count)
+}
+
 // RemoteDeploymentUnavailableError carries routing metadata for remote
 // schema change service availability failures so callers can render actionable
 // operator-facing errors without parsing strings.
@@ -64,6 +82,160 @@ func (e *RemoteDeploymentUnavailableError) Error() string {
 
 func (e *RemoteDeploymentUnavailableError) Unwrap() error {
 	return e.Err
+}
+
+// handlePullSchema handles POST /api/pull requests.
+func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
+	var req apitypes.PullSchemaRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if req.Database == "" {
+		s.writeError(w, http.StatusBadRequest, "database is required")
+		return
+	}
+	if req.Environment == "" {
+		s.writeError(w, http.StatusBadRequest, "environment is required")
+		return
+	}
+	if req.Type != "" {
+		switch req.Type {
+		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
+		default:
+			s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", or "+storage.DatabaseTypeStrata)
+			return
+		}
+	}
+
+	resp, err := s.ExecutePullSchema(r.Context(), req)
+	if err != nil {
+		var unsupportedErr *unsupportedPullSchemaError
+		if errors.As(err, &unsupportedErr) {
+			s.logger.Warn("pull schema rejected for unsupported database type", "database", req.Database, "environment", req.Environment, "type", unsupportedErr.DatabaseType)
+			s.writeError(w, http.StatusNotImplemented, err.Error())
+			return
+		}
+		var ambiguousErr *ambiguousPullSchemaTargetError
+		if errors.As(err, &ambiguousErr) {
+			s.logger.Warn("pull schema rejected for multi-deployment environment", "database", ambiguousErr.Database, "environment", ambiguousErr.Environment, "deployment_count", ambiguousErr.Count)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var unavailableErr *RemoteDeploymentUnavailableError
+		if errors.As(err, &unavailableErr) {
+			s.logger.Error("pull schema failed because remote deployment is unavailable",
+				"database", req.Database,
+				"environment", req.Environment,
+				"deployment", unavailableErr.Deployment,
+				"target", unavailableErr.Target,
+				"error", err)
+			s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable, "pull schema failed: "+err.Error())
+			return
+		}
+		s.logger.Error("pull schema failed", "database", req.Database, "environment", req.Environment, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "pull schema failed: "+err.Error())
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// ExecutePullSchema resolves a configured database route and fetches its live schema.
+func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchemaRequest) (*apitypes.PullSchemaResponse, error) {
+	ctx, span := otel.Tracer("schemabot").Start(ctx, "ExecutePullSchema",
+		trace.WithAttributes(
+			attribute.String("database", req.Database),
+			attribute.String("environment", req.Environment),
+			attribute.String("type", req.Type),
+		),
+	)
+	defer span.End()
+
+	resolvedTargets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve target")
+		return nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if len(resolvedTargets) != 1 {
+		ambiguousErr := &ambiguousPullSchemaTargetError{Database: req.Database, Environment: req.Environment, Count: len(resolvedTargets)}
+		span.RecordError(ambiguousErr)
+		span.SetStatus(otelcodes.Error, "ambiguous target")
+		return nil, ambiguousErr
+	}
+	resolvedTarget := resolvedTargets[0]
+	if req.Type != "" && req.Type != resolvedTarget.DatabaseType {
+		typeErr := fmt.Errorf("database %q type %q does not match server config type %q", req.Database, req.Type, resolvedTarget.DatabaseType)
+		span.RecordError(typeErr)
+		span.SetStatus(otelcodes.Error, "type mismatch")
+		return nil, typeErr
+	}
+	if resolvedTarget.DatabaseType != storage.DatabaseTypeMySQL {
+		unsupportedErr := &unsupportedPullSchemaError{DatabaseType: resolvedTarget.DatabaseType}
+		span.RecordError(unsupportedErr)
+		span.SetStatus(otelcodes.Error, "unsupported database type")
+		return nil, unsupportedErr
+	}
+
+	client, err := s.TernClient(resolvedTarget.Deployment, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "tern client")
+		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
+	}
+
+	s.logger.Info("ExecutePullSchema: calling client.PullSchema",
+		"database", req.Database,
+		"type", resolvedTarget.DatabaseType,
+		"deployment", resolvedTarget.Deployment,
+		"target", resolvedTarget.Target,
+		"environment", req.Environment,
+		"is_remote", client.IsRemote(),
+	)
+
+	resp, err := client.PullSchema(ctx, &ternv1.PullSchemaRequest{
+		Database:    req.Database,
+		Type:        resolvedTarget.DatabaseType,
+		Environment: req.Environment,
+		Target:      resolvedTarget.Target,
+	})
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "pull schema failed")
+		s.logger.Error("ExecutePullSchema: client.PullSchema failed",
+			"database", req.Database,
+			"type", resolvedTarget.DatabaseType,
+			"deployment", resolvedTarget.Deployment,
+			"target", resolvedTarget.Target,
+			"environment", req.Environment,
+			"endpoint", client.Endpoint(),
+			"is_remote", client.IsRemote(),
+			"error", err,
+		)
+		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
+			return nil, &RemoteDeploymentUnavailableError{
+				Deployment: resolvedTarget.Deployment,
+				Target:     resolvedTarget.Target,
+				Err:        err,
+			}
+		}
+		return nil, err
+	}
+
+	span.SetAttributes(attribute.Int("table_count", int(resp.TableCount)))
+	s.logger.Info("ExecutePullSchema: pull schema response",
+		"database", resp.Database,
+		"type", resp.Type,
+		"environment", resp.Environment,
+		"table_count", resp.TableCount,
+		"namespace_count", len(resp.SchemaFiles),
+	)
+
+	return pullSchemaResponseFromProto(resp), nil
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.

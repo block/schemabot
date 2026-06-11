@@ -486,6 +486,7 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/databases/{database}/environments", s.handleDatabaseEnvironments)
 
 	// Orchestration API
+	mux.HandleFunc("POST /api/pull", s.handlePullSchema)
 	mux.HandleFunc("POST /api/plan", s.handlePlan)
 	mux.HandleFunc("POST /api/apply", s.handleApply)
 	mux.HandleFunc("GET /api/progress/apply/{apply_id}", s.handleProgressByApplyID)

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -16,6 +17,24 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
+	content, err := pulledSchemaFileContent("orders", spirittable.TableSchema{
+		Name:   "users",
+		Schema: "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n", content)
+
+	_, err = pulledSchemaFileContent("orders", spirittable.TableSchema{
+		Name:   "broken_users",
+		Schema: "CREATE TABLE",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
+}
 
 type exactProgressApplyStore struct {
 	storage.ApplyStore

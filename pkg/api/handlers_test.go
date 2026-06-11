@@ -429,6 +429,9 @@ type mockTernClient struct {
 	planResp          *ternv1.PlanResponse
 	planErr           error
 	planReq           *ternv1.PlanRequest
+	pullSchemaResp    *ternv1.PullSchemaResponse
+	pullSchemaErr     error
+	pullSchemaReq     *ternv1.PullSchemaRequest
 	applyResp         *ternv1.ApplyResponse
 	applyErr          error
 	applyReq          *ternv1.ApplyRequest
@@ -463,6 +466,13 @@ type mockTernClient struct {
 }
 
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
+func (m *mockTernClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	m.pullSchemaReq = req
+	if m.pullSchemaResp != nil {
+		return m.pullSchemaResp, m.pullSchemaErr
+	}
+	return nil, m.pullSchemaErr
+}
 func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	m.planReq = req
 	if m.planResp != nil {
@@ -812,6 +822,155 @@ func TestExecutePlanUnavailableRemoteErrorIncludesDeployment(t *testing.T) {
 	assert.Equal(t, "pie", remoteErr.Deployment)
 	assert.Equal(t, "orders-staging", remoteErr.Target)
 	assert.Equal(t, codes.Unavailable, status.Code(err))
+}
+
+func TestExecutePullSchemaRoutesConfiguredMySQLTarget(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			SchemaFiles: map[string]*ternv1.SchemaFiles{
+				"orders": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "orders",
+		Environment: "production",
+		Type:        storage.DatabaseTypeMySQL,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "orders", resp.Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, resp.Type)
+	assert.Equal(t, int32(1), resp.TableCount)
+	require.NotNil(t, mockClient.pullSchemaReq)
+	assert.Equal(t, "orders-production", mockClient.pullSchemaReq.Target)
+	assert.Equal(t, "production", mockClient.pullSchemaReq.Environment)
+	assert.Equal(t, storage.DatabaseTypeMySQL, mockClient.pullSchemaReq.Type)
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", resp.SchemaFiles["orders"].Files["users.sql"])
+}
+
+func TestExecutePullSchemaRejectsUnsupportedType(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeVitess,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, cfg, map[string]tern.Client{
+		"primary/production": &mockTernClient{},
+	}, logger)
+
+	_, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "orders",
+		Environment: "production",
+		Type:        storage.DatabaseTypeVitess,
+	})
+
+	var unsupportedErr *unsupportedPullSchemaError
+	require.ErrorAs(t, err, &unsupportedErr)
+	assert.Equal(t, storage.DatabaseTypeVitess, unsupportedErr.DatabaseType)
+}
+
+func TestExecutePullSchemaRejectsMultiDeploymentEnvironment(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Deployments: map[string]DeploymentTarget{
+							"primary":   {Target: "orders-primary"},
+							"secondary": {Target: "orders-secondary"},
+						},
+					},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary":   {"production": "primary.example.com:80"},
+			"secondary": {"production": "secondary.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, cfg, map[string]tern.Client{}, logger)
+
+	_, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "orders",
+		Environment: "production",
+		Type:        storage.DatabaseTypeMySQL,
+	})
+
+	var ambiguousErr *ambiguousPullSchemaTargetError
+	require.ErrorAs(t, err, &ambiguousErr)
+	assert.Equal(t, "orders", ambiguousErr.Database)
+	assert.Equal(t, "production", ambiguousErr.Environment)
+	assert.Equal(t, 2, ambiguousErr.Count)
+}
+
+func TestPullSchemaHandlerRejectsMultiDeploymentEnvironment(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Deployments: map[string]DeploymentTarget{
+							"primary":   {Target: "orders-primary"},
+							"secondary": {Target: "orders-secondary"},
+						},
+					},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary":   {"production": "primary.example.com:80"},
+			"secondary": {"production": "secondary.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, cfg, map[string]tern.Client{}, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"orders","environment":"production","type":"mysql"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "resolves to 2 deployments")
 }
 
 func TestExecuteApplySourcePolicyAllowsDirectPlan(t *testing.T) {

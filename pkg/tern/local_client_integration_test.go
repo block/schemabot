@@ -441,6 +441,63 @@ func TestLocalClient_Health(t *testing.T) {
 	assert.NoError(t, client.Health(ctx), "Health() returned error")
 }
 
+// Pulling a live MySQL schema returns deterministic declarative files from the
+// data-plane database without preserving volatile AUTO_INCREMENT counters.
+func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container // container is managed by TestMain
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "open database")
+	defer utils.CloseAndLog(db)
+
+	_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `pull_schema_users`, `pull_schema_users_archive_2026_06_12`")
+	require.NoError(t, err, "drop old pull schema tables")
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		require.NoError(t, cleanupErr, "open database for pull schema cleanup")
+		defer utils.CloseAndLog(cleanupDB)
+		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `pull_schema_users`, `pull_schema_users_archive_2026_06_12`")
+		assert.NoError(t, cleanupErr, "drop pull schema tables")
+	})
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, PRIMARY KEY (`id`), UNIQUE KEY `idx_email` (`email`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create pull schema table")
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users_archive_2026_06_12` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create archive table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, nil, logger)
+	require.NoError(t, err, "create client")
+	defer utils.CloseAndLog(client)
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+	})
+
+	require.NoError(t, err, "pull schema")
+	require.NotNil(t, resp)
+	assert.Equal(t, "testdb", resp.Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, resp.Type)
+	assert.Equal(t, localClientTestEnvironment, resp.Environment)
+	require.Contains(t, resp.SchemaFiles, "testdb")
+	ddl := resp.SchemaFiles["testdb"].Files["pull_schema_users.sql"]
+	assert.Contains(t, ddl, "CREATE TABLE `pull_schema_users`")
+	assert.Contains(t, ddl, "`email` varchar(255) NOT NULL")
+	assert.NotContains(t, ddl, "AUTO_INCREMENT=")
+	assert.True(t, strings.HasSuffix(ddl, "\n"), "pulled schema file should end with a newline")
+	assert.NotContains(t, resp.SchemaFiles["testdb"].Files, "pull_schema_users_archive_2026_06_12.sql")
+}
+
 func TestLocalClient_Plan(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")

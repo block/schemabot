@@ -54,6 +54,22 @@ type SchemaFiles struct {
 	Files map[string]string `json:"files,omitempty"`
 }
 
+// PullSchemaRequest is the HTTP request body for POST /api/pull.
+type PullSchemaRequest struct {
+	Database    string `json:"database"`
+	Environment string `json:"environment"`
+	Type        string `json:"type"`
+}
+
+// PullSchemaResponse is the HTTP response body for POST /api/pull.
+type PullSchemaResponse struct {
+	Database    string                  `json:"database"`
+	Type        string                  `json:"type"`
+	Environment string                  `json:"environment"`
+	SchemaFiles map[string]*SchemaFiles `json:"schema_files"`
+	TableCount  int32                   `json:"table_count"`
+}
+
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
 	Database    string                  `json:"database"`
