@@ -545,12 +545,15 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, workerID int
 // markOperationFromApplyState transitions the claimed operation row to mirror
 // the parent apply's final state after a successful resume.
 //
-// It returns updated=true only when the operation row was durably written to a
-// terminal state, which is the signal the caller needs before deriving the
-// parent apply's state from its children. A non-terminal parent leaves the
-// operation claimable (updated=false, nil error) so a later poll re-leases and
-// resumes it; a write failure returns the error so the caller skips derivation
-// rather than aggregating a stale child state.
+// It returns updated=true whenever the operation row was durably written to
+// mirror the parent — including resumable final states (stopped,
+// failed_retryable), not only terminal ones. updated=true is the signal the
+// caller needs before deriving the parent apply's state from its children: the
+// child row now reflects the parent, so the derived state is current. A parent
+// that is still mid-flight leaves the operation claimable (updated=false, nil
+// error) so a later poll re-leases and resumes it; a write failure returns the
+// error so the caller skips derivation rather than aggregating a stale child
+// state.
 func (s *Service) markOperationFromApplyState(ctx context.Context, workerID int, op *storage.ApplyOperation, apply *storage.Apply) (updated bool, err error) {
 	opStore := s.storage.ApplyOperations()
 	switch {
