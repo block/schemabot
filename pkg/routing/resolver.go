@@ -1,6 +1,6 @@
-// Package targetresolver defines the boundary for turning logical SchemaBot
+// Package routing defines the boundary for turning logical SchemaBot
 // targets into execution targets.
-package targetresolver
+package routing
 
 import "context"
 
@@ -13,10 +13,10 @@ type Request struct {
 	Environment string
 }
 
-// Target is one execution target returned by a Resolver. A single logical
-// request can resolve to multiple targets when an environment fans out across
-// deployments.
-type Target struct {
+// ExecutionTarget is one execution target returned by a Resolver. A single
+// logical request can resolve to multiple targets when an environment fans out
+// across deployments.
+type ExecutionTarget struct {
 	DatabaseType string
 	Deployment   string
 	Target       string
@@ -24,5 +24,5 @@ type Target struct {
 
 // Resolver resolves logical SchemaBot targets to concrete execution targets.
 type Resolver interface {
-	ResolveTargets(ctx context.Context, req Request) ([]Target, error)
+	ResolveTargets(ctx context.Context, req Request) ([]ExecutionTarget, error)
 }
