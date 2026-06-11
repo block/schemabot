@@ -203,6 +203,91 @@ func TestFilterNonPassingNonSchemaBotChecks_RequiredChecks(t *testing.T) {
 	}
 }
 
+func TestIsAggregateCheckName(t *testing.T) {
+	cases := []struct {
+		name          string
+		checkName     string
+		aggregateBase string
+		want          bool
+	}{
+		{name: "base name matches", checkName: "SchemaBot", aggregateBase: "SchemaBot", want: true},
+		{name: "environment-scoped name matches", checkName: "SchemaBot (staging)", aggregateBase: "SchemaBot", want: true},
+		{name: "custom base environment-scoped name matches", checkName: "SchemaBot X (production)", aggregateBase: "SchemaBot X", want: true},
+		{name: "different base does not match", checkName: "SchemaBot X (staging)", aggregateBase: "SchemaBot", want: false},
+		{name: "prefix without parenthesized suffix does not match", checkName: "SchemaBot Lint", aggregateBase: "SchemaBot", want: false},
+		{name: "unrelated CI check does not match", checkName: "CI / unit-tests", aggregateBase: "SchemaBot", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isAggregateCheckName(tc.checkName, tc.aggregateBase))
+		})
+	}
+}
+
+// TestFilterNonPassingNonSchemaBotChecks_SiblingAggregate covers the
+// split-deployment topology where another deployment in the promotion chain
+// publishes its aggregate Check Run under a different GitHub App. When that
+// App's slug is configured as trusted, the aggregate is classified as a
+// SchemaBot check and never blocks applies. When the App is untrusted, the
+// same-named check is treated as ordinary external CI and its non-passing
+// conclusion blocks applies — name alone can never unblock the gate, so a
+// spoofed aggregate name cannot hide a failing check.
+func TestFilterNonPassingNonSchemaBotChecks_SiblingAggregate(t *testing.T) {
+	t.Run("trusted sibling aggregate does not block", func(t *testing.T) {
+		statuses := []ghclient.PRCheckStatus{
+			{Name: "SchemaBot (production)", Status: "completed", Conclusion: "action_required", AppSlug: "schemabot-production", IsSchemaBot: true},
+			{Name: "CI / unit-tests", Status: "completed", Conclusion: "failure"},
+		}
+
+		notPassing := filterNonPassingNonSchemaBotChecks(statuses, nil)
+
+		require.Len(t, notPassing, 1)
+		assert.Equal(t, "CI / unit-tests", notPassing[0].Name)
+		assert.Equal(t, "failure", notPassing[0].State)
+	})
+
+	t.Run("untrusted aggregate-named check blocks", func(t *testing.T) {
+		statuses := []ghclient.PRCheckStatus{
+			{Name: "SchemaBot (production)", Status: "completed", Conclusion: "action_required", AppSlug: "github-actions", IsSchemaBot: false},
+		}
+
+		notPassing := filterNonPassingNonSchemaBotChecks(statuses, nil)
+
+		require.Len(t, notPassing, 1)
+		assert.Equal(t, "SchemaBot (production)", notPassing[0].Name)
+		assert.Equal(t, "action_required", notPassing[0].State)
+	})
+}
+
+// TestFilterInProgressNonSchemaBotChecks_SiblingAggregate verifies the same
+// identity rule for in-flight checks: a trusted sibling deployment's
+// mid-apply aggregate does not block, while an untrusted aggregate-named
+// check that is still running blocks like any other in-progress CI.
+func TestFilterInProgressNonSchemaBotChecks_SiblingAggregate(t *testing.T) {
+	t.Run("trusted sibling aggregate does not block", func(t *testing.T) {
+		statuses := []ghclient.PRCheckStatus{
+			{Name: "SchemaBot (production)", Status: "in_progress", Conclusion: "", AppSlug: "schemabot-production", IsSchemaBot: true},
+			{Name: "CI / tests", Status: "in_progress", Conclusion: ""},
+		}
+
+		inProgress := filterInProgressNonSchemaBotChecks(statuses, nil)
+
+		require.Len(t, inProgress, 1)
+		assert.Equal(t, "CI / tests", inProgress[0].Name)
+	})
+
+	t.Run("untrusted aggregate-named check blocks", func(t *testing.T) {
+		statuses := []ghclient.PRCheckStatus{
+			{Name: "SchemaBot (production)", Status: "in_progress", Conclusion: "", AppSlug: "github-actions", IsSchemaBot: false},
+		}
+
+		inProgress := filterInProgressNonSchemaBotChecks(statuses, nil)
+
+		require.Len(t, inProgress, 1)
+		assert.Equal(t, "SchemaBot (production)", inProgress[0].Name)
+	})
+}
+
 func TestFilterInProgressNonSchemaBotChecks(t *testing.T) {
 	statuses := []ghclient.PRCheckStatus{
 		{Name: "CI / tests", Status: "in_progress", Conclusion: ""},

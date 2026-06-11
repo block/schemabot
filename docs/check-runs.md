@@ -6,6 +6,7 @@
 
 - [GitHub Check Concepts](#github-check-concepts)
 - [Safety Philosophy](#safety-philosophy)
+- [Cross-Deployment Trust Model](#cross-deployment-trust-model)
 - [Published Checks](#published-checks)
 - [Managed Schema Configs](#managed-schema-configs)
   - [Onboarding a schema directory](#onboarding-a-schema-directory)
@@ -115,6 +116,53 @@ changes, when the apply represented by the stored check state completes
 successfully, or when the current PR head no longer touches that managed
 database. Missing storage, a stale SHA, or ambiguous apply ownership is a
 failure to represent safety, not a reason to skip.
+
+## Cross-Deployment Trust Model
+
+In a split deployment, a later environment's promotion gate consumes a check
+run created by an earlier environment's deployment. Earlier environments are
+assumed to be lower-trust zones: staging typically has looser access controls
+than production, and its GitHub App credentials or runtime could be tampered
+with. The trust model bounds what that tampering can reach:
+
+> Cross-environment signals are evidence for sequencing, never authority for
+> execution. A prior environment's check decides when a later environment may
+> apply — never what DDL executes, who may request it, or whether safety lint
+> is bypassed.
+
+What a fully compromised earlier environment (able to publish arbitrary green
+aggregate checks) can and cannot affect in a later environment:
+
+| Later-environment control | Influenced by the earlier environment? |
+| --- | --- |
+| Promotion ordering (apply only after the prior environment) | Yes — defeated by a forged green check |
+| DDL content | No — the later deployment re-plans from the PR's schema files against its own database |
+| Actor authorization for `apply` / `apply-confirm` | No — evaluated by the later deployment |
+| Review gate (CODEOWNERS approval) | No |
+| Unsafe-change lint and `--allow-unsafe` | No — re-evaluated at the later environment's plan time |
+| Apply confirmation flow and locks | No |
+
+The bound holds because of rules that future changes must preserve:
+
+- **Single consumer.** The prior-environment check feeds exactly one decision:
+  the promotion gate. It must never feed actor policy, plan content, lint
+  decisions, or unsafe-change allowances.
+- **Identity, not names.** Gates trust check runs only from the GitHub App
+  identities in `trusted-check-app-slugs`. Forging the sequencing signal
+  requires compromising a chain App's credentials, not naming a check
+  cleverly. Aggregate-named checks from untrusted apps cannot satisfy the
+  promotion gate, cannot be excluded from the passing-checks gate, and are
+  surfaced with a warning log and metric.
+- **Per-commit evidence.** Checks bind to the PR head SHA, so a forged check
+  on one commit cannot bless another.
+- **Local re-validation is authoritative.** The later environment's plan and
+  lint run fresh against its own database; prior-environment evidence never
+  shortcuts them.
+
+The accepted residual risk: a compromised earlier environment defeats
+staging-first sequencing and nothing else. Hardening beyond that (such as
+signed attestations embedded in check output) is a non-goal — the remaining
+gates already do not trust the earlier environment.
 
 ## Published Checks
 
@@ -893,6 +941,13 @@ the prior environment's deployment uses a different GitHub App, its slug must
 be listed in `trusted-check-app-slugs`; otherwise its aggregate check is
 treated as untrusted and the gate fails closed, blocking the apply.
 
+The blocked comment distinguishes the two failure shapes because their
+remediations differ: when no check exists at all, it directs the user to plan
+and apply the prior environment; when a check exists but only from untrusted
+apps, it names those apps and directs an operator to the
+`trusted-check-app-slugs` config (or to investigate a possible impersonating
+check), since re-running the prior environment cannot change check ownership.
+
 Remote prior-environment checks use the aggregate because the current deployment
 does not have access to the other deployment's per-database storage. That makes
 the remote check stricter than the local check: a production apply can be
@@ -1001,6 +1056,13 @@ GitHub UI setup:
 2. Go to Branches and edit the branch protection rule.
 3. Enable "Require status checks to pass before merging".
 4. Select the SchemaBot aggregate check names used by the deployment.
+5. Pin each required SchemaBot check to the SchemaBot GitHub App that
+   publishes it (GitHub shows the source app next to each check). A required
+   check pinned by name only can be satisfied by any app that creates a
+   same-named passing check run — for example a GitHub Actions job — which
+   would let a PR merge without SchemaBot's verification. SchemaBot's own
+   gates verify App identity; pinning extends that to GitHub's merge gate,
+   which SchemaBot cannot enforce itself.
 
 GitHub API example for a single aggregate:
 

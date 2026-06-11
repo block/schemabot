@@ -757,6 +757,18 @@ func TestRenderApplyBlockedByMissingPriorEnvCheck(t *testing.T) {
 	assert.NotContains(t, result, "Retry the apply command")
 }
 
+func TestRenderApplyBlockedByUntrustedPriorEnvCheck(t *testing.T) {
+	result := RenderApplyBlockedByUntrustedPriorEnvCheck("staging", "SchemaBot (staging)", []string{"schemabot-staging"})
+
+	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "`SchemaBot (staging)`")
+	assert.Contains(t, result, "- `schemabot-staging`")
+	assert.Contains(t, result, "does not trust")
+	assert.Contains(t, result, "trusted-check-app-slugs")
+	assert.Contains(t, result, "Re-running `schemabot plan -e staging` will not resolve this")
+	assert.NotContains(t, result, "could not find a completed")
+}
+
 func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {
 	inProgress := []BlockingCheck{
 		{Name: "CI / unit-tests", State: "in_progress"},

@@ -6,14 +6,28 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// isAggregateCheckName reports whether a check name matches this deployment's
+// configured aggregate Check Run name: the base name itself or the
+// environment-scoped form "base (<env>)". Aggregate identity is decided by
+// the creating GitHub App, never by name — this predicate exists only to
+// flag aggregate-named checks from untrusted apps for operator triage.
+func isAggregateCheckName(name, aggregateBase string) bool {
+	if name == aggregateBase {
+		return true
+	}
+	return strings.HasPrefix(name, aggregateBase+" (") && strings.HasSuffix(name, ")")
+}
+
 // filterNonPassingNonSchemaBotChecks returns completed checks that block apply,
-// excluding SchemaBot's own checks. A completed check is ignored only when its
-// conclusion is "success", "neutral", or "skipped"; every other conclusion
-// (such as "failure", "timed_out", "cancelled", "action_required", "stale",
-// or "startup_failure") blocks apply, so unrecognized conclusions fail closed.
+// excluding checks created by trusted SchemaBot GitHub Apps. A completed check
+// is ignored only when its conclusion is "success", "neutral", or "skipped";
+// every other conclusion (such as "failure", "timed_out", "cancelled",
+// "action_required", "stale", or "startup_failure") blocks apply, so
+// unrecognized conclusions fail closed.
 func filterNonPassingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var notPassing []templates.BlockingCheck
 	filterRequiredChecks := statusesContainRequiredCheck(statuses, config)
@@ -96,6 +110,7 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 
 	notPassing := filterNonPassingNonSchemaBotChecks(statuses, config)
 	inProgress := filterInProgressNonSchemaBotChecks(statuses, config)
+	h.flagUntrustedAggregateNamedChecks(ctx, statuses, repo, pr, headSHA, environment)
 
 	if len(notPassing) > 0 {
 		h.logger.Info("apply blocked by non-passing PR checks",
@@ -136,8 +151,31 @@ func (h *Handler) githubAppDisplayNameForRepo(repo string, client *ghclient.Inst
 	return ""
 }
 
+// flagUntrustedAggregateNamedChecks surfaces PR checks that carry this
+// deployment's aggregate Check Run name but were not created by a trusted
+// SchemaBot GitHub App. Such a check is either a spoof attempt or a sibling
+// deployment whose App slug is missing from trusted-check-app-slugs; in both
+// cases it is treated as ordinary external CI (so a non-passing one blocks
+// applies), and operators need the app identity to tell the two apart.
+func (h *Handler) flagUntrustedAggregateNamedChecks(ctx context.Context, statuses []ghclient.PRCheckStatus, repo string, pr int, headSHA, environment string) {
+	aggregateBase := h.aggregateCheckNameForRepo(repo)
+	for _, s := range statuses {
+		if s.IsSchemaBot {
+			continue
+		}
+		if !isAggregateCheckName(s.Name, aggregateBase) {
+			continue
+		}
+		h.logger.Warn("aggregate-named check from untrusted GitHub App is treated as external CI and will block applies unless passing",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "environment", environment,
+			"check_name", s.Name, "app_slug", s.AppSlug,
+			"check_status", s.Status, "check_conclusion", s.Conclusion)
+		metrics.RecordUntrustedAggregateNamedCheck(ctx, repo, environment, s.AppSlug, metrics.CheckTrustGatePassingChecks)
+	}
+}
+
 // filterInProgressNonSchemaBotChecks returns checks that are still running,
-// excluding SchemaBot's own checks.
+// excluding checks created by trusted SchemaBot GitHub Apps.
 func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var inProgress []templates.BlockingCheck
 	filterRequiredChecks := statusesContainRequiredCheck(statuses, config)

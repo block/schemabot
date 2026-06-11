@@ -138,7 +138,7 @@ func TestFindCheckRunByNameIgnoresForeignAppCheckRuns(t *testing.T) {
 	})
 
 	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "schemabot")
-	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+	result, untrustedApps, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -146,6 +146,7 @@ func TestFindCheckRunByNameIgnoresForeignAppCheckRuns(t *testing.T) {
 	assert.Equal(t, "SchemaBot (staging)", result.Name)
 	assert.Equal(t, "completed", result.Status)
 	assert.Equal(t, "action_required", result.Conclusion)
+	assert.Equal(t, []string{"github-actions"}, untrustedApps, "the ignored foreign app is reported for triage")
 }
 
 // TestFindCheckRunByNameReturnsNilWhenOnlyForeignAppRunsExist covers a PR
@@ -164,10 +165,11 @@ func TestFindCheckRunByNameReturnsNilWhenOnlyForeignAppRunsExist(t *testing.T) {
 	})
 
 	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "schemabot")
-	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+	result, untrustedApps, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
 
 	require.NoError(t, err)
 	assert.Nil(t, result)
+	assert.Equal(t, []string{"github-actions"}, untrustedApps, "callers can distinguish an untrusted check from a missing one")
 }
 
 // TestFindCheckRunByNameReturnsMostRecentOwnAppRun covers a PR commit with
@@ -188,12 +190,13 @@ func TestFindCheckRunByNameReturnsMostRecentOwnAppRun(t *testing.T) {
 	})
 
 	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "schemabot")
-	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+	result, untrustedApps, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.Equal(t, int64(9), result.ID)
 	assert.Equal(t, "success", result.Conclusion)
+	assert.Empty(t, untrustedApps)
 }
 
 // TestFindCheckRunByNameErrorsWhenOwnAppSlugUnknown covers the case where the
@@ -215,13 +218,14 @@ func TestFindCheckRunByNameErrorsWhenOwnAppSlugUnknown(t *testing.T) {
 	})
 
 	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+	result, untrustedApps, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "check run ownership cannot be verified")
 	assert.Contains(t, err.Error(), "octocat/hello-world")
 	assert.Contains(t, err.Error(), "abc123")
 	assert.Nil(t, result)
+	assert.Empty(t, untrustedApps)
 	assert.Equal(t, int64(0), requests.Load())
 }
 
@@ -305,13 +309,14 @@ func TestFindCheckRunByNameAcceptsTrustedSiblingAppCheckRun(t *testing.T) {
 	})
 
 	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "schemabot-production", "schemabot-staging")
-	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+	result, untrustedApps, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.Equal(t, int64(3), result.ID)
 	assert.Equal(t, "completed", result.Status)
 	assert.Equal(t, "success", result.Conclusion)
+	assert.Equal(t, []string{"github-actions"}, untrustedApps)
 }
 
 // TestFindCheckRunByNameProceedsWithTrustedSlugsWhenOwnSlugUnknown covers a
@@ -331,12 +336,13 @@ func TestFindCheckRunByNameProceedsWithTrustedSlugsWhenOwnSlugUnknown(t *testing
 	})
 
 	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "", "schemabot-staging")
-	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+	result, untrustedApps, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.Equal(t, int64(4), result.ID)
 	assert.Equal(t, "success", result.Conclusion)
+	assert.Empty(t, untrustedApps)
 }
 
 // TestGetPRCheckStatusesClassifiesTrustedSiblingAppAsSchemaBot verifies that

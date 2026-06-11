@@ -361,7 +361,9 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 		assert.True(t, blocked, "a staging aggregate check from an unconfigured App must not satisfy the promotion gate")
 		select {
 		case body := <-comments:
-			assert.Contains(t, body, "staging")
+			assert.Contains(t, body, "`schemabot-staging`")
+			assert.Contains(t, body, "trusted-check-app-slugs")
+			assert.NotContains(t, body, "could not find a completed `staging` check")
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for staging block comment")
 		}
@@ -495,9 +497,10 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 
 	// A repository contributor can create a GitHub Actions job whose name matches
 	// the staging instance's aggregate Check Run. The promotion gate must only
-	// trust Check Runs created by SchemaBot's own GitHub App, so a passing
-	// same-named run from another app blocks the production apply as if the
-	// staging check were missing.
+	// trust Check Runs created by trusted SchemaBot GitHub Apps, so a passing
+	// same-named run from another app blocks the production apply — and the
+	// blocked comment names the untrusted app and points at the trust config
+	// instead of suggesting a staging re-plan that cannot fix it.
 	t.Run("same-named foreign-app success run blocks apply", func(t *testing.T) {
 		h, comments := setupCheckRunServer(t, []map[string]any{
 			{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "github-actions"}},
@@ -509,9 +512,13 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		select {
 		case body := <-comments:
 			assert.Contains(t, body, "Apply Blocked")
-			assert.Contains(t, body, "could not find a completed `staging` check")
+			assert.Contains(t, body, "`github-actions`")
+			assert.Contains(t, body, "does not trust")
+			assert.Contains(t, body, "trusted-check-app-slugs")
+			assert.Contains(t, body, "will not resolve this")
+			assert.NotContains(t, body, "could not find a completed `staging` check")
 		default:
-			t.Fatal("expected a comment explaining the missing prior environment check")
+			t.Fatal("expected a comment explaining the untrusted prior environment check")
 		}
 	})
 

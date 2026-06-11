@@ -441,6 +441,43 @@ func RecordCheckOwnershipMiss(ctx context.Context, operation, repository, databa
 	)
 }
 
+// Gates that evaluate check run trust, used as the gate attribute on
+// RecordUntrustedAggregateNamedCheck.
+const (
+	// CheckTrustGatePassingChecks is the require_passing_checks CI-health gate.
+	CheckTrustGatePassingChecks = "passing_checks"
+	// CheckTrustGatePromotion is the prior-environment promotion gate.
+	CheckTrustGatePromotion = "promotion"
+)
+
+// RecordUntrustedAggregateNamedCheck counts PR checks that carry a SchemaBot
+// aggregate Check Run name but were created by an untrusted GitHub App. A
+// sustained spike means either a check-name spoof attempt or a sibling
+// SchemaBot deployment missing from trusted-check-app-slugs; operators should
+// inspect the app_slug attribute and the matching warn logs to tell which.
+// The gate attribute distinguishes where the untrusted check surfaced: the
+// passing-checks gate (it blocks applies as external CI) or the promotion
+// gate (it cannot verify the prior environment).
+func RecordUntrustedAggregateNamedCheck(ctx context.Context, repository, environment, appSlug, gate string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.untrusted_aggregate_named_checks_total",
+		otelmetric.WithDescription("Total PR checks with a SchemaBot aggregate name from an untrusted GitHub App"),
+		otelmetric.WithUnit("{check}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create untrusted aggregate-named check counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("repository", repository),
+			EnvironmentAttribute(environment),
+			attribute.String("app_slug", appSlug),
+			attribute.String("gate", gate),
+		),
+	)
+}
+
 // AdjustActiveApplies increments or decrements the active applies gauge.
 // Use delta=1 when an apply is accepted and delta=-1 when it reaches a terminal state.
 func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment, environment string) {

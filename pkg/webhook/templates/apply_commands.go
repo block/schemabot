@@ -498,6 +498,30 @@ func RenderApplyBlockedByMissingPriorEnvCheck(priorEnv string) string {
 	return sb.String()
 }
 
+// RenderApplyBlockedByUntrustedPriorEnvCheck renders a comment when apply is
+// blocked because the prior environment's check exists on the PR head but was
+// created only by GitHub Apps this deployment does not trust. Re-running plan
+// or apply on the prior environment cannot fix this — the remediation is a
+// server config change (trusting the owning deployment's App) or removing a
+// spoofed check, so the comment must not suggest the plan/apply loop.
+func RenderApplyBlockedByUntrustedPriorEnvCheck(priorEnv, checkName string, untrustedApps []string) string {
+	var sb strings.Builder
+
+	sb.WriteString("## ❌ Apply Blocked\n\n")
+	fmt.Fprintf(&sb, "A `%s` check named `%s` exists on this PR, but it was created by a GitHub App this SchemaBot deployment does not trust:\n\n", priorEnv, checkName)
+	for _, app := range untrustedApps {
+		fmt.Fprintf(&sb, "- `%s`\n", app)
+	}
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "SchemaBot only verifies `%s` through check runs created by trusted SchemaBot deployment Apps.\n\n", priorEnv)
+	sb.WriteString("### Next steps\n")
+	fmt.Fprintf(&sb, "- If the App above is the SchemaBot deployment that owns `%s`, an operator must add its slug to `github.trusted-check-app-slugs` in this deployment's server config.\n", priorEnv)
+	sb.WriteString("- If you do not recognize the App, do not trust it — the check may be impersonating SchemaBot.\n\n")
+	fmt.Fprintf(&sb, "Re-running `schemabot plan -e %s` will not resolve this.\n", priorEnv)
+
+	return sb.String()
+}
+
 // RenderApplyBlockedByPriorEnvInProgress renders a comment when an apply is blocked
 // because a prior environment's apply is currently running.
 func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv string) string {

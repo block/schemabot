@@ -649,18 +649,20 @@ type CheckRunResult struct {
 // Only check runs created by a trusted SchemaBot GitHub App are considered:
 // this deployment's own App plus any configured trusted sibling deployment
 // Apps. A same-named check run created by any other app (for example a GitHub
-// Actions job configured with a matching name) is ignored, so it can never
-// satisfy a gate that relies on this lookup. When multiple trusted-app runs
+// Actions job configured with a matching name) can never satisfy a gate that
+// relies on this lookup; the slugs of such apps are returned so callers can
+// tell "no check exists" apart from "a check exists but its App is not
+// trusted" and surface the right remediation. When multiple trusted-app runs
 // share the name, the most recently created one (highest check run ID) is
 // returned.
 //
-// Returns nil if no trusted-app check run matches. Returns an error when the
-// own app slug is unknown and no trusted sibling slugs are configured — check
-// run ownership cannot be verified against anything, and callers must fail
-// closed instead of trusting a same-named run.
-func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*CheckRunResult, error) {
+// Returns a nil run if no trusted-app check run matches. Returns an error
+// when the own app slug is unknown and no trusted sibling slugs are
+// configured — check run ownership cannot be verified against anything, and
+// callers must fail closed instead of trusting a same-named run.
+func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*CheckRunResult, []string, error) {
 	if ic.loadAppSlug() == "" && len(ic.trustedCheckAppSlugs) == 0 {
-		return nil, fmt.Errorf("find check run %q on %s@%s: GitHub App slug is unavailable and no trusted sibling App slugs are configured, check run ownership cannot be verified", checkName, repo, headSHA)
+		return nil, nil, fmt.Errorf("find check run %q on %s@%s: GitHub App slug is unavailable and no trusted sibling App slugs are configured, check run ownership cannot be verified", checkName, repo, headSHA)
 	}
 
 	owner, repoName := splitRepo(repo)
@@ -673,10 +675,12 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 	}
 
 	var newest *CheckRunResult
+	var untrustedApps []string
+	seenUntrusted := make(map[string]struct{})
 	for {
 		result, resp, err := ic.client.Checks.ListCheckRunsForRef(ctx, owner, repoName, headSHA, opts)
 		if err != nil {
-			return nil, fmt.Errorf("list check runs named %q on %s@%s: %w", checkName, repo, headSHA, err)
+			return nil, nil, fmt.Errorf("list check runs named %q on %s@%s: %w", checkName, repo, headSHA, err)
 		}
 		if result != nil {
 			for _, run := range result.CheckRuns {
@@ -684,6 +688,11 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 					ic.logger.Warn("ignoring same-named check run created by an untrusted GitHub App",
 						"repo", repo, "head_sha", headSHA, "check_name", checkName,
 						"check_run_id", run.GetID(), "app_slug", run.GetApp().GetSlug())
+					slug := run.GetApp().GetSlug()
+					if _, seen := seenUntrusted[slug]; !seen {
+						seenUntrusted[slug] = struct{}{}
+						untrustedApps = append(untrustedApps, slug)
+					}
 					continue
 				}
 				if newest == nil || run.GetID() > newest.ID {
@@ -702,7 +711,7 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 		opts.Page = resp.NextPage
 	}
 
-	return newest, nil
+	return newest, untrustedApps, nil
 }
 
 // PRCheckStatus represents the status of a single PR check (check run or commit status).
@@ -710,7 +719,8 @@ type PRCheckStatus struct {
 	Name        string
 	Status      string // "completed", "in_progress", "queued"
 	Conclusion  string // "success", "failure", "neutral", "skipped", etc.
-	IsSchemaBot bool   // true if this is a SchemaBot check
+	AppSlug     string // creating GitHub App slug; empty for commit statuses
+	IsSchemaBot bool   // true if this check was created by a trusted SchemaBot GitHub App
 }
 
 // isOwnAppSlug returns true if the given slug belongs to this SchemaBot
@@ -792,6 +802,7 @@ func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo strin
 			Name:        r.Name,
 			Status:      r.Status,
 			Conclusion:  r.Conclusion,
+			AppSlug:     r.AppSlug,
 			IsSchemaBot: ic.isTrustedCheckAppSlug(r.AppSlug),
 		}
 	}

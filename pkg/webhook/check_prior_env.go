@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -226,7 +227,7 @@ func (h *Handler) checkPriorEnvViaGitHub(
 	}
 
 	checkName := aggregateCheckNameForEnv(h.aggregateCheckNameForRepo(repo), priorEnv)
-	checkResult, err := h.waitForGitHubPriorEnvCheck(ctx, client, repo, pr, database, environment, priorEnv, prInfo.HeadSHA, checkName)
+	checkResult, untrustedApps, err := h.waitForGitHubPriorEnvCheck(ctx, client, repo, pr, database, environment, priorEnv, prInfo.HeadSHA, checkName)
 	if err != nil {
 		h.logger.Error("failed to query GitHub check for prior environment, blocking apply",
 			"repo", repo, "pr", pr,
@@ -236,6 +237,26 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			"check_name", checkName, "error", err)
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "query check runs", err))
+		return true
+	}
+
+	if checkResult == nil && len(untrustedApps) > 0 {
+		// The prior environment's check exists on this commit but none of the
+		// creating apps are trusted — re-running plan/apply on the prior
+		// environment cannot fix this; only trusting the owning deployment's
+		// App (or removing a spoofed check) can.
+		h.logger.Warn("prior environment check exists only from untrusted GitHub Apps, blocking apply",
+			"repo", repo, "pr", pr,
+			"database", database,
+			"environment", environment, "prior_environment", priorEnv,
+			"head_sha", prInfo.HeadSHA,
+			"check_name", checkName,
+			"untrusted_app_slugs", untrustedApps)
+		for _, appSlug := range untrustedApps {
+			metrics.RecordUntrustedAggregateNamedCheck(ctx, repo, environment, appSlug, metrics.CheckTrustGatePromotion)
+		}
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByUntrustedPriorEnvCheck(priorEnv, checkName, untrustedApps))
 		return true
 	}
 
@@ -287,18 +308,20 @@ func (h *Handler) waitForGitHubPriorEnvCheck(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int,
 	database, environment, priorEnv, headSHA, checkName string,
-) (*ghclient.CheckRunResult, error) {
+) (*ghclient.CheckRunResult, []string, error) {
 	// Cross-instance prior environment checks depend on GitHub Check Run
 	// visibility. Retry briefly so ordering jitter does not cause an avoidable
 	// block, then fail closed if the required check is still missing or running.
 	attempts := h.priorEnvCheckMaxAttemptCount()
+	var untrustedApps []string
 	for attempt := 1; attempt <= attempts; attempt++ {
-		checkResult, err := client.FindCheckRunByName(ctx, repo, headSHA, checkName)
+		checkResult, untrusted, err := client.FindCheckRunByName(ctx, repo, headSHA, checkName)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		untrustedApps = untrusted
 		if !shouldRetryGitHubPriorEnvCheck(checkResult) || attempt == attempts {
-			return checkResult, nil
+			return checkResult, untrustedApps, nil
 		}
 
 		h.logger.Debug("prior environment GitHub check not ready, retrying",
@@ -310,11 +333,11 @@ func (h *Handler) waitForGitHubPriorEnvCheck(
 			"check_status", githubPriorEnvCheckStatus(checkResult),
 			"attempt", attempt, "max_attempts", attempts)
 		if err := h.waitBeforePriorEnvCheckRetry(ctx); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
-	return nil, nil
+	return nil, untrustedApps, nil
 }
 
 func shouldRetryGitHubPriorEnvCheck(check *ghclient.CheckRunResult) bool {
