@@ -205,17 +205,19 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 		return
 	}
 	ctx = storage.WithApplyLease(ctx, lease)
-	s.resumeClaimedApply(ctx, workerID, apply)
+	// Legacy FindNextApply path drives the whole apply (applyOperationID == 0).
+	s.resumeClaimedApply(ctx, workerID, apply, 0)
 }
 
 // recoverApplyOperation claims work at the apply_operations (per-deployment)
 // level: it leases one operation row, acquires the parent apply lease that
-// lease-guarded writes require, drives the apply through the shared resume path
-// while heartbeating the operation row, then marks the operation row terminal
-// from the parent apply's final state. While the apply-create dual-write emits
-// exactly one operation per apply, driving the parent apply is equivalent to
-// driving the single operation; this path is the foundation for the future
-// multi-deployment fan-out.
+// lease-guarded writes require, drives only that operation's tasks through the
+// shared resume path while heartbeating the operation row, then marks the
+// operation row terminal from the parent apply's final state. Scoping the drive
+// to the claimed operation is what lets sibling deployments run concurrently
+// once the multi-deployment fan-out lands; while the apply-create dual-write
+// emits exactly one operation per apply, the operation-scoped drive resolves to
+// the same tasks as the whole apply.
 func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner string) {
 	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx)
 	if err != nil {
@@ -278,7 +280,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 	stopHeartbeat := s.startApplyOperationHeartbeat(runCtx, workerID, op, apply, cancelRun)
 	defer stopHeartbeat()
 
-	resumed := s.resumeClaimedApply(runCtx, workerID, apply)
+	resumed := s.resumeClaimedApply(runCtx, workerID, apply, op.ID)
 	stopHeartbeat()
 	if !resumed {
 		return
@@ -389,11 +391,15 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 }
 
-// resumeClaimedApply drives a claimed apply through ResumeApply with the apply
-// lease already attached to ctx. Returns true when the apply resumed without
-// error. Failures are logged and recorded as metrics internally; the bool lets
-// the operation-level claim loop decide whether to mark its operation terminal.
-func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *storage.Apply) bool {
+// resumeClaimedApply drives claimed work through the engine with the apply lease
+// already attached to ctx. When applyOperationID is set (the operation-claim
+// path) it drives only that deployment's tasks via ResumeApplyOperation, so
+// sibling deployments are unaffected; when it is 0 (the legacy whole-apply path)
+// it drives every task of the apply via ResumeApply. Returns true when the work
+// resumed without error. Failures are logged and recorded as metrics internally;
+// the bool lets the operation-level claim loop decide whether to mark its
+// operation terminal.
+func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *storage.Apply, applyOperationID int64) bool {
 	lease := apply.Lease()
 	start := s.clock.Now()
 	s.logger.Info("operator: claimed apply",
@@ -440,7 +446,16 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 	if retryableClaim {
 		metrics.AdjustActiveApplies(ctx, 1, apply.Database, deployment, apply.Environment)
 	}
-	if err := client.ResumeApply(ctx, apply); err != nil {
+	// The operation-claim path scopes the drive to the single deployment it
+	// leased so sibling deployments are unaffected; ResumeApplyOperation fails
+	// closed when no tasks scope to the operation. The legacy whole-apply path
+	// (applyOperationID == 0) drives every task of the apply.
+	if applyOperationID > 0 {
+		err = client.ResumeApplyOperation(ctx, apply, applyOperationID)
+	} else {
+		err = client.ResumeApply(ctx, apply)
+	}
+	if err != nil {
 		if errors.Is(err, storage.ErrApplyLeaseLost) {
 			s.logger.Warn("operator: apply lease was lost; worker will stop writing this apply",
 				"worker", workerID,
