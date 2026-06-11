@@ -155,6 +155,39 @@ type Config struct {
 	Storage storage.Storage
 }
 
+// retryServiceConfig enables client-side retries for idempotent RPCs.
+//
+// The network path to a remote Tern deployment often crosses proxies and
+// service meshes, where brief connection resets or TLS handshake flaps
+// surface as UNAVAILABLE before the request reaches the server. Retrying
+// rides out sub-second blips instead of failing the caller's operation.
+//
+// Only RPCs that are safe to re-send are retried:
+//   - Plan: each attempt produces an independent plan record and only the
+//     returned plan ID is used, so a duplicate attempt is harmless.
+//   - Progress and Health: read-only.
+//
+// State-changing RPCs (Apply, Cutover, Stop, Start, Volume, Revert,
+// SkipRevert) are intentionally not retried here: re-sending them could
+// duplicate work or advance an apply twice, and the operator's durable
+// queue already owns redelivery for dispatch failures.
+const retryServiceConfig = `{
+	"methodConfig": [{
+		"name": [
+			{"service": "tern.v1.Tern", "method": "Plan"},
+			{"service": "tern.v1.Tern", "method": "Progress"},
+			{"service": "tern.v1.Tern", "method": "Health"}
+		],
+		"retryPolicy": {
+			"maxAttempts": 3,
+			"initialBackoff": "0.2s",
+			"maxBackoff": "2s",
+			"backoffMultiplier": 2.0,
+			"retryableStatusCodes": ["UNAVAILABLE"]
+		}
+	}]
+}`
+
 // NewGRPCClient creates a new gRPC client connected to the given address.
 //
 // The address may include a port (e.g. "tern.example.com:80"). The full
@@ -171,6 +204,7 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		config.Address,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithAuthority(host),
+		grpc.WithDefaultServiceConfig(retryServiceConfig),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", config.Address, err)

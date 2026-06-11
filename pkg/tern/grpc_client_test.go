@@ -113,6 +113,114 @@ func (s *mockTernServer) SkipRevert(ctx context.Context, req *ternv1.SkipRevertR
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
 }
 
+// flakyTernServer fails the first N calls of an RPC with UNAVAILABLE and then
+// succeeds, simulating a transient transport blip in front of a healthy
+// remote deployment.
+type flakyTernServer struct {
+	ternv1.UnimplementedTernServer
+	mu          sync.Mutex
+	planCalls   int
+	applyCalls  int
+	failPlans   int
+	failApplies int
+}
+
+func (s *flakyTernServer) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.planCalls++
+	if s.planCalls <= s.failPlans {
+		return nil, status.Error(codes.Unavailable, "upstream connect error")
+	}
+	return &ternv1.PlanResponse{PlanId: "plan-after-retry"}, nil
+}
+
+func (s *flakyTernServer) Apply(context.Context, *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applyCalls++
+	if s.applyCalls <= s.failApplies {
+		return nil, status.Error(codes.Unavailable, "upstream connect error")
+	}
+	return &ternv1.ApplyResponse{Accepted: true, ApplyId: "remote-apply-1"}, nil
+}
+
+func (s *flakyTernServer) calls() (plans, applies int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.planCalls, s.applyCalls
+}
+
+// newRetryTestClient starts an in-process Tern gRPC server and connects a
+// GRPCClient through the production constructor so the client's retry policy
+// is exercised.
+func newRetryTestClient(t *testing.T, server ternv1.TernServer) *GRPCClient {
+	t.Helper()
+
+	lis, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "localhost:0")
+	require.NoError(t, err, "failed to listen")
+
+	grpcServer := grpc.NewServer()
+	ternv1.RegisterTernServer(grpcServer, server)
+	go func() {
+		_ = grpcServer.Serve(lis)
+	}()
+
+	client, err := NewGRPCClient(Config{Address: lis.Addr().String()})
+	require.NoError(t, err, "failed to create client")
+
+	t.Cleanup(func() {
+		utils.CloseAndLog(client)
+		grpcServer.Stop()
+	})
+	return client
+}
+
+// A transient UNAVAILABLE on the network path in front of a remote deployment
+// must not fail a plan request: the client retries idempotent RPCs and
+// returns the successful response.
+func TestGRPCClientRetriesPlanOnUnavailable(t *testing.T) {
+	server := &flakyTernServer{failPlans: 1}
+	client := newRetryTestClient(t, server)
+
+	resp, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: "testdb"})
+
+	require.NoError(t, err)
+	assert.Equal(t, "plan-after-retry", resp.GetPlanId())
+	plans, _ := server.calls()
+	assert.Equal(t, 2, plans, "client should retry the failed plan attempt")
+}
+
+// Retries are bounded: a deployment that stays unavailable surfaces
+// UNAVAILABLE to the caller after the retry budget instead of retrying
+// forever.
+func TestGRPCClientPlanRetriesAreBounded(t *testing.T) {
+	server := &flakyTernServer{failPlans: 10}
+	client := newRetryTestClient(t, server)
+
+	_, err := client.Plan(t.Context(), &ternv1.PlanRequest{Database: "testdb"})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Unavailable, status.Code(err))
+	plans, _ := server.calls()
+	assert.Equal(t, 3, plans, "client should stop after the configured attempt budget")
+}
+
+// Apply is state-changing, so the client surfaces a transient UNAVAILABLE
+// instead of re-sending the request; the operator's durable queue owns
+// redelivery for dispatch failures.
+func TestGRPCClientDoesNotRetryApplyOnUnavailable(t *testing.T) {
+	server := &flakyTernServer{failApplies: 1}
+	client := newRetryTestClient(t, server)
+
+	_, err := client.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: "plan-1"})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Unavailable, status.Code(err))
+	_, applies := server.calls()
+	assert.Equal(t, 1, applies, "state-changing RPCs must not be retried")
+}
+
 // testClient creates a test server and returns a connected GRPCClient.
 func testClient(t *testing.T, server *mockTernServer) (*GRPCClient, func()) {
 	t.Helper()
