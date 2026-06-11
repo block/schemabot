@@ -26,6 +26,7 @@ type Client interface {
     RollbackPlan(ctx, database string) (*PlanResponse, error)
     Health(ctx) error
     ResumeApply(ctx, *storage.Apply) error
+    ResumeApplyOperation(ctx, *storage.Apply, applyOperationID int64) error
     Close() error
 }
 ```

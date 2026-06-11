@@ -56,6 +56,14 @@ type Client interface {
 	// use checkpoint/resume capabilities of the underlying engine.
 	ResumeApply(ctx context.Context, apply *storage.Apply) error
 
+	// ResumeApplyOperation starts or resumes a single apply_operation (one
+	// deployment of a multi-deployment apply), driving only that operation's
+	// tasks. The drive logic is identical to ResumeApply; the operation scope
+	// only narrows which tasks are loaded/re-queried so a worker can advance one
+	// deployment independently of its siblings. Fails closed when no tasks match
+	// the operation rather than touching the rest of the apply.
+	ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error
+
 	// Endpoint returns the address this client connects to.
 	// For GRPCClient, this is the dial address (e.g., "tern-staging:9090").
 	// For LocalClient, this is the database name.
