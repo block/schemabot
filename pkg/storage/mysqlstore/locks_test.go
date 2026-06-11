@@ -466,7 +466,7 @@ func TestLockStore_List(t *testing.T) {
 func TestLockStore_Update(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := newChangedRowsStore(t)
 
 	// Create lock
 	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
@@ -482,7 +482,7 @@ func TestLockStore_Update(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, initial)
 
-	// Wait 1 second to ensure updated_at will change (MySQL datetime has second precision)
+	// Wait 1 second so updated_at advances (MySQL DATETIME has second precision).
 	time.Sleep(1 * time.Second)
 
 	// Update lock (just touches updated_at)
@@ -498,10 +498,38 @@ func TestLockStore_Update(t *testing.T) {
 		"expected updated_at to change, initial: %v, updated: %v", initial.UpdatedAt, updated.UpdatedAt)
 }
 
+// Touching a lock twice within the same one-second DATETIME tick leaves
+// updated_at unchanged on the second write. Under production changed-rows
+// semantics that UPDATE reports zero affected rows, but the lock still exists,
+// so the touch must succeed rather than report the lock as missing.
+func TestLockStore_UpdateSameSecondSucceeds(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := newChangedRowsStore(t)
+
+	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName: "testdb",
+		DatabaseType: "vitess",
+		Repository:   "org/repo",
+		PullRequest:  123,
+		Owner:        "testuser",
+	}))
+
+	touch := &storage.Lock{DatabaseName: "testdb", DatabaseType: "vitess"}
+	require.NoError(t, store.Locks().Update(ctx, touch))
+	require.NoError(t, store.Locks().Update(ctx, touch),
+		"a same-second touch is a no-op UPDATE but the lock still exists")
+
+	lock, err := store.Locks().Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "testuser", lock.Owner)
+}
+
 func TestLockStore_UpdateNonExistent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := newChangedRowsStore(t)
 
 	err := store.Locks().Update(ctx, &storage.Lock{
 		DatabaseName: "nonexistent",
