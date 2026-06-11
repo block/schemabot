@@ -955,8 +955,9 @@ func TestApplyOperationStore_FindNextApplyOperation_RecoversStaleSetupPhase(t *t
 	ctx := t.Context()
 	store := New(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_setup_crash", 1, state.Apply.ApplyingBranchChanges, "staging")
+	require.Equal(t, storage.EnginePlanetScale, apply.Engine, "setup-phase states only occur for the PlanetScale engine")
 	_, err := testDB.ExecContext(ctx, `
 		UPDATE applies SET state = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
 	`, state.Apply.ApplyingBranchChanges, apply.ID)
@@ -981,6 +982,7 @@ func TestApplyOperationStore_FindNextApplyOperation_RecoversStaleSetupPhase(t *t
 	require.NoError(t, err)
 	require.NotNil(t, parent, "the stale setup-phase parent apply must be claimable so the operation can be driven")
 	assert.Equal(t, state.Apply.ApplyingBranchChanges, parent.State)
+	assert.Equal(t, storage.EnginePlanetScale, parent.Engine, "the reclaimed parent apply keeps its PlanetScale engine")
 	assert.Equal(t, "operator-a", parent.LeaseOwner)
 	assert.NotEmpty(t, parent.LeaseToken)
 }
