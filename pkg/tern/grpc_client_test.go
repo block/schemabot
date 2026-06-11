@@ -825,6 +825,50 @@ func TestGRPCClient_ResumeApplyOperationRejectsTasksFromAnotherApply(t *testing.
 	assert.Nil(t, server.getApplyRequest(), "foreign tasks must not be dispatched to remote Tern")
 }
 
+func TestGRPCClient_ResumeApplyOperationFailsClosedOnNoTasks(t *testing.T) {
+	// An operation that resolves to no tasks is an invalid or stale claim. The
+	// remote drive must fail closed without dispatching or mutating the parent
+	// apply — marking the whole apply failed would be wrong when only this one
+	// operation's lookup came back empty. Mirrors LocalClient.
+	server := &capturingTernServer{remoteApplyID: "remote-should-not-dispatch"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-op-scoped",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target", DeferCutover: true})
+	operationID := int64(42)
+
+	applyStore := &mockApplyStore{apply: apply}
+	taskStore := &mockTaskStore{tasks: nil}
+	client.storage = &mockStorage{
+		applies: applyStore,
+		tasks:   taskStore,
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-op-scoped",
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no tasks found for apply_operation 42")
+
+	assert.Equal(t, operationID, taskStore.lastOperationID, "drive must look up tasks scoped to the operation")
+	assert.Nil(t, server.getApplyRequest(), "an operation with no tasks must not be dispatched to remote Tern")
+	assert.Empty(t, applyStore.updates, "the parent apply must not be mutated when one operation lookup is empty")
+	assert.Equal(t, state.Apply.Pending, apply.State, "the parent apply state must be left untouched")
+}
+
 func TestGRPCClient_ResumeApplyLogsRemoteLifecycle(t *testing.T) {
 	// gRPC mode keeps the stored apply history in the control plane. When the
 	// operator dispatches work to a remote Tern service, operators should still

@@ -794,7 +794,27 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 	if applyOperationID <= 0 {
 		return fmt.Errorf("apply operation id is required")
 	}
-	return c.resumeApply(ctx, apply, operationApplyTaskScope(applyOperationID))
+	if c.storage == nil {
+		return fmt.Errorf("storage not configured for GRPCClient")
+	}
+	if apply == nil {
+		return fmt.Errorf("apply is required")
+	}
+	scope := operationApplyTaskScope(applyOperationID)
+	// Fail closed before any dispatch or state mutation: an operation that
+	// resolves to no tasks is an invalid or stale claim. The shared resume path
+	// would otherwise mark the whole parent apply failed (dispatchPendingApply
+	// and the remote-failure sites set applies.state regardless of scope), which
+	// is wrong when only this operation's lookup came back empty. Mirrors
+	// LocalClient.ResumeApplyOperation.
+	tasks, err := c.loadApplyTasks(ctx, apply, scope)
+	if err != nil {
+		return err
+	}
+	if len(tasks) == 0 {
+		return fmt.Errorf("no tasks found for apply_operation %d (apply %s)", applyOperationID, apply.ApplyIdentifier)
+	}
+	return c.resumeApply(ctx, apply, scope)
 }
 
 // resumeApply runs work claimed by the operator. Fresh queued applies have no
