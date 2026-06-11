@@ -445,6 +445,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context) (*stor
 	// so the operator can resume it. Like the stale-active clause, it carries
 	// no deployment-order gate — a stopped row already ran, so resuming it is
 	// recovering work it started rather than starting a new deployment.
+	//
+	// There is intentionally no "pending + pending start request" clause to
+	// match ApplyStore.FindNextApply's pending-start clause. That apply-level
+	// clause only matters because apply-level pending claimability is
+	// task-gated (state = pending AND EXISTS tasks); a start request lets a
+	// no-task pending apply be claimed. Operation-level pending claimability is
+	// instead deployment-order-gated (the clause below), so a pending operation
+	// is already claimable the moment it is legal to start — once every earlier
+	// sibling has completed. A parent start request must not relax that gate:
+	// adding an ungated pending-start clause would let a later deployment be
+	// claimed out of order while an earlier sibling is still non-completed, and
+	// a gated one would be redundant with the pending clause below. Start
+	// requests resume eligible work; they do not reorder the rollout.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations

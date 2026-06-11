@@ -916,6 +916,52 @@ func TestApplyOperationStore_FindNextApplyOperation_HaltsOnFailedSibling(t *test
 	assert.Nil(t, claimed, "later siblings must not be claimed once an earlier deployment failed")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_PendingStartRequestDoesNotBypassSiblingGate
+// verifies that a parent apply's pending start request does not let a later
+// pending deployment jump the deployment-order gate. Start requests resume
+// eligible work (e.g. a stopped operation); they must never reorder a rollout
+// by claiming a pending sibling while an earlier sibling is still non-completed.
+func TestApplyOperationStore_FindNextApplyOperation_PendingStartRequestDoesNotBypassSiblingGate(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_pending_start", 1, state.Apply.Running, "staging")
+
+	// region-a is running (fresh, so not stale-claimable); region-b is pending
+	// behind it. The earlier non-completed sibling gates the later pending one.
+	runningID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Running,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+
+	// A pending start request on the parent apply must not unblock region-b.
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a pending start request must not let a later pending sibling bypass the deployment-order gate")
+
+	// Sanity: once the earlier sibling completes, the gate opens normally —
+	// confirming the nil above was the order gate, not an unrelated skip.
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, runningID))
+	next, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, next, "region-b must be claimable once region-a completes")
+	assert.Equal(t, "region-b", next.Deployment)
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_IsolatesApplies verifies the
 // sibling gate is scoped per apply: a blocked deployment in one apply does not
 // hold back the first deployment of an unrelated apply.
