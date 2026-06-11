@@ -144,7 +144,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 		SourceTrusted: true,
 	}
 
-	planResp, err := h.service.ExecutePlan(ctx, planReq)
+	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())

@@ -73,6 +73,11 @@ type Handler struct {
 	service   *api.Service
 	ghClients github.ClientSet
 
+	// transientPlanRetryDelay overrides the pause before retrying a plan
+	// request that failed with transient remote unavailability. Zero means
+	// the package default.
+	transientPlanRetryDelay time.Duration
+
 	// webhookSecretsByApp maps each configured App's logical name to its
 	// HMAC webhook secret. In legacy single-App mode there is exactly one
 	// entry under defaultAppName. In multi-App mode there is one entry per

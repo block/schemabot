@@ -43,7 +43,7 @@ func (h *Handler) executeApply(
 		SourceTrusted: true,
 	}
 
-	planResp, err := h.service.ExecutePlan(ctx, planReq)
+	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
 	if err != nil {
 		h.logger.Error("plan execution failed on confirm", "repo", repo, "pr", pr, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())

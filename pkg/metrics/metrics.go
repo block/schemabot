@@ -267,6 +267,30 @@ func RecordStalePlanRejected(ctx context.Context, environment string) {
 	)
 }
 
+// RecordTransientPlanRetry increments the counter for webhook plan retries
+// after transient remote deployment unavailability. A spike with
+// outcome="exhausted" for one environment means the network path to that
+// remote deployment is down rather than flapping — investigate the
+// connectivity between this server and the deployment.
+func RecordTransientPlanRetry(ctx context.Context, database, environment, outcome string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.webhook.plan_transient_retry.total",
+		otelmetric.WithDescription("webhook plan retries after transient remote deployment unavailability"),
+		otelmetric.WithUnit("{retry}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create transient plan retry counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+			EnvironmentAttribute(environment),
+			attribute.String("outcome", outcome),
+		),
+	)
+}
+
 var knownSourcePolicyOperations = map[string]bool{
 	"plan":  true,
 	"apply": true,
