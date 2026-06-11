@@ -109,7 +109,8 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 	}
 
 	notPassing := filterNonPassingNonSchemaBotChecks(statuses, config)
-	inProgress := filterInProgressNonSchemaBotChecks(statuses, config)
+	missingRequired := missingRequiredChecks(statuses, config)
+	inProgress := append(filterInProgressNonSchemaBotChecks(statuses, config), missingRequired...)
 	h.flagUntrustedAggregateNamedChecks(ctx, statuses, config, repo, pr, headSHA, environment)
 
 	if len(notPassing) > 0 {
@@ -124,7 +125,8 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 	if len(inProgress) > 0 {
 		h.logger.Info("apply blocked by in-progress PR checks",
 			"repo", repo, "pr", pr, "environment", environment,
-			"in_progress_count", len(inProgress))
+			"in_progress_count", len(inProgress),
+			"missing_required_count", len(missingRequired))
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByInProgressChecks(environment, inProgress))
 		return true
@@ -206,6 +208,39 @@ func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 		}
 	}
 	return inProgress
+}
+
+// missingRequiredStateNotReported is the State surfaced for a configured
+// required check that GitHub has not yet reported on the PR commit. It mirrors
+// how a legacy commit status in the EXPECTED state maps to in_progress: GitHub
+// knows the check is owed but has not delivered a result, so apply must wait.
+const missingRequiredStateNotReported = "not reported"
+
+// missingRequiredChecks returns the configured required checks that GitHub has
+// not reported on the commit, by name regardless of which app owns the status.
+// An absent required check is treated as a blocking in-progress check so the
+// apply gate fails closed: a required check that has not reported must never
+// let an apply through. Returns nil when no required checks are configured,
+// since the gate then has no named checks to demand.
+func missingRequiredChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
+	if config == nil || len(config.RequiredChecks) == 0 {
+		return nil
+	}
+	reported := make(map[string]struct{}, len(statuses))
+	for _, s := range statuses {
+		reported[s.Name] = struct{}{}
+	}
+	var missing []templates.BlockingCheck
+	for _, name := range config.RequiredChecks {
+		if _, ok := reported[name]; ok {
+			continue
+		}
+		missing = append(missing, templates.BlockingCheck{
+			Name:  name,
+			State: missingRequiredStateNotReported,
+		})
+	}
+	return missing
 }
 
 func statusesContainRequiredCheck(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) bool {
