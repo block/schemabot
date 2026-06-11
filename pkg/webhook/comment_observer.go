@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
@@ -27,6 +28,7 @@ type CommentObserver struct {
 	applyID        int64
 	applyLease     storage.ApplyLease
 	deferCutover   bool
+	supportChannel api.SupportChannelConfig
 	logger         interface {
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
@@ -67,6 +69,7 @@ type CommentObserverConfig struct {
 	ApplyID        int64
 	ApplyLease     storage.ApplyLease
 	DeferCutover   bool
+	SupportChannel api.SupportChannelConfig
 	Logger         interface {
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
@@ -101,6 +104,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		applyID:        cfg.ApplyID,
 		applyLease:     cfg.ApplyLease,
 		deferCutover:   cfg.DeferCutover,
+		supportChannel: cfg.SupportChannel,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
@@ -316,7 +320,7 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 		return
 	}
 
-	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, body); err != nil {
+	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, o.renderPRComment(body)); err != nil {
 		o.logger.Error("observer: failed to edit comment", "error", err, "comment_state", commentState)
 		return
 	}
@@ -347,7 +351,7 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 		return
 	}
 
-	commentID, err := client.CreateIssueComment(ctx, o.repo, o.pr, body)
+	commentID, err := client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
 	if err != nil {
 		o.logger.Error("observer: failed to post comment", "error", err, "comment_state", commentState)
 		return
@@ -364,6 +368,10 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), comment); err != nil {
 		o.logger.Error("observer: failed to store comment ID", "error", err)
 	}
+}
+
+func (o *CommentObserver) renderPRComment(body string) string {
+	return appendSupportChannelFooter(body, o.supportChannel)
 }
 
 // markSummaryPosted upserts a summary marker record in apply_comments.

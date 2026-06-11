@@ -62,6 +62,18 @@ func PreviewCommentHelp() string {
 	return RenderHelpComment()
 }
 
+// PreviewCommentSupportChannel renders a sample error comment with a support-channel footer.
+func PreviewCommentSupportChannel() string {
+	support := SupportChannelData{
+		Name: "#schema-help",
+		URL:  "https://chat.example.com/schema-help",
+	}
+	return "### Invalid command\n\n" +
+		RenderSupportChannelFooter(RenderInvalidCommand(), support) +
+		"\n\n### Apply failure\n\n" +
+		RenderSupportChannelFooter(PreviewCommentApplyFailed(), support)
+}
+
 // PreviewCommentErrorNoConfig renders the "no config found" error comment.
 func PreviewCommentErrorNoConfig() string {
 	return RenderNoConfig(SchemaErrorData{

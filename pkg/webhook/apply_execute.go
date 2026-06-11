@@ -118,6 +118,7 @@ func (h *Handler) executeApply(
 		PR:             pr,
 		InstallationID: installationID,
 		DeferCutover:   options["defer_cutover"] == "true",
+		SupportChannel: h.supportChannel(),
 		Logger:         h.logger,
 		OnTerminalHook: func(apply *storage.Apply) {
 			updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, apply)

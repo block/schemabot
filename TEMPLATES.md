@@ -545,6 +545,77 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="support-channel-footer"></a><strong>Support Channel Footer</strong></summary>
+
+
+### Invalid command
+
+## ❌ Invalid Command
+
+That command wasn't recognized. Available commands:
+
+| Command | Description |
+|---------|-------------|
+| `schemabot plan [-e <env>]` | Preview schema changes |
+| `schemabot apply -e <env>` | Plan, lock, and confirm deployment |
+| `schemabot apply-confirm -e <env>` | Execute a locked plan |
+| `schemabot unlock` | Release lock and discard plan |
+| `schemabot stop <apply-id>` | Stop an in-progress deployment |
+| `schemabot start <apply-id>` | Resume a stopped deployment |
+| `schemabot cutover <apply-id>` | Complete a deferred cutover |
+| `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
+| `schemabot rollback-confirm -e <env>` | Execute a rollback |
+
+**Options**: `-e <env>` environment, `-d <db>` database, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
+
+**Quick start**: `plan` → `apply` → `apply-confirm`
+
+> 💬 Support: [#schema-help](https://chat.example.com/schema-help).
+
+### Apply failure
+
+## ❌ Schema Change Failed
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+📊 1/3 complete · 1 failed · 1 cancelled
+
+### Table Progress
+
+**`users`**: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`products`**: ⊘ Cancelled (not started)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+
+---
+
+To retry:
+```
+schemabot apply -e staging
+```
+
+> 💬 Support: [#schema-help](https://chat.example.com/schema-help).
+</details>
+
+<details>
 <summary><a name="no-config-no-d-flag"></a><strong>No Config (No -d Flag)</strong></summary>
 
 

@@ -103,6 +103,112 @@ func TestWebhookIgnoresUnknownEvents(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "ignored")
 }
 
+func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
+	t.Run("disabled without service config", func(t *testing.T) {
+		h := &Handler{}
+		assert.Equal(t, "hello", h.renderPRComment("hello"))
+	})
+
+	t.Run("does not append to normal comments", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment("hello\n")
+
+		assert.Equal(t, "hello\n", body)
+	})
+
+	t.Run("appends to help comments", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderHelpComment())
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
+	t.Run("appends to error comments", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderInvalidCommand())
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
+	t.Run("appends to apply failure comments", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.PreviewCommentApplyFailed())
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
+	t.Run("escapes markdown link text", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: `team]ops\help`,
+				URL:  "https://example.com/support",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderHelpComment())
+
+		assert.Contains(t, body, `[team\]ops\\help](https://example.com/support)`)
+	})
+
+	t.Run("does not duplicate footer", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		once := h.renderPRComment(templates.RenderHelpComment())
+		twice := h.renderPRComment(once)
+
+		assert.Equal(t, once, twice)
+	})
+
+	t.Run("does not append to plan comments", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment("## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n💡 **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+
+		assert.NotContains(t, body, "Support:")
+	})
+}
+
 func TestCheckRunRerequestIgnoresNonSchemaBotCheck(t *testing.T) {
 	h, _, _ := newTestHandler(t)
 

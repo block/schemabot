@@ -2583,6 +2583,76 @@ func TestPendingDropsConfig(t *testing.T) {
 	})
 }
 
+func TestSupportChannelConfig(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg := validConfig()
+		require.NoError(t, cfg.Validate())
+		assert.False(t, cfg.SupportChannel.Enabled())
+	})
+
+	t.Run("valid support channel", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{Name: "#schema-help", URL: "https://example.com/schema-help"}
+		require.NoError(t, cfg.Validate())
+		assert.True(t, cfg.SupportChannel.Enabled())
+	})
+
+	t.Run("name requires url", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{Name: "#schema-help"}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "support_channel.url is required")
+	})
+
+	t.Run("url requires name", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{URL: "https://example.com/schema-help"}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "support_channel.name is required")
+	})
+
+	t.Run("url must be absolute http", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{Name: "#schema-help", URL: "irc://example.com/schema-help"}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "support_channel.url must use http or https")
+	})
+
+	t.Run("url must not include credentials", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{Name: "#schema-help", URL: "https://user:pass@example.com/schema-help"}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "support_channel.url must not include credentials")
+	})
+
+	t.Run("url must not contain whitespace", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{Name: "#schema-help", URL: "https://example.com/schema help"}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "support_channel.url contains whitespace or control characters")
+	})
+
+	t.Run("url must not contain markdown-unsafe delimiters", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.SupportChannel = SupportChannelConfig{Name: "#schema-help", URL: "https://example.com/schema-help)"}
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "support_channel.url contains characters that are unsafe in Markdown links")
+	})
+}
+
 func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
 	dsnPath := filepath.Join(t.TempDir(), "target.dsn")
 	cfg := &ServerConfig{

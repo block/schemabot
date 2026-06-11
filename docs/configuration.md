@@ -12,6 +12,7 @@
 - [Hybrid Mode](#hybrid-mode)
 - [Operator Workers](#operator-workers)
 - [Pending Drops](#pending-drops)
+- [Support Channel](#support-channel)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
 - [Review Gate](#review-gate)
@@ -300,6 +301,22 @@ The cleaner only runs against local-mode MySQL databases (environments with a
 process has no target DSN and cannot clean that target. Cleanup runs only if the
 remote deployment is also a SchemaBot server with the target configured as
 local-mode MySQL and `cleanup_enabled: true`.
+
+## Support Channel
+
+SchemaBot can add an opt-in support link to GitHub PR comments so authors know
+where to ask for help when a plan, apply, gate, or command response needs
+operator attention.
+
+```yaml
+support_channel:
+  name: "#schema-help"
+  url: "https://chat.example.com/schema-help"
+```
+
+Both `name` and `url` are required when `support_channel` is configured. The
+URL must be an absolute `http` or `https` link with no credentials, whitespace,
+or Markdown link delimiters. When omitted, SchemaBot comments are unchanged.
 
 ## Repository Allowlist
 

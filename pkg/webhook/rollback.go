@@ -286,6 +286,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 			PR:             pr,
 			InstallationID: installationID,
 			ApplyID:        applyID,
+			SupportChannel: h.supportChannel(),
 			Logger:         h.logger,
 			OnTerminalHook: func(a *storage.Apply) {
 				updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, a)

@@ -31,9 +31,32 @@ var TimestampFunc = func() string {
 // NowFunc returns the current time. Override in previews for deterministic output.
 var NowFunc = time.Now
 
+// SupportChannelData configures an optional support destination shown in PR comments.
+type SupportChannelData struct {
+	Name string
+	URL  string
+}
+
 // currentTimestamp returns the current UTC time formatted for PR comments.
 func currentTimestamp() string {
 	return TimestampFunc()
+}
+
+// RenderSupportChannelFooter appends a support-channel footer to a rendered PR comment.
+func RenderSupportChannelFooter(body string, support SupportChannelData) string {
+	if support.Name == "" || support.URL == "" {
+		return body
+	}
+	footer := fmt.Sprintf("> 💬 Support: [%s](%s).", escapeMarkdownLinkText(support.Name), support.URL)
+	if strings.Contains(body, footer) {
+		return body
+	}
+	return strings.TrimRight(body, "\n") + "\n\n" + footer
+}
+
+func escapeMarkdownLinkText(text string) string {
+	text = strings.ReplaceAll(text, "\\", "\\\\")
+	return strings.ReplaceAll(text, "]", "\\]")
 }
 
 // writeErrorBlock writes an error message as a blockquote with warning emoji.

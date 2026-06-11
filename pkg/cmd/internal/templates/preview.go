@@ -117,6 +117,7 @@ const (
 	PreviewCommentVitessApplyPlan       PreviewType = "comment_vitess_apply_plan"       // Locked Vitess apply-plan with options
 	PreviewCommentMySQLMultiSchema      PreviewType = "comment_mysql_multi_schema"      // MySQL plan with multiple schema names
 	PreviewCommentHelp                  PreviewType = "comment_help"                    // Help command reference comment
+	PreviewCommentSupportChannel        PreviewType = "comment_support_channel"         // Comment with support-channel footer
 	PreviewCommentErrors                PreviewType = "comment_errors"                  // All error comment templates
 	PreviewCommentUnsafeBlocked         PreviewType = "comment_unsafe_blocked"          // Unsafe changes blocked (no --allow-unsafe)
 	PreviewCommentApplyPlan             PreviewType = "comment_apply_plan"              // Locked apply-plan comment

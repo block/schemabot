@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/secrets"
@@ -62,6 +64,10 @@ type ServerConfig struct {
 	// ReviewPolicy controls whose PR approvals satisfy the review gate before
 	// apply/apply-confirm proceeds.
 	ReviewPolicy ReviewPolicyConfig `yaml:"review_policy,omitempty"`
+
+	// SupportChannel adds an optional help link to GitHub PR comments posted by
+	// SchemaBot so PR authors know where to ask operators for help.
+	SupportChannel SupportChannelConfig `yaml:"support_channel,omitempty"`
 
 	// DefaultReviewers are GitHub teams/users required to review schema changes.
 	DefaultReviewers []string `yaml:"default_reviewers"`
@@ -162,6 +168,18 @@ type PendingDropsConfig struct {
 	// DryRun makes the cleaner log the tables it would drop without dropping
 	// them. The quarantine itself is unaffected.
 	DryRun bool `yaml:"dry_run,omitempty"`
+}
+
+// SupportChannelConfig configures an optional support destination shown in
+// GitHub PR comments posted by SchemaBot.
+type SupportChannelConfig struct {
+	Name string `yaml:"name,omitempty"`
+	URL  string `yaml:"url,omitempty"`
+}
+
+// Enabled reports whether support channel footer rendering is configured.
+func (c SupportChannelConfig) Enabled() bool {
+	return c.Name != "" && c.URL != ""
 }
 
 // PendingDropsEnabled reports whether the pending drops quarantine is enabled.
@@ -568,6 +586,9 @@ func (c *ServerConfig) Validate() error {
 	if err := validateReviewPolicy(c.ReviewPolicy); err != nil {
 		return err
 	}
+	if err := validateSupportChannel(c.SupportChannel); err != nil {
+		return err
+	}
 	if err := c.validateGitHubAppsConfig(); err != nil {
 		return err
 	}
@@ -684,6 +705,46 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 
+	return nil
+}
+
+func validateSupportChannel(c SupportChannelConfig) error {
+	if c.Name == "" && c.URL == "" {
+		return nil
+	}
+	if strings.TrimSpace(c.Name) != c.Name {
+		return fmt.Errorf("support_channel.name contains leading or trailing whitespace")
+	}
+	if strings.TrimSpace(c.URL) != c.URL {
+		return fmt.Errorf("support_channel.url contains leading or trailing whitespace")
+	}
+	if strings.ContainsAny(c.URL, "()\\") {
+		return fmt.Errorf("support_channel.url contains characters that are unsafe in Markdown links")
+	}
+	for _, r := range c.URL {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("support_channel.url contains whitespace or control characters")
+		}
+	}
+	if c.Name == "" {
+		return fmt.Errorf("support_channel.name is required when support_channel.url is set")
+	}
+	if c.URL == "" {
+		return fmt.Errorf("support_channel.url is required when support_channel.name is set")
+	}
+	parsed, err := url.Parse(c.URL)
+	if err != nil {
+		return fmt.Errorf("support_channel.url is invalid: %w", err)
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return fmt.Errorf("support_channel.url must use http or https")
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("support_channel.url must include a host")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("support_channel.url must not include credentials")
+	}
 	return nil
 }
 

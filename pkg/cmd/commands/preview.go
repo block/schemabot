@@ -75,7 +75,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentMultiEnvLint,
 		templates.PreviewCommentVitessPlan, templates.PreviewCommentVitessApplyPlan,
 		templates.PreviewCommentMySQLMultiSchema,
-		templates.PreviewCommentHelp,
+		templates.PreviewCommentHelp, templates.PreviewCommentSupportChannel,
 		templates.PreviewCommentErrors, templates.PreviewCommentUnsafeBlocked,
 		templates.PreviewCommentApplyPlan, templates.PreviewCommentApplyPlanOptions,
 		templates.PreviewCommentApplyPlanUnsafe,
@@ -226,6 +226,7 @@ Comment Templates (GitHub PR comments):
   comment_multi_env_diff        Multi-env plan (different plans per environment)
   comment_multi_env_lint        Multi-env plan with lint violations
   comment_help                  Help command reference comment
+  comment_support_channel       Comment with support-channel footer
   comment_errors                All error comment templates
   comment_unsafe_blocked        Unsafe changes blocked (no --allow-unsafe)
   comment_single_progress       Single table: running (most common case)

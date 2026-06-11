@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -269,7 +271,7 @@ func (h *Handler) postComment(repo string, pr int, installationID int64, body st
 		return
 	}
 
-	if _, err := client.CreateIssueComment(ctx, repo, pr, body); err != nil {
+	if _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body)); err != nil {
 		h.logger.Error("failed to post comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
 	}
@@ -287,7 +289,7 @@ func (h *Handler) postAndTrackComment(
 		return 0
 	}
 
-	commentID, err := client.CreateIssueComment(ctx, repo, pr, body)
+	commentID, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body))
 	if err != nil {
 		h.logger.Error("failed to post tracked comment",
 			"repo", repo, "pr", pr, "commentState", commentState, "error", err)
@@ -305,4 +307,51 @@ func (h *Handler) postAndTrackComment(
 	}
 
 	return commentID
+}
+
+func (h *Handler) renderPRComment(body string) string {
+	return appendSupportChannelFooter(body, h.supportChannel())
+}
+
+func (h *Handler) supportChannel() api.SupportChannelConfig {
+	cfg := h.config()
+	if cfg == nil {
+		return api.SupportChannelConfig{}
+	}
+	return cfg.SupportChannel
+}
+
+func appendSupportChannelFooter(body string, support api.SupportChannelConfig) string {
+	if !support.Enabled() || !shouldShowSupportChannel(body) {
+		return body
+	}
+	return templates.RenderSupportChannelFooter(body, templates.SupportChannelData{
+		Name: support.Name,
+		URL:  support.URL,
+	})
+}
+
+func shouldShowSupportChannel(body string) bool {
+	firstLine, _, _ := strings.Cut(body, "\n")
+	firstLine = strings.ToLower(firstLine)
+
+	if strings.Contains(firstLine, "help") {
+		return true
+	}
+	for _, marker := range []string{
+		"failed",
+		"blocked",
+		"not authorized",
+		"authorization check failed",
+		"invalid",
+		"missing",
+		"not found",
+		"no valid",
+		"multiple",
+	} {
+		if strings.Contains(firstLine, marker) {
+			return true
+		}
+	}
+	return strings.Contains(body, "⛔ Unsafe Changes Detected")
 }

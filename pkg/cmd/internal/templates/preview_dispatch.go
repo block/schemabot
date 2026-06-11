@@ -127,6 +127,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentMySQLMultiSchema())
 	case PreviewCommentHelp:
 		fmt.Print(webhooktemplates.PreviewCommentHelp())
+	case PreviewCommentSupportChannel:
+		fmt.Print(webhooktemplates.PreviewCommentSupportChannel())
 	case PreviewCommentErrors:
 		previewCommentErrorsOutput()
 	case PreviewCommentUnsafeBlocked:
