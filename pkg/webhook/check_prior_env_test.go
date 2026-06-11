@@ -372,12 +372,14 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 
 // TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed covers a
 // scoped SchemaBot instance (allowed_environments is configured) applying to an
-// environment that is not part of the configured promotion order. SchemaBot
-// cannot determine which environments must be applied first, so it cannot
-// enforce staging-first ordering. The apply must fail closed with a
-// configuration error instead of falling back to this instance's local
-// environment list, which would silently skip prior environments owned by other
-// instances.
+// environment that this instance handles but that the operator omitted from the
+// configured promotion order. The command reaches the gate because the target
+// environment is allowed, yet the promotion order cannot place it among its
+// prior environments. SchemaBot cannot determine which environments must be
+// applied first, so it cannot enforce staging-first ordering. The apply must
+// fail closed with a configuration error instead of falling back to this
+// instance's local environment list, which would silently skip prior
+// environments owned by other instances.
 func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testing.T) {
 	const (
 		repo = "octocat/hello-world"
@@ -398,7 +400,7 @@ func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testin
 
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	service := api.New(&emptyStorage{}, &api.ServerConfig{
-		AllowedEnvironments: []string{"production"},
+		AllowedEnvironments: []string{"production", "canary"},
 		EnvironmentOrder:    []string{"staging", "production"},
 		Databases: map[string]api.DatabaseConfig{
 			"orders": {
@@ -421,7 +423,7 @@ func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testin
 
 	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
 		"orders", "mysql", "canary", []string{"canary"}, 12345, "testuser")
-	assert.True(t, blocked, "scoped instance must fail closed when the target environment is not in the promotion order")
+	assert.True(t, blocked, "scoped instance must fail closed when an allowed target environment is absent from the promotion order")
 
 	select {
 	case body := <-comments:
