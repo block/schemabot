@@ -464,12 +464,24 @@ func TestOperator_OperationDeploymentMismatchFailsClosed(t *testing.T) {
 
 	// Having reached the guard, it must never drive the operation to a terminal
 	// state, because its deployment diverges from the parent apply's.
-	require.Never(t, func() bool {
-		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
-		require.NoError(t, err)
-		return op != nil && state.IsTerminalApplyState(op.State)
-	}, 3*time.Second, 200*time.Millisecond,
-		"operator must fail closed and never drive an operation whose deployment diverges from its parent apply")
+	neverTerminalDeadline := time.NewTimer(3 * time.Second)
+	defer neverTerminalDeadline.Stop()
+	neverTerminalPoll := time.NewTicker(200 * time.Millisecond)
+	defer neverTerminalPoll.Stop()
+
+	observingOperation := true
+	for observingOperation {
+		select {
+		case <-neverTerminalDeadline.C:
+			observingOperation = false
+		case <-neverTerminalPoll.C:
+			op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+			require.NoError(t, err)
+			if op != nil && state.IsTerminalApplyState(op.State) {
+				require.Failf(t, "operation reached terminal state", "operator must fail closed and never drive an operation whose deployment diverges from its parent apply; got state %q", op.State)
+			}
+		}
+	}
 
 	op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
 	require.NoError(t, err)
