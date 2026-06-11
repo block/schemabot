@@ -41,6 +41,14 @@ func writeErrorBlock(sb *strings.Builder, msg string) {
 	fmt.Fprintf(sb, "\n> ⚠️ **Error:** %s\n", msg)
 }
 
+// writeTableErrorLine writes a task's last error as a blockquote below its
+// progress line. Newlines are quoted so multi-line engine errors stay inside
+// the quote instead of escaping into the surrounding comment structure.
+func writeTableErrorLine(sb *strings.Builder, msg string) {
+	quoted := strings.ReplaceAll(msg, "\n", "\n> ")
+	fmt.Fprintf(sb, "> ⚠️ Last error: %s\n", quoted)
+}
+
 // writeSuccessBlock writes a success message as a blockquote.
 func writeSuccessBlock(sb *strings.Builder, msg string) {
 	fmt.Fprintf(sb, "\n> %s\n", msg)

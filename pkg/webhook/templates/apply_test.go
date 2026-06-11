@@ -212,7 +212,7 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	assert.NotContains(t, result, "failed_retryable")
 	// The retry detail lives on the affected table, not in the headline.
 	assert.Contains(t, result, "🔄 Interrupted — retrying automatically")
-	assert.Contains(t, result, "Last error: remote deployment unavailable")
+	assert.Contains(t, result, "> ⚠️ Last error: remote deployment unavailable")
 	assert.Contains(t, result, "🟧") // orange bar for the interrupted table
 	// Progress summary counts the retrying table.
 	assert.Contains(t, result, "1/2 complete")
@@ -256,6 +256,29 @@ func TestRenderApplyStatusComment_FailedRetryableUppercaseStatus(t *testing.T) {
 
 	assert.Contains(t, result, "🔄 Interrupted — retrying automatically")
 	assert.NotContains(t, result, "Running...")
+}
+
+// Engine errors can span multiple lines; every line must stay inside the
+// blockquote so the error cannot break the structure of the rest of the
+// comment.
+func TestRenderApplyStatusComment_FailedRetryableMultilineError(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.FailedRetryable,
+		Tables: []TableProgressData{
+			{
+				TableName:    "users",
+				DDL:          "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Status:       state.Task.FailedRetryable,
+				ErrorMessage: "rpc error: code = Unavailable\ndesc = upstream connect error",
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "> ⚠️ Last error: rpc error: code = Unavailable\n> desc = upstream connect error")
 }
 
 func TestRenderApplyStatusComment_Stopped(t *testing.T) {

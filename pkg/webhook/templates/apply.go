@@ -378,7 +378,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
-			fmt.Fprintf(sb, "Last error: %s\n", table.ErrorMessage)
+			writeTableErrorLine(sb, table.ErrorMessage)
 		}
 
 	case state.Task.Cancelled:
