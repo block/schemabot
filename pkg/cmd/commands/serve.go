@@ -341,9 +341,11 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	}
 
 	appID := serverConfig.GitHub.ResolveAppID()
-	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger)
+	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger,
+		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs))
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger)
-	logger.Info("GitHub webhook endpoint registered", "app_id", appID)
+	logger.Info("GitHub webhook endpoint registered",
+		"app_id", appID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs)
 	return webhookRuntime{
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
@@ -398,11 +400,13 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 			return webhookRuntime{}, fmt.Errorf("app %q webhook secret resolved to empty value", e.name)
 		}
 
-		clients[e.name] = ghclient.NewClient(e.id, []byte(privateKey), logger)
+		clients[e.name] = ghclient.NewClient(e.id, []byte(privateKey), logger,
+			ghclient.WithTrustedCheckAppSlugs(e.cfg.TrustedCheckAppSlugs))
 		secretsByApp[e.name] = []byte(secret)
 		appByID[e.id] = e.name
 
-		logger.Info("registered GitHub App", "app_name", e.name, "app_id", e.id)
+		logger.Info("registered GitHub App",
+			"app_name", e.name, "app_id", e.id, "trusted_check_app_slugs", e.cfg.TrustedCheckAppSlugs)
 	}
 
 	handler := webhook.NewHandlerWithDispatch(

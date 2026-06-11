@@ -475,7 +475,15 @@ github:
   private-key: "file:/run/secrets/prod-github-key.pem"
   webhook-secret: "env:PROD_WEBHOOK_SECRET"
   check-name: "SchemaBot X"
+  trusted-check-app-slugs:
+    - schemabot-staging  # the staging instance's GitHub App slug
 ```
+
+The production instance lists the staging instance's GitHub App slug in
+`trusted-check-app-slugs` so the promotion gate can verify the staging
+aggregate check run that the staging App created. Without it, the production
+instance only trusts check runs created by its own App, and the staging gate
+fails closed — production applies stay blocked even when staging is green.
 
 ### Environment-local gRPC targets
 
@@ -532,6 +540,8 @@ Do not require the staging ConfigMap to contain production targets, or the produ
 - **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates. Set `github.check-name` when independent SchemaBot gates need distinct visible names; every instance in the same promotion chain should use the same base name.
 
 - **Cross-instance environment verification:** Environment ordering (e.g., staging must succeed before production) works across instances. The production instance queries the GitHub Checks API for the staging instance's aggregate check to verify the prior environment completed successfully. GitHub check runs are the shared authority for cross-environment state; the production instance does not need staging target configuration to enforce the staging gate.
+
+- **Trusted check App slugs:** The promotion gate only accepts check runs created by trusted SchemaBot GitHub Apps, so a same-named check from an unrelated app (such as a GitHub Actions job) can never satisfy it. When instances use separate GitHub Apps, each instance that verifies a prior environment must list the owning instance's App slug in `github.trusted-check-app-slugs`; otherwise the prior environment's check is treated as untrusted and the gate fails closed, blocking applies. Trusted sibling App checks are also excluded from the `require_passing_checks` gate, the same as the instance's own checks — SchemaBot aggregate checks are governed by the promotion and merge gates, not the CI-health gate.
 
 - **Separate GitHub Apps:** Each instance needs its own GitHub App installation. Both Apps must be installed on the same repositories and configured to receive the same webhook events. GitHub delivers webhooks to all installed Apps independently.
 

@@ -287,6 +287,93 @@ func TestFetchSchemaFilesOptimizedSmallDirectory(t *testing.T) {
 	assert.Equal(t, "CREATE TABLE users (id INT);", files[0].Content)
 }
 
+// TestFindCheckRunByNameAcceptsTrustedSiblingAppCheckRun covers the
+// split-deployment topology where the looked-up check run was created by a
+// sibling SchemaBot deployment's GitHub App. The lookup must return the
+// sibling App's run when its slug is configured as trusted, while a
+// same-named run from an unconfigured app is still ignored.
+func TestFindCheckRunByNameAcceptsTrustedSiblingAppCheckRun(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 2,
+			"check_runs": []map[string]any{
+				{"id": 9, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "failure", "app": map[string]any{"slug": "github-actions"}},
+				{"id": 3, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot-staging"}},
+			},
+		}))
+	})
+
+	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "schemabot-production", "schemabot-staging")
+	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, int64(3), result.ID)
+	assert.Equal(t, "completed", result.Status)
+	assert.Equal(t, "success", result.Conclusion)
+}
+
+// TestFindCheckRunByNameProceedsWithTrustedSlugsWhenOwnSlugUnknown covers a
+// client that failed to fetch its own App slug but has trusted sibling slugs
+// configured. The configured slugs are statically verifiable, so the lookup
+// proceeds and matches the sibling App's run instead of failing closed on the
+// missing own slug.
+func TestFindCheckRunByNameProceedsWithTrustedSlugsWhenOwnSlugUnknown(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 1,
+			"check_runs": []map[string]any{
+				{"id": 4, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot-staging"}},
+			},
+		}))
+	})
+
+	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "", "schemabot-staging")
+	result, err := ic.FindCheckRunByName(t.Context(), "octocat/hello-world", "abc123", "SchemaBot (staging)")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, int64(4), result.ID)
+	assert.Equal(t, "success", result.Conclusion)
+}
+
+// TestGetPRCheckStatusesClassifiesTrustedSiblingAppAsSchemaBot verifies that
+// aggregate checks created by a trusted sibling SchemaBot deployment's App are
+// classified as SchemaBot checks. Sibling aggregate checks are governed by
+// SchemaBot's own promotion and merge gates, so the passing-checks gate must
+// not treat them as external CI that can block apply.
+func TestGetPRCheckStatusesClassifiesTrustedSiblingAppAsSchemaBot(t *testing.T) {
+	client, mux := setupRateLimitedTestGitHubServer(t)
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/status", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"state": "pending", "statuses": []map[string]any{}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 3,
+			"check_runs": []map[string]any{
+				{"id": 1, "name": "SchemaBot (production)", "status": "completed", "conclusion": "action_required", "app": map[string]any{"slug": "schemabot-production"}},
+				{"id": 2, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "action_required", "app": map[string]any{"slug": "schemabot-staging"}},
+				{"id": 3, "name": "ci/build", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "github-actions"}},
+			},
+		}))
+	})
+
+	ic := NewInstallationClientWithSlug(client, slog.New(slog.NewTextHandler(io.Discard, nil)), "schemabot-production", "schemabot-staging")
+	statuses, err := ic.GetPRCheckStatuses(t.Context(), "octocat/hello-world", "abc123", nil)
+
+	require.NoError(t, err)
+	require.Len(t, statuses, 3)
+	byName := make(map[string]PRCheckStatus, len(statuses))
+	for _, s := range statuses {
+		byName[s.Name] = s
+	}
+	assert.True(t, byName["SchemaBot (production)"].IsSchemaBot, "own App check must be classified as SchemaBot")
+	assert.True(t, byName["SchemaBot (staging)"].IsSchemaBot, "trusted sibling App check must be classified as SchemaBot")
+	assert.False(t, byName["ci/build"].IsSchemaBot, "unrelated app check must remain external CI")
+}
+
 func setupRateLimitedTestGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {
 	t.Helper()
 

@@ -197,9 +197,11 @@ func storedPriorEnvCheckStatus(check *storage.Check) string {
 // cannot query per-database check state from another instance, and it is safer to
 // require the entire environment to be healthy before promoting.
 //
-// Only Check Runs created by this GitHub App are trusted: a same-named check
-// run from another app (e.g. a GitHub Actions job) cannot satisfy the gate,
-// and when ownership cannot be verified the gate blocks the apply.
+// Only Check Runs created by a trusted SchemaBot GitHub App are accepted:
+// this deployment's own App or a configured trusted sibling deployment App
+// (github.trusted-check-app-slugs). A same-named check run from any other app
+// (e.g. a GitHub Actions job) cannot satisfy the gate, and when ownership
+// cannot be verified the gate blocks the apply.
 func (h *Handler) checkPriorEnvViaGitHub(
 	ctx context.Context, repo string, pr int,
 	database, environment, priorEnv string,

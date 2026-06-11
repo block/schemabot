@@ -214,6 +214,17 @@ type GitHubConfig struct {
 	// this App. Environment-scoped deployments append the environment in
 	// parentheses, for example "SchemaBot (staging)".
 	CheckName string `yaml:"check-name,omitempty"`
+
+	// TrustedCheckAppSlugs lists the GitHub App slugs of sibling SchemaBot
+	// deployments whose Check Runs this deployment trusts, in addition to its
+	// own App. Environment-scoped deployments that verify a prior
+	// environment's aggregate Check Run must list the App slug of the
+	// deployment that owns that environment here when it is a different
+	// GitHub App; otherwise the promotion gate cannot verify ownership of the
+	// prior environment's check and will block applies. Check Runs from Apps
+	// not in this list (and not this deployment's own App) never satisfy
+	// SchemaBot gates.
+	TrustedCheckAppSlugs []string `yaml:"trusted-check-app-slugs,omitempty"`
 }
 
 // CheckRunNameBase returns the configured aggregate GitHub Check Run base name.
@@ -721,11 +732,17 @@ func (c *ServerConfig) validateNoLocalRemoteRouteCollision() error {
 //   - If apps: is NOT set, repos must not declare github_app (it would be a
 //     silently ignored field, which we want to fail closed on).
 func (c *ServerConfig) validateGitHubAppsConfig() error {
-	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != ""
+	hasGitHub := c.GitHub.AppID != "" || c.GitHub.PrivateKey != "" || c.GitHub.WebhookSecret != "" || c.GitHub.CheckName != "" || len(c.GitHub.TrustedCheckAppSlugs) > 0
 	hasApps := c.Apps != nil
 
 	if hasGitHub && hasApps {
 		return fmt.Errorf("github: and apps: are mutually exclusive; configure one or the other")
+	}
+
+	if hasGitHub {
+		if err := validateUniqueNames("github.trusted-check-app-slugs", c.GitHub.TrustedCheckAppSlugs); err != nil {
+			return err
+		}
 	}
 
 	if hasApps {
@@ -744,6 +761,9 @@ func (c *ServerConfig) validateGitHubAppsConfig() error {
 			}
 			if app.WebhookSecret == "" {
 				return fmt.Errorf("app %q missing webhook-secret", name)
+			}
+			if err := validateUniqueNames(fmt.Sprintf("app %q trusted-check-app-slugs", name), app.TrustedCheckAppSlugs); err != nil {
+				return err
 			}
 		}
 		for repo, repoConfig := range c.Repos {

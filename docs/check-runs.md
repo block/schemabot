@@ -885,6 +885,14 @@ environment:
   environment aggregate check run from GitHub, such as `SchemaBot (staging)` or
   the deployment's configured check name.
 
+The GitHub lookup verifies which App created the check run: only this
+deployment's own GitHub App and the sibling deployment Apps listed in
+`github.trusted-check-app-slugs` are trusted, so a same-named check run from an
+unrelated app (such as a GitHub Actions job) can never satisfy the gate. When
+the prior environment's deployment uses a different GitHub App, its slug must
+be listed in `trusted-check-app-slugs`; otherwise its aggregate check is
+treated as untrusted and the gate fails closed, blocking the apply.
+
 Remote prior-environment checks use the aggregate because the current deployment
 does not have access to the other deployment's per-database storage. That makes
 the remote check stricter than the local check: a production apply can be

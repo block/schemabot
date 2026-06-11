@@ -256,6 +256,118 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 	}
 }
 
+// TestCheckPriorEnvironmentsCrossDeploymentAppTrust covers the split-deployment
+// topology where each environment is owned by a separate SchemaBot deployment
+// with its own GitHub App: the production deployment verifies staging through
+// the "SchemaBot (staging)" aggregate Check Run, which was created by the
+// staging deployment's App, not its own. The promotion gate must accept that
+// sibling App's check when its slug is configured as trusted — and must keep
+// failing closed when it is not, so an unconfigured deployment never trusts a
+// check it cannot attribute to a SchemaBot App.
+func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
+	const (
+		repo        = "octocat/hello-world"
+		pr          = 1
+		headSHA     = "abc123"
+		ownSlug     = "schemabot-production"
+		siblingSlug = "schemabot-staging"
+	)
+
+	productionScopedConfig := func() *api.ServerConfig {
+		return &api.ServerConfig{
+			AllowedEnvironments: []string{"production"},
+			EnvironmentOrder:    []string{"staging", "production"},
+			Databases: map[string]api.DatabaseConfig{
+				"orders": {
+					Type: "mysql",
+					Environments: map[string]api.EnvironmentConfig{
+						"production": {Deployment: "default", Target: "orders"},
+					},
+				},
+			},
+		}
+	}
+
+	setup := func(t *testing.T, installClient *ghclient.InstallationClient) (*Handler, chan string) {
+		t.Helper()
+		comments := make(chan string, 10)
+
+		service := api.New(&emptyStorage{}, productionScopedConfig(), nil, testLogger())
+		t.Cleanup(func() { utils.CloseAndLog(service) })
+
+		return &Handler{
+			service:                    service,
+			ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+			logger:                     testLogger(),
+			priorEnvCheckMaxAttempts:   1,
+			priorEnvCheckRetryInterval: time.Nanosecond,
+		}, comments
+	}
+
+	registerGitHubEndpoints := func(t *testing.T, mux *http.ServeMux, comments chan string) {
+		t.Helper()
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"head": map[string]any{"sha": headSHA, "ref": "feature"},
+				"base": map[string]any{"sha": "base123", "ref": "main"},
+				"user": map[string]any{"login": "testuser"},
+			})
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"total_count": 1,
+				"check_runs": []map[string]any{
+					{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": siblingSlug}},
+				},
+			})
+		})
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+	}
+
+	t.Run("trusted sibling app check satisfies the promotion gate", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), ownSlug, siblingSlug)
+		h, comments := setup(t, installClient)
+		registerGitHubEndpoints(t, mux, comments)
+
+		blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+			"orders", "mysql", "production", []string{"production"}, 12345, "testuser")
+
+		assert.False(t, blocked, "a passing staging aggregate check from the trusted staging deployment App must allow production apply")
+		select {
+		case body := <-comments:
+			t.Fatalf("unexpected comment posted: %s", body)
+		default:
+		}
+	})
+
+	t.Run("unconfigured sibling app check fails closed", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), ownSlug)
+		h, comments := setup(t, installClient)
+		registerGitHubEndpoints(t, mux, comments)
+
+		blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+			"orders", "mysql", "production", []string{"production"}, 12345, "testuser")
+
+		assert.True(t, blocked, "a staging aggregate check from an unconfigured App must not satisfy the promotion gate")
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "staging")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for staging block comment")
+		}
+	})
+}
+
 func TestCheckPriorEnvViaGitHub(t *testing.T) {
 	const (
 		repo    = "octocat/hello-world"

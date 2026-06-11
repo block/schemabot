@@ -45,6 +45,11 @@ type Client struct {
 	// after NewClient returns (holds the empty string if the fetch failed).
 	appSlug atomic.Pointer[string]
 
+	// trustedCheckAppSlugs lists sibling SchemaBot GitHub App slugs whose
+	// Check Runs this deployment trusts in addition to its own App. Static
+	// configuration set at construction; never mutated afterwards.
+	trustedCheckAppSlugs []string
+
 	// slugFetchMu serialises slug-fetch attempts so concurrent
 	// ForInstallation callers do not thundering-herd retry on startup
 	// failure. lastSlugAttempt is read+written only under this mutex.
@@ -70,6 +75,19 @@ type Client struct {
 	// checks), so any memoisation window would risk converting a
 	// now-failing gate into a passing one.
 	checkStatusSingleflight *CheckStatusSingleflight
+}
+
+// ClientOption configures optional Client behavior at construction.
+type ClientOption func(*Client)
+
+// WithTrustedCheckAppSlugs configures the GitHub App slugs of sibling
+// SchemaBot deployments whose Check Runs this deployment trusts in addition
+// to its own App. Cross-deployment gates (such as the prior-environment
+// promotion gate) accept Check Runs created by these Apps.
+func WithTrustedCheckAppSlugs(slugs []string) ClientOption {
+	return func(c *Client) {
+		c.trustedCheckAppSlugs = slugs
+	}
 }
 
 // loadAppSlug returns the current app slug, or empty if not yet fetched.
@@ -102,13 +120,16 @@ const slugFetchRetryCooldown = 5 * time.Second
 // across every InstallationClient it produces, so concurrent webhook
 // deliveries and command bursts targeting the same (repo, sha) collapse to a
 // single upstream GitHub read.
-func NewClient(appID int64, privateKey []byte, logger *slog.Logger) *Client {
+func NewClient(appID int64, privateKey []byte, logger *slog.Logger, opts ...ClientOption) *Client {
 	c := &Client{
 		appID:                   appID,
 		privateKey:              privateKey,
 		logger:                  logger,
 		installations:           make(map[int64]*InstallationClient),
 		checkStatusSingleflight: NewCheckStatusSingleflight(),
+	}
+	for _, opt := range opts {
+		opt(c)
 	}
 	// Seed the atomic with the empty string so loadAppSlug never returns
 	// from a nil pointer.
@@ -202,6 +223,7 @@ func (c *Client) ForInstallation(installationID int64) (*InstallationClient, err
 		client:                  ghClient,
 		logger:                  c.logger,
 		installationID:          installationID,
+		trustedCheckAppSlugs:    c.trustedCheckAppSlugs,
 		checkStatusSingleflight: c.checkStatusSingleflight,
 	}
 	ic.storeAppSlug(slug)
@@ -217,11 +239,13 @@ func NewInstallationClient(client *gh.Client, logger *slog.Logger) *Installation
 	return NewInstallationClientWithSlug(client, logger, "")
 }
 
-// NewInstallationClientWithSlug creates an InstallationClient with an explicit app slug.
-func NewInstallationClientWithSlug(client *gh.Client, logger *slog.Logger, appSlug string) *InstallationClient {
+// NewInstallationClientWithSlug creates an InstallationClient with an explicit
+// app slug and, optionally, trusted sibling SchemaBot App slugs.
+func NewInstallationClientWithSlug(client *gh.Client, logger *slog.Logger, appSlug string, trustedCheckAppSlugs ...string) *InstallationClient {
 	ic := &InstallationClient{
-		client: client,
-		logger: logger,
+		client:               client,
+		logger:               logger,
+		trustedCheckAppSlugs: trustedCheckAppSlugs,
 	}
 	ic.storeAppSlug(appSlug)
 	return ic
@@ -240,6 +264,11 @@ type InstallationClient struct {
 	// this field after a slug recovery while concurrent isOwnAppSlug reads
 	// run on other goroutines.
 	appSlug atomic.Pointer[string]
+
+	// trustedCheckAppSlugs lists sibling SchemaBot GitHub App slugs whose
+	// Check Runs this deployment trusts in addition to its own App. Static
+	// configuration copied from the parent Client; never mutated.
+	trustedCheckAppSlugs []string
 
 	// checkStatusSingleflight is owned by the parent Client factory and
 	// shared across every InstallationClient it produces so concurrent
@@ -617,18 +646,21 @@ type CheckRunResult struct {
 }
 
 // FindCheckRunByName searches for a check run on a specific commit by name.
-// Only check runs created by this SchemaBot GitHub App are considered: a
-// same-named check run created by another app (for example a GitHub Actions
-// job configured with a matching name) is ignored, so it can never satisfy a
-// gate that relies on this lookup. When multiple own-app runs share the name,
-// the most recently created one (highest check run ID) is returned.
+// Only check runs created by a trusted SchemaBot GitHub App are considered:
+// this deployment's own App plus any configured trusted sibling deployment
+// Apps. A same-named check run created by any other app (for example a GitHub
+// Actions job configured with a matching name) is ignored, so it can never
+// satisfy a gate that relies on this lookup. When multiple trusted-app runs
+// share the name, the most recently created one (highest check run ID) is
+// returned.
 //
-// Returns nil if no own-app check run matches. Returns an error when the own
-// app slug is unknown — check run ownership cannot be verified, and callers
-// must fail closed instead of trusting a same-named run.
+// Returns nil if no trusted-app check run matches. Returns an error when the
+// own app slug is unknown and no trusted sibling slugs are configured — check
+// run ownership cannot be verified against anything, and callers must fail
+// closed instead of trusting a same-named run.
 func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*CheckRunResult, error) {
-	if ic.loadAppSlug() == "" {
-		return nil, fmt.Errorf("find check run %q on %s@%s: GitHub App slug is unavailable, check run ownership cannot be verified", checkName, repo, headSHA)
+	if ic.loadAppSlug() == "" && len(ic.trustedCheckAppSlugs) == 0 {
+		return nil, fmt.Errorf("find check run %q on %s@%s: GitHub App slug is unavailable and no trusted sibling App slugs are configured, check run ownership cannot be verified", checkName, repo, headSHA)
 	}
 
 	owner, repoName := splitRepo(repo)
@@ -648,8 +680,8 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 		}
 		if result != nil {
 			for _, run := range result.CheckRuns {
-				if !ic.isOwnAppSlug(run.GetApp().GetSlug()) {
-					ic.logger.Warn("ignoring same-named check run created by another GitHub App",
+				if !ic.isTrustedCheckAppSlug(run.GetApp().GetSlug()) {
+					ic.logger.Warn("ignoring same-named check run created by an untrusted GitHub App",
 						"repo", repo, "head_sha", headSHA, "check_name", checkName,
 						"check_run_id", run.GetID(), "app_slug", run.GetApp().GetSlug())
 					continue
@@ -696,9 +728,31 @@ func (ic *InstallationClient) isOwnAppSlug(slug string) bool {
 	return strings.EqualFold(slug, own)
 }
 
+// isTrustedCheckAppSlug returns true if the given slug belongs to a SchemaBot
+// deployment this instance trusts: its own App or a configured trusted sibling
+// deployment App. An empty slug never matches, so StatusContext rows (which
+// have no App) and unverifiable rows fail closed.
+func (ic *InstallationClient) isTrustedCheckAppSlug(slug string) bool {
+	if slug == "" {
+		return false
+	}
+	if ic.isOwnAppSlug(slug) {
+		return true
+	}
+	for _, trusted := range ic.trustedCheckAppSlugs {
+		if strings.EqualFold(slug, trusted) {
+			return true
+		}
+	}
+	return false
+}
+
 // GetPRCheckStatuses fetches check runs and commit statuses for a ref via REST.
-// SchemaBot's own check runs are identified via the GitHub App slug (more
-// reliable than name matching).
+// SchemaBot check runs are identified via the GitHub App slug (more reliable
+// than name matching): this deployment's own App plus any configured trusted
+// sibling deployment Apps. Sibling deployments' aggregate checks are governed
+// by SchemaBot's own promotion and merge gates, so they are classified as
+// SchemaBot checks rather than treated as external CI.
 //
 // Concurrent calls for the same (repo, ref) collapse to a single upstream
 // GitHub read via the Client-shared singleflight (when configured), so
@@ -738,7 +792,7 @@ func (ic *InstallationClient) GetPRCheckStatuses(ctx context.Context, repo strin
 			Name:        r.Name,
 			Status:      r.Status,
 			Conclusion:  r.Conclusion,
-			IsSchemaBot: ic.isOwnAppSlug(r.AppSlug),
+			IsSchemaBot: ic.isTrustedCheckAppSlug(r.AppSlug),
 		}
 	}
 	return out, nil

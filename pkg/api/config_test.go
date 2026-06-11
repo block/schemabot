@@ -2160,6 +2160,34 @@ func TestServerConfig_AppsValidation(t *testing.T) {
 			repos:  map[string]RepoConfig{"org/repo": {}},
 		},
 		{
+			name: "single-app github: with trusted check app slugs is accepted",
+			github: GitHubConfig{
+				AppID: "42", PrivateKey: "env:PK", WebhookSecret: "env:WS",
+				TrustedCheckAppSlugs: []string{"schemabot-staging"},
+			},
+			repos: map[string]RepoConfig{"org/repo": {}},
+		},
+		{
+			name: "single-app github: with empty trusted check app slug is rejected",
+			github: GitHubConfig{
+				AppID: "42", PrivateKey: "env:PK", WebhookSecret: "env:WS",
+				TrustedCheckAppSlugs: []string{""},
+			},
+			repos:      map[string]RepoConfig{"org/repo": {}},
+			wantErrSub: "github.trusted-check-app-slugs contains an empty value",
+		},
+		{
+			name: "app with duplicate trusted check app slugs is rejected",
+			apps: map[string]GitHubAppConfig{
+				"app-a": {
+					AppID: "12345", PrivateKey: "env:PK", WebhookSecret: "env:WS",
+					TrustedCheckAppSlugs: []string{"schemabot-staging", "schemabot-staging"},
+				},
+			},
+			repos:      map[string]RepoConfig{"org/repo": {GitHubApp: "app-a"}},
+			wantErrSub: `app "app-a" trusted-check-app-slugs contains duplicate value "schemabot-staging"`,
+		},
+		{
 			name: "well-formed multi-app config is accepted",
 			apps: map[string]GitHubAppConfig{
 				"app-a": validApp,
