@@ -77,14 +77,10 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 	if !cmd.SkipVerify {
 		fmt.Println()
 		fmt.Println("Verifying pulled schema against the source environment...")
-		verifyResult, err := verifyOnboardPlan(ep, resp, cmd.SchemaDir)
-		if err != nil {
+		if err := verifyOnboardPlan(ep, resp, cmd.SchemaDir); err != nil {
 			return err
 		}
 		fmt.Println("Verified: pulled schema produces no schema changes in the source environment.")
-		if lintErrorCount := len(verifyResult.LintErrors()); lintErrorCount > 0 {
-			fmt.Printf("Warning: pulled schema has %d lint errors; normal PR checks will report them.\n", lintErrorCount)
-		}
 	}
 	fmt.Println()
 	fmt.Println("Next: open a normal PR. SchemaBot plan comments and checks will reconcile other configured environments.")
@@ -227,18 +223,15 @@ func formatOnboardWriteError(operation, path string, written []string, err error
 	return fmt.Errorf("%s %s after writing files:\n  %s\nerror: %w", operation, path, strings.Join(written, "\n  "), err)
 }
 
-func verifyOnboardPlan(endpoint string, resp *apitypes.PullSchemaResponse, schemaDir string) (*apitypes.PlanResponse, error) {
+func verifyOnboardPlan(endpoint string, resp *apitypes.PullSchemaResponse, schemaDir string) error {
 	planResult, err := client.CallPlanAPI(endpoint, resp.Database, resp.Type, resp.Environment, schemaDir, "", 0)
 	if err != nil {
 		if outputPlanRequestError(resp.Database, resp.Environment, err) {
-			return nil, ErrSilent
+			return ErrSilent
 		}
-		return nil, fmt.Errorf("verify pulled schema for database %s environment %s: %w", resp.Database, resp.Environment, err)
+		return fmt.Errorf("verify pulled schema for database %s environment %s: %w", resp.Database, resp.Environment, err)
 	}
-	if err := validateOnboardPlanResult(planResult); err != nil {
-		return nil, err
-	}
-	return planResult, nil
+	return validateOnboardPlanResult(planResult)
 }
 
 func validateOnboardPlanResult(result *apitypes.PlanResponse) error {
