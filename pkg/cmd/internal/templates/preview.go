@@ -146,23 +146,24 @@ const (
 	PreviewCommentAll                     PreviewType = "comment_all"                        // Show all comment template previews
 
 	// Apply command comment previews (GitHub PR apply commands)
-	PreviewCommentApplyStartedType     PreviewType = "comment_apply_started"                // Apply started notification
-	PreviewCommentApplyWaiting         PreviewType = "comment_apply_waiting"                // Waiting for cutover notification
-	PreviewCommentUnlock               PreviewType = "comment_unlock"                       // Lock released confirmation
-	PreviewCommentApplyBlocked         PreviewType = "comment_apply_blocked"                // Apply blocked by another PR
-	PreviewCommentApplyBlockedCLI      PreviewType = "comment_apply_blocked_cli"            // Apply blocked by CLI session
-	PreviewCommentApplyActive          PreviewType = "comment_apply_active"                 // Apply already in progress
-	PreviewCommentApplyNoLock          PreviewType = "comment_apply_no_lock"                // No lock found
-	PreviewCommentBlockedByPriorEnv    PreviewType = "comment_blocked_prior_env"            // Blocked by staging (pending)
-	PreviewCommentBlockedByPriorFailed PreviewType = "comment_blocked_prior_env_failed"     // Blocked by staging (failed)
-	PreviewCommentBlockedByPriorInProg PreviewType = "comment_blocked_prior_env_inprogress" // Blocked by staging (in progress)
-	PreviewCommentReviewRequired       PreviewType = "comment_review_required"              // Review gate: approval needed
-	PreviewCommentReviewGateError      PreviewType = "comment_review_gate_error"            // Review gate: fail-closed error
-	PreviewCommentChecksGateNotPassing PreviewType = "comment_checks_gate_not_passing"      // Checks gate: non-passing CI/lint
-	PreviewCommentChecksGateInProgress PreviewType = "comment_checks_gate_in_progress"      // Checks gate: CI still running
-	PreviewCommentActorNotAuthorized   PreviewType = "comment_actor_not_authorized"         // Actor authorization: user is not allowed
-	PreviewCommentActorAuthUnavailable PreviewType = "comment_actor_auth_unavailable"       // Actor authorization: fail-closed error
-	PreviewCommentCutoverAccepted      PreviewType = "comment_cutover_accepted"             // Cutover command accepted
-	PreviewCommentCutoverActive        PreviewType = "comment_cutover_active"               // Cutover command when cutover is already in progress
-	PreviewCommentApplyAllType         PreviewType = "comment_apply_all"                    // Show all apply comment previews
+	PreviewCommentApplyStartedType      PreviewType = "comment_apply_started"                // Apply started notification
+	PreviewCommentApplyWaiting          PreviewType = "comment_apply_waiting"                // Waiting for cutover notification
+	PreviewCommentUnlock                PreviewType = "comment_unlock"                       // Lock released confirmation
+	PreviewCommentApplyBlocked          PreviewType = "comment_apply_blocked"                // Apply blocked by another PR
+	PreviewCommentApplyBlockedCLI       PreviewType = "comment_apply_blocked_cli"            // Apply blocked by CLI session
+	PreviewCommentApplyActive           PreviewType = "comment_apply_active"                 // Apply already in progress
+	PreviewCommentApplyNoLock           PreviewType = "comment_apply_no_lock"                // No lock found
+	PreviewCommentBlockedByPriorEnv     PreviewType = "comment_blocked_prior_env"            // Blocked by staging (pending)
+	PreviewCommentBlockedByPriorFailed  PreviewType = "comment_blocked_prior_env_failed"     // Blocked by staging (failed)
+	PreviewCommentBlockedByPriorInProg  PreviewType = "comment_blocked_prior_env_inprogress" // Blocked by staging (in progress)
+	PreviewCommentReviewRequired        PreviewType = "comment_review_required"              // Review gate: approval needed
+	PreviewCommentReviewGateError       PreviewType = "comment_review_gate_error"            // Review gate: fail-closed error
+	PreviewCommentChecksGateNotPassing  PreviewType = "comment_checks_gate_not_passing"      // Checks gate: non-passing CI/lint
+	PreviewCommentChecksGateInProgress  PreviewType = "comment_checks_gate_in_progress"      // Checks gate: CI still running
+	PreviewCommentActorNotAuthorized    PreviewType = "comment_actor_not_authorized"         // Actor authorization: user is not allowed
+	PreviewCommentActorAuthUnavailable  PreviewType = "comment_actor_auth_unavailable"       // Actor authorization: fail-closed error
+	PreviewCommentDatabaseNotConfigured PreviewType = "comment_database_not_configured"      // Actor authorization: database not configured on this instance
+	PreviewCommentCutoverAccepted       PreviewType = "comment_cutover_accepted"             // Cutover command accepted
+	PreviewCommentCutoverActive         PreviewType = "comment_cutover_active"               // Cutover command when cutover is already in progress
+	PreviewCommentApplyAllType          PreviewType = "comment_apply_all"                    // Show all apply comment previews
 )

@@ -4302,6 +4302,21 @@ A configured SchemaBot admin/database operator should inspect SchemaBot authoriz
 </details>
 
 <details>
+<summary><a name="actor-authorization-database-not-configured"></a><strong>Actor Authorization: Database Not Configured</strong></summary>
+
+
+## SchemaBot Command Not Authorized
+
+**Database**: `payments`
+
+`schemabot unlock` cannot run because database `payments` is not configured on this SchemaBot instance.
+
+Verify the database name, or run the command against the SchemaBot instance that manages this database.
+
+
+</details>
+
+<details>
 <summary><a name="cutover-command-accepted"></a><strong>Cutover Command Accepted</strong></summary>
 
 

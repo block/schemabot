@@ -104,6 +104,7 @@ func previewApplyCommandAllOutput() {
 		{"REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
 		{"ACTOR AUTHORIZATION: NOT AUTHORIZED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized()) }},
 		{"ACTOR AUTHORIZATION: UNAVAILABLE", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable()) }},
+		{"ACTOR AUTHORIZATION: DATABASE NOT CONFIGURED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandDatabaseNotConfigured()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
 		{"CHECKS GATE: NOT PASSING", func() {

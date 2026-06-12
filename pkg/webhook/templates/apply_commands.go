@@ -53,6 +53,22 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 	return sb.String()
 }
 
+// RenderPRCommandDatabaseNotConfigured renders a comment when a mutating PR
+// command targets a database that is not configured on this SchemaBot instance.
+// It is distinct from a plain authorization denial so operators do not waste a
+// round-trip assuming the actor lacks access when the database is simply absent.
+func RenderPRCommandDatabaseNotConfigured(data ActorAuthorizationCommentData) string {
+	var sb strings.Builder
+
+	sb.WriteString("## SchemaBot Command Not Authorized\n\n")
+	writeDBEnvLine(&sb, data.Database, data.Environment)
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "`schemabot %s` cannot run because database `%s` is not configured on this SchemaBot instance.\n\n", data.CommandName, data.Database)
+	sb.WriteString("Verify the database name, or run the command against the SchemaBot instance that manages this database.\n")
+
+	return sb.String()
+}
+
 // RenderPRCommandAuthorizationUnavailable renders a comment when SchemaBot
 // cannot verify actor authorization for a mutating PR command.
 func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData) string {

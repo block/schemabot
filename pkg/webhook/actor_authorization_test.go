@@ -266,6 +266,28 @@ func TestEnforcePRCommandActorAuthorizationComments(t *testing.T) {
 	assert.Contains(t, body, "`schemabot apply`")
 }
 
+// A mutating PR command targeting a database that is not configured on this
+// instance fails closed, but the comment distinguishes the missing-database
+// case from a plain access denial so operators do not retry assuming an
+// authorization problem.
+func TestEnforcePRCommandActorAuthorizationUnconfiguredDatabaseComment(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock)
+	assert.True(t, blocked)
+
+	body := requireComment(t, comments, "unconfigured-database authorization comment")
+	assert.Contains(t, body, "database `payments` is not configured on this SchemaBot instance")
+	assert.NotContains(t, body, "is not authorized")
+}
+
 func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 2)
@@ -376,13 +398,21 @@ func TestWebhookStopCommandBlocksUnauthorizedActor(t *testing.T) {
 // flow with actor authorization enabled. Rollback executes DDL against the
 // target database, so an actor who is not a configured admin/operator receives
 // a denial comment before SchemaBot generates a rollback plan or acquires a
-// lock.
+// lock. A conflicting lock is seeded so the test also proves the authorization
+// gate runs before the lock-conflict probe: an unauthorized actor must not be
+// able to learn lock ownership by probing apply IDs.
 func TestHandleRollbackCommandBlocksUnauthorizedActor(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 2)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 
-	locks := &actorAuthLockStore{}
+	locks := &actorAuthLockStore{locks: []*storage.Lock{{
+		DatabaseName: "orders",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Owner:        "octocat/other-repo#9",
+		Repository:   "octocat/other-repo",
+		PullRequest:  9,
+	}}}
 	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
 		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
 	})
@@ -395,6 +425,8 @@ func TestHandleRollbackCommandBlocksUnauthorizedActor(t *testing.T) {
 	assert.Contains(t, body, "SchemaBot Command Not Authorized")
 	assert.Contains(t, body, "@mona is not authorized")
 	assert.Contains(t, body, "`schemabot rollback`")
+	assert.NotContains(t, body, "Rollback Blocked", "denied rollback must not leak lock-conflict detail")
+	assert.NotContains(t, body, "octocat/other-repo#9", "denied rollback must not reveal the conflicting lock owner")
 	assert.Empty(t, locks.acquired, "denied rollback must not acquire a lock")
 }
 
@@ -540,6 +572,36 @@ func TestHandleUnlockCommandAllowsAuthorizedActor(t *testing.T) {
 	assert.Contains(t, body, "Lock Released")
 	assert.Contains(t, body, "@hubot")
 	assert.Equal(t, []string{"orders"}, locks.forceReleased)
+}
+
+// TestHandleUnlockCommandUnconfiguredDatabaseHint exercises the PR force-unlock
+// flow against a database that is not configured on this SchemaBot instance.
+// The actor authorization gate fails closed and no lock is released, but the
+// operator-facing comment differentiates the missing-database case from a plain
+// access denial so the operator does not assume an authorization problem.
+func TestHandleUnlockCommandUnconfiguredDatabaseHint(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	locks := &actorAuthLockStore{locks: []*storage.Lock{{
+		DatabaseName: "payments",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Owner:        "cli:dev@workstation",
+	}}}
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := actorAuthStorageTestHandler(cfg, &actorAuthStorage{locks: locks}, installClient)
+
+	h.handleUnlockCommand("octocat/hello-world", 1, 12345, "hubot", CommandResult{Action: action.Unlock, Force: true, Database: "payments"})
+
+	body := requireComment(t, comments, "unconfigured-database unlock comment")
+	assert.Contains(t, body, "database `payments` is not configured on this SchemaBot instance")
+	assert.NotContains(t, body, "is not authorized", "unconfigured database must not render a plain access denial")
+	assert.Empty(t, locks.forceReleased, "unconfigured database unlock must not force-release any lock")
+	assert.Empty(t, locks.released, "unconfigured database unlock must not release any lock")
 }
 
 func actorAuthRollbackApply() *storage.Apply {
