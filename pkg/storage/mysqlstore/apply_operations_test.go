@@ -1269,6 +1269,40 @@ func TestApplyOperationStore_FindNextApplyOperation_BarrierClaimsPastSiblingAtCu
 	assert.Equal(t, "region-b", claimed.Deployment)
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_BarrierClaimsPastSiblingInRevertWindow
+// verifies that revert_window — a PlanetScale post-cutover success state where
+// the schema change has already been applied — is treated as past the cutover
+// barrier under the barrier policy, so an earlier sibling sitting in its revert
+// window does not block a later deployment from starting its copy phase.
+func TestApplyOperationStore_FindNextApplyOperation_BarrierClaimsPastSiblingInRevertWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_barrier_revert_window", 1)
+
+	// region-a has cut over and is holding its post-cutover revert window;
+	// region-b is pending behind it. Both rows carry the barrier policy.
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.RevertWindow, CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	regionBID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	// region-a stays fresh so the stale-reclaim clause can't surface it — the
+	// only row that should be claimable is region-b, via the barrier relaxation.
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "barrier must let a later deployment copy once an earlier sibling reaches its post-cutover revert window")
+	assert.Equal(t, regionBID, claimed.ID)
+	assert.Equal(t, "region-b", claimed.Deployment)
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_RollingBlocksOnSiblingAtCutoverBarrier
 // verifies that the default rolling policy keeps the fully serial gate: an
 // earlier sibling parked at the cutover barrier (waiting_for_cutover) still
