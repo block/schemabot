@@ -156,6 +156,10 @@ func TestFileStatusForDryRunTreatsStatErrorsAsExisting(t *testing.T) {
 
 func TestValidateOnboardPlanResult(t *testing.T) {
 	assert.NoError(t, validateOnboardPlanResult(&apitypes.PlanResponse{Environment: "production"}))
+	assert.NoError(t, validateOnboardPlanResult(&apitypes.PlanResponse{
+		Environment: "production",
+		LintResults: []*apitypes.LintViolationResponse{{Severity: "error", Message: "existing lint violation"}},
+	}))
 
 	err := validateOnboardPlanResult(&apitypes.PlanResponse{
 		Environment: "production",
