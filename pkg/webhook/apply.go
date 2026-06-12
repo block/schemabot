@@ -23,12 +23,25 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task) template
 	if apply.CompletedAt != nil {
 		data.CompletedAt = apply.CompletedAt.Format(time.RFC3339)
 	}
+	data.Tables = tableProgressFromTasks(apply.Database, tasks)
+	return data
+}
+
+// tableProgressFromTasks maps storage tasks to per-table template rows. The
+// databaseFallback is used as a task's namespace when the task has none, so the
+// single-deployment and per-deployment builders render table identities the same
+// way.
+func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task) []templates.TableProgressData {
+	if len(tasks) == 0 {
+		return nil
+	}
+	out := make([]templates.TableProgressData, 0, len(tasks))
 	for _, t := range tasks {
 		ns := t.Namespace
 		if ns == "" {
-			ns = apply.Database
+			ns = databaseFallback
 		}
-		data.Tables = append(data.Tables, templates.TableProgressData{
+		out = append(out, templates.TableProgressData{
 			Namespace:       ns,
 			TableName:       t.TableName,
 			DDL:             t.DDL,
@@ -42,7 +55,7 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task) template
 			ErrorMessage:    t.ErrorMessage,
 		})
 	}
-	return data
+	return out
 }
 
 // formatProgressComment renders the progress comment using the template system.
