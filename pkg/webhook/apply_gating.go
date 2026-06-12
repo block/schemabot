@@ -109,8 +109,8 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 	}
 
 	notPassing := filterNonPassingNonSchemaBotChecks(statuses, config)
-	missingRequired := missingRequiredChecks(statuses, config)
-	inProgress := append(filterInProgressNonSchemaBotChecks(statuses, config), missingRequired...)
+	inProgress := filterInProgressNonSchemaBotChecks(statuses, config)
+	notReported := missingRequiredChecks(statuses, config)
 	h.flagUntrustedAggregateNamedChecks(ctx, statuses, config, repo, pr, headSHA, environment)
 
 	if len(notPassing) > 0 {
@@ -122,17 +122,28 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 		return true
 	}
 
-	if len(inProgress) > 0 {
-		h.logger.Info("apply blocked by in-progress PR checks",
+	if len(inProgress) > 0 || len(notReported) > 0 {
+		h.logger.Info("apply blocked: PR checks have not finished verifying this commit",
 			"repo", repo, "pr", pr, "environment", environment,
 			"in_progress_count", len(inProgress),
-			"missing_required_count", len(missingRequired))
+			"missing_required_count", len(notReported),
+			"missing_required_checks", blockingCheckNames(notReported))
 		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByInProgressChecks(environment, inProgress))
+			templates.RenderApplyBlockedByInProgressChecks(environment, inProgress, notReported))
 		return true
 	}
 
 	return false
+}
+
+// blockingCheckNames extracts the check names from a slice of blocking checks
+// so triage logs can name the checks rather than only count them.
+func blockingCheckNames(checks []templates.BlockingCheck) []string {
+	names := make([]string, 0, len(checks))
+	for _, c := range checks {
+		names = append(names, c.Name)
+	}
+	return names
 }
 
 func checkStatusReadLooksPermissionDenied(err error) bool {

@@ -116,7 +116,7 @@ func previewApplyCommandAllOutput() {
 			fmt.Print(webhooktemplates.RenderApplyBlockedByInProgressChecks("staging", []webhooktemplates.BlockingCheck{
 				{Name: "CI / unit-tests", State: "in_progress"},
 				{Name: "CI / integration-tests", State: "queued"},
-			}))
+			}, nil))
 		}},
 	}
 

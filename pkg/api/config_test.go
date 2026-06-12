@@ -386,6 +386,59 @@ func TestServerConfig_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "required checks reject the default aggregate check base name",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{DefaultGitHubCheckName},
+			},
+			wantErr: true,
+		},
+		{
+			name: "required checks reject the environment-scoped aggregate check name",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{DefaultGitHubCheckName + " (staging)"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "required checks reject a custom aggregate check base name",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				GitHub:         GitHubConfig{CheckName: "Acme SchemaBot"},
+				RequiredChecks: []string{"Acme SchemaBot (production)"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "required checks allow a name that merely shares the aggregate prefix",
+			cfg: ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type:         "mysql",
+						Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+					},
+				},
+				RequiredChecks: []string{DefaultGitHubCheckName + " Lint"},
+			},
+			wantErr: false,
+		},
+		{
 			name: "remote database target",
 			cfg: ServerConfig{
 				Databases: map[string]DatabaseConfig{
@@ -520,6 +573,59 @@ func TestServerConfig_Validate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A required_checks entry that names SchemaBot's own aggregate Check Run would
+// be silently unenforced: SchemaBot checks are excluded from the passing-checks
+// gate, so the gate would treat the named check as always satisfied. Config
+// validation rejects such an entry and the error names the offending entry and
+// the aggregate base so the operator can correct the typo.
+func TestServerConfig_ValidateRejectsAggregateRequiredCheck(t *testing.T) {
+	baseConfig := func(required []string) *ServerConfig {
+		return &ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type:         "mysql",
+					Environments: map[string]EnvironmentConfig{"staging": {DSN: "root@tcp(localhost)/mydb"}},
+				},
+			},
+			RequiredChecks: required,
+		}
+	}
+
+	t.Run("default aggregate base", func(t *testing.T) {
+		err := baseConfig([]string{"CI / lint", DefaultGitHubCheckName}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "required_checks entry \"SchemaBot\"")
+		assert.Contains(t, err.Error(), "would never be enforced")
+	})
+
+	t.Run("environment-scoped aggregate name", func(t *testing.T) {
+		err := baseConfig([]string{DefaultGitHubCheckName + " (production)"}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "required_checks entry \"SchemaBot (production)\"")
+	})
+
+	t.Run("multi-app aggregate base", func(t *testing.T) {
+		cfg := baseConfig([]string{"Acme Bot (staging)"})
+		cfg.Apps = map[string]GitHubAppConfig{
+			"acme": {
+				AppID:         "123",
+				PrivateKey:    "key",
+				WebhookSecret: "secret",
+				CheckName:     "Acme Bot",
+			},
+		}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "required_checks entry \"Acme Bot (staging)\"")
+		assert.Contains(t, err.Error(), "base \"Acme Bot\"")
+	})
+
+	t.Run("name sharing the aggregate prefix is allowed", func(t *testing.T) {
+		err := baseConfig([]string{DefaultGitHubCheckName + " Lint"}).Validate()
+		assert.NoError(t, err)
+	})
 }
 
 func TestServerConfig_ValidateRejectsLocalRemoteRouteCollision(t *testing.T) {
