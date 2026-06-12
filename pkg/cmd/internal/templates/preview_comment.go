@@ -105,6 +105,8 @@ func previewApplyCommandAllOutput() {
 		{"ACTOR AUTHORIZATION: NOT AUTHORIZED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized()) }},
 		{"ACTOR AUTHORIZATION: UNAVAILABLE", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable()) }},
 		{"ACTOR AUTHORIZATION: DATABASE NOT CONFIGURED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandDatabaseNotConfigured()) }},
+		{"START COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAccepted()) }},
+		{"START COMMAND ALREADY PENDING", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAlreadyRequested()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
 		{"CHECKS GATE: NOT PASSING", func() {
@@ -209,6 +211,8 @@ func previewCommentApplyFlowAllOutput() {
 		// Cutover states
 		{"WAITING FOR CUTOVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyWaitingForCutover()) }},
 		{"CUTTING OVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCuttingOver()) }},
+		{"START COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAccepted()) }},
+		{"START COMMAND ALREADY PENDING", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAlreadyRequested()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
 		// Summaries

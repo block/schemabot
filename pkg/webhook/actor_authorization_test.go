@@ -334,9 +334,10 @@ func TestHandleApplyCommandBlocksUnauthorizedActorBeforePlanning(t *testing.T) {
 	assert.Contains(t, body, "@mona is not authorized")
 }
 
-// Stop is a mutating PR comment command, so the full webhook path uses the same
-// configured admin/operator authorization as apply before recording durable stop intent.
-func TestWebhookStopCommandBlocksUnauthorizedActor(t *testing.T) {
+// Apply-scoped control commands are mutating PR comments, so the full webhook
+// path uses the same configured admin/operator authorization as apply before
+// recording durable operator intent.
+func TestWebhookApplyScopedControlCommandBlocksUnauthorizedActor(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 2)
 	reactions := make(chan string, 2)
@@ -371,27 +372,31 @@ func TestWebhookStopCommandBlocksUnauthorizedActor(t *testing.T) {
 		logger:    testLogger(),
 	}
 
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment:   "schemabot stop " + apply.ApplyIdentifier + " -e staging",
-		userLogin: "mona",
-		isPR:      true,
-	}, nil)
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "stop started")
+	for _, command := range []string{action.Stop, action.Start} {
+		t.Run(command, func(t *testing.T) {
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment:   "schemabot " + command + " " + apply.ApplyIdentifier + " -e staging",
+				userLogin: "mona",
+				isPR:      true,
+			}, nil)
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), command+" started")
 
-	select {
-	case reaction := <-reactions:
-		assert.Equal(t, "eyes", reaction)
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "timed out waiting for stop acknowledgement reaction")
+			select {
+			case reaction := <-reactions:
+				assert.Equal(t, "eyes", reaction)
+			case <-time.After(2 * time.Second):
+				require.FailNow(t, "timed out waiting for "+command+" acknowledgement reaction")
+			}
+
+			body := requireComment(t, comments, "unauthorized "+command+" comment")
+			assert.Contains(t, body, "SchemaBot Command Not Authorized")
+			assert.Contains(t, body, "@mona is not authorized")
+			assert.Contains(t, body, "`schemabot "+command+"`")
+		})
 	}
-
-	body := requireComment(t, comments, "unauthorized stop comment")
-	assert.Contains(t, body, "SchemaBot Command Not Authorized")
-	assert.Contains(t, body, "@mona is not authorized")
-	assert.Contains(t, body, "`schemabot stop`")
 }
 
 // TestHandleRollbackCommandBlocksUnauthorizedActor exercises the PR rollback

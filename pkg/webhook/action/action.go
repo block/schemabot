@@ -8,6 +8,7 @@ const (
 	ApplyConfirm    = "apply-confirm"
 	Unlock          = "unlock"
 	Stop            = "stop"
+	Start           = "start"
 	Cutover         = "cutover"
 	Revert          = "revert"
 	SkipRevert      = "skip-revert"

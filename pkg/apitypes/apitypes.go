@@ -253,7 +253,10 @@ type ControlResponse struct {
 	Status       string `json:"status,omitempty"`
 }
 
-const ControlStatusAlreadyInProgress = "already_in_progress"
+const (
+	ControlStatusAlreadyInProgress = "already_in_progress"
+	ControlStatusAlreadyRequested  = "already_requested"
+)
 
 // StopResponse is the HTTP response for POST /api/stop.
 type StopResponse struct {

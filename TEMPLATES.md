@@ -532,9 +532,9 @@ schemabot apply -e production
 | `schemabot apply -e <env>` | Plan, lock, and confirm deployment |
 | `schemabot apply-confirm -e <env>` | Execute a locked plan |
 | `schemabot unlock` | Release lock and discard plan |
-| `schemabot stop <apply-id>` | Stop an in-progress deployment |
-| `schemabot start <apply-id>` | Resume a stopped deployment |
-| `schemabot cutover <apply-id>` | Complete a deferred cutover |
+| `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
+| `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
+| `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env>` | Execute a rollback |
 
@@ -560,9 +560,9 @@ That command wasn't recognized. Available commands:
 | `schemabot apply -e <env>` | Plan, lock, and confirm deployment |
 | `schemabot apply-confirm -e <env>` | Execute a locked plan |
 | `schemabot unlock` | Release lock and discard plan |
-| `schemabot stop <apply-id>` | Stop an in-progress deployment |
-| `schemabot start <apply-id>` | Resume a stopped deployment |
-| `schemabot cutover <apply-id>` | Complete a deferred cutover |
+| `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
+| `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
+| `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env>` | Execute a rollback |
 
@@ -750,9 +750,9 @@ That command wasn't recognized. Available commands:
 | `schemabot apply -e <env>` | Plan, lock, and confirm deployment |
 | `schemabot apply-confirm -e <env>` | Execute a locked plan |
 | `schemabot unlock` | Release lock and discard plan |
-| `schemabot stop <apply-id>` | Stop an in-progress deployment |
-| `schemabot start <apply-id>` | Resume a stopped deployment |
-| `schemabot cutover <apply-id>` | Complete a deferred cutover |
+| `schemabot stop <apply-id> -e <env>` | Stop an in-progress deployment |
+| `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
+| `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
 | `schemabot rollback <apply-id> -e <env>` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env>` | Execute a rollback |
 
@@ -2120,6 +2120,38 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ---
 
 Cutover in progress — typically completes within seconds.
+
+</details>
+
+<details>
+<summary><a name="start-command-accepted"></a><strong>Start Command Accepted</strong></summary>
+
+
+## Start Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Start request accepted. SchemaBot will resume this schema change; status remains available from the PR progress comment or CLI.
+
+**Tasks selected for start**: 1 started, 0 skipped.
+
+</details>
+
+<details>
+<summary><a name="start-command-already-pending"></a><strong>Start Command Already Pending</strong></summary>
+
+
+## Start Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Start was already requested. SchemaBot will keep the existing start request pending until the operator owner finishes it.
+
+**Tasks selected for start**: 1 started, 0 skipped.
 
 </details>
 
@@ -4312,6 +4344,40 @@ A configured SchemaBot admin/database operator should inspect SchemaBot authoriz
 `schemabot unlock` cannot run because database `payments` is not configured on this SchemaBot instance.
 
 Verify the database name, or run the command against the SchemaBot instance that manages this database.
+
+
+</details>
+
+<details>
+<summary><a name="start-command-accepted"></a><strong>Start Command Accepted</strong></summary>
+
+
+## Start Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Start request accepted. SchemaBot will resume this schema change; status remains available from the PR progress comment or CLI.
+
+**Tasks selected for start**: 1 started, 0 skipped.
+
+
+</details>
+
+<details>
+<summary><a name="start-command-already-pending"></a><strong>Start Command Already Pending</strong></summary>
+
+
+## Start Request Accepted
+
+**Apply**: `apply-a1b2c3d4e5f67890`
+**Environment**: `staging`
+**Requested by**: @alice
+
+Start was already requested. SchemaBot will keep the existing start request pending until the operator owner finishes it.
+
+**Tasks selected for start**: 1 started, 0 skipped.
 
 
 </details>

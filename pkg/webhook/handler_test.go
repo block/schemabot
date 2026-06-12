@@ -409,6 +409,7 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 		action  string
 	}{
 		{name: "stop", comment: "schemabot stop -e staging", action: "stop"},
+		{name: "start", comment: "schemabot start -e staging", action: "start"},
 		{name: "cutover", comment: "schemabot cutover -e staging", action: "cutover"},
 	}
 
@@ -557,7 +558,7 @@ func TestWebhookEyesReaction(t *testing.T) {
 func TestWebhookPhase2CommandNotYetAvailable(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
-	// Test remaining Phase 2 commands (apply, apply-confirm, unlock, stop, and cutover are now implemented)
+	// Test remaining Phase 2 commands (apply, apply-confirm, unlock, stop, start, and cutover are now implemented)
 	cmds := []struct {
 		comment string
 		action  string

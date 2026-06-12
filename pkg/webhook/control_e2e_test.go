@@ -231,6 +231,161 @@ func TestE2EStopCommandStopsDeferredCutoverLocalApply(t *testing.T) {
 	assertReactionEventually(t, reactions)
 }
 
+// TestE2EStartCommandRecordsDurableRequest verifies that a PR comment start
+// command records durable operator intent for a stopped apply without directly
+// claiming execution from the webhook process.
+func TestE2EStartCommandRecordsDurableRequest(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier := "apply_bcdf2345"
+	database := "start_pr_comments_db"
+	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+	t.Cleanup(func() {
+		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+		utils.CloseAndLog(schemabotDB)
+	})
+
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	storedApply.State = state.Apply.Stopped
+	storedApply.UpdatedAt = time.Now().UTC()
+	require.NoError(t, store.Applies().Update(ctx, storedApply))
+	storedTasks, err := store.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, storedTasks, 1)
+	storedTasks[0].State = state.Task.Stopped
+	storedTasks[0].UpdatedAt = time.Now().UTC()
+	require.NoError(t, store.Tasks().Update(ctx, storedTasks[0]))
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	reactions := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	service.RegisterTernClient(database, "staging", &stopCommandTernClient{})
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	postStartCommand(t, h, applyIdentifier, "alice")
+	firstComment := readComment(t, comments)
+	assert.Contains(t, firstComment, "Start Request Accepted")
+	assert.Contains(t, firstComment, "`"+applyIdentifier+"`")
+	assert.Contains(t, firstComment, "@alice")
+
+	controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq)
+	assert.Equal(t, "github:alice@octocat/hello-world#1", controlReq.RequestedBy)
+	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
+
+	postStartCommand(t, h, applyIdentifier, "bob")
+	secondComment := readComment(t, comments)
+	assert.Contains(t, secondComment, "Start was already requested")
+	assert.Contains(t, secondComment, "@bob")
+
+	logs, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: applyID, Limit: 20})
+	require.NoError(t, err)
+	assert.True(t, applyLogContains(logs, "Start requested by user (caller: github:alice@octocat/hello-world#1)"))
+	assert.True(t, applyLogContains(logs, "Start requested by user (caller: github:bob@octocat/hello-world#1)"))
+
+	assertReactionEventually(t, reactions)
+	assertReactionEventually(t, reactions)
+}
+
+// TestE2EStartCommandRejectsCompletedApply verifies that a PR comment start
+// command surfaces an actionable error when the apply is already terminal and
+// does not record a durable start request.
+func TestE2EStartCommandRejectsCompletedApply(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier := "apply_cfab3456"
+	database := "start_pr_comments_completed_db"
+	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+	t.Cleanup(func() {
+		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+		utils.CloseAndLog(schemabotDB)
+	})
+
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	storedApply.State = state.Apply.Completed
+	storedApply.UpdatedAt = time.Now().UTC()
+	require.NoError(t, store.Applies().Update(ctx, storedApply))
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	reactions := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	service.RegisterTernClient(database, "staging", &stopCommandTernClient{})
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	postStartCommand(t, h, applyIdentifier, "alice")
+	comment := readComment(t, comments)
+	assert.Contains(t, comment, "Start Failed")
+	assert.Contains(t, comment, "already completed and cannot be started")
+
+	pendingStart, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStart)
+	assertReactionEventually(t, reactions)
+}
+
 // TestE2ECutoverCommandRecordsDurableRequest verifies that a PR comment
 // cutover command records durable operator intent for the exact apply and
 // environment, then leaves the operator owner to perform the data-plane action.
@@ -478,6 +633,19 @@ func postStopCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "stop started")
+}
+
+func postStartCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
+	t.Helper()
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment:   "schemabot start " + applyIdentifier + " -e staging",
+		userLogin: user,
+		isPR:      true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "start started")
 }
 
 func postCutoverCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
