@@ -177,12 +177,18 @@ func TestWaitForDeployRequestPending_NilDeployRequestIsRejected(t *testing.T) {
 type resumeDeployClient struct {
 	psclient.PSClient
 	recovered    *ps.DeployRequest
+	getErr       error
+	getCalls     int
 	deployCalls  int
 	lastDeploy   *ps.PerformDeployRequest
 	deployResult *ps.DeployRequest
 }
 
 func (c *resumeDeployClient) GetDeployRequest(_ context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.getCalls++
+	if c.getErr != nil {
+		return nil, c.getErr
+	}
 	dr := *c.recovered
 	dr.Number = req.Number
 	return &dr, nil
@@ -373,10 +379,67 @@ func TestResumeExistingDeployRequest_ErrorStateStartsFresh(t *testing.T) {
 	assert.Nil(t, req.ResumeState)
 }
 
+// A transient error fetching the recovered deploy request must NOT be treated as
+// "the deploy request was cleaned up." Starting fresh here would create a new
+// branch and a second deploy request while the original is still actively
+// deploying. Resume must propagate the transient error so it retries against the
+// same deploy request instead of forking a duplicate schema change.
+func TestResumeExistingDeployRequest_TransientGetErrorDoesNotFork(t *testing.T) {
+	freshApplyCalled := false
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		func(_, _ string) (psclient.PSClient, error) {
+			freshApplyCalled = true
+			return nil, errors.New("fresh apply must not run")
+		})
+	transientErr := &ps.Error{Code: ps.ErrInternal}
+	client := &resumeDeployClient{getErr: transientErr}
+
+	meta := &psMetadata{BranchName: "schemabot-testdb-xyz", DeployRequestID: 7}
+	req := resumeRequest(t, meta, "singularity:in-flight")
+
+	_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, transientErr)
+	assert.Contains(t, err.Error(), "get deploy request #7 on resume")
+	// No fresh apply, no second deploy: the original deploy request is untouched.
+	assert.False(t, freshApplyCalled)
+	assert.Equal(t, 0, client.deployCalls)
+	assert.Equal(t, 1, client.getCalls)
+	// ResumeState is preserved so the next resume retries the same deploy request.
+	require.NotNil(t, req.ResumeState)
+	assert.Equal(t, "singularity:in-flight", req.ResumeState.MigrationContext)
+}
+
+// A genuine not-found means the deploy request really was cleaned up, so resume
+// abandons the stale record and starts a fresh apply. The fresh Apply fails fast
+// on the recovered request's incomplete credentials, proving the not-found path
+// takes the start-fresh branch (which clears ResumeState) rather than
+// propagating the not-found as a retryable error.
+func TestResumeExistingDeployRequest_NotFoundStartsFresh(t *testing.T) {
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		func(_, _ string) (psclient.PSClient, error) {
+			return nil, errors.New("client unavailable")
+		})
+	client := &resumeDeployClient{getErr: &ps.Error{Code: ps.ErrNotFound}}
+
+	meta := &psMetadata{BranchName: "schemabot-testdb-gone", DeployRequestID: 13}
+	req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+
+	_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+	require.Error(t, err)
+	assert.Equal(t, 0, client.deployCalls)
+	assert.Equal(t, 1, client.getCalls)
+	// The start-fresh branch clears ResumeState before re-running Apply, unlike
+	// the transient-error path which preserves it for retry.
+	assert.Nil(t, req.ResumeState)
+}
+
 // When no vtgate DSN is configured, resume cannot rediscover a Vitess context;
 // it must preserve the stored identifier as-is rather than blanking it, so the
 // apply record keeps whatever progress handle it already had.
-func TestResolveResumeMigrationContext_PreservesStoredWithoutDSN(t *testing.T) {
+func TestResolveResumeSchemaChangeContext_PreservesStoredWithoutDSN(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	client := &resumeDeployClient{recovered: &ps.DeployRequest{}}
 
@@ -386,7 +449,7 @@ func TestResolveResumeMigrationContext_PreservesStoredWithoutDSN(t *testing.T) {
 		ResumeState: &engine.ResumeState{MigrationContext: "apply-1a2b3c4d5e6f7890"},
 	}
 
-	got := e.resolveResumeMigrationContext(t.Context(), client, req, map[string]bool{})
+	got := e.resolveResumeSchemaChangeContext(t.Context(), client, req, map[string]bool{})
 
 	assert.Equal(t, "apply-1a2b3c4d5e6f7890", got)
 }
@@ -414,17 +477,17 @@ func TestIsRealVitessContext(t *testing.T) {
 	}
 }
 
-// persistResumeMigrationContext must durably record only a real Vitess context.
+// persistResumeSchemaChangeContext must durably record only a real Vitess context.
 // Persisting the tern apply identifier or an empty value would carry no per-shard
 // progress and could clobber a previously persisted real context.
-func TestPersistResumeMigrationContext(t *testing.T) {
+func TestPersistResumeSchemaChangeContext(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 
 	t.Run("persists real context", func(t *testing.T) {
 		req := resumeRequest(t, &psMetadata{}, "")
 		persisted := captureStateChanges(req)
 
-		e.persistResumeMigrationContext(req, "singularity:real-context", "encoded-meta")
+		e.persistResumeSchemaChangeContext(req, "singularity:real-context", "encoded-meta")
 
 		require.Len(t, *persisted, 1)
 		assert.Equal(t, "singularity:real-context", (*persisted)[0].MigrationContext)
@@ -435,7 +498,7 @@ func TestPersistResumeMigrationContext(t *testing.T) {
 		req := resumeRequest(t, &psMetadata{}, "")
 		persisted := captureStateChanges(req)
 
-		e.persistResumeMigrationContext(req, "apply-1a2b3c4d5e6f7890", "encoded-meta")
+		e.persistResumeSchemaChangeContext(req, "apply-1a2b3c4d5e6f7890", "encoded-meta")
 
 		assert.Empty(t, *persisted)
 	})
@@ -444,7 +507,7 @@ func TestPersistResumeMigrationContext(t *testing.T) {
 		req := resumeRequest(t, &psMetadata{}, "")
 		persisted := captureStateChanges(req)
 
-		e.persistResumeMigrationContext(req, "", "encoded-meta")
+		e.persistResumeSchemaChangeContext(req, "", "encoded-meta")
 
 		assert.Empty(t, *persisted)
 	})
@@ -454,7 +517,7 @@ func TestPersistResumeMigrationContext(t *testing.T) {
 		req.OnStateChange = nil
 
 		assert.NotPanics(t, func() {
-			e.persistResumeMigrationContext(req, "singularity:real-context", "encoded-meta")
+			e.persistResumeSchemaChangeContext(req, "singularity:real-context", "encoded-meta")
 		})
 	})
 }

@@ -3,6 +3,7 @@ package planetscale
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -418,7 +419,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Discover migration_context by diffing current SHOW VITESS_MIGRATIONS against
 	// the pre-deploy baseline. Retries because Vitess may not have created migrations
 	// immediately after the deploy request is submitted.
-	migrationContext := e.discoverMigrationContextWithRetry(ctx, client, req.Database, req.Credentials, existingContexts)
+	migrationContext := e.discoverSchemaChangeContextWithRetry(ctx, client, req.Database, req.Credentials, existingContexts)
 
 	meta, err := encodePSMetadata(&psMetadata{
 		BranchName:       branchName,
@@ -825,11 +826,11 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("deploy on resume: %w", err)
 	}
 
-	migrationContext := e.resolveResumeMigrationContext(ctx, client, req, existingContexts)
+	migrationContext := e.resolveResumeSchemaChangeContext(ctx, client, req, existingContexts)
 
 	// Persist the rediscovered context now so a crash before this function
 	// returns does not lose it — the returned ResumeState alone is not durable.
-	e.persistResumeMigrationContext(req, migrationContext, persistMeta)
+	e.persistResumeSchemaChangeContext(req, migrationContext, persistMeta)
 
 	e.logger.Info("resumed and deployed", "number", dr.Number, "branch", meta.BranchName, "migration_context", migrationContext)
 	return &engine.ApplyResult{
@@ -850,11 +851,19 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata) (*engine.ApplyResult, error) {
 	dr, err := e.getDeployRequest(ctx, client, org, req.Database, meta.DeployRequestID)
 	if err != nil {
-		// Deploy request may have been cleaned up — start fresh.
-		e.logger.Warn("deploy request not found on resume, starting fresh",
-			"database", req.Database, "deploy_request", meta.DeployRequestID, "error", err)
-		req.ResumeState = nil
-		return e.Apply(ctx, req)
+		// Only a genuine not-found means the deploy request was cleaned up and the
+		// apply should start fresh. A transient API error must propagate so resume
+		// retries against the same deploy request — forking a fresh branch and
+		// deploy request here would start a duplicate schema change while the
+		// original is still in flight.
+		var psErr *ps.Error
+		if errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound {
+			e.logger.Warn("deploy request not found on resume, starting fresh",
+				"database", req.Database, "deploy_request", meta.DeployRequestID, "error", err)
+			req.ResumeState = nil
+			return e.Apply(ctx, req)
+		}
+		return nil, fmt.Errorf("get deploy request #%d on resume: %w", meta.DeployRequestID, err)
 	}
 
 	// If the deploy request failed, start fresh with a new branch rather
@@ -879,6 +888,11 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	// the deferred-deploy promotion to waiting_for_deploy does not apply, and the
 	// tern auto-deploy trigger only fires on waiting_for_deploy. Start the deploy
 	// here, mirroring the fresh path, so the schema change actually runs.
+	//
+	// The gate reads dr just above and then calls DeployDeployRequest, so two
+	// resumes racing here could both decide to deploy. That read→call window is
+	// self-correcting: the provider accepts at most one deploy and rejects the
+	// loser, so a duplicate schema change is never started.
 	if deployRequestNeedsResumeDeploy(dr, meta) {
 		e.logger.Info("deploying recovered deploy request that was never started",
 			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", meta.IsInstant)
@@ -895,11 +909,11 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		}
 		dr = deployed
 
-		migrationContext = e.resolveResumeMigrationContext(ctx, client, req, existingContexts)
+		migrationContext = e.resolveResumeSchemaChangeContext(ctx, client, req, existingContexts)
 
 		// Persist the rediscovered context now so a crash before this function
 		// returns does not lose it — the returned ResumeState alone is not durable.
-		e.persistResumeMigrationContext(req, migrationContext, updatedMeta)
+		e.persistResumeSchemaChangeContext(req, migrationContext, updatedMeta)
 
 		e.logger.Info("resumed and deployed recovered deploy request",
 			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "migration_context", migrationContext)
@@ -922,13 +936,16 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	if !isRealVitessContext(migrationContext) {
 		e.logger.Info("rediscovering Vitess context on reattach; stored value is not a real context",
 			"database", req.Database, "deploy_request", dr.Number, "stored_context", migrationContext)
-		// The deploy already ran in a prior process, so its Vitess context is
-		// already present in SHOW VITESS_MIGRATIONS. Discover against an empty
-		// baseline so any existing context counts as a match.
-		rediscovered := e.discoverMigrationContextWithRetry(ctx, client, req.Database, req.Credentials, map[string]bool{})
+		// The deploy ran in a prior process, so its context is already in SHOW
+		// VITESS_MIGRATIONS. Discover against an empty baseline, which makes every
+		// context a candidate; selection keeps only non-terminal candidates so a
+		// completed historical context from an unrelated change is never matched.
+		// A genuinely finished change yields no non-terminal candidate, so the
+		// stored identifier is preserved rather than attached to stale progress.
+		rediscovered := e.discoverSchemaChangeContextWithRetry(ctx, client, req.Database, req.Credentials, map[string]bool{})
 		if rediscovered != "" {
 			migrationContext = rediscovered
-			e.persistResumeMigrationContext(req, migrationContext, updatedMeta)
+			e.persistResumeSchemaChangeContext(req, migrationContext, updatedMeta)
 		} else {
 			e.logger.Warn("Vitess context not found on reattach; per-shard progress will be empty until it is found",
 				"database", req.Database, "deploy_request", dr.Number, "stored_context", migrationContext)
@@ -958,7 +975,7 @@ func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata) bool
 	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && dr.DeployedAt == nil
 }
 
-// resolveResumeMigrationContext rediscovers the Vitess migration_context after a
+// resolveResumeSchemaChangeContext rediscovers the Vitess migration_context after a
 // resume deploy. It prefers a freshly discovered context (the one that appeared
 // since the pre-deploy baseline). When discovery turns up nothing — Vitess may
 // not have created migrations within the bounded discovery window — it preserves
@@ -967,10 +984,10 @@ func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata) bool
 // baseline; otherwise it is the tern-assigned apply identifier, which never
 // matches SHOW VITESS_MIGRATIONS, so per-shard progress stays empty until a real
 // context is found.
-func (e *Engine) resolveResumeMigrationContext(ctx context.Context, client psclient.PSClient, req *engine.ApplyRequest, existingContexts map[string]bool) string {
+func (e *Engine) resolveResumeSchemaChangeContext(ctx context.Context, client psclient.PSClient, req *engine.ApplyRequest, existingContexts map[string]bool) string {
 	stored := req.ResumeState.MigrationContext
 
-	discovered := e.discoverMigrationContextWithRetry(ctx, client, req.Database, req.Credentials, existingContexts)
+	discovered := e.discoverSchemaChangeContextWithRetry(ctx, client, req.Database, req.Credentials, existingContexts)
 	if discovered != "" {
 		return discovered
 	}
@@ -988,23 +1005,25 @@ func (e *Engine) resolveResumeMigrationContext(ctx context.Context, client pscli
 // isRealVitessContext reports whether a migration_context value is a real Vitess
 // context (the "<system>:<uuid>" form that appears in SHOW VITESS_MIGRATIONS,
 // e.g. "singularity:17694ee9-...") rather than the tern-assigned apply identifier
-// (e.g. "apply-1a2b3c..."). The apply identifier never matches a Vitess migration
-// row, so per-shard progress stays empty until a real context is resolved. The
-// colon separating system and uuid is the distinguishing marker — tern identifiers
-// never contain one.
+// (e.g. "apply-1a2b3c..."). The apply identifier never matches a SHOW
+// VITESS_MIGRATIONS row, so per-shard progress stays empty until a real context
+// is resolved. The colon separating system and uuid is the distinguishing
+// marker — tern identifiers never contain one.
 func isRealVitessContext(migrationContext string) bool {
 	return strings.Contains(migrationContext, ":")
 }
 
-// persistResumeMigrationContext durably records a freshly resolved Vitess context
+// persistResumeSchemaChangeContext durably records a freshly resolved Vitess context
 // via OnStateChange so a crash after deploy (but before the resume function
 // returns) does not lose it — without persistence the stored ResumeState would
 // still hold the tern apply identifier, leaving the next resume with no per-shard
 // Vitess progress. It only persists a real Vitess context; an empty or
 // apply-identifier value carries no per-shard progress and is left untouched so a
 // previously persisted real context is never clobbered.
-func (e *Engine) persistResumeMigrationContext(req *engine.ApplyRequest, migrationContext, metadata string) {
+func (e *Engine) persistResumeSchemaChangeContext(req *engine.ApplyRequest, migrationContext, metadata string) {
 	if req.OnStateChange == nil {
+		e.logger.Debug("not persisting resume context: no OnStateChange callback",
+			"database", req.Database, "context", migrationContext)
 		return
 	}
 	if !isRealVitessContext(migrationContext) {
