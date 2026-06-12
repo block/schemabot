@@ -422,6 +422,15 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 // firstRevertWindowTask returns the first targeted task that is in the revert
 // window, or nil if none are. A revert-window task has already cut over, so the
 // stop path must reject rather than treat it as a cancellable in-flight change.
+//
+// When targetApplyID is 0 (an untargeted stop with no apply id), any
+// revert-window task on the database rejects the whole stop, even one belonging
+// to a different apply. This is bounded by the one-active-apply-per-target
+// invariant: storage permits at most one active apply per (database, database
+// type, environment), and LocalClient is scoped to a single such target, so a
+// revert-window task from a second, distinct apply cannot coexist with another
+// active apply on the same target. Cross-apply coexistence is therefore not a
+// case this scope has to disambiguate.
 func firstRevertWindowTask(tasks []*storage.Task, targetApplyID int64) *storage.Task {
 	for _, task := range tasks {
 		if targetApplyID > 0 && task.ApplyID != targetApplyID {
@@ -490,19 +499,34 @@ func (c *LocalClient) applyHasRevertWindowTask(ctx context.Context, apply *stora
 //     behind the abandoned runner.
 //   - WaitingForDeploy: the PlanetScale deferred deploy request exists and stays
 //     startable from the PlanetScale UI until eng.Stop cancels it.
+//   - FailedRetryable: a transient failure (e.g. repeated progress-poll errors)
+//     pauses the apply for operator retry, but the PlanetScale deploy request was
+//     already created and its resume state persisted before the failure, so the
+//     deploy request stays live and startable from the PlanetScale UI. Without
+//     eng.Stop, recording the stop as cancelled would leave that deploy request
+//     runnable from the provider side — the same storage-vs-engine divergence the
+//     other live states avoid. eng.Stop (CancelDeployRequest) is keyed only on the
+//     persisted deploy request id, so cancelling a retryable task is safe; stop is
+//     a terminal operator action that ends the apply rather than retrying it.
 func hasLiveEngineWork(taskState string) bool {
 	return state.IsState(taskState,
 		state.Task.Running,
 		state.Task.WaitingForCutover,
 		state.Task.CuttingOver,
 		state.Task.Recovering,
-		state.Task.WaitingForDeploy)
+		state.Task.WaitingForDeploy,
+		state.Task.FailedRetryable)
 }
 
 // stopEngineForTasks calls eng.Stop() if any targeted task has live engine work.
 // Returns an error if the engine stop fails (e.g., PlanetScale deploy request
 // cancellation failed). For Spirit, stop errors are non-fatal since the runner
 // may have already exited.
+//
+// It stops at the first task with live engine work and returns: an apply drives
+// a single engine operation (one Spirit runner or one PlanetScale deploy
+// request) whose stop terminates the whole operation, so one eng.Stop covers the
+// targeted apply.
 func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine, creds *engine.Credentials, tasks []*storage.Task, targetApplyID int64) error {
 	if eng == nil {
 		c.logger.Error("stopEngineForTasks: engine is nil")

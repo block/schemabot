@@ -488,6 +488,51 @@ func TestLocalClient_StopWaitingForDeployCancelsDeployRequest(t *testing.T) {
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
 }
 
+// A PlanetScale failed_retryable task paused after a transient failure (e.g.
+// repeated progress-poll errors) still has its created, startable deploy request
+// and persisted resume state. Stop is a terminal operator action, so it must
+// cancel that deploy request via the engine before recording the cancellation —
+// otherwise the deploy stays startable from the PlanetScale UI while SchemaBot
+// reports it cancelled.
+func TestLocalClient_StopFailedRetryableCancelsDeployRequest(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-failed-retryable",
+		State:           state.Apply.FailedRetryable,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-failed-retryable",
+		State:            state.Task.FailedRetryable,
+	}
+	resumeData := planetscale.ResumeData{
+		BranchName:       "branch-123",
+		DeployRequestID:  321,
+		MigrationContext: "ctx-123",
+		DeployRequestURL: "https://example.test/deploys/321",
+		DeferredDeploy:   true,
+	}
+	resumeState := engineResumeStateFromPlanetScaleData(t, operationID, resumeData)
+	eng := &controlCaptureEngine{}
+	stateAtEngineStop := ""
+	eng.onStop = func() { stateAtEngineStop = task.State }
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
+
+	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	require.NotNil(t, eng.stopReq, "stop must cancel the deploy request for a failed_retryable task")
+	require.NotNil(t, eng.stopReq.ResumeState)
+	assert.Equal(t, resumeData.MigrationContext, eng.stopReq.ResumeState.MigrationContext)
+	assert.Equal(t, state.Task.FailedRetryable, stateAtEngineStop, "deploy request must be cancelled before the task is marked cancelled")
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+}
+
 // A task in the revert window has already cut over: the new schema is live.
 // Stop must reject rather than record it as cancelled, so an operator chooses
 // explicitly between reverting (undo) and skip-revert (finalize). The engine is
