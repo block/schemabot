@@ -62,14 +62,14 @@ func (s *Service) writeErrorCode(w http.ResponseWriter, status int, code, messag
 }
 
 // writeBodyDecodeError maps a request-body decode failure to the right client
-// error. Bodies that exceed the API request body limit get a 413 that tells
-// the caller the limit so they can shrink the payload; every other decode
-// failure is malformed JSON and gets a 400 with the decoder's error.
+// error. Bodies that exceed the enforced request body limit get a 413 that
+// tells the caller the limit so they can shrink the payload; every other
+// decode failure gets a 400 with the decoder's error.
 func (s *Service) writeBodyDecodeError(w http.ResponseWriter, err error) {
 	var maxBytesErr *http.MaxBytesError
 	if errors.As(err, &maxBytesErr) {
 		s.writeError(w, http.StatusRequestEntityTooLarge,
-			fmt.Sprintf("request body exceeds the %d MiB limit; reduce the payload size", maxAPIRequestBodyBytes>>20))
+			fmt.Sprintf("request body exceeds the %d MiB limit; reduce the payload size", maxBytesErr.Limit>>20))
 		return
 	}
 	s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())

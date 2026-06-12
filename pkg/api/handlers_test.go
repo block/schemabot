@@ -1305,7 +1305,7 @@ func TestAPIRoutesRejectOversizedRequestBody(t *testing.T) {
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 	var resp apitypes.ErrorResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
-	assert.Contains(t, resp.Error, "request body exceeds the 32 MiB limit")
+	assert.Contains(t, resp.Error, fmt.Sprintf("request body exceeds the %d MiB limit", maxAPIRequestBodyBytes>>20))
 	assert.Contains(t, resp.Error, "reduce the payload size")
 }
 

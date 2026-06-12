@@ -513,7 +513,8 @@ func (s *Service) HandleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 // Route Registration
 // =============================================================================
 
-// maxAPIRequestBodyBytes caps the request body size for every API route.
+// maxAPIRequestBodyBytes caps the request body size for every route
+// registered by ConfigureRoutes, including the health endpoints.
 // The largest legitimate payloads are plan and pull requests carrying full
 // schema files — a database with hundreds of tables can reach a few megabytes
 // of DDL — so the cap leaves generous headroom for real schemas while
@@ -530,7 +531,8 @@ func (s *Service) limitRequestBody(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// ConfigureRoutes registers all HTTP API routes on the given mux.
+// ConfigureRoutes registers all HTTP routes — API and health endpoints —
+// on the given mux.
 // Every route is wrapped with a request body size limit so oversized
 // requests are rejected instead of being buffered into memory.
 func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
