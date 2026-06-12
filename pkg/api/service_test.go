@@ -7,6 +7,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 func TestTernConfig_Endpoint_SingleDeployment(t *testing.T) {
@@ -143,6 +147,80 @@ func TestTernConfig_Endpoint_MultiDeployment(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestService_RoutingTernClientRoutesPlanThroughConfiguredDeployment(t *testing.T) {
+	deploymentClient := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-1"}}
+	service := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"appdb": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {
+						Deployment: "primary",
+						Target:     "appdb-target",
+					},
+				},
+			},
+		},
+	}, map[string]tern.Client{
+		"primary/staging": deploymentClient,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	client, err := service.RoutingTernClient()
+	require.NoError(t, err)
+	again, err := service.RoutingTernClient()
+	require.NoError(t, err)
+	assert.Same(t, client, again)
+
+	resp, err := client.Plan(t.Context(), &ternv1.PlanRequest{
+		Database:    "appdb",
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "plan-1", resp.PlanId)
+	require.NotNil(t, deploymentClient.planReq)
+	assert.Equal(t, storage.DatabaseTypeMySQL, deploymentClient.planReq.Type)
+	assert.Equal(t, "appdb-target", deploymentClient.planReq.Target)
+	assert.Equal(t, "appdb", deploymentClient.planReq.Database)
+	assert.Equal(t, "staging", deploymentClient.planReq.Environment)
+}
+
+func TestService_RoutingTernClientRoutesApplyThroughStoredPlanTarget(t *testing.T) {
+	deploymentClient := &mockTernClient{applyResp: &ternv1.ApplyResponse{Accepted: true, ApplyId: "apply-routed"}}
+	service := New(&mockStorageWithApplyStores{
+		plans: &staticPlanStore{plan: &storage.Plan{
+			PlanIdentifier: "plan-1",
+			Database:       "appdb",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Deployment:     "primary",
+			Target:         "appdb-target",
+			Environment:    "staging",
+		}},
+		applies: &staticApplyStore{},
+	}, &ServerConfig{}, map[string]tern.Client{
+		"primary/staging": deploymentClient,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	client, err := service.RoutingTernClient()
+	require.NoError(t, err)
+	resp, err := client.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, "apply-routed", resp.ApplyId)
+	require.NotNil(t, deploymentClient.applyReq)
+	assert.Equal(t, "appdb", deploymentClient.applyReq.Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, deploymentClient.applyReq.Type)
+	assert.Equal(t, "appdb-target", deploymentClient.applyReq.Target)
+	assert.Equal(t, "staging", deploymentClient.applyReq.Environment)
+	assert.Equal(t, "appdb-target", deploymentClient.applyReq.Options["target"])
 }
 
 func TestTernConfig_Endpoint_EmptyEndpoint(t *testing.T) {

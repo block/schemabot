@@ -55,6 +55,8 @@ type RoutingClient struct {
 	activeObservers map[int64]ProgressObserver
 }
 
+var _ Client = (*RoutingClient)(nil)
+
 // NewRoutingClient creates a routing client.
 func NewRoutingClient(config RoutingClientConfig) (*RoutingClient, error) {
 	if config.Resolver == nil {
@@ -77,6 +79,28 @@ func NewRoutingClient(config RoutingClientConfig) (*RoutingClient, error) {
 		clientForDeployment:  config.ClientForDeployment,
 		activeObservers:      make(map[int64]ProgressObserver),
 	}, nil
+}
+
+// PullSchema fetches live schema from the resolved execution target.
+func (c *RoutingClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("pull schema request is required: %w", ErrPullSchemaInvalidRequest)
+	}
+	target, err := c.resolveSingleExecutionTarget(ctx, req.Database, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	if req.Type != "" && req.Type != target.DatabaseType {
+		return nil, fmt.Errorf("pull schema request type %q does not match resolved database type %q: %w", req.Type, target.DatabaseType, ErrPullSchemaInvalidRequest)
+	}
+	client, err := c.clientForDeployment(ctx, target.Deployment, req.Environment)
+	if err != nil {
+		return nil, fmt.Errorf("get client for deployment %q environment %q: %w", target.Deployment, req.Environment, err)
+	}
+	routedReq := proto.Clone(req).(*ternv1.PullSchemaRequest)
+	routedReq.Type = target.DatabaseType
+	routedReq.Target = target.Target
+	return client.PullSchema(ctx, routedReq)
 }
 
 // Plan generates a schema change plan on the resolved execution target.

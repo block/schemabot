@@ -850,7 +850,10 @@ func TestExecutePullSchemaRoutesConfiguredMySQLTarget(t *testing.T) {
 		},
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := New(&mockStorage{}, cfg, map[string]tern.Client{
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
 		"primary/production": mockClient,
 	}, logger)
 

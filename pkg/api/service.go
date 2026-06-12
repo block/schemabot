@@ -105,12 +105,13 @@ type pendingObserverKey struct {
 }
 
 type Service struct {
-	storage     storage.Storage
-	config      *ServerConfig
-	ternClients map[string]tern.Client // keyed by "deployment/environment", lazily created
-	ternMu      sync.Mutex             // protects ternClients
-	logger      *slog.Logger
-	clock       clock.Clock
+	storage           storage.Storage
+	config            *ServerConfig
+	ternClients       map[string]tern.Client // keyed by "deployment/environment", lazily created
+	routingTernClient *tern.RoutingClient
+	ternMu            sync.Mutex // protects tern client caches
+	logger            *slog.Logger
+	clock             clock.Clock
 
 	// Operator loop management.
 	operatorMu           sync.Mutex
@@ -311,6 +312,41 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	}
 
 	s.ternClients[key] = client
+	return client, nil
+}
+
+// RoutingTernClient returns a client that routes requests from server
+// configuration and stored execution metadata. It is safe for Plan, Apply, and
+// PullSchema routing; handlers that branch on transport mode must continue to
+// use deployment-scoped clients until transport metadata is request-scoped.
+func (s *Service) RoutingTernClient() (*tern.RoutingClient, error) {
+	if s.config == nil {
+		return nil, fmt.Errorf("server config is required for routing tern client")
+	}
+	if s.storage == nil {
+		return nil, fmt.Errorf("storage is required for routing tern client")
+	}
+
+	s.ternMu.Lock()
+	defer s.ternMu.Unlock()
+	if s.routingTernClient != nil {
+		return s.routingTernClient, nil
+	}
+
+	client, err := tern.NewRoutingClient(tern.RoutingClientConfig{
+		Resolver:             s.config,
+		PlanLookup:           s.storage.Plans(),
+		ApplyLookup:          s.storage.Applies(),
+		ApplyOperationLookup: s.storage.ApplyOperations(),
+		ClientForDeployment: func(_ context.Context, deployment, environment string) (tern.Client, error) {
+			return s.TernClient(deployment, environment)
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create routing tern client: %w", err)
+	}
+	s.routingTernClient = client
+	s.logger.Info("created routing tern client")
 	return client, nil
 }
 
@@ -572,6 +608,11 @@ func (s *Service) Close() error {
 
 	s.ternMu.Lock()
 	var errs []error
+	if s.routingTernClient != nil {
+		if err := s.routingTernClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	for _, client := range s.ternClients {
 		if err := client.Close(); err != nil {
 			errs = append(errs, err)

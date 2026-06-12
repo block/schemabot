@@ -181,42 +181,42 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		return nil, unsupportedErr
 	}
 
-	client, err := s.TernClient(resolvedTarget.Deployment, req.Environment)
+	client, err := s.RoutingTernClient()
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "tern client")
 		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
-	s.logger.Info("ExecutePullSchema: calling client.PullSchema",
+	isRemoteTarget := s.executionTargetUsesRemoteClient(resolvedTarget.Deployment, req.Environment)
+	s.logger.Info("ExecutePullSchema: calling routing client PullSchema",
 		"database", req.Database,
 		"type", resolvedTarget.DatabaseType,
 		"deployment", resolvedTarget.Deployment,
 		"target", resolvedTarget.Target,
 		"environment", req.Environment,
-		"is_remote", client.IsRemote(),
+		"is_remote", isRemoteTarget,
 	)
 
 	resp, err := client.PullSchema(ctx, &ternv1.PullSchemaRequest{
 		Database:    req.Database,
-		Type:        resolvedTarget.DatabaseType,
+		Type:        req.Type,
 		Environment: req.Environment,
-		Target:      resolvedTarget.Target,
 	})
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "pull schema failed")
-		s.logger.Error("ExecutePullSchema: client.PullSchema failed",
+		s.logger.Error("ExecutePullSchema: routing client PullSchema failed",
 			"database", req.Database,
 			"type", resolvedTarget.DatabaseType,
 			"deployment", resolvedTarget.Deployment,
 			"target", resolvedTarget.Target,
 			"environment", req.Environment,
 			"endpoint", client.Endpoint(),
-			"is_remote", client.IsRemote(),
+			"is_remote", isRemoteTarget,
 			"error", err,
 		)
-		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
+		if isRemoteTarget && grpcstatus.Code(err) == grpccodes.Unavailable {
 			return nil, &RemoteDeploymentUnavailableError{
 				Deployment: resolvedTarget.Deployment,
 				Target:     resolvedTarget.Target,
@@ -236,6 +236,16 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	)
 
 	return pullSchemaResponseFromProto(resp), nil
+}
+
+func (s *Service) executionTargetUsesRemoteClient(deployment, environment string) bool {
+	if dbConfig := s.config.Database(deployment); dbConfig != nil {
+		if envConfig, ok := dbConfig.Environments[environment]; ok && envConfig.HasLocalDSN() {
+			return false
+		}
+	}
+	_, err := s.config.TernDeployments.Endpoint(deployment, environment)
+	return err == nil
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.

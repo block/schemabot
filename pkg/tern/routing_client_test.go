@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -40,6 +41,7 @@ func (l routingApplyOperationLookup) Get(_ context.Context, id int64) (*storage.
 type routingRecordingClient struct {
 	Client
 
+	pullSchemaReq      *ternv1.PullSchemaRequest
 	planReq            *ternv1.PlanRequest
 	applyReq           *ternv1.ApplyRequest
 	applyErr           error
@@ -49,6 +51,11 @@ type routingRecordingClient struct {
 	pendingObserverSet bool
 	observerApplyID    int64
 	isRemote           bool
+}
+
+func (c *routingRecordingClient) PullSchema(_ context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	c.pullSchemaReq = req
+	return &ternv1.PullSchemaResponse{Database: req.Database}, nil
 }
 
 func (c *routingRecordingClient) Plan(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
@@ -97,6 +104,80 @@ type routingNoopObserver struct{}
 func (routingNoopObserver) OnProgress(*storage.Apply, []*storage.Task) {}
 
 func (routingNoopObserver) OnTerminal(*storage.Apply, []*storage.Task) {}
+
+func TestRoutingClientPullSchemaResolvesSingleExecutionTarget(t *testing.T) {
+	clients := map[string]*routingRecordingClient{
+		"east/staging": {},
+	}
+	routingClient := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver: routingResolverFunc(func(_ context.Context, req routing.Request) ([]routing.ExecutionTarget, error) {
+			assert.Equal(t, routing.Request{Database: "logical-db", Environment: "staging"}, req)
+			return []routing.ExecutionTarget{{
+				DatabaseType: storage.DatabaseTypeMySQL,
+				Deployment:   "east",
+				Target:       "target-123",
+			}}, nil
+		}),
+		PlanLookup:          routingPlanLookup{},
+		ApplyLookup:         routingApplyLookup{},
+		ClientForDeployment: testDeploymentClientFunc(clients),
+	})
+
+	resp, err := routingClient.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "logical-db",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		Target:      "caller-supplied-target",
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "logical-db", resp.Database)
+	require.NotNil(t, clients["east/staging"].pullSchemaReq)
+	assert.Equal(t, "logical-db", clients["east/staging"].pullSchemaReq.Database)
+	assert.Equal(t, "staging", clients["east/staging"].pullSchemaReq.Environment)
+	assert.Equal(t, storage.DatabaseTypeMySQL, clients["east/staging"].pullSchemaReq.Type)
+	assert.Equal(t, "target-123", clients["east/staging"].pullSchemaReq.Target)
+}
+
+func TestRoutingClientPullSchemaRejectsInvalidRequestAsInvalidPullSchemaRequest(t *testing.T) {
+	routingClient := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver:            routingResolverFunc(func(context.Context, routing.Request) ([]routing.ExecutionTarget, error) { return nil, nil }),
+		PlanLookup:          routingPlanLookup{},
+		ApplyLookup:         routingApplyLookup{},
+		ClientForDeployment: testDeploymentClientFunc(nil),
+	})
+
+	_, err := routingClient.PullSchema(t.Context(), nil)
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "pull schema request is required")
+	assert.True(t, errors.Is(err, ErrPullSchemaInvalidRequest))
+}
+
+func TestRoutingClientPullSchemaRejectsTypeMismatchAsInvalidPullSchemaRequest(t *testing.T) {
+	routingClient := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver: routingResolverFunc(func(context.Context, routing.Request) ([]routing.ExecutionTarget, error) {
+			return []routing.ExecutionTarget{{
+				DatabaseType: storage.DatabaseTypeMySQL,
+				Deployment:   "east",
+				Target:       "target-123",
+			}}, nil
+		}),
+		PlanLookup:          routingPlanLookup{},
+		ApplyLookup:         routingApplyLookup{},
+		ClientForDeployment: testDeploymentClientFunc(nil),
+	})
+
+	_, err := routingClient.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "logical-db",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeVitess,
+	})
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `request type "vitess" does not match resolved database type "mysql"`)
+	assert.True(t, errors.Is(err, ErrPullSchemaInvalidRequest))
+}
 
 func TestRoutingClientPlanResolvesSingleExecutionTarget(t *testing.T) {
 	clients := map[string]*routingRecordingClient{
