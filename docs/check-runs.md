@@ -586,9 +586,10 @@ On new commits:
 - Stale internal records with a started apply or rollback remain blocking
   because the live database may still change.
 - A plan result never overwrites an in-progress apply-owned record, regardless
-  of head SHA. The record is released only when the apply reaches a terminal
-  state or an explicit recovery path proves the target already matches the PR
-  schema.
+  of head SHA. Rollbacks hold the record through the same apply ID ownership,
+  so the record is released only when the owning apply or rollback reaches a
+  terminal state or an explicit recovery path proves the target already matches
+  the PR schema.
 
 ## Edge Cases
 

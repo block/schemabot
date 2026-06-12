@@ -87,8 +87,10 @@ type CheckStore interface {
 
 	// UpsertPlanResult creates or updates stored check state from a plan result.
 	// It fails closed: an in-progress apply-owned row for the same
-	// PR/environment/database is preserved regardless of head SHA, and is
-	// released only by apply completion or an explicit recovery path.
+	// PR/environment/database is preserved regardless of head SHA. Ownership is
+	// released only by apply completion (CompleteForApply), rollback completion
+	// (MarkActionRequiredForApply), or the explicit same-head no-op recovery
+	// path (RecoverApplyOwnedCheckWithNoOpPlan).
 	UpsertPlanResult(ctx context.Context, check *Check) error
 
 	// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check state
