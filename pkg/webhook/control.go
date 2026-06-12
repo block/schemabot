@@ -4,11 +4,33 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
+
+// logControlCommandError logs a failed PR control command at the severity
+// matching the error class: internal failures (storage, control request store,
+// Tern, or other unexpected errors) log at Error so operators investigate
+// them, while operator-actionable rejections such as state conflicts log at
+// Warn.
+func (h *Handler) logControlCommandError(command, repo string, pr int, applyID, environment, requestedBy string, err error) {
+	attrs := []any{
+		"repo", repo,
+		"pr", pr,
+		"apply_id", applyID,
+		"environment", environment,
+		"requested_by", requestedBy,
+		"error", err,
+	}
+	if api.IsInternalControlError(err) {
+		h.logger.Error(command+" PR command failed", attrs...)
+	} else {
+		h.logger.Warn(command+" PR command rejected", attrs...)
+	}
+}
 
 func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int, installationID int64, requestedBy string, result CommandResult, command string) (*storage.Apply, bool) {
 	if result.ApplyID == "" {
@@ -128,13 +150,7 @@ func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, r
 		Caller:      caller,
 	})
 	if err != nil {
-		h.logger.Warn("stop PR command rejected",
-			"repo", repo,
-			"pr", pr,
-			"apply_id", result.ApplyID,
-			"environment", result.Environment,
-			"requested_by", requestedBy,
-			"error", err)
+		h.logControlCommandError(action.Stop, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
 		h.postCommandError(repo, pr, installationID, action.Stop, result.Environment, requestedBy, err.Error())
 		return
 	}
@@ -208,13 +224,7 @@ func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, 
 		Caller:      caller,
 	})
 	if err != nil {
-		h.logger.Warn("start PR command rejected",
-			"repo", repo,
-			"pr", pr,
-			"apply_id", result.ApplyID,
-			"environment", result.Environment,
-			"requested_by", requestedBy,
-			"error", err)
+		h.logControlCommandError(action.Start, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
 		h.postCommandError(repo, pr, installationID, action.Start, result.Environment, requestedBy, err.Error())
 		return
 	}
@@ -288,13 +298,7 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 		Caller:      caller,
 	})
 	if err != nil {
-		h.logger.Warn("cutover PR command rejected",
-			"repo", repo,
-			"pr", pr,
-			"apply_id", result.ApplyID,
-			"environment", result.Environment,
-			"requested_by", requestedBy,
-			"error", err)
+		h.logControlCommandError(action.Cutover, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
 		h.postCommandError(repo, pr, installationID, action.Cutover, result.Environment, requestedBy, err.Error())
 		return
 	}

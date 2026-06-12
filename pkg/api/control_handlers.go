@@ -54,6 +54,15 @@ func controlOperationHTTPStatus(err error) int {
 	return http.StatusInternalServerError
 }
 
+// IsInternalControlError reports whether a control operation error is an
+// internal failure (storage, Tern, or other unexpected errors) rather than an
+// operator-actionable rejection such as a state conflict. Callers use this to
+// pick error-level logging for failures operators must investigate, versus
+// warning-level logging for rejections the requester can act on.
+func IsInternalControlError(err error) bool {
+	return controlOperationHTTPStatus(err) >= http.StatusInternalServerError
+}
+
 func controlHTTPErrorf(status int, format string, args ...any) error {
 	return &controlOperationHTTPError{
 		status: status,
@@ -342,18 +351,22 @@ func (s *Service) ExecuteCutover(ctx context.Context, req apitypes.ControlReques
 	return resp, err
 }
 
+// executeCutoverForApply records durable cutover intent for an apply. The
+// returned HTTP status is meaningful only when err == nil; every error path
+// returns a zero status, and callers must derive the response status from the
+// error (e.g. via writeControlError).
 func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.ControlResponse, int, error) {
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
 		err := fmt.Errorf("control request store is not available")
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 	controlReq, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationCutover)
 	if err != nil {
 		err := fmt.Errorf("load pending cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 	if controlReq != nil {
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
@@ -373,7 +386,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 	if err != nil {
 		err := fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 	if readiness == cutoverRequestAlreadyInProgress {
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
@@ -398,12 +411,12 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 			"state", apply.State)
 		err := controlConflictf("schema change is recovering after restart; cutover will be available once recovery completes")
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 	if readiness == cutoverRequestNotReady {
 		err := controlConflictf("schema change is not waiting for cutover (current state: %s)", apply.State)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
@@ -414,7 +427,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 	if err != nil {
 		err := fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 	metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
 	message := "Cutover requested by user"
@@ -541,6 +554,10 @@ func (s *Service) ExecuteStop(ctx context.Context, req apitypes.ControlRequest) 
 	return resp, err
 }
 
+// executeStopForApply records durable stop intent for an apply and attempts an
+// immediate local stop. The returned HTTP status is meaningful only when
+// err == nil; every error path returns a zero status, and callers must derive
+// the response status from the error (e.g. via writeControlError).
 func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) (*apitypes.StopResponse, int, error) {
 	resp, responseStatus, err := s.queueStopForApplyOwner(ctx, apply, caller)
 	if err != nil {
@@ -549,7 +566,7 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 			status = "rejected"
 		}
 		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, status)
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 	metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
@@ -885,10 +902,14 @@ func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest)
 	return resp, err
 }
 
+// executeStartForApply records durable start intent for an apply or dispatches
+// a deferred deploy. The returned HTTP status is meaningful only when
+// err == nil; every error path returns a zero status, and callers must derive
+// the response status from the error (e.g. via writeControlError).
 func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.StartResponse, int, error) {
 	if err := validateStartRequestState(apply); err != nil {
 		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, "rejected")
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 	if err := s.completeResolvedStopBeforeStart(ctx, client, apply, caller); err != nil {
 		status := "error"
@@ -896,7 +917,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 			status = "rejected"
 		}
 		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 	if err := s.rejectControlIfStopPending(ctx, "start", apply); err != nil {
 		status := "error"
@@ -904,7 +925,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 			status = "rejected"
 		}
 		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 
 	var resp *ternv1.StartResponse
@@ -919,7 +940,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 				status = "rejected"
 			}
 			metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
-			return nil, http.StatusOK, err
+			return nil, 0, err
 		}
 		resp, err = client.Start(ctx, &ternv1.StartRequest{
 			ApplyId:     ternApplyID,
@@ -951,7 +972,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 			status = "rejected"
 		}
 		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
-		return nil, http.StatusOK, err
+		return nil, 0, err
 	}
 
 	metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
