@@ -184,6 +184,10 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	// Clean up any stale data from previous test runs (shared storage DB)
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+	// Delete child apply_operations rows before their parent applies rows so the
+	// operator claim loop cannot re-claim orphan operations whose parent lookup
+	// returns nil.
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1")
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1")
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", appDBName)
 

@@ -266,8 +266,18 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 	// survive the delete at the storage layer even if the applies table missed
 	// the in-flight work above.
 	if err := h.service.Storage().Checks().DeleteByPRExcludingApplyOwned(ctx, repo, pr); err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "pr_close_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
 		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "error", err)
 	} else {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "pr_close_cleanup",
+			Repository: repo,
+			Status:     "success",
+		})
 		h.logger.Info("deleted checks for closed PR", "repo", repo, "pr", pr)
 	}
 }
