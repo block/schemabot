@@ -519,7 +519,6 @@ func TestLockStore_UpdateSameSecondSucceeds(t *testing.T) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	t.Cleanup(func() {
-		_, _ = db.ExecContext(t.Context(), "SET TIMESTAMP = DEFAULT")
 		require.NoError(t, db.Close())
 	})
 	require.NoError(t, db.PingContext(ctx))
