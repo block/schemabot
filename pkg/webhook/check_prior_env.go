@@ -49,6 +49,7 @@ func (h *Handler) checkPriorEnvironments(
 			"database", database, "database_type", dbType,
 			"environment", environment,
 			"promotion_order", order)
+		metrics.RecordPromotionConfigErrorBlock(ctx, repo, database, environment)
 		h.postComment(repo, pr, installationID,
 			templates.RenderApplyBlockedByUnlistedEnvironment(environment, order))
 		return true

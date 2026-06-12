@@ -8,6 +8,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/spirit/pkg/utils"
 
@@ -386,6 +390,15 @@ func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testin
 		pr   = 1
 	)
 
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 1)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
@@ -435,6 +448,44 @@ func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testin
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for unlisted-environment config error comment")
 	}
+
+	dp := requirePromotionConfigErrorBlockDataPoint(t, reader)
+	assert.Equal(t, int64(1), dp.Value, "the config-error block must increment the metric exactly once")
+	assertStringAttr(t, dp.Attributes, "repository", repo)
+	assertStringAttr(t, dp.Attributes, "database", "orders")
+	assertStringAttr(t, dp.Attributes, "environment", "canary")
+}
+
+// requirePromotionConfigErrorBlockDataPoint collects metrics from the reader and
+// returns the single data point for the promotion config-error block counter,
+// failing the test if the metric is absent or has more than one data point.
+func requirePromotionConfigErrorBlockDataPoint(t *testing.T, reader *sdkmetric.ManualReader) metricdata.DataPoint[int64] {
+	t.Helper()
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.promotion.config_error_blocks_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "promotion config error block metric must be an int64 sum")
+			require.Len(t, sum.DataPoints, 1, "expected exactly one promotion config error block data point")
+			return sum.DataPoints[0]
+		}
+	}
+
+	t.Fatal("schemabot.promotion.config_error_blocks_total metric not found")
+	return metricdata.DataPoint[int64]{}
+}
+
+func assertStringAttr(t *testing.T, set attribute.Set, key, want string) {
+	t.Helper()
+	got, ok := set.Value(attribute.Key(key))
+	assert.True(t, ok, "metric data point must carry the %q attribute", key)
+	assert.Equal(t, want, got.AsString(), "metric attribute %q", key)
 }
 
 // TestCheckPriorEnvironmentsScopedTargetInOrderAllowsApply covers a scoped

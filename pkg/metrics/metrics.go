@@ -481,6 +481,32 @@ func RecordUntrustedAggregateNamedCheck(ctx context.Context, repository, environ
 	)
 }
 
+// RecordPromotionConfigErrorBlock counts applies blocked by the staging-first
+// promotion gate because the target environment is absent from the configured
+// promotion order on a scoped SchemaBot instance. This fires only on operator
+// misconfiguration: the gate cannot identify the target's prior environments,
+// so it fails closed. A non-zero count means an operator must add the
+// environment to environment_order; the matching warn log carries the
+// promotion_order so they can see what is configured.
+func RecordPromotionConfigErrorBlock(ctx context.Context, repository, database, environment string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.promotion.config_error_blocks_total",
+		otelmetric.WithDescription("Total applies blocked because the target environment is absent from the configured promotion order"),
+		otelmetric.WithUnit("{block}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create promotion config error block counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("repository", repository),
+			attribute.String("database", database),
+			EnvironmentAttribute(environment),
+		),
+	)
+}
+
 // AdjustActiveApplies increments or decrements the active applies gauge.
 // Use delta=1 when an apply is accepted and delta=-1 when it reaches a terminal state.
 func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment, environment string) {
