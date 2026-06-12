@@ -49,6 +49,7 @@ type routingRecordingClient struct {
 	resumeApply        *storage.Apply
 	resumeOperationID  int64
 	pendingObserverSet bool
+	pendingObserver    ProgressObserver
 	observerApplyID    int64
 	isRemote           bool
 }
@@ -89,6 +90,7 @@ func (c *routingRecordingClient) ResumeApplyOperation(_ context.Context, apply *
 
 func (c *routingRecordingClient) SetPendingObserver(observer ProgressObserver) {
 	c.pendingObserverSet = observer != nil
+	c.pendingObserver = observer
 }
 
 func (c *routingRecordingClient) IsRemote() bool {
@@ -104,6 +106,11 @@ type routingNoopObserver struct{}
 func (routingNoopObserver) OnProgress(*storage.Apply, []*storage.Task) {}
 
 func (routingNoopObserver) OnTerminal(*storage.Apply, []*storage.Task) {}
+
+type namedRoutingObserver struct {
+	routingNoopObserver
+	name string
+}
 
 func TestRoutingClientPullSchemaResolvesSingleExecutionTarget(t *testing.T) {
 	clients := map[string]*routingRecordingClient{
@@ -257,7 +264,7 @@ func TestRoutingClientApplyRoutesByStoredPlan(t *testing.T) {
 		ApplyLookup:         routingApplyLookup{},
 		ClientForDeployment: testDeploymentClientFunc(clients),
 	})
-	routingClient.SetPendingObserver(routingNoopObserver{})
+	require.NoError(t, routingClient.SetPendingObserverForPlan("plan-123", routingNoopObserver{}))
 
 	resp, err := routingClient.Apply(t.Context(), &ternv1.ApplyRequest{
 		PlanId:      "plan-123",
@@ -279,6 +286,142 @@ func TestRoutingClientApplyRoutesByStoredPlan(t *testing.T) {
 	assert.Equal(t, "production", clients["west/production"].applyReq.Environment)
 	assert.Equal(t, "stored-target", clients["west/production"].applyReq.Target)
 	assert.Equal(t, "stored-target", clients["west/production"].applyReq.Options["target"])
+}
+
+func TestRoutingClientApplyConsumesPlanScopedPendingObserver(t *testing.T) {
+	clients := map[string]*routingRecordingClient{
+		"west/production": {},
+	}
+	routingClient := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver: routingResolverFunc(func(context.Context, routing.Request) ([]routing.ExecutionTarget, error) {
+			return nil, fmt.Errorf("apply must route from stored plan")
+		}),
+		PlanLookup: routingPlanLookup{
+			"plan-123": {
+				PlanIdentifier: "plan-123",
+				Database:       "stored-db",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				Deployment:     "west",
+				Target:         "stored-target",
+				Environment:    "production",
+			},
+			"plan-456": {
+				PlanIdentifier: "plan-456",
+				Database:       "stored-db",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				Deployment:     "west",
+				Target:         "stored-target",
+				Environment:    "production",
+			},
+		},
+		ApplyLookup:         routingApplyLookup{},
+		ClientForDeployment: testDeploymentClientFunc(clients),
+	})
+	planObserver := namedRoutingObserver{name: "plan-456"}
+	require.NoError(t, routingClient.SetPendingObserverForPlan("plan-456", planObserver))
+
+	_, err := routingClient.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan-123",
+		Environment: "production",
+	})
+	require.NoError(t, err)
+	assert.False(t, clients["west/production"].pendingObserverSet)
+
+	_, err = routingClient.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan-456",
+		Environment: "production",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, clients["west/production"].pendingObserver)
+	assert.Equal(t, ProgressObserver(planObserver), clients["west/production"].pendingObserver)
+
+	clients["west/production"].pendingObserverSet = false
+	clients["west/production"].pendingObserver = nil
+	_, err = routingClient.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan-456",
+		Environment: "production",
+	})
+	require.NoError(t, err)
+	assert.False(t, clients["west/production"].pendingObserverSet)
+}
+
+func TestRoutingClientSetPendingObserverForPlanValidatesPlanIdentifier(t *testing.T) {
+	routingClient := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver:            routingResolverFunc(func(context.Context, routing.Request) ([]routing.ExecutionTarget, error) { return nil, nil }),
+		PlanLookup:          routingPlanLookup{},
+		ApplyLookup:         routingApplyLookup{},
+		ClientForDeployment: testDeploymentClientFunc(nil),
+	})
+
+	err := routingClient.SetPendingObserverForPlan("", routingNoopObserver{})
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "plan identifier is required")
+}
+
+func TestRoutingClientSetPendingObserverDoesNotAttachUnscopedObserver(t *testing.T) {
+	clients := map[string]*routingRecordingClient{
+		"west/production": {},
+	}
+	routingClient := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver: routingResolverFunc(func(context.Context, routing.Request) ([]routing.ExecutionTarget, error) {
+			return nil, fmt.Errorf("apply must route from stored plan")
+		}),
+		PlanLookup: routingPlanLookup{
+			"plan-123": {
+				PlanIdentifier: "plan-123",
+				Database:       "stored-db",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				Deployment:     "west",
+				Target:         "stored-target",
+				Environment:    "production",
+			},
+		},
+		ApplyLookup:         routingApplyLookup{},
+		ClientForDeployment: testDeploymentClientFunc(clients),
+	})
+	routingClient.SetPendingObserver(routingNoopObserver{})
+
+	_, err := routingClient.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan-123",
+		Environment: "production",
+	})
+
+	require.NoError(t, err)
+	assert.False(t, clients["west/production"].pendingObserverSet)
+}
+
+func TestRoutingClientSetPendingObserverForPlanClearsObserver(t *testing.T) {
+	clients := map[string]*routingRecordingClient{
+		"west/production": {},
+	}
+	routingClient := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver: routingResolverFunc(func(context.Context, routing.Request) ([]routing.ExecutionTarget, error) {
+			return nil, fmt.Errorf("apply must route from stored plan")
+		}),
+		PlanLookup: routingPlanLookup{
+			"plan-123": {
+				PlanIdentifier: "plan-123",
+				Database:       "stored-db",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				Deployment:     "west",
+				Target:         "stored-target",
+				Environment:    "production",
+			},
+		},
+		ApplyLookup:         routingApplyLookup{},
+		ClientForDeployment: testDeploymentClientFunc(clients),
+	})
+	require.NoError(t, routingClient.SetPendingObserverForPlan("plan-123", routingNoopObserver{}))
+	require.NoError(t, routingClient.SetPendingObserverForPlan("plan-123", nil))
+
+	_, err := routingClient.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan-123",
+		Environment: "production",
+	})
+
+	require.NoError(t, err)
+	assert.False(t, clients["west/production"].pendingObserverSet)
 }
 
 func TestRoutingClientApplyRejectsEnvironmentMismatch(t *testing.T) {
@@ -334,7 +477,7 @@ func TestRoutingClientApplyClearsPendingObserverOnError(t *testing.T) {
 		ApplyLookup:         routingApplyLookup{},
 		ClientForDeployment: testDeploymentClientFunc(clients),
 	})
-	routingClient.SetPendingObserver(routingNoopObserver{})
+	require.NoError(t, routingClient.SetPendingObserverForPlan("plan-123", routingNoopObserver{}))
 
 	_, err := routingClient.Apply(t.Context(), &ternv1.ApplyRequest{
 		PlanId:      "plan-123",

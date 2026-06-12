@@ -50,9 +50,12 @@ type RoutingClient struct {
 	applyOperationLookup ApplyOperationLookup
 	clientForDeployment  DeploymentClientFunc
 
-	observerMu      sync.Mutex
-	pendingObserver ProgressObserver
-	activeObservers map[int64]ProgressObserver
+	observerMu             sync.Mutex
+	pendingObserversByPlan map[string]ProgressObserver
+	activeObservers        map[int64]ProgressObserver
+
+	delegateApplyMu    sync.Mutex
+	delegateApplyLocks map[string]*sync.Mutex
 }
 
 var _ Client = (*RoutingClient)(nil)
@@ -72,12 +75,14 @@ func NewRoutingClient(config RoutingClientConfig) (*RoutingClient, error) {
 		return nil, fmt.Errorf("deployment client lookup is required")
 	}
 	return &RoutingClient{
-		resolver:             config.Resolver,
-		planLookup:           config.PlanLookup,
-		applyLookup:          config.ApplyLookup,
-		applyOperationLookup: config.ApplyOperationLookup,
-		clientForDeployment:  config.ClientForDeployment,
-		activeObservers:      make(map[int64]ProgressObserver),
+		resolver:               config.Resolver,
+		planLookup:             config.PlanLookup,
+		applyLookup:            config.ApplyLookup,
+		applyOperationLookup:   config.ApplyOperationLookup,
+		clientForDeployment:    config.ClientForDeployment,
+		pendingObserversByPlan: make(map[string]ProgressObserver),
+		activeObservers:        make(map[int64]ProgressObserver),
+		delegateApplyLocks:     make(map[string]*sync.Mutex),
 	}, nil
 }
 
@@ -147,7 +152,10 @@ func (c *RoutingClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*t
 	if err != nil {
 		return nil, fmt.Errorf("get client for plan %q deployment %q environment %q: %w", req.PlanId, plan.Deployment, plan.Environment, err)
 	}
-	if observer := c.takePendingObserver(); observer != nil {
+	delegateApplyLock := c.delegateApplyLock(plan.Deployment, plan.Environment)
+	delegateApplyLock.Lock()
+	defer delegateApplyLock.Unlock()
+	if observer := c.takePendingObserverForPlan(req.PlanId); observer != nil {
 		client.SetPendingObserver(observer)
 		defer func() {
 			if err != nil {
@@ -320,11 +328,24 @@ func (c *RoutingClient) Endpoint() string { return "routing" }
 // clients until transport metadata becomes request-scoped.
 func (c *RoutingClient) IsRemote() bool { return false }
 
-// SetPendingObserver sets an observer that will be consumed by the next Apply call.
-func (c *RoutingClient) SetPendingObserver(observer ProgressObserver) {
+// SetPendingObserver is unsupported for routed applies because routing needs a
+// plan identifier to attach observers safely. Use SetPendingObserverForPlan.
+func (c *RoutingClient) SetPendingObserver(observer ProgressObserver) {}
+
+// SetPendingObserverForPlan sets an observer that will be consumed only by an
+// Apply call for the matching plan identifier.
+func (c *RoutingClient) SetPendingObserverForPlan(planIdentifier string, observer ProgressObserver) error {
+	if planIdentifier == "" {
+		return fmt.Errorf("plan identifier is required for plan-scoped pending observer")
+	}
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()
-	c.pendingObserver = observer
+	if observer == nil {
+		delete(c.pendingObserversByPlan, planIdentifier)
+		return nil
+	}
+	c.pendingObserversByPlan[planIdentifier] = observer
+	return nil
 }
 
 // SetObserver registers a progress observer for an active apply.
@@ -450,12 +471,26 @@ func operationScopedApply(apply *storage.Apply, operation *storage.ApplyOperatio
 	return &scopedApply
 }
 
-func (c *RoutingClient) takePendingObserver() ProgressObserver {
+func (c *RoutingClient) takePendingObserverForPlan(planIdentifier string) ProgressObserver {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()
-	observer := c.pendingObserver
-	c.pendingObserver = nil
-	return observer
+	if observer, ok := c.pendingObserversByPlan[planIdentifier]; ok {
+		delete(c.pendingObserversByPlan, planIdentifier)
+		return observer
+	}
+	return nil
+}
+
+func (c *RoutingClient) delegateApplyLock(deployment, environment string) *sync.Mutex {
+	key := deployment + "/" + environment
+	c.delegateApplyMu.Lock()
+	defer c.delegateApplyMu.Unlock()
+	lock := c.delegateApplyLocks[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		c.delegateApplyLocks[key] = lock
+	}
+	return lock
 }
 
 func (c *RoutingClient) attachObserver(client Client, applyID int64) {
