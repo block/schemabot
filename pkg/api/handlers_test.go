@@ -1278,6 +1278,56 @@ func TestEnqueueAuthorizedApplyWakesOperatorForQueuedApply(t *testing.T) {
 	}
 }
 
+// planBodyOfSize builds a /api/plan JSON payload of exactly totalSize bytes
+// by padding the schema file content, so tests can probe either side of the
+// API request body limit.
+func planBodyOfSize(t *testing.T, totalSize int) string {
+	const envelope = `{"database":"testdb","environment":"staging","type":"mysql","schema_files":{"testdb":{"files":{"big.sql":"%s"}}}}`
+	overhead := len(envelope) - len("%s")
+	require.Greater(t, totalSize, overhead)
+	return fmt.Sprintf(envelope, strings.Repeat("a", totalSize-overhead))
+}
+
+// A request body over the API limit is rejected with 413 and an error that
+// tells the caller the limit, instead of being buffered into server memory.
+func TestAPIRoutesRejectOversizedRequestBody(t *testing.T) {
+	svc := newTestService()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	body := planBodyOfSize(t, maxAPIRequestBodyBytes+1)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+	var resp apitypes.ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Contains(t, resp.Error, "request body exceeds the 32 MiB limit")
+	assert.Contains(t, resp.Error, "reduce the payload size")
+}
+
+// A request body just under the API limit passes the size check and reaches
+// normal request handling. The request can still fail validation downstream,
+// but never with the body-size error.
+func TestAPIRoutesAcceptBodyUnderSizeLimit(t *testing.T) {
+	svc := newTestService()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	body := planBodyOfSize(t, maxAPIRequestBodyBytes-1)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.NotEqual(t, http.StatusRequestEntityTooLarge, w.Code)
+	assert.NotContains(t, w.Body.String(), "request body exceeds")
+}
+
 func TestPlanHandlerRejectsClientSuppliedSchemaPath(t *testing.T) {
 	svc := newTestService()
 	mux := http.NewServeMux()

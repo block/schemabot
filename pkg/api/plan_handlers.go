@@ -90,7 +90,7 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		s.writeBodyDecodeError(w, err)
 		return
 	}
 
@@ -253,7 +253,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		s.writeBodyDecodeError(w, err)
 		return
 	}
 
@@ -485,7 +485,7 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		s.writeBodyDecodeError(w, err)
 		return
 	}
 

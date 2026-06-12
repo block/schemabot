@@ -57,7 +57,7 @@ type LockConflictResponse struct {
 func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	var req LockAcquireRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		s.writeBodyDecodeError(w, err)
 		return
 	}
 
@@ -118,7 +118,7 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 	var req LockReleaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		s.writeBodyDecodeError(w, err)
 		return
 	}
 

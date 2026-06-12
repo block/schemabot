@@ -2,6 +2,8 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -57,4 +59,18 @@ func (s *Service) writeError(w http.ResponseWriter, status int, message string) 
 // Clients should match on error_code rather than parsing the error message.
 func (s *Service) writeErrorCode(w http.ResponseWriter, status int, code, message string) {
 	s.writeJSON(w, status, apitypes.ErrorResponse{Error: message, ErrorCode: code})
+}
+
+// writeBodyDecodeError maps a request-body decode failure to the right client
+// error. Bodies that exceed the API request body limit get a 413 that tells
+// the caller the limit so they can shrink the payload; every other decode
+// failure is malformed JSON and gets a 400 with the decoder's error.
+func (s *Service) writeBodyDecodeError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		s.writeError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("request body exceeds the %d MiB limit; reduce the payload size", maxAPIRequestBodyBytes>>20))
+		return
+	}
+	s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 }

@@ -513,42 +513,65 @@ func (s *Service) HandleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 // Route Registration
 // =============================================================================
 
+// maxAPIRequestBodyBytes caps the request body size for every API route.
+// The largest legitimate payloads are plan and pull requests carrying full
+// schema files — a database with hundreds of tables can reach a few megabytes
+// of DDL — so the cap leaves generous headroom for real schemas while
+// preventing a single oversized request from exhausting server memory.
+const maxAPIRequestBodyBytes = 32 << 20
+
+// limitRequestBody wraps a handler so its request body cannot exceed
+// maxAPIRequestBodyBytes. Reads past the limit fail with *http.MaxBytesError,
+// which writeBodyDecodeError maps to an actionable 413 response.
+func (s *Service) limitRequestBody(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxAPIRequestBodyBytes)
+		next(w, r)
+	}
+}
+
 // ConfigureRoutes registers all HTTP API routes on the given mux.
+// Every route is wrapped with a request body size limit so oversized
+// requests are rejected instead of being buffered into memory.
 func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
+	handle := func(pattern string, handler http.HandlerFunc) {
+		mux.HandleFunc(pattern, s.limitRequestBody(handler))
+	}
+
 	// Health endpoints
-	mux.HandleFunc("GET /health", s.handleHealth)
-	mux.HandleFunc("GET /tern-health/{deployment}/{environment}", s.handleTernHealth)
+	handle("GET /health", s.handleHealth)
+	handle("GET /tern-health/{deployment}/{environment}", s.handleTernHealth)
 
 	// Config API (for CLI to discover environments)
-	mux.HandleFunc("GET /api/databases/{database}/environments", s.handleDatabaseEnvironments)
+	handle("GET /api/databases/{database}/environments", s.handleDatabaseEnvironments)
 
 	// Orchestration API
-	mux.HandleFunc("POST /api/pull", s.handlePullSchema)
-	mux.HandleFunc("POST /api/plan", s.handlePlan)
-	mux.HandleFunc("POST /api/apply", s.handleApply)
-	mux.HandleFunc("GET /api/progress/apply/{apply_id}", s.handleProgressByApplyID)
-	mux.HandleFunc("GET /api/history/{database}", s.handleDatabaseHistory)
-	mux.HandleFunc("POST /api/cutover", s.handleCutover)
-	mux.HandleFunc("POST /api/stop", s.handleStop)
-	mux.HandleFunc("POST /api/start", s.handleStart)
-	mux.HandleFunc("POST /api/volume", s.handleVolume)
-	mux.HandleFunc("POST /api/revert", s.handleRevert)
-	mux.HandleFunc("POST /api/skip-revert", s.handleSkipRevert)
-	mux.HandleFunc("POST /api/rollback/plan", s.handleRollbackPlan)
-	mux.HandleFunc("GET /api/status", s.handleStatus)
-	mux.HandleFunc("GET /api/logs/{database}", s.handleLogs)
-	mux.HandleFunc("GET /api/logs", s.handleLogsWithoutDatabase)
+	handle("POST /api/pull", s.handlePullSchema)
+	handle("POST /api/plan", s.handlePlan)
+	handle("POST /api/apply", s.handleApply)
+	handle("GET /api/progress/apply/{apply_id}", s.handleProgressByApplyID)
+	handle("GET /api/history/{database}", s.handleDatabaseHistory)
+	handle("POST /api/cutover", s.handleCutover)
+	handle("POST /api/stop", s.handleStop)
+	handle("POST /api/start", s.handleStart)
+	handle("POST /api/volume", s.handleVolume)
+	handle("POST /api/revert", s.handleRevert)
+	handle("POST /api/skip-revert", s.handleSkipRevert)
+	handle("POST /api/rollback/plan", s.handleRollbackPlan)
+	handle("GET /api/status", s.handleStatus)
+	handle("GET /api/logs/{database}", s.handleLogs)
+	handle("GET /api/logs", s.handleLogsWithoutDatabase)
 
 	// Lock API (database-level locking)
-	mux.HandleFunc("POST /api/locks/acquire", s.handleLockAcquire)
-	mux.HandleFunc("DELETE /api/locks", s.handleLockRelease)
-	mux.HandleFunc("GET /api/locks/{database}/{dbtype}", s.handleLockGet)
-	mux.HandleFunc("GET /api/locks", s.handleLockList)
+	handle("POST /api/locks/acquire", s.handleLockAcquire)
+	handle("DELETE /api/locks", s.handleLockRelease)
+	handle("GET /api/locks/{database}/{dbtype}", s.handleLockGet)
+	handle("GET /api/locks", s.handleLockList)
 
 	// Settings API
-	mux.HandleFunc("GET /api/settings", s.handleSettingsList)
-	mux.HandleFunc("GET /api/settings/{key}", s.handleSettingsGet)
-	mux.HandleFunc("POST /api/settings", s.handleSettingsSet)
+	handle("GET /api/settings", s.handleSettingsList)
+	handle("GET /api/settings/{key}", s.handleSettingsGet)
+	handle("POST /api/settings", s.handleSettingsSet)
 
 	// GitHub webhook endpoint — registered externally via RegisterWebhook
 }

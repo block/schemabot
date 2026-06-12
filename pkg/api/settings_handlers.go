@@ -62,7 +62,7 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		Value string `json:"value"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		s.writeBodyDecodeError(w, err)
 		return
 	}
 

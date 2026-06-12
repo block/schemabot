@@ -160,7 +160,7 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, d
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dest); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		s.writeBodyDecodeError(w, err)
 		return nil, nil, "", false
 	}
 	if *applyID == "" {
@@ -1487,7 +1487,7 @@ func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		s.writeBodyDecodeError(w, err)
 		return
 	}
 	if req.ApplyID == "" {
