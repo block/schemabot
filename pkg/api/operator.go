@@ -34,6 +34,11 @@ const (
 	// DefaultOperatorWorkers is the number of concurrent operator workers
 	// when not configured via operator_workers in the server config.
 	DefaultOperatorWorkers = 4
+
+	// ApplyClaimLogTimeout bounds the best-effort apply-log append recording an
+	// operator claim, so a slow or hung storage layer cannot delay the resume
+	// the claim is about to drive.
+	ApplyClaimLogTimeout = 5 * time.Second
 )
 
 // StartOperator starts the background operator worker pool.
@@ -497,6 +502,12 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 		"state", apply.State,
 		"last_heartbeat", apply.UpdatedAt)
 
+	// Record the claim in the apply's durable log so the timeline explains
+	// why new state transitions appear after a failure or a worker crash —
+	// without this entry, an operator reading apply_logs sees a gap between
+	// the last failure and the resumed work.
+	s.logApplyResumeClaim(ctx, workerID, apply)
+
 	previousState := apply.State
 
 	deployment, err := storedDeploymentForApply(apply)
@@ -614,6 +625,39 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 	metrics.RecordOperatorResume(ctx, apply.Database, deployment, apply.Environment, previousState)
 	metrics.RecordOperatorClaimDuration(ctx, duration, apply.Database, deployment, apply.Environment, previousState)
 	return true, nil
+}
+
+// logApplyResumeClaim appends a durable apply log entry recording that an
+// operator worker claimed the apply to resume it. Best-effort: a failed
+// append must not block the resume, so the error is logged and the claim
+// proceeds.
+func (s *Service) logApplyResumeClaim(ctx context.Context, workerID int, apply *storage.Apply) {
+	logStore := s.storage.ApplyLogs()
+	if logStore == nil {
+		s.logger.Warn("operator: no apply log store configured; apply claim will not appear in apply logs",
+			"worker", workerID,
+			"apply_id", apply.ApplyIdentifier)
+		return
+	}
+	logCtx, cancel := context.WithTimeout(ctx, ApplyClaimLogTimeout)
+	defer cancel()
+	if err := logStore.Append(logCtx, &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelInfo,
+		EventType: storage.LogEventInfo,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   fmt.Sprintf("Operator claimed apply to resume it (worker %d, state %s)", workerID, apply.State),
+		OldState:  apply.State,
+		NewState:  apply.State,
+		CreatedAt: s.clock.Now(),
+	}); err != nil {
+		s.logger.Warn("operator: failed to log apply claim; apply claim will not appear in apply logs",
+			"worker", workerID,
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"error", err)
+	}
 }
 
 // startApplyOperationHeartbeat refreshes the claimed operation row's lease while
