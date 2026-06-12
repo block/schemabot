@@ -467,15 +467,17 @@ type EnvironmentConfig struct {
 	// Only meaningful alongside a Deployments map.
 	CutoverPolicy string `yaml:"cutover_policy,omitempty"`
 
-	// HaltOnFailure controls multi-deployment rollout behaviour when a
-	// deployment fails. When true or unset (the default), a failed deployment
-	// halts the rollout — later deployments in deployment_order are not started.
-	// When false, a failed deployment no longer blocks later deployments, so
-	// the rollout attempts every deployment instead of stopping at the first
-	// failure. It governs only rollout continuation; the apply's pass/fail
-	// verdict and the merge gate stay fail-closed on any failed deployment.
-	// Only meaningful alongside a Deployments map.
-	HaltOnFailure *bool `yaml:"halt_on_failure,omitempty"`
+	// OnFailure controls multi-deployment rollout continuation when a deployment
+	// terminally fails. "halt" (the default, also used when unset) stops the
+	// rollout — later deployments in deployment_order are not started. "continue"
+	// drops a terminal-failed deployment as a blocker so the rollout attempts
+	// every deployment instead of stopping at the first failure. "pause" is a
+	// known value reserved for a future release-gate behaviour and is rejected
+	// at validation until that machinery lands. It governs only rollout
+	// continuation; the apply's pass/fail verdict and the merge gate stay
+	// fail-closed on any failed deployment. Only meaningful alongside a
+	// Deployments map.
+	OnFailure string `yaml:"on_failure,omitempty"`
 
 	// For PlanetScale/Vitess:
 	// Organization is the PlanetScale organization name.
@@ -666,8 +668,17 @@ func (c *ServerConfig) Validate() error {
 					return fmt.Errorf("database %q environment %q has invalid cutover_policy %q (want %q or %q)", name, env, envConfig.CutoverPolicy, storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier)
 				}
 			}
-			if envConfig.HaltOnFailure != nil && !hasMapRouting {
-				return fmt.Errorf("database %q environment %q sets halt_on_failure without a deployments map", name, env)
+			if envConfig.OnFailure != "" {
+				if !hasMapRouting {
+					return fmt.Errorf("database %q environment %q sets on_failure without a deployments map", name, env)
+				}
+				switch envConfig.OnFailure {
+				case storage.OnFailureHalt, storage.OnFailureContinue:
+				case storage.OnFailurePause:
+					return fmt.Errorf("database %q environment %q sets on_failure %q which is not yet supported; use %q or %q", name, env, storage.OnFailurePause, storage.OnFailureHalt, storage.OnFailureContinue)
+				default:
+					return fmt.Errorf("database %q environment %q has invalid on_failure %q (want %q or %q)", name, env, envConfig.OnFailure, storage.OnFailureHalt, storage.OnFailureContinue)
+				}
 			}
 			switch {
 			case hasDSN && (hasScalarRouting || hasMapRouting):
@@ -932,16 +943,16 @@ func (c *ServerConfig) CutoverPolicyFor(database, environment string) string {
 	return env.CutoverPolicy
 }
 
-// HaltOnFailureEnabled reports whether a failed deployment should halt the
-// rollout of later deployments for this database+environment. Defaults to true
-// (halt) when the environment is unconfigured or leaves halt_on_failure unset,
-// preserving stop-at-first-failure as the safe default.
-func (c *ServerConfig) HaltOnFailureEnabled(database, environment string) bool {
+// OnFailure returns the resolved rollout-continuation policy for a
+// database+environment. It defaults to OnFailureHalt when the environment is
+// unconfigured or leaves on_failure unset, preserving stop-at-first-failure as
+// the safe default.
+func (c *ServerConfig) OnFailure(database, environment string) string {
 	env := c.DatabaseEnvironment(database, environment)
-	if env == nil || env.HaltOnFailure == nil {
-		return true
+	if env == nil || env.OnFailure == "" {
+		return storage.OnFailureHalt
 	}
-	return *env.HaltOnFailure
+	return env.OnFailure
 }
 
 // DatabaseEnvironments returns the environments configured server-side for a

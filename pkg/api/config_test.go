@@ -20,28 +20,28 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// TestServerConfig_HaltOnFailureEnabled verifies the rollout-policy resolver:
-// it defaults to halting (true) when unset or unconfigured, and honours an
-// explicit false so a failed deployment no longer halts later ones.
-func TestServerConfig_HaltOnFailureEnabled(t *testing.T) {
+// TestServerConfig_OnFailure verifies the rollout-continuation resolver: it
+// defaults to halt when unset or unconfigured, and honours an explicit
+// continue so a terminal-failed deployment no longer halts later ones.
+func TestServerConfig_OnFailure(t *testing.T) {
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"payments": {
 				Type: "mysql",
 				Environments: map[string]EnvironmentConfig{
-					"halt-unset": {Target: "payments", Deployment: "payments-a"},
-					"halt-true":  {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, HaltOnFailure: new(true)},
-					"halt-false": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, HaltOnFailure: new(false)},
+					"unset":    {Target: "payments", Deployment: "payments-a"},
+					"halt":     {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailureHalt},
+					"continue": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, OnFailure: storage.OnFailureContinue},
 				},
 			},
 		},
 	}
 
-	assert.True(t, cfg.HaltOnFailureEnabled("payments", "halt-unset"), "unset defaults to halting")
-	assert.True(t, cfg.HaltOnFailureEnabled("payments", "halt-true"), "explicit true halts")
-	assert.False(t, cfg.HaltOnFailureEnabled("payments", "halt-false"), "explicit false does not halt")
-	assert.True(t, cfg.HaltOnFailureEnabled("payments", "missing-env"), "unconfigured env defaults to halting")
-	assert.True(t, cfg.HaltOnFailureEnabled("missing-db", "halt-false"), "unconfigured database defaults to halting")
+	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "unset"), "unset defaults to halting")
+	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "halt"), "explicit halt halts")
+	assert.Equal(t, storage.OnFailureContinue, cfg.OnFailure("payments", "continue"), "explicit continue does not halt")
+	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("payments", "missing-env"), "unconfigured env defaults to halting")
+	assert.Equal(t, storage.OnFailureHalt, cfg.OnFailure("missing-db", "continue"), "unconfigured database defaults to halting")
 }
 
 func TestLoadServerConfig(t *testing.T) {
@@ -1409,24 +1409,56 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			tern: baseTern,
 		},
 		{
-			name: "halt_on_failure without a deployments map is rejected",
+			name: "on_failure without a deployments map is rejected",
 			envConfig: EnvironmentConfig{
-				Target:        "payments",
-				Deployment:    "payments-a",
-				HaltOnFailure: new(false),
+				Target:     "payments",
+				Deployment: "payments-a",
+				OnFailure:  storage.OnFailureContinue,
 			},
 			tern:       baseTern,
-			wantErrSub: "sets halt_on_failure without a deployments map",
+			wantErrSub: "sets on_failure without a deployments map",
 		},
 		{
-			name: "halt_on_failure with a deployments map is accepted",
+			name: "on_failure halt with a deployments map is accepted",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
 					"payments-a": {Target: "payments"},
 				},
-				HaltOnFailure: new(false),
+				OnFailure: storage.OnFailureHalt,
 			},
 			tern: baseTern,
+		},
+		{
+			name: "on_failure continue with a deployments map is accepted",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+				OnFailure: storage.OnFailureContinue,
+			},
+			tern: baseTern,
+		},
+		{
+			name: "invalid on_failure value is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+				OnFailure: "warp-speed",
+			},
+			tern:       baseTern,
+			wantErrSub: `invalid on_failure "warp-speed"`,
+		},
+		{
+			name: "on_failure pause is rejected as not yet supported",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+				},
+				OnFailure: storage.OnFailurePause,
+			},
+			tern:       baseTern,
+			wantErrSub: `sets on_failure "pause" which is not yet supported`,
 		},
 	}
 

@@ -25,6 +25,28 @@ const (
 	CutoverPolicyBarrier = "barrier"
 )
 
+// On-failure policies control multi-deployment rollout continuation when an
+// earlier deployment terminally fails. Like the cutover policy, the value is
+// resolved from the environment config at apply-create time and persisted on
+// each apply_operations row so the policy in force when the apply was created
+// travels with it.
+const (
+	// OnFailureHalt is the default: a terminal-failed earlier deployment blocks
+	// every later deployment of the same apply, so the rollout stops at the
+	// first failure.
+	OnFailureHalt = "halt"
+
+	// OnFailureContinue treats a terminal-failed earlier deployment as settled
+	// so it no longer blocks later deployments; the rollout attempts every
+	// deployment instead of stopping at the first failure.
+	OnFailureContinue = "continue"
+
+	// OnFailurePause holds the rollout after a failure until a human releases
+	// it. It is a known value but not yet supported; config validation rejects
+	// it until the release machinery lands.
+	OnFailurePause = "pause"
+)
+
 // Lock represents a database-level deployment lock.
 // Locks prevent concurrent schema changes to the same database across
 // all environments and PRs. Lock key is database:type (no environment).
@@ -466,20 +488,18 @@ type ApplyOperation struct {
 	// an empty value as "rolling", matching the column's NOT NULL DEFAULT.
 	CutoverPolicy string
 
-	// HaltOnFailure is the rollout policy captured for this operation's parent
-	// apply at apply-create time, drawn from the resolved environment config.
-	// When true, a failed earlier sibling blocks every later deployment of the
-	// same apply — the rollout stops at the first failure. When false, a
-	// terminal-failed earlier sibling no longer blocks later siblings, so the
-	// rollout attempts every deployment instead of halting. It governs only
-	// rollout continuation, never the apply's pass/fail verdict or the merge
-	// gate, which stay fail-closed on any failed deployment.
-	//
-	// A pointer so an unset value is distinguishable from an explicit false:
-	// Insert treats nil as halt-on-failure (the safe default, matching the
-	// column's NOT NULL DEFAULT 1), so a caller that omits the policy never
-	// silently degrades to the less-safe non-halting behaviour.
-	HaltOnFailure *bool
+	// OnFailure is the rollout-continuation policy captured for this operation's
+	// parent apply at apply-create time, drawn from the resolved environment
+	// config. "halt" (the default) blocks every later deployment of the same
+	// apply once an earlier sibling terminally fails — the rollout stops at the
+	// first failure. "continue" treats a terminal-failed earlier sibling as
+	// settled so it no longer blocks later siblings, and the rollout attempts
+	// every deployment instead of halting. It governs only rollout
+	// continuation, never the apply's pass/fail verdict or the merge gate,
+	// which stay fail-closed on any failed deployment. Insert treats an empty
+	// value as "halt", matching the column's NOT NULL DEFAULT, so a caller that
+	// omits the policy never silently degrades to the less-safe behaviour.
+	OnFailure string
 
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time

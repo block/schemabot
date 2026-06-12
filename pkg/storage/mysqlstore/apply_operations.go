@@ -20,7 +20,7 @@ import (
 
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, deployment, target, state, error_message,
-	cutover_policy, halt_on_failure, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
+	cutover_policy, on_failure, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
 // mysqlErrDupEntry is MySQL's error number for a duplicate-key violation.
@@ -64,21 +64,22 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		cutoverPolicy = storage.CutoverPolicyRolling
 	}
 
-	// nil policy means the caller did not resolve a halt_on_failure preference,
+	// An empty policy means the caller did not resolve an on_failure preference,
 	// so fall back to halting — the safe default that matches the column's
-	// NOT NULL DEFAULT 1 and never silently degrades to non-halting behaviour.
-	haltOnFailure := true
-	if ad.HaltOnFailure != nil {
-		haltOnFailure = *ad.HaltOnFailure
+	// NOT NULL DEFAULT 'halt' and never silently degrades to non-halting
+	// behaviour.
+	onFailure := ad.OnFailure
+	if onFailure == "" {
+		onFailure = storage.OnFailureHalt
 	}
 
 	result, err := exec.ExecContext(ctx, `
 		INSERT INTO apply_operations (
-			apply_id, deployment, target, state, error_message, cutover_policy, halt_on_failure,
+			apply_id, deployment, target, state, error_message, cutover_policy, on_failure,
 			started_at, completed_at, engine_resume_context, engine_resume_metadata
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		ad.ApplyID, ad.Deployment, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy, haltOnFailure,
+		ad.ApplyID, ad.Deployment, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
@@ -96,6 +97,7 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 	ad.ID = id
 	ad.State = stateVal
 	ad.CutoverPolicy = cutoverPolicy
+	ad.OnFailure = onFailure
 	return id, nil
 }
 
@@ -556,11 +558,11 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 //     terminal non-success states (failed, cancelled, reverted) — still block,
 //     so a failed earlier deployment still halts the rollout.
 //
-// halt_on_failure (per-apply policy, also captured on each row at create)
-// layers on top of both policies: when true (the default), a terminal-failed
-// earlier sibling blocks every later sibling, so the rollout halts on the
-// first failure. When false, a terminal `failed` earlier sibling is treated as
-// settled and no longer blocks: later deployments are still claimed and
+// on_failure (per-apply policy, also captured on each row at create)
+// layers on top of both policies: "halt" (the default) keeps a terminal-failed
+// earlier sibling blocking every later sibling, so the rollout halts on the
+// first failure. "continue" treats a terminal `failed` earlier sibling as
+// settled so it no longer blocks: later deployments are still claimed and
 // attempted. Only terminal `failed` is exempted — pending, running,
 // failed_retryable, and stopped earlier siblings still block under both
 // policies (work is in-flight or recoverable). The policy governs only rollout
@@ -601,9 +603,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// reaches the cutover barrier or succeeds (waiting_for_cutover, cutting_over,
 	// revert_window, completed); under rolling — and any non-barrier value, which
 	// fails closed to the serial gate — only a completed earlier sibling stops
-	// blocking. The trailing Failed arg drives the halt_on_failure exemption:
-	// when the policy is off, a terminal-failed earlier sibling no longer blocks
-	// later ones.
+	// blocking. The trailing on_failure/Failed pair drives the exemption: when
+	// the policy is "continue", a terminal-failed earlier sibling no longer
+	// blocks later ones.
 	queryArgs = append(queryArgs,
 		storage.CutoverPolicyBarrier,
 		state.ApplyOperation.WaitingForCutover,
@@ -612,6 +614,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		state.ApplyOperation.Completed,
 		storage.CutoverPolicyBarrier,
 		state.ApplyOperation.Completed,
+		storage.OnFailureContinue,
 		state.ApplyOperation.Failed,
 	)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
@@ -678,7 +681,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								AND earlier.state <> ?
 							)
 						)
-						AND NOT (apply_operations.halt_on_failure = 0 AND earlier.state = ?)
+						AND NOT (apply_operations.on_failure = ? AND earlier.state = ?)
 				)
 			)
 			OR (state IN (%s) AND updated_at < NOW() - INTERVAL %s)
@@ -862,18 +865,14 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var errMsg sql.NullString
 	var engineResumeContext, engineResumeMetadata sql.NullString
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
-	var haltOnFailure bool
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.Target, &ad.State, &errMsg,
-		&ad.CutoverPolicy, &haltOnFailure, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
+		&ad.CutoverPolicy, &ad.OnFailure, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
-
-	// The column is NOT NULL, so a stored row always carries an explicit policy.
-	ad.HaltOnFailure = &haltOnFailure
 
 	if errMsg.Valid {
 		ad.ErrorMessage = errMsg.String
