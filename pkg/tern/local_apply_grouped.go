@@ -619,15 +619,30 @@ func (c *LocalClient) markRevertSkipped(ctx context.Context, apply *storage.Appl
 	}
 }
 
-// revertWindowDuration returns the configured revert window duration,
-// falling back to PlanetScale's default of 30 minutes.
+// revertWindowDuration returns the configured revert window duration, falling
+// back to the engine default when none is set. The server writes a canonical,
+// already-validated duration into metadata, so a malformed value only reaches
+// here when an embedder populates metadata directly. Rather than silently
+// using the default — which would hide a misconfigured revert window — an
+// unparseable or non-positive value is surfaced via a warning before falling
+// back, so the whole class of bad input is observable.
 func (c *LocalClient) revertWindowDuration() time.Duration {
-	if s := c.config.Metadata["revert_window_duration"]; s != "" {
-		if d, err := time.ParseDuration(s); err == nil && d > 0 {
-			return d
-		}
+	s := c.config.Metadata["revert_window_duration"]
+	if s == "" {
+		return defaultRevertWindowDuration
 	}
-	return defaultRevertWindowDuration
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		c.logger.Warn("invalid revert_window_duration metadata; using engine default",
+			"database", c.config.Database, "value", s, "default", defaultRevertWindowDuration, "error", err)
+		return defaultRevertWindowDuration
+	}
+	if d <= 0 {
+		c.logger.Warn("non-positive revert_window_duration metadata; using engine default",
+			"database", c.config.Database, "value", s, "default", defaultRevertWindowDuration)
+		return defaultRevertWindowDuration
+	}
+	return d
 }
 
 // revertWindowDeadline computes when the revert window expires.

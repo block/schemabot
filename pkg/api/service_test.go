@@ -195,47 +195,86 @@ func TestServiceDeploymentForDatabaseEnvironment(t *testing.T) {
 	require.Error(t, err)
 }
 
-// A PlanetScale token reference that resolves to a value without the name:value
-// separator is rejected when building the local client, rather than silently
-// producing an empty token name and value.
-func TestNewLocalTernClient_RejectsMalformedTokenReference(t *testing.T) {
+// A PlanetScale token configured as a literal (the secrets resolver returns
+// unprefixed values as-is) that lacks the name:value separator is rejected when
+// building the local client. The literal is the raw credential, so the error
+// redacts it and identifies the environment by its config key instead.
+func TestNewLocalTernClient_RejectsMalformedLiteralTokenWithoutLeakingValue(t *testing.T) {
 	cfg := &ServerConfig{}
 	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
+	const secretLiteral = "pscale_tkn_supersecretvalue"
 	envConfig := EnvironmentConfig{
 		DSN:            "root@tcp(localhost:3306)/mydb",
 		Organization:   "acme",
-		TokenSecretRef: "no-separator-token",
+		TokenSecretRef: secretLiteral,
 	}
 
 	_, err := service.newLocalTernClient("vitessdb-staging", "vitessdb", "vitess", envConfig)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "vitessdb-staging")
-	assert.Contains(t, err.Error(), `"no-separator-token"`)
+	assert.Contains(t, err.Error(), "literal value redacted")
 	assert.Contains(t, err.Error(), "name:value format")
+	assert.NotContains(t, err.Error(), secretLiteral)
 }
 
-// A PlanetScale token reference that resolves to a value with the name:value
-// separator present but an empty name or empty value is rejected, rather than
-// silently producing an empty token name or value.
-func TestNewLocalTernClient_RejectsTokenReferenceWithEmptyParts(t *testing.T) {
+// A literal PlanetScale token with the name:value separator present but an empty
+// name or value is also redacted: the whole literal is the credential, so the
+// error never echoes it. Each case carries a distinctive secret fragment that
+// must be absent from the error.
+func TestNewLocalTernClient_RejectsLiteralTokenWithEmptyPartsWithoutLeakingValue(t *testing.T) {
 	cfg := &ServerConfig{}
 	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	for _, ref := range []string{":secret", "name:", "  :  "} {
-		t.Run(ref, func(t *testing.T) {
+	cases := []struct {
+		ref      string
+		fragment string // distinctive credential text that must not appear in the error
+	}{
+		{ref: ":supersecretvalue", fragment: "supersecretvalue"},
+		{ref: "supersecretname:", fragment: "supersecretname"},
+		{ref: "  :  ", fragment: "  :  "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.ref, func(t *testing.T) {
 			envConfig := EnvironmentConfig{
 				DSN:            "root@tcp(localhost:3306)/mydb",
 				Organization:   "acme",
-				TokenSecretRef: ref,
+				TokenSecretRef: tc.ref,
 			}
 
 			_, err := service.newLocalTernClient("vitessdb-staging", "vitessdb", "vitess", envConfig)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "vitessdb-staging")
+			assert.Contains(t, err.Error(), "literal value redacted")
 			assert.Contains(t, err.Error(), "non-empty name and value")
+			assert.NotContains(t, err.Error(), tc.fragment)
 		})
 	}
+}
+
+// A token configured as a real reference indirection (e.g. env:VAR) that
+// resolves to a malformed value is rejected with the reference echoed: the
+// reference names where the credential lives, not the credential itself, so it
+// is safe to surface for triage while the resolved secret value stays hidden.
+func TestNewLocalTernClient_RejectsMalformedTokenReferenceEchoingTheReference(t *testing.T) {
+	cfg := &ServerConfig{}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	const secretValue = "no-separator-secret-value"
+	t.Setenv("SCHEMABOT_TEST_TOKEN", secretValue)
+
+	envConfig := EnvironmentConfig{
+		DSN:            "root@tcp(localhost:3306)/mydb",
+		Organization:   "acme",
+		TokenSecretRef: "env:SCHEMABOT_TEST_TOKEN",
+	}
+
+	_, err := service.newLocalTernClient("vitessdb-staging", "vitessdb", "vitess", envConfig)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vitessdb-staging")
+	assert.Contains(t, err.Error(), `"env:SCHEMABOT_TEST_TOKEN"`)
+	assert.Contains(t, err.Error(), "name:value format")
+	assert.NotContains(t, err.Error(), secretValue)
 }
 
 // A PlanetScale token reference that resolves to a well-formed name:value pair

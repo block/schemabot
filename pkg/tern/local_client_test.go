@@ -1094,3 +1094,87 @@ func attrValues(t *testing.T, attrs []any) map[string]any {
 	}
 	return values
 }
+
+// capturedLog records a single emitted log record's level, message, and
+// attributes for assertions.
+type capturedLog struct {
+	level slog.Level
+	msg   string
+	attrs map[string]any
+}
+
+// captureHandler is a minimal slog.Handler that records every emitted record so
+// tests can assert on level, message, and attributes.
+type captureHandler struct {
+	records *[]capturedLog
+}
+
+func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
+	attrs := make(map[string]any, r.NumAttrs())
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	*h.records = append(*h.records, capturedLog{level: r.Level, msg: r.Message, attrs: attrs})
+	return nil
+}
+
+func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// A canonical, positive revert_window_duration in metadata is honored, while an
+// empty value falls back to the engine default. A malformed or non-positive
+// value — which the server never writes but an embedder populating metadata
+// directly can — fails observably: it warns with the offending value and the
+// engine default rather than silently defaulting.
+func TestLocalClient_RevertWindowDuration(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		want      time.Duration
+		wantWarn  bool
+		warnValue string
+	}{
+		{name: "honors a valid positive duration", value: "45m", want: 45 * time.Minute},
+		{name: "empty uses engine default", value: "", want: defaultRevertWindowDuration},
+		{name: "unparseable warns and uses default", value: "not-a-duration", want: defaultRevertWindowDuration, wantWarn: true, warnValue: "not-a-duration"},
+		{name: "zero warns and uses default", value: "0s", want: defaultRevertWindowDuration, wantWarn: true, warnValue: "0s"},
+		{name: "negative warns and uses default", value: "-5m", want: defaultRevertWindowDuration, wantWarn: true, warnValue: "-5m"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var records []capturedLog
+			client := &LocalClient{
+				config: LocalConfig{
+					Database: "orders",
+					Metadata: map[string]string{"revert_window_duration": tc.value},
+				},
+				logger: slog.New(captureHandler{records: &records}),
+			}
+
+			got := client.revertWindowDuration()
+			assert.Equal(t, tc.want, got)
+
+			var warnings []capturedLog
+			for _, r := range records {
+				if r.level == slog.LevelWarn {
+					warnings = append(warnings, r)
+				}
+			}
+
+			if !tc.wantWarn {
+				assert.Empty(t, warnings, "no warning expected")
+				return
+			}
+
+			require.Len(t, warnings, 1, "exactly one warning expected")
+			w := warnings[0]
+			assert.Equal(t, tc.warnValue, w.attrs["value"])
+			assert.Equal(t, "orders", w.attrs["database"])
+			assert.Equal(t, defaultRevertWindowDuration, w.attrs["default"])
+		})
+	}
+}
