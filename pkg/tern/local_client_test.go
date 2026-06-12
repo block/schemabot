@@ -99,15 +99,24 @@ type fakeControlEngine struct {
 	progressReq    *engine.ProgressRequest
 	progressResult *engine.ProgressResult
 	progressErr    error
+	planResult     *engine.PlanResult
+	applyResult    *engine.ApplyResult
+	applyErr       error
 }
 
 func (e *fakeControlEngine) Name() string { return "fake" }
 
 func (e *fakeControlEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	if e.planResult != nil {
+		return e.planResult, nil
+	}
 	return &engine.PlanResult{}, nil
 }
 
 func (e *fakeControlEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	if e.applyResult != nil || e.applyErr != nil {
+		return e.applyResult, e.applyErr
+	}
 	return &engine.ApplyResult{Accepted: true}, nil
 }
 
@@ -188,12 +197,16 @@ func (s *exactProgressVitessApplyDataStore) GetByApplyID(context.Context, int64)
 
 type exactProgressApplyOperationStore struct {
 	storage.ApplyOperationStore
-	data  *storage.EngineResumeState
-	err   error
-	saved *storage.EngineResumeState
+	data    *storage.EngineResumeState
+	err     error
+	saveErr error
+	saved   *storage.EngineResumeState
 }
 
 func (s *exactProgressApplyOperationStore) SaveEngineResumeState(_ context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	if s.err != nil {
 		return s.err
 	}
@@ -556,6 +569,123 @@ func TestGroupedResumeStateRequiresApplyOperationForVitess(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "apply-unlinked-mysql", resumeState.MigrationContext)
 	assert.Empty(t, resumeState.Metadata)
+}
+
+// reattachResumeFixture builds a Vitess apply that has already reattached to an
+// in-flight deploy request: the engine accepts the grouped resume, so the apply
+// owner must not write terminal failure when post-accept resume-state handling
+// goes wrong. The fake engine's plan keeps the task active through the final
+// schema check so the resume reaches the post-accept persistence path.
+func reattachResumeFixture(applyOperations storage.ApplyOperationStore, applyResult *engine.ApplyResult) (*LocalClient, *storage.Apply, []*storage.Task, *storage.Plan, *exactProgressApplyStore) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-reattach-vitess",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Engine:          storage.EnginePlanetScale,
+		State:           state.Apply.Recovering,
+	}
+	tasks := []*storage.Task{{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-reattach",
+		Database:         "testdb",
+		DatabaseType:     storage.DatabaseTypeVitess,
+		Engine:           storage.EnginePlanetScale,
+		Namespace:        "commerce",
+		TableName:        "users",
+		DDL:              "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		DDLAction:        "alter",
+		State:            state.Task.Recovering,
+	}}
+	plan := &storage.Plan{PlanIdentifier: "plan-reattach"}
+	eng := &fakeControlEngine{
+		planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
+			Namespace: "commerce",
+			TableChanges: []engine.TableChange{{
+				Table: "users",
+				DDL:   "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			}},
+		}}},
+		applyResult: applyResult,
+	}
+	applyStore := &exactProgressApplyStore{apply: apply}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			applyOperations: applyOperations,
+		},
+		planetscaleEngine: eng,
+		logger:            slog.Default(),
+	}
+	return client, apply, tasks, plan, applyStore
+}
+
+// After the engine accepts the grouped resume a deploy request is running on the
+// provider. A failure to persist the returned resume state is storage
+// uncertainty, not a failed schema change: the apply owner exits non-terminally
+// so an operator can retry against the in-flight work instead of abandoning it.
+func TestLaunchAtomicResumeSaveFailureStaysRecoverable(t *testing.T) {
+	store := &exactProgressApplyOperationStore{
+		data: &storage.EngineResumeState{
+			ApplyOperationID: 7,
+			MigrationContext: "ctx-reattach",
+			Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+		},
+		saveErr: errors.New("storage unavailable"),
+	}
+	applyResult := &engine.ApplyResult{
+		Accepted: true,
+		ResumeState: &engine.ResumeState{
+			MigrationContext: "ctx-reattach",
+			Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+		},
+	}
+	client, apply, tasks, plan, applyStore := reattachResumeFixture(store, applyResult)
+
+	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, buildApplyOptions(apply), "Recovering from checkpoint", false, false)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.ErrorContains(t, err, "apply-reattach-vitess")
+	assert.False(t, state.IsTerminalApplyState(applyStore.apply.State),
+		"in-flight apply must stay recoverable, not terminal: got %s", applyStore.apply.State)
+	assert.NotEqual(t, state.Apply.Failed, applyStore.apply.State)
+}
+
+// The Vitess poll loop is driven by resume-state metadata, so an accepted resume
+// that returns no metadata leaves the owner unable to track the in-flight deploy
+// request. That ambiguity is non-terminal: the owner exits for operator retry
+// rather than failing an apply whose deploy request is still running.
+func TestLaunchAtomicResumeMissingMetadataStaysRecoverable(t *testing.T) {
+	store := &exactProgressApplyOperationStore{
+		data: &storage.EngineResumeState{
+			ApplyOperationID: 7,
+			MigrationContext: "ctx-reattach",
+			Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+		},
+	}
+	applyResult := &engine.ApplyResult{
+		Accepted: true,
+		ResumeState: &engine.ResumeState{
+			MigrationContext: "ctx-reattach",
+			Metadata:         "",
+		},
+	}
+	client, apply, tasks, plan, applyStore := reattachResumeFixture(store, applyResult)
+
+	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, buildApplyOptions(apply), "Recovering from checkpoint", false, false)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+	assert.ErrorContains(t, err, "apply-reattach-vitess")
+	assert.False(t, state.IsTerminalApplyState(applyStore.apply.State),
+		"in-flight apply must stay recoverable, not terminal: got %s", applyStore.apply.State)
+	assert.NotEqual(t, state.Apply.Failed, applyStore.apply.State)
 }
 
 // Rebuilt resume changes must preserve each task's namespace and table so

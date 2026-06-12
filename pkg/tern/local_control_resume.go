@@ -560,15 +560,22 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	if result.ResumeState != nil {
 		resumeState = result.ResumeState
 		if c.config.Type == storage.DatabaseTypeVitess {
+			// The engine has already accepted the resume and a deploy request is
+			// running on the provider. A failure to persist the resume state must
+			// not become terminal apply state — the owner exits and the operator
+			// retries against the in-flight work rather than abandoning it.
 			if saveErr := c.saveEngineResumeState(ctx, tasks, resumeState); saveErr != nil {
-				return fmt.Errorf("save engine resume state after grouped resume of apply %s (database %s): %w", apply.ApplyIdentifier, apply.Database, saveErr)
+				return fmt.Errorf("%w: save engine resume state after grouped resume of apply %s (database %s): %w", errGroupedResumeStateUnavailable, apply.ApplyIdentifier, apply.Database, saveErr)
 			}
 		}
 	}
 	// Progress polling for Vitess applies is driven entirely by resume state
 	// metadata; without it the poll loop can never observe the deploy request.
+	// The engine has already accepted the resume, so an absent metadata invariant
+	// leaves the owner unable to track in-flight work — exit non-terminally so the
+	// operator can retry rather than failing an apply that is still running.
 	if c.config.Type == storage.DatabaseTypeVitess && resumeState.Metadata == "" {
-		return fmt.Errorf("engine accepted grouped resume of Vitess apply %s (database %s) without resume state metadata", apply.ApplyIdentifier, apply.Database)
+		return fmt.Errorf("%w: engine accepted grouped resume of Vitess apply %s (database %s) without resume state metadata", errGroupedResumeStateUnavailable, apply.ApplyIdentifier, apply.Database)
 	}
 
 	now := time.Now()
@@ -620,10 +627,12 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	return nil
 }
 
-// errGroupedResumeStateUnavailable marks a resume attempt that could not load
-// (or rule out) persisted engine resume state. The current apply owner must
-// exit without writing terminal state so a later attempt can retry against
-// intact storage — failing the apply here would abandon in-flight engine work.
+// errGroupedResumeStateUnavailable marks a resume attempt whose persisted engine
+// resume state could not be loaded (or ruled out) before the engine apply, or
+// could not be persisted (or confirmed present) after the engine accepted the
+// reattach. The current apply owner must exit without writing terminal state so
+// a later attempt can retry against intact storage — failing the apply here
+// would abandon engine work that is still in flight on the provider.
 var errGroupedResumeStateUnavailable = errors.New("grouped resume state unavailable")
 
 // groupedResumeState returns the ResumeState handed to the engine when a
