@@ -83,6 +83,7 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 		fmt.Println("Verified: pulled schema produces no schema changes in the source environment.")
 	}
 	fmt.Println()
+	fmt.Printf("Onboarding complete for %s from %s.\n", resp.Database, resp.Environment)
 	fmt.Println("Next: open a normal PR. SchemaBot plan comments and checks will reconcile other configured environments.")
 	return nil
 }
