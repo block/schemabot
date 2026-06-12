@@ -611,6 +611,11 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// claimable, resumable operation. CreateWithTasksAndOperations links each
 	// task to the single operation via ApplyOperationID, which the engine
 	// resume-state path requires and the operator claim loop selects on.
+	//
+	// CutoverPolicy and HaltOnFailure are intentionally left unset: the Tern
+	// client has no environment config to resolve them from (unlike the API
+	// apply path), so the store applies its safe defaults (rolling cutover,
+	// halt on failure).
 	operations := []*storage.ApplyOperation{{
 		Deployment: apply.Deployment,
 		Target:     plan.Target,
