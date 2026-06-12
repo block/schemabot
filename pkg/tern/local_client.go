@@ -154,6 +154,16 @@ type LocalClient struct {
 	cancelApply           context.CancelFunc
 	cancelApplyGeneration uint64
 
+	// controlMu serializes Stop and Start so a start can never interleave with
+	// an in-flight stop. A stop is not atomic: the engine reports the data plane
+	// as stopped (and progress polling persists stopped task/apply rows) before
+	// the stop handler has written its own final task and apply states. Without
+	// serialization, a start accepted in that window resumes the schema change
+	// and the stop's remaining writes then mark the resumed apply stopped —
+	// stranding an actively running (or even completed) change in a stopped
+	// state that blocks all further progress reporting and resumption.
+	controlMu sync.Mutex
+
 	// observers holds per-apply progress observers. The progress poller notifies
 	// the observer on state changes and terminal state. Cleared on terminal state.
 	// Protected by observerMu.

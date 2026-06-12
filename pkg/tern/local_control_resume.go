@@ -18,6 +18,13 @@ import (
 // diff and their tasks are marked completed. Only the remaining DDLs are sent to
 // the engine, which auto-detects Spirit checkpoints for partially-copied tables.
 func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
+	// Serialize against Stop: a stop reports the data plane as stopped before
+	// its final task/apply writes land, so a start accepted in that window must
+	// wait for the stop to finish. Otherwise the stop's remaining writes would
+	// mark the apply this start resumes as stopped while its engine work runs.
+	c.controlMu.Lock()
+	defer c.controlMu.Unlock()
+
 	tasks, err := c.storage.Tasks().GetByDatabase(ctx, c.config.Database)
 	if err != nil {
 		return nil, fmt.Errorf("get tasks failed: %w", err)

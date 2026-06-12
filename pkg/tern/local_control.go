@@ -233,6 +233,12 @@ func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv
 }
 
 func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller string) (*ternv1.StopResponse, error) {
+	// Hold controlMu across the whole stop — engine stop, progress snapshot,
+	// and the final task/apply state writes — so a concurrent Start cannot
+	// observe the data plane as stopped and resume before those writes land.
+	c.controlMu.Lock()
+	defer c.controlMu.Unlock()
+
 	c.logger.Info("Stop requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
 	tasks, err := c.storage.Tasks().GetByDatabase(ctx, c.config.Database)
 	if err != nil {
