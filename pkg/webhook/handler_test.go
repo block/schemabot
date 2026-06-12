@@ -913,3 +913,27 @@ func TestWebhookRepoAllowlistPullRequestRejectsUnregistered(t *testing.T) {
 
 // PR close bypass of the allowlist is tested in the integration suite
 // (TestE2EPRCloseCleanup) which has real storage via testcontainers.
+
+// A panic inside a webhook-spawned goroutine must not crash the server:
+// goSafe recovers it, logs the stack, and posts an error comment on the PR
+// so the user gets feedback instead of silence. This is the recovery wrapper
+// every async command dispatch (apply, plan, rollback, reactions) runs under.
+func TestGoSafeRecoversPanicAndPostsErrorComment(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+
+	h := &Handler{
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    testLogger(),
+	}
+
+	h.goSafe("octocat/hello-world", 1, 12345, func() {
+		panic("boom")
+	})
+
+	body := requireComment(t, comments, "panic recovery comment")
+	assert.Contains(t, body, "Internal error: goroutine panic")
+	assert.Contains(t, body, "boom")
+}

@@ -125,7 +125,9 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		if result.Action == action.Plan {
 			// Plan without -e: run for all configured environments
 			h.logger.Info("plan without -e flag", "repo", repo, "pr", pr)
-			go h.handleMultiEnvPlan(repo, pr, result.Database, installationID, requestedBy, false)
+			h.goSafe(repo, pr, installationID, func() {
+				h.handleMultiEnvPlan(repo, pr, result.Database, installationID, requestedBy, false)
+			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return
 		}
@@ -177,7 +179,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// the command. Placed after all skip/filter checks so only the owning
 	// instance reacts — avoids duplicate reactions in multi-instance setups.
 	if payload.Comment.ID > 0 && h.ghClients.Len() > 0 {
-		go func() {
+		h.goSafe(repo, pr, installationID, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			client, err := h.clientForRepo(repo, installationID)
@@ -188,7 +190,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			if err := client.AddReactionToComment(ctx, repo, payload.Comment.ID, "eyes"); err != nil {
 				h.logger.Error("failed to add acknowledgment reaction", "error", err)
 			}
-		}()
+		})
 	}
 
 	// Reject -y/--yes on commands that don't support it
