@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,6 +44,18 @@ func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
 	orders, err := os.ReadFile(filepath.Join(root, "orders", "orders.sql"))
 	require.NoError(t, err)
 	assert.Equal(t, "CREATE TABLE `orders` (`id` bigint NOT NULL);\n", string(orders))
+}
+
+func TestWritePullSchemaResponseReturnsSchemaAsJSON(t *testing.T) {
+	var out bytes.Buffer
+	require.NoError(t, writePullSchemaResponse(&out, validPullSchemaResponse()))
+
+	var got apitypes.PullSchemaResponse
+	require.NoError(t, json.Unmarshal(out.Bytes(), &got))
+	assert.Equal(t, "orders", got.Database)
+	assert.Equal(t, "mysql", got.Type)
+	assert.Equal(t, "production", got.Environment)
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", got.SchemaFiles["orders"].Files["users.sql"])
 }
 
 func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {

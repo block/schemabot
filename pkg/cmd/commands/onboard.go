@@ -1,8 +1,10 @@
 package commands
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,6 +27,13 @@ type OnboardCmd struct {
 	SkipVerify  bool   `help:"Skip plan verification after writing files" name:"skip-verify"`
 }
 
+// PullCmd returns live schema from a source environment without writing files.
+type PullCmd struct {
+	Database    string `short:"d" required:"" help:"Database name from SchemaBot server config"`
+	Environment string `short:"e" required:"" help:"Source environment to pull from"`
+	Type        string `help:"Database type" default:"mysql" enum:"mysql"`
+}
+
 // Run executes the onboard command.
 func (cmd *OnboardCmd) Run(g *Globals) error {
 	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
@@ -34,7 +43,7 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 
 	resp, err := client.CallPullSchemaAPI(ep, cmd.Database, cmd.Type, cmd.Environment)
 	if err != nil {
-		if outputOnboardRequestError(cmd.Database, cmd.Environment, err) {
+		if outputSchemaPullRequestError("Onboard", cmd.Database, cmd.Environment, err) {
 			return ErrSilent
 		}
 		return fmt.Errorf("pull schema for database %s environment %s: %w", cmd.Database, cmd.Environment, err)
@@ -86,6 +95,31 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 	fmt.Printf("Onboarding complete for %s from %s.\n", resp.Database, resp.Environment)
 	fmt.Println("Next: open a normal PR with these files. SchemaBot will reconcile other configured environments.")
 	return nil
+}
+
+// Run executes the pull command.
+func (cmd *PullCmd) Run(g *Globals) error {
+	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
+	if err != nil {
+		return err
+	}
+	resp, err := client.CallPullSchemaAPI(ep, cmd.Database, cmd.Type, cmd.Environment)
+	if err != nil {
+		if outputSchemaPullRequestError("Pull", cmd.Database, cmd.Environment, err) {
+			return ErrSilent
+		}
+		return fmt.Errorf("pull schema for database %s environment %s: %w", cmd.Database, cmd.Environment, err)
+	}
+	if err := writePullSchemaResponse(os.Stdout, resp); err != nil {
+		return fmt.Errorf("write pull schema response: %w", err)
+	}
+	return nil
+}
+
+func writePullSchemaResponse(w io.Writer, resp *apitypes.PullSchemaResponse) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(resp)
 }
 
 type onboardWritePlan struct {
@@ -248,14 +282,14 @@ func validateOnboardPlanResult(result *apitypes.PlanResponse) error {
 	return nil
 }
 
-func outputOnboardRequestError(database, environment string, err error) bool {
+func outputSchemaPullRequestError(operation, database, environment string, err error) bool {
 	var apiErr *client.APIError
 	var connectionErr *client.ConnectionError
 	if !errors.As(err, &apiErr) && !errors.As(err, &connectionErr) {
 		return false
 	}
 
-	fmt.Printf("%sOnboard failed%s\n", templates.ANSIRed, templates.ANSIReset)
+	fmt.Printf("%s%s failed%s\n", templates.ANSIRed, operation, templates.ANSIReset)
 	fmt.Printf("  Database: %s\n", database)
 	fmt.Printf("  Environment: %s\n", environment)
 	if apiErr != nil {
