@@ -1133,6 +1133,7 @@ var knownStatusCheckOperations = map[string]bool{
 	"aggregate_check_sync":                 true,
 	"stale_check_cleanup":                  true,
 	"stale_check_reconciliation":           true,
+	"pr_close_cleanup":                     true,
 	"schema_config_discovery":              true,
 	"schema_config_source_policy":          true,
 	"schema_config_environment_validation": true,

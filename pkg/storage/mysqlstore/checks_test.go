@@ -197,22 +197,29 @@ func TestCheckStore_Delete(t *testing.T) {
 	require.ErrorIs(t, store.Checks().Delete(ctx, 99999), storage.ErrCheckNotFound)
 }
 
-func TestCheckStore_DeleteByPR(t *testing.T) {
+// TestCheckStore_DeleteByPRExcludingApplyOwned verifies PR-close cleanup at the
+// storage layer: all of a PR's stored check state is deleted except rows owned
+// by an in-flight apply (apply_id set and status in_progress), which must keep
+// blocking the PR until the apply reaches a terminal state. Rows for other PRs
+// are untouched.
+func TestCheckStore_DeleteByPRExcludingApplyOwned(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := New(testDB)
 
-	// Create checks for same PR
+	// Checks for the closed PR: two deletable rows, one apply-owned in-flight
+	// row that must survive, and one terminal apply-owned row that is deletable.
 	checksToCreate := []*storage.Check{
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "staging", DatabaseType: "vitess", DatabaseName: "db1", Status: "pending"},
-		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "vitess", DatabaseName: "db1", Status: "pending"},
 		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "staging", DatabaseType: "mysql", DatabaseName: "db2", Status: "pending"},
+		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db3", Status: "in_progress", ApplyID: 77},
+		{Repository: "org/repo", PullRequest: 123, HeadSHA: "abc", Environment: "production", DatabaseType: "mysql", DatabaseName: "db4", Status: "completed", ApplyID: 88, Conclusion: "success"},
 	}
 	for _, c := range checksToCreate {
 		require.NoError(t, store.Checks().Upsert(ctx, c))
 	}
 
-	// Create check for different PR (should not be deleted)
+	// Check for a different PR (must not be deleted)
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
 		Repository:   "org/repo",
 		PullRequest:  456,
@@ -223,21 +230,24 @@ func TestCheckStore_DeleteByPR(t *testing.T) {
 		Status:       "pending",
 	}))
 
-	// DeleteByPR should succeed
-	require.NoError(t, store.Checks().DeleteByPR(ctx, "org/repo", 123))
+	require.NoError(t, store.Checks().DeleteByPRExcludingApplyOwned(ctx, "org/repo", 123))
 
-	// Verify PR 123 checks are deleted
+	// Only the apply-owned in-flight row survives for PR 123.
 	retrieved, err := store.Checks().GetByPR(ctx, "org/repo", 123)
 	require.NoError(t, err)
-	require.Empty(t, retrieved)
+	require.Len(t, retrieved, 1)
+	assert.Equal(t, "db3", retrieved[0].DatabaseName)
+	assert.Equal(t, "in_progress", retrieved[0].Status)
+	assert.Equal(t, int64(77), retrieved[0].ApplyID)
 
-	// Verify PR 456 check still exists
+	// PR 456's check still exists.
 	retrieved, err = store.Checks().GetByPR(ctx, "org/repo", 456)
 	require.NoError(t, err)
 	require.Len(t, retrieved, 1)
+	assert.Equal(t, "db1", retrieved[0].DatabaseName)
 
-	// DeleteByPR on non-existent PR should not error (no-op)
-	require.NoError(t, store.Checks().DeleteByPR(ctx, "org/repo", 999))
+	// Deleting for a non-existent PR is a no-op, not an error.
+	require.NoError(t, store.Checks().DeleteByPRExcludingApplyOwned(ctx, "org/repo", 999))
 }
 
 func TestCheckStore_GetByPR_DBError(t *testing.T) {
