@@ -839,7 +839,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 					if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err != nil {
 						c.logger.Warn("failed to load apply after progress task state update", "apply_id", activeTask.ApplyID, "error", err)
 					} else if apply != nil && !state.IsTerminalApplyState(apply.State) {
-						apply.State = state.DeriveApplyState(taskStates(currentApplyTasks))
+						apply.State = c.deriveAggregateApplyState(ctx, apply, currentApplyTasks)
 						apply.UpdatedAt = now
 						if err := c.storage.Applies().Update(ctx, apply); err != nil {
 							c.logger.Warn("failed to update apply after progress task state update", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)

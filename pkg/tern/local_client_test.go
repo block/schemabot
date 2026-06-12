@@ -1094,3 +1094,96 @@ func attrValues(t *testing.T, attrs []any) map[string]any {
 	}
 	return values
 }
+
+// listApplyOperationStore is a fake ApplyOperationStore that returns a fixed set
+// of operation rows from ListByApply so the aggregate-state projection can be
+// exercised without a database.
+type listApplyOperationStore struct {
+	storage.ApplyOperationStore
+	ops []*storage.ApplyOperation
+	err error
+}
+
+func (s *listApplyOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	return s.ops, s.err
+}
+
+// deriveAggregateApplyState projects applies.state over all of an apply's
+// operation rows. With one operation per apply the projection equals the current
+// deployment's own derived state, so behaviour is unchanged; with a still-active
+// sibling the apply stays non-terminal so one deployment's drive cannot clobber
+// the rollout-level aggregate.
+func TestDeriveAggregateApplyState(t *testing.T) {
+	const currentOpID = int64(1)
+
+	taskWith := func(taskState string) *storage.Task {
+		id := currentOpID
+		return &storage.Task{State: taskState, ApplyOperationID: &id}
+	}
+
+	t.Run("one operation per apply matches current deployment derivation", func(t *testing.T) {
+		taskStateSets := [][]string{
+			{state.Task.Completed},
+			{state.Task.Completed, state.Task.Completed},
+			{state.Task.Running, state.Task.Pending},
+			{state.Task.Failed, state.Task.Completed},
+			{state.Task.WaitingForCutover, state.Task.Completed},
+			{state.Task.Pending},
+		}
+		for _, taskStateSet := range taskStateSets {
+			tasks := make([]*storage.Task, len(taskStateSet))
+			for i, ts := range taskStateSet {
+				tasks[i] = taskWith(ts)
+			}
+			client := &LocalClient{
+				storage: &exactProgressStorage{
+					applyOperations: &listApplyOperationStore{
+						ops: []*storage.ApplyOperation{
+							{ID: currentOpID, State: state.ApplyOperation.Pending},
+						},
+					},
+				},
+				logger: slog.Default(),
+			}
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-one-op"}
+
+			got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+			want := state.DeriveApplyState(taskStates(tasks))
+			assert.Equal(t, want, got, "task states %v", taskStateSet)
+		}
+	})
+
+	t.Run("pending sibling keeps the apply non-terminal", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Completed)}
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						{ID: currentOpID, State: state.ApplyOperation.Running},
+						{ID: 2, State: state.ApplyOperation.Pending},
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-multi-op"}
+
+		got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.False(t, state.IsTerminalApplyState(got), "derived state %q must be non-terminal", got)
+		assert.False(t, state.IsState(got, state.Apply.Completed), "derived state must not clobber the pending sibling to completed")
+	})
+
+	t.Run("falls back to current deployment derivation when operations cannot be read", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Completed)}
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				applyOperations: &listApplyOperationStore{err: assert.AnError},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-fallback"}
+
+		got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.Equal(t, state.DeriveApplyState(taskStates(tasks)), got)
+	})
+}
