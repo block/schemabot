@@ -377,6 +377,17 @@ func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	// Captured from the first successful load so a later transient load failure
+	// stays searchable by the user-facing apply_id operators triage with. Before
+	// the first load succeeds the identifier is unknown, so it is simply omitted.
+	var applyIdentifier string
+	identArgs := func() []any {
+		if applyIdentifier == "" {
+			return nil
+		}
+		return []any{"apply_id", applyIdentifier}
+	}
+
 	for range ticker.C {
 		obs := c.getObserver(applyID)
 		if obs == nil {
@@ -385,19 +396,32 @@ func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
 			return
 		}
 
+		// Load failures here are transient — the ticker retries on the next
+		// tick, so log at Warn rather than Error.
 		apply, err := c.storage.Applies().Get(context.Background(), applyID)
 		if err != nil {
-			slog.Error("observer poll: failed to load apply", "apply_id", applyID, "error", err)
+			slog.Warn("observer poll: failed to load apply; will retry on next tick",
+				append(identArgs(), "error", err)...)
 			continue
 		}
 		if apply == nil {
-			slog.Error("observer poll: apply not found", "apply_id", applyID)
-			continue
+			// The row is gone rather than transiently unreadable, so it will
+			// never reappear — stop polling instead of spinning and warning
+			// every tick for an apply that no longer exists.
+			slog.Warn("observer poll: apply not found; stopping poll", identArgs()...)
+			c.clearObserver(applyID)
+			return
 		}
+		applyIdentifier = apply.ApplyIdentifier
 
 		tasks, err := c.storage.Tasks().GetByApplyID(context.Background(), applyID)
 		if err != nil {
-			slog.Error("observer poll: failed to load tasks", "apply_id", applyID, "error", err)
+			slog.Warn("observer poll: failed to load tasks; will retry on next tick",
+				"apply_id", apply.ApplyIdentifier,
+				"external_id", apply.ExternalID,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"error", err)
 			continue
 		}
 
