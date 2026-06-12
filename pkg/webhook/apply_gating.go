@@ -110,7 +110,7 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 
 	notPassing := filterNonPassingNonSchemaBotChecks(statuses, config)
 	inProgress := filterInProgressNonSchemaBotChecks(statuses, config)
-	h.flagUntrustedAggregateNamedChecks(ctx, statuses, repo, pr, headSHA, environment)
+	h.flagUntrustedAggregateNamedChecks(ctx, statuses, config, repo, pr, headSHA, environment)
 
 	if len(notPassing) > 0 {
 		h.logger.Info("apply blocked by non-passing PR checks",
@@ -154,11 +154,15 @@ func (h *Handler) githubAppDisplayNameForRepo(repo string, client *ghclient.Inst
 // flagUntrustedAggregateNamedChecks surfaces PR checks that carry this
 // deployment's aggregate Check Run name but were not created by a trusted
 // SchemaBot GitHub App. Such a check is either a spoof attempt or a sibling
-// deployment whose App slug is missing from trusted-check-app-slugs; in both
-// cases it is treated as ordinary external CI (so a non-passing one blocks
-// applies), and operators need the app identity to tell the two apart.
-func (h *Handler) flagUntrustedAggregateNamedChecks(ctx context.Context, statuses []ghclient.PRCheckStatus, repo string, pr int, headSHA, environment string) {
+// deployment whose App slug is missing from trusted-check-app-slugs; the
+// signal fires in both cases because operators need the app identity to tell
+// the two apart, independent of whether the check currently gates applies.
+// The log states the check's actual gating impact: it is treated as ordinary
+// external CI, but when required_checks narrowing is active a non-required
+// check does not block.
+func (h *Handler) flagUntrustedAggregateNamedChecks(ctx context.Context, statuses []ghclient.PRCheckStatus, config *api.ServerConfig, repo string, pr int, headSHA, environment string) {
 	aggregateBase := h.aggregateCheckNameForRepo(repo)
+	filterRequiredChecks := statusesContainRequiredCheck(statuses, config)
 	for _, s := range statuses {
 		if s.IsSchemaBot {
 			continue
@@ -166,10 +170,17 @@ func (h *Handler) flagUntrustedAggregateNamedChecks(ctx context.Context, statuse
 		if !isAggregateCheckName(s.Name, aggregateBase) {
 			continue
 		}
-		h.logger.Warn("aggregate-named check from untrusted GitHub App is treated as external CI and will block applies unless passing",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "environment", environment,
-			"check_name", s.Name, "app_slug", s.AppSlug,
-			"check_status", s.Status, "check_conclusion", s.Conclusion)
+		if filterRequiredChecks && !config.IsCheckRequired(s.Name) {
+			h.logger.Warn("aggregate-named check from untrusted GitHub App is present; required_checks narrowing keeps it from gating applies, but it may be impersonating SchemaBot",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "environment", environment,
+				"check_name", s.Name, "app_slug", s.AppSlug,
+				"check_status", s.Status, "check_conclusion", s.Conclusion)
+		} else {
+			h.logger.Warn("aggregate-named check from untrusted GitHub App is treated as external CI and will block applies unless passing",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "environment", environment,
+				"check_name", s.Name, "app_slug", s.AppSlug,
+				"check_status", s.Status, "check_conclusion", s.Conclusion)
+		}
 		metrics.RecordUntrustedAggregateNamedCheck(ctx, repo, environment, s.AppSlug, metrics.CheckTrustGatePassingChecks)
 	}
 }

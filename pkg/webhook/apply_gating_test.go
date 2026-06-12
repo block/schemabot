@@ -1,7 +1,9 @@
 package webhook
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"testing"
 	"time"
@@ -285,6 +287,48 @@ func TestFilterInProgressNonSchemaBotChecks_SiblingAggregate(t *testing.T) {
 
 		require.Len(t, inProgress, 1)
 		assert.Equal(t, "SchemaBot (production)", inProgress[0].Name)
+	})
+}
+
+// TestFlagUntrustedAggregateNamedChecks verifies that the spoof/misconfig
+// signal states the check's actual gating impact: when required_checks
+// narrowing excludes a non-required untrusted aggregate-named check from the
+// gate, the warning says so instead of claiming the check will block applies.
+func TestFlagUntrustedAggregateNamedChecks(t *testing.T) {
+	newHandler := func(buf *bytes.Buffer) *Handler {
+		return &Handler{logger: slog.New(slog.NewTextHandler(buf, nil))}
+	}
+	untrustedAggregate := ghclient.PRCheckStatus{
+		Name: "SchemaBot (production)", Status: "completed", Conclusion: "action_required",
+		AppSlug: "github-actions", IsSchemaBot: false,
+	}
+
+	t.Run("gating check is reported as blocking", func(t *testing.T) {
+		var buf bytes.Buffer
+		h := newHandler(&buf)
+
+		h.flagUntrustedAggregateNamedChecks(t.Context(),
+			[]ghclient.PRCheckStatus{untrustedAggregate},
+			nil, "octocat/hello-world", 1, "abc123", "staging")
+
+		assert.Contains(t, buf.String(), "will block applies unless passing")
+		assert.Contains(t, buf.String(), "app_slug=github-actions")
+	})
+
+	t.Run("check excluded by required_checks narrowing is reported as non-gating", func(t *testing.T) {
+		var buf bytes.Buffer
+		h := newHandler(&buf)
+		config := &api.ServerConfig{RequiredChecks: []string{"Owner Owl"}}
+		statuses := []ghclient.PRCheckStatus{
+			untrustedAggregate,
+			{Name: "Owner Owl", Status: "completed", Conclusion: "success"},
+		}
+
+		h.flagUntrustedAggregateNamedChecks(t.Context(),
+			statuses, config, "octocat/hello-world", 1, "abc123", "staging")
+
+		assert.Contains(t, buf.String(), "required_checks narrowing keeps it from gating applies")
+		assert.NotContains(t, buf.String(), "will block applies unless passing")
 	})
 }
 

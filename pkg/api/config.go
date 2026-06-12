@@ -235,13 +235,19 @@ type GitHubConfig struct {
 
 	// TrustedCheckAppSlugs lists the GitHub App slugs of sibling SchemaBot
 	// deployments whose Check Runs this deployment trusts, in addition to its
-	// own App. Environment-scoped deployments that verify a prior
-	// environment's aggregate Check Run must list the App slug of the
-	// deployment that owns that environment here when it is a different
-	// GitHub App; otherwise the promotion gate cannot verify ownership of the
-	// prior environment's check and will block applies. Check Runs from Apps
-	// not in this list (and not this deployment's own App) never satisfy
-	// SchemaBot gates.
+	// own App. This is chain-level shared configuration: every deployment in
+	// a promotion chain should carry the same complete list of the chain's
+	// App slugs (its own included, which is harmless), like environment_order.
+	//
+	// The list feeds two gates. The promotion gate only accepts a prior
+	// environment's aggregate Check Run from a trusted App, so a deployment
+	// that verifies a prior environment owned by a different GitHub App must
+	// trust that App or the gate fails closed and blocks applies. The
+	// require_passing_checks gate classifies trusted Apps' checks as SchemaBot
+	// checks rather than external CI, so a sibling's aggregate sitting at
+	// action_required (expected before its environment applies) does not block
+	// this deployment's applies. Check Runs from Apps not in this list (and
+	// not this deployment's own App) never satisfy SchemaBot gates.
 	TrustedCheckAppSlugs []string `yaml:"trusted-check-app-slugs,omitempty"`
 }
 

@@ -455,9 +455,12 @@ const (
 // sustained spike means either a check-name spoof attempt or a sibling
 // SchemaBot deployment missing from trusted-check-app-slugs; operators should
 // inspect the app_slug attribute and the matching warn logs to tell which.
-// The gate attribute distinguishes where the untrusted check surfaced: the
-// passing-checks gate (it blocks applies as external CI) or the promotion
-// gate (it cannot verify the prior environment).
+// The counter is an identity-mismatch signal, not a blocking signal: it fires
+// whenever such a check is observed by a gate, even when required_checks
+// narrowing keeps that check from gating applies — the warn log states the
+// actual gating impact. The gate attribute distinguishes where the untrusted
+// check surfaced: the passing-checks gate or the promotion gate (where it
+// cannot verify the prior environment).
 func RecordUntrustedAggregateNamedCheck(ctx context.Context, repository, environment, appSlug, gate string) {
 	meter := otel.Meter(meterName)
 	counter, err := meter.Int64Counter("schemabot.untrusted_aggregate_named_checks_total",
