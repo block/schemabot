@@ -1,6 +1,10 @@
 package webhook
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -8,6 +12,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/webhook/action"
 )
 
 func TestWebhookRollbackDispatch(t *testing.T) {
@@ -106,6 +117,104 @@ func TestWebhookRollbackMissingApplyIDAndEnv(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for comment")
 	}
+}
+
+// rollbackNoopTernClient returns a rollback plan with no schema changes,
+// simulating a database that already matches the original schema when
+// rollback-confirm re-plans for drift detection.
+type rollbackNoopTernClient struct {
+	tern.Client
+}
+
+func (c *rollbackNoopTernClient) RollbackPlan(context.Context, string) (*ternv1.PlanResponse, error) {
+	return &ternv1.PlanResponse{PlanId: "rollback-plan-noop"}, nil
+}
+
+// newRollbackConfirmNoopHandler builds a handler whose rollback-confirm
+// re-plan finds no remaining changes, backed by the supplied lock store and
+// logger, plus a channel that captures posted PR comments.
+func newRollbackConfirmNoopHandler(t *testing.T, locks *actorAuthLockStore, logger *slog.Logger) (*Handler, chan string) {
+	t.Helper()
+	client, mux := setupGitHubServer(t)
+	registerApplyDiscoveryEndpoints(t, mux, "orders")
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	installClient := ghclient.NewInstallationClient(client, logger)
+	svc := api.New(&actorAuthStorage{locks: locks}, cfg,
+		map[string]tern.Client{"orders/staging": &rollbackNoopTernClient{}}, logger)
+	return &Handler{
+		service:   svc,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    logger,
+	}, comments
+}
+
+// prOwnedRollbackLock returns a lock held by the PR that issues the
+// rollback-confirm command in these tests.
+func prOwnedRollbackLock() *storage.Lock {
+	return &storage.Lock{
+		DatabaseName: "orders",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Owner:        "octocat/hello-world#1",
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+	}
+}
+
+// TestHandleRollbackConfirmAlreadyRolledBackReleasesLock verifies the
+// rollback-confirm no-op path: when the database already matches the original
+// schema, the PR's database lock is released and the comment tells the
+// operator the lock is gone.
+func TestHandleRollbackConfirmAlreadyRolledBackReleasesLock(t *testing.T) {
+	locks := &actorAuthLockStore{locks: []*storage.Lock{prOwnedRollbackLock()}}
+	h, comments := newRollbackConfirmNoopHandler(t, locks, testLogger())
+
+	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.RollbackConfirm})
+
+	body := requireComment(t, comments, "already-rolled-back comment")
+	assert.Contains(t, body, "Already Rolled Back")
+	assert.Contains(t, body, "`orders`")
+	assert.Contains(t, body, "Lock released")
+	assert.NotContains(t, body, "failed to release")
+	assert.Equal(t, []string{"orders"}, locks.released)
+}
+
+// TestHandleRollbackConfirmAlreadyRolledBackLockReleaseFails verifies that
+// when the rollback-confirm no-op path cannot release the database lock, the
+// failure is logged with triage identifiers and the comment tells the
+// operator the lock is still held and how to clear it, instead of claiming
+// the lock was released.
+func TestHandleRollbackConfirmAlreadyRolledBackLockReleaseFails(t *testing.T) {
+	locks := &actorAuthLockStore{
+		locks:      []*storage.Lock{prOwnedRollbackLock()},
+		releaseErr: errors.New("storage unavailable"),
+	}
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	h, comments := newRollbackConfirmNoopHandler(t, locks, logger)
+
+	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.RollbackConfirm})
+
+	body := requireComment(t, comments, "already-rolled-back lock-held comment")
+	assert.Contains(t, body, "Already Rolled Back")
+	assert.Contains(t, body, "failed to release the lock held by `octocat/hello-world#1`")
+	assert.Contains(t, body, "Applies on this database will be blocked until the lock is released")
+	assert.Contains(t, body, "schemabot unlock")
+	assert.Contains(t, body, "schemabot unlock -d orders --force")
+	assert.NotContains(t, body, "Lock released")
+	assert.Empty(t, locks.released, "failed release must not be recorded as released")
+
+	logs := logBuf.String()
+	assert.Contains(t, logs, "failed to release the database lock")
+	assert.Contains(t, logs, "octocat/hello-world")
+	assert.Contains(t, logs, "database=orders")
+	assert.Contains(t, logs, "environment=staging")
+	assert.Contains(t, logs, "lock_owner=octocat/hello-world#1")
+	assert.Contains(t, logs, "storage unavailable")
 }
 
 func TestWebhookApplyDispatch(t *testing.T) {

@@ -212,7 +212,15 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 
 	// If no changes remain, release lock and notify
 	if len(planResp.FlatTables()) == 0 {
-		_ = h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
+		if err := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner); err != nil {
+			h.logger.Error("rollback-confirm found nothing to roll back but failed to release the database lock; applies on this database will be blocked until the lock is released manually",
+				"repo", repo, "pr", pr, "database", database,
+				"database_type", dbType, "environment", environment,
+				"lock_owner", lockOwner, "error", err)
+			h.postComment(repo, pr, installationID,
+				templates.RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner))
+			return
+		}
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackAlreadyRolledBack(database, environment))
 		return

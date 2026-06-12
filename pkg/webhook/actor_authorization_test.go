@@ -652,12 +652,15 @@ func (s *actorAuthApplyStore) GetByDatabase(_ context.Context, _, _, _ string) (
 
 // actorAuthLockStore serves locks from a fixed set and records every lock
 // mutation so tests can assert which releases and acquisitions happened.
+// Setting releaseErr makes every Release call fail with that error, simulating
+// a storage outage during lock release.
 type actorAuthLockStore struct {
 	storage.LockStore
 	locks         []*storage.Lock
 	acquired      []*storage.Lock
 	released      []string
 	forceReleased []string
+	releaseErr    error
 }
 
 func (s *actorAuthLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
@@ -689,6 +692,9 @@ func (s *actorAuthLockStore) Acquire(_ context.Context, lock *storage.Lock) erro
 }
 
 func (s *actorAuthLockStore) Release(_ context.Context, database, _, _ string) error {
+	if s.releaseErr != nil {
+		return s.releaseErr
+	}
 	s.released = append(s.released, database)
 	return nil
 }

@@ -178,6 +178,19 @@ func TestRenderRollbackAlreadyRolledBack(t *testing.T) {
 	assert.Contains(t, rendered, "Lock released")
 }
 
+func TestRenderRollbackAlreadyRolledBackLockHeld(t *testing.T) {
+	rendered := RenderRollbackAlreadyRolledBackLockHeld("testapp", "staging", "block/myapp#42")
+	assert.Contains(t, rendered, "## Already Rolled Back")
+	assert.Contains(t, rendered, "`testapp`")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "failed to release the lock held by `block/myapp#42`")
+	assert.Contains(t, rendered, "Applies on this database will be blocked until the lock is released")
+	assert.Contains(t, rendered, "schemabot unlock")
+	assert.Contains(t, rendered, "schemabot unlock -d testapp --force")
+	assert.NotContains(t, rendered, "Lock released",
+		"a failed release must not claim the lock was released")
+}
+
 func TestRenderRollbackNotAccepted(t *testing.T) {
 	rendered := RenderRollbackNotAccepted("testapp", "staging", "plan not found")
 	assert.Contains(t, rendered, "## Rollback Not Accepted")
@@ -188,14 +201,15 @@ func TestRenderRollbackNotAccepted(t *testing.T) {
 
 func TestRollbackTemplates_NoStrayWhitespace(t *testing.T) {
 	for name, body := range map[string]string{
-		"MissingApplyID":     RenderRollbackMissingApplyID(),
-		"ApplyNotFound":      RenderRollbackApplyNotFound("a"),
-		"BlockedByLockPR":    RenderRollbackBlockedByLock("d", "e", "o", "r", 1),
-		"BlockedByLockOwner": RenderRollbackBlockedByLock("d", "e", "o", "", 0),
-		"NothingToDo":        RenderRollbackNothingToDo("d", "e", "a"),
-		"LockNotOwned":       RenderRollbackLockNotOwned("d", "e", "o"),
-		"AlreadyRolledBack":  RenderRollbackAlreadyRolledBack("d", "e"),
-		"NotAccepted":        RenderRollbackNotAccepted("d", "e", "x"),
+		"MissingApplyID":            RenderRollbackMissingApplyID(),
+		"ApplyNotFound":             RenderRollbackApplyNotFound("a"),
+		"BlockedByLockPR":           RenderRollbackBlockedByLock("d", "e", "o", "r", 1),
+		"BlockedByLockOwner":        RenderRollbackBlockedByLock("d", "e", "o", "", 0),
+		"NothingToDo":               RenderRollbackNothingToDo("d", "e", "a"),
+		"LockNotOwned":              RenderRollbackLockNotOwned("d", "e", "o"),
+		"AlreadyRolledBack":         RenderRollbackAlreadyRolledBack("d", "e"),
+		"AlreadyRolledBackLockHeld": RenderRollbackAlreadyRolledBackLockHeld("d", "e", "o"),
+		"NotAccepted":               RenderRollbackNotAccepted("d", "e", "x"),
 	} {
 		assert.False(t, strings.HasPrefix(body, " ") || strings.HasPrefix(body, "\n"),
 			"%s body should not start with whitespace", name)

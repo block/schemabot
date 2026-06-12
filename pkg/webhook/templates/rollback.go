@@ -144,6 +144,22 @@ func RenderRollbackAlreadyRolledBack(database, environment string) string {
 		database, environment)
 }
 
+// RenderRollbackAlreadyRolledBackLockHeld renders the message posted when
+// rollback-confirm finds no changes remain but the database lock could not be
+// released. The lock continues to block applies on the database until an
+// operator releases it.
+func RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner string) string {
+	return fmt.Sprintf("## Already Rolled Back\n\n"+
+		"**Database**: `%s` | **Environment**: `%s`\n\n"+
+		"The database schema already matches the original state, but SchemaBot failed to release the lock held by `%s`. "+
+		"Applies on this database will be blocked until the lock is released.\n\n"+
+		"Release it by commenting:\n"+
+		"```\nschemabot unlock\n```\n"+
+		"If the lock persists, force-release it:\n"+
+		"```\nschemabot unlock -d %s --force\n```",
+		database, environment, lockOwner, database)
+}
+
 // RenderRollbackNotAccepted renders the message posted when the apply service
 // rejects a rollback request (e.g. plan not found, validation error).
 func RenderRollbackNotAccepted(database, environment, errorMessage string) string {
