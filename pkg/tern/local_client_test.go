@@ -1186,4 +1186,35 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 		got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
 		assert.Equal(t, state.DeriveApplyState(taskStates(tasks)), got)
 	})
+
+	t.Run("falls back to current deployment derivation when the operation store is not configured", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Completed)}
+		client := &LocalClient{
+			storage: &exactProgressStorage{applyOperations: nil},
+			logger:  slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-no-store"}
+
+		got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.Equal(t, state.DeriveApplyState(taskStates(tasks)), got)
+	})
+
+	t.Run("falls back to current deployment derivation when the current operation row is missing", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Completed)}
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						{ID: 2, State: state.ApplyOperation.Pending},
+						{ID: 3, State: state.ApplyOperation.Pending},
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-missing-current-op"}
+
+		got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.Equal(t, state.DeriveApplyState(taskStates(tasks)), got)
+	})
 }

@@ -335,7 +335,14 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 		return currentOpState
 	}
 
-	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		c.logger.Warn("deriving apply state from current deployment only: apply operation store is not configured",
+			"apply_id", apply.ApplyIdentifier)
+		return currentOpState
+	}
+
+	ops, err := store.ListByApply(ctx, apply.ID)
 	if err != nil {
 		c.logger.Warn("deriving apply state from current deployment only: failed to list sibling apply operations",
 			"apply_id", apply.ApplyIdentifier, "error", err)
@@ -348,12 +355,19 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 	}
 
 	childStates := make([]string, len(ops))
+	foundCurrent := false
 	for i, op := range ops {
 		if op.ID == operationID {
 			childStates[i] = currentOpState
+			foundCurrent = true
 			continue
 		}
 		childStates[i] = op.State
+	}
+	if !foundCurrent {
+		c.logger.Warn("deriving apply state from current deployment only: current operation row missing from sibling set",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", operationID)
+		return currentOpState
 	}
 	return state.DeriveApplyState(childStates)
 }
