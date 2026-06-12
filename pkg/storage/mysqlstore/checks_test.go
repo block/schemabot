@@ -865,7 +865,12 @@ func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheck(t *testing.T)
 	require.Equal(t, int64(0), retrieved.ApplyID)
 }
 
-func TestCheckStore_UpsertPlanResultReplacesInProgressApplyOnNewHead(t *testing.T) {
+// An apply starts on one commit and a newer commit reverts the schema change
+// in-file. The auto-plan for the newer commit diffs against the mid-apply
+// database and reports a successful no-op, but it must not overwrite or take
+// ownership of the in-progress apply-owned row: the stored state keeps blocking
+// the PR until the apply itself completes and writes its real result.
+func TestCheckStore_UpsertPlanResultPreservesInProgressApplyOnNewHead(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := New(testDB)
@@ -891,6 +896,65 @@ func TestCheckStore_UpsertPlanResultReplacesInProgressApplyOnNewHead(t *testing.
 		Environment:  "staging",
 		DatabaseType: "mysql",
 		DatabaseName: "testdb",
+		HasChanges:   false,
+		Status:       "completed",
+		Conclusion:   "success",
+	})
+	require.NoError(t, err)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "oldsha", retrieved.HeadSHA)
+	assert.Equal(t, "in_progress", retrieved.Status)
+	assert.Empty(t, retrieved.Conclusion)
+	assert.True(t, retrieved.HasChanges)
+	assert.Equal(t, apply.ID, retrieved.ApplyID)
+
+	// The apply still owns the row, so its completion lands the real result.
+	completion := *retrieved
+	completion.Status = "completed"
+	completion.Conclusion = "success"
+	completion.HasChanges = false
+	updated, err := store.Checks().CompleteForApply(ctx, &completion, apply)
+	require.NoError(t, err)
+	require.True(t, updated)
+
+	retrieved, err = store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, "completed", retrieved.Status)
+	assert.Equal(t, "success", retrieved.Conclusion)
+	assert.Equal(t, apply.ID, retrieved.ApplyID)
+}
+
+// A plan result for a newer commit replaces an in-progress row that no apply
+// owns: without a started apply there is nothing authoritative to protect, so
+// the plan write proceeds normally.
+func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheckOnNewHead(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "oldsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
+		HasChanges:   true,
+		Status:       "in_progress",
+		Conclusion:   "",
+	}))
+
+	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		Repository:   "org/repo",
+		PullRequest:  123,
+		HeadSHA:      "newsha",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: "testdb",
 		HasChanges:   true,
 		Status:       "completed",
 		Conclusion:   "action_required",
@@ -900,10 +964,10 @@ func TestCheckStore_UpsertPlanResultReplacesInProgressApplyOnNewHead(t *testing.
 	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
 	require.NoError(t, err)
 	require.NotNil(t, retrieved)
-	require.Equal(t, "newsha", retrieved.HeadSHA)
-	require.Equal(t, "completed", retrieved.Status)
-	require.Equal(t, "action_required", retrieved.Conclusion)
-	require.Equal(t, int64(0), retrieved.ApplyID)
+	assert.Equal(t, "newsha", retrieved.HeadSHA)
+	assert.Equal(t, "completed", retrieved.Status)
+	assert.Equal(t, "action_required", retrieved.Conclusion)
+	assert.Equal(t, int64(0), retrieved.ApplyID)
 }
 
 func TestCheckStore_UpsertPlanResultClearsApplyIDWhenNotInProgress(t *testing.T) {

@@ -58,7 +58,7 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 }
 
 // UpsertPlanResult stores plan-derived check state without overwriting
-// in-progress apply state for the same PR/environment/database/head SHA.
+// in-progress apply-owned state for the same PR/environment/database.
 func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check) error {
 	var checkRunID any
 	if check.CheckRunID != 0 {
@@ -85,9 +85,12 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check)
 		return err
 	}
 
-	// Preserve in-progress apply-owned state for the same PR commit. A plan
-	// result for that same commit is stale relative to the apply that already
-	// started.
+	// Preserve in-progress apply-owned state regardless of the plan's head SHA.
+	// Once an apply has started, the stored row is authoritative until the apply
+	// completes (CompleteForApply, MarkActionRequiredForApply) or an explicit
+	// recovery path releases it. A plan result — even from a newer PR commit that
+	// diffs cleanly against the mid-apply database — must not take ownership or
+	// convert the row into a passing check.
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE checks
 		SET head_sha = ?,
@@ -100,10 +103,10 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check)
 		    error_message = ?
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
-		  AND NOT (status = ? AND head_sha = ? AND apply_id IS NOT NULL)
+		  AND NOT (status = ? AND apply_id IS NOT NULL)
 	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-		checkStatusInProgress, check.HeadSHA)
+		checkStatusInProgress)
 	return err
 }
 

@@ -1767,11 +1767,13 @@ func TestE2EAggregateCheckStaleCleanup(t *testing.T) {
 	assert.False(t, prematurePassingAggregate.Load(), "passing aggregate was published before stale per-database records were cleaned")
 }
 
-// TestE2ENewHeadPlanReplacesInProgressApplyOwnership verifies the case where
-// an older commit has a running apply, then a newer commit still contains schema
-// changes and produces a fresh plan result. The old apply must not own or update
-// the new commit's check state.
-func TestE2ENewHeadPlanReplacesInProgressApplyOwnership(t *testing.T) {
+// TestE2ENewHeadPlanPreservesInProgressApplyOwnership verifies the case where
+// an older commit has a running apply, then a newer commit is pushed and
+// auto-planned. The running apply remains authoritative for the stored check
+// state: the new commit's plan result must not take ownership or overwrite it,
+// the aggregate on the new commit stays in_progress (blocking merge), and the
+// apply's own completion still lands its real result.
+func TestE2ENewHeadPlanPreservesInProgressApplyOwnership(t *testing.T) {
 	dbName := "webhook_new_head_replans"
 	svc := setupE2EService(t, dbName)
 	ctx := t.Context()
@@ -1823,7 +1825,8 @@ func TestE2ENewHeadPlanReplacesInProgressApplyOwnership(t *testing.T) {
 	}))
 
 	// Fake GitHub now serves the newer PR commit and schema files. Auto-plan
-	// should replace the old apply-owned check state with a new plan result.
+	// produces a plan result for the new commit, but the running apply keeps
+	// ownership of the stored check state.
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
@@ -1846,41 +1849,41 @@ func TestE2ENewHeadPlanReplacesInProgressApplyOwnership(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	// The new commit has a plan result but no started apply yet, so ApplyID is
-	// cleared while the check remains action_required.
-	require.Eventually(t, func() bool {
-		check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
-		return err == nil && check != nil &&
-			check.HeadSHA == "abc123" &&
-			check.Status == checkStatusCompleted &&
-			check.Conclusion == checkConclusionActionRequired &&
-			check.ApplyID == 0
-	}, webhookIntegrationPollDeadline, 200*time.Millisecond, "new-head plan should replace old apply ownership")
-
+	// The aggregate is re-created on the new commit and stays in_progress
+	// because the apply-owned per-database row still blocks it.
 	select {
 	case cr := <-result.checkRuns:
 		assert.Equal(t, aggregateCheckName, cr.Name)
 		assert.Equal(t, "abc123", cr.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+		assert.Equal(t, checkStatusInProgress, cr.Status)
+		assert.Empty(t, cr.Conclusion)
 	case <-time.After(webhookIntegrationCheckRunDeadline):
 		t.Fatal("timed out waiting for new-head aggregate check run")
 	}
 
-	// The old apply finishing later is an ownership miss. It must not overwrite
-	// the newer commit's action_required plan result.
-	apply.State = state.Apply.Completed
-	updated, err := h.updateCheckRecordForApplyResult(ctx, "octocat/hello-world", 1, apply)
-	require.NoError(t, err)
-	assert.False(t, updated, "old apply completion should not overwrite the new-head plan result")
-
+	// The running apply keeps ownership: the new commit's plan result must not
+	// overwrite the in-progress check state or clear the apply ID.
 	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
 	require.NoError(t, err)
 	require.NotNil(t, check)
-	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.Equal(t, "oldsha111", check.HeadSHA)
+	assert.Equal(t, checkStatusInProgress, check.Status)
+	assert.Empty(t, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
+
+	// The apply still owns the check state, so its completion lands the real
+	// terminal result instead of missing ownership.
+	apply.State = state.Apply.Completed
+	updated, err := h.updateCheckRecordForApplyResult(ctx, "octocat/hello-world", 1, apply)
+	require.NoError(t, err)
+	assert.True(t, updated, "apply completion should update the check state it owns")
+
+	check, err = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
 	assert.Equal(t, checkStatusCompleted, check.Status)
-	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
-	assert.Equal(t, int64(0), check.ApplyID)
+	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+	assert.Equal(t, applyID, check.ApplyID)
 }
 
 func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {

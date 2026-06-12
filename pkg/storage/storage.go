@@ -85,8 +85,10 @@ type CheckStore interface {
 	// Upsert creates or updates stored check state.
 	Upsert(ctx context.Context, check *Check) error
 
-	// UpsertPlanResult creates or updates stored check state from a plan result,
-	// but preserves in-progress apply state for the same PR/environment/database/head SHA.
+	// UpsertPlanResult creates or updates stored check state from a plan result.
+	// It fails closed: an in-progress apply-owned row for the same
+	// PR/environment/database is preserved regardless of head SHA, and is
+	// released only by apply completion or an explicit recovery path.
 	UpsertPlanResult(ctx context.Context, check *Check) error
 
 	// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check state

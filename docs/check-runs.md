@@ -585,9 +585,10 @@ On new commits:
   started for that row.
 - Stale internal records with a started apply or rollback remain blocking
   because the live database may still change.
-- A plan result for the same head SHA does not overwrite an in-progress apply
-  check. A plan result for a new head SHA clears `apply_id` and becomes the new
-  source of truth for databases still managed by the new PR head.
+- A plan result never overwrites an in-progress apply-owned record, regardless
+  of head SHA. The record is released only when the apply reaches a terminal
+  state or an explicit recovery path proves the target already matches the PR
+  schema.
 
 ## Edge Cases
 
@@ -665,9 +666,9 @@ On the new head:
 - Any stale webhook work for an older SHA is ignored when SchemaBot can verify
   that the PR head has moved on.
 
-If a new plan is for the same head SHA as a running apply, it does not overwrite
-the running `apply_id`. If a new plan is for a newer head SHA, it clears the old
-ownership marker and becomes the source of truth for that PR head.
+A plan never overwrites a running apply's ownership marker, regardless of head
+SHA. The running apply remains the source of truth for that database until it
+reaches a terminal state.
 
 ### New commit pushed while an apply is in progress
 
@@ -681,20 +682,21 @@ The `synchronize` webhook auto-plans the new PR head. Because GitHub branch
 protection evaluates checks on the current head commit, SchemaBot writes
 aggregate checks for the new SHA.
 
-For affected databases, the new plan result becomes the merge-gating source of
-truth for that head. If the new plan still has unapplied changes, the aggregate
-is `action_required`. If the live schema already matches the new desired schema,
-the aggregate can pass.
+For a database whose apply is still running, the new plan result is not stored:
+the apply-owned record keeps the aggregate on the new head `in_progress` and the
+PR stays blocked. A plan against a mid-apply database is not trustworthy — it
+diffs against a schema that is still changing — so it must not become the
+merge-gating source of truth or convert the record into a passing check.
 
-When the old apply watcher eventually finishes, it can complete the check only
-if the stored row still belongs to that `apply_id` and no newer apply exists for
-the same PR, environment, database type, and database name. If a new-head plan
-has replaced the row, the old watcher cannot mark the new PR head success or
-failure based on work started for an older commit.
+When the apply reaches a terminal state, it completes the record it still owns
+(provided no newer apply exists for the same PR, environment, database type, and
+database name). A subsequent plan — auto-plan on the next commit or a manual
+`schemabot plan` — then refreshes the record against the settled live schema and
+becomes the source of truth for the current head.
 
 This is conservative for commits that keep touching the same managed database:
-the new head must be proven by a plan against the current desired schema, not by
-blindly reusing a terminal result from work started on an older commit.
+the new head must be proven by a plan against the settled live schema, not by a
+plan taken while an apply was still mutating it.
 
 #### New head removes the schema changes before apply starts
 
@@ -882,6 +884,8 @@ because another SchemaBot pod can change the same row between those operations.
 SchemaBot uses `apply_id` as a durable ownership marker:
 
 - Apply start sets the internal record to `in_progress` and stores the apply ID.
+- Plan results never overwrite an `in_progress` row that has an `apply_id`,
+  regardless of which head SHA the plan was generated for.
 - Apply completion only updates the row if it is still `in_progress`, still has
   that same `apply_id`, and no newer apply exists for the same
   PR/environment/database.
