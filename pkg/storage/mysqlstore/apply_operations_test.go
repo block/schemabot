@@ -1027,7 +1027,7 @@ func TestApplyOperationStore_FindNextApplyOperation_RecoversStaleSetupPhase(t *t
 	`, id)
 	require.NoError(t, err)
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx)
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "operator-a")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "a stale running operation must be reclaimable when its parent apply crashed mid-setup")
 	assert.Equal(t, id, claimed.ID)
