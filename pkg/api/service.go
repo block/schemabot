@@ -105,12 +105,13 @@ type pendingObserverKey struct {
 }
 
 type Service struct {
-	storage     storage.Storage
-	config      *ServerConfig
-	ternClients map[string]tern.Client // keyed by "deployment/environment", lazily created
-	ternMu      sync.Mutex             // protects ternClients
-	logger      *slog.Logger
-	clock       clock.Clock
+	storage           storage.Storage
+	config            *ServerConfig
+	ternClients       map[string]tern.Client // keyed by "deployment/environment", lazily created
+	routingTernClient *tern.RoutingClient
+	ternMu            sync.Mutex // protects tern client caches
+	logger            *slog.Logger
+	clock             clock.Clock
 
 	// Operator loop management.
 	operatorMu           sync.Mutex
@@ -314,6 +315,41 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	return client, nil
 }
 
+// RoutingTernClient returns a client that routes requests from server
+// configuration and stored execution metadata. It is safe for Plan, Apply, and
+// PullSchema routing; handlers that branch on transport mode must continue to
+// use deployment-scoped clients until transport metadata is request-scoped.
+func (s *Service) RoutingTernClient() (*tern.RoutingClient, error) {
+	if s.config == nil {
+		return nil, fmt.Errorf("server config is required for routing tern client")
+	}
+	if s.storage == nil {
+		return nil, fmt.Errorf("storage is required for routing tern client")
+	}
+
+	s.ternMu.Lock()
+	defer s.ternMu.Unlock()
+	if s.routingTernClient != nil {
+		return s.routingTernClient, nil
+	}
+
+	client, err := tern.NewRoutingClient(tern.RoutingClientConfig{
+		Resolver:             s.config,
+		PlanLookup:           s.storage.Plans(),
+		ApplyLookup:          s.storage.Applies(),
+		ApplyOperationLookup: s.storage.ApplyOperations(),
+		ClientForDeployment: func(_ context.Context, deployment, environment string) (tern.Client, error) {
+			return s.TernClient(deployment, environment)
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create routing tern client: %w", err)
+	}
+	s.routingTernClient = client
+	s.logger.Info("created routing tern client")
+	return client, nil
+}
+
 // RegisterTernClient registers a tern client for the given deployment and
 // environment. This allows embedders to add clients dynamically as they
 // are created (e.g., lazily per-cluster).
@@ -327,6 +363,20 @@ func (s *Service) RegisterTernClient(deployment, environment string, client tern
 	s.ternClients[key] = client
 }
 
+// malformedTokenError builds an error for a token that did not parse into a
+// name:value pair. The secrets resolver returns literal (unprefixed) values
+// as-is, so when the resolved token equals the configured ref the ref *is* the
+// raw credential and must not be echoed. Only a true reference indirection
+// (ref resolved to a different value, e.g. via env:/file:/secretsmanager:) is
+// safe to print; for a literal we redact it, since the config key alone is
+// enough for triage.
+func malformedTokenError(key, ref, resolved, requirement string) error {
+	if resolved != ref {
+		return fmt.Errorf("token for %s resolved from %q %s", key, ref, requirement)
+	}
+	return fmt.Errorf("token for %s (literal value redacted) %s", key, requirement)
+}
+
 func (s *Service) newLocalTernClient(key, database, dbType string, envConfig EnvironmentConfig) (tern.Client, error) {
 	// Resolve target DSN (handles env:, file: prefixes and structured DSN sources)
 	targetDSN, err := envConfig.ResolveDSN()
@@ -334,7 +384,10 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		return nil, fmt.Errorf("resolve DSN for %s: %w", key, err)
 	}
 
-	// Resolve PlanetScale token if configured
+	// Resolve PlanetScale token if configured. Token validation is intentionally
+	// first-use here (at client creation) rather than fail-fast at config load,
+	// unlike revert_window_duration: resolving a token may require a call to a
+	// secrets backend, so it is deferred until the client is actually built.
 	var tokenName, tokenValue string
 	if envConfig.TokenSecretRef != "" {
 		token, err := secrets.Resolve(envConfig.TokenSecretRef, "")
@@ -342,8 +395,13 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 			return nil, fmt.Errorf("resolve token for %s: %w", key, err)
 		}
 		parts := strings.SplitN(token, ":", 2)
-		if len(parts) == 2 {
-			tokenName, tokenValue = parts[0], parts[1]
+		if len(parts) != 2 {
+			return nil, malformedTokenError(key, envConfig.TokenSecretRef, token, "must be in name:value format")
+		}
+		tokenName = strings.TrimSpace(parts[0])
+		tokenValue = strings.TrimSpace(parts[1])
+		if tokenName == "" || tokenValue == "" {
+			return nil, malformedTokenError(key, envConfig.TokenSecretRef, token, "must be in name:value format with a non-empty name and value")
 		}
 	}
 
@@ -356,11 +414,26 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		}
 	}
 
-	// LocalClient uses SchemaBot's storage directly
+	// LocalClient uses SchemaBot's storage directly. ServerConfig.Validate
+	// rejects an unparseable or non-positive revert_window_duration at config
+	// load; parsing here fails closed rather than silently falling back to the
+	// default window.
 	var revertWindow time.Duration
 	if envConfig.RevertWindowDuration != "" {
-		if d, err := time.ParseDuration(envConfig.RevertWindowDuration); err == nil {
-			revertWindow = d
+		d, err := time.ParseDuration(envConfig.RevertWindowDuration)
+		if err != nil {
+			return nil, fmt.Errorf("parse revert_window_duration %q for %s: %w", envConfig.RevertWindowDuration, key, err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("revert_window_duration %q for %s must be positive (omit it to use the engine default)", envConfig.RevertWindowDuration, key)
+		}
+		revertWindow = d
+		// Revert is engine-dependent: only Vitess/PlanetScale honors a revert
+		// window. A window configured on a plain MySQL database is accepted but
+		// ignored, so warn to surface the likely misconfiguration.
+		if dbType == storage.DatabaseTypeMySQL {
+			s.logger.Warn("revert_window_duration is configured but ignored for a MySQL database; revert is engine-dependent",
+				"key", key, "database", database, "revert_window_duration", revertWindow.String())
 		}
 	}
 	metadata := map[string]string{
@@ -486,6 +559,7 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/databases/{database}/environments", s.handleDatabaseEnvironments)
 
 	// Orchestration API
+	mux.HandleFunc("POST /api/pull", s.handlePullSchema)
 	mux.HandleFunc("POST /api/plan", s.handlePlan)
 	mux.HandleFunc("POST /api/apply", s.handleApply)
 	mux.HandleFunc("GET /api/progress/apply/{apply_id}", s.handleProgressByApplyID)
@@ -534,6 +608,11 @@ func (s *Service) Close() error {
 
 	s.ternMu.Lock()
 	var errs []error
+	if s.routingTernClient != nil {
+		if err := s.routingTernClient.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	for _, client := range s.ternClients {
 		if err := client.Close(); err != nil {
 			errs = append(errs, err)

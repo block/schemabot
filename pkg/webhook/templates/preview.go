@@ -243,6 +243,16 @@ func PreviewCommentPRCommandAuthorizationUnavailable() string {
 	})
 }
 
+// PreviewCommentPRCommandDatabaseNotConfigured renders a sample comment for a
+// mutating PR command that targets a database not configured on this instance.
+func PreviewCommentPRCommandDatabaseNotConfigured() string {
+	return RenderPRCommandDatabaseNotConfigured(ActorAuthorizationCommentData{
+		RequestedBy: "mona",
+		CommandName: action.Unlock,
+		Database:    "payments",
+	})
+}
+
 // PreviewCommentApplyBlockedByPriorEnv renders a sample "production blocked by staging" comment.
 func PreviewCommentApplyBlockedByPriorEnv() string {
 	return RenderApplyBlockedByPriorEnv("testapp", "production", "staging", "has pending changes", "Apply staging first")

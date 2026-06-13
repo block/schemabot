@@ -9,6 +9,7 @@ import (
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -224,33 +225,120 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 	return messages
 }
 
-// handlePRClosed cleans up resources when a PR is closed (merged or unmerged).
-// Releases any locks held by this PR and deletes stored check records.
+// handlePRClosed cleans up resources when a PR is closed (merged or unmerged):
+// it releases locks held by this PR and deletes its stored check state.
+//
+// Cleanup only covers finished work. While any apply for the PR is
+// non-terminal, that apply's database lock is retained so another PR cannot
+// acquire the database mid-apply, and the PR's stored check state is retained
+// so a close-and-reopen cannot convert in-flight apply state into a passing
+// check. If apply state cannot be read, cleanup fails closed and nothing is
+// released or deleted.
 func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Release all locks held by this PR
-	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
+	applies, err := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to look up locks for closed PR", "repo", repo, "pr", pr, "error", err)
-	} else {
-		for _, lock := range locks {
-			if err := h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner); err != nil {
-				h.logger.Error("failed to release lock on PR close",
-					"database", lock.DatabaseName, "error", err)
-			} else {
-				h.logger.Info("released lock on PR close",
-					"repo", repo, "pr", pr, "database", lock.DatabaseName)
-			}
-		}
+		// Fail closed: with apply state unknown, releasing a lock or deleting
+		// check state could unblock a database with an apply still in flight.
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "pr_close_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
+		h.logger.Error("PR close cleanup skipped: cannot verify apply state; all locks and check state are retained",
+			"repo", repo, "pr", pr, "error", err)
+		return
 	}
 
-	// Delete all check records for this PR
-	if err := h.service.Storage().Checks().DeleteByPR(ctx, repo, pr); err != nil {
+	inFlight := h.inFlightAppliesForClosedPR(ctx, repo, pr, applies)
+
+	h.releaseLocksForClosedPR(ctx, repo, pr, inFlight)
+
+	if len(inFlight) > 0 {
+		h.logger.Info("check state retained for closed PR until all applies reach a terminal state",
+			"repo", repo, "pr", pr, "in_flight_databases", len(inFlight))
+		return
+	}
+
+	// Delete stored check state for this PR. Rows owned by an in-flight apply
+	// survive the delete at the storage layer even if the applies table missed
+	// the in-flight work above.
+	if err := h.service.Storage().Checks().DeleteByPRExcludingApplyOwned(ctx, repo, pr); err != nil {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "pr_close_cleanup",
+			Repository: repo,
+			Status:     "error",
+		})
 		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "error", err)
 	} else {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "pr_close_cleanup",
+			Repository: repo,
+			Status:     "success",
+		})
 		h.logger.Info("deleted checks for closed PR", "repo", repo, "pr", pr)
+	}
+}
+
+// closedPRDatabase identifies the database lock an apply holds.
+type closedPRDatabase struct {
+	database     string
+	databaseType string
+}
+
+// inFlightAppliesForClosedPR returns the databases for which the closed PR
+// still has a non-terminal apply recorded. Each in-flight apply is logged and
+// counted because it blocks close cleanup: the database stays locked and the
+// PR's stored check state stays in place until the apply reaches a terminal
+// state.
+func (h *Handler) inFlightAppliesForClosedPR(ctx context.Context, repo string, pr int, applies []*storage.Apply) map[closedPRDatabase]bool {
+	inFlight := make(map[closedPRDatabase]bool)
+	for _, a := range applies {
+		if state.IsTerminalApplyState(a.State) {
+			// Terminal applies never block close cleanup.
+			continue
+		}
+		inFlight[closedPRDatabase{database: a.Database, databaseType: a.DatabaseType}] = true
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "pr_close_cleanup",
+			Repository:   repo,
+			Database:     a.Database,
+			DatabaseType: a.DatabaseType,
+			Environment:  a.Environment,
+			Status:       "blocked",
+		})
+		h.logger.Warn("retaining lock and check state for closed PR with in-flight apply; close cleanup skipped for this database",
+			"repo", repo, "pr", pr,
+			"database", a.Database, "database_type", a.DatabaseType,
+			"environment", a.Environment,
+			"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier, "apply_state", a.State)
+	}
+	return inFlight
+}
+
+// releaseLocksForClosedPR releases the closed PR's locks, except locks on
+// databases that still have an in-flight apply.
+func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) {
+	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to look up locks for closed PR; no locks released", "repo", repo, "pr", pr, "error", err)
+		return
+	}
+	for _, lock := range locks {
+		if inFlight[closedPRDatabase{database: lock.DatabaseName, databaseType: lock.DatabaseType}] {
+			h.logger.Info("lock retained on PR close because an apply is in flight",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType)
+			continue
+		}
+		if err := h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner); err != nil {
+			h.logger.Error("failed to release lock on PR close",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
+		} else {
+			h.logger.Info("released lock on PR close",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName)
+		}
 	}
 }
 

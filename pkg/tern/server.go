@@ -38,6 +38,27 @@ func (s *Server) Health(ctx context.Context, req *ternv1.HealthRequest) (*ternv1
 	return &ternv1.HealthResponse{Status: "ok"}, nil
 }
 
+func (s *Server) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	resp, err := s.client.PullSchema(ctx, req)
+	if err != nil {
+		return nil, status.Error(pullSchemaErrorCode(err), err.Error())
+	}
+	return resp, nil
+}
+
+func pullSchemaErrorCode(err error) codes.Code {
+	if err == nil {
+		return codes.OK
+	}
+	if errors.Is(err, ErrPullSchemaUnsupportedType) {
+		return codes.Unimplemented
+	}
+	if errors.Is(err, ErrPullSchemaInvalidRequest) {
+		return codes.InvalidArgument
+	}
+	return codes.Internal
+}
+
 func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	resp, err := s.client.Plan(ctx, req)
 	if err != nil {

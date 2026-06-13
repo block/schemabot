@@ -22,6 +22,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.schema_request.errors_total` | Counter | repository, command, database, environment, reason | Schema request errors by reason |
 | `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies |
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
+| `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
 | `schemabot.webhook.events_total` | Counter | environment, event_type, action, repository, status | GitHub webhook events |
 | `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action, repository | Webhook events ignored because the repository is not configured |
@@ -131,6 +132,21 @@ Operator response:
 4. If the live schema may now differ from the PR's current declarative schema,
    re-plan the current head and decide whether to apply again, roll back, or
    hold the PR until drift is resolved.
+
+### Promotion Config Error Blocks
+
+`schemabot.promotion.config_error_blocks_total` should always be zero. It
+increments only when a scoped SchemaBot instance (with `allowed_environments`
+configured) is asked to apply to an environment that is absent from the
+configured promotion order. The staging-first gate cannot determine which
+environments must be applied before the target, so it fails closed and blocks
+the apply.
+
+This is an operator misconfiguration, not user commit churn. Group by
+`repository`, `database`, and `environment` to find the affected instance, then
+add the blocked `environment` to that instance's `environment_order` so the gate
+knows where it sits in the promotion sequence. The matching warn log carries the
+`promotion_order` currently in effect.
 
 ### Status Check Operations
 

@@ -549,6 +549,89 @@ func TestServerConfig_ValidateRejectsLocalRemoteRouteCollision(t *testing.T) {
 	assert.Contains(t, err.Error(), `tern_deployments also defines deployment "primary"`)
 }
 
+// A non-empty but unparseable revert_window_duration is a startup config error
+// so a typo (e.g. "30 minutes") fails closed instead of silently reverting to
+// the engine default window.
+func TestServerConfig_ValidateRejectsInvalidRevertWindowDuration(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "vitess",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/mydb", RevertWindowDuration: "30 minutes"},
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "mydb" environment "staging" revert_window_duration "30 minutes"`)
+	assert.Contains(t, err.Error(), "not a valid duration")
+}
+
+// A revert_window_duration that parses but is non-positive ("0", "-5m") is
+// rejected so a meaningless window fails closed at config load instead of
+// silently reverting to the engine default window.
+func TestServerConfig_ValidateRejectsNonPositiveRevertWindowDuration(t *testing.T) {
+	for _, value := range []string{"0", "0s", "-5m"} {
+		t.Run(value, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "vitess",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", RevertWindowDuration: value},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" revert_window_duration "`+value+`"`)
+			assert.Contains(t, err.Error(), "must be positive")
+		})
+	}
+}
+
+// A well-formed revert_window_duration parses to the configured window.
+func TestServerConfig_ValidateAcceptsValidRevertWindowDuration(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "vitess",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/mydb", RevertWindowDuration: "4h"},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, cfg.Validate())
+
+	parsed, err := time.ParseDuration(cfg.Databases["mydb"].Environments["staging"].RevertWindowDuration)
+	require.NoError(t, err)
+	assert.Equal(t, 4*time.Hour, parsed)
+}
+
+// An empty revert_window_duration is valid and leaves the engine default in
+// place — only a non-empty unparseable value is rejected.
+func TestServerConfig_ValidateAllowsEmptyRevertWindowDuration(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "vitess",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/mydb"},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, cfg.Validate())
+}
+
 func TestServerConfig_ValidateSourcePolicy(t *testing.T) {
 	baseConfig := func(allowedDirs []string) ServerConfig {
 		return ServerConfig{

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,7 +10,57 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/apitypes"
 )
+
+func TestCallPullSchemaAPI(t *testing.T) {
+	var gotReq apitypes.PullSchemaRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/pull", r.URL.Path)
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.PullSchemaResponse{
+			Database:    "orders",
+			Type:        "mysql",
+			Environment: "production",
+			TableCount:  1,
+			SchemaFiles: map[string]*apitypes.SchemaFiles{
+				"orders": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+		}))
+	}))
+	t.Cleanup(server.Close)
+
+	result, err := CallPullSchemaAPI(server.URL, "orders", "mysql", "production")
+	require.NoError(t, err)
+
+	assert.Equal(t, apitypes.PullSchemaRequest{Database: "orders", Type: "mysql", Environment: "production"}, gotReq)
+	require.NotNil(t, result)
+	assert.Equal(t, "orders", result.Database)
+	assert.Equal(t, "mysql", result.Type)
+	assert.Equal(t, "production", result.Environment)
+	assert.Equal(t, int32(1), result.TableCount)
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", result.SchemaFiles["orders"].Files["users.sql"])
+}
+
+func TestCallPullSchemaAPIError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, err := w.Write([]byte(`{"error":"database not configured"}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	result, err := CallPullSchemaAPI(server.URL, "orders", "mysql", "production")
+	require.Error(t, err)
+
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "database not configured")
+}
 
 func TestGetStatusWithOptions(t *testing.T) {
 	var gotLimit, gotEnvironment, gotFailed string

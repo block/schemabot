@@ -36,7 +36,7 @@ type ActorAuthorizationCommentData struct {
 }
 
 // RenderPRCommandNotAuthorized renders a comment when a GitHub PR command
-// actor is not allowed to run SchemaBot apply/apply-confirm for the database.
+// actor is not allowed to run a mutating SchemaBot command for the database.
 func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 	var sb strings.Builder
 
@@ -53,8 +53,24 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 	return sb.String()
 }
 
+// RenderPRCommandDatabaseNotConfigured renders a comment when a mutating PR
+// command targets a database that is not configured on this SchemaBot instance.
+// It is distinct from a plain authorization denial so operators do not waste a
+// round-trip assuming the actor lacks access when the database is simply absent.
+func RenderPRCommandDatabaseNotConfigured(data ActorAuthorizationCommentData) string {
+	var sb strings.Builder
+
+	sb.WriteString("## SchemaBot Command Not Authorized\n\n")
+	writeDBEnvLine(&sb, data.Database, data.Environment)
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "`schemabot %s` cannot run because database `%s` is not configured on this SchemaBot instance.\n\n", data.CommandName, data.Database)
+	sb.WriteString("Verify the database name, or run the command against the SchemaBot instance that manages this database.\n")
+
+	return sb.String()
+}
+
 // RenderPRCommandAuthorizationUnavailable renders a comment when SchemaBot
-// cannot verify actor authorization for apply/apply-confirm.
+// cannot verify actor authorization for a mutating PR command.
 func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData) string {
 	var sb strings.Builder
 
@@ -533,6 +549,25 @@ func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv stri
 	fmt.Fprintf(&sb, "%s is currently in progress. Wait for it to complete before applying to %s.\n\n", capitalizeFirst(priorEnv), environment)
 	fmt.Fprintf(&sb, "Once %s completes, retry:\n", priorEnv)
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
+
+	return sb.String()
+}
+
+// RenderApplyBlockedByUnlistedEnvironment renders a comment when an apply is
+// blocked because this scoped SchemaBot instance cannot enforce staging-first
+// promotion ordering: the target environment is not part of the configured
+// promotion order, so SchemaBot cannot determine which environments must be
+// applied before it. This is a configuration error that an operator must fix.
+func RenderApplyBlockedByUnlistedEnvironment(environment string, promotionOrder []string) string {
+	var sb strings.Builder
+
+	sb.WriteString("## ❌ Apply Blocked\n\n")
+	fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", environment)
+	fmt.Fprintf(&sb, "`%s` is not in the configured promotion order, so SchemaBot cannot determine which environments must be applied before it and cannot enforce staging-first ordering.\n\n", environment)
+	if len(promotionOrder) > 0 {
+		fmt.Fprintf(&sb, "Configured promotion order: `%s`\n\n", strings.Join(promotionOrder, "` → `"))
+	}
+	fmt.Fprintf(&sb, "Add `%s` to `environment_order` so SchemaBot knows where it sits in the promotion sequence, then retry the apply.\n", environment)
 
 	return sb.String()
 }

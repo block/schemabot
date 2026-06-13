@@ -47,10 +47,11 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// clientFoundRows=true: return number of matched rows, not changed rows
-	// This is needed because UPDATE ... SET updated_at = NOW() may not change
-	// the value if called within the same second, but we still want to know
-	// if the row was found.
+	// testDSN sets clientFoundRows=true so RowsAffected reflects matched rows.
+	// testDSNChangedRows omits it to mirror production, where RowsAffected
+	// reflects changed rows: a matched row whose values are unchanged reports
+	// zero affected rows. Storage paths that infer existence or ownership from
+	// RowsAffected must be correct under the changed-rows connection.
 	testDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot_test?parseTime=true&clientFoundRows=true&multiStatements=true", host, port)
 	testDSNChangedRows = fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot_test?parseTime=true&multiStatements=true", host, port)
 

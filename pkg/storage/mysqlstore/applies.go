@@ -72,10 +72,16 @@ type txBeginner interface {
 // claimableApplyStates returns active apply states where operator recovery can
 // safely resume work after the heartbeat becomes stale. Pending has a separate
 // queue path and does not need to be stale before a worker claims it. Terminal
-// states are already done, failed_retryable has its own retry path, stopped
-// requires an explicit user start, and PlanetScale setup states are excluded
-// until recovery can reload the persisted branch/deploy metadata needed to
-// resume them without restarting setup.
+// states are already done, failed_retryable has its own retry path, and stopped
+// requires an explicit user start.
+//
+// The PlanetScale setup-phase states (preparing_branch through
+// validating_deploy_request) are included: a stale heartbeat in any of them
+// unambiguously means the worker driving engine setup died, and the persisted
+// branch/deploy metadata lets recovery resume the apply from stored state. A
+// healthy worker mid-setup keeps its heartbeat fresh, so it is never claimed out
+// from under itself. Leaving these states out would strand a crashed setup-phase
+// apply non-terminal and unclaimable, so no operator could ever recover it.
 func claimableApplyStates() []string {
 	return []string{
 		state.Apply.Running,
@@ -85,6 +91,11 @@ func claimableApplyStates() []string {
 		"recovering_cutover",
 		state.Apply.CuttingOver,
 		state.Apply.RevertWindow,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest,
 	}
 }
 

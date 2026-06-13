@@ -163,6 +163,7 @@ type Config struct {
 // rides out sub-second blips instead of failing the caller's operation.
 //
 // Only RPCs that are safe to re-send are retried:
+//   - PullSchema: read-only live schema fetch.
 //   - Plan: each attempt produces an independent plan record and only the
 //     returned plan ID is used, so a duplicate attempt is harmless.
 //   - Progress and Health: read-only.
@@ -174,6 +175,7 @@ type Config struct {
 const retryServiceConfig = `{
 	"methodConfig": [{
 		"name": [
+			{"service": "tern.v1.Tern", "method": "PullSchema"},
 			{"service": "tern.v1.Tern", "method": "Plan"},
 			{"service": "tern.v1.Tern", "method": "Progress"},
 			{"service": "tern.v1.Tern", "method": "Health"}
@@ -261,6 +263,10 @@ func (c *GRPCClient) Close() error {
 
 func (c *GRPCClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	return c.client.Plan(ctx, req)
+}
+
+func (c *GRPCClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	return c.client.PullSchema(ctx, req)
 }
 
 func (c *GRPCClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {

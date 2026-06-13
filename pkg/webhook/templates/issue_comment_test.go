@@ -54,9 +54,33 @@ func TestRenderStopCommandAcceptedAlreadyRequested(t *testing.T) {
 	rendered := RenderStopCommandAccepted(StopCommandAcceptedData{
 		ApplyID:     "apply_abc123",
 		Environment: "staging",
-		Status:      "already_requested",
+		Status:      apitypes.ControlStatusAlreadyRequested,
 	})
 	assert.Contains(t, rendered, "Stop was already requested")
+}
+
+func TestRenderStartCommandAccepted(t *testing.T) {
+	rendered := RenderStartCommandAccepted(StartCommandAcceptedData{
+		ApplyID:      "apply_abc123",
+		Environment:  "staging",
+		RequestedBy:  "alice",
+		StartedCount: 1,
+		SkippedCount: 2,
+	})
+	assert.Contains(t, rendered, "Start Request Accepted")
+	assert.Contains(t, rendered, "`apply_abc123`")
+	assert.Contains(t, rendered, "`staging`")
+	assert.Contains(t, rendered, "@alice")
+	assert.Contains(t, rendered, "1 started, 2 skipped")
+}
+
+func TestRenderStartCommandAcceptedAlreadyRequested(t *testing.T) {
+	rendered := RenderStartCommandAccepted(StartCommandAcceptedData{
+		ApplyID:     "apply_abc123",
+		Environment: "staging",
+		Status:      apitypes.ControlStatusAlreadyRequested,
+	})
+	assert.Contains(t, rendered, "Start was already requested")
 }
 
 func TestRenderCutoverCommandAccepted(t *testing.T) {

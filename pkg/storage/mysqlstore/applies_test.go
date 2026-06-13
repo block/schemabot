@@ -1052,6 +1052,87 @@ func TestApplyStore_ClaimApplyByIDReturnsNilForTerminalAndMissing(t *testing.T) 
 	assert.Nil(t, missing, "a non-existent apply id yields no claim")
 }
 
+// A PlanetScale apply transitions through engine setup-phase states
+// (preparing_branch through validating_deploy_request) before per-table work
+// begins. If the worker driving setup crashes, the apply is left in one of
+// those states; a fresh worker must reclaim it once the heartbeat goes stale so
+// setup resumes from persisted branch/deploy metadata. While the original
+// worker is still alive its heartbeat stays fresh, so the apply is not claimed
+// out from under it.
+func TestApplyStore_FindNextApplyClaimsStaleSetupPhase(t *testing.T) {
+	for _, setupState := range []string{
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest,
+	} {
+		t.Run(setupState, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_setup_"+setupState, 700, setupState, "staging")
+			require.Equal(t, storage.EnginePlanetScale, apply.Engine, "setup-phase states only occur for the PlanetScale engine")
+
+			fresh, err := store.Applies().FindNextApply(ctx, "operator-a")
+			require.NoError(t, err)
+			assert.Nil(t, fresh, "a setup-phase apply with a fresh heartbeat is owned by its active worker")
+
+			_, err = testDB.ExecContext(ctx, `
+				UPDATE applies
+				SET updated_at = NOW() - INTERVAL 2 MINUTE
+				WHERE id = ?
+			`, apply.ID)
+			require.NoError(t, err)
+
+			claimed, err := store.Applies().FindNextApply(ctx, "operator-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "a stale setup-phase apply must be reclaimable for recovery")
+			assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+			assert.Equal(t, setupState, claimed.State, "the caller sees the setup-phase state to resume from")
+			assert.Equal(t, storage.EnginePlanetScale, claimed.Engine, "the reclaimed apply keeps its PlanetScale engine")
+			assert.Equal(t, "operator-a", claimed.LeaseOwner)
+			assert.NotEmpty(t, claimed.LeaseToken)
+		})
+	}
+}
+
+// ClaimApplyByID is how the operation-level claim loop acquires the parent apply
+// lease after leasing a stale operation row. When a PlanetScale worker crashes
+// mid-setup the operation row stays running (stale) while the parent apply sits
+// in a setup-phase state, so ClaimApplyByID must reclaim that stale parent for
+// recovery while still refusing one whose heartbeat is fresh.
+func TestApplyStore_ClaimApplyByIDClaimsStaleSetupPhase(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_setup", 701, state.Apply.ApplyingBranchChanges, "staging")
+	require.Equal(t, storage.EnginePlanetScale, apply.Engine, "setup-phase states only occur for the PlanetScale engine")
+
+	fresh, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	assert.Nil(t, fresh, "a fresh setup-phase apply is owned by its active worker")
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = NOW() - INTERVAL 2 MINUTE
+		WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a stale setup-phase parent apply must be reclaimable")
+	assert.Equal(t, state.Apply.ApplyingBranchChanges, claimed.State)
+	assert.Equal(t, storage.EnginePlanetScale, claimed.Engine, "the reclaimed parent apply keeps its PlanetScale engine")
+	assert.Equal(t, "operator-a", claimed.LeaseOwner)
+	assert.NotEmpty(t, claimed.LeaseToken)
+}
+
 // ClaimApplyByID requires an owner so a lease can never be acquired without an
 // identity that lease-guarded writes can fail closed against.
 func TestApplyStore_ClaimApplyByIDRequiresOwner(t *testing.T) {
@@ -2134,7 +2215,7 @@ func createTestApplyWithStateAndEnv(t *testing.T, store *Storage, lock *storage.
 		Repository:      lock.Repository,
 		PullRequest:     lock.PullRequest,
 		Environment:     env,
-		Engine:          "spirit",
+		Engine:          storage.EngineForType(lock.DatabaseType),
 		State:           applyState,
 	}
 

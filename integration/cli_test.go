@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -141,6 +141,59 @@ CREATE TABLE products (
 		assertContains(t, out, "Apply started")
 		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
 	})
+}
+
+// TestCLI_OnboardPullsLiveMySQLSchema verifies the CLI onboarding flow against
+// a real MySQL target: live schema is pulled into a new declarative directory,
+// schemabot.yaml is created, and the generated files plan cleanly immediately.
+func TestCLI_OnboardPullsLiveMySQLSchema(t *testing.T) {
+	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
+	dbName := fmt.Sprintf("onboard_%d", time.Now().UnixNano())
+	schemabotAddr := startSchemaBotLocalDB(t, dbName)
+	endpoint := "http://" + schemabotAddr
+
+	cfg, err := mysql.ParseDSN(targetDSN)
+	require.NoError(t, err)
+	cfg.DBName = dbName
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	require.NoError(t, err, "open target database")
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()), "ping target database")
+
+	_, err = db.ExecContext(t.Context(), `
+CREATE TABLE `+quoteIdentifier("onboard_users")+` (
+  `+quoteIdentifier("id")+` BIGINT NOT NULL AUTO_INCREMENT,
+  `+quoteIdentifier("email")+` VARCHAR(255) NOT NULL,
+  `+quoteIdentifier("created_at")+` DATETIME DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`+quoteIdentifier("id")+`),
+  UNIQUE KEY `+quoteIdentifier("idx_email")+` (`+quoteIdentifier("email")+`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`)
+	require.NoError(t, err, "create live table")
+
+	schemaDir := filepath.Join(t.TempDir(), "schema", dbName)
+	out := runCLI(t, binPath, "onboard",
+		"-d", dbName,
+		"-e", "staging",
+		"-s", schemaDir,
+		"--endpoint", endpoint,
+	)
+	assertContains(t, out, "Onboarding complete")
+	assertContains(t, out, "Verified: pulled schema produces no schema changes")
+
+	config, err := os.ReadFile(filepath.Join(schemaDir, "schemabot.yaml"))
+	require.NoError(t, err, "read generated schemabot.yaml")
+	assert.Equal(t, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), string(config))
+
+	tableFile := filepath.Join(schemaDir, dbName, "onboard_users.sql")
+	ddl, err := os.ReadFile(tableFile)
+	require.NoError(t, err, "read generated table file")
+	ddlText := string(ddl)
+	assert.Contains(t, ddlText, "CREATE TABLE `onboard_users`")
+	assert.Contains(t, ddlText, "`email` varchar(255) NOT NULL")
+	assert.Contains(t, ddlText, "UNIQUE KEY `idx_email` (`email`)")
+
+	planOut := runCLIInDir(t, binPath, schemaDir, "plan", "-e", "staging", "--endpoint", endpoint)
+	assertContains(t, planOut, "No schema changes detected")
 }
 
 // TestCLI_DeferCutover tests the full defer-cutover workflow.

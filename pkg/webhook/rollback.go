@@ -55,6 +55,21 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		return
 	}
 
+	// Rollback executes DDL against the target database, so the actor must be an
+	// authorized admin/operator before SchemaBot reveals any lock or plan detail
+	// for the database. The gate runs as soon as the database is known and only
+	// after the environment-routing check above, so a non-owning instance stays
+	// silent instead of posting a denial for an environment it does not manage.
+	// An unauthorized actor must not learn lock ownership or rollback plan
+	// contents by probing apply IDs.
+	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, database, environment, action.Rollback)
+	if blocked {
+		return
+	}
+	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback); blocked {
+		return
+	}
+
 	// Check for existing lock
 	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
 	if err != nil {
@@ -162,6 +177,13 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment,
 	database := schemaResult.Database
 	dbType := schemaResult.Type
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
+
+	// Rollback-confirm executes DDL with unsafe changes allowed, so the actor
+	// must be an authorized admin/operator before any lock state is read,
+	// released, or acted on.
+	if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm); blocked {
+		return
+	}
 
 	// Check lock ownership
 	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)

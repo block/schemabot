@@ -497,6 +497,21 @@ func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64,
 		return
 	}
 
+	// Unlock mutates lock state for every matched database, including
+	// force-releasing CLI-owned locks, so the actor must be an authorized
+	// admin/operator for each affected database before any lock is released.
+	// Locks are not environment-scoped, so authorization is enforced per
+	// database without an environment.
+	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, locks[0].DatabaseName, "", action.Unlock)
+	if blocked {
+		return
+	}
+	for _, lock := range locks {
+		if blocked := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, lock.DatabaseName, lock.DatabaseType, "", action.Unlock); blocked {
+			return
+		}
+	}
+
 	// Check for active applies on any locked database. Even force-unlock should
 	// not break a lock while SchemaBot still has a non-terminal apply recorded
 	// for the same database/type. When apply state cannot be read, the unlock

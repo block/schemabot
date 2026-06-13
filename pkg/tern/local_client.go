@@ -87,13 +87,18 @@ package tern
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/block/spirit/pkg/statement"
+	spirittable "github.com/block/spirit/pkg/table"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 
@@ -270,6 +275,71 @@ func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *st
 // Health checks the service health.
 func (c *LocalClient) Health(ctx context.Context) error {
 	return c.storage.Ping(ctx)
+}
+
+// PullSchema fetches the live schema and returns declarative schema files.
+func (c *LocalClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	if c.config.Type != storage.DatabaseTypeMySQL {
+		return nil, fmt.Errorf("pull schema for database %s type %s: only %s is supported: %w", c.config.Database, c.config.Type, storage.DatabaseTypeMySQL, ErrPullSchemaUnsupportedType)
+	}
+	if req.Type != "" && req.Type != c.config.Type {
+		return nil, fmt.Errorf("pull schema for database %s: request type %q does not match client type %q: %w", c.config.Database, req.Type, c.config.Type, ErrPullSchemaInvalidRequest)
+	}
+
+	attrs := []any{"database", c.config.Database}
+	attrs = append(attrs, dsnLogAttrs(c.config.TargetDSN)...)
+	c.logger.Info("LocalClient.PullSchema: loading live schema", attrs...)
+
+	db, err := sql.Open("mysql", c.config.TargetDSN)
+	if err != nil {
+		return nil, fmt.Errorf("open database %s for schema pull: %w", c.config.Database, err)
+	}
+	defer utils.CloseAndLog(db)
+
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping database %s for schema pull: %w", c.config.Database, err)
+	}
+
+	tables, err := spirittable.LoadSchemaFromDB(ctx, db, spirittable.WithoutUnderscoreTables, spirittable.WithoutArchiveTables, spirittable.WithStrippedAutoIncrement)
+	if err != nil {
+		return nil, fmt.Errorf("load live schema for database %s: %w", c.config.Database, err)
+	}
+	sort.Slice(tables, func(i, j int) bool { return tables[i].Name < tables[j].Name })
+
+	files := make(map[string]string, len(tables))
+	for _, tbl := range tables {
+		content, err := pulledSchemaFileContent(c.config.Database, tbl)
+		if err != nil {
+			return nil, err
+		}
+		files[tbl.Name+".sql"] = content
+	}
+
+	c.logger.Info("LocalClient.PullSchema: loaded live schema",
+		"database", c.config.Database,
+		"table_count", len(tables),
+	)
+
+	return &ternv1.PullSchemaResponse{
+		Database:    c.config.Database,
+		Type:        c.config.Type,
+		Environment: req.Environment,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			c.config.Database: {Files: files},
+		},
+		TableCount: int32(len(tables)),
+	}, nil
+}
+
+func pulledSchemaFileContent(database string, tbl spirittable.TableSchema) (string, error) {
+	if tbl.Name == "" {
+		return "", fmt.Errorf("load live schema for database %s: table with empty name", database)
+	}
+	content := strings.TrimRight(tbl.Schema, "\n") + "\n"
+	if _, err := statement.ParseCreateTable(content); err != nil {
+		return "", fmt.Errorf("parse pulled schema for database %s table %s: %w", database, tbl.Name, err)
+	}
+	return content, nil
 }
 
 // Plan generates a schema change plan from declarative schema files.
@@ -538,7 +608,21 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	optionsJSON := storage.MarshalApplyOptions(applyOpts)
 
-	// Create Apply record first (1 Apply -> N Tasks)
+	// Create VSchema tasks for namespaces with VSchema changes so the
+	// progress API and TUI can track VSchema application alongside DDL.
+	// For VSchema-only deploys (0 DDL changes), this gives the progress API
+	// something to track.
+	for ns, nsData := range plan.Namespaces {
+		if len(nsData.VSchema) > 0 {
+			ddlChanges = append(ddlChanges, storage.TableChange{
+				Table:     "VSchema: " + ns,
+				Namespace: ns,
+				Operation: "vschema_update",
+			})
+		}
+	}
+
+	// Build the Apply record (1 Apply -> N Tasks).
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 	apply := &storage.Apply{
 		ApplyIdentifier: applyIdentifier,
@@ -556,19 +640,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
-	applyID, err := c.storage.Applies().Create(ctx, apply)
-	if err != nil {
-		return nil, fmt.Errorf("create apply: %w", err)
-	}
-	apply.ID = applyID
 
-	// Log apply started
-	c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Apply started: %s", applyIdentifier), "", state.Apply.Pending)
-
-	// Create one Task per DDLChange in the plan.
-	// For VSchema-only deploys (0 DDL changes), create a synthetic task per
-	// keyspace with VSchema changes so the progress API has something to track.
 	c.logger.Info("Apply: creating tasks",
 		"plan_id", plan.PlanIdentifier,
 		"ddl_change_count", len(ddlChanges),
@@ -581,24 +653,11 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		)
 	}
 
-	// Create VSchema tasks for namespaces with VSchema changes so the
-	// progress API and TUI can track VSchema application alongside DDL.
-	for ns, nsData := range plan.Namespaces {
-		if len(nsData.VSchema) > 0 {
-			ddlChanges = append(ddlChanges, storage.TableChange{
-				Table:     "VSchema: " + ns,
-				Namespace: ns,
-				Operation: "vschema_update",
-			})
-		}
-	}
-
 	tasks := make([]*storage.Task, len(ddlChanges))
 	for i, ddlChange := range ddlChanges {
 		taskIdentifier := "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 		tasks[i] = &storage.Task{
 			TaskIdentifier: taskIdentifier,
-			ApplyID:        applyID,
 			PlanID:         plan.ID,
 			Database:       plan.Database,
 			DatabaseType:   plan.DatabaseType,
@@ -615,12 +674,35 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
-		taskID, err := c.storage.Tasks().Create(ctx, tasks[i])
-		if err != nil {
-			return nil, fmt.Errorf("create task for table %s: %w", ddlChange.Table, err)
-		}
-		tasks[i].ID = taskID
 	}
+
+	// Dual-write one apply_operations row alongside the applies row in the
+	// same transaction so every apply created via the Tern client carries a
+	// claimable, resumable operation. CreateWithTasksAndOperations links each
+	// task to the single operation via ApplyOperationID, which the engine
+	// resume-state path requires and the operator claim loop selects on.
+	//
+	// CutoverPolicy and HaltOnFailure are intentionally left unset: the Tern
+	// client has no environment config to resolve them from (unlike the API
+	// apply path), so the store applies its safe defaults (rolling cutover,
+	// halt on failure).
+	operations := []*storage.ApplyOperation{{
+		Deployment: apply.Deployment,
+		Target:     plan.Target,
+		State:      state.ApplyOperation.Pending,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}}
+
+	applyID, err := c.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+	if err != nil {
+		return nil, fmt.Errorf("create apply %s with tasks and operations: %w", applyIdentifier, err)
+	}
+	apply.ID = applyID
+
+	// Log apply started
+	c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Apply started: %s", applyIdentifier), "", state.Apply.Pending)
 
 	// Direct client calls can still register a pending observer before starting
 	// the engine. API-created applies use the service-level observer registry

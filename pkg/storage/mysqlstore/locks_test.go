@@ -466,7 +466,7 @@ func TestLockStore_List(t *testing.T) {
 func TestLockStore_Update(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := newChangedRowsStore(t)
 
 	// Create lock
 	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
@@ -482,7 +482,7 @@ func TestLockStore_Update(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, initial)
 
-	// Wait 1 second to ensure updated_at will change (MySQL datetime has second precision)
+	// Wait 1 second so updated_at advances (MySQL DATETIME has second precision).
 	time.Sleep(1 * time.Second)
 
 	// Update lock (just touches updated_at)
@@ -498,10 +498,63 @@ func TestLockStore_Update(t *testing.T) {
 		"expected updated_at to change, initial: %v, updated: %v", initial.UpdatedAt, updated.UpdatedAt)
 }
 
+// Touching a lock whose updated_at already equals NOW() leaves the row
+// unchanged. Under production changed-rows semantics that UPDATE reports zero
+// affected rows, but the lock still exists, so the touch must succeed rather
+// than report the lock as missing.
+//
+// The session timestamp is frozen on a single pinned connection so both the
+// row's stored updated_at and the touch's NOW() resolve to the same instant,
+// making the UPDATE a guaranteed no-op. Without freezing, a touch that crossed
+// into the next one-second DATETIME tick would change updated_at and report one
+// affected row, masking the changed-rows path this exercises.
+func TestLockStore_UpdateSameSecondSucceeds(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+
+	// Pin to a single connection so the frozen session timestamp persists across
+	// the seed INSERT, the touch UPDATE, and the re-read.
+	db, err := sql.Open("mysql", testDSNChangedRows)
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	require.NoError(t, db.PingContext(ctx))
+
+	// Freeze NOW() so the seeded updated_at and the touch's NOW() are identical.
+	_, err = db.ExecContext(ctx, "SET TIMESTAMP = 1700000000")
+	require.NoError(t, err)
+
+	store := &lockStore{db: db}
+
+	// Acquire seeds the row via the locks table's DEFAULT CURRENT_TIMESTAMP,
+	// which resolves to the frozen NOW().
+	require.NoError(t, store.Acquire(ctx, &storage.Lock{
+		DatabaseName: "testdb",
+		DatabaseType: "vitess",
+		Repository:   "org/repo",
+		PullRequest:  123,
+		Owner:        "testuser",
+	}))
+
+	// updated_at already equals the frozen NOW(), so the touch's
+	// SET updated_at = NOW() changes nothing: zero affected rows under
+	// changed-rows semantics. The lock still exists, so the touch must succeed.
+	require.NoError(t, store.Update(ctx, &storage.Lock{DatabaseName: "testdb", DatabaseType: "vitess"}),
+		"a no-op touch leaves updated_at unchanged but the lock still exists")
+
+	lock, err := store.Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "testuser", lock.Owner)
+}
+
 func TestLockStore_UpdateNonExistent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := newChangedRowsStore(t)
 
 	err := store.Locks().Update(ctx, &storage.Lock{
 		DatabaseName: "nonexistent",

@@ -65,6 +65,7 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Unlock, SupportsDB: true, SupportsForce: true},
 	{Name: action.FixLint, SupportsDB: true},
 	{Name: action.Stop, RequiresEnv: true, HasApplyID: true},
+	{Name: action.Start, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Revert, RequiresEnv: true},
 	{Name: action.SkipRevert, RequiresEnv: true},
 	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},

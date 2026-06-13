@@ -61,6 +61,21 @@ func IsTerminalTaskState(s string) bool {
 	}
 }
 
+// IsInFlightTaskState returns true if the state implies the engine is actively
+// working on the task. These are the only states for which a missing engine
+// migration means the task was abandoned (e.g. a server crash). Resting states
+// such as Stopped and FailedRetryable also have no active engine work, but that
+// absence is expected — Spirit keeps the checkpoint while the operator decides
+// whether to resume or retry — so they are excluded here.
+func IsInFlightTaskState(s string) bool {
+	switch NormalizeState(s) {
+	case Task.Running, Task.WaitingForCutover, Task.CuttingOver, Task.WaitingForDeploy, Task.Recovering:
+		return true
+	default:
+		return false
+	}
+}
+
 // NormalizeTaskStatus maps a raw engine status to a canonical Task state.
 // Called at the parsing boundary (ParseProgressResponse) so rendering code
 // can compare against Task.* constants directly.

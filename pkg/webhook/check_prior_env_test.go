@@ -8,6 +8,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/spirit/pkg/utils"
 
@@ -368,6 +372,194 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 			t.Fatal("timed out waiting for staging block comment")
 		}
 	})
+}
+
+// TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed covers a
+// scoped SchemaBot instance (allowed_environments is configured) applying to an
+// environment that this instance handles but that the operator omitted from the
+// configured promotion order. The command reaches the gate because the target
+// environment is allowed, yet the promotion order cannot place it among its
+// prior environments. SchemaBot cannot determine which environments must be
+// applied first, so it cannot enforce staging-first ordering. The apply must
+// fail closed with a configuration error instead of falling back to this
+// instance's local environment list, which would silently skip prior
+// environments owned by other instances.
+func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testing.T) {
+	const (
+		repo = "octocat/hello-world"
+		pr   = 1
+	)
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	service := api.New(&emptyStorage{}, &api.ServerConfig{
+		AllowedEnvironments: []string{"production", "canary"},
+		EnvironmentOrder:    []string{"staging", "production"},
+		Databases: map[string]api.DatabaseConfig{
+			"orders": {
+				Type: "mysql",
+				Environments: map[string]api.EnvironmentConfig{
+					"canary": {Deployment: "default", Target: "orders"},
+				},
+			},
+		},
+	}, nil, testLogger())
+	t.Cleanup(func() { utils.CloseAndLog(service) })
+
+	h := &Handler{
+		service:                    service,
+		ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:                     testLogger(),
+		priorEnvCheckMaxAttempts:   1,
+		priorEnvCheckRetryInterval: time.Nanosecond,
+	}
+
+	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+		"orders", "mysql", "canary", []string{"canary"}, 12345, "testuser")
+	assert.True(t, blocked, "scoped instance must fail closed when an allowed target environment is absent from the promotion order")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Apply Blocked")
+		assert.Contains(t, body, "`canary` is not in the configured promotion order")
+		assert.Contains(t, body, "cannot enforce staging-first ordering")
+		assert.Contains(t, body, "environment_order")
+		assert.Contains(t, body, "`staging` → `production`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for unlisted-environment config error comment")
+	}
+
+	dp := requirePromotionConfigErrorBlockDataPoint(t, reader)
+	assert.Equal(t, int64(1), dp.Value, "the config-error block must increment the metric exactly once")
+	assertStringAttr(t, dp.Attributes, "repository", repo)
+	assertStringAttr(t, dp.Attributes, "database", "orders")
+	assertStringAttr(t, dp.Attributes, "environment", "canary")
+}
+
+// requirePromotionConfigErrorBlockDataPoint collects metrics from the reader and
+// returns the single data point for the promotion config-error block counter,
+// failing the test if the metric is absent or has more than one data point.
+func requirePromotionConfigErrorBlockDataPoint(t *testing.T, reader *sdkmetric.ManualReader) metricdata.DataPoint[int64] {
+	t.Helper()
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.promotion.config_error_blocks_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "promotion config error block metric must be an int64 sum")
+			require.Len(t, sum.DataPoints, 1, "expected exactly one promotion config error block data point")
+			return sum.DataPoints[0]
+		}
+	}
+
+	t.Fatal("schemabot.promotion.config_error_blocks_total metric not found")
+	return metricdata.DataPoint[int64]{}
+}
+
+func assertStringAttr(t *testing.T, set attribute.Set, key, want string) {
+	t.Helper()
+	got, ok := set.Value(attribute.Key(key))
+	assert.True(t, ok, "metric data point must carry the %q attribute", key)
+	assert.Equal(t, want, got.AsString(), "metric attribute %q", key)
+}
+
+// TestCheckPriorEnvironmentsScopedTargetInOrderAllowsApply covers a scoped
+// SchemaBot instance applying to an environment that is in the configured
+// promotion order, with all prior environments verified successfully. The
+// staging-first config-error gate must not trip: the apply proceeds and no
+// configuration-error comment is posted.
+func TestCheckPriorEnvironmentsScopedTargetInOrderAllowsApply(t *testing.T) {
+	const (
+		repo    = "octocat/hello-world"
+		pr      = 1
+		headSHA = "abc123"
+	)
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": headSHA, "ref": "feature"},
+			"base": map[string]any{"sha": "base123", "ref": "main"},
+			"user": map[string]any{"login": "testuser"},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"total_count": 1,
+			"check_runs": []map[string]any{
+				{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "success", "app": map[string]any{"slug": "schemabot"}},
+			},
+		})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
+	service := api.New(&emptyStorage{}, &api.ServerConfig{
+		AllowedEnvironments: []string{"production"},
+		EnvironmentOrder:    []string{"staging", "production"},
+		Databases: map[string]api.DatabaseConfig{
+			"orders": {
+				Type: "mysql",
+				Environments: map[string]api.EnvironmentConfig{
+					"production": {Deployment: "default", Target: "orders"},
+				},
+			},
+		},
+	}, nil, testLogger())
+	t.Cleanup(func() { utils.CloseAndLog(service) })
+
+	h := &Handler{
+		service:                    service,
+		ghClients:                  ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:                     testLogger(),
+		priorEnvCheckMaxAttempts:   1,
+		priorEnvCheckRetryInterval: time.Nanosecond,
+	}
+
+	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
+		"orders", "mysql", "production", []string{"production"}, 12345, "testuser")
+	assert.False(t, blocked, "in-order target with a passing prior environment check should be allowed")
+
+	select {
+	case body := <-comments:
+		t.Fatalf("unexpected comment posted: %s", body)
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
 func TestCheckPriorEnvViaGitHub(t *testing.T) {

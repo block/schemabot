@@ -512,7 +512,7 @@ type stopControlRequestMetadata struct {
 	SkippedCount int64 `json:"skipped_count,omitempty"`
 }
 
-const stopResponseStatusAlreadyRequested = "already_requested"
+const stopResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyRequested
 
 // handleStop handles POST /api/stop requests.
 // Records durable stop intent for the apply owner to process.
@@ -855,7 +855,7 @@ type startControlRequestMetadata struct {
 
 const (
 	startResponseStatusQueued           = "queued"
-	startResponseStatusAlreadyRequested = "already_requested"
+	startResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyRequested
 )
 
 // handleStart handles POST /api/start requests.
@@ -865,29 +865,46 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	resp, httpStatus, err := s.executeStartForApply(r.Context(), client, apply, applyID, req.Caller)
+	if err != nil {
+		s.writeControlError(w, "start", apply, err)
+		return
+	}
+	s.writeJSON(w, httpStatus, resp)
+}
 
+// ExecuteStart records durable start intent for a stopped apply. The operator
+// owner is responsible for resuming stopped work when immediate dispatch is not
+// possible.
+func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest) (*apitypes.StartResponse, error) {
+	client, apply, ternApplyID, err := s.controlTarget(ctx, "start", req.ApplyID, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	resp, _, err := s.executeStartForApply(ctx, client, apply, ternApplyID, req.Caller)
+	return resp, err
+}
+
+func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.StartResponse, int, error) {
 	if err := validateStartRequestState(apply); err != nil {
-		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, "rejected")
-		s.writeControlError(w, "start", apply, err)
-		return
+		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return nil, http.StatusOK, err
 	}
-	if err := s.completeResolvedStopBeforeStart(r.Context(), client, apply, req.Caller); err != nil {
+	if err := s.completeResolvedStopBeforeStart(ctx, client, apply, caller); err != nil {
 		status := "error"
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 			status = "rejected"
 		}
-		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, status)
-		s.writeControlError(w, "start", apply, err)
-		return
+		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
+		return nil, http.StatusOK, err
 	}
-	if err := s.rejectControlIfStopPending(r.Context(), "start", apply); err != nil {
+	if err := s.rejectControlIfStopPending(ctx, "start", apply); err != nil {
 		status := "error"
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 			status = "rejected"
 		}
-		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, status)
-		s.writeControlError(w, "start", apply, err)
-		return
+		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
+		return nil, http.StatusOK, err
 	}
 
 	var resp *ternv1.StartResponse
@@ -896,21 +913,20 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	queuedForOperator := false
 	switch {
 	case state.IsState(apply.State, state.Apply.WaitingForDeploy):
-		if err := s.rejectControlIfStopPending(r.Context(), "start dispatch", apply); err != nil {
+		if err := s.rejectControlIfStopPending(ctx, "start dispatch", apply); err != nil {
 			status := "error"
 			if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 				status = "rejected"
 			}
-			metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, status)
-			s.writeControlError(w, "start", apply, err)
-			return
+			metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
+			return nil, http.StatusOK, err
 		}
-		resp, err = client.Start(r.Context(), &ternv1.StartRequest{
-			ApplyId:     applyID,
+		resp, err = client.Start(ctx, &ternv1.StartRequest{
+			ApplyId:     ternApplyID,
 			Environment: apply.Environment,
 		})
 	case state.IsState(apply.State, state.Apply.Pending):
-		resp, responseStatus, err = s.startResponseForPendingStartRequest(r.Context(), apply)
+		resp, responseStatus, err = s.startResponseForPendingStartRequest(ctx, apply)
 		queuedForOperator = err == nil && resp.Accepted
 	case storedApplyMayHaveStoppedTasksForStart(apply.State):
 		// A queued or operator-claimed start can leave the durable request
@@ -918,12 +934,12 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		// either state as idempotent duplicates instead of revalidating remote
 		// state or recording another request.
 		var foundPendingStart bool
-		resp, responseStatus, foundPendingStart, err = s.pendingStartResponseIfPresent(r.Context(), apply)
+		resp, responseStatus, foundPendingStart, err = s.pendingStartResponseIfPresent(ctx, apply)
 		queuedForOperator = err == nil && foundPendingStart && resp.Accepted
 		if err == nil && !foundPendingStart && client.IsRemote() && apply.ExternalID != "" {
-			resp, responseStatus, err = s.queueRemoteStoppedApplyForOperator(r.Context(), client, apply, req.Caller)
+			resp, responseStatus, err = s.queueRemoteStoppedApplyForOperator(ctx, client, apply, caller)
 		} else if err == nil && !foundPendingStart {
-			resp, responseStatus, err = s.queueStoppedApplyForOperator(r.Context(), apply, req.Caller)
+			resp, responseStatus, err = s.queueStoppedApplyForOperator(ctx, apply, caller)
 		}
 		queuedForOperator = queuedForOperator || (err == nil && resp.Accepted)
 	default:
@@ -934,14 +950,13 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
 			status = "rejected"
 		}
-		metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, status)
-		s.writeControlError(w, "start", apply, err)
-		return
+		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
+		return nil, http.StatusOK, err
 	}
 
-	metrics.RecordControlOperation(r.Context(), "start", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
+	metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
-		s.logControlOperation(r, apply.ApplyIdentifier, req.Caller, storage.LogEventStartRequested, "Start requested by user")
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStartRequested, "Start requested by user")
 		if queuedForOperator {
 			s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		}
@@ -959,7 +974,7 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	if responseStatus == startResponseStatusAlreadyRequested {
 		httpStatus = http.StatusAccepted
 	}
-	s.writeJSON(w, httpStatus, httpResp)
+	return httpResp, httpStatus, nil
 }
 
 func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) error {

@@ -9,9 +9,9 @@ func commandReference() string {
 | ` + "`schemabot apply -e <env>`" + ` | Plan, lock, and confirm deployment |
 | ` + "`schemabot apply-confirm -e <env>`" + ` | Execute a locked plan |
 | ` + "`schemabot unlock`" + ` | Release lock and discard plan |
-| ` + "`schemabot stop <apply-id>`" + ` | Stop an in-progress deployment |
-| ` + "`schemabot start <apply-id>`" + ` | Resume a stopped deployment |
-| ` + "`schemabot cutover <apply-id>`" + ` | Complete a deferred cutover |
+| ` + "`schemabot stop <apply-id> -e <env>`" + ` | Stop an in-progress deployment |
+| ` + "`schemabot start <apply-id> -e <env>`" + ` | Resume a stopped deployment |
+| ` + "`schemabot cutover <apply-id> -e <env>`" + ` | Complete a deferred cutover |
 | ` + "`schemabot rollback <apply-id> -e <env>`" + ` | Generate a rollback plan |
 | ` + "`schemabot rollback-confirm -e <env>`" + ` | Execute a rollback |
 

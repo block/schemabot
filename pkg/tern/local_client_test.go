@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -16,6 +17,24 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
+	content, err := pulledSchemaFileContent("orders", spirittable.TableSchema{
+		Name:   "users",
+		Schema: "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n", content)
+
+	_, err = pulledSchemaFileContent("orders", spirittable.TableSchema{
+		Name:   "broken_users",
+		Schema: "CREATE TABLE",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
+}
 
 type exactProgressApplyStore struct {
 	storage.ApplyStore
@@ -508,6 +527,71 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
+}
+
+// A revert-window apply has already cut over, so a durable stop request against
+// it is a permanent rejection. Processing it must resolve the request terminally
+// (failed) with the operator-facing reason instead of bubbling a retryable error
+// that keeps the request pending and spins the operator-owned retry loop forever.
+// The apply stays in the revert window for the operator to revert or skip-revert.
+func TestLocalClient_ProcessPendingStopControlRequestRejectsRevertWindow(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              321,
+		ApplyIdentifier: "apply-revert-window-stop",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.RevertWindow,
+	}
+	task := &storage.Task{
+		ID:             654,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-revert-window-stop",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		TableName:      "users",
+		State:          state.Task.RevertWindow,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		planetscaleEngine: fakeEngine,
+		logger:            slog.Default(),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+
+	require.NoError(t, err, "a permanent rejection must not bubble a retryable error")
+	assert.True(t, handled, "the durable request is resolved, so the owner must not retry")
+	assert.Equal(t, 0, fakeEngine.stopCount, "stop must not touch the engine for a revert-window apply")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "revert-window apply must not be recorded as cancelled or stopped")
+	assert.Equal(t, state.Task.RevertWindow, task.State, "revert-window task must be preserved")
+
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the stop request must not be left pending")
+
+	require.Len(t, controlRequests.requests, 1)
+	resolved := controlRequests.requests[0]
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "the stop request must be terminally failed, not retried")
+	assert.Equal(t, "schema change apply-revert-window-stop is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", resolved.ErrorMessage)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Pending stop request rejected: schema change apply-revert-window-stop is in the revert window"))
 }
 
 func TestLocalClient_ProcessPendingCutoverControlRequest(t *testing.T) {
@@ -1218,6 +1302,90 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 			got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
 			assert.True(t, ok, "non-terminal single-op derivation is a safe fallback")
 			assert.Equal(t, want, got)
+		})
+	}
+}
+
+// capturedLog records a single emitted log record's level, message, and
+// attributes for assertions.
+type capturedLog struct {
+	level slog.Level
+	msg   string
+	attrs map[string]any
+}
+
+// captureHandler is a minimal slog.Handler that records every emitted record so
+// tests can assert on level, message, and attributes.
+type captureHandler struct {
+	records *[]capturedLog
+}
+
+func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
+	attrs := make(map[string]any, r.NumAttrs())
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	*h.records = append(*h.records, capturedLog{level: r.Level, msg: r.Message, attrs: attrs})
+	return nil
+}
+
+func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// A canonical, positive revert_window_duration in metadata is honored, while an
+// empty value falls back to the engine default. A malformed or non-positive
+// value — which the server never writes but an embedder populating metadata
+// directly can — fails observably: it warns with the offending value and the
+// engine default rather than silently defaulting.
+func TestLocalClient_RevertWindowDuration(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		want      time.Duration
+		wantWarn  bool
+		warnValue string
+	}{
+		{name: "honors a valid positive duration", value: "45m", want: 45 * time.Minute},
+		{name: "empty uses engine default", value: "", want: defaultRevertWindowDuration},
+		{name: "unparseable warns and uses default", value: "not-a-duration", want: defaultRevertWindowDuration, wantWarn: true, warnValue: "not-a-duration"},
+		{name: "zero warns and uses default", value: "0s", want: defaultRevertWindowDuration, wantWarn: true, warnValue: "0s"},
+		{name: "negative warns and uses default", value: "-5m", want: defaultRevertWindowDuration, wantWarn: true, warnValue: "-5m"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var records []capturedLog
+			client := &LocalClient{
+				config: LocalConfig{
+					Database: "orders",
+					Metadata: map[string]string{"revert_window_duration": tc.value},
+				},
+				logger: slog.New(captureHandler{records: &records}),
+			}
+
+			got := client.revertWindowDuration()
+			assert.Equal(t, tc.want, got)
+
+			var warnings []capturedLog
+			for _, r := range records {
+				if r.level == slog.LevelWarn {
+					warnings = append(warnings, r)
+				}
+			}
+
+			if !tc.wantWarn {
+				assert.Empty(t, warnings, "no warning expected")
+				return
+			}
+
+			require.Len(t, warnings, 1, "exactly one warning expected")
+			w := warnings[0]
+			assert.Equal(t, tc.warnValue, w.attrs["value"])
+			assert.Equal(t, "orders", w.attrs["database"])
+			assert.Equal(t, defaultRevertWindowDuration, w.attrs["default"])
 		})
 	}
 }

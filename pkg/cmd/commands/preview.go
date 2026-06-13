@@ -98,6 +98,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyNoLock, templates.PreviewCommentApplyAllType,
 		templates.PreviewCommentChecksGateNotPassing, templates.PreviewCommentChecksGateInProgress,
 		templates.PreviewCommentActorNotAuthorized, templates.PreviewCommentActorAuthUnavailable,
+		templates.PreviewCommentDatabaseNotConfigured,
+		templates.PreviewCommentStartAccepted, templates.PreviewCommentStartPending,
 		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive:
 		templates.PreviewCLIOutput(previewType)
 	// Paired aggregate types (PR + CLI subsections)
@@ -263,6 +265,9 @@ Apply Command Comments (GitHub PR apply commands):
   comment_apply_no_lock         No lock found (need apply first)
   comment_actor_not_authorized  Actor authorization denied
   comment_actor_auth_unavailable Actor authorization fail-closed error
+  comment_database_not_configured Actor authorization database missing from this instance
+  comment_start_accepted        Start request accepted
+  comment_start_pending         Start already pending
   comment_cutover_accepted      Cutover request accepted
   comment_cutover_active        Cutover already in progress
   comment_apply_all             Show all apply command previews

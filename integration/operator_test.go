@@ -650,11 +650,11 @@ func TestOperator_ClaimableStates(t *testing.T) {
 		{name: "failed", applyState: state.Apply.Failed, databaseType: "mysql", engine: "spirit"},
 		{name: "stopped", applyState: state.Apply.Stopped, databaseType: "mysql", engine: "spirit"},
 		{name: "reverted", applyState: state.Apply.Reverted, databaseType: "vitess", engine: "planetscale"},
-		{name: "preparing branch", applyState: state.Apply.PreparingBranch, databaseType: "vitess", engine: "planetscale"},
-		{name: "applying branch changes", applyState: state.Apply.ApplyingBranchChanges, databaseType: "vitess", engine: "planetscale"},
-		{name: "validating branch", applyState: state.Apply.ValidatingBranch, databaseType: "vitess", engine: "planetscale"},
-		{name: "creating deploy request", applyState: state.Apply.CreatingDeployRequest, databaseType: "vitess", engine: "planetscale"},
-		{name: "validating deploy request", applyState: state.Apply.ValidatingDeployRequest, databaseType: "vitess", engine: "planetscale"},
+		{name: "preparing branch", applyState: state.Apply.PreparingBranch, databaseType: "vitess", engine: "planetscale", wantClaim: true},
+		{name: "applying branch changes", applyState: state.Apply.ApplyingBranchChanges, databaseType: "vitess", engine: "planetscale", wantClaim: true},
+		{name: "validating branch", applyState: state.Apply.ValidatingBranch, databaseType: "vitess", engine: "planetscale", wantClaim: true},
+		{name: "creating deploy request", applyState: state.Apply.CreatingDeployRequest, databaseType: "vitess", engine: "planetscale", wantClaim: true},
+		{name: "validating deploy request", applyState: state.Apply.ValidatingDeployRequest, databaseType: "vitess", engine: "planetscale", wantClaim: true},
 	}
 
 	for i, tc := range cases {
@@ -1073,46 +1073,4 @@ func TestOperator_DatabaseExclusionScopedByEnvironment(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, "apply-env-stale-production", claimed.ApplyIdentifier)
-}
-
-func TestOperator_PlanetScaleSetupStatesNotClaimed(t *testing.T) {
-	ctx := t.Context()
-
-	fixture := newOperatorClaimFixture(t, "ps_states_")
-	appDBName := fixture.appDBName
-	stor := fixture.store
-	schemabotDB := fixture.storageDB
-
-	now := time.Now()
-	for _, ps := range []string{
-		state.Apply.PreparingBranch,
-		state.Apply.ApplyingBranchChanges,
-		state.Apply.ValidatingBranch,
-		state.Apply.CreatingDeployRequest,
-		state.Apply.ValidatingDeployRequest,
-	} {
-		fixture.resetStorage(t)
-		_, err := stor.Applies().Create(ctx, &storage.Apply{
-			ApplyIdentifier: "apply-ps-" + ps,
-			Database:        appDBName,
-			DatabaseType:    "vitess",
-			Deployment:      appDBName,
-			Engine:          "planetscale",
-			State:           ps,
-			Options:         []byte("{}"),
-			Environment:     "staging",
-			CreatedAt:       now,
-			UpdatedAt:       now,
-		})
-		require.NoError(t, err)
-		_, err = schemabotDB.ExecContext(ctx,
-			"UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_identifier = ?",
-			"apply-ps-"+ps)
-		require.NoError(t, err)
-
-		// The operator should leave PlanetScale setup states unclaimed until resume metadata can be hydrated.
-		claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
-		require.NoError(t, err)
-		assert.Nil(t, claimed, "stale %s should not be claimed without persisted resume metadata", ps)
-	}
 }

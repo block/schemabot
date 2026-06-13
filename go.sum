@@ -111,8 +111,8 @@ github.com/beorn7/perks v0.0.0-20180321164747-3a771d992973/go.mod h1:Dwedo/Wpr24
 github.com/beorn7/perks v1.0.0/go.mod h1:KWe93zE9D1o94FZ5RNwFwVgaQK1VOXiVxmqh+CedLV8=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
-github.com/block/spirit v0.14.1-0.20260601195732-86c57e3e1d73 h1:FRUNoMWPvOBqWf5VsTswv/nJs8giKeAGbe9dwrikTHA=
-github.com/block/spirit v0.14.1-0.20260601195732-86c57e3e1d73/go.mod h1:ku7mCCKx7Wk4QrMa/mHnsqQhZkoUD2vdBkpjJEDk4lY=
+github.com/block/spirit v0.14.1-0.20260612153639-4865f22b5a5c h1:oPKSD7EGAL9ytktdDavq17I9ztHYyqwIymWpPcsl5C4=
+github.com/block/spirit v0.14.1-0.20260612153639-4865f22b5a5c/go.mod h1:ku7mCCKx7Wk4QrMa/mHnsqQhZkoUD2vdBkpjJEDk4lY=
 github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8 h1:+OfdTacrEyjlqcRUpBFX9uJ6ROBq6cUjwY4DClhnsdU=
 github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8/go.mod h1:zDLDsfNBU5+L6T4J9/OgWAHc/WZvMUjbpgHqQ/t3yKo=
 github.com/block/vitess v0.0.0-20260601162944-8318a748ceb1 h1:dnHGiR/N1+X2EM1FGzL4548iCzJcIAnhcMbEt026xHQ=
@@ -562,10 +562,6 @@ github.com/shirou/gopsutil/v4 v4.26.3 h1:2ESdQt90yU3oXF/CdOlRCJxrP+Am1aBYubTMTfx
 github.com/shirou/gopsutil/v4 v4.26.3/go.mod h1:LZ6ewCSkBqUpvSOf+LsTGnRinC6iaNUNMGBtDkJBaLQ=
 github.com/shopspring/decimal v1.4.0 h1:bxl37RwXBklmTi0C79JfXCEBD1cqqHt0bbgBAGFp81k=
 github.com/shopspring/decimal v1.4.0/go.mod h1:gawqmDU56v4yIKSwfBSFip1HdCCXN8/+DMd9qYNcwME=
-github.com/shurcooL/githubv4 v0.0.0-20260209031235-2402fdf4a9ed h1:KT7hI8vYXgU0s2qaMkrfq9tCA1w/iEPgfredVP+4Tzw=
-github.com/shurcooL/githubv4 v0.0.0-20260209031235-2402fdf4a9ed/go.mod h1:zqMwyHmnN/eDOZOdiTohqIUKUrTFX62PNlu7IJdu0q8=
-github.com/shurcooL/graphql v0.0.0-20240915155400-7ee5256398cf h1:o1uxfymjZ7jZ4MsgCErcwWGtVKSiNAXtS59Lhs6uI/g=
-github.com/shurcooL/graphql v0.0.0-20240915155400-7ee5256398cf/go.mod h1:9dIRpgIY7hVhoqfe0/FcYp0bpInZaT7dc3BYOprrIUE=
 github.com/sirupsen/logrus v1.2.0/go.mod h1:LxeOpSwHxABJmUn/MG1IvRgCAasNZTLOkJPxbbu5VWo=
 github.com/sirupsen/logrus v1.4.2/go.mod h1:tLMulIdttU9McNUspp0xgXVQah82FyeX6MwdIuYE2rE=
 github.com/sirupsen/logrus v1.6.0/go.mod h1:7uNnSEd1DgxDLC74fIahvMZmmYsHGZGEOFrfsX/uA88=

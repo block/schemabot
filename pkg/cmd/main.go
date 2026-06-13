@@ -25,6 +25,8 @@ type CLI struct {
 	VersionFlag kong.VersionFlag `name:"version" help:"Show version information"`
 
 	Plan       commands.PlanCmd       `cmd:"" help:"Create a schema change plan"`
+	Onboard    commands.OnboardCmd    `cmd:"" help:"Pull live schema into a new declarative schema directory"`
+	Pull       commands.PullCmd       `cmd:"" help:"Return live schema from a source environment"`
 	Apply      commands.ApplyCmd      `cmd:"" help:"Apply schema changes"`
 	Progress   commands.ProgressCmd   `cmd:"" help:"Get schema change progress"`
 	Cutover    commands.CutoverCmd    `cmd:"" help:"Trigger cutover for a deferred schema change"`

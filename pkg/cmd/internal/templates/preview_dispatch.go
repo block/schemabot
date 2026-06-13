@@ -216,6 +216,12 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized())
 	case PreviewCommentActorAuthUnavailable:
 		fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable())
+	case PreviewCommentDatabaseNotConfigured:
+		fmt.Print(webhooktemplates.PreviewCommentPRCommandDatabaseNotConfigured())
+	case PreviewCommentStartAccepted:
+		fmt.Print(webhooktemplates.PreviewCommentStartCommandAccepted())
+	case PreviewCommentStartPending:
+		fmt.Print(webhooktemplates.PreviewCommentStartCommandAlreadyRequested())
 	case PreviewCommentCutoverAccepted:
 		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted())
 	case PreviewCommentCutoverActive:

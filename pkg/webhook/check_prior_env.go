@@ -35,6 +35,26 @@ func (h *Handler) checkPriorEnvironments(
 	installationID int64, requestedBy string,
 ) bool {
 	config := h.service.Config()
+
+	// On a scoped instance the server-configured promotion order is the only
+	// authoritative source for which environments precede the target. If the
+	// target is absent from that order we cannot identify its prior
+	// environments, so staging-first ordering cannot be enforced. Fail closed:
+	// block the apply with a config error rather than fall back to a local-only
+	// ordering that omits prior environments owned by other instances.
+	if scopedTargetMissingFromPromotionOrder(config, environment) {
+		order := config.PromotionEnvironmentOrder()
+		h.logger.Warn("target environment is absent from the configured promotion order, blocking apply",
+			"repo", repo, "pr", pr,
+			"database", database, "database_type", dbType,
+			"environment", environment,
+			"promotion_order", order)
+		metrics.RecordPromotionConfigErrorBlock(ctx, repo, database, environment)
+		h.postComment(repo, pr, installationID,
+			templates.RenderApplyBlockedByUnlistedEnvironment(environment, order))
+		return true
+	}
+
 	environments = promotionGateEnvironments(config, environment, environments)
 
 	// Find the index of the current environment
@@ -69,6 +89,18 @@ func (h *Handler) checkPriorEnvironments(
 	}
 
 	return false
+}
+
+// scopedTargetMissingFromPromotionOrder reports whether this instance is scoped
+// to a subset of environments (allowed_environments is configured) while the
+// target environment is absent from the server promotion order. In that state
+// the prior environments cannot be derived from the order, and the staging-first
+// gate cannot be enforced — the caller must fail closed.
+func scopedTargetMissingFromPromotionOrder(config *api.ServerConfig, environment string) bool {
+	if config == nil || len(config.AllowedEnvironments) == 0 {
+		return false
+	}
+	return !slices.Contains(config.PromotionEnvironmentOrder(), environment)
 }
 
 func promotionGateEnvironments(config *api.ServerConfig, environment string, environments []string) []string {

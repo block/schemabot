@@ -52,6 +52,20 @@ func GetEnvironments(endpoint, database string) ([]string, error) {
 	return result.Environments, nil
 }
 
+// CallPullSchemaAPI fetches live schema files for a database/environment pair.
+func CallPullSchemaAPI(endpoint, database, dbType, environment string) (*apitypes.PullSchemaResponse, error) {
+	req := apitypes.PullSchemaRequest{
+		Database:    database,
+		Type:        dbType,
+		Environment: environment,
+	}
+	var result apitypes.PullSchemaResponse
+	if err := doPostInto(endpoint, "/api/pull", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // CallPlanAPI calls the plan API by reading .sql files from schemaDir.
 // Files are grouped by namespace: subdirectories become namespace keys,
 // flat files use the directory name as the namespace.
