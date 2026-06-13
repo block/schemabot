@@ -42,9 +42,11 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	assert.Contains(t, out, "**Deployments**: 1 ready for cutover, 1 running, 2 waiting")
 
 	// Single next-action points at the cutover-ready deployment, even though the
-	// aggregate is still running.
+	// aggregate is still running. The command is the executable apply-ID form the
+	// CLI accepts today (no --deployment flag yet).
 	assert.Contains(t, out, "To cut over `eu`:")
-	assert.Contains(t, out, "schemabot cutover -e production --deployment eu")
+	assert.Contains(t, out, "schemabot cutover apply-123")
+	assert.NotContains(t, out, "--deployment")
 
 	// Per-deployment summary lines, in resolved order, with derived labels.
 	assert.Contains(t, out, "- 🟢 eu — ready for cutover — next in order")
@@ -60,8 +62,8 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 }
 
 // A halt-on-failure rollout with a failed deployment keeps the aggregate failed,
-// names the failure as the next action, and marks the never-started deployments
-// as halted (and open, since halted explains the next action).
+// offers retry as the next action, and marks the never-started deployments as
+// halted (and open, since halted explains the next action).
 func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
 		rollingOp("eu", so.WaitingForCutover),
@@ -71,13 +73,17 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	})
 	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model:       model,
+		ApplyID:     "apply-123",
 		Environment: "production",
 	})
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed")
 	assert.Contains(t, out, "**Deployments**: 1 ready for cutover, 2 halted, 1 failed")
-	assert.Contains(t, out, "Review the failure in `us`, then revert:")
-	assert.Contains(t, out, "schemabot revert -e production --deployment us")
+	// The recovery path for a failed apply is retry, matching the single-deployment
+	// footer. revert is only for a deployment in its post-cutover revert window.
+	assert.Contains(t, out, "To retry:")
+	assert.Contains(t, out, "schemabot apply -e production")
+	assert.NotContains(t, out, "schemabot revert")
 	assert.Contains(t, out, "- ❌ us — failed")
 	assert.Contains(t, out, "- ⏸ au — halted — us failed")
 	assert.Contains(t, out, "<details open>\n<summary>⏸ au — halted — us failed</summary>")
@@ -92,6 +98,7 @@ func TestRenderMultiDeploymentApplyComment_DetailsReuseSingleRenderer(t *testing
 	})
 	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model:       model,
+		ApplyID:     "apply-123",
 		Environment: "production",
 		Details: map[string]ApplyStatusCommentData{
 			"us": {
@@ -107,9 +114,11 @@ func TestRenderMultiDeploymentApplyComment_DetailsReuseSingleRenderer(t *testing
 	// The us section carries the single-deployment body: its database and table.
 	assert.Contains(t, out, "**Database**: `payments_us`")
 	assert.Contains(t, out, "orders")
-	// Completed deployment with no detail still renders its summary line + section.
+	// Completed deployment with no detail still renders its summary line + section,
+	// with a placeholder body rather than an empty <details>.
 	assert.Contains(t, out, "- ✅ eu — completed")
 	assert.Contains(t, out, "<details>\n<summary>✅ eu — completed</summary>")
+	assert.Contains(t, out, "_No details available yet._")
 }
 
 // A deployment in an unrecognized engine state still renders a summary line and
@@ -119,7 +128,7 @@ func TestRenderMultiDeploymentApplyComment_UnknownStateNoGlyph(t *testing.T) {
 		rollingOp("eu", so.Running),
 		rollingOp("us", "some_engine_state"),
 	})
-	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{Model: model, Environment: "staging"})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{Model: model, ApplyID: "apply-123", Environment: "staging"})
 	require.Len(t, model.Deployments, 2)
 	assert.Contains(t, out, "- us — some_engine_state")
 	assert.NotContains(t, out, "-  us")
@@ -131,9 +140,24 @@ func TestRenderMultiDeploymentApplyComment_NoNextActionWhenCompleted(t *testing.
 		rollingOp("eu", so.Completed),
 		rollingOp("us", so.Completed),
 	})
-	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{Model: model, Environment: "production"})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{Model: model, ApplyID: "apply-123", Environment: "production"})
 	assert.Contains(t, out, "## ✅ Schema Change Applied")
 	assert.NotContains(t, out, "schemabot cutover")
 	assert.NotContains(t, out, "schemabot revert")
 	assert.NotContains(t, out, "To resume:")
+	assert.NotContains(t, out, "To retry:")
+}
+
+// Deployment names and labels come from configuration/engine state, so they are
+// HTML-escaped before being interpolated into the <summary> tags — a name with
+// markup characters must not break the comment HTML.
+func TestRenderMultiDeploymentApplyComment_EscapesSummaryHTML(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu<b>", so.Running),
+		rollingOp("us&ca", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{Model: model, ApplyID: "apply-123", Environment: "production"})
+	assert.Contains(t, out, "eu&lt;b&gt;")
+	assert.Contains(t, out, "us&amp;ca")
+	assert.NotContains(t, out, "<summary>🔄 eu<b>")
 }

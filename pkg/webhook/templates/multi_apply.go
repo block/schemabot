@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"html"
 	"strings"
 
 	"github.com/block/schemabot/pkg/presentation"
@@ -18,11 +19,14 @@ type MultiDeploymentApplyData struct {
 	// the per-deployment presentations in resolved deployment order.
 	Model presentation.Apply
 
-	// ApplyID is the parent apply's identifier, shown once in the aggregate header.
+	// ApplyID is the parent apply's identifier, shown once in the aggregate
+	// header and used to format the next-action commands. Always set: every
+	// apply is created with a server-generated identifier.
 	ApplyID string
 
 	// Environment is the rollout environment, shown in the header and used to
-	// format the next-action command.
+	// format the next-action commands. Always set: a non-empty environment is
+	// enforced when the apply is created.
 	Environment string
 
 	// RequestedBy is the operator who requested the apply.
@@ -72,19 +76,16 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 // section — so the aggregate carries only the environment, apply ID, elapsed
 // time, and requester.
 func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData) {
-	var parts []string
-	if data.Environment != "" {
-		parts = append(parts, fmt.Sprintf("**Environment**: `%s`", data.Environment))
-	}
-	if data.ApplyID != "" {
-		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
+	// Environment and ApplyID are always populated from the persisted apply, so
+	// they are rendered unconditionally; only the optional elapsed time is guarded.
+	parts := []string{
+		fmt.Sprintf("**Environment**: `%s`", data.Environment),
+		fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID),
 	}
 	if elapsed := applyElapsed(ApplyStatusCommentData{StartedAt: data.StartedAt, CompletedAt: data.CompletedAt}); elapsed != "" {
 		parts = append(parts, fmt.Sprintf("**Elapsed**: %s", elapsed))
 	}
-	if len(parts) > 0 {
-		fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	}
+	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 	writeAppliedByOrTimestamp(sb, data.RequestedBy)
 }
 
@@ -102,26 +103,25 @@ func writeDeploymentCounts(sb *strings.Builder, counts []presentation.StateCount
 }
 
 // writeAggregateNextAction renders the single suggested operator action derived
-// for the rollup, if any. The verb set mirrors the per-deployment commands the
-// CLI exposes; an empty action (NextActionNone) writes nothing.
+// for the rollup, if any. An empty action (NextActionNone) writes nothing.
 func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData) {
+	// The CLI today addresses an apply by its identifier and has no
+	// --deployment flag, so the suggested commands mirror the executable forms
+	// the single-deployment footer already ships. Deployment-targeted commands
+	// arrive with the per-deployment CLI surface.
 	na := data.Model.NextAction
 	switch na.Kind {
 	case presentation.NextActionCutover:
 		writeFooterAction(sb,
 			fmt.Sprintf("To cut over `%s`:", na.Deployment),
-			fmt.Sprintf("schemabot cutover -e %s --deployment %s", data.Environment, na.Deployment))
+			fmt.Sprintf("schemabot cutover %s", data.ApplyID))
 	case presentation.NextActionResume:
-		writeFooterAction(sb, "To resume:", fmt.Sprintf("schemabot start -e %s", data.Environment))
+		writeFooterAction(sb, "To resume:", fmt.Sprintf("schemabot start %s", data.ApplyID))
 	case presentation.NextActionReviewFailure:
-		if na.Deployment != "" {
-			writeFooterAction(sb,
-				fmt.Sprintf("Review the failure in `%s`, then revert:", na.Deployment),
-				fmt.Sprintf("schemabot revert -e %s --deployment %s", data.Environment, na.Deployment))
-		} else {
-			writeFooterAction(sb, "Review the failed deployment, then revert:",
-				fmt.Sprintf("schemabot revert -e %s", data.Environment))
-		}
+		// revert applies only to a deployment still in its post-cutover revert
+		// window, not to a failure; the recovery path for a failed apply is a
+		// retry, matching the single-deployment failed footer.
+		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
 	case presentation.NextActionNone:
 		// No operator action is pending; nothing to render.
 	}
@@ -136,7 +136,7 @@ func writeDeploymentSummaryList(sb *strings.Builder, deps []presentation.Deploym
 	}
 	sb.WriteString("\n")
 	for _, d := range deps {
-		fmt.Fprintf(sb, "- %s — %s\n", deploymentTag(d), d.Label)
+		fmt.Fprintf(sb, "- %s — %s\n", deploymentTag(d), html.EscapeString(d.Label))
 	}
 }
 
@@ -151,9 +151,11 @@ func writeDeploymentSections(sb *strings.Builder, data MultiDeploymentApplyData)
 		if d.Open {
 			openAttr = " open"
 		}
-		fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n\n", openAttr, deploymentTag(d), d.Label)
+		fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n\n", openAttr, deploymentTag(d), html.EscapeString(d.Label))
 		if detail, ok := data.Details[d.Deployment]; ok {
 			sb.WriteString(RenderApplyStatusComment(detail))
+		} else {
+			sb.WriteString("_No details available yet._\n")
 		}
 		sb.WriteString("\n</details>\n")
 	}
@@ -162,8 +164,9 @@ func writeDeploymentSections(sb *strings.Builder, data MultiDeploymentApplyData)
 // deploymentTag renders the "<emoji> <deployment>" prefix, omitting the leading
 // space when a state has no glyph.
 func deploymentTag(d presentation.Deployment) string {
+	name := html.EscapeString(d.Deployment)
 	if d.Emoji == "" {
-		return d.Deployment
+		return name
 	}
-	return fmt.Sprintf("%s %s", d.Emoji, d.Deployment)
+	return fmt.Sprintf("%s %s", d.Emoji, name)
 }
