@@ -510,9 +510,9 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, "", apply.Environment, "missing_deployment")
 		return false, err
 	}
-	client, err := s.TernClient(deployment, apply.Environment)
+	client, err := s.RoutingTernClient()
 	if err != nil {
-		s.logger.Error("operator: failed to get client",
+		s.logger.Error("operator: failed to get routing client",
 			"worker", workerID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,

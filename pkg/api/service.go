@@ -148,9 +148,9 @@ func (s *Service) SetApplyObserver(database, deployment, environment string, app
 			"database", database, "deployment", deployment, "environment", environment, "apply_id", applyID, "error", err)
 		return
 	}
-	client, err := s.TernClient(deployment, environment)
+	client, err := s.RoutingTernClient()
 	if err != nil {
-		s.logger.Error("failed to get tern client for observer",
+		s.logger.Error("failed to get routing tern client for observer",
 			"database", database, "deployment", deployment, "environment", environment, "apply_id", applyID, "error", err)
 		return
 	}

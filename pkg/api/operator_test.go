@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 func TestOperatorWorkersConfig(t *testing.T) {
@@ -67,6 +68,43 @@ func (m *mockStorageWithApplyOperations) ApplyOperations() storage.ApplyOperatio
 func newOperatorTestService(opStore storage.ApplyOperationStore) *Service {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	return New(&mockStorageWithApplyOperations{applyOps: opStore}, testServerConfig(), nil, logger)
+}
+
+type noopProgressObserver struct{}
+
+func (noopProgressObserver) OnProgress(*storage.Apply, []*storage.Task) {}
+
+func (noopProgressObserver) OnTerminal(*storage.Apply, []*storage.Task) {}
+
+func TestResumeClaimedApplyRoutesRecoveredObserver(t *testing.T) {
+	deploymentClient := &mockTernClient{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, &ServerConfig{}, map[string]tern.Client{
+		"east/staging": deploymentClient,
+	}, logger)
+	observer := noopProgressObserver{}
+	svc.OnApplyRecovered = func(apply *storage.Apply) {
+		svc.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, apply.ID, observer)
+	}
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Deployment:      "east",
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+
+	resumed, err := svc.resumeClaimedApply(t.Context(), 1, apply, 0)
+
+	require.NoError(t, err)
+	assert.True(t, resumed)
+	assert.Same(t, apply, deploymentClient.resumeApply)
+	assert.Equal(t, int64(42), deploymentClient.observerApplyID)
+	assert.Equal(t, observer, deploymentClient.observer)
 }
 
 // TestMarkOperationFromApplyState_MirrorsFailedRetryable verifies that a parent

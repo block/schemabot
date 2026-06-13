@@ -462,6 +462,8 @@ type mockTernClient struct {
 	resumeApply       *storage.Apply
 	resumeOperationID int64
 	resumeCh          chan *storage.Apply
+	observerApplyID   int64
+	observer          tern.ProgressObserver
 	isRemote          bool
 }
 
@@ -577,6 +579,8 @@ func (m *mockTernClient) Endpoint() string                                  { re
 func (m *mockTernClient) IsRemote() bool                                    { return m.isRemote }
 func (m *mockTernClient) SetPendingObserver(observer tern.ProgressObserver) {}
 func (m *mockTernClient) SetObserver(applyID int64, observer tern.ProgressObserver) {
+	m.observerApplyID = applyID
+	m.observer = observer
 }
 func (m *mockTernClient) Close() error { return nil }
 
