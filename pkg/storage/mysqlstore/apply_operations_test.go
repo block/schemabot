@@ -1244,6 +1244,50 @@ func TestApplyOperationStore_FindNextApplyOperation_OnFailureContinueStillBlocks
 	assert.Nil(t, claimed, "a running earlier sibling still blocks even with on_failure continue")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_UnrecognizedOnFailureBlocksFailedSibling
+// pins the fail-closed property of the claim predicate: only the exact value
+// "continue" exempts a terminal-failed earlier sibling. Any other stored value
+// — here "pause", which config validation rejects today but a future change or
+// a hand-written row could let reach storage — must keep the failed sibling
+// blocking so the rollout never races ahead on an unrecognized policy.
+func TestApplyOperationStore_FindNextApplyOperation_UnrecognizedOnFailureBlocksFailedSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_unrecognized", 1)
+
+	// region-a failed; region-b is pending behind it. The failed row carries an
+	// unrecognized on_failure value, so the exemption (which keys on exact
+	// "continue") does not apply and the failed sibling keeps blocking.
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailurePause,
+	})
+	require.NoError(t, err)
+
+	// The unrecognized value is persisted verbatim — it is not normalized to a
+	// known enum on the way into storage.
+	failedRow, err := store.ApplyOperations().Get(ctx, failedID)
+	require.NoError(t, err)
+	assert.Equal(t, storage.OnFailurePause, failedRow.OnFailure, "an unrecognized on_failure value is stored as-is")
+
+	// Backdate the failed row so staleness can't be the reason it's skipped —
+	// the only thing holding the rollout is the earlier failed sibling.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "an unrecognized on_failure value must fail closed and keep the failed sibling blocking")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_BarrierClaimsPastSiblingAtCutoverBarrier
 // verifies the barrier cutover policy: a later deployment may start its copy
 // phase once an earlier sibling has reached the cutover barrier
