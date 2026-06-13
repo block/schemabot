@@ -326,23 +326,33 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 // With one operation per apply the sibling set is the current operation alone,
 // so the projection collapses to the current deployment's derived state.
 //
-// When the sibling rows cannot be read, the projection falls back to the current
-// deployment's derived state only if that state is non-terminal. A terminal
-// current-deployment state must never become the aggregate on incomplete
-// information: a transient read failure on one deployment would otherwise mark
-// the whole apply terminal while siblings are still in flight. In that case the
-// projection is reported as undetermined (ok=false) and the caller keeps the
-// stored value for the next poll to reconcile.
+// Two outcomes are distinguished when the full sibling set is not available:
+//
+//   - The apply does not use the operation model — its tasks carry no
+//     apply_operation_id, or the operation store is not configured. There are no
+//     siblings, so the per-task derivation is authoritative and may terminalize.
+//     This preserves single-writer/legacy behaviour for applies written before
+//     the apply-create path populated apply_operation_id.
+//
+//   - The apply uses the operation model (its tasks carry an apply_operation_id)
+//     but the sibling rows cannot be read consistently — the list call failed,
+//     returned no rows, or omitted the current operation. Here the sibling
+//     states are genuinely unknown, so a terminal current-deployment derivation
+//     must not become the aggregate: a transient read failure on the
+//     last-finishing deployment would otherwise mark the whole apply terminal
+//     while siblings are still in flight. The projection is reported as
+//     undetermined (ok=false) and the caller keeps the stored value for the next
+//     poll to reconcile. A non-terminal derivation is still a safe fallback.
 //
 // The read-then-write is not atomic, so concurrent sibling drives last-write-
 // wins from possibly stale reads; the aggregate converges on the next poll.
 func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (string, bool) {
 	currentOpState := state.DeriveApplyState(taskStates(tasks))
 
-	// fallback reports the current deployment's derived state when the sibling
-	// set is unknown, but refuses to terminalize the apply on incomplete
-	// information.
-	fallback := func() (string, bool) {
+	// failClosed reports the current deployment's derived state when the sibling
+	// set is in use but unreadable, refusing to terminalize the apply on
+	// incomplete information.
+	failClosed := func() (string, bool) {
 		if state.IsTerminalApplyState(currentOpState) {
 			c.logger.Warn("cannot determine aggregate apply state and current deployment is terminal; leaving stored apply state unchanged",
 				"apply_id", apply.ApplyIdentifier, "current_deployment_state", currentOpState)
@@ -353,28 +363,32 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 
 	operationID, err := applyOperationIDForTasks(tasks)
 	if err != nil {
-		c.logger.Warn("deriving apply state from current deployment only: could not resolve apply operation for tasks",
-			"apply_id", apply.ApplyIdentifier, "error", err)
-		return fallback()
+		// No operation model in use: tasks carry no apply_operation_id, so there
+		// are no siblings and the per-task derivation is authoritative.
+		c.logger.Debug("deriving apply state from tasks: apply has no operation model",
+			"apply_id", apply.ApplyIdentifier, "reason", err)
+		return currentOpState, true
 	}
 
 	store := c.storage.ApplyOperations()
 	if store == nil {
-		c.logger.Warn("deriving apply state from current deployment only: apply operation store is not configured",
+		// Operation store unavailable: no siblings can exist, so the per-task
+		// derivation is authoritative.
+		c.logger.Debug("deriving apply state from tasks: apply operation store is not configured",
 			"apply_id", apply.ApplyIdentifier)
-		return fallback()
+		return currentOpState, true
 	}
 
 	ops, err := store.ListByApply(ctx, apply.ID)
 	if err != nil {
-		c.logger.Warn("deriving apply state from current deployment only: failed to list sibling apply operations",
-			"apply_id", apply.ApplyIdentifier, "error", err)
-		return fallback()
+		c.logger.Warn("cannot determine aggregate apply state: failed to list sibling apply operations",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", operationID, "error", err)
+		return failClosed()
 	}
 	if len(ops) == 0 {
-		c.logger.Warn("deriving apply state from current deployment only: apply has no operation rows",
-			"apply_id", apply.ApplyIdentifier)
-		return fallback()
+		c.logger.Warn("cannot determine aggregate apply state: tasks reference an apply operation but no operation rows were found",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", operationID)
+		return failClosed()
 	}
 
 	childStates := make([]string, len(ops))
@@ -388,9 +402,9 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 		childStates[i] = op.State
 	}
 	if !foundCurrent {
-		c.logger.Warn("deriving apply state from current deployment only: current operation row missing from sibling set",
+		c.logger.Warn("cannot determine aggregate apply state: current operation row missing from sibling set",
 			"apply_id", apply.ApplyIdentifier, "apply_operation_id", operationID)
-		return fallback()
+		return failClosed()
 	}
 	return state.DeriveApplyState(childStates), true
 }
