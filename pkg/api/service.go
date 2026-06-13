@@ -152,9 +152,19 @@ func (s *Service) SetApplyObserver(database, deployment, environment string, app
 	if err != nil {
 		s.logger.Error("failed to get routing tern client for observer",
 			"database", database, "deployment", deployment, "environment", environment, "apply_id", applyID, "error", err)
+	} else {
+		client.SetObserver(applyID, observer)
+	}
+
+	// A known apply can already be running by the time its observer is created,
+	// so also attach directly to the concrete deployment client.
+	deploymentClient, err := s.TernClient(deployment, environment)
+	if err != nil {
+		s.logger.Error("failed to get tern client for observer",
+			"database", database, "deployment", deployment, "environment", environment, "apply_id", applyID, "error", err)
 		return
 	}
-	client.SetObserver(applyID, observer)
+	deploymentClient.SetObserver(applyID, observer)
 }
 
 // SetPendingObserver stores an observer for the next apply request for this
