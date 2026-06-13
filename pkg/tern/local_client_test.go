@@ -1147,8 +1147,9 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 			}
 			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-one-op"}
 
-			got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+			got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
 			want := state.DeriveApplyState(taskStates(tasks))
+			assert.True(t, ok, "task states %v: current op row present, projection must be determined", taskStateSet)
 			assert.Equal(t, want, got, "task states %v", taskStateSet)
 		}
 	})
@@ -1168,53 +1169,55 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 		}
 		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-multi-op"}
 
-		got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.True(t, ok, "current op row present, projection must be determined")
 		assert.False(t, state.IsTerminalApplyState(got), "derived state %q must be non-terminal", got)
 		assert.False(t, state.IsState(got, state.Apply.Completed), "derived state must not clobber the pending sibling to completed")
 	})
 
-	t.Run("falls back to current deployment derivation when operations cannot be read", func(t *testing.T) {
-		tasks := []*storage.Task{taskWith(state.Task.Completed)}
-		client := &LocalClient{
-			storage: &exactProgressStorage{
-				applyOperations: &listApplyOperationStore{err: assert.AnError},
+	// Degraded paths (sibling rows unknown) must never terminalize the apply on
+	// incomplete information: a transient read failure on the last-finishing
+	// deployment would otherwise mark the whole apply terminal while siblings are
+	// still in flight. The projection is reported undetermined (ok=false) so the
+	// caller keeps the stored value for the next poll to reconcile.
+	degradedStores := map[string]storage.ApplyOperationStore{
+		"operations cannot be read":     &listApplyOperationStore{err: assert.AnError},
+		"operation store not available": nil,
+		"current operation row missing": &listApplyOperationStore{
+			ops: []*storage.ApplyOperation{
+				{ID: 2, State: state.ApplyOperation.Pending},
+				{ID: 3, State: state.ApplyOperation.Pending},
 			},
-			logger: slog.Default(),
-		}
-		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-fallback"}
+		},
+	}
 
-		got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
-		assert.Equal(t, state.DeriveApplyState(taskStates(tasks)), got)
-	})
+	for name, store := range degradedStores {
+		t.Run("degraded ("+name+") refuses to terminalize a terminal current deployment", func(t *testing.T) {
+			tasks := []*storage.Task{taskWith(state.Task.Completed)}
+			client := &LocalClient{
+				storage: &exactProgressStorage{applyOperations: store},
+				logger:  slog.Default(),
+			}
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-degraded-terminal"}
 
-	t.Run("falls back to current deployment derivation when the operation store is not configured", func(t *testing.T) {
-		tasks := []*storage.Task{taskWith(state.Task.Completed)}
-		client := &LocalClient{
-			storage: &exactProgressStorage{applyOperations: nil},
-			logger:  slog.Default(),
-		}
-		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-no-store"}
+			require.True(t, state.IsTerminalApplyState(state.DeriveApplyState(taskStates(tasks))), "precondition: current deployment derives terminal")
+			_, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+			assert.False(t, ok, "must not overwrite stored apply state from a terminal single-op derivation")
+		})
 
-		got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
-		assert.Equal(t, state.DeriveApplyState(taskStates(tasks)), got)
-	})
+		t.Run("degraded ("+name+") falls back to a non-terminal current deployment", func(t *testing.T) {
+			tasks := []*storage.Task{taskWith(state.Task.Running), taskWith(state.Task.Pending)}
+			client := &LocalClient{
+				storage: &exactProgressStorage{applyOperations: store},
+				logger:  slog.Default(),
+			}
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-degraded-active"}
 
-	t.Run("falls back to current deployment derivation when the current operation row is missing", func(t *testing.T) {
-		tasks := []*storage.Task{taskWith(state.Task.Completed)}
-		client := &LocalClient{
-			storage: &exactProgressStorage{
-				applyOperations: &listApplyOperationStore{
-					ops: []*storage.ApplyOperation{
-						{ID: 2, State: state.ApplyOperation.Pending},
-						{ID: 3, State: state.ApplyOperation.Pending},
-					},
-				},
-			},
-			logger: slog.Default(),
-		}
-		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-missing-current-op"}
-
-		got := client.deriveAggregateApplyState(t.Context(), apply, tasks)
-		assert.Equal(t, state.DeriveApplyState(taskStates(tasks)), got)
-	})
+			want := state.DeriveApplyState(taskStates(tasks))
+			require.False(t, state.IsTerminalApplyState(want), "precondition: current deployment derives non-terminal")
+			got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+			assert.True(t, ok, "non-terminal single-op derivation is a safe fallback")
+			assert.Equal(t, want, got)
+		})
+	}
 }

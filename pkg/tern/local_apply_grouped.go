@@ -310,7 +310,9 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 }
 
 // deriveAggregateApplyState computes applies.state as the rollout projection
-// over every apply_operation row of the apply.
+// over every apply_operation row of the apply. The boolean is false when the
+// projection could not be determined safely and the caller must leave the
+// stored apply state unchanged.
 //
 // Invariant: applies.state is the rollout projection over all operations of the
 // apply, not only the operation this drive is executing. The current
@@ -322,36 +324,57 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 // running sibling holding the apply non-terminal.
 //
 // With one operation per apply the sibling set is the current operation alone,
-// so the projection collapses to the current deployment's derived state and the
-// result is unchanged. If the operation rows cannot be read the projection
-// degrades to that same single-operation value.
-func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) string {
+// so the projection collapses to the current deployment's derived state.
+//
+// When the sibling rows cannot be read, the projection falls back to the current
+// deployment's derived state only if that state is non-terminal. A terminal
+// current-deployment state must never become the aggregate on incomplete
+// information: a transient read failure on one deployment would otherwise mark
+// the whole apply terminal while siblings are still in flight. In that case the
+// projection is reported as undetermined (ok=false) and the caller keeps the
+// stored value for the next poll to reconcile.
+//
+// The read-then-write is not atomic, so concurrent sibling drives last-write-
+// wins from possibly stale reads; the aggregate converges on the next poll.
+func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (string, bool) {
 	currentOpState := state.DeriveApplyState(taskStates(tasks))
+
+	// fallback reports the current deployment's derived state when the sibling
+	// set is unknown, but refuses to terminalize the apply on incomplete
+	// information.
+	fallback := func() (string, bool) {
+		if state.IsTerminalApplyState(currentOpState) {
+			c.logger.Warn("cannot determine aggregate apply state and current deployment is terminal; leaving stored apply state unchanged",
+				"apply_id", apply.ApplyIdentifier, "current_deployment_state", currentOpState)
+			return "", false
+		}
+		return currentOpState, true
+	}
 
 	operationID, err := applyOperationIDForTasks(tasks)
 	if err != nil {
 		c.logger.Warn("deriving apply state from current deployment only: could not resolve apply operation for tasks",
 			"apply_id", apply.ApplyIdentifier, "error", err)
-		return currentOpState
+		return fallback()
 	}
 
 	store := c.storage.ApplyOperations()
 	if store == nil {
 		c.logger.Warn("deriving apply state from current deployment only: apply operation store is not configured",
 			"apply_id", apply.ApplyIdentifier)
-		return currentOpState
+		return fallback()
 	}
 
 	ops, err := store.ListByApply(ctx, apply.ID)
 	if err != nil {
 		c.logger.Warn("deriving apply state from current deployment only: failed to list sibling apply operations",
 			"apply_id", apply.ApplyIdentifier, "error", err)
-		return currentOpState
+		return fallback()
 	}
 	if len(ops) == 0 {
 		c.logger.Warn("deriving apply state from current deployment only: apply has no operation rows",
 			"apply_id", apply.ApplyIdentifier)
-		return currentOpState
+		return fallback()
 	}
 
 	childStates := make([]string, len(ops))
@@ -367,9 +390,9 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 	if !foundCurrent {
 		c.logger.Warn("deriving apply state from current deployment only: current operation row missing from sibling set",
 			"apply_id", apply.ApplyIdentifier, "apply_operation_id", operationID)
-		return currentOpState
+		return fallback()
 	}
-	return state.DeriveApplyState(childStates)
+	return state.DeriveApplyState(childStates), true
 }
 
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
@@ -578,7 +601,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Update apply state from persisted task state so recovery guards can keep
 	// storage ahead of stale engine progress until Spirit reaches the cutover wait again.
-	apply.State = c.deriveAggregateApplyState(ctx, apply, tasks)
+	if derived, ok := c.deriveAggregateApplyState(ctx, apply, tasks); ok {
+		apply.State = derived
+	}
 	apply.UpdatedAt = now
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
 		c.logger.Error("failed to reload apply before progress state update", "apply_id", apply.ApplyIdentifier, "error", err)
