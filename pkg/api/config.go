@@ -375,28 +375,29 @@ type DatabaseConfig struct {
 	// and descendants. A literal "*" allows any trusted schema directory.
 	AllowedDirs []string `yaml:"allowed_dirs,omitempty"`
 
-	// OperatorTeams are GitHub teams whose members may run apply/apply-confirm
-	// PR comment commands for this database when PR command authorization is enabled.
+	// OperatorTeams are GitHub teams whose members may run mutating PR comment
+	// commands for this database when PR command authorization is enabled.
 	OperatorTeams []string `yaml:"operator_teams,omitempty"`
 
-	// OperatorUsers are GitHub users who may run apply/apply-confirm PR comment
-	// commands for this database when PR command authorization is enabled.
+	// OperatorUsers are GitHub users who may run mutating PR comment commands
+	// for this database when PR command authorization is enabled.
 	OperatorUsers []string `yaml:"operator_users,omitempty"`
 }
 
-// PRCommandAuthorizationConfig configures actor authorization for SchemaBot
-// apply/apply-confirm GitHub PR comment commands.
+// PRCommandAuthorizationConfig configures actor authorization for mutating
+// SchemaBot GitHub PR comment commands (apply, stop, cutover, rollback,
+// unlock, and their confirmation variants).
 type PRCommandAuthorizationConfig struct {
-	// Enabled turns on fail-closed actor authorization for apply/apply-confirm
-	// PR commands.
+	// Enabled turns on fail-closed actor authorization for mutating PR
+	// commands.
 	Enabled bool `yaml:"enabled,omitempty"`
 
-	// AdminTeams are GitHub teams whose members may run apply/apply-confirm PR
-	// commands for any configured database.
+	// AdminTeams are GitHub teams whose members may run mutating PR commands
+	// for any configured database.
 	AdminTeams []string `yaml:"admin_teams,omitempty"`
 
-	// AdminUsers are GitHub users who may run apply/apply-confirm PR commands
-	// for any configured database.
+	// AdminUsers are GitHub users who may run mutating PR commands for any
+	// configured database.
 	AdminUsers []string `yaml:"admin_users,omitempty"`
 }
 
@@ -652,6 +653,9 @@ func (c *ServerConfig) Validate() error {
 			return fmt.Errorf("database %q has no environments configured", name)
 		}
 		for env, envConfig := range dbConfig.Environments {
+			if err := envConfig.validateRevertWindowDuration(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
+				return err
+			}
 			hasDSN := envConfig.HasLocalDSN()
 			hasScalarRouting := envConfig.Target != "" || envConfig.Deployment != ""
 			hasMapRouting := envConfig.Deployments != nil
@@ -1361,6 +1365,25 @@ func (c EnvironmentConfig) ResolveDSN() (string, error) {
 		return c.DSNFrom.Resolve()
 	}
 	return secrets.Resolve(c.DSN, "")
+}
+
+// validateRevertWindowDuration ensures a configured revert window parses as a
+// positive Go duration. An empty value means "use the engine default". A
+// non-empty value that is unparseable or non-positive is rejected so a typo or
+// a meaningless window fails closed at config load instead of silently reverting
+// to the default window.
+func (c EnvironmentConfig) validateRevertWindowDuration(context string) error {
+	if c.RevertWindowDuration == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(c.RevertWindowDuration)
+	if err != nil {
+		return fmt.Errorf("%s revert_window_duration %q is not a valid duration: %w", context, c.RevertWindowDuration, err)
+	}
+	if d <= 0 {
+		return fmt.Errorf("%s revert_window_duration %q must be positive (omit it to use the engine default)", context, c.RevertWindowDuration)
+	}
+	return nil
 }
 
 func (c *DSNFromConfig) Validate(context string) error {

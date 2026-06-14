@@ -84,9 +84,9 @@ func TestNamespaceForTable(t *testing.T) {
 		},
 		"users": {
 			Files: map[string]string{
-				"users.sql":   "CREATE TABLE `users` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-				"orders.sql":  "CREATE TABLE `orders` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-				"migrate.sql": "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				"users.sql":  "CREATE TABLE `users` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+				"orders.sql": "CREATE TABLE `orders` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+				"change.sql": "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 			},
 		},
 	}
@@ -123,32 +123,75 @@ func TestNamespaceForTable(t *testing.T) {
 		assert.Equal(t, "ns2", ns, "should match the namespace with CREATE TABLE, not ALTER/DROP/RENAME")
 	})
 
-	t.Run("single namespace fallback", func(t *testing.T) {
-		single := schema.SchemaFiles{
-			"default": {
+	// A single CREATE TABLE match in a multi-namespace setup always resolves to
+	// the same namespace, regardless of Go's randomized map iteration order.
+	t.Run("multi-namespace match is deterministic across map orderings", func(t *testing.T) {
+		for range 50 {
+			ns, err := namespaceForTable("orders", sf)
+			require.NoError(t, err)
+			require.Equal(t, "users", ns)
+		}
+	})
+
+	// A schema file containing several CREATE TABLE statements maps every table
+	// it defines to that file's namespace, not just the first statement.
+	t.Run("multi-statement file maps all defined tables", func(t *testing.T) {
+		multi := schema.SchemaFiles{
+			"catalog": {
 				Files: map[string]string{
-					"other.sql": "CREATE TABLE `other` (`id` bigint NOT NULL) ENGINE=InnoDB",
+					"schema.sql": "CREATE TABLE `products` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\nCREATE TABLE `categories` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+				},
+			},
+			"accounts": {
+				Files: map[string]string{
+					"users.sql": "CREATE TABLE `users` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 				},
 			},
 		}
-		ns, err := namespaceForTable("nonexistent", single)
+
+		first, err := namespaceForTable("products", multi)
+		require.NoError(t, err)
+		assert.Equal(t, "catalog", first)
+
+		// The second CREATE TABLE in the same file also resolves, proving every
+		// statement in the file is classified.
+		second, err := namespaceForTable("categories", multi)
+		require.NoError(t, err)
+		assert.Equal(t, "catalog", second)
+	})
+
+	// With exactly one namespace, a table whose CREATE is absent (such as a
+	// DROP TABLE plan) is attributed to that sole namespace.
+	t.Run("single namespace fallback returns the only namespace", func(t *testing.T) {
+		single := schema.SchemaFiles{
+			"default": {
+				Files: map[string]string{
+					"other.sql": "CREATE TABLE `other` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+				},
+			},
+		}
+		ns, err := namespaceForTable("dropped_table", single)
 		require.NoError(t, err)
 		assert.Equal(t, "default", ns)
 	})
 
-	t.Run("no match falls back to single namespace", func(t *testing.T) {
-		// When no CREATE TABLE matches but there's only one namespace, it's returned as fallback
-		single := schema.SchemaFiles{
-			"only": {Files: map[string]string{"x.sql": "CREATE TABLE `x` (`id` bigint NOT NULL) ENGINE=InnoDB"}},
+	// With two or more namespaces and no defining statement, the namespace is
+	// ambiguous. Returning an arbitrary map key would make per-table progress
+	// matching nondeterministic, so the lookup fails loudly instead.
+	t.Run("multi-namespace with no match returns an error", func(t *testing.T) {
+		for range 50 {
+			ns, err := namespaceForTable("dropped_table", sf)
+			require.Error(t, err)
+			assert.Empty(t, ns)
+			assert.Contains(t, err.Error(), "dropped_table")
+			assert.Contains(t, err.Error(), "billing")
+			assert.Contains(t, err.Error(), "users")
 		}
-		ns, err := namespaceForTable("nonexistent", single)
-		require.NoError(t, err)
-		assert.Equal(t, "only", ns)
 	})
 
-	t.Run("no namespace found with empty schema files", func(t *testing.T) {
-		empty := schema.SchemaFiles{}
-		_, err := namespaceForTable("nonexistent", empty)
-		assert.Error(t, err)
+	t.Run("empty schema files returns an error", func(t *testing.T) {
+		ns, err := namespaceForTable("nonexistent", schema.SchemaFiles{})
+		require.Error(t, err)
+		assert.Empty(t, ns)
 	})
 }

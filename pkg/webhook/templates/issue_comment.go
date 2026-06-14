@@ -39,6 +39,16 @@ type StopCommandAcceptedData struct {
 	SkippedCount int64
 }
 
+// StartCommandAcceptedData contains data for a PR comment start acknowledgement.
+type StartCommandAcceptedData struct {
+	ApplyID      string
+	Environment  string
+	RequestedBy  string
+	Status       string
+	StartedCount int64
+	SkippedCount int64
+}
+
 // CutoverCommandAcceptedData contains data for a PR comment cutover acknowledgement.
 type CutoverCommandAcceptedData struct {
 	ApplyID     string
@@ -59,7 +69,7 @@ func RenderControlMissingApplyID(action string) string {
 // comment stop command records durable stop intent.
 func RenderStopCommandAccepted(data StopCommandAcceptedData) string {
 	statusLine := "Stop request accepted. SchemaBot will stop this schema change; status remains available from the PR progress comment or CLI."
-	if data.Status == "already_requested" {
+	if data.Status == apitypes.ControlStatusAlreadyRequested {
 		statusLine = "Stop was already requested. SchemaBot will keep the existing stop request pending until the operator owner finishes it."
 	}
 
@@ -74,6 +84,52 @@ func RenderStopCommandAccepted(data StopCommandAcceptedData) string {
 		body += fmt.Sprintf("\n**Tasks selected for stop**: %d stopped, %d skipped.\n", data.StoppedCount, data.SkippedCount)
 	}
 	return body
+}
+
+// RenderStartCommandAccepted renders the acknowledgement posted when a PR
+// comment start command records durable start intent.
+func RenderStartCommandAccepted(data StartCommandAcceptedData) string {
+	statusLine := "Start request accepted. SchemaBot will resume this schema change; status remains available from the PR progress comment or CLI."
+	if data.Status == apitypes.ControlStatusAlreadyRequested {
+		statusLine = "Start was already requested. SchemaBot will keep the existing start request pending until the operator owner finishes it."
+	}
+
+	body := "## Start Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += "\n" + statusLine + "\n"
+	if data.StartedCount > 0 || data.SkippedCount > 0 {
+		body += fmt.Sprintf("\n**Tasks selected for start**: %d started, %d skipped.\n", data.StartedCount, data.SkippedCount)
+	}
+	return body
+}
+
+// PreviewCommentStartCommandAccepted renders a sample start command
+// acknowledgement comment.
+func PreviewCommentStartCommandAccepted() string {
+	return RenderStartCommandAccepted(StartCommandAcceptedData{
+		ApplyID:      "apply-a1b2c3d4e5f67890",
+		Environment:  "staging",
+		RequestedBy:  "alice",
+		StartedCount: 1,
+		SkippedCount: 0,
+	})
+}
+
+// PreviewCommentStartCommandAlreadyRequested renders a sample start
+// acknowledgement when start is already pending.
+func PreviewCommentStartCommandAlreadyRequested() string {
+	return RenderStartCommandAccepted(StartCommandAcceptedData{
+		ApplyID:      "apply-a1b2c3d4e5f67890",
+		Environment:  "staging",
+		RequestedBy:  "alice",
+		Status:       apitypes.ControlStatusAlreadyRequested,
+		StartedCount: 1,
+		SkippedCount: 0,
+	})
 }
 
 // RenderCutoverCommandAccepted renders the acknowledgement posted when a PR

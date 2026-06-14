@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -16,6 +17,24 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
+	content, err := pulledSchemaFileContent("orders", spirittable.TableSchema{
+		Name:   "users",
+		Schema: "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n", content)
+
+	_, err = pulledSchemaFileContent("orders", spirittable.TableSchema{
+		Name:   "broken_users",
+		Schema: "CREATE TABLE",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
+}
 
 type exactProgressApplyStore struct {
 	storage.ApplyStore
@@ -508,6 +527,71 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
+}
+
+// A revert-window apply has already cut over, so a durable stop request against
+// it is a permanent rejection. Processing it must resolve the request terminally
+// (failed) with the operator-facing reason instead of bubbling a retryable error
+// that keeps the request pending and spins the operator-owned retry loop forever.
+// The apply stays in the revert window for the operator to revert or skip-revert.
+func TestLocalClient_ProcessPendingStopControlRequestRejectsRevertWindow(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              321,
+		ApplyIdentifier: "apply-revert-window-stop",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.RevertWindow,
+	}
+	task := &storage.Task{
+		ID:             654,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-revert-window-stop",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		TableName:      "users",
+		State:          state.Task.RevertWindow,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		planetscaleEngine: fakeEngine,
+		logger:            slog.Default(),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+
+	require.NoError(t, err, "a permanent rejection must not bubble a retryable error")
+	assert.True(t, handled, "the durable request is resolved, so the owner must not retry")
+	assert.Equal(t, 0, fakeEngine.stopCount, "stop must not touch the engine for a revert-window apply")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "revert-window apply must not be recorded as cancelled or stopped")
+	assert.Equal(t, state.Task.RevertWindow, task.State, "revert-window task must be preserved")
+
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the stop request must not be left pending")
+
+	require.Len(t, controlRequests.requests, 1)
+	resolved := controlRequests.requests[0]
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "the stop request must be terminally failed, not retried")
+	assert.Equal(t, "schema change apply-revert-window-stop is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", resolved.ErrorMessage)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Pending stop request rejected: schema change apply-revert-window-stop is in the revert window"))
 }
 
 func TestLocalClient_ProcessPendingCutoverControlRequest(t *testing.T) {
@@ -1093,4 +1177,254 @@ func attrValues(t *testing.T, attrs []any) map[string]any {
 		values[key] = attrs[i+1]
 	}
 	return values
+}
+
+// listApplyOperationStore is a fake ApplyOperationStore that returns a fixed set
+// of operation rows from ListByApply so the aggregate-state projection can be
+// exercised without a database.
+type listApplyOperationStore struct {
+	storage.ApplyOperationStore
+	ops []*storage.ApplyOperation
+	err error
+}
+
+func (s *listApplyOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	return s.ops, s.err
+}
+
+// deriveAggregateApplyState projects applies.state over all of an apply's
+// operation rows. With one operation per apply the projection equals the current
+// deployment's own derived state, so behaviour is unchanged; with a still-active
+// sibling the apply stays non-terminal so one deployment's drive cannot clobber
+// the rollout-level aggregate.
+func TestDeriveAggregateApplyState(t *testing.T) {
+	const currentOpID = int64(1)
+
+	taskWith := func(taskState string) *storage.Task {
+		id := currentOpID
+		return &storage.Task{State: taskState, ApplyOperationID: &id}
+	}
+
+	t.Run("one operation per apply matches current deployment derivation", func(t *testing.T) {
+		taskStateSets := [][]string{
+			{state.Task.Completed},
+			{state.Task.Completed, state.Task.Completed},
+			{state.Task.Running, state.Task.Pending},
+			{state.Task.Failed, state.Task.Completed},
+			{state.Task.WaitingForCutover, state.Task.Completed},
+			{state.Task.Pending},
+		}
+		for _, taskStateSet := range taskStateSets {
+			tasks := make([]*storage.Task, len(taskStateSet))
+			for i, ts := range taskStateSet {
+				tasks[i] = taskWith(ts)
+			}
+			client := &LocalClient{
+				storage: &exactProgressStorage{
+					applyOperations: &listApplyOperationStore{
+						ops: []*storage.ApplyOperation{
+							{ID: currentOpID, State: state.ApplyOperation.Pending},
+						},
+					},
+				},
+				logger: slog.Default(),
+			}
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-one-op"}
+
+			got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+			want := state.DeriveApplyState(taskStates(tasks))
+			assert.True(t, ok, "task states %v: current op row present, projection must be determined", taskStateSet)
+			assert.Equal(t, want, got, "task states %v", taskStateSet)
+		}
+	})
+
+	t.Run("pending sibling keeps the apply non-terminal", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Completed)}
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						{ID: currentOpID, State: state.ApplyOperation.Running},
+						{ID: 2, State: state.ApplyOperation.Pending},
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-multi-op"}
+
+		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.True(t, ok, "current op row present, projection must be determined")
+		assert.False(t, state.IsTerminalApplyState(got), "derived state %q must be non-terminal", got)
+		assert.False(t, state.IsState(got, state.Apply.Completed), "derived state must not clobber the pending sibling to completed")
+	})
+
+	// No operation model in use: the tasks carry no apply_operation_id, or the
+	// operation store is not configured. There are no siblings, so the per-task
+	// derivation is authoritative and may terminalize — this preserves
+	// single-writer/legacy behaviour for applies that predate apply_operation_id.
+	taskNoOp := func(taskState string) *storage.Task {
+		return &storage.Task{State: taskState}
+	}
+	noOperationModel := map[string]struct {
+		tasks []*storage.Task
+		store storage.ApplyOperationStore
+	}{
+		"tasks carry no apply_operation_id": {
+			tasks: []*storage.Task{taskNoOp(state.Task.Completed)},
+			store: &listApplyOperationStore{ops: []*storage.ApplyOperation{{ID: currentOpID, State: state.ApplyOperation.Pending}}},
+		},
+		"operation store not configured": {
+			tasks: []*storage.Task{taskWith(state.Task.Completed)},
+			store: nil,
+		},
+	}
+
+	for name, tc := range noOperationModel {
+		t.Run("no operation model ("+name+") terminalizes from tasks", func(t *testing.T) {
+			client := &LocalClient{
+				storage: &exactProgressStorage{applyOperations: tc.store},
+				logger:  slog.Default(),
+			}
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-no-op-model"}
+
+			want := state.DeriveApplyState(taskStates(tc.tasks))
+			require.True(t, state.IsTerminalApplyState(want), "precondition: per-task derivation is terminal")
+			got, ok := client.deriveAggregateApplyState(t.Context(), apply, tc.tasks)
+			assert.True(t, ok, "no siblings exist, so a terminal per-task derivation is authoritative")
+			assert.Equal(t, want, got)
+		})
+	}
+
+	// Operation model in use (tasks carry an apply_operation_id) but the sibling
+	// rows cannot be read consistently. The sibling states are unknown, so a
+	// terminal current-deployment derivation must not become the aggregate: a
+	// transient read failure on the last-finishing deployment would otherwise
+	// mark the whole apply terminal while siblings are still in flight. The
+	// projection is reported undetermined (ok=false) so the caller keeps the
+	// stored value for the next poll to reconcile.
+	unreadableSiblings := map[string]storage.ApplyOperationStore{
+		"operations cannot be read": &listApplyOperationStore{err: assert.AnError},
+		"no operation rows found":   &listApplyOperationStore{ops: nil},
+		"current operation row missing": &listApplyOperationStore{
+			ops: []*storage.ApplyOperation{
+				{ID: 2, State: state.ApplyOperation.Pending},
+				{ID: 3, State: state.ApplyOperation.Pending},
+			},
+		},
+	}
+
+	for name, store := range unreadableSiblings {
+		t.Run("unreadable siblings ("+name+") refuse to terminalize a terminal current deployment", func(t *testing.T) {
+			tasks := []*storage.Task{taskWith(state.Task.Completed)}
+			client := &LocalClient{
+				storage: &exactProgressStorage{applyOperations: store},
+				logger:  slog.Default(),
+			}
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-unreadable-terminal"}
+
+			require.True(t, state.IsTerminalApplyState(state.DeriveApplyState(taskStates(tasks))), "precondition: current deployment derives terminal")
+			_, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+			assert.False(t, ok, "must not overwrite stored apply state from a terminal single-op derivation")
+		})
+
+		t.Run("unreadable siblings ("+name+") fall back to a non-terminal current deployment", func(t *testing.T) {
+			tasks := []*storage.Task{taskWith(state.Task.Running), taskWith(state.Task.Pending)}
+			client := &LocalClient{
+				storage: &exactProgressStorage{applyOperations: store},
+				logger:  slog.Default(),
+			}
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-unreadable-active"}
+
+			want := state.DeriveApplyState(taskStates(tasks))
+			require.False(t, state.IsTerminalApplyState(want), "precondition: current deployment derives non-terminal")
+			got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+			assert.True(t, ok, "non-terminal single-op derivation is a safe fallback")
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
+// capturedLog records a single emitted log record's level, message, and
+// attributes for assertions.
+type capturedLog struct {
+	level slog.Level
+	msg   string
+	attrs map[string]any
+}
+
+// captureHandler is a minimal slog.Handler that records every emitted record so
+// tests can assert on level, message, and attributes.
+type captureHandler struct {
+	records *[]capturedLog
+}
+
+func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
+	attrs := make(map[string]any, r.NumAttrs())
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	*h.records = append(*h.records, capturedLog{level: r.Level, msg: r.Message, attrs: attrs})
+	return nil
+}
+
+func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// A canonical, positive revert_window_duration in metadata is honored, while an
+// empty value falls back to the engine default. A malformed or non-positive
+// value — which the server never writes but an embedder populating metadata
+// directly can — fails observably: it warns with the offending value and the
+// engine default rather than silently defaulting.
+func TestLocalClient_RevertWindowDuration(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		want      time.Duration
+		wantWarn  bool
+		warnValue string
+	}{
+		{name: "honors a valid positive duration", value: "45m", want: 45 * time.Minute},
+		{name: "empty uses engine default", value: "", want: defaultRevertWindowDuration},
+		{name: "unparseable warns and uses default", value: "not-a-duration", want: defaultRevertWindowDuration, wantWarn: true, warnValue: "not-a-duration"},
+		{name: "zero warns and uses default", value: "0s", want: defaultRevertWindowDuration, wantWarn: true, warnValue: "0s"},
+		{name: "negative warns and uses default", value: "-5m", want: defaultRevertWindowDuration, wantWarn: true, warnValue: "-5m"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var records []capturedLog
+			client := &LocalClient{
+				config: LocalConfig{
+					Database: "orders",
+					Metadata: map[string]string{"revert_window_duration": tc.value},
+				},
+				logger: slog.New(captureHandler{records: &records}),
+			}
+
+			got := client.revertWindowDuration()
+			assert.Equal(t, tc.want, got)
+
+			var warnings []capturedLog
+			for _, r := range records {
+				if r.level == slog.LevelWarn {
+					warnings = append(warnings, r)
+				}
+			}
+
+			if !tc.wantWarn {
+				assert.Empty(t, warnings, "no warning expected")
+				return
+			}
+
+			require.Len(t, warnings, 1, "exactly one warning expected")
+			w := warnings[0]
+			assert.Equal(t, tc.warnValue, w.attrs["value"])
+			assert.Equal(t, "orders", w.attrs["database"])
+			assert.Equal(t, defaultRevertWindowDuration, w.attrs["default"])
+		})
+	}
 }

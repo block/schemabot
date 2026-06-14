@@ -11,6 +11,40 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// actorAuthorizationClient resolves the installation-scoped GitHub client used
+// for actor authorization team membership lookups. The client is only needed
+// when PR command authorization is enabled. A client resolution failure fails
+// closed: the command is blocked and an authorization-unavailable comment is
+// posted so the actor knows no schema change action was taken.
+func (h *Handler) actorAuthorizationClient(
+	repo string,
+	pr int,
+	installationID int64,
+	requestedBy string,
+	database string,
+	environment string,
+	commandName string,
+) (*ghclient.InstallationClient, bool) {
+	if !h.service.Config().PRCommandAuthorizationEnabled() || h.ghClients.Len() == 0 {
+		return nil, false
+	}
+	client, err := h.clientForRepo(repo, installationID)
+	if err != nil {
+		h.logger.Warn("PR command blocked because the actor authorization GitHub client could not be created",
+			"repo", repo, "pr", pr, "database", database,
+			"environment", environment, "command", commandName,
+			"requested_by", requestedBy, "error", err)
+		h.postComment(repo, pr, installationID, templates.RenderPRCommandAuthorizationUnavailable(templates.ActorAuthorizationCommentData{
+			RequestedBy: requestedBy,
+			CommandName: commandName,
+			Database:    database,
+			Environment: environment,
+		}))
+		return nil, true
+	}
+	return client, false
+}
+
 func (h *Handler) enforcePRCommandActorAuthorization(
 	ctx context.Context,
 	client *ghclient.InstallationClient,
@@ -42,6 +76,23 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 		return true
 	}
 	if !result.Allowed {
+		// A missing database config is operationally distinct from an actor who
+		// lacks access: the database simply is not managed by this instance. Post
+		// a hint so operators do not assume an access problem and retry blindly.
+		if result.Reason == api.ActorAuthReasonMissingDatabaseConfig {
+			h.logger.Warn("PR command blocked because the database is not configured on this instance",
+				"repo", repo, "pr", pr, "database", database,
+				"database_type", databaseType, "environment", environment,
+				"command", commandName, "requested_by", requestedBy,
+				"reason", result.Reason)
+			h.postComment(repo, pr, installationID, templates.RenderPRCommandDatabaseNotConfigured(templates.ActorAuthorizationCommentData{
+				RequestedBy: requestedBy,
+				CommandName: commandName,
+				Database:    database,
+				Environment: environment,
+			}))
+			return true
+		}
 		h.logger.Warn("PR command blocked by actor authorization",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", databaseType, "environment", environment,
@@ -62,7 +113,11 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 			"command", commandName, "requested_by", requestedBy)
 		return false
 	}
-	h.logger.Debug("PR command actor authorization allowed",
+	// Rollback, rollback-confirm, and unlock execute DDL or force-release locks,
+	// so the allow decision is audit-relevant. Log it at Info with the same
+	// identifiers used on the denial paths so operators can reconstruct who was
+	// authorized to mutate which database.
+	h.logger.Info("PR command actor authorization allowed",
 		"repo", repo, "pr", pr, "database", database,
 		"database_type", databaseType, "environment", environment,
 		"command", commandName, "requested_by", requestedBy,

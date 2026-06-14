@@ -191,7 +191,15 @@ func (s *lockStore) List(ctx context.Context) ([]*storage.Lock, error) {
 	return scanLocks(rows)
 }
 
-// Update updates lock metadata (touches updated_at).
+// Update touches updated_at to mark lock liveness.
+//
+// RowsAffected==0 is ambiguous and must not be read as "the lock does not
+// exist". Under MySQL's default changed-rows semantics, a matched row reports
+// zero affected rows when updated_at already equals NOW() — which happens when
+// Update runs twice within the same one-second DATETIME tick. The lock still
+// exists in that case, so the touch has succeeded. To distinguish that from a
+// genuinely missing lock, re-read it and return ErrLockNotFound only when the
+// row is actually gone.
 func (s *lockStore) Update(ctx context.Context, lock *storage.Lock) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE locks
@@ -199,10 +207,26 @@ func (s *lockStore) Update(ctx context.Context, lock *storage.Lock) error {
 		WHERE database_name = ? AND database_type = ?
 	`, lock.DatabaseName, lock.DatabaseType)
 	if err != nil {
-		return err
+		return fmt.Errorf("touch lock for %s/%s: %w", lock.DatabaseName, lock.DatabaseType, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected touching lock for %s/%s: %w",
+			lock.DatabaseName, lock.DatabaseType, err)
+	}
+	if rowsAffected > 0 {
+		return nil
 	}
 
-	return checkRowsAffected(result, storage.ErrLockNotFound)
+	current, getErr := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
+	if getErr != nil {
+		return fmt.Errorf("read lock after touch affected no rows for %s/%s: %w",
+			lock.DatabaseName, lock.DatabaseType, getErr)
+	}
+	if current == nil {
+		return storage.ErrLockNotFound
+	}
+	return nil
 }
 
 // GetByPR returns all locks associated with a PR.

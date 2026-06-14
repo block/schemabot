@@ -184,6 +184,11 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	// Clean up any stale data from previous test runs (shared storage DB)
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+	// Delete child apply_operations rows before their parent applies rows so the
+	// operator claim loop cannot re-claim orphan operations whose parent lookup
+	// returns nil.
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1")
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", appDBName)
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
@@ -2804,7 +2809,12 @@ func TestE2ERollbackIgnoredByNonOwningInstance(t *testing.T) {
 	}
 }
 
-// TestE2EPRCloseCleanup verifies that closing a PR releases locks and deletes checks.
+// TestE2EPRCloseCleanup verifies PR-close cleanup against real storage. While
+// the PR has a running apply, closing it retains the database lock (so no other
+// PR can start a concurrent apply on the same database) and retains stored
+// check state (so a close-and-reopen cannot turn in-flight apply state into a
+// passing check). Once the apply reaches a terminal state, closing the PR
+// releases the lock and deletes the stored check state.
 func TestE2EPRCloseCleanup(t *testing.T) {
 	dbName := "webhook_pr_close"
 	svc := setupE2EService(t, dbName)
@@ -2847,7 +2857,28 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 
 	h := NewHandler(svc, nil, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
 
-	// Send PR closed webhook
+	// Close the PR while the apply is running. The handler is invoked directly
+	// (not through the async webhook goroutine) so the retention assertions
+	// below observe a finished cleanup pass.
+	h.handlePRClosed("octocat/hello-world", 1, 12345)
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "lock must be retained while the apply is running")
+	assert.Equal(t, "octocat/hello-world#1", lock.Owner)
+
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "stored check state must be retained while the apply is running")
+	assert.Equal(t, "action_required", check.Conclusion)
+
+	// Finish the apply, then close the PR again through the webhook path.
+	apply, err := svc.Storage().Applies().Get(t.Context(), applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	apply.State = state.Apply.Completed
+	require.NoError(t, svc.Storage().Applies().Update(t.Context(), apply))
+
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "closed"}, nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -2859,18 +2890,13 @@ func TestE2EPRCloseCleanup(t *testing.T) {
 	require.Eventually(t, func() bool {
 		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 		return err == nil && lock == nil
-	}, 5*time.Second, 100*time.Millisecond, "lock should be released on PR close")
+	}, 5*time.Second, 100*time.Millisecond, "lock should be released on PR close once the apply is terminal")
 
 	// Poll until check is deleted
 	require.Eventually(t, func() bool {
 		check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
 		return err == nil && check == nil
-	}, 5*time.Second, 100*time.Millisecond, "check should be deleted on PR close")
-
-	apply, err := svc.Storage().Applies().Get(t.Context(), applyID)
-	require.NoError(t, err)
-	require.NotNil(t, apply)
-	assert.Equal(t, state.Apply.Running, apply.State)
+	}, 5*time.Second, 100*time.Millisecond, "check should be deleted on PR close once the apply is terminal")
 }
 
 // TestE2EStaleCheckCleanup verifies that checks for databases no longer in the PR

@@ -415,10 +415,20 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	return checkRowsAffected(result, storage.ErrCheckNotFound)
 }
 
-// DeleteByPR removes all stored check state for a PR.
-func (s *checkStore) DeleteByPR(ctx context.Context, repo string, pr int) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM checks WHERE repository = ? AND pull_request = ?`, repo, pr)
-	return err
+// DeleteByPRExcludingApplyOwned removes stored check state for a PR, except
+// rows owned by an in-flight apply. A row with apply_id set and status
+// in_progress must keep blocking until the apply reaches a terminal state,
+// even when PR-close cleanup found no non-terminal apply in the applies table.
+func (s *checkStore) DeleteByPRExcludingApplyOwned(ctx context.Context, repo string, pr int) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM checks
+		WHERE repository = ? AND pull_request = ?
+		  AND NOT (apply_id IS NOT NULL AND status = ?)
+	`, repo, pr, checkStatusInProgress)
+	if err != nil {
+		return fmt.Errorf("delete checks for closed PR %s#%d: %w", repo, pr, err)
+	}
+	return nil
 }
 
 // scanCheck scans a single check row, returning nil if not found.

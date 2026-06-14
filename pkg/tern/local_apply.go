@@ -64,7 +64,9 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 }
 
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
-// If the engine reports terminal or "no active schema change", the task is updated in storage.
+// If the engine reports a terminal state, or reports no active work for a task that
+// storage believes is in-flight, the task is updated in storage and no longer blocks.
+// Resting tasks (Stopped, FailedRetryable) are left untouched.
 // Returns true if the task was resolved (no longer blocking).
 func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, database string) bool {
 	eng := c.getEngine()
@@ -96,9 +98,19 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		return true
 	}
 
-	// Spirit has no active schema change but task isn't terminal — task is stale.
-	// Crashed or failed without updating storage.
+	// The engine has no active work. For in-flight states this means the task was
+	// abandoned (e.g. a server crash) and must be failed so it stops blocking.
+	// Resting states (Stopped, FailedRetryable) also have no active engine work,
+	// but that is expected — Spirit keeps the checkpoint until an operator resumes
+	// or retries. Failing them here would destroy resumable work and void the
+	// operator retry budget, so leave them untouched and let the conflict/lock
+	// logic decide whether the new apply proceeds.
 	if result.Message == "No active schema change" {
+		if !state.IsInFlightTaskState(t.State) {
+			c.logger.Debug("conflict check: leaving resting task untouched (no active engine work expected)",
+				"task_id", t.TaskIdentifier, "storage_state", t.State)
+			return false
+		}
 		c.logger.Info("conflict check: cleaning up stale task (no active schema change in engine)",
 			"task_id", t.TaskIdentifier, "storage_state", t.State, "started_at", t.StartedAt)
 		now := time.Now()

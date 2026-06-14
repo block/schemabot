@@ -129,9 +129,12 @@ type CheckStore interface {
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
 
-	// DeleteByPR removes all stored check state for a PR.
-	// Used for cleanup when a PR is closed or merged.
-	DeleteByPR(ctx context.Context, repo string, pr int) error
+	// DeleteByPRExcludingApplyOwned removes stored check state for a PR,
+	// except rows owned by an in-flight apply (apply_id set and status
+	// in_progress). Used for cleanup when a PR is closed or merged:
+	// apply-owned rows must keep blocking until the apply reaches a terminal
+	// state, even across a close and reopen.
+	DeleteByPRExcludingApplyOwned(ctx context.Context, repo string, pr int) error
 }
 
 // SettingsStore manages admin-level SchemaBot settings (global config).

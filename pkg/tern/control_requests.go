@@ -195,6 +195,26 @@ func completePendingStopControlRequests(ctx context.Context, store storage.Stora
 	return nil
 }
 
+// failPendingStopControlRequests marks the pending stop request terminally
+// failed. A failed request is no longer pending, so the operator-owned retry
+// loop stops re-running stop instead of spinning on a permanent rejection.
+func failPendingStopControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, errorMessage string) error {
+	if store == nil {
+		return fmt.Errorf("storage is not available")
+	}
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, storage.ControlOperationStop); err != nil {
+		return err
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return fmt.Errorf("control request store is not available")
+	}
+	if err := controlStore.FailPending(ctx, apply.ID, storage.ControlOperationStop, errorMessage); err != nil {
+		return fmt.Errorf("fail pending stop control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
 func ensureApplyLeaseForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) error {
 	lease, ok := storage.ApplyLeaseFromContext(ctx)
 	if !ok {

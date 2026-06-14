@@ -309,6 +309,106 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 	return *task.ApplyOperationID, nil
 }
 
+// deriveAggregateApplyState computes applies.state as the rollout projection
+// over every apply_operation row of the apply. The boolean is false when the
+// projection could not be determined safely and the caller must leave the
+// stored apply state unchanged.
+//
+// Invariant: applies.state is the rollout projection over all operations of the
+// apply, not only the operation this drive is executing. The current
+// deployment's freshly derived per-operation state is folded in over its own
+// (possibly stale) operation row, then the aggregate is derived from the whole
+// sibling set. Deriving from the current deployment's tasks alone would let one
+// deployment move the apply to a terminal/aggregate state that ignores siblings;
+// folding the current state into the sibling set keeps a still-pending or
+// running sibling holding the apply non-terminal.
+//
+// With one operation per apply the sibling set is the current operation alone,
+// so the projection collapses to the current deployment's derived state.
+//
+// Two outcomes are distinguished when the full sibling set is not available:
+//
+//   - The apply does not use the operation model — its tasks carry no
+//     apply_operation_id, or the operation store is not configured. There are no
+//     siblings, so the per-task derivation is authoritative and may terminalize.
+//     This preserves single-writer/legacy behaviour for applies written before
+//     the apply-create path populated apply_operation_id.
+//
+//   - The apply uses the operation model (its tasks carry an apply_operation_id)
+//     but the sibling rows cannot be read consistently — the list call failed,
+//     returned no rows, or omitted the current operation. Here the sibling
+//     states are genuinely unknown, so a terminal current-deployment derivation
+//     must not become the aggregate: a transient read failure on the
+//     last-finishing deployment would otherwise mark the whole apply terminal
+//     while siblings are still in flight. The projection is reported as
+//     undetermined (ok=false) and the caller keeps the stored value for the next
+//     poll to reconcile. A non-terminal derivation is still a safe fallback.
+//
+// The read-then-write is not atomic, so concurrent sibling drives last-write-
+// wins from possibly stale reads; the aggregate converges on the next poll.
+func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (string, bool) {
+	currentOpState := state.DeriveApplyState(taskStates(tasks))
+
+	// failClosed reports the current deployment's derived state when the sibling
+	// set is in use but unreadable, refusing to terminalize the apply on
+	// incomplete information.
+	failClosed := func() (string, bool) {
+		if state.IsTerminalApplyState(currentOpState) {
+			c.logger.Warn("cannot determine aggregate apply state and current deployment is terminal; leaving stored apply state unchanged",
+				"apply_id", apply.ApplyIdentifier, "current_deployment_state", currentOpState)
+			return "", false
+		}
+		return currentOpState, true
+	}
+
+	operationID, err := applyOperationIDForTasks(tasks)
+	if err != nil {
+		// No operation model in use: tasks carry no apply_operation_id, so there
+		// are no siblings and the per-task derivation is authoritative.
+		c.logger.Debug("deriving apply state from tasks: apply has no operation model",
+			"apply_id", apply.ApplyIdentifier, "reason", err)
+		return currentOpState, true
+	}
+
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		// Operation store unavailable: no siblings can exist, so the per-task
+		// derivation is authoritative.
+		c.logger.Debug("deriving apply state from tasks: apply operation store is not configured",
+			"apply_id", apply.ApplyIdentifier)
+		return currentOpState, true
+	}
+
+	ops, err := store.ListByApply(ctx, apply.ID)
+	if err != nil {
+		c.logger.Warn("cannot determine aggregate apply state: failed to list sibling apply operations",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", operationID, "error", err)
+		return failClosed()
+	}
+	if len(ops) == 0 {
+		c.logger.Warn("cannot determine aggregate apply state: tasks reference an apply operation but no operation rows were found",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", operationID)
+		return failClosed()
+	}
+
+	childStates := make([]string, len(ops))
+	foundCurrent := false
+	for i, op := range ops {
+		if op.ID == operationID {
+			childStates[i] = currentOpState
+			foundCurrent = true
+			continue
+		}
+		childStates[i] = op.State
+	}
+	if !foundCurrent {
+		c.logger.Warn("cannot determine aggregate apply state: current operation row missing from sibling set",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", operationID)
+		return failClosed()
+	}
+	return state.DeriveApplyState(childStates), true
+}
+
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
 // Each table copies and cuts over independently.
 
@@ -515,7 +615,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Update apply state from persisted task state so recovery guards can keep
 	// storage ahead of stale engine progress until Spirit reaches the cutover wait again.
-	apply.State = state.DeriveApplyState(taskStates(tasks))
+	if derived, ok := c.deriveAggregateApplyState(ctx, apply, tasks); ok {
+		apply.State = derived
+	}
 	apply.UpdatedAt = now
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
 		c.logger.Error("failed to reload apply before progress state update", "apply_id", apply.ApplyIdentifier, "error", err)
@@ -619,15 +721,30 @@ func (c *LocalClient) markRevertSkipped(ctx context.Context, apply *storage.Appl
 	}
 }
 
-// revertWindowDuration returns the configured revert window duration,
-// falling back to PlanetScale's default of 30 minutes.
+// revertWindowDuration returns the configured revert window duration, falling
+// back to the engine default when none is set. The server writes a canonical,
+// already-validated duration into metadata, so a malformed value only reaches
+// here when an embedder populates metadata directly. Rather than silently
+// using the default — which would hide a misconfigured revert window — an
+// unparseable or non-positive value is surfaced via a warning before falling
+// back, so the whole class of bad input is observable.
 func (c *LocalClient) revertWindowDuration() time.Duration {
-	if s := c.config.Metadata["revert_window_duration"]; s != "" {
-		if d, err := time.ParseDuration(s); err == nil && d > 0 {
-			return d
-		}
+	s := c.config.Metadata["revert_window_duration"]
+	if s == "" {
+		return defaultRevertWindowDuration
 	}
-	return defaultRevertWindowDuration
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		c.logger.Warn("invalid revert_window_duration metadata; using engine default",
+			"database", c.config.Database, "value", s, "default", defaultRevertWindowDuration, "error", err)
+		return defaultRevertWindowDuration
+	}
+	if d <= 0 {
+		c.logger.Warn("non-positive revert_window_duration metadata; using engine default",
+			"database", c.config.Database, "value", s, "default", defaultRevertWindowDuration)
+		return defaultRevertWindowDuration
+	}
+	return d
 }
 
 // revertWindowDeadline computes when the revert window expires.

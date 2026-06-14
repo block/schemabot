@@ -19,6 +19,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	Tern_PullSchema_FullMethodName = "/tern.v1.Tern/PullSchema"
 	Tern_Plan_FullMethodName       = "/tern.v1.Tern/Plan"
 	Tern_Apply_FullMethodName      = "/tern.v1.Tern/Apply"
 	Tern_Progress_FullMethodName   = "/tern.v1.Tern/Progress"
@@ -56,6 +57,9 @@ const (
 //
 // Only one active schema change per database at a time (enforced by Apply).
 type TernClient interface {
+	// PullSchema fetches the live schema for a database route and returns it as
+	// declarative schema files. It does not modify the database.
+	PullSchema(ctx context.Context, in *PullSchemaRequest, opts ...grpc.CallOption) (*PullSchemaResponse, error)
 	// Plan generates a schema change plan by diffing declarative schema files
 	// against the live database schema. Returns DDL statements needed to converge.
 	//
@@ -170,6 +174,16 @@ type ternClient struct {
 
 func NewTernClient(cc grpc.ClientConnInterface) TernClient {
 	return &ternClient{cc}
+}
+
+func (c *ternClient) PullSchema(ctx context.Context, in *PullSchemaRequest, opts ...grpc.CallOption) (*PullSchemaResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PullSchemaResponse)
+	err := c.cc.Invoke(ctx, Tern_PullSchema_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *ternClient) Plan(ctx context.Context, in *PlanRequest, opts ...grpc.CallOption) (*PlanResponse, error) {
@@ -297,6 +311,9 @@ func (c *ternClient) Volume(ctx context.Context, in *VolumeRequest, opts ...grpc
 //
 // Only one active schema change per database at a time (enforced by Apply).
 type TernServer interface {
+	// PullSchema fetches the live schema for a database route and returns it as
+	// declarative schema files. It does not modify the database.
+	PullSchema(context.Context, *PullSchemaRequest) (*PullSchemaResponse, error)
 	// Plan generates a schema change plan by diffing declarative schema files
 	// against the live database schema. Returns DDL statements needed to converge.
 	//
@@ -412,6 +429,9 @@ type TernServer interface {
 // pointer dereference when methods are called.
 type UnimplementedTernServer struct{}
 
+func (UnimplementedTernServer) PullSchema(context.Context, *PullSchemaRequest) (*PullSchemaResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PullSchema not implemented")
+}
 func (UnimplementedTernServer) Plan(context.Context, *PlanRequest) (*PlanResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Plan not implemented")
 }
@@ -460,6 +480,24 @@ func RegisterTernServer(s grpc.ServiceRegistrar, srv TernServer) {
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&Tern_ServiceDesc, srv)
+}
+
+func _Tern_PullSchema_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PullSchemaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).PullSchema(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_PullSchema_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).PullSchema(ctx, req.(*PullSchemaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _Tern_Plan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -649,6 +687,10 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "tern.v1.Tern",
 	HandlerType: (*TernServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "PullSchema",
+			Handler:    _Tern_PullSchema_Handler,
+		},
 		{
 			MethodName: "Plan",
 			Handler:    _Tern_Plan_Handler,

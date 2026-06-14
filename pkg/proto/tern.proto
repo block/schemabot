@@ -26,6 +26,15 @@ option go_package = "github.com/block/schemabot/pkg/proto/ternv1";
 //
 // Only one active schema change per database at a time (enforced by Apply).
 service Tern {
+  // PullSchema fetches the live schema for a database route and returns it as
+  // declarative schema files. It does not modify the database.
+  rpc PullSchema(PullSchemaRequest) returns (PullSchemaResponse) {
+    option (google.api.http) = {
+      post: "/v1/pull-schema"
+      body: "*"
+    };
+  }
+
   // Plan generates a schema change plan by diffing declarative schema files
   // against the live database schema. Returns DDL statements needed to converge.
   //
@@ -234,6 +243,27 @@ enum ChangeType {
 message SchemaFiles {
   // Filename → content mapping (e.g., "users.sql" → CREATE TABLE, "vschema.json" → VSchema JSON).
   map<string, string> files = 1;
+}
+
+// PullSchemaRequest requests a live schema export for a database route.
+message PullSchemaRequest {
+  // Database name from server-side config.
+  string database = 1;
+  // Database type: "vitess" or "mysql".
+  string type = 2;
+  // Environment: "staging" or "production".
+  string environment = 3;
+  // Opaque identifier for endpoint discovery. Defaults to database if empty.
+  string target = 4;
+}
+
+// PullSchemaResponse contains live schema files grouped by namespace.
+message PullSchemaResponse {
+  string database = 1;
+  string type = 2;
+  string environment = 3;
+  map<string, SchemaFiles> schema_files = 4;
+  int32 table_count = 5;
 }
 
 // PlanRequest requests a schema change plan from declarative schema files.

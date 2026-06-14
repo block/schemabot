@@ -17,9 +17,20 @@ import (
 // callers can match it with errors.Is regardless of the transport.
 var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
 
+var (
+	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
+	// the data plane does not yet support.
+	ErrPullSchemaUnsupportedType = errors.New("pull schema unsupported database type")
+	// ErrPullSchemaInvalidRequest marks a malformed pull request.
+	ErrPullSchemaInvalidRequest = errors.New("pull schema invalid request")
+)
+
 // Client defines the interface for schema change operations.
 // Uses proto-generated types for type safety.
 type Client interface {
+	// PullSchema fetches the live schema and returns it as declarative schema files.
+	PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
+
 	// Plan generates a schema change plan from declarative schema files.
 	// Returns a plan_id that can be used with Apply.
 	Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error)

@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -250,6 +251,17 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 		targetApply = apply
 	}
 
+	// A task in the revert window has already cut over: the new schema is live.
+	// Stop must not finalize it as cancelled — that would record a deployed
+	// change as if nothing happened. Reject so the operator chooses explicitly
+	// between revert (undo the deployed change) and skip-revert (finalize it).
+	if revertTask := firstRevertWindowTask(tasks, targetApplyID); revertTask != nil {
+		applyIdentifier := c.resolveRevertWindowApplyIdentifier(ctx, req, targetApply, revertTask)
+		c.logger.Warn("stop rejected: schema change is in the revert window and has already cut over",
+			"apply_id", applyIdentifier, "task_id", revertTask.TaskIdentifier, "state", revertTask.State)
+		return nil, errors.New(revertWindowStopRejectionMessage(applyIdentifier))
+	}
+
 	creds := c.credentials()
 	eng := c.getEngine()
 	applyCancel := c.currentApplyCancel()
@@ -306,8 +318,9 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 		return nil, fmt.Errorf("no active schema change")
 	}
 
-	// Edge case: stop was requested but all tasks had already completed.
-	// Mark the apply as completed so the TUI sees a clean terminal state.
+	// Edge case: stop was requested but every targeted task is already
+	// terminal. Finalize the apply from its task states so the TUI sees an
+	// accurate terminal state.
 	if stoppedCount == 0 && skippedCount > 0 && applyID > 0 {
 		if targetApply != nil && state.IsTerminalApplyState(targetApply.State) && !state.IsState(targetApply.State, state.Apply.Completed) {
 			c.logger.Info("all tasks are terminal and apply is already terminal; preserving apply state during stop",
@@ -320,7 +333,7 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 				SkippedCount: skippedCount,
 			}, nil
 		}
-		return c.handleStopAllCompleted(ctx, applyID, skippedCount)
+		return c.handleStopAllTasksTerminal(ctx, applyID, skippedCount)
 	}
 
 	return &ternv1.StopResponse{
@@ -362,6 +375,26 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		return true, nil
 	}
 
+	// A revert-window apply has already cut over. Stop is a permanent rejection,
+	// not a retryable error: failing the durable request resolves it terminally
+	// so the operator-owned retry loop stops re-running stop. The operator must
+	// revert (undo) or skip-revert (finalize) instead.
+	if revertWindow, err := c.applyHasRevertWindowTask(ctx, apply); err != nil {
+		return true, err
+	} else if revertWindow {
+		message := revertWindowStopRejectionMessage(apply.ApplyIdentifier)
+		c.logger.Warn("rejecting pending stop request: schema change is in the revert window and has already cut over",
+			"apply_id", apply.ApplyIdentifier,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Pending stop request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		if err := failPendingStopControlRequests(ctx, c.storage, apply, message); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+
 	stopCtx := context.WithoutCancel(ctx)
 	resp, err := c.stop(stopCtx, &ternv1.StopRequest{
 		ApplyId:     apply.ApplyIdentifier,
@@ -387,10 +420,114 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	return true, nil
 }
 
-// stopEngineForTasks calls eng.Stop() if any targeted task is actively running.
+// firstRevertWindowTask returns the first targeted task that is in the revert
+// window, or nil if none are. A revert-window task has already cut over, so the
+// stop path must reject rather than treat it as a cancellable in-flight change.
+//
+// When targetApplyID is 0 (an untargeted stop with no apply id), any
+// revert-window task on the database rejects the whole stop, even one belonging
+// to a different apply. This is bounded by the one-active-apply-per-target
+// invariant: storage permits at most one active apply per (database, database
+// type, environment), and LocalClient is scoped to a single such target, so a
+// revert-window task from a second, distinct apply cannot coexist with another
+// active apply on the same target. Cross-apply coexistence is therefore not a
+// case this scope has to disambiguate.
+func firstRevertWindowTask(tasks []*storage.Task, targetApplyID int64) *storage.Task {
+	for _, task := range tasks {
+		if targetApplyID > 0 && task.ApplyID != targetApplyID {
+			continue
+		}
+		if state.IsState(task.State, state.Task.RevertWindow) {
+			return task
+		}
+	}
+	return nil
+}
+
+// revertWindowStopRejectionMessage is the operator-facing reason a stop targeting
+// a revert-window schema change is permanently rejected. The change has already
+// cut over, so the operator must choose revert or skip-revert.
+func revertWindowStopRejectionMessage(applyIdentifier string) string {
+	return fmt.Sprintf("schema change %s is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", applyIdentifier)
+}
+
+// resolveRevertWindowApplyIdentifier returns the apply-level identifier an
+// operator supplied or recognizes, not the per-table task identifier. It prefers
+// the requested apply id, then the resolved target apply, then a lookup of the
+// revert task's apply, falling back to the task identifier only if the apply
+// cannot be loaded.
+func (c *LocalClient) resolveRevertWindowApplyIdentifier(ctx context.Context, req *ternv1.StopRequest, targetApply *storage.Apply, revertTask *storage.Task) string {
+	if req.ApplyId != "" {
+		return req.ApplyId
+	}
+	if targetApply != nil && targetApply.ApplyIdentifier != "" {
+		return targetApply.ApplyIdentifier
+	}
+	apply, err := c.storage.Applies().Get(ctx, revertTask.ApplyID)
+	if err != nil {
+		c.logger.Warn("could not load apply to resolve revert-window stop identifier; using task identifier",
+			"apply_db_id", revertTask.ApplyID, "task_id", revertTask.TaskIdentifier, "error", err)
+		return revertTask.TaskIdentifier
+	}
+	if apply == nil {
+		c.logger.Warn("apply not found while resolving revert-window stop identifier; using task identifier",
+			"apply_db_id", revertTask.ApplyID, "task_id", revertTask.TaskIdentifier)
+		return revertTask.TaskIdentifier
+	}
+	return apply.ApplyIdentifier
+}
+
+// applyHasRevertWindowTask reports whether any task for the apply is in the
+// revert window. It reads the stored tasks directly so the durable stop path
+// detects the same cut-over condition the synchronous stop path rejects on.
+func (c *LocalClient) applyHasRevertWindowTask(ctx context.Context, apply *storage.Apply) (bool, error) {
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("load tasks for apply %s to detect revert window before stop: %w", apply.ApplyIdentifier, err)
+	}
+	return firstRevertWindowTask(tasks, apply.ID) != nil, nil
+}
+
+// hasLiveEngineWork reports whether a task in this state has live engine or
+// remote work that eng.Stop must terminate before storage records the stop.
+// These are the non-terminal states where a Spirit runner is copying rows or a
+// PlanetScale deploy request is created and can be cancelled:
+//   - Running / CuttingOver: Spirit runner or PlanetScale deploy actively executing.
+//   - WaitingForCutover: Spirit runner alive, holding connections until cutover.
+//   - Recovering: Spirit's runner is restarted with a detached context during
+//     recovery; only eng.Stop kills it, so without this the runner keeps copying
+//     rows while storage reports stopped and a later resume blocks in Drain()
+//     behind the abandoned runner.
+//   - WaitingForDeploy: the PlanetScale deferred deploy request exists and stays
+//     startable from the PlanetScale UI until eng.Stop cancels it.
+//   - FailedRetryable: a transient failure (e.g. repeated progress-poll errors)
+//     pauses the apply for operator retry, but the PlanetScale deploy request was
+//     already created and its resume state persisted before the failure, so the
+//     deploy request stays live and startable from the PlanetScale UI. Without
+//     eng.Stop, recording the stop as cancelled would leave that deploy request
+//     runnable from the provider side — the same storage-vs-engine divergence the
+//     other live states avoid. eng.Stop (CancelDeployRequest) is keyed only on the
+//     persisted deploy request id, so cancelling a retryable task is safe; stop is
+//     a terminal operator action that ends the apply rather than retrying it.
+func hasLiveEngineWork(taskState string) bool {
+	return state.IsState(taskState,
+		state.Task.Running,
+		state.Task.WaitingForCutover,
+		state.Task.CuttingOver,
+		state.Task.Recovering,
+		state.Task.WaitingForDeploy,
+		state.Task.FailedRetryable)
+}
+
+// stopEngineForTasks calls eng.Stop() if any targeted task has live engine work.
 // Returns an error if the engine stop fails (e.g., PlanetScale deploy request
 // cancellation failed). For Spirit, stop errors are non-fatal since the runner
 // may have already exited.
+//
+// It stops at the first task with live engine work and returns: an apply drives
+// a single engine operation (one Spirit runner or one PlanetScale deploy
+// request) whose stop terminates the whole operation, so one eng.Stop covers the
+// targeted apply.
 func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine, creds *engine.Credentials, tasks []*storage.Task, targetApplyID int64) error {
 	if eng == nil {
 		c.logger.Error("stopEngineForTasks: engine is nil")
@@ -404,22 +541,23 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 			c.logger.Info("skipping terminal task in stop", "task_id", task.TaskIdentifier, "state", task.State)
 			continue
 		}
-		if task.State == state.Task.Running ||
-			task.State == state.Task.WaitingForCutover ||
-			task.State == state.Task.CuttingOver {
-			req, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlStop)
-			if err != nil {
-				return fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
-			}
-			if _, err := eng.Stop(ctx, req); err != nil {
-				if c.config.Type == storage.DatabaseTypeVitess {
-					return fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, err)
-				}
-				c.logger.Warn("engine stop returned error (runner may have already exited)",
-					"task_id", task.TaskIdentifier, "error", err)
-			}
-			return nil
+		if !hasLiveEngineWork(task.State) {
+			c.logger.Debug("skipping engine stop for task with no live engine work",
+				"task_id", task.TaskIdentifier, "state", task.State)
+			continue
 		}
+		req, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlStop)
+		if err != nil {
+			return fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
+		}
+		if _, err := eng.Stop(ctx, req); err != nil {
+			if c.config.Type == storage.DatabaseTypeVitess {
+				return fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, err)
+			}
+			c.logger.Warn("engine stop returned error (runner may have already exited)",
+				"task_id", task.TaskIdentifier, "error", err)
+		}
+		return nil
 	}
 	return nil
 }
@@ -482,25 +620,70 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 	return stoppedCount, skippedCount, applyID
 }
 
-// handleStopAllCompleted handles the edge case where stop is requested but all tasks
-// had already completed. Marks the apply as completed so the TUI sees a clean state.
-func (c *LocalClient) handleStopAllCompleted(ctx context.Context, applyID int64, skippedCount int64) (*ternv1.StopResponse, error) {
-	if apply, err := c.storage.Applies().Get(ctx, applyID); err == nil && apply != nil && !state.IsTerminalApplyState(apply.State) {
+// firstFailedTaskError returns an apply-level failure reason derived from task
+// rows: the first failed task that recorded an error message, preferring
+// hard-failed tasks over retryable ones. Returns "" when no failed task
+// recorded a reason.
+func firstFailedTaskError(tasks []*storage.Task) string {
+	for _, failedState := range []string{state.Task.Failed, state.Task.FailedRetryable} {
+		for _, task := range tasks {
+			if state.IsState(task.State, failedState) && task.ErrorMessage != "" {
+				return fmt.Sprintf("table %s failed: %s", task.TableName, task.ErrorMessage)
+			}
+		}
+	}
+	return ""
+}
+
+// handleStopAllTasksTerminal handles the edge case where stop is requested but
+// every targeted task is already in a terminal state (completed, failed,
+// cancelled, or reverted). The apply row may still be non-terminal — e.g., a
+// worker exited after finalizing task rows but before the apply row — so the
+// apply's final state is derived from its task states rather than assumed.
+// A failed task must surface as a failed apply, never as a completed one, and
+// its failure reason is propagated so operators can triage from the apply
+// record. An ErrorMessage already on the apply is authoritative and kept.
+func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID int64, skippedCount int64) (*ternv1.StopResponse, error) {
+	apply, err := c.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("load apply %d after stop found all tasks terminal: %w", applyID, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("load apply %d after stop found all tasks terminal: %w", applyID, storage.ErrApplyNotFound)
+	}
+
+	if !state.IsTerminalApplyState(apply.State) {
+		tasks, err := c.storage.Tasks().GetByApplyID(ctx, applyID)
+		if err != nil {
+			return nil, fmt.Errorf("load tasks for apply %s to derive final state: %w", apply.ApplyIdentifier, err)
+		}
+		derivedState := state.DeriveApplyState(taskStates(tasks))
+		oldState := apply.State
 		now := time.Now()
-		apply.State = state.Apply.Completed
-		apply.CompletedAt = &now
+		apply.State = derivedState
+		if state.IsState(derivedState, state.Apply.Failed) && apply.ErrorMessage == "" {
+			apply.ErrorMessage = firstFailedTaskError(tasks)
+		}
+		if state.IsTerminalApplyState(derivedState) {
+			apply.CompletedAt = &now
+		}
 		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
+			return nil, fmt.Errorf("update apply %s to derived state %s: %w", apply.ApplyIdentifier, derivedState, err)
 		}
 
+		c.logger.Info("stop found all tasks terminal; apply state derived from tasks",
+			"apply_id", apply.ApplyIdentifier,
+			"old_state", oldState,
+			"new_state", derivedState,
+			"skipped_count", skippedCount)
 		c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			"All tasks completed before stop took effect", "", state.Apply.Completed)
+			fmt.Sprintf("All tasks terminal before stop took effect; apply state derived from tasks: %s", derivedState), oldState, derivedState)
 	}
 
 	return &ternv1.StopResponse{
 		Accepted:     true,
-		ErrorMessage: "Schema change already completed",
+		ErrorMessage: fmt.Sprintf("Schema change already %s", apply.State),
 		StoppedCount: 0,
 		SkippedCount: skippedCount,
 	}, nil
