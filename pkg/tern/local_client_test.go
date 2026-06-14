@@ -492,6 +492,7 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 		ApplyID:        apply.ID,
 		TaskIdentifier: "task-stop-local",
 		Database:       "testdb",
+		Namespace:      "testdb",
 		DatabaseType:   storage.DatabaseTypeMySQL,
 		TableName:      "users",
 		State:          state.Task.Running,
@@ -601,6 +602,7 @@ func TestLocalClient_ProcessPendingStartControlRequestStartsDeferredDeploy(t *te
 		ApplyID:        apply.ID,
 		TaskIdentifier: "task-deferred-start",
 		Database:       "testdb",
+		Namespace:      "testdb",
 		DatabaseType:   storage.DatabaseTypeMySQL,
 		TableName:      "users",
 		State:          state.Task.WaitingForDeploy,
@@ -716,6 +718,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequest(t *testing.T) {
 		ApplyID:        apply.ID,
 		TaskIdentifier: "task-cutover-local",
 		Database:       "testdb",
+		Namespace:      "testdb",
 		DatabaseType:   storage.DatabaseTypeMySQL,
 		TableName:      "users",
 		State:          state.Task.WaitingForCutover,
@@ -766,6 +769,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestUsesCompletedTaskForCuto
 		ApplyID:        apply.ID,
 		TaskIdentifier: "task-cutover-completed-task-local",
 		Database:       "testdb",
+		Namespace:      "testdb",
 		DatabaseType:   storage.DatabaseTypeMySQL,
 		TableName:      "users",
 		State:          state.Task.Completed,
@@ -912,6 +916,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *
 		ApplyID:        apply.ID,
 		TaskIdentifier: "task-cutover-rejected-local",
 		Database:       "testdb",
+		Namespace:      "testdb",
 		DatabaseType:   storage.DatabaseTypeMySQL,
 		TableName:      "users",
 		State:          state.Task.WaitingForCutover,
@@ -1581,4 +1586,101 @@ func TestLocalClient_RevertWindowDuration(t *testing.T) {
 			assert.Equal(t, defaultRevertWindowDuration, w.attrs["default"])
 		})
 	}
+}
+
+// MySQL targets come in two shapes. A target DSN that already names a database
+// is the local-DSN shape: the namespace is an organizational label and the
+// configured DSN is used unchanged. A namespace-free target DSN is the
+// inventory/data-plane shape: the concrete namespace is the connection schema
+// and must be injected per operation, so a missing namespace is an error.
+// Vitess credentials carry engine metadata and never inject a MySQL schema.
+func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
+	t.Run("local DSN with database keeps configured DSN regardless of namespace", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/orders",
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForMySQLNamespace("ignored-label")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/orders", creds.DSN)
+
+		creds, err = c.credentialsForMySQLNamespace("")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/orders", creds.DSN)
+	})
+
+	t.Run("namespace-free DSN injects the namespace as the connection schema", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForMySQLNamespace("orders_schema")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+	})
+
+	t.Run("namespace-free DSN without a namespace is an error", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		}, logger: slog.Default()}
+
+		_, err := c.credentialsForMySQLNamespace("")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "namespace is required")
+	})
+
+	t.Run("credentialsForTask uses the task namespace for a namespace-free DSN", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForTask(&storage.Task{Namespace: "orders_schema"})
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+	})
+
+	t.Run("credentialsForApply uses the first targeted task namespace", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		}, logger: slog.Default()}
+
+		tasks := []*storage.Task{
+			{ApplyID: 1, Namespace: "other_schema"},
+			{ApplyID: 7, Namespace: "orders_schema"},
+		}
+		creds, err := c.credentialsForApply(tasks, 7)
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+	})
+
+	t.Run("credentialsForGroupedApply injects the plan namespace", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForGroupedApply(&storage.Plan{
+			Namespaces: map[string]*storage.NamespacePlanData{"orders_schema": {}},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+	})
+
+	t.Run("Vitess credentials carry metadata and never inject a schema", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeVitess,
+			TargetDSN: "vtgate-dsn",
+			Metadata:  map[string]string{"organization": "acme"},
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForTask(&storage.Task{Namespace: "ignored"})
+		require.NoError(t, err)
+		assert.Equal(t, "vtgate-dsn", creds.DSN)
+		assert.Equal(t, "acme", creds.Metadata["organization"])
+	})
 }

@@ -108,6 +108,7 @@ import (
 	"github.com/block/schemabot/pkg/mysqlconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -253,6 +254,96 @@ func (c *LocalClient) credentials() *engine.Credentials {
 	}
 }
 
+func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Credentials, error) {
+	if c.config.Type != storage.DatabaseTypeMySQL {
+		return c.credentials(), nil
+	}
+	hasDatabase, err := mysqlDSNHasDatabase(c.config.TargetDSN)
+	if err != nil {
+		return nil, fmt.Errorf("inspect MySQL target DSN for namespace injection: %w", err)
+	}
+	// A target DSN that already names a database is the local-DSN shape: Spirit
+	// connects to that database and the namespace is an organizational label, so
+	// the configured credentials are used as-is.
+	if hasDatabase {
+		return c.credentials(), nil
+	}
+	// A namespace-free target DSN is the inventory/data-plane shape: the concrete
+	// namespace is the connection schema and must be injected per operation.
+	if namespace == "" {
+		return nil, fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
+	}
+	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, namespace)
+	if err != nil {
+		return nil, err
+	}
+	return &engine.Credentials{
+		DSN:      dsn,
+		Metadata: c.config.Metadata,
+	}, nil
+}
+
+func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credentials, error) {
+	if c.config.Type != storage.DatabaseTypeMySQL {
+		return c.credentials(), nil
+	}
+	if task == nil {
+		return nil, fmt.Errorf("task is required for MySQL credentials")
+	}
+	return c.credentialsForMySQLNamespace(task.Namespace)
+}
+
+// credentialsForGroupedApply resolves the single-namespace credentials for a
+// grouped/atomic MySQL apply. A grouped apply runs one Spirit execution and
+// rejects multi-namespace plans, so exactly one namespace drives the connection.
+func (c *LocalClient) credentialsForGroupedApply(plan *storage.Plan) (*engine.Credentials, error) {
+	if c.config.Type != storage.DatabaseTypeMySQL {
+		return c.credentials(), nil
+	}
+	creds := c.credentials()
+	for namespace := range plan.Namespaces {
+		nsCreds, err := c.credentialsForMySQLNamespace(namespace)
+		if err != nil {
+			return nil, err
+		}
+		creds = nsCreds
+	}
+	return creds, nil
+}
+
+// credentialsForApply resolves credentials for an apply's engine operation. A
+// MySQL apply runs one namespace, so the namespace of any targeted task gives
+// the connection database; the first targeted task is representative.
+func (c *LocalClient) credentialsForApply(tasks []*storage.Task, targetApplyID int64) (*engine.Credentials, error) {
+	if c.config.Type != storage.DatabaseTypeMySQL {
+		return c.credentials(), nil
+	}
+	for _, task := range tasks {
+		if targetApplyID > 0 && task.ApplyID != targetApplyID {
+			continue
+		}
+		return c.credentialsForTask(task)
+	}
+	return nil, fmt.Errorf("no targeted task found to resolve MySQL credentials for apply %d", targetApplyID)
+}
+
+func mysqlDSNWithDatabase(dsn, database string) (string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("parse MySQL DSN: %w", err)
+	}
+	cfg.DBName = database
+	return cfg.FormatDSN(), nil
+}
+
+func mysqlDSNHasDatabase(dsn string) (bool, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return false, fmt.Errorf("parse MySQL DSN: %w", err)
+	}
+	return cfg.DBName != "", nil
+}
+
 func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *storage.Apply) (bool, bool, error) {
 	if apply == nil {
 		return false, false, fmt.Errorf("apply is required for deferred cutover signal lookup")
@@ -286,11 +377,20 @@ func (c *LocalClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequ
 		return nil, fmt.Errorf("pull schema for database %s: request type %q does not match client type %q: %w", c.config.Database, req.Type, c.config.Type, ErrPullSchemaInvalidRequest)
 	}
 
+	targetDSN := c.config.TargetDSN
+	if c.config.Type == storage.DatabaseTypeMySQL {
+		creds, err := c.credentialsForMySQLNamespace(c.config.Database)
+		if err != nil {
+			return nil, fmt.Errorf("resolve database %s credentials for schema pull: %w", c.config.Database, err)
+		}
+		targetDSN = creds.DSN
+	}
+
 	attrs := []any{"database", c.config.Database}
-	attrs = append(attrs, dsnLogAttrs(c.config.TargetDSN)...)
+	attrs = append(attrs, dsnLogAttrs(targetDSN)...)
 	c.logger.Info("LocalClient.PullSchema: loading live schema", attrs...)
 
-	db, err := mysqlconn.Open(c.config.TargetDSN)
+	db, err := mysqlconn.Open(targetDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open database %s for schema pull: %w", c.config.Database, err)
 	}
@@ -348,29 +448,15 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		return nil, fmt.Errorf("type must be %q or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess)
 	}
 
-	eng := c.getEngine()
-	if eng == nil {
-		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
-	}
-
 	// Convert schema files from proto to engine type
 	schemaFiles := protoToSchemaFiles(req.SchemaFiles)
-
-	creds := c.credentials()
 
 	planLogAttrs := []any{"database", c.config.Database}
 	planLogAttrs = append(planLogAttrs, dsnLogAttrs(c.config.TargetDSN)...)
 	planLogAttrs = append(planLogAttrs, "schema_file_count", len(schemaFiles))
 	c.logger.Info("LocalClient.Plan: calling engine", planLogAttrs...)
 
-	result, err := eng.Plan(ctx, &engine.PlanRequest{
-		Database:     c.config.Database,
-		DatabaseType: c.config.Type,
-		SchemaFiles:  schemaFiles,
-		Repository:   req.Repository,
-		PullRequest:  int(req.PullRequest),
-		Credentials:  creds,
-	})
+	result, err := c.planWithEngine(ctx, req, c.config.Database, schemaFiles)
 	if err != nil {
 		c.logger.Error("plan failed", "error", err, "database", c.config.Database)
 		return nil, err // Error already has clear prefix (SQL syntax/usage error)
@@ -535,6 +621,73 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		Changes:        changes,
 		LintViolations: violations,
 	}, nil
+}
+
+func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
+	eng := c.getEngine()
+	if eng == nil {
+		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+	if c.config.Type != storage.DatabaseTypeMySQL {
+		return c.planNamespaceWithEngine(ctx, eng, req, database, schemaFiles, c.credentials())
+	}
+	hasDatabase, err := mysqlDSNHasDatabase(c.config.TargetDSN)
+	if err != nil {
+		return nil, err
+	}
+	if hasDatabase {
+		return c.planNamespaceWithEngine(ctx, eng, req, database, schemaFiles, c.credentials())
+	}
+	if len(schemaFiles) == 0 {
+		return nil, fmt.Errorf("schema files are required for namespace-free MySQL target DSN")
+	}
+	if len(schemaFiles) == 1 {
+		for namespace := range schemaFiles {
+			creds, err := c.credentialsForMySQLNamespace(namespace)
+			if err != nil {
+				return nil, err
+			}
+			return c.planNamespaceWithEngine(ctx, eng, req, namespace, schemaFiles, creds)
+		}
+	}
+	return c.planMySQLNamespacesWithEngine(ctx, eng, req, schemaFiles)
+}
+
+func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.Engine, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles, creds *engine.Credentials) (*engine.PlanResult, error) {
+	return eng.Plan(ctx, &engine.PlanRequest{
+		Database:     database,
+		DatabaseType: c.config.Type,
+		SchemaFiles:  schemaFiles,
+		Repository:   req.Repository,
+		PullRequest:  int(req.PullRequest),
+		Credentials:  creds,
+	})
+}
+
+func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng engine.Engine, req *ternv1.PlanRequest, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
+	namespaces := make([]string, 0, len(schemaFiles))
+	for namespace := range schemaFiles {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+
+	result := &engine.PlanResult{PlanID: fmt.Sprintf("plan-%d", time.Now().UnixNano()), NoChanges: true}
+	for _, namespace := range namespaces {
+		creds, err := c.credentialsForMySQLNamespace(namespace)
+		if err != nil {
+			return nil, err
+		}
+		nsResult, err := c.planNamespaceWithEngine(ctx, eng, req, namespace, schema.SchemaFiles{namespace: schemaFiles[namespace]}, creds)
+		if err != nil {
+			return nil, fmt.Errorf("plan MySQL namespace %q: %w", namespace, err)
+		}
+		result.Changes = append(result.Changes, nsResult.Changes...)
+		result.LintViolations = append(result.LintViolations, nsResult.LintViolations...)
+		if !nsResult.NoChanges || len(nsResult.Changes) > 0 {
+			result.NoChanges = false
+		}
+	}
+	return result, nil
 }
 
 // Apply executes a previously generated plan.

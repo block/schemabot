@@ -206,10 +206,13 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	if len(applyTasks) == 0 {
 		return nil, fmt.Errorf("no tasks found for apply %s", apply.ApplyIdentifier)
 	}
-	creds := c.credentials()
 	eng := c.getEngine()
 	if eng == nil {
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+	creds, err := c.credentialsForTask(applyTasks[0])
+	if err != nil {
+		return nil, fmt.Errorf("resolve credentials for deferred deploy task %s: %w", applyTasks[0].TaskIdentifier, err)
 	}
 	controlReq, err := c.buildControlRequest(ctx, applyTasks[0], creds, eng, engine.ControlStart)
 	if err != nil {
@@ -393,18 +396,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 // still needs schema changes. Returns false if the table already has the
 // desired schema (e.g., Spirit's cutover completed during the stop sequence).
 func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, tableName string) (bool, error) {
-	creds := c.credentials()
-	eng := c.getEngine()
-	if eng == nil {
-		return false, fmt.Errorf("no engine available")
-	}
-
-	result, err := eng.Plan(ctx, &engine.PlanRequest{
-		Database:     apply.Database,
-		DatabaseType: c.config.Type,
-		SchemaFiles:  plan.SchemaFiles,
-		Credentials:  creds,
-	})
+	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
 	if err != nil {
 		return false, fmt.Errorf("re-plan check failed: %w", err)
 	}
@@ -431,18 +423,7 @@ type replanResult struct {
 // Used by both Start() and ResumeApply() to handle tables that completed before
 // stop or crash.
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
-	creds := c.credentials()
-	eng := c.getEngine()
-	if eng == nil {
-		return nil, fmt.Errorf("no engine available")
-	}
-
-	replanOut, err := eng.Plan(ctx, &engine.PlanRequest{
-		Database:     apply.Database,
-		DatabaseType: c.config.Type,
-		SchemaFiles:  plan.SchemaFiles,
-		Credentials:  creds,
-	})
+	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("re-plan failed: %w", err)
 	}
@@ -568,10 +549,13 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string, block bool, startRequested bool) error {
 
 	allTasks := tasks
-	creds := c.credentials()
 	eng := c.getEngine()
 	if eng == nil {
 		return fmt.Errorf("no engine available for grouped resume apply %s", apply.ApplyIdentifier)
+	}
+	creds, err := c.credentialsForGroupedApply(plan)
+	if err != nil {
+		return fmt.Errorf("resolve credentials for grouped resume apply %s: %w", apply.ApplyIdentifier, err)
 	}
 
 	if drainer, ok := eng.(engine.Drainer); ok {

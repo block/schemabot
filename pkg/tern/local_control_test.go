@@ -163,8 +163,9 @@ func (e *controlCaptureEngine) Progress(context.Context, *engine.ProgressRequest
 func newMySQLControlTestClient(apply *storage.Apply, tasks []*storage.Task, eng *controlCaptureEngine) *LocalClient {
 	return &LocalClient{
 		config: LocalConfig{
-			Database: "testdb",
-			Type:     storage.DatabaseTypeMySQL,
+			Database:  "testdb",
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
 		},
 		storage: &controlTestStorage{
 			applies:   &controlTestApplyStore{apply: apply},
@@ -233,6 +234,7 @@ func TestLocalClient_StopMarksMySQLApplyStopped(t *testing.T) {
 		ApplyID:        apply.ID,
 		TaskIdentifier: "task-mysql-stop",
 		Database:       "testdb",
+		Namespace:      "testdb",
 		State:          state.Task.Running,
 	}
 	eng := &controlCaptureEngine{}
@@ -319,6 +321,7 @@ func TestLocalClient_StopAllTasksTerminalDerivesApplyState(t *testing.T) {
 					TaskIdentifier: fmt.Sprintf("task-mysql-stop-terminal-%d", i+1),
 					TableName:      fmt.Sprintf("t%d", i+1),
 					Database:       "testdb",
+					Namespace:      "testdb",
 					State:          taskState,
 				}
 				if i < len(tc.taskErrors) {
@@ -521,6 +524,7 @@ func TestLocalClient_StopRecoveringMySQLStopsEngineBeforeStorage(t *testing.T) {
 		ApplyID:        apply.ID,
 		TaskIdentifier: "task-mysql-recovering",
 		Database:       "testdb",
+		Namespace:      "testdb",
 		State:          state.Task.Recovering,
 	}
 	eng := &controlCaptureEngine{}

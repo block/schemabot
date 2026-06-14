@@ -19,7 +19,6 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	ctx, cancelApply := context.WithCancel(ctx)
 	defer cancelApply()
 	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
-	creds := c.credentials()
 	mode := groupedApplyMode(apply)
 	modeDescription := groupedApplyModeDescription(apply)
 
@@ -55,6 +54,11 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		}
 		c.failApplyWithTasks(ctx, apply, tasks,
 			fmt.Sprintf("MySQL applies support one namespace per apply, but plan has %d: %v", len(plan.Namespaces), names))
+		return
+	}
+	creds, err := c.credentialsForGroupedApply(plan)
+	if err != nil {
+		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
 		return
 	}
 	changes := planNamespacesToChanges(plan.Namespaces)
