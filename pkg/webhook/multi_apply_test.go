@@ -82,17 +82,18 @@ func TestBuildDeploymentDetail_UsesOperationStateAndError(t *testing.T) {
 }
 
 // The storage→presentation boundary resolves the rollout policies: barrier flips
-// the Barrier flag, and a nil halt_on_failure resolves to true (the safe default).
+// the Barrier flag, and on_failure becomes HaltOnFailure — true unless on_failure
+// is "continue", so an unset value resolves to halting (the safe default).
 func TestApplyOperationToPresentation_ResolvesPolicies(t *testing.T) {
 	barrier := applyOperationToPresentation(&storage.ApplyOperation{
 		Deployment: "eu", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
 	assert.True(t, barrier.Barrier)
-	assert.True(t, barrier.HaltOnFailure, "nil halt_on_failure resolves to true")
+	assert.True(t, barrier.HaltOnFailure, "unset on_failure resolves to halting")
 
 	rolling := applyOperationToPresentation(&storage.ApplyOperation{
 		Deployment: "us", State: state.ApplyOperation.Running,
-		CutoverPolicy: storage.CutoverPolicyRolling, HaltOnFailure: new(false),
+		CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureContinue,
 	})
 	assert.False(t, rolling.Barrier)
 	assert.False(t, rolling.HaltOnFailure)

@@ -64,14 +64,15 @@ func deriveApplyPresentation(ops []*storage.ApplyOperation) presentation.Apply {
 
 // applyOperationToPresentation maps one storage operation row to the neutral
 // presentation input, resolving the two rollout-policy values at the boundary:
-// cutover_policy "barrier" becomes the Barrier flag, and a nil halt_on_failure
-// resolves to true (the safe default the claim predicate also assumes).
+// cutover_policy "barrier" becomes the Barrier flag, and on_failure becomes the
+// HaltOnFailure flag — true unless on_failure is "continue", so any other value
+// fails closed to halting, the safe default the claim predicate also assumes.
 func applyOperationToPresentation(op *storage.ApplyOperation) presentation.Operation {
 	return presentation.Operation{
 		Deployment:    op.Deployment,
 		State:         op.State,
 		Barrier:       op.CutoverPolicy == storage.CutoverPolicyBarrier,
-		HaltOnFailure: op.HaltOnFailure == nil || *op.HaltOnFailure,
+		HaltOnFailure: op.OnFailure != storage.OnFailureContinue,
 		Error:         op.ErrorMessage,
 	}
 }
