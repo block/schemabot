@@ -1259,6 +1259,52 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 		assert.False(t, state.IsState(got, state.Apply.Completed), "derived state must not clobber the pending sibling to completed")
 	})
 
+	// Under on_failure "continue" a terminally failed deployment does not
+	// terminalize the apply while a sibling is still pending: the apply is held
+	// running so the remaining deployment gets its turn, then settles to failed
+	// once every sibling is terminal.
+	t.Run("continue policy holds the apply active past a failed deployment", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Failed)}
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						{ID: currentOpID, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue},
+						{ID: 2, State: state.ApplyOperation.Pending, OnFailure: storage.OnFailureContinue},
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-continue"}
+
+		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.True(t, ok, "current op row present, projection must be determined")
+		assert.Equal(t, state.Apply.Running, got, "continue policy must hold the apply active until the pending sibling settles")
+	})
+
+	// Default policy (on_failure unset) fails closed: a terminally failed
+	// deployment terminalizes the apply even with a pending sibling.
+	t.Run("default policy terminalizes the apply on a failed deployment", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Failed)}
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						{ID: currentOpID, State: state.ApplyOperation.Failed},
+						{ID: 2, State: state.ApplyOperation.Pending},
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-halt"}
+
+		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.True(t, ok, "current op row present, projection must be determined")
+		assert.Equal(t, state.Apply.Failed, got, "default policy must terminalize the apply on a failed deployment")
+	})
+
 	// No operation model in use: the tasks carry no apply_operation_id, or the
 	// operation store is not configured. There are no siblings, so the per-task
 	// derivation is authoritative and may terminalize — this preserves

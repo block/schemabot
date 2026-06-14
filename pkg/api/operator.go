@@ -723,9 +723,13 @@ func (s *Service) markOperationFromApplyState(ctx context.Context, workerID int,
 //
 // This is the inverse of markOperationFromApplyState: the operator drives each
 // operation row to its state, then the parent apply's state follows from the
-// aggregate via the same state.DeriveApplyState that derives apply state from
-// task states. While an apply has exactly one operation the derived value equals
-// the value ResumeApply already persisted, so this is a no-op until the
+// aggregate via state.DeriveRolloutApplyState, the policy-aware projection over
+// all operation rows. Under on_failure "continue" a terminal-failed sibling no
+// longer terminalizes the apply while other siblings are still in flight; the
+// apply is held running until the rollout settles, then takes the failed verdict.
+// Every other policy (halt, pause, unrecognized) fails closed to the failed
+// verdict. While an apply has exactly one operation the derived value equals the
+// value ResumeApply already persisted, so this is a no-op until the
 // multi-deployment fan-out makes an apply own more than one operation.
 //
 // The caller is responsible for lease scoping: the active operator path passes a
@@ -742,11 +746,14 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 		return fmt.Errorf("derive apply state for apply %s (%d): no apply_operations rows", apply.ApplyIdentifier, apply.ID)
 	}
 
-	childStates := make([]string, len(ops))
+	children := make([]state.RolloutChild, len(ops))
 	for i, op := range ops {
-		childStates[i] = op.State
+		children[i] = state.RolloutChild{
+			State:             op.State,
+			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
+		}
 	}
-	derived := state.DeriveApplyState(childStates)
+	derived := state.DeriveRolloutApplyState(children)
 
 	if state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived) {
 		return fmt.Errorf("derive apply state for terminal apply %s (%d): child operations derive non-terminal state %q from parent state %q",

@@ -127,6 +127,73 @@ func DeriveApplyState(taskStates []string) string {
 	return Apply.Pending
 }
 
+// RolloutChild is one apply_operation's contribution to the parent apply's
+// rollout projection: its derived state plus whether the on_failure policy
+// captured on that operation lets the rollout continue past a terminal failure.
+//
+// ContinueOnFailure must be set by the caller using the exact-match semantics of
+// the claim predicate: only the literal on_failure value "continue" is
+// continuable; "halt", "pause", and any unrecognized value are not, so the
+// projection fails closed (a failed sibling keeps the apply failed) on anything
+// but an explicit continue.
+type RolloutChild struct {
+	// State is the child operation's derived apply state.
+	State string
+	// ContinueOnFailure is true only when the operation's on_failure policy is
+	// exactly "continue".
+	ContinueOnFailure bool
+}
+
+// DeriveRolloutApplyState projects the parent apply's state over all of its
+// child operations, accounting for the on_failure rollout-continuation policy.
+//
+// It builds on DeriveApplyState: the base projection is computed the same way,
+// and any non-failed base is returned unchanged. The policy only modulates the
+// failed case. continue governs rollout *continuation*, never the apply's
+// pass/fail verdict — so an apply that suffered a continuable failure still
+// settles to failed once every sibling is terminal; the policy only delays that
+// verdict so the remaining siblings get their turn instead of the first failure
+// terminalizing the whole apply.
+//
+// When the base projection is failed (at least one child terminally failed):
+//
+//   - if any failed child is not continuable (ContinueOnFailure false), the
+//     failure stands and the apply is failed (fail closed, matching halt); else
+//   - if every child is terminal, the rollout is settled and the apply is
+//     failed (the verdict still reflects the failure); else
+//   - the apply is held running so the still-in-flight siblings can run to
+//     completion under continue.
+//
+// An empty child set returns Pending, matching DeriveApplyState.
+func DeriveRolloutApplyState(children []RolloutChild) string {
+	if len(children) == 0 {
+		return Apply.Pending
+	}
+
+	childStates := make([]string, len(children))
+	for i, c := range children {
+		childStates[i] = c.State
+	}
+	base := DeriveApplyState(childStates)
+	if !IsState(base, Apply.Failed) {
+		return base
+	}
+
+	allTerminal := true
+	for _, c := range children {
+		if IsState(c.State, Apply.Failed) && !c.ContinueOnFailure {
+			return Apply.Failed
+		}
+		if !IsTerminalApplyState(c.State) {
+			allTerminal = false
+		}
+	}
+	if allTerminal {
+		return Apply.Failed
+	}
+	return Apply.Running
+}
+
 // normalizeApplyState converts a task state string to its canonical lowercase form.
 func normalizeApplyState(raw string) string {
 	switch strings.ToUpper(raw) {

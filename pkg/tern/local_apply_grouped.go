@@ -310,9 +310,15 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 }
 
 // deriveAggregateApplyState computes applies.state as the rollout projection
-// over every apply_operation row of the apply. The boolean is false when the
-// projection could not be determined safely and the caller must leave the
+// over every apply_operation row of the apply, accounting for each operation's
+// on_failure policy via state.DeriveRolloutApplyState. The boolean is false when
+// the projection could not be determined safely and the caller must leave the
 // stored apply state unchanged.
+//
+// Under on_failure "continue" a terminal-failed sibling does not terminalize the
+// apply while other siblings are still in flight: the apply is held running until
+// the rollout settles, then takes the failed verdict. Every other policy fails
+// closed and a failed sibling terminalizes the apply immediately.
 //
 // Invariant: applies.state is the rollout projection over all operations of the
 // apply, not only the operation this drive is executing. The current
@@ -391,22 +397,25 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 		return failClosed()
 	}
 
-	childStates := make([]string, len(ops))
+	children := make([]state.RolloutChild, len(ops))
 	foundCurrent := false
 	for i, op := range ops {
-		if op.ID == operationID {
-			childStates[i] = currentOpState
-			foundCurrent = true
-			continue
+		child := state.RolloutChild{
+			State:             op.State,
+			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
 		}
-		childStates[i] = op.State
+		if op.ID == operationID {
+			child.State = currentOpState
+			foundCurrent = true
+		}
+		children[i] = child
 	}
 	if !foundCurrent {
 		c.logger.Warn("cannot determine aggregate apply state: current operation row missing from sibling set",
 			"apply_id", apply.ApplyIdentifier, "apply_operation_id", operationID)
 		return failClosed()
 	}
-	return state.DeriveApplyState(childStates), true
+	return state.DeriveRolloutApplyState(children), true
 }
 
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).

@@ -305,3 +305,108 @@ func TestNormalizeApplyState_NewStates(t *testing.T) {
 	assert.Equal(t, Apply.ValidatingBranch, normalizeApplyState("VALIDATING_BRANCH"))
 	assert.Equal(t, Apply.ValidatingDeployRequest, normalizeApplyState("VALIDATING_DEPLOY_REQUEST"))
 }
+
+// rc builds a RolloutChild from a state and its continuation policy so the
+// truth-table cases below read like the rollout scenario they describe.
+func rc(state string, continueOnFailure bool) RolloutChild {
+	return RolloutChild{State: state, ContinueOnFailure: continueOnFailure}
+}
+
+func TestDeriveRolloutApplyState_Empty(t *testing.T) {
+	assert.Equal(t, Apply.Pending, DeriveRolloutApplyState(nil))
+	assert.Equal(t, Apply.Pending, DeriveRolloutApplyState([]RolloutChild{}))
+}
+
+// TestDeriveRolloutApplyState_NoFailureMatchesBase verifies that when no child
+// has terminally failed, the rollout projection is exactly the base projection
+// regardless of any child's continuation policy.
+func TestDeriveRolloutApplyState_NoFailureMatchesBase(t *testing.T) {
+	cases := []struct {
+		name     string
+		children []RolloutChild
+		want     string
+	}{
+		{
+			name:     "all pending",
+			children: []RolloutChild{rc(Apply.Pending, false), rc(Apply.Pending, true)},
+			want:     Apply.Pending,
+		},
+		{
+			name:     "all completed",
+			children: []RolloutChild{rc(Apply.Completed, true), rc(Apply.Completed, true)},
+			want:     Apply.Completed,
+		},
+		{
+			name:     "running and completed",
+			children: []RolloutChild{rc(Apply.Running, true), rc(Apply.Completed, true)},
+			want:     Apply.Running,
+		},
+		{
+			name:     "stopped sibling holds",
+			children: []RolloutChild{rc(Apply.Stopped, true), rc(Apply.Completed, true)},
+			want:     Apply.Stopped,
+		},
+		{
+			name:     "failed_retryable not yet failed",
+			children: []RolloutChild{rc(Apply.FailedRetryable, true), rc(Apply.Running, true)},
+			want:     Apply.FailedRetryable,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DeriveRolloutApplyState(tc.children))
+		})
+	}
+}
+
+// TestDeriveRolloutApplyState_FailurePolicy is the truth table for the failed
+// base case: continue holds the apply active until siblings settle, while halt,
+// pause, and unrecognized policies fail closed to the failed verdict.
+func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
+	cases := []struct {
+		name     string
+		children []RolloutChild
+		want     string
+	}{
+		{
+			name:     "continue failure with pending sibling holds running",
+			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Pending, true)},
+			want:     Apply.Running,
+		},
+		{
+			name:     "continue failure with running sibling holds running",
+			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Running, true)},
+			want:     Apply.Running,
+		},
+		{
+			name:     "continue failure with all siblings terminal settles failed",
+			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Completed, true)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "continue failure with another failed continue sibling settles failed",
+			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Failed, true)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "non-continuable (halt) failure fails closed even with pending sibling",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Pending, false)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "mixed: one continue failure, one halt failure fails closed",
+			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Failed, false), rc(Apply.Pending, true)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "continue failure with completed and pending holds running",
+			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Completed, true), rc(Apply.Pending, true)},
+			want:     Apply.Running,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, DeriveRolloutApplyState(tc.children))
+		})
+	}
+}
