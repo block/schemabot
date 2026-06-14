@@ -2090,6 +2090,19 @@ func TestE2EApplyWithNoCurrentSchemaFilesExplainsInProgressApply(t *testing.T) {
 	assert.NotContains(t, body, "truncated repository tree")
 }
 
+// TestE2EApplyConfirmWithNoCurrentSchemaFilesExplainsInProgressApply verifies
+// that apply-confirm also fails closed before discovery when a PR no longer has
+// managed schema files but still owns an in-flight apply.
+func TestE2EApplyConfirmWithNoCurrentSchemaFilesExplainsInProgressApply(t *testing.T) {
+	body, treeCalls := runCommandWithNoCurrentSchemaFilesAndApplyOwnedCheck(t, "schemabot apply-confirm -e staging", state.Apply.Running, checkStatusInProgress, "")
+
+	assert.Zero(t, treeCalls, "empty-diff apply-confirm should not use whole-repo git tree discovery")
+	assert.Contains(t, body, "SchemaBot is still applying a schema change from this PR")
+	assert.Contains(t, body, "schemabot stop apply-empty-diff -e staging")
+	assert.Contains(t, body, "schemabot rollback apply-empty-diff -e staging")
+	assert.NotContains(t, body, "truncated repository tree")
+}
+
 func runCommandWithNoCurrentSchemaFilesAndApplyOwnedCheck(t *testing.T, comment, applyState, checkStatus, checkConclusion string) (string, int64) {
 	t.Helper()
 

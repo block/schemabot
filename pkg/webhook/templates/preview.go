@@ -71,7 +71,8 @@ func PreviewCommentNoManagedSchemaChanges() string {
 }
 
 // PreviewCommentSchemaReconciliationInProgress renders the reconciliation
-// comment for a PR whose current diff no longer contains a running apply.
+// comment for a PR whose current diff no longer contains managed schema files
+// while a stored apply from that PR is still running.
 func PreviewCommentSchemaReconciliationInProgress() string {
 	return RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{
 		RequestedBy: previewRequestedBy,
@@ -89,7 +90,8 @@ func PreviewCommentSchemaReconciliationInProgress() string {
 }
 
 // PreviewCommentSchemaReconciliationCompleted renders the reconciliation
-// comment for a PR whose current diff no longer contains a completed apply.
+// comment for a PR whose current diff no longer contains managed schema files
+// after a stored apply from that PR has completed.
 func PreviewCommentSchemaReconciliationCompleted() string {
 	return RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{
 		RequestedBy: previewRequestedBy,
