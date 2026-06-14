@@ -3,6 +3,7 @@ package templates
 import (
 	"time"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -776,6 +777,138 @@ func PreviewCommentApplyCuttingOver() string {
 		tables[i].Status = state.Task.CuttingOver
 	}
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.CuttingOver, tables))
+}
+
+// =============================================================================
+// Multi-Deployment Apply Previews (MD-10)
+// =============================================================================
+//
+// These render the aggregate PR comment for an apply that fans out across more
+// than one deployment of a single environment. The per-deployment <details>
+// bodies reuse the single-deployment renderer, so each scenario seeds both the
+// derived rollup (presentation.Derive) and the per-deployment detail data.
+
+// sampleDeploymentDetail builds one deployment's single-deployment comment data
+// for the per-deployment <details> body, with its own database name.
+func sampleDeploymentDetail(database, applyState string, tables []TableProgressData) ApplyStatusCommentData {
+	return ApplyStatusCommentData{
+		Database:    database,
+		Environment: "production",
+		RequestedBy: "aparajon",
+		State:       applyState,
+		Engine:      "Spirit",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		StartedAt:   sampleTime().Add(-8 * time.Minute).UTC().Format(time.RFC3339),
+		Tables:      tables,
+	}
+}
+
+// PreviewCommentMultiDeploymentApplyInProgress renders a barrier rollout
+// mid-flight: one deployment parked ready for cutover, one copying, two queued.
+func PreviewCommentMultiDeploymentApplyInProgress() string {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "eu", State: state.ApplyOperation.WaitingForCutover, Barrier: true, HaltOnFailure: true},
+		{Deployment: "us", State: state.ApplyOperation.Running, Barrier: true, HaltOnFailure: true},
+		{Deployment: "au", State: state.ApplyOperation.Pending, Barrier: true, HaltOnFailure: true},
+		{Deployment: "ca", State: state.ApplyOperation.Pending, Barrier: true, HaltOnFailure: true},
+	})
+
+	euTables := sampleApplyTables()
+	for i := range euTables {
+		euTables[i].Status = state.Task.WaitingForCutover
+	}
+
+	usTables := sampleApplyTables()
+	usTables[0].Status = state.Task.Completed
+	usTables[1].Status = state.Task.Running
+	usTables[1].RowsCopied = 914707
+	usTables[1].RowsTotal = 1466232
+	usTables[1].PercentComplete = 62
+	usTables[1].ETASeconds = 195
+	usTables[2].Status = state.Task.Pending
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-12 * time.Minute).UTC().Format(time.RFC3339),
+		Details: map[string]ApplyStatusCommentData{
+			"eu": sampleDeploymentDetail("payments_eu", state.Apply.WaitingForCutover, euTables),
+			"us": sampleDeploymentDetail("payments_us", state.Apply.Running, usTables),
+		},
+	})
+}
+
+// PreviewCommentMultiDeploymentApplyFailed renders a halt-on-failure rollout
+// where one deployment failed: completed deployments stay completed, later
+// deployments are halted, and the aggregate is failed with retry as next action.
+func PreviewCommentMultiDeploymentApplyFailed() string {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "eu", State: state.ApplyOperation.Completed, HaltOnFailure: true},
+		{Deployment: "us", State: state.ApplyOperation.Failed, HaltOnFailure: true, Error: PreviewErrorMiddleFailed},
+		{Deployment: "au", State: state.ApplyOperation.Pending, HaltOnFailure: true},
+		{Deployment: "ca", State: state.ApplyOperation.Pending, HaltOnFailure: true},
+	})
+
+	euTables := sampleApplyTables()
+	for i := range euTables {
+		euTables[i].Status = state.Task.Completed
+	}
+
+	usTables := sampleApplyTables()
+	usTables[0].Status = state.Task.Completed
+	usTables[1].Status = state.Task.Failed
+	usTables[1].RowsCopied = 439870
+	usTables[1].RowsTotal = 1466232
+	usTables[1].PercentComplete = 30
+	usTables[2].Status = state.Task.Cancelled
+	usDetail := sampleDeploymentDetail("payments_us", state.Apply.Failed, usTables)
+	usDetail.ErrorMessage = PreviewErrorMiddleFailed
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		Details: map[string]ApplyStatusCommentData{
+			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, euTables),
+			"us": usDetail,
+		},
+	})
+}
+
+// PreviewCommentMultiDeploymentApplyCompleted renders a fully completed rollout
+// across all deployments — aggregate applied, no pending operator action.
+func PreviewCommentMultiDeploymentApplyCompleted() string {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "eu", State: state.ApplyOperation.Completed, HaltOnFailure: true},
+		{Deployment: "us", State: state.ApplyOperation.Completed, HaltOnFailure: true},
+		{Deployment: "au", State: state.ApplyOperation.Completed, HaltOnFailure: true},
+	})
+
+	completedTables := func() []TableProgressData {
+		tables := sampleApplyTables()
+		for i := range tables {
+			tables[i].Status = state.Task.Completed
+		}
+		return tables
+	}
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+		Details: map[string]ApplyStatusCommentData{
+			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, completedTables()),
+			"us": sampleDeploymentDetail("payments_us", state.Apply.Completed, completedTables()),
+			"au": sampleDeploymentDetail("payments_au", state.Apply.Completed, completedTables()),
+		},
+	})
 }
 
 // =============================================================================

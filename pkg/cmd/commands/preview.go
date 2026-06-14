@@ -83,6 +83,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyEstimateExceeded,
 		templates.PreviewCommentApplyFailed, templates.PreviewCommentApplyStopped,
 		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
+		templates.PreviewCommentMultiDeployInProgress, templates.PreviewCommentMultiDeployFailed,
+		templates.PreviewCommentMultiDeployCompleted, templates.PreviewCommentMultiDeployAll,
 		templates.PreviewCommentSingleProgress, templates.PreviewCommentSingleComplete,
 		templates.PreviewCommentSingleFailed, templates.PreviewCommentSingleStopped,
 		templates.PreviewCommentSummaryCompleted, templates.PreviewCommentSummaryFailed,

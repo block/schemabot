@@ -3990,6 +3990,11 @@ No schema changes found for database 'new-db'
 ```
 </details>
 
+
+## Apply Gates
+
+### PR Comments
+
 <details>
 <summary><a name="apply-plan-lock--confirm"></a><strong>Apply Plan (Lock + Confirm)</strong></summary>
 
@@ -4455,6 +4460,371 @@ Wait for checks to complete and retry:
 schemabot apply -e staging
 ```
 
+</details>
+
+## Multi-Deployment Apply
+
+### PR Comments
+
+<details>
+<summary><a name="barrier-rollout-in-progress"></a><strong>Barrier Rollout In Progress</strong></summary>
+
+
+## Schema Change In Progress
+
+**Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 12m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Deployments**: 1 ready for cutover, 1 running, 2 waiting
+
+---
+
+To cut over `eu`:
+```
+schemabot cutover apply-a1b2c3d4e5f6
+```
+
+- 🟢 eu — ready for cutover — next in order
+- 🔄 us — running table copy
+- ⏳ au — waiting for us
+- ⏳ ca — waiting for us
+
+<details open>
+<summary>🟢 eu — ready for cutover — next in order</summary>
+
+## Schema Change — Waiting for Cutover
+
+**Database**: `payments_eu` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**0/3** table(s) ready for cutover — waiting on 3
+
+📊 3 waiting for cutover
+
+### Table Progress
+
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+To proceed with cutover:
+```
+schemabot cutover apply-a1b2c3d4e5f6
+```
+
+</details>
+
+<details open>
+<summary>🔄 us — running table copy</summary>
+
+## Schema Change In Progress
+
+**Database**: `payments_us` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+📊 1/3 complete · 1 running (62%) · 1 queued
+
+### Table Progress
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6
+```
+
+</details>
+
+<details>
+<summary>⏳ au — waiting for us</summary>
+
+_No details available yet._
+
+</details>
+
+<details>
+<summary>⏳ ca — waiting for us</summary>
+
+_No details available yet._
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="halt-on-failure-one-deployment-failed"></a><strong>Halt On Failure (One Deployment Failed)</strong></summary>
+
+
+## ❌ Schema Change Failed
+
+**Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 20m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Deployments**: 1 completed, 2 halted, 1 failed
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+- ✅ eu — completed
+- ❌ us — failed
+- ⏸ au — halted — us failed
+- ⏸ ca — halted — us failed
+
+<details>
+<summary>✅ eu — completed</summary>
+
+## ✅ Schema Change Applied
+
+**Database**: `payments_eu` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+📊 3/3 complete
+
+### Table Progress
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+</details>
+
+<details open>
+<summary>❌ us — failed</summary>
+
+## ❌ Schema Change Failed
+
+**Database**: `payments_us` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+📊 1/3 complete · 1 failed · 1 cancelled
+
+### Table Progress
+
+**`users`**: 🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`products`**: ⊘ Cancelled (not started)
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details open>
+<summary>⏸ au — halted — us failed</summary>
+
+_No details available yet._
+
+</details>
+
+<details open>
+<summary>⏸ ca — halted — us failed</summary>
+
+_No details available yet._
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="all-deployments-completed"></a><strong>All Deployments Completed</strong></summary>
+
+
+## ✅ Schema Change Applied
+
+**Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 28m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Deployments**: 3 completed
+
+- ✅ eu — completed
+- ✅ us — completed
+- ✅ au — completed
+
+<details>
+<summary>✅ eu — completed</summary>
+
+## ✅ Schema Change Applied
+
+**Database**: `payments_eu` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+📊 3/3 complete
+
+### Table Progress
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+</details>
+
+<details>
+<summary>✅ us — completed</summary>
+
+## ✅ Schema Change Applied
+
+**Database**: `payments_us` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+📊 3/3 complete
+
+### Table Progress
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+</details>
+
+<details>
+<summary>✅ au — completed</summary>
+
+## ✅ Schema Change Applied
+
+**Database**: `payments_au` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+📊 3/3 complete
+
+### Table Progress
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+</details>
 </details>
 
 ## Sequential Mode (CLI)

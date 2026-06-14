@@ -227,6 +227,18 @@ func previewCommentApplyFlowAllOutput() {
 	printSections(sections)
 }
 
+func previewCommentMultiDeployAllOutput() {
+	sections := []struct {
+		name string
+		fn   func()
+	}{
+		{"BARRIER ROLLOUT IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyInProgress()) }},
+		{"HALT ON FAILURE (ONE DEPLOYMENT FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyFailed()) }},
+		{"ALL DEPLOYMENTS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyCompleted()) }},
+	}
+	printSections(sections)
+}
+
 func previewCLIPlanAllOutput() {
 	sections := []struct {
 		name string

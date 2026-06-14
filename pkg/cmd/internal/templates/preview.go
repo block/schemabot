@@ -131,6 +131,12 @@ const (
 	PreviewCommentApplyWaitingCutover   PreviewType = "comment_apply_waiting_cutover"   // Waiting for cutover
 	PreviewCommentApplyCuttingOver      PreviewType = "comment_apply_cutting_over"      // Cutting over
 
+	// Multi-deployment apply comment previews (one apply fanned out across deployments)
+	PreviewCommentMultiDeployInProgress PreviewType = "comment_multi_deploy_in_progress" // Barrier rollout mid-flight
+	PreviewCommentMultiDeployFailed     PreviewType = "comment_multi_deploy_failed"      // Halt-on-failure: one deployment failed
+	PreviewCommentMultiDeployCompleted  PreviewType = "comment_multi_deploy_completed"   // All deployments completed
+	PreviewCommentMultiDeployAll        PreviewType = "comment_multi_deploy_all"         // Show all multi-deployment apply previews
+
 	// Single-table apply comment previews (most common case)
 	PreviewCommentSingleProgress          PreviewType = "comment_single_progress"            // Single table running
 	PreviewCommentSingleComplete          PreviewType = "comment_single_complete"            // Single table completed

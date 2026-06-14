@@ -150,8 +150,17 @@ render_paired_section "Apply Flow"     "comment_apply_flow_all" "cli_apply_all"
     echo ""
     echo "### PR Comments"
     echo ""
-    "$BINARY" preview "comment_apply_all" 2>&1 | wrap_sections >> "$SNAPSHOT"
-}
+    "$BINARY" preview "comment_apply_all" 2>&1 | wrap_sections
+} >> "$SNAPSHOT"
+
+{
+    echo ""
+    echo "## Multi-Deployment Apply"
+    echo ""
+    echo "### PR Comments"
+    echo ""
+    "$BINARY" preview "comment_multi_deploy_all" 2>&1 | wrap_sections
+} >> "$SNAPSHOT"
 
 # === CLI-only sections ===
 render_cli_section "Sequential Mode (CLI)" "sequential_all"
