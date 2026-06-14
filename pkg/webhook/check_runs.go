@@ -60,10 +60,10 @@ var schemaRemovedAfterApplyBlock = checkBlockReason{
 
 // rollbackCompletedBlock is used after a rollback succeeds. The target
 // environment no longer has the schema requested by the PR, so the check must
-// stay blocked until the schema change is applied again or the PR is updated.
+// stay blocked until the PR and live schema are reconciled.
 var rollbackCompletedBlock = checkBlockReason{
 	blockingReason: "rollback_completed",
-	message:        "Schema changes were rolled back in this environment; apply again before this check can pass.",
+	message:        "Schema changes were rolled back in this environment; apply the PR schema changes again, or reconcile the PR and live schema before this check can pass.",
 }
 
 // githubConfigDiscoveryUnavailableBlock is used when GitHub is unavailable

@@ -2056,6 +2056,7 @@ func TestE2EPlanWithNoCurrentSchemaFilesExplainsInProgressApply(t *testing.T) {
 	assert.Contains(t, body, "schemabot stop apply-empty-diff -e staging")
 	assert.Contains(t, body, "schemabot rollback apply-empty-diff -e staging")
 	assert.Contains(t, body, "schemabot plan -e staging -d webhook_empty_diff_apply")
+	assert.Contains(t, body, "do not run `schemabot plan` on this empty-diff PR")
 	assert.NotContains(t, body, "truncated repository tree")
 	assert.NotContains(t, body, "schemabot status")
 }
@@ -2073,6 +2074,8 @@ func TestE2EPlanWithNoCurrentSchemaFilesExplainsCompletedApply(t *testing.T) {
 	assert.Contains(t, body, "Undo the live schema change")
 	assert.Contains(t, body, "schemabot rollback apply-empty-diff -e staging")
 	assert.Contains(t, body, "schemabot plan -e staging -d webhook_empty_diff_apply")
+	assert.Contains(t, body, "do not run `schemabot plan` on this empty-diff PR")
+	assert.Contains(t, body, "clear the blocked check state")
 	assert.NotContains(t, body, "truncated repository tree")
 	assert.NotContains(t, body, "Git reverting")
 }

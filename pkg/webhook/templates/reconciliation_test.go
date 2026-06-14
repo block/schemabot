@@ -27,6 +27,7 @@ func TestRenderSchemaChangeReconciliationRequiredInProgress(t *testing.T) {
 	assert.Contains(t, rendered, "schemabot stop apply-1234 -e staging")
 	assert.Contains(t, rendered, "schemabot rollback apply-1234 -e staging")
 	assert.Contains(t, rendered, "schemabot plan -e staging -d orders")
+	assert.Contains(t, rendered, "do not run `schemabot plan` on this empty-diff PR")
 	assert.NotContains(t, rendered, "Git reverting")
 	assert.NotContains(t, rendered, "Removing the schema change")
 }
@@ -52,6 +53,8 @@ func TestRenderSchemaChangeReconciliationRequiredCompleted(t *testing.T) {
 	assert.Contains(t, rendered, "Undo the live schema change")
 	assert.Contains(t, rendered, "schemabot rollback apply-1234 -e staging")
 	assert.Contains(t, rendered, "schemabot plan -e staging -d orders")
+	assert.Contains(t, rendered, "do not run `schemabot plan` on this empty-diff PR")
+	assert.Contains(t, rendered, "clear the blocked check state")
 	assert.NotContains(t, rendered, "schemabot status")
 	assert.NotContains(t, rendered, "Git reverting")
 }

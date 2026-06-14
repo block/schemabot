@@ -122,8 +122,7 @@ func writeInProgressReconciliation(sb *strings.Builder, items []SchemaChangeReco
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(items))
 	sb.WriteString("   - If the live schema change should not remain, roll it back:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(items))
-	sb.WriteString("     Then comment:\n")
-	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(items))
+	sb.WriteString("     After rollback completes, do not run `schemabot plan` on this empty-diff PR unless you first add managed schema files back to the PR. Ask a SchemaBot operator to verify the live schema matches the current desired schema and clear the blocked check state.\n")
 }
 
 func writeCompletedReconciliation(sb *strings.Builder, items []SchemaChangeReconciliationItem) {
@@ -138,8 +137,8 @@ func writeCompletedReconciliation(sb *strings.Builder, items []SchemaChangeRecon
 	sb.WriteString("\n2. Undo the live schema change:\n")
 	sb.WriteString("   - comment:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(items))
-	sb.WriteString("   - after rollback completes, comment:\n")
-	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(items))
+	sb.WriteString("   - after rollback completes, do not run `schemabot plan` on this empty-diff PR unless you first add managed schema files back to the PR\n")
+	sb.WriteString("   - ask a SchemaBot operator to verify the live schema matches the current desired schema and clear the blocked check state\n")
 }
 
 func planCommand(items []SchemaChangeReconciliationItem) string {
