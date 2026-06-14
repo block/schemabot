@@ -15,7 +15,7 @@ All templates rendered with sample data.
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
 CREATE TABLE `users` (
@@ -66,9 +66,103 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ✅ **No schema changes detected**
+
+</details>
+
+<details>
+<summary><a name="no-managed-schema-changes"></a><strong>No Managed Schema Changes</strong></summary>
+
+
+## ✅ No Managed Schema Changes
+
+**Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+This PR does not contain schema changes managed by SchemaBot. SchemaBot did not find any apply-owned state that requires live database reconciliation.
+
+</details>
+
+<details>
+<summary><a name="reconciliation-required-in-progress"></a><strong>Reconciliation Required (In Progress)</strong></summary>
+
+
+## ⚠️ Schema Change Reconciliation Required
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-09f8ba28fb67492e`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+SchemaBot is still applying a schema change from this PR, but the current PR no longer contains that change.
+
+The live database operation was already started and may continue independently of the current PR diff.
+
+### What to do next
+
+1. First, resolve the in-flight apply:
+   - Wait for SchemaBot to post the final apply result, or
+   - If stopping is supported for this database, comment:
+     ```
+     schemabot stop apply-09f8ba28fb67492e -e staging
+     ```
+
+2. Then reconcile the final live schema:
+   - If the live schema change should remain, add the schema change back to the PR, then comment:
+     ```
+     schemabot plan -e staging -d testapp
+     ```
+   - If the live schema change should not remain, roll it back:
+     ```
+     schemabot rollback apply-09f8ba28fb67492e -e staging
+     ```
+     Then comment:
+     ```
+     schemabot plan -e staging -d testapp
+     ```
+
+The PR check will remain blocked until the live database and PR schema files agree.
+
+</details>
+
+<details>
+<summary><a name="reconciliation-required-completed"></a><strong>Reconciliation Required (Completed)</strong></summary>
+
+
+## ⚠️ Schema Change Reconciliation Required
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-09f8ba28fb67492e`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+SchemaBot already applied a schema change from this PR, but the current PR no longer contains that change.
+
+The live database was already updated and may no longer match the current PR schema files.
+
+### What to do next
+
+Choose one:
+
+1. Keep the live schema change:
+   - add the schema change back to the PR
+   - comment:
+     ```
+     schemabot plan -e staging -d testapp
+     ```
+
+2. Undo the live schema change:
+   - comment:
+     ```
+     schemabot rollback apply-09f8ba28fb67492e -e staging
+     ```
+   - after rollback completes, comment:
+     ```
+     schemabot plan -e staging -d testapp
+     ```
+
+The PR check will remain blocked until the live database and PR schema files agree.
 
 </details>
 
@@ -80,7 +174,7 @@ schemabot apply -e staging
 
 **Database**: `commerce` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Keyspace: `commerce`
 #### VSchema
@@ -168,7 +262,7 @@ schemabot apply -e staging
 
 **Database**: `commerce` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -265,7 +359,7 @@ schemabot unlock
 
 **Database**: `myapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 #### Schema Name: `app_primary`
 ```sql
@@ -308,7 +402,7 @@ schemabot apply -e staging
 
 **Database**: `testapp`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging & Production
 
@@ -361,7 +455,7 @@ schemabot apply -e production
 
 **Database**: `testapp`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging
 
@@ -413,7 +507,7 @@ schemabot apply -e production
 
 **Database**: `testapp`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ### Staging
 
@@ -578,7 +672,7 @@ That command wasn't recognized. Available commands:
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -623,7 +717,7 @@ schemabot apply -e staging
 
 **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-15 14:30:00 UTC*
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
 
 No `schemabot.yaml` configuration file was found in this repository.
 
@@ -651,7 +745,7 @@ schemabot plan -e staging -d <database-name>
 
 **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-15 14:30:00 UTC*
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
 
 This repository has multiple `schemabot.yaml` configurations.
 
@@ -677,7 +771,7 @@ schemabot plan -e staging -d <database-name>
 
 **Database**: `nonexistent-db` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-15 14:30:00 UTC*
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
 
 No `schemabot.yaml` configuration with `database: nonexistent-db` was found in this repository.
 
@@ -692,7 +786,7 @@ Check that your `schemabot.yaml` file has the correct `database` field matching 
 
 **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-15 14:30:00 UTC*
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
 
 The `schemabot.yaml` file must include `database` and `type` fields:
 
@@ -713,7 +807,7 @@ type: mysql
 
 **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-15 14:30:00 UTC*
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
 
 ### Error
 
@@ -1020,7 +1114,7 @@ Production
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 Another PR currently holds the lock for this database.
 
@@ -1039,11 +1133,11 @@ Wait for the other PR to complete or ask the lock holder to run `schemabot unloc
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 A CLI session currently holds the lock for this database.
 
-**Locked by**: `cli:aparajon@macbook.local`
+**Locked by**: `cli:jackjackbits@macbook.local`
 **Since**: 2026-03-15 14:00:00 UTC
 
 Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
@@ -1061,7 +1155,7 @@ schemabot unlock -d testapp --force
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Released by @aparajon at 2026-01-01 00:00:00 UTC*
+*Released by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 The database is now available for schema changes.
 
@@ -1075,7 +1169,7 @@ The database is now available for schema changes.
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 An apply is already running for this PR (apply ID: `apply-a1b2c3d4e5f6`, state: `running`).
 
@@ -1156,7 +1250,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 Schema changes require approval from an authorized reviewer before applying.
 
@@ -1178,7 +1272,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 **Environment**: `staging`
 
-*Requested by @aparajon at  UTC*
+*Requested by @jackjackbits at  UTC*
 
 ### Error
 
@@ -1305,7 +1399,7 @@ Use --force to release a lock owned by someone else.
 🔒 Active Locks (2)
 
   1. testapp (mysql)
-     Owner: cli:aparajon@macbook
+     Owner: cli:jackjackbits@macbook
      Since: 30 minutes ago
      Last activity: 5 minutes ago
 
@@ -1341,7 +1435,7 @@ No active locks.
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -1395,7 +1489,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -1451,7 +1545,7 @@ schemabot unlock
 
 **Database**: `commerce` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -1548,7 +1642,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 Schema changes are being applied. Progress updates will be posted as new comments.
 
@@ -1562,7 +1656,7 @@ Schema changes are being applied. Progress updates will be posted as new comment
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 ### Table Progress
 
@@ -1593,7 +1687,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 ### Table Progress
 
@@ -1614,7 +1708,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 ### Table Progress
 
@@ -1644,7 +1738,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 ### Table Progress
 
@@ -1673,7 +1767,7 @@ schemabot start apply-a1b2c3d4e5f6
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 📊 3 queued
 
@@ -1717,7 +1811,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 📊 1 running (22%) · 2 queued
 
@@ -1762,7 +1856,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 📊 1/3 complete · 1 running (62%) · 1 queued
 
@@ -1807,7 +1901,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 📊 1/3 complete · 1 running (Active) · 1 queued
 
@@ -1853,7 +1947,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 📊 2/3 complete · 1 running (17%)
 
@@ -1898,7 +1992,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 📊 3/3 complete
 
@@ -1933,7 +2027,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 📊 1 failed · 2 cancelled
 
@@ -1977,7 +2071,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 📊 1/3 complete · 1 failed · 1 cancelled
 
@@ -2021,7 +2115,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 📊 1/2 complete · 1 stopped
 
@@ -2058,7 +2152,7 @@ schemabot start apply-a1b2c3d4e5f6
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **0/3** table(s) ready for cutover — waiting on 3
 
@@ -2104,7 +2198,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **0/3** table(s) ready for cutover — waiting on 3
 
@@ -2237,7 +2331,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 > ⚠️ **Error:** table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value
 
@@ -2284,7 +2378,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 45m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 1 of 2 tables completed before stop.
 
@@ -2371,7 +2465,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 3h 30m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 > ⚠️ **Error:** Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'
 
@@ -2435,7 +2529,7 @@ schemabot apply -e staging
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 > ⚠️ **Error:** table customers.addresses failed: Error 1205: Lock wait timeout exceeded
 
@@ -4019,7 +4113,7 @@ No schema changes found for database 'new-db'
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -4074,7 +4168,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 🔒 **Lock acquired by** `acme/myapp#42` at 2026-03-14 10:30:00 UTC
 
@@ -4131,7 +4225,7 @@ schemabot unlock
 
 **Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 Schema changes are being applied. Progress updates will be posted as new comments.
 
@@ -4146,7 +4240,7 @@ Schema changes are being applied. Progress updates will be posted as new comment
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Released by @aparajon at 2026-01-01 00:00:00 UTC*
+*Released by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 The database is now available for schema changes.
 
@@ -4161,7 +4255,7 @@ The database is now available for schema changes.
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 Another PR currently holds the lock for this database.
 
@@ -4181,11 +4275,11 @@ Wait for the other PR to complete or ask the lock holder to run `schemabot unloc
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 A CLI session currently holds the lock for this database.
 
-**Locked by**: `cli:aparajon@macbook.local`
+**Locked by**: `cli:jackjackbits@macbook.local`
 **Since**: 2026-03-15 14:00:00 UTC
 
 Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
@@ -4204,7 +4298,7 @@ schemabot unlock -d testapp --force
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 An apply is already running for this PR (apply ID: `apply-a1b2c3d4e5f6`, state: `running`).
 
@@ -4290,7 +4384,7 @@ schemabot apply -e production
 
 **Database**: `testapp` | **Environment**: `staging`
 
-*Requested by @aparajon at 2026-01-01 00:00:00 UTC*
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 Schema changes require approval from an authorized reviewer before applying.
 
@@ -4313,7 +4407,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 **Environment**: `staging`
 
-*Requested by @aparajon at  UTC*
+*Requested by @jackjackbits at  UTC*
 
 ### Error
 

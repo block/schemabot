@@ -15,6 +15,7 @@ const (
 	PreviewErrorMiddleFailed = "lock wait timeout exceeded; try restarting transaction"
 	previewRepository        = "block/schemabot"
 	previewHeadSHA           = "abcdef1234567890abcdef1234567890abcdef12"
+	previewRequestedBy       = "jackjackbits"
 )
 
 // PreviewCommentPlan renders a sample plan comment with DDL changes and lint violations.
@@ -25,7 +26,7 @@ func PreviewCommentPlan() string {
 		Environment: "staging",
 		HeadSHA:     previewHeadSHA,
 		Repository:  previewRepository,
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		IsMySQL:     true,
 		Changes: []KeyspaceChangeData{
 			{
@@ -52,9 +53,55 @@ func PreviewCommentPlanNoChanges() string {
 		Environment: "staging",
 		HeadSHA:     previewHeadSHA,
 		Repository:  previewRepository,
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		IsMySQL:     true,
 		Changes:     nil,
+	})
+}
+
+// PreviewCommentNoManagedSchemaChanges renders the safe empty-diff comment when
+// SchemaBot has no apply-owned state for the PR.
+func PreviewCommentNoManagedSchemaChanges() string {
+	return RenderNoManagedSchemaChanges(SchemaErrorData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-03-15 14:30:00",
+		Environment: "staging",
+		CommandName: action.Plan,
+	})
+}
+
+// PreviewCommentSchemaReconciliationInProgress renders the reconciliation
+// comment for a PR whose current diff no longer contains a running apply.
+func PreviewCommentSchemaReconciliationInProgress() string {
+	return RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-03-15 14:30:00",
+		Items: []SchemaChangeReconciliationItem{
+			{
+				Database:    "testapp",
+				Environment: "staging",
+				ApplyID:     "apply-09f8ba28fb67492e",
+				State:       state.Apply.Running,
+				InProgress:  true,
+			},
+		},
+	})
+}
+
+// PreviewCommentSchemaReconciliationCompleted renders the reconciliation
+// comment for a PR whose current diff no longer contains a completed apply.
+func PreviewCommentSchemaReconciliationCompleted() string {
+	return RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-03-15 14:30:00",
+		Items: []SchemaChangeReconciliationItem{
+			{
+				Database:    "testapp",
+				Environment: "staging",
+				ApplyID:     "apply-09f8ba28fb67492e",
+				State:       state.Apply.Completed,
+			},
+		},
 	})
 }
 
@@ -78,7 +125,7 @@ func PreviewCommentSupportChannel() string {
 // PreviewCommentErrorNoConfig renders the "no config found" error comment.
 func PreviewCommentErrorNoConfig() string {
 	return RenderNoConfig(SchemaErrorData{
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		Timestamp:   "2026-01-15 14:30:00",
 		Environment: "staging",
 		CommandName: action.Plan,
@@ -88,7 +135,7 @@ func PreviewCommentErrorNoConfig() string {
 // PreviewCommentErrorMultiple renders the "multiple databases" error comment.
 func PreviewCommentErrorMultiple() string {
 	return RenderMultipleConfigs(SchemaErrorData{
-		RequestedBy:        "aparajon",
+		RequestedBy:        previewRequestedBy,
 		Timestamp:          "2026-01-15 14:30:00",
 		Environment:        "staging",
 		CommandName:        action.Plan,
@@ -99,7 +146,7 @@ func PreviewCommentErrorMultiple() string {
 // PreviewCommentErrorNotFound renders the "database not found" error comment.
 func PreviewCommentErrorNotFound() string {
 	return RenderDatabaseNotFound(SchemaErrorData{
-		RequestedBy:  "aparajon",
+		RequestedBy:  previewRequestedBy,
 		Timestamp:    "2026-01-15 14:30:00",
 		Environment:  "staging",
 		DatabaseName: "nonexistent-db",
@@ -110,7 +157,7 @@ func PreviewCommentErrorNotFound() string {
 // PreviewCommentErrorInvalid renders the "invalid config" error comment.
 func PreviewCommentErrorInvalid() string {
 	return RenderInvalidConfig(SchemaErrorData{
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		Timestamp:   "2026-01-15 14:30:00",
 		Environment: "staging",
 		CommandName: action.Plan,
@@ -120,7 +167,7 @@ func PreviewCommentErrorInvalid() string {
 // PreviewCommentErrorGeneric renders a generic plan failure error comment.
 func PreviewCommentErrorGeneric() string {
 	return RenderGenericError(SchemaErrorData{
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		Timestamp:   "2026-01-15 14:30:00",
 		Environment: "staging",
 		CommandName: action.Plan,
@@ -147,14 +194,14 @@ func PreviewCommentApplyStarted() string {
 	return RenderApplyStarted(ApplyStatusCommentData{
 		Database:    "testapp",
 		Environment: "staging",
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		ApplyID:     "apply-a1b2c3d4e5f6",
 	})
 }
 
 // PreviewCommentUnlockSuccess renders a sample "lock released" confirmation.
 func PreviewCommentUnlockSuccess() string {
-	return RenderUnlockSuccess("testapp", "staging", "aparajon")
+	return RenderUnlockSuccess("testapp", "staging", previewRequestedBy)
 }
 
 // PreviewCommentApplyBlockedByOtherPR renders a sample "blocked by other PR" comment.
@@ -163,7 +210,7 @@ func PreviewCommentApplyBlockedByOtherPR() string {
 		Database:     "testapp",
 		DatabaseType: "mysql",
 		Environment:  "staging",
-		RequestedBy:  "aparajon",
+		RequestedBy:  previewRequestedBy,
 		LockOwner:    "block/myapp#42",
 		LockRepo:     "block/myapp",
 		LockPR:       42,
@@ -177,8 +224,8 @@ func PreviewCommentApplyBlockedByCLI() string {
 		Database:     "testapp",
 		DatabaseType: "mysql",
 		Environment:  "staging",
-		RequestedBy:  "aparajon",
-		LockOwner:    "cli:aparajon@macbook.local",
+		RequestedBy:  previewRequestedBy,
+		LockOwner:    "cli:jackjackbits@macbook.local",
 		LockPR:       0,
 		LockCreated:  sampleTime().Add(-30 * time.Minute),
 	})
@@ -190,7 +237,7 @@ func PreviewCommentApplyInProgress() string {
 		Database:     "testapp",
 		DatabaseType: "mysql",
 		Environment:  "staging",
-		RequestedBy:  "aparajon",
+		RequestedBy:  previewRequestedBy,
 		ApplyID:      "apply-a1b2c3d4e5f6",
 		ApplyState:   "running",
 	})
@@ -206,16 +253,16 @@ func PreviewCommentReviewRequired() string {
 	return RenderReviewRequired(ReviewGateData{
 		Database:    "testapp",
 		Environment: "staging",
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		Reviewers:   []string{"acme/schema-reviewers", "jdoe"},
-		PRAuthor:    "aparajon",
+		PRAuthor:    previewRequestedBy,
 	})
 }
 
 // PreviewCommentReviewGateError renders a sample review gate error comment (fail-closed).
 func PreviewCommentReviewGateError() string {
 	return RenderGenericError(SchemaErrorData{
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		Environment: "staging",
 		CommandName: action.Apply,
 		ErrorDetail: "Review gate check failed: expand team @acme/schema-reviewers: team membership cannot be read. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
@@ -296,7 +343,7 @@ func PreviewCommentUnsafeBlocked() string {
 		Environment: "staging",
 		HeadSHA:     previewHeadSHA,
 		Repository:  previewRepository,
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		IsMySQL:     true,
 		Changes: []KeyspaceChangeData{
 			{
@@ -323,7 +370,7 @@ func PreviewCommentApplyPlan() string {
 		Environment:  "staging",
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
-		RequestedBy:  "aparajon",
+		RequestedBy:  previewRequestedBy,
 		IsMySQL:      true,
 		Changes:      samplePlanChanges(),
 		IsLocked:     true,
@@ -340,7 +387,7 @@ func PreviewCommentApplyPlanOptions() string {
 		Environment:  "staging",
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
-		RequestedBy:  "aparajon",
+		RequestedBy:  previewRequestedBy,
 		IsMySQL:      true,
 		Changes:      samplePlanChanges(),
 		DeferCutover: true,
@@ -359,7 +406,7 @@ func PreviewCommentApplyPlanUnsafe() string {
 		Environment: "staging",
 		HeadSHA:     previewHeadSHA,
 		Repository:  previewRepository,
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		IsMySQL:     true,
 		Changes: []KeyspaceChangeData{
 			{
@@ -445,7 +492,7 @@ func PreviewCommentVitessPlan() string {
 		Environment: "staging",
 		HeadSHA:     previewHeadSHA,
 		Repository:  previewRepository,
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		IsMySQL:     false,
 		Changes:     sampleVitessPlanChanges(),
 	})
@@ -459,7 +506,7 @@ func PreviewCommentVitessApplyPlan() string {
 		Environment:  "staging",
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
-		RequestedBy:  "aparajon",
+		RequestedBy:  previewRequestedBy,
 		IsMySQL:      false,
 		Changes:      sampleVitessPlanChanges(),
 		DeferCutover: true,
@@ -477,7 +524,7 @@ func PreviewCommentMySQLMultiSchema() string {
 		Environment: "staging",
 		HeadSHA:     previewHeadSHA,
 		Repository:  previewRepository,
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		IsMySQL:     true,
 		Changes: []KeyspaceChangeData{
 			{
@@ -511,20 +558,20 @@ func PreviewCommentMultiEnvPlan() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
-		RequestedBy:  "aparajon",
+		RequestedBy:  previewRequestedBy,
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
 			"staging": {
 				Database:    "testapp",
 				Environment: "staging",
-				RequestedBy: "aparajon",
+				RequestedBy: previewRequestedBy,
 				IsMySQL:     true,
 				Changes:     changes,
 			},
 			"production": {
 				Database:    "testapp",
 				Environment: "production",
-				RequestedBy: "aparajon",
+				RequestedBy: previewRequestedBy,
 				IsMySQL:     true,
 				Changes:     changes,
 			},
@@ -567,13 +614,13 @@ func PreviewCommentMultiEnvPlanError() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
-		RequestedBy:  "aparajon",
+		RequestedBy:  previewRequestedBy,
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
 			"staging": {
 				Database:    "testapp",
 				Environment: "staging",
-				RequestedBy: "aparajon",
+				RequestedBy: previewRequestedBy,
 				IsMySQL:     true,
 				Changes:     changes,
 			},
@@ -593,20 +640,20 @@ func PreviewCommentMultiEnvPlanDiff() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
-		RequestedBy:  "aparajon",
+		RequestedBy:  previewRequestedBy,
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
 			"staging": {
 				Database:    "testapp",
 				Environment: "staging",
-				RequestedBy: "aparajon",
+				RequestedBy: previewRequestedBy,
 				IsMySQL:     true,
 				Changes:     nil,
 			},
 			"production": {
 				Database:    "testapp",
 				Environment: "production",
-				RequestedBy: "aparajon",
+				RequestedBy: previewRequestedBy,
 				IsMySQL:     true,
 				Changes:     samplePlanChanges(),
 			},
@@ -644,7 +691,7 @@ func sampleApplyData(s string, tables []TableProgressData) ApplyStatusCommentDat
 	return ApplyStatusCommentData{
 		Database:    "testapp",
 		Environment: "staging",
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		State:       s,
 		Engine:      "Spirit",
 		ApplyID:     "apply-a1b2c3d4e5f6",
@@ -998,7 +1045,7 @@ func sampleSingleApplyData(s string, table TableProgressData) ApplyStatusComment
 	return ApplyStatusCommentData{
 		Database:    "testapp",
 		Environment: "staging",
-		RequestedBy: "aparajon",
+		RequestedBy: previewRequestedBy,
 		State:       s,
 		Engine:      "Spirit",
 		ApplyID:     "apply-a1b2c3d4e5f6",

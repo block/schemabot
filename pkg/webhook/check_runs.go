@@ -55,7 +55,7 @@ type checkBlockReason struct {
 // users in per-database check state.
 var schemaRemovedAfterApplyBlock = checkBlockReason{
 	blockingReason: "schema_removed_after_apply_started",
-	message:        "Schema changes were removed from the PR after an apply started; operator action is required before this check can pass.",
+	message:        "The current PR no longer contains a schema change whose apply has already started; reconciliation is required before this check can pass.",
 }
 
 // rollbackCompletedBlock is used after a rollback succeeds. The target
