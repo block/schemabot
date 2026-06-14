@@ -46,17 +46,10 @@ func (h *Handler) handleNoManagedSchemaChangesForCommand(ctx context.Context, cl
 		return true, nil
 	}
 
-	h.logger.Info("command found no managed schema changes and no apply-owned reconciliation state",
+	h.logger.Debug("command found no apply-owned reconciliation state; continuing with normal config discovery",
 		"repo", repo, "pr", pr, "environment", environment,
 		"database", databaseName, "action", commandName)
-	h.postComment(repo, pr, installationID, templates.RenderNoManagedSchemaChanges(templates.SchemaErrorData{
-		RequestedBy:  requestedBy,
-		Timestamp:    templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
-		Environment:  environment,
-		DatabaseName: databaseName,
-		CommandName:  commandName,
-	}))
-	return true, nil
+	return false, nil
 }
 
 func prHasCurrentSchemaBotFiles(files []ghclient.PRFile) bool {
