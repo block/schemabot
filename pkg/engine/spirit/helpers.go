@@ -1,13 +1,11 @@
 package spirit
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
-	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/go-sql-driver/mysql"
 
@@ -21,46 +19,6 @@ func parseDSN(dsn string) (host, username, password, database string, err error)
 		return "", "", "", "", fmt.Errorf("parse DSN: %w", err)
 	}
 	return cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, nil
-}
-
-func openMySQL(dsn string) (*sql.DB, error) {
-	connectionDSN, err := mysqlConnectionDSN(dsn)
-	if err != nil {
-		return nil, err
-	}
-	db, err := sql.Open("mysql", connectionDSN)
-	if err != nil {
-		return nil, fmt.Errorf("open MySQL connection: %w", err)
-	}
-	return db, nil
-}
-
-func mysqlConnectionDSN(dsn string) (string, error) {
-	cfg, err := mysql.ParseDSN(dsn)
-	if err != nil {
-		return "", fmt.Errorf("parse DSN: %w", err)
-	}
-	if cfg.TLSConfig != "" {
-		return dsn, nil
-	}
-	tlsMode, ok := mysqlTLSModeForHost(cfg.Addr)
-	if !ok {
-		return dsn, nil
-	}
-	dbConfig := dbconn.NewDBConfig()
-	dbConfig.TLSMode = tlsMode
-	connectionDSN, err := dbconn.EnhanceDSNWithTLS(dsn, dbConfig)
-	if err != nil {
-		return "", fmt.Errorf("enhance RDS DSN with TLS: %w", err)
-	}
-	return connectionDSN, nil
-}
-
-func mysqlTLSModeForHost(addr string) (string, bool) {
-	if dbconn.IsRDSHost(addr) {
-		return "REQUIRED", true
-	}
-	return "", false
 }
 
 // namespaceForTable finds which namespace a table belongs to by checking

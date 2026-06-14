@@ -12,6 +12,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/mysqlconn"
 )
 
 const (
@@ -85,7 +86,7 @@ func (c *Cleaner) Run(ctx context.Context) error {
 // cleanTarget connects to one target, serializes against other SchemaBot
 // instances with an advisory lock, and drops expired quarantined tables.
 func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
-	db, err := sql.Open("mysql", target.DSN)
+	db, err := mysqlconn.Open(target.DSN)
 	if err != nil {
 		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "target_error")
 		return fmt.Errorf("open target %s/%s: %w", target.Database, target.Environment, err)

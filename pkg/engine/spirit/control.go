@@ -21,6 +21,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/mysqlconn"
 )
 
 // Stop pauses a running schema change.
@@ -193,7 +194,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 		return nil, fmt.Errorf("database is required for cutover")
 	}
 
-	db, err := openMySQL(req.Credentials.DSN)
+	db, err := mysqlconn.Open(req.Credentials.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("open connection for cutover: %w", err)
 	}
@@ -242,7 +243,7 @@ func (e *Engine) DeferredCutoverSignalExists(ctx context.Context, req *engine.De
 		return false, fmt.Errorf("database is required for deferred cutover signal lookup")
 	}
 
-	db, err := openMySQL(req.Credentials.DSN)
+	db, err := mysqlconn.Open(req.Credentials.DSN)
 	if err != nil {
 		return false, fmt.Errorf("open connection for deferred cutover signal lookup: %w", err)
 	}
@@ -459,7 +460,7 @@ func settingsToVolume(threads int, chunkTime time.Duration) int32 {
 // dynamically calculated from available_logical_processors / 4.
 // Returns 0 if the query fails or the value can't be determined.
 func (e *Engine) queryCPUHint(ctx context.Context, dsn string) int {
-	db, err := openMySQL(dsn)
+	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		e.logger.Debug("queryCPUHint: failed to open", "error", err)
 		return 0
@@ -511,7 +512,7 @@ func (e *Engine) logCheckpointState(rm *runningMigration, phase string, extra ma
 	cfg.InterpolateParams = true
 	dsn := cfg.FormatDSN()
 
-	db, err := openMySQL(dsn)
+	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		e.logger.Warn("logCheckpointState: failed to open", "error", err)
 		return

@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -197,7 +198,7 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 }
 
 func staleSpiritTableNames(ctx context.Context, dsn string) ([]string, error) {
-	db, err := sql.Open("mysql", dsn)
+	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -286,7 +287,7 @@ type storageDiagnostic struct {
 // diagnoseStorageTarget connects to the DSN and queries the actual database
 // identity and existing table state. Used for diagnostic logging only.
 func diagnoseStorageTarget(ctx context.Context, dsn string) (*storageDiagnostic, error) {
-	db, err := sql.Open("mysql", dsn)
+	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -330,7 +331,7 @@ const ensureSchemaLockName = "schemabot_ensure_schema"
 // EnsureSchema across pods. Returns the connection holding the lock — the
 // lock is released when the connection is closed.
 func acquireEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger) (*sql.Conn, error) {
-	db, err := sql.Open("mysql", dsn)
+	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -378,7 +379,7 @@ func acquireEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logge
 // This must NOT be used on target databases where user schema changes may be
 // in progress or resumable.
 func cleanStaleSpiritTables(ctx context.Context, dsn string, logger *slog.Logger) error {
-	db, err := sql.Open("mysql", dsn)
+	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}

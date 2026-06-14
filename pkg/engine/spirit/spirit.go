@@ -29,6 +29,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
+	"github.com/block/schemabot/pkg/mysqlconn"
 )
 
 // DefaultTargetChunkTime is the default time Spirit aims for per chunk.
@@ -553,7 +554,7 @@ func progressState(rm *runningMigration, spiritState status.State) engine.State 
 // fetchCurrentSchema retrieves table schemas from the database, filtering out
 // internal tables (Spirit shadow/checkpoint tables and other _-prefixed tables).
 func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, _ string) ([]table.TableSchema, error) {
-	db, err := openMySQL(dsn)
+	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}

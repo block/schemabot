@@ -16,6 +16,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/ast"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/pendingdrops"
 )
 
@@ -58,11 +59,7 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 	cfg.Passwd = password
 	cfg.DBName = database
 
-	connectionDSN, err := mysqlConnectionDSN(cfg.FormatDSN())
-	if err != nil {
-		return fmt.Errorf("build pending drops connection DSN for database %s: %w", database, err)
-	}
-	db, err := sql.Open("mysql", connectionDSN)
+	db, err := mysqlconn.Open(cfg.FormatDSN())
 	if err != nil {
 		return fmt.Errorf("open database %s: %w", database, err)
 	}

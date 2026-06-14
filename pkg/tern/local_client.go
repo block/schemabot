@@ -87,7 +87,6 @@ package tern
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -106,6 +105,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/mysqlconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
@@ -290,7 +290,7 @@ func (c *LocalClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequ
 	attrs = append(attrs, dsnLogAttrs(c.config.TargetDSN)...)
 	c.logger.Info("LocalClient.PullSchema: loading live schema", attrs...)
 
-	db, err := sql.Open("mysql", c.config.TargetDSN)
+	db, err := mysqlconn.Open(c.config.TargetDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open database %s for schema pull: %w", c.config.Database, err)
 	}

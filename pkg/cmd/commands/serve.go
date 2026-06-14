@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook"
@@ -87,7 +88,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 			return fmt.Errorf("ensure schema after %d attempts: %w", maxRetries, err)
 		}
 
-		db, err = sql.Open("mysql", dsn)
+		db, err = mysqlconn.Open(dsn)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}

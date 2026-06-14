@@ -3,77 +3,11 @@ package spirit
 import (
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/schema"
 )
-
-func TestMySQLConnectionDSN(t *testing.T) {
-	tests := []struct {
-		name       string
-		dsn        string
-		wantTLS    string
-		wantSame   bool
-		wantErrSub string
-	}{
-		{
-			name:    "RDS host gets TLS",
-			dsn:     "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?parseTime=true",
-			wantTLS: "rds",
-		},
-		{
-			name:     "non-RDS host is unchanged",
-			dsn:      "root:secret@tcp(localhost:3306)/app?parseTime=true",
-			wantSame: true,
-		},
-		{
-			name:     "database alias is unchanged",
-			dsn:      "spirit:secret@tcp(database.example.com:3306)/app?parseTime=true",
-			wantSame: true,
-		},
-		{
-			name:     "explicit TLS is preserved",
-			dsn:      "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?tls=skip-verify",
-			wantTLS:  "skip-verify",
-			wantSame: true,
-		},
-		{
-			name:     "explicit disabled TLS is preserved",
-			dsn:      "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?tls=false",
-			wantTLS:  "false",
-			wantSame: true,
-		},
-		{
-			name:       "invalid DSN returns context",
-			dsn:        "not-a-dsn",
-			wantErrSub: "parse DSN",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := mysqlConnectionDSN(tt.dsn)
-			if tt.wantErrSub != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErrSub)
-				return
-			}
-
-			require.NoError(t, err)
-			if tt.wantSame {
-				assert.Equal(t, tt.dsn, got)
-			}
-
-			cfg, err := mysql.ParseDSN(got)
-			require.NoError(t, err)
-			assert.Equal(t, tt.wantTLS, cfg.TLSConfig)
-			_, err = mysql.NewConnector(cfg)
-			require.NoError(t, err)
-		})
-	}
-}
 
 func TestNamespaceForTable(t *testing.T) {
 	sf := schema.SchemaFiles{
