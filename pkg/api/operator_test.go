@@ -314,3 +314,57 @@ func TestMarkOperationFromOwnResult_LeavesNonTerminalClaimable(t *testing.T) {
 	assert.False(t, marked, "a still-running operation must be left claimable for a later poll")
 	assert.False(t, opStore.called, "no terminal write should occur for a non-terminal operation")
 }
+
+// TestUpdateApplyStateFromOperations_StampsAggregateFailureMessage verifies that
+// when the rollout settles to failed the parent apply's ErrorMessage is surfaced
+// from the first failed operation, not from the last-driven (here, successful)
+// sibling. The failing deployment ran first and the apply carries no prior
+// message; the derived failed verdict must be accompanied by that deployment's
+// reason so an operator sees why the apply failed.
+func TestUpdateApplyStateFromOperations_StampsAggregateFailureMessage(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed, ErrorMessage: "spirit: cutover failed"},
+		{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Completed},
+	}
+	applyStore := &recordingApplyStore{}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Running,
+		Environment:     "staging",
+	}
+
+	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply))
+	require.NotNil(t, applyStore.updated, "derived failed state differs from running, so the apply must be persisted")
+	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+	assert.Equal(t, "deployment region-a failed: spirit: cutover failed", applyStore.updated.ErrorMessage,
+		"the failure reason must come from the failed operation, not the successful last sibling")
+}
+
+// TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarriesOne
+// verifies that a derived failed verdict preserves the apply's existing message
+// when no failed operation row carries one, rather than blanking the reason.
+func TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarriesOne(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed},
+		{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Completed},
+	}
+	applyStore := &recordingApplyStore{}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Running,
+		Environment:     "staging",
+		ErrorMessage:    "prior reason",
+	}
+
+	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply))
+	require.NotNil(t, applyStore.updated)
+	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+	assert.Equal(t, "prior reason", applyStore.updated.ErrorMessage,
+		"with no operation-level message the existing apply reason must be preserved")
+}
