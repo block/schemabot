@@ -53,11 +53,12 @@ func GetEnvironments(endpoint, database string) ([]string, error) {
 }
 
 // CallPullSchemaAPI fetches live schema files for a database/environment pair.
-func CallPullSchemaAPI(endpoint, database, dbType, environment string) (*apitypes.PullSchemaResponse, error) {
+func CallPullSchemaAPI(endpoint, database, dbType, environment string, namespaces ...string) (*apitypes.PullSchemaResponse, error) {
 	req := apitypes.PullSchemaRequest{
 		Database:    database,
 		Type:        dbType,
 		Environment: environment,
+		Namespaces:  namespaces,
 	}
 	var result apitypes.PullSchemaResponse
 	if err := doPostInto(endpoint, "/api/pull", req, &result); err != nil {

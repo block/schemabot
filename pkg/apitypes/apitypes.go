@@ -54,20 +54,29 @@ type SchemaFiles struct {
 	Files map[string]string `json:"files,omitempty"`
 }
 
+// PulledNamespace contains live schema content for a namespace (schema name for
+// MySQL, keyspace for Vitess). It intentionally describes database objects, not
+// repository filenames; clients decide how to materialize tables and artifacts.
+type PulledNamespace struct {
+	Tables    map[string]string `json:"tables,omitempty"`
+	Artifacts map[string]string `json:"artifacts,omitempty"`
+}
+
 // PullSchemaRequest is the HTTP request body for POST /api/pull.
 type PullSchemaRequest struct {
-	Database    string `json:"database"`
-	Environment string `json:"environment"`
-	Type        string `json:"type"`
+	Database    string   `json:"database"`
+	Environment string   `json:"environment"`
+	Type        string   `json:"type"`
+	Namespaces  []string `json:"namespaces,omitempty"`
 }
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.
 type PullSchemaResponse struct {
-	Database    string                  `json:"database"`
-	Type        string                  `json:"type"`
-	Environment string                  `json:"environment"`
-	SchemaFiles map[string]*SchemaFiles `json:"schema_files"`
-	TableCount  int32                   `json:"table_count"`
+	Database    string                      `json:"database"`
+	Type        string                      `json:"type"`
+	Environment string                      `json:"environment"`
+	Namespaces  map[string]*PulledNamespace `json:"namespaces"`
+	TableCount  int32                       `json:"table_count"`
 }
 
 // PlanRequest is the HTTP request body for POST /api/plan.

@@ -21,6 +21,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -180,6 +181,12 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.SetStatus(otelcodes.Error, "unsupported database type")
 		return nil, unsupportedErr
 	}
+	namespaces, err := pullNamespaces(req.Namespaces)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "invalid namespaces")
+		return nil, err
+	}
 
 	client, err := s.RoutingTernClient()
 	if err != nil {
@@ -195,47 +202,122 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		"deployment", resolvedTarget.Deployment,
 		"target", resolvedTarget.Target,
 		"environment", req.Environment,
+		"pull_call_count", len(namespaces),
+		"explicit_namespace_count", len(req.Namespaces),
 		"is_remote", isRemoteTarget,
 	)
 
-	resp, err := client.PullSchema(ctx, &ternv1.PullSchemaRequest{
+	merged := &ternv1.PullSchemaResponse{
 		Database:    req.Database,
-		Type:        req.Type,
+		Type:        resolvedTarget.DatabaseType,
 		Environment: req.Environment,
-	})
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "pull schema failed")
-		s.logger.Error("ExecutePullSchema: routing client PullSchema failed",
-			"database", req.Database,
-			"type", resolvedTarget.DatabaseType,
-			"deployment", resolvedTarget.Deployment,
-			"target", resolvedTarget.Target,
-			"environment", req.Environment,
-			"endpoint", client.Endpoint(),
-			"is_remote", isRemoteTarget,
-			"error", err,
-		)
-		if isRemoteTarget && grpcstatus.Code(err) == grpccodes.Unavailable {
-			return nil, &RemoteDeploymentUnavailableError{
-				Deployment: resolvedTarget.Deployment,
-				Target:     resolvedTarget.Target,
-				Err:        err,
+		Namespaces:  make(map[string]*ternv1.PulledNamespace),
+	}
+	for _, namespace := range namespaces {
+		resp, pullErr := client.PullSchema(ctx, &ternv1.PullSchemaRequest{
+			Database:    req.Database,
+			Type:        resolvedTarget.DatabaseType,
+			Environment: req.Environment,
+			Namespace:   namespace,
+		})
+		if pullErr != nil {
+			span.RecordError(pullErr)
+			span.SetStatus(otelcodes.Error, "pull schema failed")
+			s.logger.Error("ExecutePullSchema: routing client PullSchema failed",
+				"database", req.Database,
+				"type", resolvedTarget.DatabaseType,
+				"deployment", resolvedTarget.Deployment,
+				"target", resolvedTarget.Target,
+				"environment", req.Environment,
+				"namespace", namespace,
+				"endpoint", client.Endpoint(),
+				"is_remote", isRemoteTarget,
+				"error", pullErr,
+			)
+			if isRemoteTarget && grpcstatus.Code(pullErr) == grpccodes.Unavailable {
+				return nil, &RemoteDeploymentUnavailableError{
+					Deployment: resolvedTarget.Deployment,
+					Target:     resolvedTarget.Target,
+					Err:        pullErr,
+				}
 			}
+			return nil, pullErr
 		}
-		return nil, err
+		if err := mergePullSchemaResponse(merged, resp, namespace); err != nil {
+			span.RecordError(err)
+			span.SetStatus(otelcodes.Error, "merge pull schema response")
+			return nil, err
+		}
 	}
 
-	span.SetAttributes(attribute.Int("table_count", int(resp.TableCount)))
+	span.SetAttributes(attribute.Int("table_count", int(merged.TableCount)))
 	s.logger.Info("ExecutePullSchema: pull schema response",
-		"database", resp.Database,
-		"type", resp.Type,
-		"environment", resp.Environment,
-		"table_count", resp.TableCount,
-		"namespace_count", len(resp.SchemaFiles),
+		"database", merged.Database,
+		"type", merged.Type,
+		"environment", merged.Environment,
+		"table_count", merged.TableCount,
+		"namespace_count", len(merged.Namespaces),
 	)
 
-	return pullSchemaResponseFromProto(resp), nil
+	return pullSchemaResponseFromProto(merged), nil
+}
+
+func pullNamespaces(namespaces []string) ([]string, error) {
+	if len(namespaces) == 0 {
+		return []string{""}, nil
+	}
+	result := make([]string, 0, len(namespaces))
+	seenOutput := make(map[string]struct{}, len(namespaces))
+	for _, namespace := range namespaces {
+		if strings.TrimSpace(namespace) != namespace || namespace == "" {
+			return nil, fmt.Errorf("pull namespace %q must be non-empty and contain no leading or trailing whitespace", namespace)
+		}
+		if strings.Contains(namespace, "..") || strings.ContainsAny(namespace, `/\`) {
+			return nil, fmt.Errorf("pull namespace %q must be a single path component", namespace)
+		}
+		if strings.Contains(namespace, "$ENV") {
+			return nil, fmt.Errorf("pull namespace %q must be a concrete live namespace; resolve $ENV before calling pull", namespace)
+		}
+		if schema.IsReservedPullNamespace(namespace) {
+			return nil, fmt.Errorf("pull namespace %q is reserved and cannot be pulled", namespace)
+		}
+		if _, ok := seenOutput[namespace]; ok {
+			return nil, fmt.Errorf("duplicate pull namespace %q", namespace)
+		}
+		seenOutput[namespace] = struct{}{}
+		result = append(result, namespace)
+	}
+	return result, nil
+}
+
+func mergePullSchemaResponse(merged, resp *ternv1.PullSchemaResponse, requestedNamespace string) error {
+	if resp == nil {
+		return fmt.Errorf("pull schema response is empty")
+	}
+	if requestedNamespace != "" {
+		if len(resp.Namespaces) != 1 {
+			return fmt.Errorf("pull namespace %q returned %d namespaces; expected 1", requestedNamespace, len(resp.Namespaces))
+		}
+		for responseNamespace, pulled := range resp.Namespaces {
+			if responseNamespace != requestedNamespace {
+				return fmt.Errorf("pull namespace %q returned namespace %q", requestedNamespace, responseNamespace)
+			}
+			if _, ok := merged.Namespaces[responseNamespace]; ok {
+				return fmt.Errorf("pull schema response contains duplicate namespace %q", responseNamespace)
+			}
+			merged.Namespaces[responseNamespace] = pulled
+		}
+		merged.TableCount += resp.TableCount
+		return nil
+	}
+	for responseNamespace, pulled := range resp.Namespaces {
+		if _, ok := merged.Namespaces[responseNamespace]; ok {
+			return fmt.Errorf("pull schema response contains duplicate namespace %q", responseNamespace)
+		}
+		merged.Namespaces[responseNamespace] = pulled
+	}
+	merged.TableCount += resp.TableCount
+	return nil
 }
 
 func (s *Service) executionTargetUsesRemoteClient(deployment, environment string) bool {

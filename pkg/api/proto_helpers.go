@@ -18,9 +18,25 @@ func pullSchemaResponseFromProto(resp *ternv1.PullSchemaResponse) *apitypes.Pull
 		Database:    resp.Database,
 		Type:        resp.Type,
 		Environment: resp.Environment,
-		SchemaFiles: protoSchemaFilesToAPI(resp.SchemaFiles),
+		Namespaces:  protoPulledNamespacesToAPI(resp.Namespaces),
 		TableCount:  resp.TableCount,
 	}
+}
+
+func protoPulledNamespacesToAPI(namespaces map[string]*ternv1.PulledNamespace) map[string]*apitypes.PulledNamespace {
+	result := make(map[string]*apitypes.PulledNamespace, len(namespaces))
+	for namespace, pulled := range namespaces {
+		if pulled == nil {
+			result[namespace] = &apitypes.PulledNamespace{Tables: map[string]string{}}
+			continue
+		}
+		tables := make(map[string]string, len(pulled.Tables))
+		maps.Copy(tables, pulled.Tables)
+		artifacts := make(map[string]string, len(pulled.Artifacts))
+		maps.Copy(artifacts, pulled.Artifacts)
+		result[namespace] = &apitypes.PulledNamespace{Tables: tables, Artifacts: artifacts}
+	}
+	return result
 }
 
 func protoSchemaFilesToAPI(sf map[string]*ternv1.SchemaFiles) map[string]*apitypes.SchemaFiles {

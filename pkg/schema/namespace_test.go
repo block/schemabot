@@ -213,3 +213,23 @@ func TestGroupFilesByNamespace_EnvSubstitution_MultipleNamespaces(t *testing.T) 
 	assert.Contains(t, result, "app_staging")
 	assert.Contains(t, result, "analytics")
 }
+
+func TestIsReservedPullNamespace(t *testing.T) {
+	tests := []struct {
+		name      string
+		namespace string
+		want      bool
+	}{
+		{name: "pending drops", namespace: "_pending_drops", want: true},
+		{name: "system schema", namespace: "information_schema", want: true},
+		{name: "schemabot storage", namespace: "schemabot", want: true},
+		{name: "underscore prefix", namespace: "_scratch", want: true},
+		{name: "application namespace", namespace: "orders_production", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, IsReservedPullNamespace(tc.namespace))
+		})
+	}
+}

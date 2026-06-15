@@ -106,7 +106,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse)
 	if resp.Type != storage.DatabaseTypeMySQL {
 		return nil, fmt.Errorf("onboard currently supports %s databases; got %s", storage.DatabaseTypeMySQL, resp.Type)
 	}
-	if len(resp.SchemaFiles) == 0 {
+	if len(resp.Namespaces) == 0 {
 		return nil, fmt.Errorf("pull schema returned no tables for database %s environment %s", resp.Database, resp.Environment)
 	}
 	root := filepath.Clean(schemaRoot)
@@ -114,8 +114,8 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse)
 		"schemabot.yaml": fmt.Sprintf("database: %s\ntype: %s\n", resp.Database, resp.Type),
 	}
 
-	namespaces := make([]string, 0, len(resp.SchemaFiles))
-	for namespace := range resp.SchemaFiles {
+	namespaces := make([]string, 0, len(resp.Namespaces))
+	for namespace := range resp.Namespaces {
 		namespaces = append(namespaces, namespace)
 	}
 	sort.Strings(namespaces)
@@ -123,23 +123,26 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse)
 		if err := validateRelativePathPart("namespace", namespace); err != nil {
 			return nil, err
 		}
-		nsFiles := resp.SchemaFiles[namespace]
-		if nsFiles == nil {
-			return nil, fmt.Errorf("schema files for namespace %s are empty", namespace)
+		pulled := resp.Namespaces[namespace]
+		if pulled == nil {
+			return nil, fmt.Errorf("pulled namespace %s is empty", namespace)
 		}
-		if len(nsFiles.Files) == 0 {
-			return nil, fmt.Errorf("schema files for namespace %s contain no tables", namespace)
+		if len(pulled.Tables) == 0 && len(pulled.Artifacts) == 0 {
+			return nil, fmt.Errorf("pulled namespace %s contains no tables or artifacts", namespace)
 		}
-		filenames := make([]string, 0, len(nsFiles.Files))
-		for filename := range nsFiles.Files {
-			filenames = append(filenames, filename)
+		tableNames := make([]string, 0, len(pulled.Tables))
+		for tableName := range pulled.Tables {
+			tableNames = append(tableNames, tableName)
 		}
-		sort.Strings(filenames)
-		for _, filename := range filenames {
-			if err := validateRelativePathPart("schema file", filename); err != nil {
+		sort.Strings(tableNames)
+		for _, tableName := range tableNames {
+			if err := validateRelativePathPart("table", tableName); err != nil {
 				return nil, err
 			}
-			files[filepath.Join(namespace, filename)] = nsFiles.Files[filename]
+			files[filepath.Join(namespace, tableName+".sql")] = pulled.Tables[tableName]
+		}
+		if vschema := pulled.Artifacts["vschema"]; vschema != "" {
+			files[filepath.Join(namespace, "vschema.json")] = vschema
 		}
 	}
 

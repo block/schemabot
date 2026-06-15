@@ -206,6 +206,49 @@ func TestTargetRouterRoutesPlanThroughStaticTarget(t *testing.T) {
 	assert.Len(t, created, 1, "the router should cache LocalClients by resolved target route and namespace")
 }
 
+func TestTargetRouterRoutesPullSchemaNamespaceWithoutChangingLogicalDatabase(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err := router.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "orders-logical",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "production",
+		Target:      "dsid-orders-prod",
+		Namespace:   "orders_production",
+	})
+
+	require.NoError(t, err)
+	client := created["orders_production"]
+	require.NotNil(t, client)
+	require.NotNil(t, client.pullReq)
+	assert.Equal(t, "orders-logical", client.pullReq.Database)
+	assert.Equal(t, "orders_production", client.pullReq.Namespace)
+	assert.Equal(t, "dsid-orders-prod", client.pullReq.Target)
+}
+
+func TestTargetRouterRoutesAllNamespacePullWithoutInjectingNamespace(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err := router.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "orders-logical",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "production",
+		Target:      "dsid-orders-prod",
+	})
+
+	require.NoError(t, err)
+	client := created["orders-logical"]
+	require.NotNil(t, client)
+	require.NotNil(t, client.pullReq)
+	assert.Equal(t, "orders-logical", client.pullReq.Database)
+	assert.Empty(t, client.pullReq.Namespace)
+	assert.Equal(t, "dsid-orders-prod", client.pullReq.Target)
+}
+
 func TestTargetRouterRollbackPlanRoutesEnvironment(t *testing.T) {
 	var resolvedReq inventory.Request
 	resolver := targetRouterResolverFunc(func(_ context.Context, req inventory.Request) (*inventory.Target, error) {

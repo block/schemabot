@@ -28,23 +28,23 @@ func TestCallPullSchemaAPI(t *testing.T) {
 			Type:        "mysql",
 			Environment: "production",
 			TableCount:  1,
-			SchemaFiles: map[string]*apitypes.SchemaFiles{
-				"orders": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 			},
 		}))
 	}))
 	t.Cleanup(server.Close)
 
-	result, err := CallPullSchemaAPI(server.URL, "orders", "mysql", "production")
+	result, err := CallPullSchemaAPI(server.URL, "orders", "mysql", "production", "orders_production", "orders_audit_production")
 	require.NoError(t, err)
 
-	assert.Equal(t, apitypes.PullSchemaRequest{Database: "orders", Type: "mysql", Environment: "production"}, gotReq)
+	assert.Equal(t, apitypes.PullSchemaRequest{Database: "orders", Type: "mysql", Environment: "production", Namespaces: []string{"orders_production", "orders_audit_production"}}, gotReq)
 	require.NotNil(t, result)
 	assert.Equal(t, "orders", result.Database)
 	assert.Equal(t, "mysql", result.Type)
 	assert.Equal(t, "production", result.Environment)
 	assert.Equal(t, int32(1), result.TableCount)
-	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", result.SchemaFiles["orders"].Files["users.sql"])
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", result.Namespaces["orders"].Tables["users"])
 }
 
 func TestCallPullSchemaAPIError(t *testing.T) {

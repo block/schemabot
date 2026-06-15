@@ -487,6 +487,8 @@ type mockTernClient struct {
 	pullSchemaResp    *ternv1.PullSchemaResponse
 	pullSchemaErr     error
 	pullSchemaReq     *ternv1.PullSchemaRequest
+	pullSchemaReqs    []*ternv1.PullSchemaRequest
+	pullSchemaHook    func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
 	applyResp         *ternv1.ApplyResponse
 	applyErr          error
 	applyReq          *ternv1.ApplyRequest
@@ -525,6 +527,10 @@ type mockTernClient struct {
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
 func (m *mockTernClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	m.pullSchemaReq = req
+	m.pullSchemaReqs = append(m.pullSchemaReqs, req)
+	if m.pullSchemaHook != nil {
+		return m.pullSchemaHook(req)
+	}
 	if m.pullSchemaResp != nil {
 		return m.pullSchemaResp, m.pullSchemaErr
 	}
@@ -889,8 +895,8 @@ func TestExecutePullSchemaRoutesConfiguredMySQLTarget(t *testing.T) {
 			Database:    "orders",
 			Type:        storage.DatabaseTypeMySQL,
 			Environment: "production",
-			SchemaFiles: map[string]*ternv1.SchemaFiles{
-				"orders": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 			},
 			TableCount: 1,
 		},
@@ -929,9 +935,64 @@ func TestExecutePullSchemaRoutesConfiguredMySQLTarget(t *testing.T) {
 	assert.Equal(t, int32(1), resp.TableCount)
 	require.NotNil(t, mockClient.pullSchemaReq)
 	assert.Equal(t, "orders-production", mockClient.pullSchemaReq.Target)
+	assert.Empty(t, mockClient.pullSchemaReq.Namespace)
 	assert.Equal(t, "production", mockClient.pullSchemaReq.Environment)
 	assert.Equal(t, storage.DatabaseTypeMySQL, mockClient.pullSchemaReq.Type)
-	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", resp.SchemaFiles["orders"].Files["users.sql"])
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", resp.Namespaces["orders"].Tables["users"])
+}
+
+func TestExecutePullSchemaPullsRequestedNamespaces(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaHook: func(req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+			return &ternv1.PullSchemaResponse{
+				Database:    req.Database,
+				Type:        req.Type,
+				Environment: req.Environment,
+				Namespaces: map[string]*ternv1.PulledNamespace{
+					req.Namespace: {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+				},
+				TableCount: 1,
+			}, nil
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders-logical": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "orders-logical",
+		Environment: "production",
+		Type:        storage.DatabaseTypeMySQL,
+		Namespaces:  []string{"orders_production", "orders_audit_production"},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "orders-logical", resp.Database)
+	assert.Equal(t, int32(2), resp.TableCount)
+	assert.Contains(t, resp.Namespaces, "orders_production")
+	assert.Contains(t, resp.Namespaces, "orders_audit_production")
+	require.Len(t, mockClient.pullSchemaReqs, 2)
+	assert.Equal(t, "orders-logical", mockClient.pullSchemaReqs[0].Database)
+	assert.Equal(t, "orders_production", mockClient.pullSchemaReqs[0].Namespace)
+	assert.Equal(t, "orders_audit_production", mockClient.pullSchemaReqs[1].Namespace)
 }
 
 func TestExecutePullSchemaRejectsUnsupportedType(t *testing.T) {

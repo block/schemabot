@@ -86,7 +86,11 @@ func (r *TargetRouter) PullSchema(ctx context.Context, req *ternv1.PullSchemaReq
 	if req == nil {
 		return nil, fmt.Errorf("pull schema request is required: %w", ErrPullSchemaInvalidRequest)
 	}
-	client, resolved, err := r.clientForTarget(ctx, targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, req.Database)
+	localDatabase := req.Database
+	if req.GetNamespace() != "" {
+		localDatabase = req.GetNamespace()
+	}
+	client, resolved, err := r.clientForTarget(ctx, targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, localDatabase)
 	if err != nil {
 		return nil, err
 	}

@@ -18,11 +18,11 @@ func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
 		Type:        "mysql",
 		Environment: "production",
 		TableCount:  2,
-		SchemaFiles: map[string]*apitypes.SchemaFiles{
+		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {
-				Files: map[string]string{
-					"users.sql":  "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
-					"orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL);\n",
+				Tables: map[string]string{
+					"users":  "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+					"orders": "CREATE TABLE `orders` (`id` bigint NOT NULL);\n",
 				},
 			},
 		},
@@ -51,8 +51,8 @@ func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {
 		Database:    "orders",
 		Type:        "mysql",
 		Environment: "production",
-		SchemaFiles: map[string]*apitypes.SchemaFiles{
-			"orders": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
 	})
 	require.NoError(t, err)
@@ -70,12 +70,12 @@ func TestBuildOnboardWritePlanRejectsUnsafeResponsePaths(t *testing.T) {
 		Database:    "orders",
 		Type:        "mysql",
 		Environment: "production",
-		SchemaFiles: map[string]*apitypes.SchemaFiles{
-			"orders": {Files: map[string]string{"../users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"../users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "schema file")
+	assert.Contains(t, err.Error(), "table")
 }
 
 func TestBuildOnboardWritePlanRejectsInvalidPullResponse(t *testing.T) {
@@ -118,11 +118,11 @@ func TestBuildOnboardWritePlanRejectsInvalidPullResponse(t *testing.T) {
 				Database:    "orders",
 				Type:        "mysql",
 				Environment: "production",
-				SchemaFiles: map[string]*apitypes.SchemaFiles{
-					"orders": {Files: map[string]string{}},
+				Namespaces: map[string]*apitypes.PulledNamespace{
+					"orders": {Tables: map[string]string{}},
 				},
 			},
-			want: "contain no tables",
+			want: "contains no tables or artifacts",
 		},
 	}
 
@@ -180,8 +180,8 @@ func validPullSchemaResponse() *apitypes.PullSchemaResponse {
 		Database:    "orders",
 		Type:        "mysql",
 		Environment: "production",
-		SchemaFiles: map[string]*apitypes.SchemaFiles{
-			"orders": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
 	}
 }

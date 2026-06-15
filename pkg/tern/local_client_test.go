@@ -1900,6 +1900,32 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
 	})
 
+	t.Run("pull namespace must match database-bound DSN", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/orders_schema",
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForMySQLPullNamespace("orders_schema")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+
+		_, err = c.credentialsForMySQLPullNamespace("audit_schema")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not match requested namespace")
+	})
+
+	t.Run("pull namespace-free DSN injects the namespace as the connection schema", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForMySQLPullNamespace("orders_schema")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+	})
+
 	t.Run("namespace-free DSN without a namespace is an error", func(t *testing.T) {
 		c := &LocalClient{config: LocalConfig{
 			Type:      storage.DatabaseTypeMySQL,
