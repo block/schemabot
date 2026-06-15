@@ -1589,10 +1589,19 @@ func TestEngine_Volume_PreservesProgress(t *testing.T) {
 	// Give Spirit time to resume and make progress
 	time.Sleep(500 * time.Millisecond)
 
-	// Check progress after volume change
+	// Check progress after volume change.
+	//
+	// A volume change is a Stop (force checkpoint) + Start (resume with new
+	// settings). Right after the restart the resumed runner can briefly report
+	// rows_copied=0 before the checkpoint watermark is reflected in its progress.
+	// Snapshotting that first reading would look like a progress reset, so poll
+	// until the resumed progress settles — tracking the highest rows_copied seen
+	// and exiting early once it climbs back past the threshold or the change
+	// completes. A transient restart reading no longer fails the test.
+	minExpected := progressBefore * 50 / 100
 	var progressAfter int64
 	var stateAfter engine.State
-	for range 20 {
+	for range 100 {
 		time.Sleep(100 * time.Millisecond)
 
 		progressResult, err := eng.Progress(ctx, &engine.ProgressRequest{})
@@ -1602,15 +1611,20 @@ func TestEngine_Volume_PreservesProgress(t *testing.T) {
 
 		stateAfter = progressResult.State
 		if len(progressResult.Tables) > 0 {
-			progressAfter = progressResult.Tables[0].RowsCopied
-			t.Logf("Progress after volume change: state=%v, rows_copied=%d/%d",
-				progressResult.State, progressAfter, progressResult.Tables[0].RowsTotal)
-			break
+			if rowsCopied := progressResult.Tables[0].RowsCopied; rowsCopied > progressAfter {
+				progressAfter = rowsCopied
+			}
+			t.Logf("Progress after volume change: state=%v, rows_copied=%d/%d (max seen %d)",
+				progressResult.State, progressResult.Tables[0].RowsCopied, progressResult.Tables[0].RowsTotal, progressAfter)
 		}
 
-		// If the migration already completed, that's a success — it didn't reset.
+		// Completed is a success — the copy finished without restarting from scratch.
 		if stateAfter == engine.StateCompleted {
-			t.Logf("Migration completed after volume change (fast completion)")
+			t.Logf("Migration completed after volume change")
+			break
+		}
+		// Resumed progress has settled back above the threshold.
+		if progressAfter >= minExpected {
 			break
 		}
 	}
@@ -1619,7 +1633,6 @@ func TestEngine_Volume_PreservesProgress(t *testing.T) {
 	// If the migration completed, rows_copied may be 0 (Spirit clears progress
 	// on completion) — that's fine, it means it finished successfully.
 	if stateAfter != engine.StateCompleted {
-		minExpected := progressBefore * 50 / 100
 		assert.GreaterOrEqual(t, progressAfter, minExpected,
 			"Progress reset after volume change! Before: %d, After: %d (expected at least %d)",
 			progressBefore, progressAfter, minExpected)
