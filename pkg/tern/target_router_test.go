@@ -79,6 +79,8 @@ type targetRouterRecordingClient struct {
 	planReq            *ternv1.PlanRequest
 	applyReq           *ternv1.ApplyRequest
 	progressReq        *ternv1.ProgressRequest
+	rollbackDatabase   string
+	rollbackEnv        string
 	resumeApply        *storage.Apply
 	targetDSN          string
 	pendingObserverSet bool
@@ -130,7 +132,9 @@ func (c *targetRouterRecordingClient) SkipRevert(context.Context, *ternv1.SkipRe
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
 }
 
-func (c *targetRouterRecordingClient) RollbackPlan(context.Context, string) (*ternv1.PlanResponse, error) {
+func (c *targetRouterRecordingClient) RollbackPlan(_ context.Context, database, environment string) (*ternv1.PlanResponse, error) {
+	c.rollbackDatabase = database
+	c.rollbackEnv = environment
 	return &ternv1.PlanResponse{PlanId: "rollback-plan"}, nil
 }
 

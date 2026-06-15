@@ -14,6 +14,7 @@ import (
 	"time"
 
 	spiritmigration "github.com/block/spirit/pkg/migration"
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -104,6 +105,14 @@ func TestMain(m *testing.M) {
 // with a single namespace matching the test database name.
 func testSchemaFiles(files map[string]string) schema.SchemaFiles {
 	return schema.SchemaFiles{"testdb": &schema.Namespace{Files: files}}
+}
+
+func tableSchemaNames(schemas []table.TableSchema) []string {
+	names := make([]string, 0, len(schemas))
+	for _, schema := range schemas {
+		names = append(names, schema.Name)
+	}
+	return names
 }
 
 // setupTestMySQL returns a connection to the shared MySQL container.
@@ -608,12 +617,42 @@ func TestEngine_FetchCurrentSchema(t *testing.T) {
 	require.NoError(t, err, "create t1")
 	_, err = db.ExecContext(t.Context(), `CREATE TABLE t2 (id INT PRIMARY KEY, value INT)`)
 	require.NoError(t, err, "create t2")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE t1_archive_2026_06 (id INT PRIMARY KEY, name VARCHAR(100))`)
+	require.NoError(t, err, "create archive table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE _spirit_t1_ghost (id INT PRIMARY KEY, name VARCHAR(100))`)
+	require.NoError(t, err, "create internal table")
 
 	eng := New(Config{})
 	schemas, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb")
 	require.NoError(t, err, "fetchCurrentSchema()")
 
 	assert.Len(t, schemas, 2)
+	assert.ElementsMatch(t, []string{"t1", "t2"}, tableSchemaNames(schemas))
+}
+
+// Archive tables are maintained outside declarative schema files, so a plan
+// must not propose dropping live archive tables that are absent from Git.
+func TestEngine_Plan_IgnoresArchiveTables(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE executions (id INT PRIMARY KEY, name VARCHAR(100))`)
+	require.NoError(t, err, "create executions")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE executions_archive_2026_06 (id INT PRIMARY KEY, name VARCHAR(100))`)
+	require.NoError(t, err, "create archive table")
+
+	eng := New(Config{})
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"executions.sql": `CREATE TABLE executions (id INT PRIMARY KEY, name VARCHAR(100))`,
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Plan()")
+	require.NotNil(t, result)
+
+	assert.True(t, result.NoChanges, "archive tables must not create DROP TABLE plan entries: %v", result.FlatDDL())
 }
 
 func TestEngine_Apply_NoChanges(t *testing.T) {
