@@ -450,10 +450,15 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 // result must not quiesce the whole apply. retryablePause is reported separately
 // because failed_retryable pauses for operator retry (completed_at stays nil,
 // observers receive progress not terminal) rather than terminalizing the apply.
-func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause bool) {
+func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, stampCompletedAt bool) {
 	retryablePause = state.IsState(projectedApplyState, state.Apply.FailedRetryable)
 	quiesce = state.IsTerminalApplyState(projectedApplyState) || retryablePause
-	return quiesce, retryablePause
+	// completed_at is stamped only when the apply is truly finished. Resumable
+	// states keep it nil so an operator can resume: failed_retryable is a retry
+	// pause, and stopped is terminal but explicitly resumable.
+	resumable := retryablePause || state.IsState(projectedApplyState, state.Apply.Stopped)
+	stampCompletedAt = quiesce && !resumable
+	return quiesce, retryablePause, stampCompletedAt
 }
 
 // handleAtomicProgressTick processes a single progress poll tick in atomic mode.
@@ -668,26 +673,23 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// observers, or stop polling for the whole apply. With one operation per
 	// apply the projection equals this operation's derived state, so this is a
 	// no-op until the multi-deployment fan-out lands.
-	quiesce, retryableFailure := applyQuiesceDecision(apply.State)
+	quiesce, retryableFailure, stampCompletedAt := applyQuiesceDecision(apply.State)
 	if quiesce {
-		if retryableFailure {
-			apply.CompletedAt = nil
-		} else {
+		if stampCompletedAt {
 			apply.CompletedAt = &now
+		} else {
+			apply.CompletedAt = nil
 		}
-		// Propagate error message from failed tasks to the apply record
+		// Prefer this operation's engine failure message. Under on_failure=continue
+		// the rollout projection can resolve the apply to a failure because of a
+		// sibling operation while this engine result is non-failed, so fall back to
+		// the failed task rows to avoid persisting a failed apply with no message.
 		if result.State == engine.StateFailed {
 			if msg := progressFailureMessage(result); msg != "" {
 				apply.ErrorMessage = msg
-			} else {
-				for _, task := range tasks {
-					if (task.State == state.Task.Failed || task.State == state.Task.FailedRetryable) && task.ErrorMessage != "" {
-						apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", task.TableName, task.ErrorMessage)
-						break
-					}
-				}
 			}
 		}
+		ensureApplyFailureMessage(apply, tasks)
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
 		}

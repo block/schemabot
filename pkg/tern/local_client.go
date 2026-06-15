@@ -956,18 +956,25 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 						// operation's derived state, so this is a no-op until the
 						// multi-deployment fan-out lands.
 						derived, ok := c.deriveAggregateApplyState(ctx, apply, currentApplyTasks)
-						quiesce, projectedRetryablePause := applyQuiesceDecision(derived)
+						quiesce, _, stampCompletedAt := applyQuiesceDecision(derived)
 						if ok && quiesce {
 							now := time.Now()
 							apply.State = derived
-							if projectedRetryablePause {
-								apply.CompletedAt = nil
-							} else {
+							if stampCompletedAt {
 								apply.CompletedAt = &now
+							} else {
+								apply.CompletedAt = nil
 							}
+							// Prefer this operation's engine failure message; fall back
+							// to the failed task rows when the rollout projection resolves
+							// the apply to a failure due to a sibling operation that this
+							// engine result doesn't reflect.
 							if result.State == engine.StateFailed {
-								apply.ErrorMessage = progressFailureMessage(result)
+								if msg := progressFailureMessage(result); msg != "" {
+									apply.ErrorMessage = msg
+								}
 							}
+							ensureApplyFailureMessage(apply, currentApplyTasks)
 							apply.UpdatedAt = now
 							if err := c.storage.Applies().Update(ctx, apply); err != nil {
 								c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
