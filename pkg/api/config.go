@@ -34,6 +34,11 @@ type ServerConfig struct {
 	// If not specified, falls back to MYSQL_DSN environment variable.
 	Storage StorageConfig `yaml:"storage"`
 
+	// Auth configures API authentication. When Type is empty or "none" (the
+	// default), authentication is disabled and all requests are allowed,
+	// unchanged from deployments without this config.
+	Auth AuthConfig `yaml:"auth"`
+
 	// GitHub configures a single GitHub App for webhook-driven schema changes.
 	// Mutually exclusive with Apps. If neither is set, the webhook endpoint
 	// is not registered.
@@ -767,7 +772,31 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 
+	if err := c.Auth.Validate(); err != nil {
+		return fmt.Errorf("auth config: %w", err)
+	}
+
 	return nil
+}
+
+// AuthConfig configures authentication for the SchemaBot HTTP API.
+// When Type is empty or "none" (the default), authentication is disabled and
+// all requests are allowed — unchanged from deployments without this config.
+type AuthConfig struct {
+	// Type selects the authenticator: "none" (or "", the default).
+	// Additional types (e.g. "oidc") are introduced in later changes.
+	Type string `yaml:"type"`
+}
+
+// Validate checks the auth configuration. Unknown types are rejected so a
+// typo fails closed at startup rather than silently disabling auth.
+func (a *AuthConfig) Validate() error {
+	switch a.Type {
+	case "", "none":
+		return nil
+	default:
+		return fmt.Errorf("unknown auth type %q (supported: none)", a.Type)
+	}
 }
 
 func validateSupportChannel(c SupportChannelConfig) error {

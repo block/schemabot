@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/auth"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
@@ -198,12 +199,23 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 
 	mux.Handle("POST /webhook", webhookRuntime.handler)
 
-	// Wrap mux with OTel HTTP instrumentation for automatic request
-	// duration, request body size, and response body size metrics.
+	// Authentication middleware. With the default (none) auth this is an
+	// allow-all NoneAuthorizer that lets every request through (attaching an
+	// anonymous user); it gates nothing until an auth type is configured. The
+	// authorizer is responsible for bypassing non-API paths (/webhook, /metrics,
+	// health) once real enforcement is added.
+	authz, err := buildAuthorizer(serverConfig.Auth, logger)
+	if err != nil {
+		return fmt.Errorf("setup auth: %w", err)
+	}
+	authedHandler := authz.Middleware(mux)
+
+	// Wrap with OTel HTTP instrumentation for automatic request duration,
+	// request body size, and response body size metrics.
 	metricHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		labeler, _ := otelhttp.LabelerFromContext(r.Context())
 		labeler.Add(metrics.EnvironmentAttribute(""))
-		mux.ServeHTTP(w, r)
+		authedHandler.ServeHTTP(w, r)
 	})
 	handler := otelhttp.NewHandler(metricHandler, "schemabot")
 
@@ -429,6 +441,21 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// buildAuthorizer selects the API authorizer from config. Today only the
+// allow-all NoneAuthorizer is supported (every request allowed, with an
+// anonymous user in context); other types are rejected so a misconfigured auth
+// type fails closed at startup rather than silently disabling auth. OIDC
+// support is layered on top of this seam.
+func buildAuthorizer(cfg api.AuthConfig, logger *slog.Logger) (auth.Authorizer, error) {
+	switch cfg.Type {
+	case "", "none":
+		logger.Info("API authentication disabled — all requests allowed")
+		return auth.NoneAuthorizer{}, nil
+	default:
+		return nil, fmt.Errorf("auth type %q is not yet supported", cfg.Type)
+	}
 }
 
 func logLevel() slog.Level {
