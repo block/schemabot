@@ -160,7 +160,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	// Post cutover comment when entering cutting_over with defer_cutover,
 	// but only if one hasn't been posted already.
 	if currentState == state.Apply.CuttingOver && o.shouldDeferCutover(apply) && !o.hasCutoverComment {
-		body := formatCutoverComment(apply, tasks)
+		body := o.formatStatusComment(apply, tasks)
 		o.postAndTrackComment(apply, state.Comment.Cutover, body)
 		o.hasCutoverComment = true
 		o.lastState = currentState
@@ -205,7 +205,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	o.lastProgressPost = now
 
 	// Edit the progress comment
-	body := formatProgressComment(apply, tasks)
+	body := o.formatStatusComment(apply, tasks)
 	o.editTrackedComment(apply, state.Comment.Progress, body)
 }
 
@@ -240,7 +240,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		o.markSummaryPosted(apply, activeCommentState)
 	} else {
 		// Edit the progress comment to its final state (completed bars / error).
-		finalBody := formatProgressComment(apply, tasks)
+		finalBody := o.formatStatusComment(apply, tasks)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 
 		// Post a separate summary comment. A new comment is more reliable than
@@ -257,6 +257,26 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 	if o.OnTerminalHook != nil {
 		o.OnTerminalHook(apply)
 	}
+}
+
+// formatStatusComment renders the apply's progress/cutover status comment,
+// choosing the single- or multi-deployment layout by the apply's operation-row
+// count via formatApplyStatusComment. It loads the operation rows (in resolved
+// deployment order) so a multi-deployment apply renders the aggregated comment;
+// a single operation (every apply today, until the fan-out lands) renders the
+// single-deployment layout byte-for-byte. A load failure falls back to the
+// single-deployment layout so a transient storage error never blocks a comment
+// update.
+func (o *CommentObserver) formatStatusComment(apply *storage.Apply, tasks []*storage.Task) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ops, err := o.stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		o.logger.Error("observer: failed to load apply operations for comment dispatch; rendering single-deployment layout",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return formatProgressComment(apply, tasks)
+	}
+	return formatApplyStatusComment(apply, ops, tasks)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
