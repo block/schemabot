@@ -73,19 +73,6 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 	// Deferred deploy: call engine Start to trigger the deploy request.
 	// This is a separate path from the stopped-task resume flow below.
 	if apply.State == state.Apply.WaitingForDeploy {
-		applyTasks, taskErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
-		if taskErr != nil || len(applyTasks) == 0 {
-			return nil, fmt.Errorf("no tasks found for apply %s", apply.ApplyIdentifier)
-		}
-		creds := c.credentials()
-		eng := c.getEngine()
-		if eng == nil {
-			return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
-		}
-		controlReq, err := c.buildControlRequest(ctx, applyTasks[0], creds, eng, engine.ControlStart)
-		if err != nil {
-			return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
-		}
 		if controlReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
 			return nil, fmt.Errorf("check pending stop before deferred deploy start for apply %s: %w", apply.ApplyIdentifier, err)
 		} else if controlReq != nil {
@@ -94,17 +81,11 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 				"requested_by", controlRequestCaller(controlReq))
 			return nil, fmt.Errorf("schema change has a pending stop request; start is blocked until stop is processed")
 		}
-		result, err := eng.Start(ctx, controlReq)
+		started, err := c.startDeferredDeploy(ctx, apply, "")
 		if err != nil {
-			return nil, fmt.Errorf("start deferred deploy: %w", err)
+			return nil, err
 		}
-		if !result.Accepted {
-			return nil, fmt.Errorf("deferred deploy not accepted: %s", result.Message)
-		}
-		return &ternv1.StartResponse{
-			Accepted:     true,
-			StartedCount: 1,
-		}, nil
+		return started.response, nil
 	}
 
 	// Second pass: collect stopped tasks ONLY from the target apply
@@ -208,6 +189,116 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		StartedCount: int64(len(resumeTasks)),
 		SkippedCount: completedCount,
 	}, nil
+}
+
+type deferredDeployStart struct {
+	response    *ternv1.StartResponse
+	tasks       []*storage.Task
+	credentials *engine.Credentials
+	resumeState *engine.ResumeState
+}
+
+func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Apply, caller string) (*deferredDeployStart, error) {
+	applyTasks, taskErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if taskErr != nil {
+		return nil, fmt.Errorf("get tasks for deferred deploy apply %s: %w", apply.ApplyIdentifier, taskErr)
+	}
+	if len(applyTasks) == 0 {
+		return nil, fmt.Errorf("no tasks found for apply %s", apply.ApplyIdentifier)
+	}
+	creds := c.credentials()
+	eng := c.getEngine()
+	if eng == nil {
+		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+	controlReq, err := c.buildControlRequest(ctx, applyTasks[0], creds, eng, engine.ControlStart)
+	if err != nil {
+		return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
+	}
+	result, err := eng.Start(ctx, controlReq)
+	if err != nil {
+		return nil, fmt.Errorf("start deferred deploy: %w", err)
+	}
+	if !result.Accepted {
+		return nil, fmt.Errorf("deferred deploy not accepted: %s", result.Message)
+	}
+	logMessage := "Deferred deploy start requested"
+	if caller != "" {
+		logMessage += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested, storage.LogSourceSchemaBot,
+		logMessage, state.Apply.WaitingForDeploy, state.Apply.Running)
+	return &deferredDeployStart{
+		response: &ternv1.StartResponse{
+			Accepted:     true,
+			StartedCount: 1,
+		},
+		tasks:       applyTasks,
+		credentials: creds,
+		resumeState: controlReq.ResumeState,
+	}, nil
+}
+
+func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+	controlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return false, err
+	}
+	if controlReq == nil {
+		return false, nil
+	}
+	if stopReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+		return true, fmt.Errorf("check pending stop before pending start for apply %s: %w", apply.ApplyIdentifier, err)
+	} else if stopReq != nil {
+		c.logger.Info("pending start request is waiting for pending stop request to finish",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"stop_requested_by", controlRequestCaller(stopReq),
+			"state", apply.State)
+		return false, nil
+	}
+	if !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
+		return false, nil
+	}
+	started, err := c.startDeferredDeploy(ctx, apply, controlRequestCaller(controlReq))
+	if err != nil {
+		if failErr := failPendingStartControlRequests(ctx, c.storage, apply, err.Error()); failErr != nil {
+			return true, fmt.Errorf("process pending start for apply %s: %w; fail pending start request: %w", apply.ApplyIdentifier, err, failErr)
+		}
+		return true, fmt.Errorf("process pending start for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	resp := started.response
+	if resp == nil || !resp.Accepted {
+		errorMessage := "not accepted"
+		if resp != nil && resp.ErrorMessage != "" {
+			errorMessage = resp.ErrorMessage
+		}
+		if err := failPendingStartControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+			return true, err
+		}
+		return true, fmt.Errorf("process pending start for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+	}
+	now := time.Now()
+	apply.State = state.Apply.Running
+	if apply.StartedAt == nil {
+		apply.StartedAt = &now
+	}
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return true, fmt.Errorf("update started deferred deploy apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+		return true, err
+	}
+	c.logger.Info("pending start request accepted and completed",
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"environment", apply.Environment,
+		"requested_by", controlRequestCaller(controlReq),
+		"state", apply.State)
+	c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState)
+	return true, ctx.Err()
 }
 
 // resumeApplySequential processes resumed tasks one at a time in sequence.
@@ -656,6 +747,9 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
+		return err
+	}
+	if handled, err := c.processPendingStartControlRequest(ctx, apply); handled || err != nil {
 		return err
 	}
 

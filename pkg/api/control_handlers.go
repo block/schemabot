@@ -890,9 +890,9 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, httpStatus, resp)
 }
 
-// ExecuteStart records durable start intent for a stopped apply. The operator
-// owner is responsible for resuming stopped work when immediate dispatch is not
-// possible.
+// ExecuteStart records durable start intent for a stopped apply or deferred
+// deploy. The apply owner is responsible for consuming the request from the
+// per-apply processing loop.
 func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest) (*apitypes.StartResponse, error) {
 	client, apply, ternApplyID, err := s.controlTarget(ctx, "start", req.ApplyID, req.Environment)
 	if err != nil {
@@ -902,10 +902,10 @@ func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest)
 	return resp, err
 }
 
-// executeStartForApply records durable start intent for an apply or dispatches
-// a deferred deploy. The returned HTTP status is meaningful only when
-// err == nil; every error path returns a zero status, and callers must derive
-// the response status from the error (e.g. via writeControlError).
+// executeStartForApply records durable start intent for an apply. The returned
+// HTTP status is meaningful only when err == nil; every error path returns a
+// zero status, and callers must derive the response status from the error (e.g.
+// via writeControlError).
 func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.StartResponse, int, error) {
 	if err := validateStartRequestState(apply); err != nil {
 		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, "rejected")
@@ -934,18 +934,8 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 	queuedForOperator := false
 	switch {
 	case state.IsState(apply.State, state.Apply.WaitingForDeploy):
-		if err := s.rejectControlIfStopPending(ctx, "start dispatch", apply); err != nil {
-			status := "error"
-			if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
-				status = "rejected"
-			}
-			metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
-			return nil, 0, err
-		}
-		resp, err = client.Start(ctx, &ternv1.StartRequest{
-			ApplyId:     ternApplyID,
-			Environment: apply.Environment,
-		})
+		resp, responseStatus, err = s.persistStartRequestForOperator(ctx, apply, caller, 1, 0)
+		queuedForOperator = err == nil && resp.Accepted
 	case state.IsState(apply.State, state.Apply.Pending):
 		resp, responseStatus, err = s.startResponseForPendingStartRequest(ctx, apply)
 		queuedForOperator = err == nil && resp.Accepted

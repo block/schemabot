@@ -785,6 +785,68 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingStar
 	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_ClaimsWaitingForDeployWithPendingStart
+// verifies that a deferred deploy start request returns to the operator loop.
+// The claim keeps the operation in waiting_for_deploy so resume can trigger the
+// deferred deploy with the persisted engine context.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsWaitingForDeployWithPendingStart(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_waiting_deploy_start", 1, state.Apply.WaitingForDeploy, "staging")
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.WaitingForDeploy,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET lease_owner = 'waiting-owner', lease_token = 'waiting-token', lease_acquired_at = NOW() - INTERVAL 2 MINUTE, updated_at = NOW()
+		WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "waiting-for-deploy operation with a pending start request must be reclaimable")
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.WaitingForDeploy, claimed.State)
+	assert.Equal(t, "test-operator", claimed.LeaseOwner)
+	assert.NotEmpty(t, claimed.LeaseToken)
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.WaitingForDeploy, persisted.State)
+	assert.Equal(t, "test-operator", persisted.LeaseOwner)
+	assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken)
+	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
+
+	claimedAgain, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimedAgain, "fresh processing lease should prevent another worker from taking the same deferred deploy start request")
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	reclaimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "recovery-operator")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "stale deferred deploy operation owner should be reclaimable")
+	assert.Equal(t, id, reclaimed.ID)
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithCompletedStart
 // verifies the claim predicate filters on a *pending* start request: once the
 // start request is no longer pending, the stopped operation is terminal again

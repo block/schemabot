@@ -91,6 +91,7 @@ func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
 type fakeControlEngine struct {
 	engine.Engine
 	stopCount      int
+	startCount     int
 	cutoverCount   int
 	cutoverResult  *engine.ControlResult
 	cutoverErr     error
@@ -123,6 +124,7 @@ func (e *fakeControlEngine) Stop(context.Context, *engine.ControlRequest) (*engi
 }
 
 func (e *fakeControlEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.startCount++
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -527,6 +529,112 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
+}
+
+func TestLocalClient_ProcessPendingStartControlRequestWaitsForPendingStop(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              123,
+		ApplyIdentifier: "apply-start-after-stop",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForDeploy,
+	}
+	task := &storage.Task{
+		ID:             456,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-start-after-stop",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:stopper",
+		},
+		{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStart,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:starter",
+		},
+	}}
+	fakeEngine := &fakeControlEngine{progressResult: &engine.ProgressResult{State: engine.StateCompleted}}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingStartControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.Equal(t, 0, fakeEngine.startCount, "pending stop must win before start is processed")
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, startReq, "start request remains pending until stop is resolved")
+}
+
+func TestLocalClient_ProcessPendingStartControlRequestStartsDeferredDeploy(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              123,
+		ApplyIdentifier: "apply-deferred-start",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForDeploy,
+	}
+	task := &storage.Task{
+		ID:             456,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-deferred-start",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:starter",
+	}}}
+	fakeEngine := &fakeControlEngine{progressResult: &engine.ProgressResult{State: engine.StateCompleted}}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingStartControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fakeEngine.startCount)
+	assert.Equal(t, state.Apply.Completed, apply.State)
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, startReq)
 }
 
 // A revert-window apply has already cut over, so a durable stop request against

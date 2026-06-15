@@ -2530,13 +2530,8 @@ func TestStopHandler(t *testing.T) {
 }
 
 func TestStartHandler(t *testing.T) {
-	t.Run("passes apply_id to tern client for deferred deploy", func(t *testing.T) {
-		mock := &mockTernClient{
-			startResp: &ternv1.StartResponse{
-				Accepted:     true,
-				StartedCount: 3,
-			},
-		}
+	t.Run("queues deferred deploy start for loop processing", func(t *testing.T) {
+		mock := &mockTernClient{}
 		apply := activeTestApply("apply-xyz789")
 		apply.State = state.Apply.WaitingForDeploy
 		svc := newControlTestService(mock, apply)
@@ -2551,9 +2546,17 @@ func TestStartHandler(t *testing.T) {
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 
-		require.NotNil(t, mock.startReq, "expected start request to be captured")
-		assert.Equal(t, "apply-xyz789", mock.startReq.ApplyId)
-		assert.Equal(t, "staging", mock.startReq.Environment)
+		assert.Nil(t, mock.startReq, "request path should queue start without calling Tern start")
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, controlReq)
+		assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
+
+		var resp apitypes.StartResponse
+		err = json.NewDecoder(w.Body).Decode(&resp)
+		require.NoError(t, err, "failed to decode response")
+		assert.True(t, resp.Accepted)
+		assert.Equal(t, int64(1), resp.StartedCount)
 	})
 
 	t.Run("rejects start while stop request is pending", func(t *testing.T) {

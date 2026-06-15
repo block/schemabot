@@ -1286,6 +1286,51 @@ func TestGRPCClient_ProgressPollBoundsStoppedAfterStart(t *testing.T) {
 	assert.True(t, hasLogMessageContaining(logs.logs, "Remote apply reached terminal state: stopped"))
 }
 
+func TestGRPCClient_ProgressPollAdoptsTerminalTablesAfterStart(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              27,
+		ApplyIdentifier: "apply-stopped-with-completed-table",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Deployment:      "us-west",
+		Environment:     "staging",
+		ExternalID:      "remote-stopped-with-completed-table",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             33,
+		TaskIdentifier: "task-stopped-with-completed-table",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: &storedApply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    &mockApplyLogStore{},
+	}
+
+	err := client.pollForCompletion(t.Context(), apply, true, wholeApplyTaskScope())
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Completed, apply.State)
+	assert.Equal(t, state.Task.Completed, task.State)
+}
+
 func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *testing.T) {
 	// A freshly dispatched remote apply can report pending before the remote
 	// engine starts copying rows. SchemaBot has already claimed the queued apply
@@ -2149,6 +2194,44 @@ func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
 	assert.Nil(t, controlReq)
 }
 
+func TestGRPCClient_ResumeApplyStartsDeferredDeployFromPendingRequest(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_COMPLETED,
+		progressStateSet: true,
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-start-deploy",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-start-deploy",
+		State:           state.Apply.WaitingForDeploy,
+	}
+	storedApply := *apply
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.NoError(t, err)
+
+	assert.Equal(t, "remote-start-deploy", server.getStartApplyID())
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq)
+}
+
 func TestGRPCClient_ResumeApplyStartErrorLeavesApplyStopped(t *testing.T) {
 	// When the operator accepts a stored start request but remote Tern rejects
 	// the Start RPC, keep the apply stopped with a visible reason and leave the
@@ -2694,7 +2777,7 @@ func TestGRPCClient_ResumeApplyDoesNotStartWhenStoppedStateCheckFails(t *testing
 	server.mu.Unlock()
 	assert.False(t, startCalled, "Start should not be called when the remote state check fails")
 	assert.Equal(t, state.Apply.Stopped, apply.State)
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote stopped-state check failed before scheduler start"))
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote stopped-state check failed before operator start"))
 }
 
 func TestGRPCClient_ResumeApplyFailsWhenStoppedRemoteHasNoActiveProgress(t *testing.T) {

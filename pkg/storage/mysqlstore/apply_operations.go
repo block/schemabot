@@ -621,6 +621,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.WaitingForDeploy,
+		storage.ControlOperationStart, storage.ControlRequestPending)
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
@@ -631,6 +634,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//
 	//   - A stopped operation whose parent apply has a pending start request is
 	//     reclaimable so the operator can resume it.
+	//
+	//   - A waiting-for-deploy operation whose parent apply has a pending start
+	//     request is reclaimable so the operator can trigger the deferred deploy.
 	//
 	//   - A failed_retryable operation is reclaimable only while its PARENT apply
 	//     is itself claimable for that operation's recovery. The operator claim
@@ -693,6 +699,21 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					WHERE cr.apply_id = apply_operations.apply_id
 						AND cr.operation = ?
 						AND cr.status = ?
+				)
+			)
+			OR (
+				state = ?
+				AND EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation = ?
+						AND cr.status = ?
+						AND (
+							apply_operations.lease_acquired_at IS NULL
+							OR apply_operations.lease_acquired_at < cr.updated_at
+							OR apply_operations.updated_at < NOW() - INTERVAL 1 MINUTE
+						)
 				)
 			)
 			OR (

@@ -892,6 +892,14 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		return err
 	}
 	startRequested := startControlReq != nil
+	if startRequested && state.IsState(apply.State, state.Apply.WaitingForDeploy) {
+		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+			return err
+		}
+		if err := c.processPendingStartControlRequest(ctx, apply); err != nil {
+			return err
+		}
+	}
 
 	if apply.ExternalID != "" && state.IsState(apply.State, state.Apply.Pending) && !startRequested {
 		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
@@ -912,7 +920,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			return fmt.Errorf("update started gRPC apply %s: %w", apply.ApplyIdentifier, err)
 		}
-		c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by scheduler", state.Apply.Pending)
+		c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by operator", state.Apply.Pending)
 	}
 
 	// Check the real state from Tern before deciding what to do. Stored state
@@ -927,7 +935,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		if err == nil {
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id during stopped-state check", apply.ExternalID)
-				slog.Warn("remote gRPC stopped-state check returned no active schema change; scheduler will not request remote start",
+				slog.Warn("remote gRPC stopped-state check returned no active schema change; operator will not request remote start",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,
@@ -937,8 +945,8 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			}
 			remoteState := ProtoStateToStorage(resp.State)
 			if remoteState == "" {
-				message := fmt.Sprintf("Remote stopped-state check returned unmapped state %s; scheduler will not request remote start", remoteApplyStateDescription(resp.State))
-				slog.Warn("remote gRPC stopped-state check returned unmapped state; scheduler will not request remote start",
+				message := fmt.Sprintf("Remote stopped-state check returned unmapped state %s; operator will not request remote start", remoteApplyStateDescription(resp.State))
+				slog.Warn("remote gRPC stopped-state check returned unmapped state; operator will not request remote start",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,
@@ -970,8 +978,8 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 				}
 				return fmt.Errorf("check stopped gRPC apply %s before start: %w", apply.ApplyIdentifier, err)
 			}
-			message := fmt.Sprintf("Remote stopped-state check failed before scheduler start: %v", err)
-			slog.Warn("remote gRPC stopped-state check failed; scheduler will not request remote start",
+			message := fmt.Sprintf("Remote stopped-state check failed before operator start: %v", err)
+			slog.Warn("remote gRPC stopped-state check failed; operator will not request remote start",
 				"apply_id", apply.ApplyIdentifier,
 				"external_id", apply.ExternalID,
 				"database", apply.Database,
@@ -1028,13 +1036,77 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			}
 		}
 		if remoteStartRequested {
-			c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by scheduler", oldState)
+			c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by operator", oldState)
 		} else if oldState != apply.State {
-			c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply state refreshed before scheduler start: %s -> %s", oldState, apply.State), oldState)
+			c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply state refreshed before operator start: %s -> %s", oldState, apply.State), oldState)
 		}
 	}
 
 	return c.pollForCompletion(ctx, apply, startRequested, scope)
+}
+
+func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, apply *storage.Apply) error {
+	controlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	if stopReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+		return fmt.Errorf("check pending stop before pending gRPC start for apply %s: %w", apply.ApplyIdentifier, err)
+	} else if stopReq != nil {
+		slog.Info("pending gRPC start request is waiting for pending stop request to finish",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"stop_requested_by", controlRequestCaller(stopReq),
+			"state", apply.State)
+		return nil
+	}
+	if !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
+		return nil
+	}
+	if apply.ExternalID == "" {
+		message := fmt.Sprintf("gRPC apply %s is waiting for deploy without external_id; start dispatch state is ambiguous", apply.ApplyIdentifier)
+		if err := failPendingStartControlRequests(ctx, c.storage, apply, message); err != nil {
+			return err
+		}
+		return errors.New(message)
+	}
+	_, err = c.client.Start(ctx, &ternv1.StartRequest{
+		ApplyId:     apply.ExternalID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		message := fmt.Sprintf("remote deferred deploy start failed for remote apply %s: %v", apply.ExternalID, err)
+		slog.Warn("remote gRPC deferred deploy start failed; storing start request failure",
+			"apply_id", apply.ApplyIdentifier,
+			"external_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"error", err)
+		if failErr := failPendingStartControlRequests(ctx, c.storage, apply, message); failErr != nil {
+			return failErr
+		}
+		return fmt.Errorf("start gRPC deferred deploy %s: %w", apply.ApplyIdentifier, err)
+	}
+	now := time.Now()
+	oldState := apply.State
+	apply.State = state.Apply.Running
+	if apply.StartedAt == nil {
+		apply.StartedAt = &now
+	}
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return fmt.Errorf("update started gRPC deferred deploy %s: %w", apply.ApplyIdentifier, err)
+	}
+	if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+		return err
+	}
+	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote deferred deploy start requested%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), oldState)
+	return nil
 }
 
 func shouldDispatchQueuedRemoteApply(apply *storage.Apply) bool {
@@ -1769,8 +1841,8 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			oldApplyState := apply.State
 			newState := ProtoStateToStorage(resp.State)
 			if newState == "" {
-				message := fmt.Sprintf("Remote progress returned unmapped apply state %s; scheduler will retry without changing stored state", remoteApplyStateDescription(resp.State))
-				slog.Warn("remote gRPC progress returned unmapped apply state; scheduler will retry without changing stored state",
+				message := fmt.Sprintf("Remote progress returned unmapped apply state %s; operator will retry without changing stored state", remoteApplyStateDescription(resp.State))
+				slog.Warn("remote gRPC progress returned unmapped apply state; operator will retry without changing stored state",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
 					"database", apply.Database,
@@ -1785,6 +1857,11 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				apply.StartedAt = &now
 			}
 			remoteApplyState := newState
+			if allowStoppedAfterStart && state.IsState(remoteApplyState, state.Apply.Stopped) {
+				if terminalTaskState, ok := terminalApplyStateFromRemoteTaskProgress(resp.Tables); ok {
+					remoteApplyState = terminalTaskState
+				}
+			}
 			if allowStoppedAfterStart && state.IsState(remoteApplyState, state.Apply.Stopped) {
 				if stoppedAfterStartDeadline.IsZero() {
 					stoppedAfterStartDeadline = now.Add(grpcStoppedAfterStartGracePeriod)
@@ -1854,4 +1931,23 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 		}
 	}
+}
+
+func terminalApplyStateFromRemoteTaskProgress(remoteTasks []*ternv1.TableProgress) (string, bool) {
+	if len(remoteTasks) == 0 {
+		return "", false
+	}
+	taskStates := make([]string, 0, len(remoteTasks))
+	for _, remoteTask := range remoteTasks {
+		if remoteTask == nil {
+			return "", false
+		}
+		remoteTaskState := state.NormalizeTaskStatus(remoteTask.Status)
+		if !state.IsTerminalTaskState(remoteTaskState) {
+			return "", false
+		}
+		taskStates = append(taskStates, remoteTaskState)
+	}
+	derivedState := state.DeriveApplyState(taskStates)
+	return derivedState, state.IsTerminalApplyState(derivedState)
 }

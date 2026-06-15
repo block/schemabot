@@ -755,10 +755,10 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 // and resumes the apply.
 // Returns the claimed apply, or nil if nothing needs work.
 //
-// Matches queued pending applies with persisted tasks, pending or stopped applies
-// with a pending start control request, stale active applies where heartbeat
-// expired > 1 minute, and recently failed_retryable applies that still have retry
-// budget.
+// Matches queued pending applies with persisted tasks, pending, stopped, or
+// waiting-for-deploy applies with a pending start control request, stale active
+// applies where heartbeat expired > 1 minute, and recently failed_retryable
+// applies that still have retry budget.
 // Apply creation/update enforces one active apply per database/type/environment,
 // so claims only need to lease one row and avoid worker races on that row.
 func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.Apply, error) {
@@ -783,6 +783,9 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 		storage.ControlOperationStart, storage.ControlRequestPending)
 	queryArgs = append(queryArgs,
 		state.Apply.Stopped,
+		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.Apply.WaitingForDeploy,
 		storage.ControlOperationStart, storage.ControlRequestPending)
 
 	// Apply creation/update enforces at most one active apply per
@@ -809,6 +812,19 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 						SELECT 1
 						FROM apply_control_requests cr
 						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+					)
+				)
+				OR (
+					a.state = ?
+					AND EXISTS (
+						SELECT 1
+						FROM apply_control_requests cr
+						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+						AND (
+							a.lease_acquired_at IS NULL
+							OR a.lease_acquired_at < cr.updated_at
+							OR a.updated_at < NOW() - INTERVAL 1 MINUTE
+						)
 					)
 				)
 			)
@@ -873,6 +889,9 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	queryArgs = append(queryArgs,
 		state.Apply.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.Apply.WaitingForDeploy,
+		storage.ControlOperationStart, storage.ControlRequestPending)
 
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
@@ -896,6 +915,19 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 						SELECT 1
 						FROM apply_control_requests cr
 						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+					)
+				)
+				OR (
+					a.state = ?
+					AND EXISTS (
+						SELECT 1
+						FROM apply_control_requests cr
+						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+						AND (
+							a.lease_acquired_at IS NULL
+							OR a.lease_acquired_at < cr.updated_at
+							OR a.updated_at < NOW() - INTERVAL 1 MINUTE
+						)
 					)
 				)
 			)
