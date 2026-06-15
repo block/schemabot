@@ -730,6 +730,22 @@ func firstFailedTaskError(tasks []*storage.Task) string {
 	return ""
 }
 
+// firstFailedOperationMessage returns a deployment-qualified failure reason from
+// the first failed operation row that carries one. It surfaces the parent
+// apply's ErrorMessage from the aggregate when the rollout settles to failed,
+// rather than leaving whatever message the last-driven (possibly successful)
+// operation wrote. The rollout's failure verdict is the first failure, so the
+// first failed row in deployment order wins. Empty when no failed operation
+// carries a message, so the caller keeps the existing apply message as fallback.
+func firstFailedOperationMessage(ops []*storage.ApplyOperation) string {
+	for _, op := range ops {
+		if state.IsState(op.State, state.ApplyOperation.Failed) && op.ErrorMessage != "" {
+			return fmt.Sprintf("deployment %s failed: %s", op.Deployment, op.ErrorMessage)
+		}
+	}
+	return ""
+}
+
 // persistOperationState writes the claimed operation row to reflect a derived
 // state, mapping each state to the appropriate row-write. The derived state and
 // errorMessage come from either the parent apply (markOperationFromApplyState,
@@ -851,6 +867,17 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 		}
 	default:
 		updated.CompletedAt = nil
+	}
+
+	// When the rollout settles to failed, surface the failure reason from the
+	// aggregate (the first failed operation) rather than leaving whatever message
+	// the last-driven operation wrote — under continue the last driver may be a
+	// successful sibling, which would leave the failed verdict with no matching
+	// reason. Keep the existing message as a fallback when no operation carries one.
+	if state.IsState(derived, state.Apply.Failed) {
+		if msg := firstFailedOperationMessage(ops); msg != "" {
+			updated.ErrorMessage = msg
+		}
 	}
 
 	if err := s.storage.Applies().Update(ctx, &updated); err != nil {
