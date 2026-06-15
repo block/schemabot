@@ -457,29 +457,58 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 }
 
 // RenderApplyBlockedByInProgressChecks renders a comment when apply is blocked
-// because non-SchemaBot PR checks are still running.
-func RenderApplyBlockedByInProgressChecks(environment string, inProgress []BlockingCheck) string {
+// because PR checks have not finished verifying the commit. Two distinct causes
+// are surfaced with distinct remediation:
+//
+//   - inProgress: non-SchemaBot checks GitHub has reported as still running.
+//     These resolve on their own, so the guidance is to wait and retry.
+//   - notReported: configured required checks that GitHub has not reported on
+//     this commit at all. These will not necessarily resolve on their own — a
+//     name that never reports (a typo in required_checks, a check not
+//     configured on the repo, or a path-filtered workflow) means waiting is
+//     futile — so the guidance is to verify the name and that the check runs on
+//     this PR, not to wait indefinitely.
+func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notReported []BlockingCheck) string {
 	var sb strings.Builder
 
 	sb.WriteString("## ⏳ Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", environment)
-	if len(inProgress) == 0 {
+	if len(inProgress) == 0 && len(notReported) == 0 {
 		// Defensive: callers should only invoke this template when at least
-		// one in-progress check has been identified. Render a generic message
-		// rather than an empty Markdown table with column headers but no rows.
-		sb.WriteString("Cannot apply while PR checks are still running.\n\n")
+		// one in-progress or not-reported check has been identified. Render a
+		// generic message rather than empty Markdown tables with column headers
+		// but no rows.
+		sb.WriteString("Cannot apply until PR checks finish verifying this commit.\n\n")
 		sb.WriteString("Wait for checks to complete and retry:\n")
 		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 		return sb.String()
 	}
-	sb.WriteString("Cannot apply while PR checks are still running:\n\n")
-	sb.WriteString("| Check | Status |\n")
-	sb.WriteString("|-------|--------|\n")
-	for _, c := range inProgress {
-		fmt.Fprintf(&sb, "| `%s` | %s |\n", c.Name, c.State)
+
+	if len(inProgress) > 0 {
+		sb.WriteString("Cannot apply while PR checks are still running:\n\n")
+		sb.WriteString("| Check | Status |\n")
+		sb.WriteString("|-------|--------|\n")
+		for _, c := range inProgress {
+			fmt.Fprintf(&sb, "| `%s` | %s |\n", c.Name, c.State)
+		}
+		sb.WriteString("\nWait for checks to complete and retry:\n")
+		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 	}
-	sb.WriteString("\nWait for checks to complete and retry:\n")
-	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
+
+	if len(notReported) > 0 {
+		if len(inProgress) > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("These required checks have not reported on this commit:\n\n")
+		sb.WriteString("| Check | Status |\n")
+		sb.WriteString("|-------|--------|\n")
+		for _, c := range notReported {
+			fmt.Fprintf(&sb, "| `%s` | %s |\n", c.Name, c.State)
+		}
+		sb.WriteString("\nIf a check never reports, waiting will not unblock the apply. ")
+		sb.WriteString("Verify the name in `required_checks` matches the check exactly and that it runs on this PR, then retry:\n")
+		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
+	}
 
 	return sb.String()
 }

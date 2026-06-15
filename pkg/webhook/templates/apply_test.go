@@ -805,7 +805,7 @@ func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {
 		{Name: "CI / integration", State: "queued"},
 	}
 
-	result := RenderApplyBlockedByInProgressChecks("staging", inProgress)
+	result := RenderApplyBlockedByInProgressChecks("staging", inProgress, nil)
 
 	assert.Contains(t, result, "⏳ Apply Blocked")
 	assert.Contains(t, result, "`staging`")
@@ -814,19 +814,66 @@ func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {
 	assert.Contains(t, result, "| `CI / integration` | queued |")
 	assert.Contains(t, result, "Wait for checks to complete")
 	assert.Contains(t, result, "schemabot apply -e staging")
+	assert.NotContains(t, result, "not reported",
+		"in-progress-only render must not surface the never-reported remediation")
+}
+
+// A configured required check that has never reported on the commit gets
+// remediation distinct from the still-running checks: waiting will not unblock
+// it, so the operator is told to verify the name and that the check runs on the
+// PR rather than to wait indefinitely.
+func TestRenderApplyBlockedByInProgressChecks_NotReported(t *testing.T) {
+	notReported := []BlockingCheck{
+		{Name: "Security scan", State: "not reported"},
+	}
+
+	result := RenderApplyBlockedByInProgressChecks("production", nil, notReported)
+
+	assert.Contains(t, result, "⏳ Apply Blocked")
+	assert.Contains(t, result, "`production`")
+	assert.Contains(t, result, "have not reported on this commit")
+	assert.Contains(t, result, "| `Security scan` | not reported |")
+	assert.Contains(t, result, "If a check never reports, waiting will not unblock the apply.")
+	assert.Contains(t, result, "Verify the name in `required_checks` matches the check exactly and that it runs on this PR")
+	assert.Contains(t, result, "schemabot apply -e production")
+	assert.NotContains(t, result, "Cannot apply while PR checks are still running",
+		"not-reported-only render must not surface the wait-and-retry headline")
+}
+
+// When both still-running checks and never-reported required checks block the
+// same apply, each cause keeps its own remediation: the running checks get the
+// wait-and-retry guidance and the missing required checks get the verify-the-name
+// guidance, so the operator does not wait indefinitely on a check that will
+// never report.
+func TestRenderApplyBlockedByInProgressChecks_InProgressAndNotReported(t *testing.T) {
+	inProgress := []BlockingCheck{
+		{Name: "CI / unit-tests", State: "in_progress"},
+	}
+	notReported := []BlockingCheck{
+		{Name: "Security scan", State: "not reported"},
+	}
+
+	result := RenderApplyBlockedByInProgressChecks("staging", inProgress, notReported)
+
+	assert.Contains(t, result, "Cannot apply while PR checks are still running:")
+	assert.Contains(t, result, "| `CI / unit-tests` | in_progress |")
+	assert.Contains(t, result, "Wait for checks to complete and retry:")
+	assert.Contains(t, result, "These required checks have not reported on this commit:")
+	assert.Contains(t, result, "| `Security scan` | not reported |")
+	assert.Contains(t, result, "Verify the name in `required_checks` matches the check exactly and that it runs on this PR")
 }
 
 func TestRenderApplyBlockedByInProgressChecks_EmptyList(t *testing.T) {
-	// Defensive guard: rendering with an empty slice must not emit an empty
+	// Defensive guard: rendering with empty slices must not emit an empty
 	// Markdown table (header row with zero data rows). It should fall back
 	// to a generic message that still preserves the header, environment,
 	// and retry block.
 	for _, inProgress := range [][]BlockingCheck{nil, {}} {
-		result := RenderApplyBlockedByInProgressChecks("staging", inProgress)
+		result := RenderApplyBlockedByInProgressChecks("staging", inProgress, nil)
 
 		assert.Contains(t, result, "## ⏳ Apply Blocked")
 		assert.Contains(t, result, "**Environment**: `staging`")
-		assert.Contains(t, result, "Cannot apply while PR checks are still running.")
+		assert.Contains(t, result, "Cannot apply until PR checks finish verifying this commit.")
 		assert.Contains(t, result, "Wait for checks to complete and retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
 		assert.NotContains(t, result, "| Check | Status |",

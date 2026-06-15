@@ -212,3 +212,78 @@ func TestShardLess(t *testing.T) {
 	assert.True(t, shardLess("40-80", "80-c0"))
 	assert.False(t, shardLess("80-c0", "40-80"))
 }
+
+// SHOW VITESS_MIGRATIONS retains completed historical rows, so an empty-baseline
+// rediscovery on resume sees both this apply's in-flight change and unrelated
+// finished changes. Selection must attach only to a non-terminal context: a
+// freshly deployed change is queued or running, while old completed history is
+// terminal and must be ignored so progress never renders the wrong change's
+// finished state while the real deploy is mid-flight.
+func TestSelectSchemaChangeContext(t *testing.T) {
+	t.Run("attaches to the in-flight context, ignoring completed history", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			// Completed history from prior, unrelated schema changes.
+			{MigrationContext: "singularity:old-add-email", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Complete},
+			{MigrationContext: "singularity:old-add-email", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Complete},
+			{MigrationContext: "singularity:old-drop-index", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Cancelled},
+			// This apply's in-flight change.
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Queued},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]bool{})
+
+		assert.Equal(t, "singularity:new-change", got)
+		assert.Equal(t, []string{"singularity:new-change"}, candidates)
+	})
+
+	t.Run("only completed history yields no candidate", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:old-add-email", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Complete},
+			{MigrationContext: "singularity:old-add-email", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Complete},
+			{MigrationContext: "singularity:old-drop-index", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Failed},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]bool{})
+
+		assert.Empty(t, got)
+		assert.Empty(t, candidates)
+	})
+
+	t.Run("a context with one running shard is in flight even if others completed", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Complete},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Running},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]bool{})
+
+		assert.Equal(t, "singularity:new-change", got)
+		assert.Equal(t, []string{"singularity:new-change"}, candidates)
+	})
+
+	t.Run("multiple in-flight candidates are ambiguous", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:change-a", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
+			{MigrationContext: "singularity:change-b", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Queued},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]bool{})
+
+		assert.Empty(t, got)
+		assert.Equal(t, []string{"singularity:change-a", "singularity:change-b"}, candidates)
+	})
+
+	t.Run("baseline contexts are never candidates", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:pre-existing", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
+		}
+		baseline := map[string]bool{"singularity:pre-existing": true}
+
+		got, candidates := selectSchemaChangeContext(rows, baseline)
+
+		assert.Equal(t, "singularity:new-change", got)
+		assert.Equal(t, []string{"singularity:new-change"}, candidates)
+	})
+}

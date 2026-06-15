@@ -312,15 +312,24 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 // engine-specific metadata (deploy request URL, revert status) into the response.
 func (s *Service) overlayVitessMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply) {
 	if apply == nil {
-		slog.Warn("overlayVitessMetadata: no apply record")
+		slog.Warn("progress response will omit vitess metadata: no apply record",
+			"apply_id", resp.ApplyID,
+			"database", resp.Database,
+			"environment", resp.Environment)
 		return
 	}
 	if apply.Engine != storage.EnginePlanetScale {
 		return
 	}
+	// The overlay is best-effort enrichment — the progress response is still
+	// served without the engine metadata, so log at Warn rather than Error.
 	vad, err := s.storage.VitessApplyData().GetByApplyID(ctx, apply.ID)
 	if err != nil {
-		slog.Error("overlayVitessMetadata: failed to load vitess apply data", "apply_id", apply.ApplyIdentifier, "error", err)
+		slog.Warn("progress response will omit vitess metadata: failed to load vitess apply data",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"error", err)
 		return
 	}
 	if resp.Metadata == nil {

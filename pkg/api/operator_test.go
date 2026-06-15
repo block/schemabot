@@ -226,3 +226,275 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 		})
 	}
 }
+
+// stubTaskStore returns a fixed task set for GetByApplyOperationID so an
+// operation's own drive result can be derived from its tasks.
+type stubTaskStore struct {
+	storage.TaskStore
+	tasks []*storage.Task
+}
+
+func (s *stubTaskStore) GetByApplyOperationID(context.Context, int64) ([]*storage.Task, error) {
+	return s.tasks, nil
+}
+
+// markFailedRecordingApplyOperationStore records MarkFailed so a test can assert
+// the operation row was persisted failed with its own task's message.
+type markFailedRecordingApplyOperationStore struct {
+	storage.ApplyOperationStore
+	called    bool
+	failedID  int64
+	failedMsg string
+}
+
+func (s *markFailedRecordingApplyOperationStore) MarkFailed(_ context.Context, id int64, errMsg string) error {
+	s.called = true
+	s.failedID = id
+	s.failedMsg = errMsg
+	return nil
+}
+
+type mockStorageWithTasksAndOperations struct {
+	mockStorage
+	tasks    storage.TaskStore
+	applyOps storage.ApplyOperationStore
+}
+
+func (m *mockStorageWithTasksAndOperations) Tasks() storage.TaskStore { return m.tasks }
+
+func (m *mockStorageWithTasksAndOperations) ApplyOperations() storage.ApplyOperationStore {
+	return m.applyOps
+}
+
+// TestMarkOperationFromOwnResult_PersistsFailedIndependentOfParent verifies that
+// the drive path records a failed deployment from the operation's OWN tasks
+// regardless of the parent apply's state. Under the on_failure "continue"
+// projection the parent is held running while sibling deployments are still in
+// flight; deriving the operation from its own failing task still marks the row
+// failed (with that task's message) rather than leaving it claimable to be
+// re-driven, so the deployment-order gate and the parent re-derivation observe
+// the real outcome.
+func TestMarkOperationFromOwnResult_PersistsFailedIndependentOfParent(t *testing.T) {
+	opStore := &markFailedRecordingApplyOperationStore{}
+	taskStore := &stubTaskStore{tasks: []*storage.Task{
+		{State: state.Task.Completed},
+		{State: state.Task.Failed, ErrorMessage: "spirit: cutover failed"},
+	}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithTasksAndOperations{tasks: taskStore, applyOps: opStore}, testServerConfig(), nil, logger)
+
+	op := &storage.ApplyOperation{ID: 9, Deployment: "region-b", OnFailure: storage.OnFailureContinue}
+
+	marked, err := svc.markOperationFromOwnResult(t.Context(), 1, op)
+	require.NoError(t, err)
+	assert.True(t, marked, "a failed operation must be durably recorded so it is not re-claimed")
+	assert.True(t, opStore.called, "the operation row must be marked failed from its own tasks")
+	assert.Equal(t, int64(9), opStore.failedID, "the claimed operation row must be the one marked failed")
+	assert.Equal(t, "spirit: cutover failed", opStore.failedMsg,
+		"the failure message must come from the operation's own failing task")
+}
+
+// TestMarkOperationFromOwnResult_LeavesNonTerminalClaimable verifies that an
+// operation whose own tasks are still running is left claimable (marked=false,
+// no terminal write) so a later poll re-leases and resumes it, rather than being
+// prematurely terminalized from a still-in-flight drive.
+func TestMarkOperationFromOwnResult_LeavesNonTerminalClaimable(t *testing.T) {
+	opStore := &markFailedRecordingApplyOperationStore{}
+	taskStore := &stubTaskStore{tasks: []*storage.Task{
+		{State: state.Task.Running},
+		{State: state.Task.Completed},
+	}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithTasksAndOperations{tasks: taskStore, applyOps: opStore}, testServerConfig(), nil, logger)
+
+	op := &storage.ApplyOperation{ID: 11, Deployment: "region-c", OnFailure: storage.OnFailureContinue}
+
+	marked, err := svc.markOperationFromOwnResult(t.Context(), 1, op)
+	require.NoError(t, err)
+	assert.False(t, marked, "a still-running operation must be left claimable for a later poll")
+	assert.False(t, opStore.called, "no terminal write should occur for a non-terminal operation")
+}
+
+// TestUpdateApplyStateFromOperations_StampsAggregateFailureMessage verifies that
+// when the rollout settles to failed the parent apply's ErrorMessage is surfaced
+// from the first failed operation, not from the last-driven (here, successful)
+// sibling. The failing deployment ran first and the apply carries no prior
+// message; the derived failed verdict must be accompanied by that deployment's
+// reason so an operator sees why the apply failed.
+func TestUpdateApplyStateFromOperations_StampsAggregateFailureMessage(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed, ErrorMessage: "spirit: cutover failed"},
+		{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Completed},
+	}
+	applyStore := &recordingApplyStore{}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Running,
+		Environment:     "staging",
+	}
+
+	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply))
+	require.NotNil(t, applyStore.updated, "derived failed state differs from running, so the apply must be persisted")
+	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+	assert.Equal(t, "deployment region-a failed: spirit: cutover failed", applyStore.updated.ErrorMessage,
+		"the failure reason must come from the failed operation, not the successful last sibling")
+}
+
+// TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarriesOne
+// verifies that a derived failed verdict preserves the apply's existing message
+// when no failed operation row carries one, rather than blanking the reason.
+func TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarriesOne(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed},
+		{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Completed},
+	}
+	applyStore := &recordingApplyStore{}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Running,
+		Environment:     "staging",
+		ErrorMessage:    "prior reason",
+	}
+
+	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply))
+	require.NotNil(t, applyStore.updated)
+	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+	assert.Equal(t, "prior reason", applyStore.updated.ErrorMessage,
+		"with no operation-level message the existing apply reason must be preserved")
+}
+
+// fakeControlRequestStore is a minimal ControlRequestStore for stop
+// reconciliation tests: GetPending returns the configured pending stop request,
+// and CompletePending records the operations it was asked to complete.
+type fakeControlRequestStore struct {
+	storage.ControlRequestStore
+	pendingStop *storage.ApplyControlRequest
+	completed   []storage.ControlOperation
+}
+
+func (s *fakeControlRequestStore) GetPending(_ context.Context, _ int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	if op == storage.ControlOperationStop {
+		return s.pendingStop, nil
+	}
+	return nil, nil
+}
+
+func (s *fakeControlRequestStore) CompletePending(_ context.Context, _ int64, op storage.ControlOperation) error {
+	s.completed = append(s.completed, op)
+	return nil
+}
+
+// markPendingStoppedRecordingStore records MarkPendingStoppedByApply so a test
+// can assert the operator stop reconciliation terminalized the pending siblings.
+type markPendingStoppedRecordingStore struct {
+	storage.ApplyOperationStore
+	called     bool
+	stoppedFor int64
+	count      int64
+}
+
+func (s *markPendingStoppedRecordingStore) MarkPendingStoppedByApply(_ context.Context, applyID int64) (int64, error) {
+	s.called = true
+	s.stoppedFor = applyID
+	return s.count, nil
+}
+
+// getApplyStore returns a fixed apply from Get so completePendingStopIfApplyResolved
+// can be driven against a chosen terminal/non-terminal state.
+type getApplyStore struct {
+	storage.ApplyStore
+	apply *storage.Apply
+}
+
+func (s *getApplyStore) Get(_ context.Context, _ int64) (*storage.Apply, error) {
+	return s.apply, nil
+}
+
+type mockStorageWithControlAndOps struct {
+	mockStorage
+	applies  storage.ApplyStore
+	applyOps storage.ApplyOperationStore
+	control  storage.ControlRequestStore
+}
+
+func (m *mockStorageWithControlAndOps) Applies() storage.ApplyStore { return m.applies }
+func (m *mockStorageWithControlAndOps) ApplyOperations() storage.ApplyOperationStore {
+	return m.applyOps
+}
+func (m *mockStorageWithControlAndOps) ControlRequests() storage.ControlRequestStore {
+	return m.control
+}
+
+func newStopReconcileTestService(applies storage.ApplyStore, ops storage.ApplyOperationStore, control storage.ControlRequestStore) *Service {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(&mockStorageWithControlAndOps{applies: applies, applyOps: ops, control: control}, testServerConfig(), nil, logger)
+}
+
+// TestStopPendingOperationsForPendingStop verifies the operator terminalizes
+// pending siblings only when a stop is actually pending for the apply.
+func TestStopPendingOperationsForPendingStop(t *testing.T) {
+	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-stop", Environment: "staging"}
+
+	t.Run("stops pending siblings when a stop is pending", func(t *testing.T) {
+		ops := &markPendingStoppedRecordingStore{count: 2}
+		control := &fakeControlRequestStore{pendingStop: &storage.ApplyControlRequest{
+			ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending,
+		}}
+		svc := newStopReconcileTestService(&getApplyStore{}, ops, control)
+
+		require.NoError(t, svc.stopPendingOperationsForPendingStop(t.Context(), 1, apply))
+		assert.True(t, ops.called, "a pending stop must terminalize pending siblings")
+		assert.Equal(t, apply.ID, ops.stoppedFor)
+	})
+
+	t.Run("no-op when no stop is pending", func(t *testing.T) {
+		ops := &markPendingStoppedRecordingStore{}
+		control := &fakeControlRequestStore{pendingStop: nil}
+		svc := newStopReconcileTestService(&getApplyStore{}, ops, control)
+
+		require.NoError(t, svc.stopPendingOperationsForPendingStop(t.Context(), 1, apply))
+		assert.False(t, ops.called, "without a pending stop, no siblings are stopped")
+	})
+}
+
+// TestCompletePendingStopIfApplyResolved verifies the operator completes a
+// pending stop request only once the apply has settled terminally.
+func TestCompletePendingStopIfApplyResolved(t *testing.T) {
+	pendingStop := func() *storage.ApplyControlRequest {
+		return &storage.ApplyControlRequest{ApplyID: 9, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending}
+	}
+
+	t.Run("completes the stop when the apply is terminal", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
+		control := &fakeControlRequestStore{pendingStop: pendingStop()}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
+		require.Len(t, control.completed, 1, "a terminal apply with a pending stop completes the request")
+		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
+	})
+
+	t.Run("leaves the stop pending while the apply is non-terminal", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-running", State: state.Apply.Running}}
+		control := &fakeControlRequestStore{pendingStop: pendingStop()}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
+		assert.Empty(t, control.completed, "a non-terminal apply must not complete the stop request")
+	})
+
+	t.Run("no-op when no stop is pending", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
+		control := &fakeControlRequestStore{pendingStop: nil}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
+		assert.Empty(t, control.completed, "no pending stop means nothing to complete")
+	})
+}

@@ -34,6 +34,11 @@ const (
 	// DefaultOperatorWorkers is the number of concurrent operator workers
 	// when not configured via operator_workers in the server config.
 	DefaultOperatorWorkers = 4
+
+	// ApplyClaimLogTimeout bounds the best-effort apply-log append recording an
+	// operator claim, so a slow or hung storage layer cannot delay the resume
+	// the claim is about to drive.
+	ApplyClaimLogTimeout = 5 * time.Second
 )
 
 // StartOperator starts the background operator worker pool.
@@ -179,6 +184,13 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 	owner := operatorLeaseOwner(workerID)
 
 	if s.config.OperatorClaimOperations {
+		// Service a pending stop with no claimable operation to carry it before
+		// claiming new operation work, so a queued stop wins over starting more
+		// deployments. When nothing needs stop reconciliation this is a cheap
+		// no-op and the worker falls through to the normal operation claim.
+		if s.recoverApplyPendingStop(ctx, workerID, owner) {
+			return
+		}
 		s.recoverApplyOperation(ctx, workerID, owner)
 		return
 	}
@@ -344,12 +356,47 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
-	// Reload the parent apply: ResumeApply persists the final state to storage,
-	// and the operation row must mirror the durable outcome, not the in-memory
-	// object the resume path started from.
+	// Persist the operation row from its OWN drive outcome — the aggregate of
+	// this operation's tasks — rather than mirroring the parent apply down.
+	// Under on_failure "continue" the parent applies.state can be held running
+	// (the policy-aware projection waits for siblings to settle) while this
+	// operation has terminally failed; mirroring the parent down would leave the
+	// failed operation claimable and re-leased on every poll, so its failure
+	// would never be durably recorded. The operation row is authoritative for
+	// its own deployment; the parent state is derived from the operation rows
+	// afterward via updateApplyStateFromOperations.
+	marked, err := s.markOperationFromOwnResult(operationLeaseCtx, workerID, op)
+	if err != nil {
+		s.logger.Error("operator: failed to update apply_operation from its tasks; derived apply state not updated",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+		return
+	}
+	if !marked {
+		return
+	}
+
+	// If a stop is pending, terminalize any still-pending sibling operations to
+	// stopped before deriving the parent. The claim gate keeps those siblings
+	// from ever starting, so under on_failure "continue" a failed sibling would
+	// otherwise hold the projection running with pending siblings that never
+	// settle — stranding the apply. Stopping them lets the derivation below reach
+	// a terminal verdict so the rollout (and the stop request) can resolve.
+	if err := s.stopPendingOperationsForPendingStop(applyLeaseCtx, workerID, apply); err != nil {
+		s.logger.Error("operator: failed to stop pending sibling operations for pending stop request; derived apply state not updated",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+		return
+	}
+
+	// Reload the parent apply so updateApplyStateFromOperations below re-derives
+	// the parent from its children against the durable apply.State (its
+	// terminal-to-non-terminal guard), not the in-memory object the resume path
+	// started from. The reloaded row is only the target of the re-derivation;
+	// the operation row was already persisted from its own tasks above.
 	finalApply, err := s.storage.Applies().Get(applyLeaseCtx, apply.ID)
 	if err != nil {
-		s.logger.Error("operator: failed to reload parent apply after resume; operation state not updated",
+		s.logger.Error("operator: failed to reload parent apply after resume; derived apply state not updated",
 			"worker", workerID,
 			"apply_operation_id", op.ID,
 			"apply_id", apply.ApplyIdentifier,
@@ -358,22 +405,11 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 	if finalApply == nil {
-		s.logger.Error("operator: parent apply not found after resume; operation state not updated",
+		s.logger.Error("operator: parent apply not found after resume; derived apply state not updated",
 			"worker", workerID,
 			"apply_operation_id", op.ID,
 			"apply_id", apply.ApplyIdentifier,
 			"deployment", op.Deployment)
-		return
-	}
-
-	marked, err := s.markOperationFromApplyState(operationLeaseCtx, workerID, op, finalApply)
-	if err != nil {
-		s.logger.Error("operator: failed to update apply_operation from parent apply state; derived apply state not updated",
-			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", finalApply.Environment, "state", finalApply.State, "error", err)
-		return
-	}
-	if !marked {
 		return
 	}
 
@@ -383,6 +419,150 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
 		return
 	}
+
+	// If the derived state above settled the apply terminally and a stop is still
+	// pending, complete it now so the request does not linger after the rollout
+	// has stopped.
+	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, workerID, finalApply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending stop request for resolved apply",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
+		return
+	}
+}
+
+// recoverApplyPendingStop drives stop reconciliation for an apply that has a
+// pending stop request but no claimable operation to carry it. Under on_failure
+// "continue" a failed earlier sibling can leave an apply with only terminal and
+// pending operations; the claim gate keeps the pending ones from starting, so
+// the normal operation-claim path never visits the apply and its stop would
+// strand forever. This path claims such an apply directly, stops its pending
+// siblings, re-derives the parent, and completes the stop once the apply is
+// terminal.
+//
+// Returns true when this tick is consumed by stop reconciliation — an apply was
+// claimed (whether the reconciliation that followed succeeded or hit an error)
+// or the claim itself errored or returned an invalid lease — so the caller does
+// not also run the normal operation claim this tick. Returns false only when no
+// apply needed reconciliation.
+func (s *Service) recoverApplyPendingStop(ctx context.Context, workerID int, owner string) bool {
+	apply, err := s.storage.Applies().FindNextApplyForStopReconciliation(ctx, owner)
+	if err != nil {
+		s.logger.Error("operator: failed to claim apply for stop reconciliation",
+			"worker", workerID, "lease_owner", owner, "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "stop_reconciliation_claim_error")
+		return true
+	}
+	if apply == nil {
+		s.logger.Debug("operator: no apply needs stop reconciliation", "worker", workerID)
+		return false
+	}
+
+	lease := apply.Lease()
+	if !lease.Valid() {
+		s.logger.Error("operator: claimed apply for stop reconciliation without a valid lease token; skipping",
+			"worker", workerID, "lease_owner", owner,
+			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment)
+		metrics.RecordOperatorClaimFailure(ctx, "stop_reconciliation_missing_lease_token")
+		return true
+	}
+	applyLeaseCtx := storage.WithApplyLease(ctx, lease)
+
+	if err := s.stopPendingOperationsForPendingStop(applyLeaseCtx, workerID, apply); err != nil {
+		s.logger.Error("operator: failed to stop pending sibling operations during stop reconciliation",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment, "error", err)
+		return true
+	}
+
+	finalApply, err := s.storage.Applies().Get(applyLeaseCtx, apply.ID)
+	if err != nil {
+		s.logger.Error("operator: failed to reload apply during stop reconciliation; derived apply state not updated",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment, "error", err)
+		return true
+	}
+	if finalApply == nil {
+		s.logger.Error("operator: apply not found during stop reconciliation; derived apply state not updated",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment)
+		return true
+	}
+
+	if err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply); err != nil {
+		s.logger.Error("operator: failed to update derived apply state during stop reconciliation",
+			"worker", workerID, "apply_id", finalApply.ApplyIdentifier,
+			"database", finalApply.Database, "environment", finalApply.Environment, "error", err)
+		return true
+	}
+
+	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, workerID, finalApply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending stop request after stop reconciliation",
+			"worker", workerID, "apply_id", finalApply.ApplyIdentifier,
+			"database", finalApply.Database, "environment", finalApply.Environment, "error", err)
+		return true
+	}
+	return true
+}
+
+// stopPendingOperationsForPendingStop terminalizes still-pending sibling
+// operations to stopped when the apply has a pending stop request, so the
+// rollout can settle instead of stranding running with siblings the claim gate
+// keeps from ever starting. No-op when no stop is pending.
+func (s *Service) stopPendingOperationsForPendingStop(ctx context.Context, workerID int, apply *storage.Apply) error {
+	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	if err != nil {
+		return fmt.Errorf("load pending stop request for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if controlReq == nil {
+		return nil
+	}
+
+	stopped, err := s.storage.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("stop pending apply_operations for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if stopped > 0 {
+		s.logger.Info("operator: stopped pending sibling operations for pending stop request",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment,
+			"stopped_operation_count", stopped)
+	}
+	return nil
+}
+
+// completePendingStopIfApplyResolved completes a pending stop control request
+// once the apply has settled to a terminal state, so the request does not stay
+// pending forever after the rollout stops. The apply is reloaded because the
+// derived-state write operates on a copy and does not mutate the caller's row.
+// No-op when the apply is still non-terminal or no stop is pending.
+func (s *Service) completePendingStopIfApplyResolved(ctx context.Context, workerID int, applyID int64) error {
+	apply, err := s.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		return fmt.Errorf("reload apply %d before completing pending stop: %w", applyID, err)
+	}
+	if apply == nil {
+		return fmt.Errorf("reload apply %d before completing pending stop: %w", applyID, storage.ErrApplyNotFound)
+	}
+	if !state.IsTerminalApplyState(apply.State) {
+		return nil
+	}
+
+	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	if err != nil {
+		return fmt.Errorf("load pending stop request for resolved apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if controlReq == nil {
+		return nil
+	}
+
+	if err := s.storage.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
+		return fmt.Errorf("complete pending stop request for resolved apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	s.logger.Info("operator: completed pending stop request for resolved apply",
+		"worker", workerID, "apply_id", apply.ApplyIdentifier,
+		"database", apply.Database, "environment", apply.Environment, "state", apply.State)
+	return nil
 }
 
 // reconcileUnclaimableParent handles a claimed operation whose parent apply
@@ -496,6 +676,12 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 		"environment", apply.Environment,
 		"state", apply.State,
 		"last_heartbeat", apply.UpdatedAt)
+
+	// Record the claim in the apply's durable log so the timeline explains
+	// why new state transitions appear after a failure or a worker crash —
+	// without this entry, an operator reading apply_logs sees a gap between
+	// the last failure and the resumed work.
+	s.logApplyResumeClaim(ctx, workerID, apply)
 
 	previousState := apply.State
 
@@ -616,6 +802,39 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 	return true, nil
 }
 
+// logApplyResumeClaim appends a durable apply log entry recording that an
+// operator worker claimed the apply to resume it. Best-effort: a failed
+// append must not block the resume, so the error is logged and the claim
+// proceeds.
+func (s *Service) logApplyResumeClaim(ctx context.Context, workerID int, apply *storage.Apply) {
+	logStore := s.storage.ApplyLogs()
+	if logStore == nil {
+		s.logger.Warn("operator: no apply log store configured; apply claim will not appear in apply logs",
+			"worker", workerID,
+			"apply_id", apply.ApplyIdentifier)
+		return
+	}
+	logCtx, cancel := context.WithTimeout(ctx, ApplyClaimLogTimeout)
+	defer cancel()
+	if err := logStore.Append(logCtx, &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelInfo,
+		EventType: storage.LogEventInfo,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   fmt.Sprintf("Operator claimed apply to resume it (worker %d, state %s)", workerID, apply.State),
+		OldState:  apply.State,
+		NewState:  apply.State,
+		CreatedAt: s.clock.Now(),
+	}); err != nil {
+		s.logger.Warn("operator: failed to log apply claim; apply claim will not appear in apply logs",
+			"worker", workerID,
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"error", err)
+	}
+}
+
 // startApplyOperationHeartbeat refreshes the claimed operation row's lease while
 // ResumeApply runs, at min(operatorPollInterval, ApplyOperationHeartbeatInterval)
 // so the row cannot go stale and be re-claimed by a peer even when the poll
@@ -663,57 +882,132 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, workerID int
 }
 
 // markOperationFromApplyState transitions the claimed operation row to mirror
-// the parent apply's final state after a successful resume.
-//
-// It returns updated=true whenever the operation row was durably written to
-// mirror the parent — including resumable final states (stopped,
-// failed_retryable), not only terminal ones. updated=true is the signal the
-// caller needs before deriving the parent apply's state from its children: the
-// child row now reflects the parent, so the derived state is current. A parent
-// that is still mid-flight leaves the operation claimable (updated=false, nil
-// error) so a later poll re-leases and resumes it; a write failure returns the
-// error so the caller skips derivation rather than aggregating a stale child
-// state.
+// the parent apply's final state. It is used by the unclaimable-parent
+// reconciliation path, where an already-terminal parent is authoritative for its
+// single operation. The drive path instead uses markOperationFromOwnResult so a
+// failed operation is recorded even while the parent projection holds the apply
+// running under on_failure "continue". Both delegate to persistOperationState,
+// which documents the updated/error contract.
 func (s *Service) markOperationFromApplyState(ctx context.Context, workerID int, op *storage.ApplyOperation, apply *storage.Apply) (updated bool, err error) {
+	return s.persistOperationState(ctx, workerID, op, apply.State, apply.ErrorMessage)
+}
+
+// markOperationFromOwnResult transitions the claimed operation row to reflect
+// the operation's OWN drive result, derived from its tasks via
+// state.DeriveApplyState rather than mirrored from the parent apply.
+//
+// This is the drive-path counterpart to markOperationFromApplyState. Under the
+// on_failure "continue" projection updateApplyStateFromOperations holds the
+// parent apply running while sibling deployments are still in flight, so
+// mirroring this operation from the parent would hit the non-terminal
+// "leave claimable" branch and never persist the operation's own terminal
+// outcome: a failed deployment would be silently re-claimed and the
+// deployment-order gate (which keys off an earlier sibling's failed state under
+// continue) would read a stale value. Deriving from the operation's own tasks
+// records its real result independently of the parent projection, which
+// updateApplyStateFromOperations then aggregates back into the parent apply.
+//
+// The returned updated flag and error carry the same contract as
+// markOperationFromApplyState: updated=true when the row was durably written
+// (including the resumable stopped / failed_retryable states), updated=false
+// with a nil error when the operation's tasks derive a non-terminal state and
+// the row is left claimable for a later poll, and a non-nil error when a read or
+// write fails so the caller skips parent derivation.
+func (s *Service) markOperationFromOwnResult(ctx context.Context, workerID int, op *storage.ApplyOperation) (updated bool, err error) {
+	tasks, err := s.storage.Tasks().GetByApplyOperationID(ctx, op.ID)
+	if err != nil {
+		return false, fmt.Errorf("load tasks for apply_operation %d (deployment %q): %w", op.ID, op.Deployment, err)
+	}
+	taskStates := make([]string, len(tasks))
+	for i, t := range tasks {
+		taskStates[i] = t.State
+	}
+	derived := state.DeriveApplyState(taskStates)
+	return s.persistOperationState(ctx, workerID, op, derived, firstFailedTaskError(tasks))
+}
+
+// firstFailedTaskError returns the ErrorMessage of the first failed task, used
+// to populate the operation row's failure reason when its own tasks derive a
+// failed state. Empty when no failed task carries a message.
+func firstFailedTaskError(tasks []*storage.Task) string {
+	for _, t := range tasks {
+		if state.IsState(t.State, state.Task.Failed) && t.ErrorMessage != "" {
+			return t.ErrorMessage
+		}
+	}
+	return ""
+}
+
+// firstFailedOperationMessage returns a deployment-qualified failure reason from
+// the first failed operation row that carries one. It surfaces the parent
+// apply's ErrorMessage from the aggregate when the rollout settles to failed,
+// rather than leaving whatever message the last-driven (possibly successful)
+// operation wrote. The rollout's failure verdict is the first failure, so the
+// first failed row in deployment order wins. Empty when no failed operation
+// carries a message, so the caller keeps the existing apply message as fallback.
+func firstFailedOperationMessage(ops []*storage.ApplyOperation) string {
+	for _, op := range ops {
+		if state.IsState(op.State, state.ApplyOperation.Failed) && op.ErrorMessage != "" {
+			return fmt.Sprintf("deployment %s failed: %s", op.Deployment, op.ErrorMessage)
+		}
+	}
+	return ""
+}
+
+// persistOperationState writes the claimed operation row to reflect a derived
+// state, mapping each state to the appropriate row-write. The derived state and
+// errorMessage come from either the parent apply (markOperationFromApplyState,
+// the reconcile path) or the operation's own tasks (markOperationFromOwnResult,
+// the drive path); the row-write mapping is identical regardless of source.
+//
+// It returns updated=true whenever the operation row was durably written —
+// including resumable states (stopped, failed_retryable), not only terminal
+// ones. updated=true is the signal the caller needs before deriving the parent
+// apply's state from its children: the child row now reflects its outcome, so
+// the derived state is current. A non-terminal derived state leaves the
+// operation claimable (updated=false, nil error) so a later poll re-leases and
+// resumes it; a write failure returns the error so the caller skips derivation
+// rather than aggregating a stale child state.
+func (s *Service) persistOperationState(ctx context.Context, workerID int, op *storage.ApplyOperation, derived, errorMessage string) (updated bool, err error) {
 	opStore := s.storage.ApplyOperations()
 	switch {
-	case state.IsState(apply.State, state.Apply.Completed):
+	case state.IsState(derived, state.Apply.Completed):
 		if err := opStore.MarkCompleted(ctx, op.ID); err != nil {
 			return false, fmt.Errorf("mark apply_operation %d completed (deployment %q): %w", op.ID, op.Deployment, err)
 		}
 		return true, nil
-	case state.IsState(apply.State, state.Apply.Failed):
-		if err := opStore.MarkFailed(ctx, op.ID, apply.ErrorMessage); err != nil {
+	case state.IsState(derived, state.Apply.Failed):
+		if err := opStore.MarkFailed(ctx, op.ID, errorMessage); err != nil {
 			return false, fmt.Errorf("mark apply_operation %d failed (deployment %q): %w", op.ID, op.Deployment, err)
 		}
 		return true, nil
-	case state.IsState(apply.State, state.Apply.Stopped):
+	case state.IsState(derived, state.Apply.Stopped):
 		// stopped is resumable, so mirror the state but leave completed_at nil
 		// (matching the apply-level convention) — stopped work may resume.
-		if err := opStore.UpdateState(ctx, op.ID, apply.State); err != nil {
+		if err := opStore.UpdateState(ctx, op.ID, derived); err != nil {
 			return false, fmt.Errorf("update stopped apply_operation %d state (deployment %q): %w", op.ID, op.Deployment, err)
 		}
 		return true, nil
-	case state.IsState(apply.State, state.Apply.FailedRetryable):
+	case state.IsState(derived, state.Apply.FailedRetryable):
 		// failed_retryable is resumable like stopped: mirror the state (leaving
 		// completed_at nil) so FindNextApplyOperation reclaims it under the
 		// parent apply's recovery budget. Leaving the row in its active state
 		// would instead make recovery depend on the stale-heartbeat path, which
 		// has no budget and would re-claim it forever once retries are exhausted.
-		if err := opStore.UpdateState(ctx, op.ID, apply.State); err != nil {
+		if err := opStore.UpdateState(ctx, op.ID, derived); err != nil {
 			return false, fmt.Errorf("update failed_retryable apply_operation %d state (deployment %q): %w", op.ID, op.Deployment, err)
 		}
 		return true, nil
-	case state.IsTerminalApplyState(apply.State):
+	case state.IsTerminalApplyState(derived):
 		// cancelled / reverted — non-resumable terminal states; stamp completed_at.
-		if err := opStore.MarkTerminal(ctx, op.ID, apply.State); err != nil {
-			return false, fmt.Errorf("mark terminal apply_operation %d state %q (deployment %q): %w", op.ID, apply.State, op.Deployment, err)
+		if err := opStore.MarkTerminal(ctx, op.ID, derived); err != nil {
+			return false, fmt.Errorf("mark terminal apply_operation %d state %q (deployment %q): %w", op.ID, derived, op.Deployment, err)
 		}
 		return true, nil
 	default:
-		s.logger.Debug("operator: parent apply not terminal after resume; leaving operation claimable",
-			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", apply.Environment, "state", apply.State)
+		s.logger.Debug("operator: derived operation state not terminal; leaving operation claimable",
+			"worker", workerID, "apply_operation_id", op.ID,
+			"deployment", op.Deployment, "state", derived)
 		return false, nil
 	}
 }
@@ -781,6 +1075,17 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 		}
 	default:
 		updated.CompletedAt = nil
+	}
+
+	// When the rollout settles to failed, surface the failure reason from the
+	// aggregate (the first failed operation) rather than leaving whatever message
+	// the last-driven operation wrote — under continue the last driver may be a
+	// successful sibling, which would leave the failed verdict with no matching
+	// reason. Keep the existing message as a fallback when no operation carries one.
+	if state.IsState(derived, state.Apply.Failed) {
+		if msg := firstFailedOperationMessage(ops); msg != "" {
+			updated.ErrorMessage = msg
+		}
 	}
 
 	if err := s.storage.Applies().Update(ctx, &updated); err != nil {

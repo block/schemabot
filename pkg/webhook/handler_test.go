@@ -209,6 +209,31 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 	})
 }
 
+func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := &Handler{
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    testLogger(),
+	}
+
+	h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "production", "", "hubot", "apply", &schemaConfigOutsideAllowedDirsError{
+		Database:     "orders",
+		DatabaseType: "mysql",
+		SchemaPath:   "services/orders/schema",
+	})
+
+	body := requireComment(t, comments, "config-not-authorized comment")
+	assert.Contains(t, body, "SchemaBot Configuration Not Authorized")
+	assert.Contains(t, body, "SchemaBot found a `schemabot.yaml` configuration")
+	assert.Contains(t, body, "`services/orders/schema`")
+	assert.Contains(t, body, "`databases.orders.allowed_dirs`")
+	assert.NotContains(t, body, "No `schemabot.yaml` configuration file was found")
+}
+
 func TestCheckRunRerequestIgnoresNonSchemaBotCheck(t *testing.T) {
 	h, _, _ := newTestHandler(t)
 

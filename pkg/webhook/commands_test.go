@@ -63,8 +63,8 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		{name: action.SkipRevert, requiresEnv: true},
 		{name: action.Cutover, requiresEnv: true, hasApplyID: true},
 		{name: action.Rollback, requiresEnv: true, hasApplyID: true,
-			supportsDB: true, supportsDefer: true},
-		{name: action.RollbackConfirm, requiresEnv: true, supportsDB: true},
+			supportsDefer: true},
+		{name: action.RollbackConfirm, requiresEnv: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -88,6 +88,20 @@ func TestHasAutoConfirmFlag(t *testing.T) {
 	assert.True(t, p.HasAutoConfirmFlag("schemabot apply -e staging --yes"))
 	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging"))
 	assert.False(t, p.HasAutoConfirmFlag(""))
+}
+
+func TestHasDatabaseFlag(t *testing.T) {
+	p := NewCommandParser()
+	assert.True(t, p.HasDatabaseFlag("schemabot rollback apply_abc123 -e staging -d users"))
+	assert.False(t, p.HasDatabaseFlag("schemabot rollback apply_abc123 -e staging"))
+}
+
+func TestCommandSupportsDatabaseFlag(t *testing.T) {
+	assert.True(t, commandSupportsDatabaseFlag(action.Plan))
+	assert.True(t, commandSupportsDatabaseFlag(action.Apply))
+	assert.False(t, commandSupportsDatabaseFlag(action.Rollback))
+	assert.False(t, commandSupportsDatabaseFlag(action.RollbackConfirm))
+	assert.False(t, commandSupportsDatabaseFlag("unknown"))
 }
 
 func TestParseCommand(t *testing.T) {
@@ -370,6 +384,17 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
+			name: "rollback leaves unsupported database flag out of result",
+			body: "schemabot rollback apply_abc123 -e staging -d users_db",
+			expected: CommandResult{
+				Action:      "rollback",
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
 			name: "rollback without apply ID",
 			body: "schemabot rollback -e Staging",
 			expected: CommandResult{
@@ -391,6 +416,16 @@ func TestParseCommand(t *testing.T) {
 		{
 			name: "rollback-confirm",
 			body: "schemabot rollback-confirm -e production",
+			expected: CommandResult{
+				Action:      "rollback-confirm",
+				Environment: "production",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "rollback-confirm leaves unsupported database flag out of result",
+			body: "schemabot rollback-confirm -e production -d users_db",
 			expected: CommandResult{
 				Action:      "rollback-confirm",
 				Environment: "production",

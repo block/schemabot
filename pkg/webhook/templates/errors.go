@@ -12,6 +12,7 @@ type SchemaErrorData struct {
 	Timestamp          string
 	Environment        string
 	DatabaseName       string
+	SchemaPath         string
 	CommandName        string // "plan" or "apply"
 	ErrorDetail        string
 	AvailableDatabases string
@@ -82,6 +83,18 @@ database: {{.DatabaseName}}
 type: mysql
 ` + "```" + ``
 
+const configOutsideAllowedDirsTemplate = `## ⚠️ SchemaBot Configuration Not Authorized
+
+**Database**: ` + "`{{.DatabaseName}}`" + ` | **Environment**: ` + "`{{.Environment}}`" + `
+
+*Requested by @{{.RequestedBy}} at {{.Timestamp}} UTC*
+
+SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but this SchemaBot instance is not configured to manage its schema directory.
+
+**Schema directory**: ` + "`{{.SchemaPath}}`" + `
+
+Ask a SchemaBot operator to add this directory to ` + "`databases.{{.DatabaseName}}.allowed_dirs`" + ` in the server config, or move the schema config and files under an allowed directory.`
+
 const multipleConfigsTemplate = `## ⚠️ Multiple Databases Detected
 
 **Environment**: ` + "`{{.Environment}}`" + `
@@ -118,6 +131,7 @@ var (
 	tmplInvalidConfig        = template.Must(template.New("invalidConfig").Parse(invalidConfigTemplate))
 	tmplNoConfigNoDatabase   = template.Must(template.New("noConfigNoDatabase").Parse(noConfigNoDatabaseTemplate))
 	tmplNoConfigWithDatabase = template.Must(template.New("noConfigWithDatabase").Parse(noConfigWithDatabaseTemplate))
+	tmplConfigNotAuthorized  = template.Must(template.New("configOutsideAllowedDirs").Parse(configOutsideAllowedDirsTemplate))
 	tmplMultipleConfigs      = template.Must(template.New("multipleConfigs").Parse(multipleConfigsTemplate))
 	tmplGenericError         = template.Must(template.New("genericError").Parse(genericErrorTemplate))
 )
@@ -138,6 +152,12 @@ func RenderNoConfig(data SchemaErrorData) string {
 		return renderTemplate(tmplNoConfigNoDatabase, data)
 	}
 	return renderTemplate(tmplNoConfigWithDatabase, data)
+}
+
+// RenderConfigNotAuthorized renders the error shown when schemabot.yaml exists
+// but its schema directory is outside the server-side allowed_dirs boundary.
+func RenderConfigNotAuthorized(data SchemaErrorData) string {
+	return renderTemplate(tmplConfigNotAuthorized, data)
 }
 
 // RenderMultipleConfigs renders the "multiple configs" error comment.

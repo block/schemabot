@@ -152,7 +152,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 			return
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, ghclient.ErrNoConfig)
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, newSchemaConfigOutsideAllowedDirsError(config, configDir))
 			return
 		}
 		schemaDatabase = config.Database
@@ -163,7 +163,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName string, i
 			return
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, ghclient.ErrNoConfig)
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, newSchemaConfigOutsideAllowedDirsError(config, configDir))
 			return
 		}
 		schemaDatabase = config.Database
@@ -372,6 +372,19 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		h.logger.Warn("schema request: database not found", logFields...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_not_found")
 		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotFound(data))
+		return
+	}
+
+	var configNotAuthorizedErr *schemaConfigOutsideAllowedDirsError
+	if errors.As(err, &configNotAuthorizedErr) {
+		data.DatabaseName = configNotAuthorizedErr.Database
+		data.SchemaPath = configNotAuthorizedErr.SchemaPath
+		h.logger.Warn("schema request: config outside allowed_dirs",
+			"repo", repo, "pr", pr, "environment", environment,
+			"database", data.DatabaseName, "database_type", configNotAuthorizedErr.DatabaseType,
+			"schema_path", data.SchemaPath, "action", commandName, "error", err)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, data.DatabaseName, environment, "config_not_authorized")
+		h.postComment(repo, pr, installationID, templates.RenderConfigNotAuthorized(data))
 		return
 	}
 

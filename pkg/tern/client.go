@@ -66,7 +66,7 @@ type Client interface {
 
 	// RollbackPlan generates a plan to revert to the schema state before the most recent apply.
 	// Uses the OriginalSchema captured at plan time.
-	RollbackPlan(ctx context.Context, database string) (*ternv1.PlanResponse, error)
+	RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error)
 
 	// Health checks the service health.
 	Health(ctx context.Context) error

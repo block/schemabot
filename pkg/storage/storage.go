@@ -253,6 +253,23 @@ type ApplyStore interface {
 	// acquire the parent apply lease after claiming an apply_operations row.
 	ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*Apply, error)
 
+	// FindNextApplyForStopReconciliation atomically claims one apply eligible for
+	// stop reconciliation — pending or one of the active recovery-claimable states
+	// (the claimableApplyStates set); the resumable non-terminal states
+	// failed_retryable and stopped are excluded because they have their own resume
+	// paths — that has a pending stop control request, at least one
+	// pending operation, and no active operation (none being driven and none
+	// awaiting stale recovery), rotating the lease onto it like FindNextApply. It
+	// is the trigger for stop reconciliation when no operation is claimable to
+	// carry it: under on_failure "continue" a failed earlier sibling can leave the
+	// apply with only terminal and pending operations, and the claim gate keeps
+	// the pending ones from starting, so without this path the apply would strand
+	// non-terminal with its stop request pending forever. Skipping applies with
+	// any active operation leaves in-flight (and crash-recovered) drives to settle
+	// the stop themselves. Returns nil when no such apply exists or it is locked
+	// by a peer.
+	FindNextApplyForStopReconciliation(ctx context.Context, owner string) (*Apply, error)
+
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 	// Should be called every 10 seconds while working on an apply.
 	// If not called for > 1 minute, another worker can claim the apply.
@@ -431,6 +448,16 @@ type ApplyOperationStore interface {
 
 	// DeleteByApply removes all child rows for an apply (cleanup on apply delete).
 	DeleteByApply(ctx context.Context, applyID int64) error
+
+	// MarkPendingStoppedByApply transitions every still-pending operation of an
+	// apply to stopped, returning the number of rows changed. Used by operator
+	// stop reconciliation: once a stop is pending the claim gate keeps pending
+	// siblings from starting, so they are terminalized here to let the apply
+	// settle instead of stranding non-terminal under on_failure "continue". Only
+	// pending rows are touched; running/terminal rows are left untouched. stopped
+	// is resumable, so completed_at is left nil. Apply-lease guarded when a lease
+	// is present in ctx.
+	MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error)
 }
 
 // VitessApplyDataStore manages Vitess-specific apply data (deploy request tracking).

@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/secrets"
@@ -33,6 +34,11 @@ type ServerConfig struct {
 	// Storage configures SchemaBot's internal storage database.
 	// If not specified, falls back to MYSQL_DSN environment variable.
 	Storage StorageConfig `yaml:"storage"`
+
+	// Auth configures API authentication. When Type is empty or "none" (the
+	// default), authentication is disabled and all requests are allowed,
+	// unchanged from deployments without this config.
+	Auth AuthConfig `yaml:"auth"`
 
 	// GitHub configures a single GitHub App for webhook-driven schema changes.
 	// Mutually exclusive with Apps. If neither is set, the webhook endpoint
@@ -54,6 +60,12 @@ type ServerConfig struct {
 	// Databases contains registered database configurations per environment.
 	// Key format: "database_name" with nested environment configs.
 	Databases map[string]DatabaseConfig `yaml:"databases"`
+
+	// TargetResolver configures how a data-plane server (serve --grpc) resolves
+	// an opaque execution target to a connection. It is distinct from the
+	// control-plane Databases routing table: the data plane receives a target
+	// over gRPC and resolves it here, rather than routing logical database names.
+	TargetResolver TargetResolverConfig `yaml:"target_resolver,omitempty"`
 
 	// Repos holds per-repository configuration.
 	Repos map[string]RepoConfig `yaml:"repos"`
@@ -357,6 +369,25 @@ type DSNFromConfigPaths struct {
 	Database string `yaml:"database,omitempty"`
 }
 
+// TargetResolverConfig configures the data-plane connection resolver. Targets
+// is the static target -> connection inventory: the "no inventory service"
+// fallback and per-target overrides. A dynamic backend (e.g. Etre) discovers
+// targets by key and needs no enumeration here, so it will slot in as a sibling
+// field without changing this shape.
+type TargetResolverConfig struct {
+	Targets map[string]inventory.StaticTarget `yaml:"targets,omitempty"`
+}
+
+// Configured reports whether the data plane has any static target inventory.
+func (c TargetResolverConfig) Configured() bool {
+	return len(c.Targets) > 0
+}
+
+// StaticInventory returns the static inventory config for NewStaticResolver.
+func (c TargetResolverConfig) StaticInventory() inventory.StaticConfig {
+	return inventory.StaticConfig{Targets: c.Targets}
+}
+
 // DatabaseConfig holds configuration for a registered database.
 type DatabaseConfig struct {
 	// Type is the database type: "mysql", "vitess", or "strata".
@@ -626,6 +657,9 @@ func (c *ServerConfig) Validate() error {
 	if err := c.validateGitHubAppsConfig(); err != nil {
 		return err
 	}
+	if err := c.validateRequiredChecksNotAggregate(); err != nil {
+		return err
+	}
 	if c.PendingDropsEnabled() {
 		if _, err := c.PendingDropsRetention(); err != nil {
 			return err
@@ -764,7 +798,31 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 
+	if err := c.Auth.Validate(); err != nil {
+		return fmt.Errorf("auth config: %w", err)
+	}
+
 	return nil
+}
+
+// AuthConfig configures authentication for the SchemaBot HTTP API.
+// When Type is empty or "none" (the default), authentication is disabled and
+// all requests are allowed — unchanged from deployments without this config.
+type AuthConfig struct {
+	// Type selects the authenticator: "none" (or "", the default).
+	// Additional types (e.g. "oidc") are introduced in later changes.
+	Type string `yaml:"type"`
+}
+
+// Validate checks the auth configuration. Unknown types are rejected so a
+// typo fails closed at startup rather than silently disabling auth.
+func (a *AuthConfig) Validate() error {
+	switch a.Type {
+	case "", "none":
+		return nil
+	default:
+		return fmt.Errorf("unknown auth type %q (supported: none)", a.Type)
+	}
 }
 
 func validateSupportChannel(c SupportChannelConfig) error {
@@ -909,6 +967,64 @@ func validateUniqueNames(field string, names []string) error {
 			return fmt.Errorf("%s contains duplicate value %q", field, name)
 		}
 		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+// aggregateCheckNameBases returns the distinct aggregate Check Run base names
+// this deployment publishes: the legacy single-App base or every multi-App
+// base. The default base applies even when check-name is unset, since SchemaBot
+// publishes "SchemaBot" by default.
+func (c *ServerConfig) aggregateCheckNameBases() []string {
+	seen := make(map[string]struct{})
+	var bases []string
+	add := func(base string) {
+		if base == "" {
+			return
+		}
+		if _, ok := seen[base]; ok {
+			return
+		}
+		seen[base] = struct{}{}
+		bases = append(bases, base)
+	}
+	if len(c.Apps) > 0 {
+		for _, app := range c.Apps {
+			add(app.CheckRunNameBase())
+		}
+		return bases
+	}
+	add(c.GitHub.CheckRunNameBase())
+	return bases
+}
+
+// isAggregateCheckName reports whether name is SchemaBot's own aggregate Check
+// Run name for base: the base itself or its environment-scoped form
+// "base (<env>)".
+func isAggregateCheckName(name, base string) bool {
+	if name == base {
+		return true
+	}
+	return strings.HasPrefix(name, base+" (") && strings.HasSuffix(name, ")")
+}
+
+// validateRequiredChecksNotAggregate rejects a required_checks entry that names
+// SchemaBot's own aggregate Check Run. SchemaBot's checks are excluded from the
+// passing-checks gate to avoid self-deadlock, so an aggregate name listed in
+// required_checks would be silently unenforced — the gate would treat it as
+// always satisfied. Failing config load makes the misconfiguration visible
+// instead of producing a gate that never blocks on the named check.
+func (c *ServerConfig) validateRequiredChecksNotAggregate() error {
+	if len(c.RequiredChecks) == 0 {
+		return nil
+	}
+	bases := c.aggregateCheckNameBases()
+	for _, name := range c.RequiredChecks {
+		for _, base := range bases {
+			if isAggregateCheckName(name, base) {
+				return fmt.Errorf("required_checks entry %q names SchemaBot's own aggregate check (base %q); SchemaBot checks are excluded from the passing-checks gate, so this entry would never be enforced", name, base)
+			}
+		}
 	}
 	return nil
 }

@@ -28,6 +28,16 @@ func TestRenderUnsupportedAutoConfirm(t *testing.T) {
 	assert.Equal(t, "The `-y` flag is not supported for `plan`.", rendered)
 }
 
+func TestRenderUnsupportedDatabaseFlag(t *testing.T) {
+	rendered := RenderUnsupportedDatabaseFlag("rollback")
+	assert.Equal(t, "The `-d` flag is not supported for `rollback`.", rendered)
+}
+
+func TestRenderUnsupportedDatabaseFlagRollbackConfirm(t *testing.T) {
+	rendered := RenderUnsupportedDatabaseFlag("rollback-confirm")
+	assert.Equal(t, "The `-d` flag is not supported for `rollback-confirm`.", rendered)
+}
+
 func TestRenderControlMissingApplyID(t *testing.T) {
 	rendered := RenderControlMissingApplyID("stop")
 	assert.Contains(t, rendered, "Missing Apply ID")

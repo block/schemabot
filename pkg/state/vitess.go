@@ -1,6 +1,8 @@
 package state
 
 import (
+	"strings"
+
 	vitessstatus "vitess.io/vitess/go/vt/schema"
 )
 
@@ -27,4 +29,17 @@ var Vitess = struct {
 	// SchemaBot synthesizes it when a migration is running with ready_to_complete=1
 	// in SHOW VITESS_MIGRATIONS output.
 	ReadyToComplete: "ready_to_complete",
+}
+
+// IsTerminalVitessState reports whether a Vitess OnlineDDL status is terminal —
+// the schema change has reached an end state and will make no further progress.
+// Comparison is case-insensitive so it tolerates whatever casing
+// SHOW VITESS_MIGRATIONS reports.
+func IsTerminalVitessState(s string) bool {
+	switch strings.ToLower(s) {
+	case Vitess.Complete, Vitess.Failed, Vitess.Cancelled:
+		return true
+	default:
+		return false
+	}
 }

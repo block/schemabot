@@ -41,6 +41,9 @@ func (h *Handler) postCommandError(
 }
 
 func userFacingError(err error) string {
+	if message, ok := userFacingConfigNotAuthorizedError(err); ok {
+		return message
+	}
 	var remoteErr *api.RemoteDeploymentUnavailableError
 	if errors.As(err, &remoteErr) {
 		return userFacingRemoteUnavailableError(remoteErr.Deployment, remoteErr.Target, err.Error())
@@ -49,6 +52,18 @@ func userFacingError(err error) string {
 		return userFacingRemoteUnavailableError("", "", err.Error())
 	}
 	return err.Error()
+}
+
+func userFacingConfigNotAuthorizedError(err error) (string, bool) {
+	var configErr *schemaConfigOutsideAllowedDirsError
+	if !errors.As(err, &configErr) {
+		return "", false
+	}
+	return strings.Join([]string{
+		"SchemaBot found a `schemabot.yaml` configuration, but this SchemaBot instance is not configured to manage its schema directory.",
+		"Schema directory: `" + configErr.SchemaPath + "`.",
+		"Ask a SchemaBot operator to add this directory to `databases." + configErr.Database + ".allowed_dirs` in the server config, or move the schema config and files under an allowed directory.",
+	}, " "), true
 }
 
 func userFacingErrorDetail(errorDetail string) string {

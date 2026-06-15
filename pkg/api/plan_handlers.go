@@ -914,7 +914,7 @@ func (s *Service) ExecuteRollbackPlan(ctx context.Context, database, environment
 		return nil, fmt.Errorf("database %q (%s): %w", database, environment, err)
 	}
 
-	resp, err := client.RollbackPlan(ctx, database)
+	resp, err := client.RollbackPlan(ctx, database, environment)
 	if err != nil {
 		return nil, err
 	}
