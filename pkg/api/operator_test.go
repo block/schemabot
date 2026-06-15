@@ -368,3 +368,133 @@ func TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarri
 	assert.Equal(t, "prior reason", applyStore.updated.ErrorMessage,
 		"with no operation-level message the existing apply reason must be preserved")
 }
+
+// fakeControlRequestStore is a minimal ControlRequestStore for stop
+// reconciliation tests: GetPending returns the configured pending stop request,
+// and CompletePending records the operations it was asked to complete.
+type fakeControlRequestStore struct {
+	storage.ControlRequestStore
+	pendingStop *storage.ApplyControlRequest
+	completed   []storage.ControlOperation
+}
+
+func (s *fakeControlRequestStore) GetPending(_ context.Context, _ int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	if op == storage.ControlOperationStop {
+		return s.pendingStop, nil
+	}
+	return nil, nil
+}
+
+func (s *fakeControlRequestStore) CompletePending(_ context.Context, _ int64, op storage.ControlOperation) error {
+	s.completed = append(s.completed, op)
+	return nil
+}
+
+// markPendingStoppedRecordingStore records MarkPendingStoppedByApply so a test
+// can assert the operator stop reconciliation terminalized the pending siblings.
+type markPendingStoppedRecordingStore struct {
+	storage.ApplyOperationStore
+	called     bool
+	stoppedFor int64
+	count      int64
+}
+
+func (s *markPendingStoppedRecordingStore) MarkPendingStoppedByApply(_ context.Context, applyID int64) (int64, error) {
+	s.called = true
+	s.stoppedFor = applyID
+	return s.count, nil
+}
+
+// getApplyStore returns a fixed apply from Get so completePendingStopIfApplyResolved
+// can be driven against a chosen terminal/non-terminal state.
+type getApplyStore struct {
+	storage.ApplyStore
+	apply *storage.Apply
+}
+
+func (s *getApplyStore) Get(_ context.Context, _ int64) (*storage.Apply, error) {
+	return s.apply, nil
+}
+
+type mockStorageWithControlAndOps struct {
+	mockStorage
+	applies  storage.ApplyStore
+	applyOps storage.ApplyOperationStore
+	control  storage.ControlRequestStore
+}
+
+func (m *mockStorageWithControlAndOps) Applies() storage.ApplyStore { return m.applies }
+func (m *mockStorageWithControlAndOps) ApplyOperations() storage.ApplyOperationStore {
+	return m.applyOps
+}
+func (m *mockStorageWithControlAndOps) ControlRequests() storage.ControlRequestStore {
+	return m.control
+}
+
+func newStopReconcileTestService(applies storage.ApplyStore, ops storage.ApplyOperationStore, control storage.ControlRequestStore) *Service {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(&mockStorageWithControlAndOps{applies: applies, applyOps: ops, control: control}, testServerConfig(), nil, logger)
+}
+
+// TestStopPendingOperationsForPendingStop verifies the operator terminalizes
+// pending siblings only when a stop is actually pending for the apply.
+func TestStopPendingOperationsForPendingStop(t *testing.T) {
+	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-stop", Environment: "staging"}
+
+	t.Run("stops pending siblings when a stop is pending", func(t *testing.T) {
+		ops := &markPendingStoppedRecordingStore{count: 2}
+		control := &fakeControlRequestStore{pendingStop: &storage.ApplyControlRequest{
+			ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending,
+		}}
+		svc := newStopReconcileTestService(&getApplyStore{}, ops, control)
+
+		require.NoError(t, svc.stopPendingOperationsForPendingStop(t.Context(), 1, apply))
+		assert.True(t, ops.called, "a pending stop must terminalize pending siblings")
+		assert.Equal(t, apply.ID, ops.stoppedFor)
+	})
+
+	t.Run("no-op when no stop is pending", func(t *testing.T) {
+		ops := &markPendingStoppedRecordingStore{}
+		control := &fakeControlRequestStore{pendingStop: nil}
+		svc := newStopReconcileTestService(&getApplyStore{}, ops, control)
+
+		require.NoError(t, svc.stopPendingOperationsForPendingStop(t.Context(), 1, apply))
+		assert.False(t, ops.called, "without a pending stop, no siblings are stopped")
+	})
+}
+
+// TestCompletePendingStopIfApplyResolved verifies the operator completes a
+// pending stop request only once the apply has settled terminally.
+func TestCompletePendingStopIfApplyResolved(t *testing.T) {
+	pendingStop := func() *storage.ApplyControlRequest {
+		return &storage.ApplyControlRequest{ApplyID: 9, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending}
+	}
+
+	t.Run("completes the stop when the apply is terminal", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
+		control := &fakeControlRequestStore{pendingStop: pendingStop()}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
+		require.Len(t, control.completed, 1, "a terminal apply with a pending stop completes the request")
+		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
+	})
+
+	t.Run("leaves the stop pending while the apply is non-terminal", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-running", State: state.Apply.Running}}
+		control := &fakeControlRequestStore{pendingStop: pendingStop()}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
+		assert.Empty(t, control.completed, "a non-terminal apply must not complete the stop request")
+	})
+
+	t.Run("no-op when no stop is pending", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
+		control := &fakeControlRequestStore{pendingStop: nil}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
+		assert.Empty(t, control.completed, "no pending stop means nothing to complete")
+	})
+}
