@@ -313,23 +313,6 @@ func (c *LocalClient) credentialsForGroupedApply(plan *storage.Plan) (*engine.Cr
 	return c.credentialsForMySQLNamespace(namespace)
 }
 
-// credentialsForApply resolves credentials for an apply's engine operation. A
-// MySQL apply runs one namespace, so every task of the apply shares it — any
-// targeted task (terminal or not) yields the same connection database, so the
-// first targeted task is representative.
-func (c *LocalClient) credentialsForApply(tasks []*storage.Task, targetApplyID int64) (*engine.Credentials, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
-		return c.credentials(), nil
-	}
-	for _, task := range tasks {
-		if targetApplyID > 0 && task.ApplyID != targetApplyID {
-			continue
-		}
-		return c.credentialsForTask(task)
-	}
-	return nil, fmt.Errorf("no targeted task found to resolve MySQL credentials for apply %d", targetApplyID)
-}
-
 func mysqlDSNWithDatabase(dsn, database string) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {

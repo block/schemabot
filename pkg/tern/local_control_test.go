@@ -127,9 +127,10 @@ func (s *controlTestStorage) ControlRequests() storage.ControlRequestStore {
 
 type controlCaptureEngine struct {
 	engine.Engine
-	cutoverReq *engine.ControlRequest
-	stopReq    *engine.ControlRequest
-	stopErr    error
+	cutoverReq  *engine.ControlRequest
+	stopReq     *engine.ControlRequest
+	progressReq *engine.ProgressRequest
+	stopErr     error
 	// onStop runs when Stop is invoked, before it returns. Used to observe
 	// storage state at the moment of the engine stop (e.g. to assert the engine
 	// is stopped before tasks are marked stopped/cancelled).
@@ -156,7 +157,8 @@ func (e *controlCaptureEngine) Stop(_ context.Context, req *engine.ControlReques
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
-func (e *controlCaptureEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+func (e *controlCaptureEngine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	e.progressReq = req
 	return &engine.ProgressResult{}, nil
 }
 
@@ -249,6 +251,50 @@ func TestLocalClient_StopMarksMySQLApplyStopped(t *testing.T) {
 	assert.Equal(t, state.Apply.Stopped, apply.State)
 	assert.Nil(t, apply.CompletedAt)
 	require.NotNil(t, eng.stopReq, "stop should call the engine")
+}
+
+// Sequential MySQL applies can contain tasks from multiple namespaces, but only
+// one Spirit operation is live at a time. Stop and the post-stop progress
+// snapshot must use the namespace for the task that had live engine work, not a
+// different targeted task that happened to appear first in storage order.
+func TestLocalClient_StopSnapshotsProgressWithStoppedTaskNamespace(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-multi-namespace-stop",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	pendingTask := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-pending",
+		Database:       "testdb",
+		Namespace:      "pending_schema",
+		State:          state.Task.Pending,
+	}
+	liveTask := &storage.Task{
+		ID:             8,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-live",
+		Database:       "testdb",
+		Namespace:      "live_schema",
+		State:          state.Task.Running,
+	}
+	eng := &controlCaptureEngine{}
+	client := newMySQLControlTestClient(apply, []*storage.Task{pendingTask, liveTask}, eng)
+
+	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	require.NotNil(t, eng.stopReq, "stop should call the engine for the live task")
+	require.NotNil(t, eng.stopReq.Credentials)
+	assert.Equal(t, "root@tcp(localhost:3306)/live_schema", eng.stopReq.Credentials.DSN)
+	require.NotNil(t, eng.progressReq, "stop should snapshot progress with the stopped task credentials")
+	require.NotNil(t, eng.progressReq.Credentials)
+	assert.Equal(t, "root@tcp(localhost:3306)/live_schema", eng.progressReq.Credentials.DSN)
 }
 
 // A stop request can race with a worker that finalized all task rows but

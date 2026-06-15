@@ -271,7 +271,8 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 	// Stop the engine first, THEN snapshot progress.
 	// eng.Stop() blocks until Spirit's goroutine exits, so by the time it
 	// returns the progress data reflects the true final state of each table.
-	if err := c.stopEngineForTasks(ctx, eng, tasks, targetApplyID); err != nil {
+	stopCreds, err := c.stopEngineForTasks(ctx, eng, tasks, targetApplyID)
+	if err != nil {
 		return nil, fmt.Errorf("engine stop failed: %w", err)
 	}
 
@@ -288,7 +289,7 @@ func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller 
 		terminalState = state.Task.Cancelled
 	} else {
 		// Snapshot progress AFTER Spirit has fully stopped to preserve row copy progress.
-		engineTableProgress = c.snapshotEngineProgress(ctx, eng, tasks, targetApplyID)
+		engineTableProgress = c.snapshotEngineProgress(ctx, eng, stopCreds)
 	}
 
 	stoppedCount, skippedCount, applyID := c.markTasksWithState(ctx, tasks, targetApplyID, engineTableProgress, terminalState)
@@ -530,10 +531,10 @@ func hasLiveEngineWork(taskState string) bool {
 // a single engine operation (one Spirit runner or one PlanetScale deploy
 // request) whose stop terminates the whole operation, so one eng.Stop covers the
 // targeted apply.
-func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine, tasks []*storage.Task, targetApplyID int64) error {
+func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine, tasks []*storage.Task, targetApplyID int64) (*engine.Credentials, error) {
 	if eng == nil {
 		c.logger.Error("stopEngineForTasks: engine is nil")
-		return fmt.Errorf("no engine configured for type: %s", c.config.Type)
+		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 	for _, task := range tasks {
 		if targetApplyID > 0 && task.ApplyID != targetApplyID {
@@ -550,34 +551,33 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 		}
 		creds, err := c.credentialsForTask(task)
 		if err != nil {
-			return fmt.Errorf("resolve credentials for stop task %s: %w", task.TaskIdentifier, err)
+			return nil, fmt.Errorf("resolve credentials for stop task %s: %w", task.TaskIdentifier, err)
 		}
 		req, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlStop)
 		if err != nil {
-			return fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
+			return nil, fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
 		}
 		if _, err := eng.Stop(ctx, req); err != nil {
 			if c.config.Type == storage.DatabaseTypeVitess {
-				return fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, err)
+				return nil, fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, err)
 			}
 			c.logger.Warn("engine stop returned error (runner may have already exited)",
 				"task_id", task.TaskIdentifier, "error", err)
 		}
-		return nil
+		return creds, nil
 	}
-	return nil
+	c.logger.Debug("no targeted task has live engine work to stop", "database", c.config.Database, "type", c.config.Type, "target_apply_id", targetApplyID)
+	return nil, nil
 }
 
 // snapshotEngineProgress captures per-table progress from the engine after stopping.
-func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Engine, tasks []*storage.Task, targetApplyID int64) map[string]*engine.TableProgress {
+func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Engine, creds *engine.Credentials) map[string]*engine.TableProgress {
 	if eng == nil {
 		c.logger.Error("snapshotEngineProgress: engine is nil")
 		return nil
 	}
-	creds, err := c.credentialsForApply(tasks, targetApplyID)
-	if err != nil {
-		c.logger.Warn("failed to resolve credentials for engine progress snapshot after stop",
-			"database", c.config.Database, "type", c.config.Type, "error", err)
+	if creds == nil {
+		c.logger.Debug("skipping engine progress snapshot because no live engine work was stopped", "database", c.config.Database, "type", c.config.Type)
 		return nil
 	}
 	progress, err := eng.Progress(ctx, &engine.ProgressRequest{

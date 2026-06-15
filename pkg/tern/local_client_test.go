@@ -1643,21 +1643,6 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
 	})
 
-	t.Run("credentialsForApply uses the first targeted task namespace", func(t *testing.T) {
-		c := &LocalClient{config: LocalConfig{
-			Type:      storage.DatabaseTypeMySQL,
-			TargetDSN: "root@tcp(localhost:3306)/",
-		}, logger: slog.Default()}
-
-		tasks := []*storage.Task{
-			{ApplyID: 1, Namespace: "other_schema"},
-			{ApplyID: 7, Namespace: "orders_schema"},
-		}
-		creds, err := c.credentialsForApply(tasks, 7)
-		require.NoError(t, err)
-		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
-	})
-
 	t.Run("credentialsForGroupedApply injects the plan namespace", func(t *testing.T) {
 		c := &LocalClient{config: LocalConfig{
 			Type:      storage.DatabaseTypeMySQL,
