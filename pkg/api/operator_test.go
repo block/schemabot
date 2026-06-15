@@ -226,3 +226,91 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 		})
 	}
 }
+
+// stubTaskStore returns a fixed task set for GetByApplyOperationID so an
+// operation's own drive result can be derived from its tasks.
+type stubTaskStore struct {
+	storage.TaskStore
+	tasks []*storage.Task
+}
+
+func (s *stubTaskStore) GetByApplyOperationID(context.Context, int64) ([]*storage.Task, error) {
+	return s.tasks, nil
+}
+
+// markFailedRecordingApplyOperationStore records MarkFailed so a test can assert
+// the operation row was persisted failed with its own task's message.
+type markFailedRecordingApplyOperationStore struct {
+	storage.ApplyOperationStore
+	called    bool
+	failedID  int64
+	failedMsg string
+}
+
+func (s *markFailedRecordingApplyOperationStore) MarkFailed(_ context.Context, id int64, errMsg string) error {
+	s.called = true
+	s.failedID = id
+	s.failedMsg = errMsg
+	return nil
+}
+
+type mockStorageWithTasksAndOperations struct {
+	mockStorage
+	tasks    storage.TaskStore
+	applyOps storage.ApplyOperationStore
+}
+
+func (m *mockStorageWithTasksAndOperations) Tasks() storage.TaskStore { return m.tasks }
+
+func (m *mockStorageWithTasksAndOperations) ApplyOperations() storage.ApplyOperationStore {
+	return m.applyOps
+}
+
+// TestMarkOperationFromOwnResult_PersistsFailedIndependentOfParent verifies that
+// the drive path records a failed deployment from the operation's OWN tasks
+// regardless of the parent apply's state. Under the on_failure "continue"
+// projection the parent is held running while sibling deployments are still in
+// flight; deriving the operation from its own failing task still marks the row
+// failed (with that task's message) rather than leaving it claimable to be
+// re-driven, so the deployment-order gate and the parent re-derivation observe
+// the real outcome.
+func TestMarkOperationFromOwnResult_PersistsFailedIndependentOfParent(t *testing.T) {
+	opStore := &markFailedRecordingApplyOperationStore{}
+	taskStore := &stubTaskStore{tasks: []*storage.Task{
+		{State: state.Apply.Completed},
+		{State: state.Apply.Failed, ErrorMessage: "spirit: cutover failed"},
+	}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithTasksAndOperations{tasks: taskStore, applyOps: opStore}, testServerConfig(), nil, logger)
+
+	op := &storage.ApplyOperation{ID: 9, Deployment: "region-b", OnFailure: storage.OnFailureContinue}
+
+	marked, err := svc.markOperationFromOwnResult(t.Context(), 1, op)
+	require.NoError(t, err)
+	assert.True(t, marked, "a failed operation must be durably recorded so it is not re-claimed")
+	assert.True(t, opStore.called, "the operation row must be marked failed from its own tasks")
+	assert.Equal(t, int64(9), opStore.failedID, "the claimed operation row must be the one marked failed")
+	assert.Equal(t, "spirit: cutover failed", opStore.failedMsg,
+		"the failure message must come from the operation's own failing task")
+}
+
+// TestMarkOperationFromOwnResult_LeavesNonTerminalClaimable verifies that an
+// operation whose own tasks are still running is left claimable (marked=false,
+// no terminal write) so a later poll re-leases and resumes it, rather than being
+// prematurely terminalized from a still-in-flight drive.
+func TestMarkOperationFromOwnResult_LeavesNonTerminalClaimable(t *testing.T) {
+	opStore := &markFailedRecordingApplyOperationStore{}
+	taskStore := &stubTaskStore{tasks: []*storage.Task{
+		{State: state.Apply.Running},
+		{State: state.Apply.Completed},
+	}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithTasksAndOperations{tasks: taskStore, applyOps: opStore}, testServerConfig(), nil, logger)
+
+	op := &storage.ApplyOperation{ID: 11, Deployment: "region-c", OnFailure: storage.OnFailureContinue}
+
+	marked, err := svc.markOperationFromOwnResult(t.Context(), 1, op)
+	require.NoError(t, err)
+	assert.False(t, marked, "a still-running operation must be left claimable for a later poll")
+	assert.False(t, opStore.called, "no terminal write should occur for a non-terminal operation")
+}

@@ -344,12 +344,34 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
-	// Reload the parent apply: ResumeApply persists the final state to storage,
-	// and the operation row must mirror the durable outcome, not the in-memory
-	// object the resume path started from.
+	// Persist the operation row from its OWN drive outcome — the aggregate of
+	// this operation's tasks — rather than mirroring the parent apply down.
+	// Under on_failure "continue" the parent applies.state can be held running
+	// (the policy-aware projection waits for siblings to settle) while this
+	// operation has terminally failed; mirroring the parent down would leave the
+	// failed operation claimable and re-leased on every poll, so its failure
+	// would never be durably recorded. The operation row is authoritative for
+	// its own deployment; the parent state is derived from the operation rows
+	// afterward via updateApplyStateFromOperations.
+	marked, err := s.markOperationFromOwnResult(operationLeaseCtx, workerID, op)
+	if err != nil {
+		s.logger.Error("operator: failed to update apply_operation from its tasks; derived apply state not updated",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+		return
+	}
+	if !marked {
+		return
+	}
+
+	// Reload the parent apply so updateApplyStateFromOperations below re-derives
+	// the parent from its children against the durable apply.State (its
+	// terminal-to-non-terminal guard), not the in-memory object the resume path
+	// started from. The reloaded row is only the target of the re-derivation;
+	// the operation row was already persisted from its own tasks above.
 	finalApply, err := s.storage.Applies().Get(applyLeaseCtx, apply.ID)
 	if err != nil {
-		s.logger.Error("operator: failed to reload parent apply after resume; operation state not updated",
+		s.logger.Error("operator: failed to reload parent apply after resume; derived apply state not updated",
 			"worker", workerID,
 			"apply_operation_id", op.ID,
 			"apply_id", apply.ApplyIdentifier,
@@ -358,22 +380,11 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 	if finalApply == nil {
-		s.logger.Error("operator: parent apply not found after resume; operation state not updated",
+		s.logger.Error("operator: parent apply not found after resume; derived apply state not updated",
 			"worker", workerID,
 			"apply_operation_id", op.ID,
 			"apply_id", apply.ApplyIdentifier,
 			"deployment", op.Deployment)
-		return
-	}
-
-	marked, err := s.markOperationFromApplyState(operationLeaseCtx, workerID, op, finalApply)
-	if err != nil {
-		s.logger.Error("operator: failed to update apply_operation from parent apply state; derived apply state not updated",
-			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", finalApply.Environment, "state", finalApply.State, "error", err)
-		return
-	}
-	if !marked {
 		return
 	}
 
@@ -663,57 +674,116 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, workerID int
 }
 
 // markOperationFromApplyState transitions the claimed operation row to mirror
-// the parent apply's final state after a successful resume.
-//
-// It returns updated=true whenever the operation row was durably written to
-// mirror the parent — including resumable final states (stopped,
-// failed_retryable), not only terminal ones. updated=true is the signal the
-// caller needs before deriving the parent apply's state from its children: the
-// child row now reflects the parent, so the derived state is current. A parent
-// that is still mid-flight leaves the operation claimable (updated=false, nil
-// error) so a later poll re-leases and resumes it; a write failure returns the
-// error so the caller skips derivation rather than aggregating a stale child
-// state.
+// the parent apply's final state. It is used by the unclaimable-parent
+// reconciliation path, where an already-terminal parent is authoritative for its
+// single operation. The drive path instead uses markOperationFromOwnResult so a
+// failed operation is recorded even while the parent projection holds the apply
+// running under on_failure "continue". Both delegate to persistOperationState,
+// which documents the updated/error contract.
 func (s *Service) markOperationFromApplyState(ctx context.Context, workerID int, op *storage.ApplyOperation, apply *storage.Apply) (updated bool, err error) {
+	return s.persistOperationState(ctx, workerID, op, apply.State, apply.ErrorMessage)
+}
+
+// markOperationFromOwnResult transitions the claimed operation row to reflect
+// the operation's OWN drive result, derived from its tasks via
+// state.DeriveApplyState rather than mirrored from the parent apply.
+//
+// This is the drive-path counterpart to markOperationFromApplyState. Under the
+// on_failure "continue" projection updateApplyStateFromOperations holds the
+// parent apply running while sibling deployments are still in flight, so
+// mirroring this operation from the parent would hit the non-terminal
+// "leave claimable" branch and never persist the operation's own terminal
+// outcome: a failed deployment would be silently re-claimed and the
+// deployment-order gate (which keys off an earlier sibling's failed state under
+// continue) would read a stale value. Deriving from the operation's own tasks
+// records its real result independently of the parent projection, which
+// updateApplyStateFromOperations then aggregates back into the parent apply.
+//
+// The returned updated flag and error carry the same contract as
+// markOperationFromApplyState: updated=true when the row was durably written
+// (including the resumable stopped / failed_retryable states), updated=false
+// with a nil error when the operation's tasks derive a non-terminal state and
+// the row is left claimable for a later poll, and a non-nil error when a read or
+// write fails so the caller skips parent derivation.
+func (s *Service) markOperationFromOwnResult(ctx context.Context, workerID int, op *storage.ApplyOperation) (updated bool, err error) {
+	tasks, err := s.storage.Tasks().GetByApplyOperationID(ctx, op.ID)
+	if err != nil {
+		return false, fmt.Errorf("load tasks for apply_operation %d (deployment %q): %w", op.ID, op.Deployment, err)
+	}
+	taskStates := make([]string, len(tasks))
+	for i, t := range tasks {
+		taskStates[i] = t.State
+	}
+	derived := state.DeriveApplyState(taskStates)
+	return s.persistOperationState(ctx, workerID, op, derived, firstFailedTaskError(tasks))
+}
+
+// firstFailedTaskError returns the ErrorMessage of the first failed task, used
+// to populate the operation row's failure reason when its own tasks derive a
+// failed state. Empty when no failed task carries a message.
+func firstFailedTaskError(tasks []*storage.Task) string {
+	for _, t := range tasks {
+		if state.IsState(t.State, state.Apply.Failed) && t.ErrorMessage != "" {
+			return t.ErrorMessage
+		}
+	}
+	return ""
+}
+
+// persistOperationState writes the claimed operation row to reflect a derived
+// state, mapping each state to the appropriate row-write. The derived state and
+// errorMessage come from either the parent apply (markOperationFromApplyState,
+// the reconcile path) or the operation's own tasks (markOperationFromOwnResult,
+// the drive path); the row-write mapping is identical regardless of source.
+//
+// It returns updated=true whenever the operation row was durably written —
+// including resumable states (stopped, failed_retryable), not only terminal
+// ones. updated=true is the signal the caller needs before deriving the parent
+// apply's state from its children: the child row now reflects its outcome, so
+// the derived state is current. A non-terminal derived state leaves the
+// operation claimable (updated=false, nil error) so a later poll re-leases and
+// resumes it; a write failure returns the error so the caller skips derivation
+// rather than aggregating a stale child state.
+func (s *Service) persistOperationState(ctx context.Context, workerID int, op *storage.ApplyOperation, derived, errorMessage string) (updated bool, err error) {
 	opStore := s.storage.ApplyOperations()
 	switch {
-	case state.IsState(apply.State, state.Apply.Completed):
+	case state.IsState(derived, state.Apply.Completed):
 		if err := opStore.MarkCompleted(ctx, op.ID); err != nil {
 			return false, fmt.Errorf("mark apply_operation %d completed (deployment %q): %w", op.ID, op.Deployment, err)
 		}
 		return true, nil
-	case state.IsState(apply.State, state.Apply.Failed):
-		if err := opStore.MarkFailed(ctx, op.ID, apply.ErrorMessage); err != nil {
+	case state.IsState(derived, state.Apply.Failed):
+		if err := opStore.MarkFailed(ctx, op.ID, errorMessage); err != nil {
 			return false, fmt.Errorf("mark apply_operation %d failed (deployment %q): %w", op.ID, op.Deployment, err)
 		}
 		return true, nil
-	case state.IsState(apply.State, state.Apply.Stopped):
+	case state.IsState(derived, state.Apply.Stopped):
 		// stopped is resumable, so mirror the state but leave completed_at nil
 		// (matching the apply-level convention) — stopped work may resume.
-		if err := opStore.UpdateState(ctx, op.ID, apply.State); err != nil {
+		if err := opStore.UpdateState(ctx, op.ID, derived); err != nil {
 			return false, fmt.Errorf("update stopped apply_operation %d state (deployment %q): %w", op.ID, op.Deployment, err)
 		}
 		return true, nil
-	case state.IsState(apply.State, state.Apply.FailedRetryable):
+	case state.IsState(derived, state.Apply.FailedRetryable):
 		// failed_retryable is resumable like stopped: mirror the state (leaving
 		// completed_at nil) so FindNextApplyOperation reclaims it under the
 		// parent apply's recovery budget. Leaving the row in its active state
 		// would instead make recovery depend on the stale-heartbeat path, which
 		// has no budget and would re-claim it forever once retries are exhausted.
-		if err := opStore.UpdateState(ctx, op.ID, apply.State); err != nil {
+		if err := opStore.UpdateState(ctx, op.ID, derived); err != nil {
 			return false, fmt.Errorf("update failed_retryable apply_operation %d state (deployment %q): %w", op.ID, op.Deployment, err)
 		}
 		return true, nil
-	case state.IsTerminalApplyState(apply.State):
+	case state.IsTerminalApplyState(derived):
 		// cancelled / reverted — non-resumable terminal states; stamp completed_at.
-		if err := opStore.MarkTerminal(ctx, op.ID, apply.State); err != nil {
-			return false, fmt.Errorf("mark terminal apply_operation %d state %q (deployment %q): %w", op.ID, apply.State, op.Deployment, err)
+		if err := opStore.MarkTerminal(ctx, op.ID, derived); err != nil {
+			return false, fmt.Errorf("mark terminal apply_operation %d state %q (deployment %q): %w", op.ID, derived, op.Deployment, err)
 		}
 		return true, nil
 	default:
-		s.logger.Debug("operator: parent apply not terminal after resume; leaving operation claimable",
-			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
-			"deployment", op.Deployment, "environment", apply.Environment, "state", apply.State)
+		s.logger.Debug("operator: derived operation state not terminal; leaving operation claimable",
+			"worker", workerID, "apply_operation_id", op.ID,
+			"deployment", op.Deployment, "state", derived)
 		return false, nil
 	}
 }
