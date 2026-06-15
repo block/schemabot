@@ -626,6 +626,9 @@ func (c *ServerConfig) Validate() error {
 	if err := c.validateGitHubAppsConfig(); err != nil {
 		return err
 	}
+	if err := c.validateRequiredChecksNotAggregate(); err != nil {
+		return err
+	}
 	if c.PendingDropsEnabled() {
 		if _, err := c.PendingDropsRetention(); err != nil {
 			return err
@@ -909,6 +912,64 @@ func validateUniqueNames(field string, names []string) error {
 			return fmt.Errorf("%s contains duplicate value %q", field, name)
 		}
 		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+// aggregateCheckNameBases returns the distinct aggregate Check Run base names
+// this deployment publishes: the legacy single-App base or every multi-App
+// base. The default base applies even when check-name is unset, since SchemaBot
+// publishes "SchemaBot" by default.
+func (c *ServerConfig) aggregateCheckNameBases() []string {
+	seen := make(map[string]struct{})
+	var bases []string
+	add := func(base string) {
+		if base == "" {
+			return
+		}
+		if _, ok := seen[base]; ok {
+			return
+		}
+		seen[base] = struct{}{}
+		bases = append(bases, base)
+	}
+	if len(c.Apps) > 0 {
+		for _, app := range c.Apps {
+			add(app.CheckRunNameBase())
+		}
+		return bases
+	}
+	add(c.GitHub.CheckRunNameBase())
+	return bases
+}
+
+// isAggregateCheckName reports whether name is SchemaBot's own aggregate Check
+// Run name for base: the base itself or its environment-scoped form
+// "base (<env>)".
+func isAggregateCheckName(name, base string) bool {
+	if name == base {
+		return true
+	}
+	return strings.HasPrefix(name, base+" (") && strings.HasSuffix(name, ")")
+}
+
+// validateRequiredChecksNotAggregate rejects a required_checks entry that names
+// SchemaBot's own aggregate Check Run. SchemaBot's checks are excluded from the
+// passing-checks gate to avoid self-deadlock, so an aggregate name listed in
+// required_checks would be silently unenforced — the gate would treat it as
+// always satisfied. Failing config load makes the misconfiguration visible
+// instead of producing a gate that never blocks on the named check.
+func (c *ServerConfig) validateRequiredChecksNotAggregate() error {
+	if len(c.RequiredChecks) == 0 {
+		return nil
+	}
+	bases := c.aggregateCheckNameBases()
+	for _, name := range c.RequiredChecks {
+		for _, base := range bases {
+			if isAggregateCheckName(name, base) {
+				return fmt.Errorf("required_checks entry %q names SchemaBot's own aggregate check (base %q); SchemaBot checks are excluded from the passing-checks gate, so this entry would never be enforced", name, base)
+			}
+		}
 	}
 	return nil
 }

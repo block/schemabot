@@ -219,7 +219,7 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.RenderApplyBlockedByInProgressChecks("staging", []webhooktemplates.BlockingCheck{
 			{Name: "CI / unit-tests", State: "in_progress"},
 			{Name: "CI / integration-tests", State: "queued"},
-		}))
+		}, nil))
 	case PreviewCommentActorNotAuthorized:
 		fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized())
 	case PreviewCommentActorAuthUnavailable:
