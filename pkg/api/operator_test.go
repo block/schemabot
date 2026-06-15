@@ -277,8 +277,8 @@ func (m *mockStorageWithTasksAndOperations) ApplyOperations() storage.ApplyOpera
 func TestMarkOperationFromOwnResult_PersistsFailedIndependentOfParent(t *testing.T) {
 	opStore := &markFailedRecordingApplyOperationStore{}
 	taskStore := &stubTaskStore{tasks: []*storage.Task{
-		{State: state.Apply.Completed},
-		{State: state.Apply.Failed, ErrorMessage: "spirit: cutover failed"},
+		{State: state.Task.Completed},
+		{State: state.Task.Failed, ErrorMessage: "spirit: cutover failed"},
 	}}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(&mockStorageWithTasksAndOperations{tasks: taskStore, applyOps: opStore}, testServerConfig(), nil, logger)
@@ -301,8 +301,8 @@ func TestMarkOperationFromOwnResult_PersistsFailedIndependentOfParent(t *testing
 func TestMarkOperationFromOwnResult_LeavesNonTerminalClaimable(t *testing.T) {
 	opStore := &markFailedRecordingApplyOperationStore{}
 	taskStore := &stubTaskStore{tasks: []*storage.Task{
-		{State: state.Apply.Running},
-		{State: state.Apply.Completed},
+		{State: state.Task.Running},
+		{State: state.Task.Completed},
 	}}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(&mockStorageWithTasksAndOperations{tasks: taskStore, applyOps: opStore}, testServerConfig(), nil, logger)

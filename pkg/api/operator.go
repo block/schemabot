@@ -723,7 +723,7 @@ func (s *Service) markOperationFromOwnResult(ctx context.Context, workerID int, 
 // failed state. Empty when no failed task carries a message.
 func firstFailedTaskError(tasks []*storage.Task) string {
 	for _, t := range tasks {
-		if state.IsState(t.State, state.Apply.Failed) && t.ErrorMessage != "" {
+		if state.IsState(t.State, state.Task.Failed) && t.ErrorMessage != "" {
 			return t.ErrorMessage
 		}
 	}
