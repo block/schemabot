@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/secrets"
@@ -54,6 +55,12 @@ type ServerConfig struct {
 	// Databases contains registered database configurations per environment.
 	// Key format: "database_name" with nested environment configs.
 	Databases map[string]DatabaseConfig `yaml:"databases"`
+
+	// TargetResolver configures how a data-plane server (serve --grpc) resolves
+	// an opaque execution target to a connection. It is distinct from the
+	// control-plane Databases routing table: the data plane receives a target
+	// over gRPC and resolves it here, rather than routing logical database names.
+	TargetResolver TargetResolverConfig `yaml:"target_resolver,omitempty"`
 
 	// Repos holds per-repository configuration.
 	Repos map[string]RepoConfig `yaml:"repos"`
@@ -355,6 +362,25 @@ type DSNFromConfigPaths struct {
 	Host     string `yaml:"host,omitempty"`
 	Port     string `yaml:"port,omitempty"`
 	Database string `yaml:"database,omitempty"`
+}
+
+// TargetResolverConfig configures the data-plane connection resolver. Targets
+// is the static target -> connection inventory: the "no inventory service"
+// fallback and per-target overrides. A dynamic backend (e.g. Etre) discovers
+// targets by key and needs no enumeration here, so it will slot in as a sibling
+// field without changing this shape.
+type TargetResolverConfig struct {
+	Targets map[string]inventory.StaticTarget `yaml:"targets,omitempty"`
+}
+
+// Configured reports whether the data plane has any static target inventory.
+func (c TargetResolverConfig) Configured() bool {
+	return len(c.Targets) > 0
+}
+
+// StaticInventory returns the static inventory config for NewStaticResolver.
+func (c TargetResolverConfig) StaticInventory() inventory.StaticConfig {
+	return inventory.StaticConfig{Targets: c.Targets}
 }
 
 // DatabaseConfig holds configuration for a registered database.
