@@ -26,7 +26,9 @@ type TargetRouterConfig struct {
 }
 
 // TargetRouter routes data-plane requests to LocalClients resolved and cached
-// per opaque target. It is the data-plane complement to RoutingClient: the
+// per resolved target route and namespace — keyed by target, database type,
+// environment, and database, because LocalClient is still namespace-bound via
+// LocalConfig.Database. It is the data-plane complement to RoutingClient: the
 // control plane decides which target to use, while this router decides how the
 // data plane connects to that target.
 type TargetRouter struct {
@@ -457,6 +459,15 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 	resolved, err := r.resolver.ResolveTarget(ctx, inventory.Request{Target: target, DatabaseType: databaseType, Environment: environment})
 	if err != nil {
 		return nil, nil, err
+	}
+	// Fail closed on a nil or incomplete resolver result rather than building a
+	// client with an empty type/DSN and surfacing a confusing connection error
+	// later. Don't log the DSN — it carries credentials.
+	if resolved == nil {
+		return nil, nil, fmt.Errorf("resolver returned no target for %q", target)
+	}
+	if resolved.Target == "" || resolved.DatabaseType == "" || resolved.DSN == "" {
+		return nil, nil, fmt.Errorf("resolver returned an incomplete target for %q (target=%q, type=%q, dsn_empty=%t)", target, resolved.Target, resolved.DatabaseType, resolved.DSN == "")
 	}
 	key := cacheKeyForResolvedTarget(resolved, environment, namespace)
 	r.mu.Lock()

@@ -199,7 +199,7 @@ func TestTargetRouterRoutesPlanThroughStaticTarget(t *testing.T) {
 
 	_, err = router.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders-logical", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: "dsid-orders-prod"})
 	require.NoError(t, err)
-	assert.Len(t, created, 1, "the router should cache LocalClients by target")
+	assert.Len(t, created, 1, "the router should cache LocalClients by resolved target route and namespace")
 }
 
 func TestTargetRouterApplyUsesTargetScopedPendingObserver(t *testing.T) {
@@ -380,6 +380,23 @@ func TestTargetRouterApplyFailsClosedOnRequestTargetMismatch(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not match plan")
 	assert.Empty(t, created, "no client should be created when the request target contradicts the plan")
+}
+
+// A resolver that returns an incomplete target (here, an empty DSN) must fail
+// closed at routing time rather than building a client that errors confusingly
+// on first connect.
+func TestTargetRouterFailsClosedOnIncompleteResolvedTarget(t *testing.T) {
+	resolver := targetRouterResolverFunc(func(context.Context, inventory.Request) (*inventory.Target, error) {
+		return &inventory.Target{Target: "dsid-orders-prod", DatabaseType: storage.DatabaseTypeMySQL, DSN: ""}, nil
+	})
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "dsid-orders-prod", Type: storage.DatabaseTypeMySQL})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "incomplete target")
+	assert.Empty(t, created, "no client should be created for an incomplete resolved target")
 }
 
 func TestTargetRouterCloseClosesCachedClients(t *testing.T) {
