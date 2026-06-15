@@ -242,8 +242,8 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 
 // formatStatusComment renders the apply's progress/cutover status comment,
 // choosing the single- or multi-deployment layout by the apply's operation-row
-// count via formatApplyStatusComment. It loads the operation rows (in resolved
-// deployment order) so a multi-deployment apply renders the aggregated comment;
+// count via formatApplyStatusComment. It loads the operation rows (as returned
+// by ListByApply) so a multi-deployment apply renders the aggregated comment;
 // a single operation (every apply today, until the fan-out lands) renders the
 // single-deployment layout byte-for-byte. A load failure falls back to the
 // single-deployment layout so a transient storage error never blocks a comment
@@ -251,10 +251,10 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 func (o *CommentObserver) formatStatusComment(apply *storage.Apply, tasks []*storage.Task) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	ops, err := o.stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
 	if err != nil {
 		o.logger.Error("observer: failed to load apply operations for comment dispatch; rendering single-deployment layout",
-			"apply_id", apply.ApplyIdentifier, "error", err)
+			"apply_id", o.applyID, "error", err)
 		return formatProgressComment(apply, tasks)
 	}
 	return formatApplyStatusComment(apply, ops, tasks)
