@@ -63,12 +63,6 @@ func formatProgressComment(apply *storage.Apply, tasks []*storage.Task) string {
 	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks))
 }
 
-// formatCutoverComment renders the cutover confirmation comment.
-// Uses the same template — the cutover state produces the appropriate header and footer.
-func formatCutoverComment(apply *storage.Apply, tasks []*storage.Task) string {
-	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks))
-}
-
 // formatSummaryComment renders the final summary comment for a terminal apply state.
 func formatSummaryComment(apply *storage.Apply, tasks []*storage.Task) string {
 	return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks))
