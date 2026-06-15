@@ -440,8 +440,11 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 // siblings, re-derives the parent, and completes the stop once the apply is
 // terminal.
 //
-// Returns true when it claimed an apply (so the caller does not also run the
-// normal operation claim this tick), false when there was nothing to reconcile.
+// Returns true when this tick is consumed by stop reconciliation — an apply was
+// claimed (whether the reconciliation that followed succeeded or hit an error)
+// or the claim itself errored or returned an invalid lease — so the caller does
+// not also run the normal operation claim this tick. Returns false only when no
+// apply needed reconciliation.
 func (s *Service) recoverApplyPendingStop(ctx context.Context, workerID int, owner string) bool {
 	apply, err := s.storage.Applies().FindNextApplyForStopReconciliation(ctx, owner)
 	if err != nil {

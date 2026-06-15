@@ -253,8 +253,11 @@ type ApplyStore interface {
 	// acquire the parent apply lease after claiming an apply_operations row.
 	ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*Apply, error)
 
-	// FindNextApplyForStopReconciliation atomically claims one non-terminal apply
-	// (including pending) that has a pending stop control request, at least one
+	// FindNextApplyForStopReconciliation atomically claims one apply eligible for
+	// stop reconciliation — pending or one of the active recovery-claimable states
+	// (the claimableApplyStates set); the resumable non-terminal states
+	// failed_retryable and stopped are excluded because they have their own resume
+	// paths — that has a pending stop control request, at least one
 	// pending operation, and no active operation (none being driven and none
 	// awaiting stale recovery), rotating the lease onto it like FindNextApply. It
 	// is the trigger for stop reconciliation when no operation is claimable to

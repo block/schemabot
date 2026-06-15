@@ -961,7 +961,9 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	return apply, nil
 }
 
-// FindNextApplyForStopReconciliation claims one non-terminal apply that has a
+// FindNextApplyForStopReconciliation claims one apply eligible for stop
+// reconciliation (pending or an active recovery-claimable state; see
+// claimableApplyStates) that has a
 // pending stop control request, at least one pending operation, and no operation
 // currently being driven, so the operator can terminalize the pending siblings
 // and let the apply settle. See the interface doc for why this trigger is needed
@@ -976,10 +978,13 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	}
 	defer rollbackApplyTx(ctx, tx, "claim apply for stop reconciliation")
 
-	// Parent eligibility: any non-terminal apply. pending is included so a stop
-	// requested before the first operation is ever claimed is not stranded —
-	// the claim gate refuses the pending ops, so reconciliation must own them;
-	// persistApplyClaim transitions a pending apply to running for the claim.
+	// Parent eligibility: pending plus the active recovery-claimable states
+	// (claimableApplyStates); the resumable failed_retryable and stopped states
+	// are excluded because they have their own resume paths. pending is included
+	// so a stop requested before the first operation is ever claimed is not
+	// stranded — the claim gate refuses the pending ops, so reconciliation must
+	// own them; persistApplyClaim transitions a pending apply to running for the
+	// claim.
 	parentStates := append([]string{state.Apply.Pending}, claimableApplyStates()...)
 	parentStatePlaceholders := placeholders(len(parentStates))
 
