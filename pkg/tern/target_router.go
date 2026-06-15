@@ -116,15 +116,21 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 	if req == nil {
 		return nil, fmt.Errorf("apply request is required")
 	}
-	target := targetOrDatabase(req.Target, req.Database)
+	// An apply executes a previously created plan, so the plan is authoritative
+	// for routing: it carries the execution target, namespace, type, and
+	// environment chosen at plan time. Derive the route from the plan and reject
+	// a request that contradicts it. Never treat req.Database as the target — the
+	// opaque execution target and the schema namespace are distinct, and that is
+	// the whole point of this router.
+	target := req.Target
 	if target == "" && req.Options != nil {
 		target = req.Options["target"]
 	}
 	namespace := req.Database
-	if namespace == "" && req.PlanId != "" {
-		if r.storage.Plans() == nil {
-			return nil, fmt.Errorf("plan lookup is required for target-routed apply %q", req.PlanId)
-		}
+	databaseType := req.Type
+	environment := req.Environment
+
+	if req.PlanId != "" && r.storage.Plans() != nil {
 		plan, err := r.storage.Plans().Get(ctx, req.PlanId)
 		if err != nil {
 			return nil, fmt.Errorf("load plan %q for apply target routing: %w", req.PlanId, err)
@@ -132,27 +138,54 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 		if plan == nil {
 			return nil, fmt.Errorf("plan %q not found for apply target routing", req.PlanId)
 		}
-		namespace = plan.Database
-		if target == "" {
-			target = plan.Target
+		if target, err = planAuthoritativeField("target", req.PlanId, target, plan.Target); err != nil {
+			return nil, err
+		}
+		if namespace, err = planAuthoritativeField("database", req.PlanId, namespace, plan.Database); err != nil {
+			return nil, err
+		}
+		if databaseType, err = planAuthoritativeField("type", req.PlanId, databaseType, plan.DatabaseType); err != nil {
+			return nil, err
+		}
+		if environment, err = planAuthoritativeField("environment", req.PlanId, environment, plan.Environment); err != nil {
+			return nil, err
 		}
 	}
-	client, resolved, err := r.clientForTarget(ctx, target, req.Type, req.Environment, namespace)
+	if target == "" {
+		return nil, fmt.Errorf("apply for plan %q has no execution target; the request supplied none and the plan has no stored target", req.PlanId)
+	}
+
+	client, resolved, err := r.clientForTarget(ctx, target, databaseType, environment, namespace)
 	if err != nil {
 		return nil, err
 	}
-	if observer := r.takePendingObserver(cacheKeyForResolvedTarget(resolved, req.Environment, namespace)); observer != nil {
+	if observer := r.takePendingObserver(cacheKeyForResolvedTarget(resolved, environment, namespace)); observer != nil {
 		client.SetPendingObserver(observer)
 	}
 	routedReq := proto.Clone(req).(*ternv1.ApplyRequest)
 	routedReq.Database = namespace
 	routedReq.Type = resolved.DatabaseType
 	routedReq.Target = resolved.Target
+	routedReq.Environment = environment
 	if routedReq.Options == nil {
 		routedReq.Options = make(map[string]string)
 	}
 	routedReq.Options["target"] = resolved.Target
 	return client.Apply(ctx, routedReq)
+}
+
+// planAuthoritativeField resolves one routing field where the stored plan is
+// authoritative: the plan value wins, and a non-empty request value that
+// disagrees with the plan fails closed rather than silently overriding the
+// plan-time route. An empty plan value leaves the request value unchanged.
+func planAuthoritativeField(name, planID, requested, planValue string) (string, error) {
+	if planValue == "" {
+		return requested, nil
+	}
+	if requested != "" && requested != planValue {
+		return "", fmt.Errorf("apply request %s %q does not match plan %q %s %q", name, requested, planID, name, planValue)
+	}
+	return planValue, nil
 }
 
 // Progress returns progress for a stored apply by routing through its target.

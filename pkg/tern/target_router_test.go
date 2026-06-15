@@ -28,11 +28,21 @@ func (s targetRouterStorage) Ping(context.Context) error { return nil }
 
 type targetRouterPlanStore struct {
 	storage.PlanStore
-	byID map[int64]*storage.Plan
+	byID         map[int64]*storage.Plan
+	byIdentifier map[string]*storage.Plan
 }
 
 func (s targetRouterPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
 	plan := s.byID[id]
+	if plan == nil {
+		return nil, nil
+	}
+	copy := *plan
+	return &copy, nil
+}
+
+func (s targetRouterPlanStore) Get(_ context.Context, identifier string) (*storage.Plan, error) {
+	plan := s.byIdentifier[identifier]
 	if plan == nil {
 		return nil, nil
 	}
@@ -309,6 +319,67 @@ func TestTargetRouterRoutesStoredApplyByStoredPlanTarget(t *testing.T) {
 	client := created["orders"]
 	require.NotNil(t, client)
 	assert.Equal(t, apply.ApplyIdentifier, client.resumeApply.ApplyIdentifier)
+}
+
+// An apply executes a previously created plan, so the plan is authoritative for
+// routing. A request that carries only the schema namespace (Database) and no
+// opaque Target must route by the plan's stored target, never by treating the
+// namespace as the target.
+func TestTargetRouterApplyRoutesByPlanTargetWhenRequestOmitsTarget(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	planStore := targetRouterPlanStore{byIdentifier: map[string]*storage.Plan{
+		"plan-7": {
+			PlanIdentifier: "plan-7",
+			Target:         "dsid-orders-prod",
+			Database:       "orders",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Environment:    "production",
+		},
+	}}
+	router := newTargetRouterForTest(t, resolver, nil, planStore, created)
+
+	resp, err := router.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:   "plan-7",
+		Database: "orders",
+	})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	client := created["orders"]
+	require.NotNil(t, client)
+	require.NotNil(t, client.applyReq)
+	assert.Equal(t, "orders", client.applyReq.Database)
+	assert.Equal(t, "dsid-orders-prod", client.applyReq.Target)
+	assert.Equal(t, "dsid-orders-prod", client.applyReq.Options["target"])
+	assert.Equal(t, storage.DatabaseTypeMySQL, client.applyReq.Type)
+	assert.Equal(t, "production", client.applyReq.Environment)
+}
+
+// The plan is authoritative: a request that supplies a Target contradicting the
+// stored plan target must fail closed rather than silently override the
+// plan-time route.
+func TestTargetRouterApplyFailsClosedOnRequestTargetMismatch(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	planStore := targetRouterPlanStore{byIdentifier: map[string]*storage.Plan{
+		"plan-7": {
+			PlanIdentifier: "plan-7",
+			Target:         "dsid-orders-prod",
+			Database:       "orders",
+		},
+	}}
+	router := newTargetRouterForTest(t, resolver, nil, planStore, created)
+
+	_, err := router.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:   "plan-7",
+		Target:   "dsid-wrong",
+		Database: "orders",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match plan")
+	assert.Empty(t, created, "no client should be created when the request target contradicts the plan")
 }
 
 func TestTargetRouterCloseClosesCachedClients(t *testing.T) {
