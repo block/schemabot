@@ -2,9 +2,11 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -73,19 +75,6 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 	// Deferred deploy: call engine Start to trigger the deploy request.
 	// This is a separate path from the stopped-task resume flow below.
 	if apply.State == state.Apply.WaitingForDeploy {
-		applyTasks, taskErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
-		if taskErr != nil || len(applyTasks) == 0 {
-			return nil, fmt.Errorf("no tasks found for apply %s", apply.ApplyIdentifier)
-		}
-		creds := c.credentials()
-		eng := c.getEngine()
-		if eng == nil {
-			return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
-		}
-		controlReq, err := c.buildControlRequest(ctx, applyTasks[0], creds, eng, engine.ControlStart)
-		if err != nil {
-			return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
-		}
 		if controlReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
 			return nil, fmt.Errorf("check pending stop before deferred deploy start for apply %s: %w", apply.ApplyIdentifier, err)
 		} else if controlReq != nil {
@@ -94,17 +83,11 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 				"requested_by", controlRequestCaller(controlReq))
 			return nil, fmt.Errorf("schema change has a pending stop request; start is blocked until stop is processed")
 		}
-		result, err := eng.Start(ctx, controlReq)
+		started, err := c.startDeferredDeploy(ctx, apply, "")
 		if err != nil {
-			return nil, fmt.Errorf("start deferred deploy: %w", err)
+			return nil, err
 		}
-		if !result.Accepted {
-			return nil, fmt.Errorf("deferred deploy not accepted: %s", result.Message)
-		}
-		return &ternv1.StartResponse{
-			Accepted:     true,
-			StartedCount: 1,
-		}, nil
+		return started.response, nil
 	}
 
 	// Second pass: collect stopped tasks ONLY from the target apply
@@ -210,6 +193,119 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 	}, nil
 }
 
+type deferredDeployStart struct {
+	response    *ternv1.StartResponse
+	tasks       []*storage.Task
+	credentials *engine.Credentials
+	resumeState *engine.ResumeState
+}
+
+func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Apply, caller string) (*deferredDeployStart, error) {
+	applyTasks, taskErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if taskErr != nil {
+		return nil, fmt.Errorf("get tasks for deferred deploy apply %s: %w", apply.ApplyIdentifier, taskErr)
+	}
+	if len(applyTasks) == 0 {
+		return nil, fmt.Errorf("no tasks found for apply %s", apply.ApplyIdentifier)
+	}
+	eng := c.getEngine()
+	if eng == nil {
+		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+	creds, err := c.credentialsForTask(applyTasks[0])
+	if err != nil {
+		return nil, fmt.Errorf("resolve credentials for deferred deploy task %s: %w", applyTasks[0].TaskIdentifier, err)
+	}
+	controlReq, err := c.buildControlRequest(ctx, applyTasks[0], creds, eng, engine.ControlStart)
+	if err != nil {
+		return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
+	}
+	result, err := eng.Start(ctx, controlReq)
+	if err != nil {
+		return nil, fmt.Errorf("start deferred deploy: %w", err)
+	}
+	if !result.Accepted {
+		return nil, fmt.Errorf("deferred deploy not accepted: %s", result.Message)
+	}
+	logMessage := "Deferred deploy start requested"
+	if caller != "" {
+		logMessage += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested, storage.LogSourceSchemaBot,
+		logMessage, state.Apply.WaitingForDeploy, state.Apply.Running)
+	return &deferredDeployStart{
+		response: &ternv1.StartResponse{
+			Accepted:     true,
+			StartedCount: 1,
+		},
+		tasks:       applyTasks,
+		credentials: creds,
+		resumeState: controlReq.ResumeState,
+	}, nil
+}
+
+func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+	controlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return false, err
+	}
+	if controlReq == nil {
+		return false, nil
+	}
+	if stopReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
+		return true, fmt.Errorf("check pending stop before pending start for apply %s: %w", apply.ApplyIdentifier, err)
+	} else if stopReq != nil {
+		c.logger.Info("pending start request is waiting for pending stop request to finish",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"stop_requested_by", controlRequestCaller(stopReq),
+			"state", apply.State)
+		return false, nil
+	}
+	if !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
+		return false, nil
+	}
+	started, err := c.startDeferredDeploy(ctx, apply, controlRequestCaller(controlReq))
+	if err != nil {
+		if failErr := failPendingStartControlRequests(ctx, c.storage, apply, err.Error()); failErr != nil {
+			return true, fmt.Errorf("process pending start for apply %s: %w; fail pending start request: %w", apply.ApplyIdentifier, err, failErr)
+		}
+		return true, fmt.Errorf("process pending start for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	resp := started.response
+	if resp == nil || !resp.Accepted {
+		errorMessage := "not accepted"
+		if resp != nil && resp.ErrorMessage != "" {
+			errorMessage = resp.ErrorMessage
+		}
+		if err := failPendingStartControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
+			return true, err
+		}
+		return true, fmt.Errorf("process pending start for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+	}
+	now := time.Now()
+	apply.State = state.Apply.Running
+	if apply.StartedAt == nil {
+		apply.StartedAt = &now
+	}
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return true, fmt.Errorf("update started deferred deploy apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+		return true, err
+	}
+	c.logger.Info("pending start request accepted and completed",
+		"apply_id", apply.ApplyIdentifier,
+		"database", apply.Database,
+		"environment", apply.Environment,
+		"requested_by", controlRequestCaller(controlReq),
+		"state", apply.State)
+	c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState)
+	return true, ctx.Err()
+}
+
 // resumeApplySequential processes resumed tasks one at a time in sequence.
 // This preserves the sequential behavior of the original apply when --defer-cutover
 // was NOT used. Each task gets its own eng.Apply + pollTaskToCompletion cycle.
@@ -302,18 +398,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 // still needs schema changes. Returns false if the table already has the
 // desired schema (e.g., Spirit's cutover completed during the stop sequence).
 func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, tableName string) (bool, error) {
-	creds := c.credentials()
-	eng := c.getEngine()
-	if eng == nil {
-		return false, fmt.Errorf("no engine available")
-	}
-
-	result, err := eng.Plan(ctx, &engine.PlanRequest{
-		Database:     apply.Database,
-		DatabaseType: c.config.Type,
-		SchemaFiles:  plan.SchemaFiles,
-		Credentials:  creds,
-	})
+	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
 	if err != nil {
 		return false, fmt.Errorf("re-plan check failed: %w", err)
 	}
@@ -340,18 +425,7 @@ type replanResult struct {
 // Used by both Start() and ResumeApply() to handle tables that completed before
 // stop or crash.
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
-	creds := c.credentials()
-	eng := c.getEngine()
-	if eng == nil {
-		return nil, fmt.Errorf("no engine available")
-	}
-
-	replanOut, err := eng.Plan(ctx, &engine.PlanRequest{
-		Database:     apply.Database,
-		DatabaseType: c.config.Type,
-		SchemaFiles:  plan.SchemaFiles,
-		Credentials:  creds,
-	})
+	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("re-plan failed: %w", err)
 	}
@@ -477,10 +551,13 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string, block bool, startRequested bool) error {
 
 	allTasks := tasks
-	creds := c.credentials()
 	eng := c.getEngine()
 	if eng == nil {
 		return fmt.Errorf("no engine available for grouped resume apply %s", apply.ApplyIdentifier)
+	}
+	creds, err := c.credentialsForGroupedApply(plan)
+	if err != nil {
+		return fmt.Errorf("resolve credentials for grouped resume apply %s: %w", apply.ApplyIdentifier, err)
 	}
 
 	if drainer, ok := eng.(engine.Drainer); ok {
@@ -521,35 +598,59 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		return nil
 	}
 
-	var ddls []string
-	for _, t := range tasks {
-		ddls = append(ddls, t.DDL)
+	resumeState, err := c.groupedResumeState(ctx, apply, tasks)
+	if err != nil {
+		return err
 	}
 
-	// Build table changes from the DDL list
-	var tableChanges []engine.TableChange
-	for _, ddl := range ddls {
-		tableChanges = append(tableChanges, engine.TableChange{DDL: ddl})
-	}
-
-	// Resume the grouped apply after restart. Use apply identifier as
-	// MigrationContext so Spirit can find existing checkpoint tables from the
-	// original run.
+	// Resume the grouped apply with the engine's persisted state so it
+	// reattaches to in-flight engine work instead of launching a duplicate
+	// schema change. The changes are rebuilt from the stored tasks so the
+	// engine keys per-table progress on the same namespace/table pairs the
+	// tasks carry.
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
-		Database: apply.Database,
-		Changes: []engine.SchemaChange{{
-			Namespace:    apply.Database,
-			TableChanges: tableChanges,
-		}},
+		Database:    apply.Database,
+		PlanID:      plan.PlanIdentifier,
+		Changes:     groupedResumeChanges(tasks),
+		SchemaFiles: plan.SchemaFiles,
 		Options:     options,
-		ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
+		ResumeState: resumeState,
 		Credentials: creds,
+		OnStateChange: func(rs *engine.ResumeState) {
+			if rs == nil {
+				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
+				return
+			}
+			if saveErr := c.saveEngineResumeState(ctx, tasks, rs); saveErr != nil {
+				c.logger.Warn("OnStateChange: failed to persist opaque resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
+			}
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("engine apply failed: %w", err)
 	}
 	if !result.Accepted {
 		return fmt.Errorf("engine did not accept apply: %s", result.Message)
+	}
+	if result.ResumeState != nil {
+		resumeState = result.ResumeState
+		if c.config.Type == storage.DatabaseTypeVitess {
+			// The engine has already accepted the resume and a deploy request is
+			// running on the provider. A failure to persist the resume state must
+			// not become terminal apply state — the owner exits and the operator
+			// retries against the in-flight work rather than abandoning it.
+			if saveErr := c.saveEngineResumeState(ctx, tasks, resumeState); saveErr != nil {
+				return fmt.Errorf("%w: save engine resume state after grouped resume of apply %s (database %s): %w", errGroupedResumeStateUnavailable, apply.ApplyIdentifier, apply.Database, saveErr)
+			}
+		}
+	}
+	// Progress polling for Vitess applies is driven entirely by resume state
+	// metadata; without it the poll loop can never observe the deploy request.
+	// The engine has already accepted the resume, so an absent metadata invariant
+	// leaves the owner unable to track in-flight work — exit non-terminally so the
+	// operator can retry rather than failing an apply that is still running.
+	if c.config.Type == storage.DatabaseTypeVitess && resumeState.Metadata == "" {
+		return fmt.Errorf("%w: engine accepted grouped resume of Vitess apply %s (database %s) without resume state metadata", errGroupedResumeStateUnavailable, apply.ApplyIdentifier, apply.Database)
 	}
 
 	now := time.Now()
@@ -587,7 +688,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		defer cancelPoll()
 		stopHeartbeat := c.startApplyHeartbeat(pollCtx, apply, cancelPoll)
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, nil)
+		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState)
 		return nil
 	}
 
@@ -596,9 +697,104 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	go func() {
 		defer cancelResume()
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, nil)
+		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState)
 	}()
 	return nil
+}
+
+// errGroupedResumeStateUnavailable marks a resume attempt whose persisted engine
+// resume state could not be loaded (or ruled out) before the engine apply, or
+// could not be persisted (or confirmed present) after the engine accepted the
+// reattach. The current apply owner must exit without writing terminal state so
+// a later attempt can retry against intact storage — failing the apply here
+// would abandon engine work that is still in flight on the provider.
+var errGroupedResumeStateUnavailable = errors.New("grouped resume state unavailable")
+
+// groupedResumeState returns the ResumeState handed to the engine when a
+// grouped apply is resumed. Recovery must reattach to the engine's existing
+// work via persisted resume state; launching fresh engine work would duplicate
+// the in-flight schema change. Absent persisted state is expected for engines
+// that reattach through durable database-side checkpoints keyed by the schema
+// change context alone (Spirit); a storage read failure fails the resume
+// attempt so a later attempt can retry with intact state.
+func (c *LocalClient) groupedResumeState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (*engine.ResumeState, error) {
+	contextOnly := &engine.ResumeState{MigrationContext: apply.ApplyIdentifier}
+
+	operationID, err := applyOperationIDForTasks(tasks)
+	if err != nil {
+		// Persisted engine resume state is scoped to an apply operation, so a
+		// Vitess apply whose tasks cannot be resolved to one leaves SchemaBot
+		// unable to prove there is no in-flight deploy request to reattach to.
+		if c.config.Type == storage.DatabaseTypeVitess {
+			return nil, fmt.Errorf("%w: resolve apply operation for grouped resume of apply %s (database %s): %w", errGroupedResumeStateUnavailable, apply.ApplyIdentifier, apply.Database, err)
+		}
+		c.logger.Info("tasks have no apply operation to hold persisted engine resume state; engine apply will start from the schema change context",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType)
+		return contextOnly, nil
+	}
+
+	stored, err := c.loadEngineResumeStateForOperation(ctx, operationID)
+	if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
+		c.logger.Info("no persisted engine resume state for apply operation; engine apply will start from the schema change context",
+			"apply_id", apply.ApplyIdentifier,
+			"apply_operation_id", operationID,
+			"database", apply.Database,
+			"database_type", apply.DatabaseType)
+		return contextOnly, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: load engine resume state for grouped resume of apply %s operation %d (database %s): %w", errGroupedResumeStateUnavailable, apply.ApplyIdentifier, operationID, apply.Database, err)
+	}
+	if stored.MigrationContext == "" {
+		stored.MigrationContext = apply.ApplyIdentifier
+	}
+	return stored, nil
+}
+
+// groupedResumeChanges rebuilds the engine changes for a grouped resume from
+// the stored tasks, grouped per namespace. Tasks carry the authoritative
+// remaining work after re-planning, and engines key per-table progress on
+// namespace and table, so the rebuilt changes must preserve both. VSchema tasks
+// carry no DDL — they are excluded from TableChanges and instead flag their
+// namespace with the vschema_changed metadata so the engine applies vschema.json
+// from the schema files, mirroring how the fresh apply builds changes.
+func groupedResumeChanges(tasks []*storage.Task) []engine.SchemaChange {
+	indexByNamespace := make(map[string]int, len(tasks))
+	var changes []engine.SchemaChange
+	ensureNamespace := func(namespace string) int {
+		idx, ok := indexByNamespace[namespace]
+		if !ok {
+			idx = len(changes)
+			indexByNamespace[namespace] = idx
+			changes = append(changes, engine.SchemaChange{Namespace: namespace})
+		}
+		return idx
+	}
+	for _, task := range tasks {
+		idx := ensureNamespace(task.Namespace)
+		if isVSchemaTask(task) {
+			if changes[idx].Metadata == nil {
+				changes[idx].Metadata = make(map[string]string)
+			}
+			changes[idx].Metadata["vschema_changed"] = "true"
+			continue
+		}
+		changes[idx].TableChanges = append(changes[idx].TableChanges, engine.TableChange{
+			Table:     task.TableName,
+			DDL:       task.DDL,
+			Operation: ddl.OpToStatementType(task.DDLAction),
+		})
+	}
+	return changes
+}
+
+// isVSchemaTask reports whether a task represents a VSchema update rather than a
+// table DDL change. VSchema tasks have no DDL; their work is applying the
+// namespace's vschema.json.
+func isVSchemaTask(task *storage.Task) bool {
+	return task.DDLAction == "vschema_update"
 }
 
 func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*storage.Task) {
@@ -658,6 +854,9 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
 		return err
 	}
+	if handled, err := c.processPendingStartControlRequest(ctx, apply); handled || err != nil {
+		return err
+	}
 
 	// Get the plan to retrieve original DDLs
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
@@ -712,6 +911,14 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				defer c.clearApplyCancel(cancelGeneration)
 				defer cancelResume()
 				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering from checkpoint", true, false); err != nil {
+					if errors.Is(err, errGroupedResumeStateUnavailable) {
+						c.logger.Warn("deferred cutover recovery could not load persisted engine resume state; current apply owner will exit for operator retry",
+							"apply_id", apply.ApplyIdentifier,
+							"database", apply.Database,
+							"database_type", apply.DatabaseType,
+							"error", err)
+						return fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err)
+					}
 					return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err), false)
 				}
 				return ctx.Err()
@@ -780,12 +987,20 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 
 	options := buildApplyOptions(apply)
 
-	if apply.GetOptions().DeferCutover {
+	if c.usesGroupedApply(apply) {
 		resumeCtx, cancelResume := context.WithCancel(ctx)
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
 		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply)), true, startRequested); err != nil {
+			if errors.Is(err, errGroupedResumeStateUnavailable) {
+				c.logger.Warn("grouped resume could not load persisted engine resume state; current apply owner will exit for operator retry",
+					"apply_id", apply.ApplyIdentifier,
+					"database", apply.Database,
+					"database_type", apply.DatabaseType,
+					"error", err)
+				return err
+			}
 			return c.handleGroupedResumeFailure(ctx, apply, activeTasks, err, startRequested)
 		}
 	} else {

@@ -200,6 +200,12 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
+	if !commandSupportsDatabaseFlag(result.Action) && parser.HasDatabaseFlag(payload.Comment.Body) {
+		h.postComment(repo, pr, installationID, templates.RenderUnsupportedDatabaseFlag(result.Action))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+
 	h.logger.Info("processing command",
 		"action", result.Action,
 		"environment", result.Environment,

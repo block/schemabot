@@ -146,6 +146,16 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	} else if handled {
 		return taskStopped
 	}
+	taskCreds := creds
+	if c.config.Type == storage.DatabaseTypeMySQL {
+		var err error
+		taskCreds, err = c.credentialsForMySQLNamespace(task.Namespace)
+		if err != nil {
+			c.markTaskFailed(ctx, task, err.Error())
+			c.logger.Error("task failed to resolve namespace credentials", "error", err, "task_id", task.TaskIdentifier, "namespace", task.Namespace, "table", task.TableName)
+			return taskFailed
+		}
+	}
 
 	// Sequential mode: one DDL per engine call. Use the task identifier as
 	// MigrationContext so each table's schema change is tracked independently.
@@ -157,7 +167,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 		}},
 		Options:     options,
 		ResumeState: &engine.ResumeState{MigrationContext: task.TaskIdentifier},
-		Credentials: creds,
+		Credentials: taskCreds,
 	})
 
 	if err != nil {
@@ -182,7 +192,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	c.logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
 	// Poll to completion
-	pollAction := c.pollTaskToCompletion(ctx, apply, task, creds)
+	pollAction := c.pollTaskToCompletion(ctx, apply, task, taskCreds)
 	if pollAction == taskAbort || pollAction == taskStopped {
 		return pollAction
 	}

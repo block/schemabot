@@ -177,8 +177,12 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 	return existing
 }
 
-// discoverMigrationContext finds the new migration_context that appeared after
-// deploying by comparing current contexts against the pre-deploy baseline.
+// discoverMigrationContext finds the schema change context that this apply's
+// deploy created. It collects current SHOW VITESS_MIGRATIONS rows across all
+// keyspaces and selects the single non-baseline, non-terminal context via
+// selectSchemaChangeContext. Returns "" when no unambiguous candidate exists
+// (zero or multiple), so the caller keeps the stored identifier rather than
+// attaching progress to the wrong context.
 func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]bool) string {
 	if creds.DSN == "" {
 		e.logger.Debug("skipping schema change context discovery, no DSN configured")
@@ -198,21 +202,104 @@ func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.P
 		return ""
 	}
 
+	var rows []vitessMigrationRow
 	for _, ks := range keyspaces {
-		rows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, "")
+		ksRows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, "")
 		if err != nil {
 			e.logger.Debug("failed to query schema changes for keyspace", "keyspace", ks.Name, "error", err)
 			continue
 		}
-		for _, r := range rows {
-			if r.MigrationContext != "" && !existingContexts[r.MigrationContext] {
-				e.logger.Info("discovered schema change context", "context", r.MigrationContext)
-				return r.MigrationContext
+		rows = append(rows, ksRows...)
+	}
+
+	discovered, candidates := selectSchemaChangeContext(rows, existingContexts)
+	switch {
+	case discovered != "":
+		e.logger.Info("discovered schema change context", "database", database, "context", discovered)
+		return discovered
+	case len(candidates) > 1:
+		// Multiple in-flight contexts not in the baseline — attaching to any one
+		// could render the wrong change's progress. Keep the stored identifier.
+		e.logger.Warn("multiple in-flight schema change contexts; keeping stored identifier to avoid attaching to the wrong change",
+			"database", database, "candidate_count", len(candidates), "candidates", candidates)
+		return ""
+	default:
+		e.logger.Warn("schema change context not discovered yet", "database", database)
+		return ""
+	}
+}
+
+// selectSchemaChangeContext picks the schema change context created by this
+// apply's deploy from a set of SHOW VITESS_MIGRATIONS rows. Candidates are the
+// distinct contexts that are NOT in the pre-deploy baseline AND are still
+// non-terminal — a freshly started change is queued or running, whereas the
+// completed history that SHOW VITESS_MIGRATIONS retains is terminal and must be
+// ignored so an empty-baseline rediscovery never attaches to an old, unrelated
+// change. It returns the single context when exactly one candidate remains and
+// the full candidate list so the caller can distinguish the zero and multiple
+// cases (both ambiguous, both must keep the stored identifier).
+func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[string]bool) (string, []string) {
+	// A context is a candidate if any of its shards is still non-terminal: the
+	// change is in flight even when some shards have already finished.
+	nonTerminal := make(map[string]bool)
+	for _, r := range rows {
+		if r.MigrationContext == "" || existingContexts[r.MigrationContext] {
+			continue
+		}
+		if state.IsTerminalVitessState(r.Status) {
+			continue
+		}
+		nonTerminal[r.MigrationContext] = true
+	}
+
+	candidates := make([]string, 0, len(nonTerminal))
+	for c := range nonTerminal {
+		candidates = append(candidates, c)
+	}
+	sort.Strings(candidates)
+
+	if len(candidates) == 1 {
+		return candidates[0], candidates
+	}
+	return "", candidates
+}
+
+// migrationContextDiscoveryAttempts and migrationContextDiscoveryInterval bound
+// how long discoverSchemaChangeContextWithRetry waits for Vitess to create
+// migrations after a deploy request is submitted. Vitess does not always create
+// them immediately, so the first poll can legitimately return nothing.
+const (
+	migrationContextDiscoveryAttempts = 10
+	migrationContextDiscoveryInterval = 500 * time.Millisecond
+)
+
+// discoverSchemaChangeContextWithRetry polls discoverMigrationContext until a new
+// Vitess context appears or the bounded attempts are exhausted. Vitess may not
+// have created migrations immediately after the deploy request is submitted, so
+// a single poll can miss the context. Returns "" if no new context was found
+// within the window; respects ctx cancellation between attempts.
+func (e *Engine) discoverSchemaChangeContextWithRetry(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, existingContexts map[string]bool) string {
+	// Without a vtgate DSN there is nothing to poll; retrying would only burn the
+	// discovery window on a query that can never succeed.
+	if creds.DSN == "" {
+		e.logger.Debug("skipping schema change context discovery, no DSN configured", "database", database)
+		return ""
+	}
+
+	for attempt := range migrationContextDiscoveryAttempts {
+		migrationContext := e.discoverMigrationContext(ctx, client, database, creds, existingContexts)
+		if migrationContext != "" {
+			return migrationContext
+		}
+		if attempt < migrationContextDiscoveryAttempts-1 {
+			select {
+			case <-ctx.Done():
+				e.logger.Debug("schema change context discovery cancelled", "database", database, "error", ctx.Err())
+				return ""
+			case <-time.After(migrationContextDiscoveryInterval):
 			}
 		}
 	}
-
-	e.logger.Warn("schema change context not discovered yet")
 	return ""
 }
 

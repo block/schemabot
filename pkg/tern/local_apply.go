@@ -203,7 +203,7 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Task) {
 	now := time.Now()
 	for _, task := range tasks {
-		if task.DDLAction == "vschema_update" {
+		if isVSchemaTask(task) {
 			continue
 		}
 		task.State = state.Task.Running

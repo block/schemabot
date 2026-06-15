@@ -12,6 +12,7 @@ import (
 // RollbackCmd rollbacks a database to its schema state before a specific apply.
 type RollbackCmd struct {
 	ApplyID      string `arg:"" required:"" help:"Apply ID to rollback"`
+	Environment  string `short:"e" required:"" help:"Target environment"`
 	AutoApprove  bool   `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 	Watch        bool   `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
 	DeferCutover bool   `help:"Defer cutover until manual trigger" name:"defer-cutover"`
@@ -19,14 +20,14 @@ type RollbackCmd struct {
 
 // Run executes the rollback command.
 func (cmd *RollbackCmd) Run(g *Globals) error {
-	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
+	ep, err := resolveControlFlags(g.Endpoint, g.Profile, cmd.ApplyID, cmd.Environment)
 	if err != nil {
 		return err
 	}
 
 	// Step 1: Generate rollback plan from the specified apply
 	fmt.Println("Generating rollback plan...")
-	planResult, err := client.CallRollbackPlanAPI(ep, cmd.ApplyID)
+	planResult, err := client.CallRollbackPlanAPI(ep, cmd.ApplyID, cmd.Environment)
 	if err != nil {
 		return err
 	}

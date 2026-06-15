@@ -283,7 +283,7 @@ func (c *RoutingClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRe
 }
 
 // RollbackPlan is not routable without an environment-scoped request.
-func (c *RoutingClient) RollbackPlan(ctx context.Context, database string) (*ternv1.PlanResponse, error) {
+func (c *RoutingClient) RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error) {
 	return nil, fmt.Errorf("rollback plan for database %q requires an environment-scoped client", database)
 }
 

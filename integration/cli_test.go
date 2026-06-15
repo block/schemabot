@@ -1241,12 +1241,14 @@ func TestCLI_Rollback_ApplyNotFound(t *testing.T) {
 	endpoint := "http://" + schemabotAddr
 
 	t.Run("rollback_apply_not_found", func(t *testing.T) {
-		_, err := runCLIWithError(t, binPath, "rollback",
+		out, err := runCLIWithError(t, binPath, "rollback",
 			"apply_nonexistent0000",
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"-y",
 		)
 		require.Error(t, err, "expected error for nonexistent apply ID")
+		assert.Contains(t, out, "apply not found: apply_nonexistent0000")
 	})
 }
 
@@ -1312,6 +1314,7 @@ CREATE TABLE items (
 		require.NotEmpty(t, applyID, "apply ID must be set by previous subtest")
 		out := runCLIInDir(t, binPath, schemaDir, "rollback",
 			applyID,
+			"-e", "staging",
 			"--endpoint", endpoint,
 			"-y",
 			"--watch=false",

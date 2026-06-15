@@ -2322,10 +2322,13 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 
 	// Step 2: Plan + apply adding an index (this stores OriginalSchema for rollback)
 	schemaWithIndex := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	prNumber := int32(1)
 	planReq := api.PlanRequest{
 		Database:    dbName,
 		Environment: "staging",
 		Type:        "mysql",
+		Repository:  "octocat/hello-world",
+		PullRequest: &prNumber,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			dbName: {Files: map[string]string{"users.sql": schemaWithIndex}},
 		},
@@ -2525,10 +2528,13 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 
 	// Step 2: Plan + apply adding an index (creates OriginalSchema for rollback)
 	schemaWithIndex := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	prNumber := int32(1)
 	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
 		Database:    dbName,
 		Environment: "staging",
 		Type:        "mysql",
+		Repository:  "octocat/hello-world",
+		PullRequest: &prNumber,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			dbName: {Files: map[string]string{"users.sql": schemaWithIndex}},
 		},
@@ -2631,10 +2637,13 @@ func TestE2ERollbackConfirmUpdatesCheckToActionRequired(t *testing.T) {
 
 	// Step 2: Plan + apply adding an index
 	schemaWithIndex := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	prNumber := int32(1)
 	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
 		Database:    dbName,
 		Environment: "staging",
 		Type:        "mysql",
+		Repository:  "octocat/hello-world",
+		PullRequest: &prNumber,
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
 			dbName: {Files: map[string]string{"users.sql": schemaWithIndex}},
 		},

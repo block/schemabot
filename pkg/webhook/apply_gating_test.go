@@ -398,6 +398,73 @@ func TestFilterInProgressNonSchemaBotChecks_RequiredChecks(t *testing.T) {
 	}
 }
 
+// A configured required check that GitHub has not reported on the commit must
+// block apply: the gate fails closed and surfaces the missing check by name so
+// the operator knows which check still has to report before apply can proceed.
+func TestMissingRequiredChecks(t *testing.T) {
+	tests := []struct {
+		name       string
+		config     *api.ServerConfig
+		statuses   []ghclient.PRCheckStatus
+		wantNames  []string
+		wantStates []string
+	}{
+		{
+			name:     "no required checks configured demands nothing",
+			config:   &api.ServerConfig{RequiredChecks: nil},
+			statuses: nil,
+		},
+		{
+			name:   "one of two required checks absent blocks on the missing one",
+			config: &api.ServerConfig{RequiredChecks: []string{"check-a", "check-b"}},
+			statuses: []ghclient.PRCheckStatus{
+				{Name: "check-a", Status: "completed", Conclusion: "success"},
+			},
+			wantNames:  []string{"check-b"},
+			wantStates: []string{"not reported"},
+		},
+		{
+			name:   "no required check reported blocks on all of them",
+			config: &api.ServerConfig{RequiredChecks: []string{"check-a", "check-b"}},
+			statuses: []ghclient.PRCheckStatus{
+				{Name: "incidental", Status: "completed", Conclusion: "success"},
+			},
+			wantNames:  []string{"check-a", "check-b"},
+			wantStates: []string{"not reported", "not reported"},
+		},
+		{
+			name:   "all required checks present demand nothing",
+			config: &api.ServerConfig{RequiredChecks: []string{"check-a", "check-b"}},
+			statuses: []ghclient.PRCheckStatus{
+				{Name: "check-a", Status: "completed", Conclusion: "success"},
+				{Name: "check-b", Status: "in_progress", Conclusion: ""},
+			},
+			wantNames: nil,
+		},
+		{
+			name:   "required check reported by SchemaBot is not demanded",
+			config: &api.ServerConfig{RequiredChecks: []string{"SchemaBot (staging)"}},
+			statuses: []ghclient.PRCheckStatus{
+				{Name: "SchemaBot (staging)", Status: "completed", Conclusion: "success", IsSchemaBot: true},
+			},
+			wantNames: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			missing := missingRequiredChecks(tt.statuses, tt.config)
+			require.Len(t, missing, len(tt.wantNames))
+			for i, name := range tt.wantNames {
+				assert.Equal(t, name, missing[i].Name)
+			}
+			for i, state := range tt.wantStates {
+				assert.Equal(t, state, missing[i].State)
+			}
+		})
+	}
+}
+
 // checkStatusNode is a single check run or commit status used by tests to build
 // mock REST responses. Set Typename to "CheckRun" or "StatusContext" and
 // populate the matching fields.
@@ -727,6 +794,219 @@ func TestEnforcePassingChecks(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for failing-checks comment")
 		}
+	})
+
+	// With two required checks configured, an apply must wait until every one
+	// has reported. When only the first has reported (and passed), the apply is
+	// blocked because the second required check has not reported yet, and the
+	// comment names the missing check so the operator knows what to wait for.
+	t.Run("absent required check blocks even when present required check passes", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 10)
+
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "Required Review", Status: "completed", Conclusion: "success", AppSlug: "review-gate"},
+		})
+
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Required Review", "Security scan"}}, nil, testLogger())
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+
+		ctx := t.Context()
+		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		assert.True(t, blocked, "should block when a required check has not reported")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "have not reported on this commit")
+			assert.Contains(t, body, "| `Security scan` | not reported |")
+			assert.Contains(t, body, "Verify the name in `required_checks` matches the check exactly and that it runs on this PR")
+			assert.NotContains(t, body, "Cannot apply while PR checks are still running",
+				"a never-reported check must not get the wait-and-retry remediation")
+			assert.NotContains(t, body, "Required Review", "the passing required check should not be listed as blocking")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for missing-required-check comment")
+		}
+	})
+
+	// Required checks are configured but none has reported on the commit; only
+	// an unrelated incidental check has passed. The apply must not slip through
+	// on incidental success — every configured required check still has to
+	// report, so the apply is blocked and the comment names each missing check.
+	t.Run("no required check reported blocks despite passing incidental check", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 10)
+
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "CI / lint", Status: "completed", Conclusion: "success", AppSlug: "github-actions"},
+		})
+
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Required Review", "Security scan"}}, nil, testLogger())
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+
+		ctx := t.Context()
+		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		assert.True(t, blocked, "should block when no required check has reported")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "have not reported on this commit")
+			assert.Contains(t, body, "| `Required Review` | not reported |")
+			assert.Contains(t, body, "| `Security scan` | not reported |")
+			assert.Contains(t, body, "Verify the name in `required_checks` matches the check exactly and that it runs on this PR")
+			assert.NotContains(t, body, "Cannot apply while PR checks are still running",
+				"never-reported required checks must not get the wait-and-retry remediation")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for missing-required-checks comment")
+		}
+	})
+
+	// Triage must be able to identify which required check blocked the apply
+	// from the logs alone, without reproducing the gate. The block log names the
+	// never-reported required checks rather than only counting them.
+	t.Run("block log names the never-reported required checks", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "Required Review", Status: "completed", Conclusion: "success", AppSlug: "review-gate"},
+		})
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+		installClient := ghclient.NewInstallationClient(client, logger)
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Required Review", "Security scan"}}, nil, logger)
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    logger,
+		}
+
+		ctx := t.Context()
+		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		assert.True(t, blocked, "should block when a required check has not reported")
+
+		logs := logBuf.String()
+		assert.Contains(t, logs, "apply blocked: PR checks have not finished verifying this commit")
+		assert.Contains(t, logs, "missing_required_count=1")
+		assert.Contains(t, logs, "in_progress_count=0")
+		assert.Contains(t, logs, "missing_required_checks")
+		assert.Contains(t, logs, "Security scan", "the block log must name the never-reported required check")
+		assert.NotContains(t, logs, "Required Review", "the reported required check must not be named as missing")
+	})
+
+	// A still-running non-required check and a never-reported required check can
+	// block the same apply. The single comment surfaces both causes with their
+	// own remediation: wait-and-retry for the running check, verify-the-name for
+	// the never-reported required check.
+	t.Run("in-progress and never-reported checks each get their own remediation", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := make(chan string, 10)
+
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "Required Review", Status: "in_progress", Conclusion: "", AppSlug: "review-gate"},
+		})
+
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Body string `json:"body"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			comments <- body.Body
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Required Review", "Security scan"}}, nil, testLogger())
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+
+		ctx := t.Context()
+		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		assert.True(t, blocked, "should block when a required check is running and another has not reported")
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Cannot apply while PR checks are still running:")
+			assert.Contains(t, body, "| `Required Review` | in_progress |")
+			assert.Contains(t, body, "Wait for checks to complete and retry:")
+			assert.Contains(t, body, "These required checks have not reported on this commit:")
+			assert.Contains(t, body, "| `Security scan` | not reported |")
+			assert.Contains(t, body, "Verify the name in `required_checks` matches the check exactly and that it runs on this PR")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for combined in-progress and not-reported comment")
+		}
+	})
+
+	// When every configured required check has reported and passed, the apply
+	// proceeds even though unrelated incidental checks are not in the required
+	// set.
+	t.Run("all required checks present and passing allows apply", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+
+		registerCheckStatusRESTHandlers(mux, []checkStatusNode{
+			{Typename: "CheckRun", Name: "Required Review", Status: "completed", Conclusion: "success", AppSlug: "review-gate"},
+			{Typename: "CheckRun", Name: "Security scan", Status: "completed", Conclusion: "success", AppSlug: "security-app"},
+			{Typename: "CheckRun", Name: "CI / tests", Status: "in_progress", Conclusion: "", AppSlug: "github-actions"},
+		})
+
+		installClient := ghclient.NewInstallationClient(client, testLogger())
+		factory := &fakeClientFactory{client: installClient}
+
+		service := api.New(nil, &api.ServerConfig{RequiredChecks: []string{"Required Review", "Security scan"}}, nil, testLogger())
+		h := &Handler{
+			service:   service,
+			ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
+			logger:    testLogger(),
+		}
+
+		ctx := t.Context()
+		blocked := h.enforcePassingChecks(ctx, installClient, "octocat/hello-world", 1, 12345, "abc123", "staging")
+		assert.False(t, blocked, "should allow when all required checks reported and passed")
 	})
 
 	t.Run("all passing allows apply", func(t *testing.T) {

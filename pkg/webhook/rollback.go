@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
@@ -30,11 +31,22 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		return
 	}
 
-	// Look up the apply to get database/environment/type
-	apply, err := h.service.Storage().Applies().GetByApplyIdentifier(ctx, applyID)
+	stor := h.service.Storage()
+	if stor == nil {
+		h.logger.Error("storage not configured for rollback", "repo", repo, "pr", pr, "applyID", applyID)
+		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, "Storage is not available")
+		return
+	}
+	applyStore := stor.Applies()
+	if applyStore == nil {
+		h.logger.Error("apply store not configured for rollback", "repo", repo, "pr", pr, "applyID", applyID)
+		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, "Apply store is not available")
+		return
+	}
+	apply, err := applyStore.GetByApplyIdentifier(ctx, applyID)
 	if err != nil {
-		h.logger.Error("failed to look up apply", "applyID", applyID, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Rollback, "", requestedBy, "Failed to look up apply: "+err.Error())
+		h.logger.Error("failed to look up rollback apply", "repo", repo, "pr", pr, "applyID", applyID, "error", err)
+		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy, "Failed to look up apply: "+err.Error())
 		return
 	}
 	if apply == nil {
@@ -47,8 +59,8 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	dbType := apply.DatabaseType
 
 	// In multi-instance setups, only the instance that owns this environment
-	// should process the rollback. Without this check, both instances react
-	// to the rollback comment (since rollback has no -e flag to filter on).
+	// should process the rollback. Without this check, every instance receives
+	// the comment delivery and can react to the same rollback request.
 	if h.service != nil && !h.service.Config().IsEnvironmentAllowed(environment) {
 		h.logger.Info("ignoring rollback for non-allowed environment",
 			"repo", repo, "pr", pr, "applyID", applyID, "environment", environment)
@@ -70,8 +82,25 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		return
 	}
 
+	if _, _, err := h.service.ValidateRollbackSourceApply(ctx, api.RollbackSourceRequest{
+		ApplyIdentifier:         applyID,
+		Environment:             result.Environment,
+		Repository:              repo,
+		PullRequest:             pr,
+		RequirePullRequestScope: true,
+	}); err != nil {
+		h.handleRollbackSourceError(repo, pr, installationID, requestedBy, apply, applyID, result.Environment, err)
+		return
+	}
+
 	// Check for existing lock
-	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
+	lockStore := stor.Locks()
+	if lockStore == nil {
+		h.logger.Error("lock store not configured for rollback", "repo", repo, "pr", pr, "applyID", applyID, "database", database, "database_type", dbType)
+		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Lock store is not available")
+		return
+	}
+	existingLock, err := lockStore.Get(ctx, database, dbType)
 	if err != nil {
 		h.logger.Error("failed to check lock", "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Failed to check lock status: "+err.Error())
@@ -87,9 +116,41 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 		return
 	}
 
+	lockAcquiredByCommand := existingLock == nil
+	if lockAcquiredByCommand {
+		lock := &storage.Lock{
+			DatabaseName: database,
+			DatabaseType: dbType,
+			Owner:        lockOwner,
+			Repository:   repo,
+			PullRequest:  pr,
+		}
+		if err := lockStore.Acquire(ctx, lock); err != nil {
+			h.logger.Error("failed to acquire lock", "error", err)
+			h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Failed to acquire lock: "+err.Error())
+			return
+		}
+	}
+
+	if _, _, err := h.service.ValidateRollbackSourceApply(ctx, api.RollbackSourceRequest{
+		ApplyIdentifier:         applyID,
+		Environment:             result.Environment,
+		Repository:              repo,
+		PullRequest:             pr,
+		RequirePullRequestScope: true,
+	}); err != nil {
+		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		h.logger.Warn("rollback rejected by source apply guardrails after lock acquisition",
+			"repo", repo, "pr", pr, "applyID", applyID,
+			"environment", result.Environment, "database", database, "error", err)
+		h.postRollbackRejected(repo, pr, installationID, apply, applyID, environment, database, err.Error())
+		return
+	}
+
 	// Generate rollback plan (uses the most recent completed apply for this database/environment)
 	planResp, err := h.service.ExecuteRollbackPlan(ctx, database, environment, "")
 	if err != nil {
+		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "no completed") {
 			h.postComment(repo, pr, installationID, templates.RenderRollbackNoCompletedApply(database, environment))
@@ -101,22 +162,9 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	}
 
 	if len(planResp.FlatTables()) == 0 {
+		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackNothingToDo(database, environment, applyID))
-		return
-	}
-
-	// Acquire lock
-	lock := &storage.Lock{
-		DatabaseName: database,
-		DatabaseType: dbType,
-		Owner:        lockOwner,
-		Repository:   repo,
-		PullRequest:  pr,
-	}
-	if err := h.service.Storage().Locks().Acquire(ctx, lock); err != nil {
-		h.logger.Error("failed to acquire lock", "error", err)
-		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Failed to acquire lock: "+err.Error())
 		return
 	}
 
@@ -151,6 +199,49 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 	commentData.Errors = planResp.Errors
 
 	h.postComment(repo, pr, installationID, templates.RenderRollbackPlanComment(commentData))
+}
+
+func (h *Handler) handleRollbackSourceError(repo string, pr int, installationID int64, requestedBy string, apply *storage.Apply, applyID, environment string, err error) {
+	status := api.ControlOperationHTTPStatus(err)
+	if status == http.StatusNotFound {
+		h.postComment(repo, pr, installationID, templates.RenderRollbackApplyNotFound(applyID))
+		return
+	}
+	if status >= http.StatusInternalServerError {
+		h.logger.Error("rollback source validation failed",
+			"repo", repo, "pr", pr, "applyID", applyID,
+			"environment", environment, "error", err)
+		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
+		return
+	}
+	h.logger.Warn("rollback rejected by source apply guardrails",
+		"repo", repo, "pr", pr, "applyID", applyID,
+		"environment", environment, "error", err)
+	h.postRollbackRejected(repo, pr, installationID, apply, applyID, environment, "", err.Error())
+}
+
+func (h *Handler) postRollbackRejected(repo string, pr int, installationID int64, apply *storage.Apply, applyID, environment, database, reason string) {
+	data := templates.RollbackRejectedData{
+		ApplyID:     applyID,
+		Database:    database,
+		Environment: environment,
+		Reason:      reason,
+	}
+	if apply != nil {
+		data.Database = apply.Database
+		data.Environment = apply.Environment
+	}
+	h.postComment(repo, pr, installationID, templates.RenderRollbackRejected(data))
+}
+
+func (h *Handler) releaseRollbackLockAfterRejectedPlan(ctx context.Context, database, dbType, lockOwner string, release bool) {
+	if !release {
+		return
+	}
+	if err := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner); err != nil {
+		h.logger.Error("failed to release rollback lock after rejected plan",
+			"database", database, "database_type", dbType, "owner", lockOwner, "error", err)
+	}
 }
 
 // handleRollbackConfirmCommand handles the "schemabot rollback-confirm -e <env>" PR comment command.

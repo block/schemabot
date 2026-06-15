@@ -29,6 +29,12 @@ func RenderUnsupportedAutoConfirm(action string) string {
 	return fmt.Sprintf("The `-y` flag is not supported for `%s`.", action)
 }
 
+// RenderUnsupportedDatabaseFlag renders the message posted when `-d` is
+// supplied to a command that does not support database scoping.
+func RenderUnsupportedDatabaseFlag(action string) string {
+	return fmt.Sprintf("The `-d` flag is not supported for `%s`.", action)
+}
+
 // StopCommandAcceptedData contains data for a PR comment stop acknowledgement.
 type StopCommandAcceptedData struct {
 	ApplyID      string

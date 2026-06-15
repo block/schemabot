@@ -2,10 +2,32 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 )
+
+type schemaConfigOutsideAllowedDirsError struct {
+	Database     string
+	DatabaseType string
+	SchemaPath   string
+}
+
+func (e *schemaConfigOutsideAllowedDirsError) Error() string {
+	return fmt.Sprintf("schema config for database %q at %q is outside server allowed_dirs", e.Database, e.SchemaPath)
+}
+
+func newSchemaConfigOutsideAllowedDirsError(config *ghclient.SchemabotConfig, schemaPath string) error {
+	if config == nil {
+		return ghclient.ErrNoConfig
+	}
+	return &schemaConfigOutsideAllowedDirsError{
+		Database:     config.Database,
+		DatabaseType: string(config.GetType()),
+		SchemaPath:   schemaPath,
+	}
+}
 
 func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, databaseName, source string) (*ghclient.SchemaRequestResult, error) {
 	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
@@ -13,7 +35,11 @@ func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *
 		return nil, err
 	}
 	if !h.shouldProcessSchemaConfig(ctx, repo, pr, schemaResult.HeadSHA, schemaResult.Database, schemaResult.Type, schemaResult.SchemaPath, source) {
-		return nil, ghclient.ErrNoConfig
+		return nil, &schemaConfigOutsideAllowedDirsError{
+			Database:     schemaResult.Database,
+			DatabaseType: schemaResult.Type,
+			SchemaPath:   schemaResult.SchemaPath,
+		}
 	}
 	return schemaResult, nil
 }

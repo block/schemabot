@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -424,7 +425,7 @@ func TestHandleRollbackCommandBlocksUnauthorizedActor(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	h := actorAuthStorageTestHandler(cfg, &actorAuthStorage{apply: actorAuthRollbackApply(), locks: locks}, installClient)
 
-	h.handleRollbackCommand("octocat/hello-world", 1, 12345, "mona", CommandResult{Action: action.Rollback, ApplyID: "apply_abcd1234"})
+	h.handleRollbackCommand("octocat/hello-world", 1, 12345, "mona", CommandResult{Action: action.Rollback, ApplyID: "apply_abcd1234", Environment: "staging"})
 
 	body := requireComment(t, comments, "unauthorized rollback comment")
 	assert.Contains(t, body, "SchemaBot Command Not Authorized")
@@ -456,7 +457,7 @@ func TestHandleRollbackCommandAllowsAuthorizedActor(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	h := actorAuthStorageTestHandler(cfg, &actorAuthStorage{apply: actorAuthRollbackApply(), locks: locks}, installClient)
 
-	h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", CommandResult{Action: action.Rollback, ApplyID: "apply_abcd1234"})
+	h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", CommandResult{Action: action.Rollback, ApplyID: "apply_abcd1234", Environment: "staging"})
 
 	body := requireComment(t, comments, "rollback blocked-by-lock comment")
 	assert.Contains(t, body, "Rollback Blocked")
@@ -610,8 +611,10 @@ func TestHandleUnlockCommandUnconfiguredDatabaseHint(t *testing.T) {
 }
 
 func actorAuthRollbackApply() *storage.Apply {
+	completedAt := time.Now()
 	return &storage.Apply{
 		ID:              42,
+		PlanID:          24,
 		ApplyIdentifier: "apply_abcd1234",
 		Database:        "orders",
 		DatabaseType:    storage.DatabaseTypeMySQL,
@@ -619,6 +622,8 @@ func actorAuthRollbackApply() *storage.Apply {
 		PullRequest:     1,
 		Environment:     "staging",
 		Deployment:      "orders",
+		State:           state.Apply.Completed,
+		CompletedAt:     &completedAt,
 	}
 }
 
@@ -639,6 +644,14 @@ func (s *actorAuthStorage) Locks() storage.LockStore {
 	return s.locks
 }
 
+func (s *actorAuthStorage) Plans() storage.PlanStore {
+	return &actorAuthPlanStore{apply: s.apply}
+}
+
+func (s *actorAuthStorage) Tasks() storage.TaskStore {
+	return &actorAuthTaskStore{apply: s.apply}
+}
+
 type actorAuthApplyStore struct {
 	storage.ApplyStore
 	apply *storage.Apply
@@ -653,6 +666,51 @@ func (s *actorAuthApplyStore) GetByApplyIdentifier(_ context.Context, applyIdent
 
 func (s *actorAuthApplyStore) GetByDatabase(_ context.Context, _, _, _ string) ([]*storage.Apply, error) {
 	return nil, nil
+}
+
+type actorAuthPlanStore struct {
+	storage.PlanStore
+	apply *storage.Apply
+}
+
+func (s *actorAuthPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
+	if s.apply == nil || s.apply.PlanID != id {
+		return nil, nil
+	}
+	return &storage.Plan{
+		ID:           s.apply.PlanID,
+		Database:     s.apply.Database,
+		DatabaseType: s.apply.DatabaseType,
+		Environment:  s.apply.Environment,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			s.apply.Database: {
+				OriginalSchema: map[string]string{"users": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"},
+			},
+		},
+	}, nil
+}
+
+type actorAuthTaskStore struct {
+	storage.TaskStore
+	apply *storage.Apply
+}
+
+func (s *actorAuthTaskStore) GetByDatabase(_ context.Context, database string) ([]*storage.Task, error) {
+	if s.apply == nil || s.apply.Database != database {
+		return nil, nil
+	}
+	return []*storage.Task{{
+		ApplyID:      s.apply.ID,
+		PlanID:       s.apply.PlanID,
+		Database:     s.apply.Database,
+		DatabaseType: s.apply.DatabaseType,
+		Repository:   s.apply.Repository,
+		PullRequest:  s.apply.PullRequest,
+		Environment:  s.apply.Environment,
+		State:        state.Task.Completed,
+		CompletedAt:  s.apply.CompletedAt,
+		CreatedAt:    s.apply.CreatedAt,
+	}}, nil
 }
 
 // actorAuthLockStore serves locks from a fixed set and records every lock
