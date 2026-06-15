@@ -1074,10 +1074,14 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 						c.logger.Warn("failed to load apply after progress task state update", "apply_id", activeTask.ApplyID, "error", err)
 					} else if apply != nil && !state.IsTerminalApplyState(apply.State) {
 						if derived, ok := c.deriveAggregateApplyState(ctx, apply, opScopedTasks); ok {
-							apply.State = derived
-							apply.UpdatedAt = now
-							if err := c.storage.Applies().Update(ctx, apply); err != nil {
-								c.logger.Warn("failed to update apply after progress task state update", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+							// Compare-and-swap on the just-read state so a stale
+							// projection cannot clobber a newer state a sibling
+							// drive already wrote.
+							swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, apply.ErrorMessage, apply.CompletedAt)
+							if err != nil {
+								c.logger.Warn("failed to update apply after progress task state update", "apply_id", apply.ApplyIdentifier, "state", derived, "error", err)
+							} else if !swapped {
+								c.logger.Debug("apply progress projection write lost a race; next poll reconciles", "apply_id", apply.ApplyIdentifier, "expected_state", apply.State, "derived_state", derived)
 							}
 						}
 					}
@@ -1107,6 +1111,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 						// one operation per apply the projection equals this
 						// operation's derived state, so this is a no-op until the
 						// multi-deployment fan-out lands.
+						expectedState := apply.State
 						derived, ok := c.deriveAggregateApplyState(ctx, apply, opScopedTasks)
 						quiesce, _, stampCompletedAt := applyQuiesceDecision(derived)
 						if ok && quiesce {
@@ -1128,10 +1133,18 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 							}
 							ensureApplyFailureMessage(apply, opScopedTasks)
 							apply.UpdatedAt = now
-							if err := c.storage.Applies().Update(ctx, apply); err != nil {
+							// Compare-and-swap on the just-read state so a stale
+							// projection cannot clobber a newer state a sibling
+							// drive already wrote.
+							swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.CompletedAt)
+							switch {
+							case err != nil:
 								c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
+							case !swapped:
+								c.logger.Debug("apply terminal projection write lost a race; next poll reconciles", "apply_id", apply.ApplyIdentifier, "expected_state", expectedState, "derived_state", derived)
+							default:
+								c.logger.Info("apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
 							}
-							c.logger.Info("apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
 						}
 					}
 				}

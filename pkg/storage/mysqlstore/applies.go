@@ -700,6 +700,72 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	return nil
 }
 
+// UpdateDerivedState compare-and-swaps the rollout-projected applies.state.
+// It writes only the fields owned by the projection and only when the row still
+// holds expectedState, so a stale projection cannot clobber a newer state a
+// sibling drive already wrote. A lost lease fails closed with an error; a CAS
+// miss (state no longer matches) returns swapped=false so the caller can skip
+// side-effects and reconcile on the next poll.
+func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, completedAt *time.Time) (bool, error) {
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return false, err
+	}
+
+	args := []any{newState, errorMessage, completedAt, applyID, expectedState}
+	leasePredicate := ""
+	if hasLease {
+		leasePredicate = " AND lease_token = ?"
+		args = append(args, lease.Token)
+	}
+
+	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE applies
+		SET state = ?, error_message = ?, completed_at = ?, updated_at = NOW()
+		WHERE id = ? AND state = ?%s
+	`, leasePredicate), args...)
+	if err != nil {
+		return false, fmt.Errorf("compare-and-swap derived apply state for apply %d (%q -> %q): %w", applyID, expectedState, newState, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read derived apply state rows affected for apply %d: %w", applyID, err)
+	}
+	if rows > 0 {
+		return true, nil
+	}
+
+	// Zero rows. A leased caller must distinguish a lost lease (fail closed) from
+	// a benign CAS outcome: the former is an ownership change the caller must
+	// surface, the latter is reconciled on the next poll.
+	if hasLease {
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return false, err
+		}
+	}
+
+	// Under production changed-rows semantics an UPDATE that touches a matching
+	// row but leaves every column unchanged reports zero rows. That only happens
+	// when the projection is a no-op (newState == expectedState and the other
+	// projected fields already hold their target), so a re-read distinguishes
+	// "row still holds expectedState" (idempotent swap) from a genuine CAS miss
+	// where another drive already advanced the state. When newState differs from
+	// expectedState a matching row would have changed, so zero rows is always a
+	// miss and no re-read is needed.
+	if !state.IsState(newState, expectedState) {
+		return false, nil
+	}
+	var currentState string
+	err = s.db.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ?`, applyID).Scan(&currentState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("re-read derived apply state for apply %d: %w", applyID, err)
+	}
+	return state.IsState(currentState, expectedState), nil
+}
+
 // GetInProgress returns all applies in non-terminal states.
 // Note: For recovery, use FindNextApply which handles locking and heartbeat staleness.
 func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error) {

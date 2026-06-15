@@ -144,17 +144,28 @@ func (s *listingApplyOperationStore) ListByApply(context.Context, int64) ([]*sto
 	return s.ops, nil
 }
 
-// recordingApplyStore captures the apply persisted by Update so the test can
-// assert the derived state and completed_at stamping.
+// recordingApplyStore captures the projection persisted by UpdateDerivedState so
+// the test can assert the derived state and completed_at stamping. swapped is
+// returned to model whether the compare-and-swap matched the expected state.
 type recordingApplyStore struct {
 	storage.ApplyStore
-	updated *storage.Apply
+	updated       *storage.Apply
+	expectedState string
+	swapped       bool
 }
 
-func (s *recordingApplyStore) Update(_ context.Context, apply *storage.Apply) error {
-	updated := *apply
-	s.updated = &updated
-	return nil
+func (s *recordingApplyStore) UpdateDerivedState(_ context.Context, applyID int64, expectedState, newState, errorMessage string, completedAt *time.Time) (bool, error) {
+	s.expectedState = expectedState
+	if !s.swapped {
+		return false, nil
+	}
+	s.updated = &storage.Apply{
+		ID:           applyID,
+		State:        newState,
+		ErrorMessage: errorMessage,
+		CompletedAt:  completedAt,
+	}
+	return true, nil
 }
 
 func newOperatorStateTestService(opStore storage.ApplyOperationStore, applyStore storage.ApplyStore) *Service {
@@ -206,7 +217,7 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			applyStore := &recordingApplyStore{}
+			applyStore := &recordingApplyStore{swapped: true}
 			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: tc.ops}, applyStore)
 
 			apply := &storage.Apply{
@@ -218,6 +229,7 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 
 			require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
 			require.NotNil(t, applyStore.updated, "derived state differs from current, so the apply must be persisted")
+			assert.Equal(t, state.Apply.Pending, applyStore.expectedState, "the write must compare-and-swap on the state read before deriving")
 			assert.Equal(t, tc.wantState, applyStore.updated.State)
 			if tc.wantDone {
 				assert.NotNil(t, applyStore.updated.CompletedAt, "terminal derived state stamps completed_at")
@@ -292,7 +304,7 @@ func TestUpdateApplyStateFromOperations_ReopenFailedGuard(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			applyStore := &recordingApplyStore{}
+			applyStore := &recordingApplyStore{swapped: true}
 			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: tc.ops}, applyStore)
 
 			// A terminal parent always carries a stamped completed_at; seed one
@@ -423,7 +435,7 @@ func TestUpdateApplyStateFromOperations_StampsAggregateFailureMessage(t *testing
 		{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed, ErrorMessage: "spirit: cutover failed"},
 		{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Completed},
 	}
-	applyStore := &recordingApplyStore{}
+	applyStore := &recordingApplyStore{swapped: true}
 	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
 
 	apply := &storage.Apply{
@@ -448,7 +460,7 @@ func TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarri
 		{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed},
 		{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Completed},
 	}
-	applyStore := &recordingApplyStore{}
+	applyStore := &recordingApplyStore{swapped: true}
 	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
 
 	apply := &storage.Apply{
@@ -594,4 +606,28 @@ func TestCompletePendingStopIfApplyResolved(t *testing.T) {
 		require.NoError(t, svc.completePendingStopIfApplyResolved(t.Context(), 1, 9))
 		assert.Empty(t, control.completed, "no pending stop means nothing to complete")
 	})
+}
+
+// TestUpdateApplyStateFromOperations_StaleWriteSkipped verifies that when the
+// compare-and-swap misses — another drive advanced the apply between the
+// operator's read and write — the operator skips quietly rather than erroring or
+// reviving a stale projection.
+func TestUpdateApplyStateFromOperations_StaleWriteSkipped(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, State: state.ApplyOperation.Failed},
+		{ID: 2, State: state.ApplyOperation.Pending},
+	}
+	applyStore := &recordingApplyStore{swapped: false}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Pending,
+		Environment:     "staging",
+	}
+
+	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
+	assert.Equal(t, state.Apply.Pending, applyStore.expectedState, "the write must compare-and-swap on the state read before deriving")
+	assert.Nil(t, applyStore.updated, "a CAS miss must not record a persisted projection")
 }

@@ -738,10 +738,17 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		apply.State = derived
 	}
 	apply.UpdatedAt = now
-	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
+	freshApply, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
 		c.logger.Error("failed to reload apply before progress state update", "apply_id", apply.ApplyIdentifier, "error", err)
 		return true
-	} else if freshApply != nil && state.IsTerminalApplyState(freshApply.State) {
+	}
+	if freshApply == nil {
+		c.logger.Warn("apply row missing before progress state update; yielding",
+			"apply_id", apply.ApplyIdentifier, "apply_db_id", apply.ID)
+		return true
+	}
+	if state.IsTerminalApplyState(freshApply.State) {
 		c.logger.Info("apply already terminal in storage, not overwriting with stale progress state",
 			"apply_id", apply.ApplyIdentifier,
 			"stored_state", freshApply.State,
@@ -754,6 +761,10 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 		return true
 	}
+	// expectedState is the authoritative current value: the projection write
+	// below compare-and-swaps on it so a stale projection cannot clobber a newer
+	// state a sibling drive already wrote between this reload and the write.
+	expectedState := freshApply.State
 
 	// Gate apply-level terminal side-effects on the rollout-projected apply state
 	// (apply.State, derived above), not the current operation's engine result.
@@ -780,8 +791,15 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			}
 		}
 		ensureApplyFailureMessage(apply, tasks)
-		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.CompletedAt)
+		if err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+		} else if !swapped {
+			// Another drive advanced the apply between our reload and write; it
+			// owns the terminal transition and its side-effects. Skip ours.
+			c.logger.Info("apply terminal-state write lost a race; yielding to the owning drive",
+				"apply_id", apply.ApplyIdentifier, "expected_state", expectedState, "derived_state", apply.State)
+			return true
 		}
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
 			c.logger.Warn("failed to complete pending stop request after terminal progress reconciliation; current apply owner will exit for operator retry",
@@ -822,8 +840,16 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		return true
 	}
 
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+	swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.CompletedAt)
+	if err != nil {
 		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+	} else if !swapped {
+		// Another drive advanced the apply between our reload and write; our
+		// progress projection is stale. Skip the observer update and let the next
+		// poll reconcile.
+		c.logger.Info("apply progress-state write lost a race; skipping",
+			"apply_id", apply.ApplyIdentifier, "expected_state", expectedState, "derived_state", apply.State)
+		return false
 	}
 
 	// Notify observer of progress update

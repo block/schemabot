@@ -1105,19 +1105,20 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 		return nil
 	}
 
-	updated := *apply
-	updated.State = derived
+	var completedAt *time.Time
 	switch {
 	case state.IsState(derived, state.Apply.Stopped):
 		// stopped is resumable; keep completed_at nil to match the convention.
-		updated.CompletedAt = nil
+		completedAt = nil
 	case state.IsTerminalApplyState(derived):
-		if updated.CompletedAt == nil {
+		if apply.CompletedAt != nil {
+			completedAt = apply.CompletedAt
+		} else {
 			now := s.clock.Now()
-			updated.CompletedAt = &now
+			completedAt = &now
 		}
 	default:
-		updated.CompletedAt = nil
+		completedAt = nil
 	}
 
 	// When the rollout settles to failed, surface the failure reason from the
@@ -1125,14 +1126,25 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 	// the last-driven operation wrote — under continue the last driver may be a
 	// successful sibling, which would leave the failed verdict with no matching
 	// reason. Keep the existing message as a fallback when no operation carries one.
+	errorMessage := apply.ErrorMessage
 	if state.IsState(derived, state.Apply.Failed) {
 		if msg := firstFailedOperationMessage(ops); msg != "" {
-			updated.ErrorMessage = msg
+			errorMessage = msg
 		}
 	}
 
-	if err := s.storage.Applies().Update(ctx, &updated); err != nil {
+	swapped, err := s.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, errorMessage, completedAt)
+	if err != nil {
 		return fmt.Errorf("update derived apply state for apply %s (%d) to %q: %w", apply.ApplyIdentifier, apply.ID, derived, err)
+	}
+	if !swapped {
+		// Another drive advanced the apply between our read and write; our
+		// projection is stale. Skip and let the next poll reconcile.
+		s.logger.Info("operator: derived apply state write lost a race; skipping",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment,
+			"expected_state", apply.State, "derived_state", derived, "operation_count", len(ops))
+		return nil
 	}
 	s.logger.Info("operator: updated derived apply state from apply_operations",
 		"worker", workerID, "apply_id", apply.ApplyIdentifier,
