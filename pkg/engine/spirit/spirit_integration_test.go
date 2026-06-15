@@ -1623,6 +1623,12 @@ func TestEngine_Volume_PreservesProgress(t *testing.T) {
 			t.Logf("Migration completed after volume change")
 			break
 		}
+		// A volume change resumes the copy; it must never drive the apply to a
+		// terminal failure/cancelled/reverted state. Fail fast on that regression
+		// instead of waiting out the poll window and mis-reporting it as a reset.
+		if stateAfter.IsTerminal() {
+			t.Fatalf("volume change drove the apply to terminal state %v (expected running or completed)", stateAfter)
+		}
 		// Resumed progress has settled back above the threshold.
 		if progressAfter >= minExpected {
 			break
