@@ -169,21 +169,47 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 					SupportChannel: h.supportChannel(),
 					Logger:         logger,
 					OnTerminalHook: func(a *storage.Apply) {
-						updated, err := h.updateCheckRecordForApplyResult(context.Background(), apply.Repository, apply.PullRequest, a)
+						// Drive every identifier and side effect from the apply the
+						// hook was handed so logs and check updates can never mix
+						// fields from two apply instances.
+						checkFields := func() []any {
+							return []any{
+								"apply_id", a.ApplyIdentifier,
+								"repo", a.Repository,
+								"pr", a.PullRequest,
+								"database", a.Database,
+								"environment", a.Environment,
+							}
+						}
+						updated, err := h.updateCheckRecordForApplyResult(context.Background(), a.Repository, a.PullRequest, a)
 						if err != nil {
-							logger.Error("observer: failed to update check record for recovered apply", "error", err)
+							logger.Error("observer: failed to update check record for recovered apply",
+								append(checkFields(), "error", err)...)
 							return
 						}
 						if !updated {
 							logger.Debug("observer: skipping aggregate check update for recovered apply, apply no longer owns check state",
-								"apply_id", a.ID, "apply_identifier", a.ApplyIdentifier)
+								checkFields()...)
 							return
 						}
-						if ghInstClient, err := h.clientForRepo(apply.Repository, apply.InstallationID); err == nil {
-							if checkRecord, err := service.Storage().Checks().Get(context.Background(), apply.Repository, apply.PullRequest, a.Environment, a.DatabaseType, a.Database); err == nil && checkRecord != nil {
-								h.updateAggregateCheck(context.Background(), ghInstClient, apply.Repository, apply.PullRequest, checkRecord.HeadSHA)
-							}
+						ghInstClient, err := h.clientForRepo(a.Repository, a.InstallationID)
+						if err != nil {
+							logger.Warn("observer: aggregate check not refreshed for recovered apply; cannot resolve GitHub App client",
+								append(checkFields(), "error", err)...)
+							return
 						}
+						checkRecord, err := service.Storage().Checks().Get(context.Background(), a.Repository, a.PullRequest, a.Environment, a.DatabaseType, a.Database)
+						if err != nil {
+							logger.Warn("observer: aggregate check not refreshed for recovered apply; failed to load stored check state",
+								append(checkFields(), "error", err)...)
+							return
+						}
+						if checkRecord == nil {
+							logger.Debug("observer: no stored check state for recovered apply; nothing to refresh",
+								checkFields()...)
+							return
+						}
+						h.updateAggregateCheck(context.Background(), ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
 					},
 				}))
 		}
@@ -251,7 +277,8 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 
 	applies, err := h.service.Storage().Applies().FindMissingSummaryComment(ctx)
 	if err != nil {
-		h.logger.Error("failed to find applies missing summary comments", "error", err)
+		h.logger.Error("summary comment reconciliation skipped this startup; PRs with a finished apply may show no final summary until the next restart",
+			"error", err)
 		return
 	}
 

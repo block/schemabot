@@ -552,7 +552,8 @@ func progressState(rm *runningMigration, spiritState status.State) engine.State 
 }
 
 // fetchCurrentSchema retrieves table schemas from the database, filtering out
-// internal tables (Spirit shadow/checkpoint tables and other _-prefixed tables).
+// internal tables (Spirit shadow/checkpoint tables and other _-prefixed tables)
+// and archive tables that are maintained outside declarative schema files.
 func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, _ string) ([]table.TableSchema, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
@@ -564,7 +565,7 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, _ string) ([]table
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
-	tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables)
+	tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables, table.WithoutArchiveTables, table.WithStrippedAutoIncrement)
 	if err != nil {
 		return nil, fmt.Errorf("load schema: %w", err)
 	}

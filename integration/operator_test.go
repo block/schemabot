@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -211,6 +212,21 @@ func TestOperator_BasicClaimAndResume(t *testing.T) {
 			return fmt.Sprintf("operator did not resume stale apply %d, last state: %q", staleID, lastState)
 		},
 	)
+
+	// The claim must appear in the apply's durable log so an operator reading
+	// the timeline sees why new state transitions follow the stale period.
+	logs, err := ts.Storage.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: staleID})
+	require.NoError(t, err)
+	claimLogged := false
+	for _, entry := range logs {
+		if strings.Contains(entry.Message, "Operator claimed apply to resume it") {
+			claimLogged = true
+			assert.Equal(t, storage.LogLevelInfo, entry.Level)
+			assert.Equal(t, storage.LogSourceSchemaBot, entry.Source)
+			break
+		}
+	}
+	assert.True(t, claimLogged, "apply_logs should record the operator claim for apply %d", staleID)
 }
 
 // TestOperator_OperatorClaimsOperationToCompletion exercises the operation-level

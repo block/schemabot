@@ -1387,6 +1387,57 @@ func TestApplyStore_FindNextApplyClaimsStoppedStartControlRequest(t *testing.T) 
 	assert.Nil(t, claimedAgain, "claim transition should prevent another worker from taking the same stopped start request")
 }
 
+func TestApplyStore_FindNextApplyClaimsWaitingForDeployStartControlRequest(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_waiting_deploy_start_request", 505, state.Apply.WaitingForDeploy, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = 'waiting-owner', lease_token = 'waiting-token', lease_acquired_at = NOW() - INTERVAL 2 MINUTE, updated_at = NOW()
+		WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+		Metadata:    []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, state.Apply.WaitingForDeploy, claimed.State)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.WaitingForDeploy, persisted.State)
+	assert.Equal(t, "test-owner", persisted.LeaseOwner)
+	assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken)
+
+	claimedAgain, err := store.Applies().FindNextApply(ctx, "test-owner")
+	require.NoError(t, err)
+	assert.Nil(t, claimedAgain, "fresh processing lease should prevent another worker from taking the same deferred deploy start request")
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	reclaimed, err := store.Applies().FindNextApply(ctx, "recovery-owner")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "stale deferred deploy start processing owner should be reclaimable")
+	assert.Equal(t, apply.ApplyIdentifier, reclaimed.ApplyIdentifier)
+}
+
 // TestApplyStore_ClaimStoppedStartRefusedWhenTargetActive verifies the
 // one-active-apply-per-target invariant survives a stopped→running claim. A
 // stopped apply is not "active", so a newer apply can become active for the same

@@ -10,8 +10,8 @@ import (
 
 // CommandSpec declares the parse and dispatch shape of a SchemaBot command.
 //
-// Adding a new command means appending one entry to commandSpecs — the parser
-// regex, flag handling, and missing-env behavior all derive from the spec.
+// Adding a new command means appending one entry to commandSpecs — the parser,
+// unsupported-flag handling, and missing-env behavior all derive from the spec.
 // Adding ad-hoc parsing logic anywhere else for a known command is a sign the
 // spec is missing a field, not that the parser needs another special case.
 type CommandSpec struct {
@@ -69,9 +69,9 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Revert, RequiresEnv: true},
 	{Name: action.SkipRevert, RequiresEnv: true},
 	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},
-	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true, SupportsDB: true,
+	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true,
 		SupportsDeferCutover: true},
-	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDB: true},
+	{Name: action.RollbackConfirm, RequiresEnv: true},
 }
 
 // specByName indexes commandSpecs for O(1) lookup by command word.
@@ -82,6 +82,11 @@ var specByName = func() map[string]CommandSpec {
 	}
 	return m
 }()
+
+func commandSupportsDatabaseFlag(actionName string) bool {
+	spec, ok := specByName[actionName]
+	return ok && spec.SupportsDB
+}
 
 // commandNamePattern is the alternation of every registered command name,
 // sorted by length descending so "apply-confirm" wins over "apply" at the same
@@ -258,4 +263,10 @@ func (p *CommandParser) applySpec(spec CommandSpec, body string) CommandResult {
 // command whose spec does not opt into SupportsAutoConfirm.
 func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
 	return p.autoConfirmRegex.MatchString(body)
+}
+
+// HasDatabaseFlag reports whether the body contains a `-d <database>` flag,
+// regardless of which command it accompanies.
+func (p *CommandParser) HasDatabaseFlag(body string) bool {
+	return p.databaseRegex.MatchString(body)
 }

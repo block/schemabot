@@ -95,6 +95,49 @@ func RenderRollbackApplyNotFound(applyID string) string {
 		"No apply found with ID `%s`. Check the ID and try again.", applyID)
 }
 
+// RollbackRejectedData contains the details shown when SchemaBot refuses to
+// generate a rollback plan because the requested apply is not safe to target.
+type RollbackRejectedData struct {
+	ApplyID     string
+	Database    string
+	Environment string
+	Reason      string
+}
+
+// RenderRollbackRejected renders a rollback-specific rejection message. These
+// rejections are deliberate safety gates, not generic command failures.
+func RenderRollbackRejected(data RollbackRejectedData) string {
+	var sb strings.Builder
+	sb.WriteString("## Rollback Not Allowed\n\n")
+	if data.ApplyID != "" {
+		fmt.Fprintf(&sb, "**Apply**: `%s`\n", data.ApplyID)
+	}
+	if data.Database != "" {
+		fmt.Fprintf(&sb, "**Database**: `%s`\n", data.Database)
+	}
+	if data.Environment != "" {
+		fmt.Fprintf(&sb, "**Environment**: `%s`\n", data.Environment)
+	}
+	if data.ApplyID != "" || data.Database != "" || data.Environment != "" {
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("SchemaBot did not generate a rollback plan because it cannot safely prove this apply is the exact completed schema change that rollback would target.\n\n")
+	if reason := sanitizedRollbackRejectionReason(data.Reason); reason != "" {
+		fmt.Fprintf(&sb, "**Reason**: `%s`\n\n", reason)
+	}
+	sb.WriteString("Rollback is currently allowed only for the latest completed apply for this database and environment, and only when that apply has stored original schema. An operator should reconcile the target schema manually or retry with the latest eligible apply.")
+	return sb.String()
+}
+
+func sanitizedRollbackRejectionReason(reason string) string {
+	fields := strings.Fields(reason)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ReplaceAll(strings.Join(fields, " "), "`", "'")
+}
+
 // RenderRollbackBlockedByLock renders the message posted when a rollback cannot
 // acquire the database lock because another caller holds it. When lockRepo and
 // lockPR are populated, the holder is rendered as a PR link; otherwise the bare

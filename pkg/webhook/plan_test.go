@@ -254,6 +254,20 @@ func TestUserFacingErrorPreservesNonGRPCErrors(t *testing.T) {
 	assert.Equal(t, "invalid DDL", got)
 }
 
+func TestUserFacingErrorExplainsConfigOutsideAllowedDirs(t *testing.T) {
+	err := &schemaConfigOutsideAllowedDirsError{
+		Database:     "orders",
+		DatabaseType: "mysql",
+		SchemaPath:   "services/orders/schema",
+	}
+
+	got := userFacingError(err)
+
+	assert.Contains(t, got, "SchemaBot found a `schemabot.yaml` configuration")
+	assert.Contains(t, got, "Schema directory: `services/orders/schema`")
+	assert.Contains(t, got, "`databases.orders.allowed_dirs`")
+}
+
 func TestUserFacingErrorDetailDoesNotWrapFormattedRemoteErrors(t *testing.T) {
 	formatted := "SchemaBot could not reach the remote deployment `pie` for target `orders-staging`. No healthy upstream is available. Raw error: rpc error: code = Unavailable desc = no healthy upstream"
 

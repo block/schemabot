@@ -87,7 +87,7 @@ func TestCommentObserverShouldDeferCutoverUsesPersistedApplyOption(t *testing.T)
 	assert.True(t, observer.shouldDeferCutover(apply))
 }
 
-func TestFormatCutoverComment(t *testing.T) {
+func TestFormatProgressCommentCutoverState(t *testing.T) {
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-abc123",
 		Database:        "testdb",
@@ -100,7 +100,7 @@ func TestFormatCutoverComment(t *testing.T) {
 		{TableName: "orders", State: state.Task.WaitingForCutover, ReadyToComplete: true},
 	}
 
-	body := formatCutoverComment(apply, tasks)
+	body := formatProgressComment(apply, tasks)
 
 	assert.Contains(t, body, "Cutover")
 	assert.Contains(t, body, "testdb")

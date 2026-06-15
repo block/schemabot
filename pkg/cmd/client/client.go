@@ -102,9 +102,10 @@ func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schema
 
 // CallRollbackPlanAPI calls the rollback API to generate a plan that reverts
 // the specified apply. The response includes database/environment metadata.
-func CallRollbackPlanAPI(endpoint, applyID string) (*apitypes.PlanResponse, error) {
+func CallRollbackPlanAPI(endpoint, applyID, environment string) (*apitypes.PlanResponse, error) {
 	body := map[string]any{
-		"apply_id": applyID,
+		"apply_id":    applyID,
+		"environment": environment,
 	}
 	var result apitypes.PlanResponse
 	if err := doPostInto(endpoint, "/api/rollback/plan", body, &result); err != nil {
