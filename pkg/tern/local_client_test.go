@@ -1671,6 +1671,23 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
 	})
 
+	t.Run("credentialsForGroupedApply fails closed unless exactly one namespace", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		}, logger: slog.Default()}
+
+		_, err := c.credentialsForGroupedApply(&storage.Plan{Namespaces: nil})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exactly one namespace")
+
+		_, err = c.credentialsForGroupedApply(&storage.Plan{
+			Namespaces: map[string]*storage.NamespacePlanData{"a": {}, "b": {}},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exactly one namespace")
+	})
+
 	t.Run("Vitess credentials carry metadata and never inject a schema", func(t *testing.T) {
 		c := &LocalClient{config: LocalConfig{
 			Type:      storage.DatabaseTypeVitess,

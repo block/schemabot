@@ -262,9 +262,10 @@ func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Cr
 	if err != nil {
 		return nil, fmt.Errorf("inspect MySQL target DSN for namespace injection: %w", err)
 	}
-	// A target DSN that already names a database is the local-DSN shape: Spirit
-	// connects to that database and the namespace is an organizational label, so
-	// the configured credentials are used as-is.
+	// Transitional: a target DSN that already names a database is used as-is.
+	// The data-plane model is a namespace-free DSN with the schema injected per
+	// operation (below); existing static/local configs still carry the database
+	// in the DSN, and those keep working until they migrate to namespace-free.
 	if hasDatabase {
 		return c.credentials(), nil
 	}
@@ -294,26 +295,28 @@ func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credential
 }
 
 // credentialsForGroupedApply resolves the single-namespace credentials for a
-// grouped/atomic MySQL apply. A grouped apply runs one Spirit execution and
-// rejects multi-namespace plans, so exactly one namespace drives the connection.
+// grouped/atomic MySQL apply. A grouped apply runs one Spirit execution against
+// one schema, so the plan must carry exactly one namespace. Fail closed rather
+// than pick a namespace by map iteration order (or silently use a namespace-free
+// DSN) if that invariant is ever violated.
 func (c *LocalClient) credentialsForGroupedApply(plan *storage.Plan) (*engine.Credentials, error) {
 	if c.config.Type != storage.DatabaseTypeMySQL {
 		return c.credentials(), nil
 	}
-	creds := c.credentials()
-	for namespace := range plan.Namespaces {
-		nsCreds, err := c.credentialsForMySQLNamespace(namespace)
-		if err != nil {
-			return nil, err
-		}
-		creds = nsCreds
+	if len(plan.Namespaces) != 1 {
+		return nil, fmt.Errorf("grouped MySQL apply requires exactly one namespace, plan has %d", len(plan.Namespaces))
 	}
-	return creds, nil
+	var namespace string
+	for ns := range plan.Namespaces {
+		namespace = ns
+	}
+	return c.credentialsForMySQLNamespace(namespace)
 }
 
 // credentialsForApply resolves credentials for an apply's engine operation. A
-// MySQL apply runs one namespace, so the namespace of any targeted task gives
-// the connection database; the first targeted task is representative.
+// MySQL apply runs one namespace, so every task of the apply shares it — any
+// targeted task (terminal or not) yields the same connection database, so the
+// first targeted task is representative.
 func (c *LocalClient) credentialsForApply(tasks []*storage.Task, targetApplyID int64) (*engine.Credentials, error) {
 	if c.config.Type != storage.DatabaseTypeMySQL {
 		return c.credentials(), nil
