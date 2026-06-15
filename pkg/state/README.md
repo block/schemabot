@@ -452,8 +452,13 @@ Engine (Spirit/Vitess)
   → engineStateToStorage()  → Storage (DB)
   → storageStateToProto()   → Proto (gRPC wire)
   → ProtoStateToStorage()   → back to canonical for CLI
-  → taskStateToApplyState() → Apply state for DB
 ```
+
+Apply state is derived from task and operation rows rather than from a single
+task: `DeriveApplyState()` (in `pkg/state`) aggregates a task set into one apply
+state, and `deriveAggregateApplyState()` (in `pkg/tern`) projects that across an
+apply's `apply_operations` siblings for the rollout-level value persisted to the
+DB.
 
 Engines report their own native states (Spirit camelCase, Vitess lowercase). The engine adapter
 (`pkg/engine/spirit`, `pkg/engine/planetscale`) translates these into `engine.State` values. From

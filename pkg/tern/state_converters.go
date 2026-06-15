@@ -16,41 +16,6 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// taskStateToApplyState maps a task state string to an Apply state string.
-func taskStateToApplyState(ts string) string {
-	ts = state.NormalizeTaskStatus(ts)
-	switch ts {
-	case state.Task.Pending:
-		return state.Apply.Pending
-	case state.Task.Running:
-		return state.Apply.Running
-	case state.Task.WaitingForDeploy:
-		return state.Apply.WaitingForDeploy
-	case state.Task.WaitingForCutover:
-		return state.Apply.WaitingForCutover
-	case state.Task.Recovering:
-		return state.Apply.Recovering
-	case state.Task.CuttingOver:
-		return state.Apply.CuttingOver
-	case state.Task.RevertWindow:
-		return state.Apply.RevertWindow
-	case state.Task.Completed:
-		return state.Apply.Completed
-	case state.Task.Failed:
-		return state.Apply.Failed
-	case state.Task.FailedRetryable:
-		return state.Apply.FailedRetryable
-	case state.Task.Stopped:
-		return state.Apply.Stopped
-	case state.Task.Reverted:
-		return state.Apply.Reverted
-	case state.Task.Cancelled:
-		return state.Apply.Cancelled
-	default:
-		return state.Apply.Pending
-	}
-}
-
 func taskStates(tasks []*storage.Task) []string {
 	states := make([]string, 0, len(tasks))
 	for _, task := range tasks {

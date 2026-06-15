@@ -391,3 +391,40 @@ func TestDeriveVSchemaTaskState(t *testing.T) {
 		assert.Equal(t, state.Task.Completed, got)
 	})
 }
+
+// applyQuiesceDecision gates the apply-level terminal/pause side-effects on the
+// rollout-projected apply state. A drive must quiesce the whole apply only when
+// the projection is terminal or a retry-pause — never when a continue policy
+// holds the apply running while siblings are still in flight. Stamping
+// completed_at follows quiesce && !retryablePause (and stopped is terminal but
+// resumable, so completed_at stays nil even though it quiesces).
+func TestApplyQuiesceDecision(t *testing.T) {
+	cases := []struct {
+		name           string
+		projected      string
+		wantQuiesce    bool
+		wantRetryPause bool
+	}{
+		{"completed", state.Apply.Completed, true, false},
+		{"failed", state.Apply.Failed, true, false},
+		{"cancelled", state.Apply.Cancelled, true, false},
+		{"reverted", state.Apply.Reverted, true, false},
+		{"stopped", state.Apply.Stopped, true, false},
+		{"failed_retryable", state.Apply.FailedRetryable, true, true},
+		{"running", state.Apply.Running, false, false},
+		{"pending", state.Apply.Pending, false, false},
+		{"waiting_for_cutover", state.Apply.WaitingForCutover, false, false},
+		{"waiting_for_deploy", state.Apply.WaitingForDeploy, false, false},
+		{"cutting_over", state.Apply.CuttingOver, false, false},
+		{"recovering", state.Apply.Recovering, false, false},
+		{"revert_window", state.Apply.RevertWindow, false, false},
+		{"empty/undetermined", "", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			quiesce, retryPause := applyQuiesceDecision(tc.projected)
+			assert.Equal(t, tc.wantQuiesce, quiesce, "quiesce for projected state %q", tc.projected)
+			assert.Equal(t, tc.wantRetryPause, retryPause, "retryablePause for projected state %q", tc.projected)
+		})
+	}
+}

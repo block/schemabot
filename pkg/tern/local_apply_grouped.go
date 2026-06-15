@@ -441,6 +441,21 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 	}
 }
 
+// applyQuiesceDecision reports whether a drive should run the apply-level
+// terminal/pause side-effects — stamping completed_at, dropping the active-
+// applies metric, completing pending stop requests, notifying observers, and
+// stopping polling — based on the rollout-projected apply state rather than one
+// operation's engine result. Under on_failure=continue a failed operation holds
+// the apply running while siblings are still in flight, so its terminal engine
+// result must not quiesce the whole apply. retryablePause is reported separately
+// because failed_retryable pauses for operator retry (completed_at stays nil,
+// observers receive progress not terminal) rather than terminalizing the apply.
+func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause bool) {
+	retryablePause = state.IsState(projectedApplyState, state.Apply.FailedRetryable)
+	quiesce = state.IsTerminalApplyState(projectedApplyState) || retryablePause
+	return quiesce, retryablePause
+}
+
 // handleAtomicProgressTick processes a single progress poll tick in atomic mode.
 // Returns true when polling should stop because the apply reached a terminal state
 // or this owner attempt must exit for operator retry.
@@ -645,8 +660,16 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		return true
 	}
 
-	if result.State.IsTerminal() {
-		retryableFailure := state.IsState(newState, state.Task.FailedRetryable)
+	// Gate apply-level terminal side-effects on the rollout-projected apply state
+	// (apply.State, derived above), not the current operation's engine result.
+	// Under on_failure=continue a failed operation holds the apply running while
+	// siblings are still in flight, so one operation's terminal engine result
+	// must not stamp completed_at, drop the active-applies metric, tear down
+	// observers, or stop polling for the whole apply. With one operation per
+	// apply the projection equals this operation's derived state, so this is a
+	// no-op until the multi-deployment fan-out lands.
+	quiesce, retryableFailure := applyQuiesceDecision(apply.State)
+	if quiesce {
 		if retryableFailure {
 			apply.CompletedAt = nil
 		} else {
@@ -678,14 +701,14 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		case retryableFailure:
 			c.logger.Warn("apply paused for operator retry",
 				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
-		case result.State == engine.StateFailed:
+		case state.IsState(apply.State, state.Apply.Failed):
 			c.logger.Error("apply failed",
 				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
 		default:
 			c.logger.Info("apply completed",
-				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "state", result.State, "task_count", len(tasks))
+				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "state", apply.State, "task_count", len(tasks))
 		}
-		eventMessage := fmt.Sprintf("Apply completed with state: %s", result.State)
+		eventMessage := fmt.Sprintf("Apply completed with state: %s", apply.State)
 		if retryableFailure {
 			eventMessage = "Apply paused for operator retry after retryable engine failure"
 		}
