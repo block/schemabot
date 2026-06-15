@@ -121,6 +121,84 @@ func TestRenderMultiDeploymentApplyComment_DetailsReuseSingleRenderer(t *testing
 	assert.Contains(t, out, "_No details available yet._")
 }
 
+// A completed multi-deployment summary uses the same aggregate header, count
+// line, and per-deployment summary list as the status comment, but each
+// <details> body is the deployment's terminal summary (the single-deployment
+// summary renderer) — so it carries the "applied successfully" outcome text
+// rather than in-progress table bars.
+func TestRenderMultiDeploymentApplySummaryComment_CompletedReusesSummaryRenderer(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Completed),
+		rollingOp("us", so.Completed),
+	})
+	out := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: map[string]ApplyStatusCommentData{
+			"eu": {
+				Database:    "payments_eu",
+				Environment: "production",
+				State:       state.Apply.Completed,
+				Tables: []TableProgressData{
+					{TableName: "orders", Status: state.Task.Completed},
+				},
+			},
+			"us": {
+				Database:    "payments_us",
+				Environment: "production",
+				State:       state.Apply.Completed,
+				Tables: []TableProgressData{
+					{TableName: "orders", Status: state.Task.Completed},
+				},
+			},
+		},
+	})
+
+	// Aggregate terminal header and per-deployment summary list, as the status
+	// comment, so an operator sees rollout outcome at a glance.
+	assert.Contains(t, out, "## ✅ Schema Change Applied")
+	assert.Contains(t, out, "- ✅ eu — completed")
+	assert.Contains(t, out, "- ✅ us — completed")
+
+	// Each <details> body is the summary renderer's output, not the status one.
+	assert.Contains(t, out, "Schema change applied successfully — your changes are live!")
+	assert.Contains(t, out, "**Database**: `payments_eu`")
+	assert.Contains(t, out, "**Database**: `payments_us`")
+}
+
+// A failed multi-deployment summary keeps the aggregate failed header and routes
+// each deployment's terminal summary into its section, so the failed deployment's
+// retry guidance appears in its <details> body.
+func TestRenderMultiDeploymentApplySummaryComment_FailedDeploymentSummary(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Completed),
+		rollingOp("us", so.Failed),
+	})
+	out := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		Details: map[string]ApplyStatusCommentData{
+			"us": {
+				Database:     "payments_us",
+				Environment:  "production",
+				State:        state.Apply.Failed,
+				ErrorMessage: "lock wait timeout",
+				Tables: []TableProgressData{
+					{TableName: "orders", Status: state.Task.Failed},
+				},
+			},
+		},
+	})
+
+	assert.Contains(t, out, "## ❌ Schema Change Failed")
+	// The failed deployment's section carries the single-deployment summary's
+	// error and retry guidance.
+	assert.Contains(t, out, "lock wait timeout")
+	assert.Contains(t, out, "To retry:")
+}
+
 // A deployment in an unrecognized engine state still renders a summary line and
 // section without a leading space where the glyph would be.
 func TestRenderMultiDeploymentApplyComment_UnknownStateNoGlyph(t *testing.T) {

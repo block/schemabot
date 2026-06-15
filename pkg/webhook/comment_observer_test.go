@@ -81,3 +81,44 @@ func TestFormatStatusCommentFallsBackOnLoadError(t *testing.T) {
 	assert.Contains(t, body, "## Schema Change In Progress")
 	assert.NotContains(t, body, "**Deployments**:")
 }
+
+// A multi-deployment terminal apply renders the aggregated summary: the observer
+// loads the operation rows and routes through the multi-deployment summary
+// layout.
+func TestFormatTerminalSummaryCommentRoutesMultiDeployment(t *testing.T) {
+	o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
+		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed},
+	}})
+
+	body := o.formatTerminalSummaryComment(completedApply(), nil)
+
+	assert.Contains(t, body, "## ✅ Schema Change Applied")
+	assert.Contains(t, body, "**Deployments**: 2 completed")
+	assert.Contains(t, body, "- ✅ eu — completed")
+	assert.Contains(t, body, "- ✅ us — completed")
+}
+
+// A single-operation terminal apply renders the single-deployment summary
+// unchanged — no aggregate header.
+func TestFormatTerminalSummaryCommentRoutesSingleDeployment(t *testing.T) {
+	o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
+	}})
+
+	body := o.formatTerminalSummaryComment(completedApply(), nil)
+
+	assert.Contains(t, body, "## ✅ Schema Change Applied")
+	assert.NotContains(t, body, "**Deployments**:")
+}
+
+// A transient operation-load failure falls back to the single-deployment summary
+// so a storage error never blocks the terminal comment.
+func TestFormatTerminalSummaryCommentFallsBackOnLoadError(t *testing.T) {
+	o := newDispatchTestObserver(&stubApplyOperationStore{err: errors.New("db unavailable")})
+
+	body := o.formatTerminalSummaryComment(completedApply(), nil)
+
+	assert.Contains(t, body, "## ✅ Schema Change Applied")
+	assert.NotContains(t, body, "**Deployments**:")
+}

@@ -4825,6 +4825,228 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 
 </details>
+
+</details>
+
+<details>
+<summary><a name="summary-all-deployments-completed"></a><strong>Summary: All Deployments Completed</strong></summary>
+
+
+## ✅ Schema Change Applied
+
+**Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 28m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Deployments**: 3 completed
+
+- ✅ eu — completed
+- ✅ us — completed
+- ✅ au — completed
+
+<details>
+<summary>✅ eu — completed</summary>
+
+## ✅ Schema Change Applied
+
+**Database**: `payments_eu` | **Environment**: `production`
+
+
+> All 3 tables applied successfully — your schema changes are live!
+
+### ✅ testapp
+
+**`orders`**
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+_Apply ID: `apply-a1b2c3d4e5f6`_
+
+</details>
+
+<details>
+<summary>✅ us — completed</summary>
+
+## ✅ Schema Change Applied
+
+**Database**: `payments_us` | **Environment**: `production`
+
+
+> All 3 tables applied successfully — your schema changes are live!
+
+### ✅ testapp
+
+**`orders`**
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+_Apply ID: `apply-a1b2c3d4e5f6`_
+
+</details>
+
+<details>
+<summary>✅ au — completed</summary>
+
+## ✅ Schema Change Applied
+
+**Database**: `payments_au` | **Environment**: `production`
+
+
+> All 3 tables applied successfully — your schema changes are live!
+
+### ✅ testapp
+
+**`orders`**
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+_Apply ID: `apply-a1b2c3d4e5f6`_
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="summary-halt-on-failure-one-deployment-failed"></a><strong>Summary: Halt On Failure (One Deployment Failed)</strong></summary>
+
+
+## ❌ Schema Change Failed
+
+**Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 19m
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Deployments**: 1 completed, 2 halted, 1 failed
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+- ✅ eu — completed
+- ❌ us — failed
+- ⏸ au — halted — us failed
+- ⏸ ca — halted — us failed
+
+<details>
+<summary>✅ eu — completed</summary>
+
+## ✅ Schema Change Applied
+
+**Database**: `payments_eu` | **Environment**: `production`
+
+
+> All 3 tables applied successfully — your schema changes are live!
+
+### ✅ testapp
+
+**`orders`**
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+_Apply ID: `apply-a1b2c3d4e5f6`_
+
+</details>
+
+<details open>
+<summary>❌ us — failed</summary>
+
+## ❌ Schema Change Failed
+
+**Database**: `payments_us` | **Environment**: `production` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+
+1 of 3 tables completed before failure.
+
+### ❌ testapp
+
+**`users`** — Failed
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`orders`**
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`products`** — Cancelled
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details open>
+<summary>⏸ au — halted — us failed</summary>
+
+_No details available yet._
+
+</details>
+
+<details open>
+<summary>⏸ ca — halted — us failed</summary>
+
+_No details available yet._
+
+</details>
 </details>
 
 ## Sequential Mode (CLI)
