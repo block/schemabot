@@ -744,6 +744,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		DeferDeploy:  deferDeploy,
 		AllowUnsafe:  allowUnsafe,
 		SkipRevert:   skipRevert,
+		Target:       plan.Target,
 	}
 	optionsJSON := storage.MarshalApplyOptions(applyOpts)
 
