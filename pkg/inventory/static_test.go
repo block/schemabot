@@ -12,7 +12,7 @@ func TestStaticResolverResolveTarget(t *testing.T) {
 	t.Setenv("TARGET_DSN", "user:pass@tcp(db.example:3306)/")
 	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
 		"dsid-orders-prod": {
-			DatabaseType: "mysql",
+			DatabaseType: "MySQL",
 			DSN:          "env:TARGET_DSN",
 			Metadata:     map[string]string{"pending_drops": "false"},
 		},
@@ -21,7 +21,7 @@ func TestStaticResolverResolveTarget(t *testing.T) {
 
 	got, err := resolver.ResolveTarget(t.Context(), Request{
 		Target:       "dsid-orders-prod",
-		DatabaseType: "mysql",
+		DatabaseType: "MYSQL",
 		Environment:  "production",
 	})
 
@@ -30,6 +30,23 @@ func TestStaticResolverResolveTarget(t *testing.T) {
 	assert.Equal(t, "mysql", got.DatabaseType)
 	assert.Equal(t, "user:pass@tcp(db.example:3306)/", got.DSN)
 	assert.Equal(t, map[string]string{"pending_drops": "false"}, got.Metadata)
+}
+
+func TestStaticResolverResolvesDSNAtConstruction(t *testing.T) {
+	t.Setenv("TARGET_DSN", "user:pass@tcp(db.example:3306)/")
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"target-1": {
+			DatabaseType: "mysql",
+			DSN:          "env:TARGET_DSN",
+		},
+	}})
+	require.NoError(t, err)
+	t.Setenv("TARGET_DSN", "other:pass@tcp(db.example:3306)/")
+
+	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "target-1"})
+
+	require.NoError(t, err)
+	assert.Equal(t, "user:pass@tcp(db.example:3306)/", got.DSN)
 }
 
 func TestStaticResolverResolveTargetClonesMetadata(t *testing.T) {
@@ -92,15 +109,13 @@ func TestStaticResolverResolveTargetValidatesRequest(t *testing.T) {
 }
 
 func TestStaticResolverResolveTargetRejectsMySQLDSNWithDatabase(t *testing.T) {
-	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+	_, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
 		"target-1": {
 			DatabaseType: "mysql",
 			DSN:          "root@tcp(localhost:3306)/appdb",
 		},
 	}})
-	require.NoError(t, err)
 
-	_, err = resolver.ResolveTarget(t.Context(), Request{Target: "target-1"})
 	assert.ErrorContains(t, err, "MySQL DSN must not include a database name")
 }
 
