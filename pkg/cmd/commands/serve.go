@@ -201,10 +201,9 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 
 	// Authentication middleware. With the default (none) auth this is an
 	// allow-all NoneAuthorizer that lets every request through (attaching an
-	// anonymous user); it gates nothing until an auth type is configured. The
-	// authorizer is responsible for bypassing non-API paths (/webhook, /metrics,
-	// health) once real enforcement is added.
-	authz, err := buildAuthorizer(serverConfig.Auth, logger)
+	// anonymous user); with "oidc" it validates Bearer JWTs and bypasses
+	// non-API paths (/webhook, /metrics, health) itself.
+	authz, err := buildAuthorizer(ctx, serverConfig.Auth, logger)
 	if err != nil {
 		return fmt.Errorf("setup auth: %w", err)
 	}
@@ -443,16 +442,28 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// buildAuthorizer selects the API authorizer from config. Today only the
-// allow-all NoneAuthorizer is supported (every request allowed, with an
-// anonymous user in context); other types are rejected so a misconfigured auth
-// type fails closed at startup rather than silently disabling auth. OIDC
-// support is layered on top of this seam.
-func buildAuthorizer(cfg api.AuthConfig, logger *slog.Logger) (auth.Authorizer, error) {
+// buildAuthorizer selects the API authorizer from config. The default
+// allow-all NoneAuthorizer lets every request through (with an anonymous user
+// in context); "oidc" validates Bearer JWTs against the issuer's JWKS. Unknown
+// types are rejected so a misconfigured auth type fails closed at startup
+// rather than silently disabling auth.
+func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, logger *slog.Logger) (auth.Authorizer, error) {
 	switch cfg.Type {
 	case "", "none":
 		logger.Info("API authentication disabled — all requests allowed")
 		return auth.NoneAuthorizer{}, nil
+	case "oidc":
+		logger.Info("initializing OIDC authentication", "issuer", cfg.Issuer)
+		authz, err := auth.NewOIDCAuthorizer(ctx, auth.OIDCConfig{
+			Issuer:      cfg.Issuer,
+			Audience:    cfg.Audience,
+			GroupsClaim: cfg.GroupsClaim,
+		}, logger)
+		if err != nil {
+			return nil, err
+		}
+		logger.Info("OIDC authentication enabled", "issuer", cfg.Issuer)
+		return authz, nil
 	default:
 		return nil, fmt.Errorf("auth type %q is not yet supported", cfg.Type)
 	}

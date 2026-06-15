@@ -783,9 +783,20 @@ func (c *ServerConfig) Validate() error {
 // When Type is empty or "none" (the default), authentication is disabled and
 // all requests are allowed — unchanged from deployments without this config.
 type AuthConfig struct {
-	// Type selects the authenticator: "none" (or "", the default).
-	// Additional types (e.g. "oidc") are introduced in later changes.
+	// Type selects the authenticator: "none" (or "", the default) or "oidc".
 	Type string `yaml:"type"`
+
+	// Issuer is the OIDC provider's issuer URL. Required when Type is "oidc".
+	Issuer string `yaml:"issuer"`
+
+	// Audience is the expected token audience (aud) claim. Required when Type is
+	// "oidc" — without it a token minted for another app sharing the issuer
+	// would be accepted.
+	Audience string `yaml:"audience"`
+
+	// GroupsClaim is the JWT claim carrying group memberships. Defaults to
+	// "groups" when empty.
+	GroupsClaim string `yaml:"groups_claim"`
 }
 
 // Validate checks the auth configuration. Unknown types are rejected so a
@@ -794,8 +805,19 @@ func (a *AuthConfig) Validate() error {
 	switch a.Type {
 	case "", "none":
 		return nil
+	case "oidc":
+		if strings.TrimSpace(a.Issuer) == "" {
+			return fmt.Errorf("issuer is required when auth type is oidc")
+		}
+		if a.Issuer != strings.TrimSpace(a.Issuer) {
+			return fmt.Errorf("issuer must not have leading or trailing whitespace")
+		}
+		if strings.TrimSpace(a.Audience) == "" {
+			return fmt.Errorf("audience is required when auth type is oidc")
+		}
+		return nil
 	default:
-		return fmt.Errorf("unknown auth type %q (supported: none)", a.Type)
+		return fmt.Errorf("unknown auth type %q (supported: none, oidc)", a.Type)
 	}
 }
 
