@@ -2063,3 +2063,134 @@ func TestApplyOperationStore_DeleteByApply_DBError(t *testing.T) {
 	err = store.ApplyOperations().DeleteByApply(t.Context(), 1)
 	require.Error(t, err)
 }
+
+// TestApplyOperationStore_FindNextApplyOperation_PendingStopGateHaltsSibling
+// verifies that a pending stop control request halts remaining siblings under
+// on_failure "continue": a pending sibling that would otherwise be claimable
+// (the earlier failed sibling is continue-exempted) is not started while the
+// stop is pending, so `stop` actually stops the rollout instead of letting the
+// next deployment kick off.
+func TestApplyOperationStore_FindNextApplyOperation_PendingStopGateHaltsSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_stop_gate", 1, state.Apply.Running, "staging")
+
+	// region-a failed (continue), region-b pending behind it. Without a stop
+	// this is exactly the OnFailureContinueClaimsPastFailedSibling case, where
+	// region-b would be claimed.
+	failed, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+	// Backdate the failed row so staleness can't be the reason region-b is held.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failed)
+	require.NoError(t, err)
+
+	// A pending stop request now exists for the apply.
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a pending stop must halt the next sibling even under on_failure continue")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_PendingStopDoesNotBlockStaleRecovery
+// verifies the stop gate covers only pending (not-yet-started) rows: a row that
+// already started and went stale is recovering work it began, so it is still
+// re-leasable even while a stop is pending. The in-flight drive observes the
+// stop through the engine.
+func TestApplyOperationStore_FindNextApplyOperation_PendingStopDoesNotBlockStaleRecovery(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_stop_stale", 1, state.Apply.Running, "staging")
+
+	runningID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+	// Make the running row stale so it is re-leasable for crash recovery.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, runningID)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a stale active row is recovering started work and is not gated by a pending stop")
+	assert.Equal(t, runningID, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Running, claimed.State, "re-lease keeps the running state for the resume drive")
+}
+
+// TestApplyOperationStore_MarkPendingStoppedByApply verifies the operator stop
+// reconciliation primitive: it terminalizes only the still-pending operations of
+// an apply to stopped, leaving running and already-terminal rows untouched, and
+// keeps completed_at nil because stopped is resumable.
+func TestApplyOperationStore_MarkPendingStoppedByApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_mark_stopped", 1, state.Apply.Running, "staging")
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+	runningID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+	pendingID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-c", OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+
+	stopped, err := store.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), stopped, "only the single pending row is stopped")
+
+	pending, err := store.ApplyOperations().Get(ctx, pendingID)
+	require.NoError(t, err)
+	assert.Equal(t, state.ApplyOperation.Stopped, pending.State, "pending row is terminalized to stopped")
+	assert.Nil(t, pending.CompletedAt, "stopped is resumable, so completed_at stays nil")
+
+	failed, err := store.ApplyOperations().Get(ctx, failedID)
+	require.NoError(t, err)
+	assert.Equal(t, state.ApplyOperation.Failed, failed.State, "an already-terminal row keeps its recorded result")
+
+	running, err := store.ApplyOperations().Get(ctx, runningID)
+	require.NoError(t, err)
+	assert.Equal(t, state.ApplyOperation.Running, running.State, "an in-flight row is left for its own driver")
+
+	// A second call is a no-op once nothing is pending.
+	again, err := store.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), again, "no pending rows remain to stop")
+}

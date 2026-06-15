@@ -2390,3 +2390,153 @@ func TestApplyStore_GetByPlan_DBError(t *testing.T) {
 	_, err = store.Applies().GetByPlan(t.Context(), 123)
 	require.Error(t, err)
 }
+
+// TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedContinueApply
+// verifies the stop-reconciliation trigger: an apply held running under
+// on_failure "continue" (a failed earlier sibling) with a pending stop and a
+// pending sibling that the claim gate keeps from starting is claimed here, so
+// the operator can stop the pending siblings and let the apply settle. Without
+// this path no operation is claimable and the stop would strand forever.
+func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedContinueApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon", 1, state.Apply.Running, "staging")
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+	// Backdate the failed row so it can't be mistaken for a fresh active op.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "an apply with a pending stop and pending siblings must be claimable for reconciliation")
+	assert.Equal(t, apply.ID, claimed.ID)
+	assert.Equal(t, "test-operator", claimed.LeaseOwner, "claim rotates the lease owner")
+	assert.Equal(t, state.Apply.Running, claimed.State, "reconciliation claim refreshes the lease without changing apply state")
+}
+
+// TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithActiveOp
+// verifies the trigger defers to the operation-claim path whenever any operation
+// is active — whether freshly heartbeating or stale-and-crashed. That path drives
+// the operation through the engine (which observes the stop), so reconciliation
+// must not settle the apply terminally out from under it. Only once nothing is
+// active does this path own the remaining pending siblings.
+func TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithActiveOp(t *testing.T) {
+	cases := []struct {
+		name      string
+		freshness string
+	}{
+		{name: "fresh heartbeat", freshness: "NOW()"},
+		{name: "stale heartbeat", freshness: "NOW() - INTERVAL 1 HOUR"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql", "staging")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_active", 1, state.Apply.Running, "staging")
+
+			runningID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue,
+			})
+			require.NoError(t, err)
+			_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailureContinue,
+			})
+			require.NoError(t, err)
+			_, err = testDB.ExecContext(ctx, `
+				UPDATE apply_operations SET updated_at = `+tc.freshness+` WHERE id = ?
+			`, runningID)
+			require.NoError(t, err)
+
+			_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+				ApplyID:     apply.ID,
+				Operation:   storage.ControlOperationStop,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "operator",
+			})
+			require.NoError(t, err)
+
+			claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "test-operator")
+			require.NoError(t, err)
+			assert.Nil(t, claimed, "an apply with any active operation is left to the operation-claim path")
+		})
+	}
+}
+
+// TestApplyStore_FindNextApplyForStopReconciliation_ClaimsPendingApplyWithStop
+// verifies a stop requested before the first operation is ever claimed is not
+// stranded: with the claim gate refusing the pending ops, reconciliation claims
+// the still-pending apply (persistApplyClaim transitions it to running) so the
+// operator can stop the pending operations and settle it.
+func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsPendingApplyWithStop(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_pending", 1, state.Apply.Pending, "staging")
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a pending apply with a pending stop must be claimable so the stop is not stranded")
+	assert.Equal(t, apply.ID, claimed.ID)
+	assert.Equal(t, "test-operator", claimed.LeaseOwner)
+}
+
+// TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithoutPendingStop
+// verifies the trigger is scoped to applies that actually have a pending stop:
+// pending siblings alone (no stop) are normal rollout work, not reconciliation
+// candidates.
+func TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithoutPendingStop(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_nostop", 1, state.Apply.Running, "staging")
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "an apply without a pending stop is not a reconciliation candidate")
+}

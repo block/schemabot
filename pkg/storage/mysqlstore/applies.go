@@ -961,6 +961,101 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	return apply, nil
 }
 
+// FindNextApplyForStopReconciliation claims one apply eligible for stop
+// reconciliation (pending or an active recovery-claimable state; see
+// claimableApplyStates) that has a
+// pending stop control request, at least one pending operation, and no operation
+// currently being driven, so the operator can terminalize the pending siblings
+// and let the apply settle. See the interface doc for why this trigger is needed
+// under on_failure "continue".
+func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, owner string) (*storage.Apply, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("operator owner is required to claim apply for stop reconciliation: %w", storage.ErrApplyLeaseLost)
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin claim apply for stop reconciliation transaction: %w", err)
+	}
+	defer rollbackApplyTx(ctx, tx, "claim apply for stop reconciliation")
+
+	// Parent eligibility: pending plus the active recovery-claimable states
+	// (claimableApplyStates); the resumable failed_retryable and stopped states
+	// are excluded because they have their own resume paths. pending is included
+	// so a stop requested before the first operation is ever claimed is not
+	// stranded — the claim gate refuses the pending ops, so reconciliation must
+	// own them; persistApplyClaim transitions a pending apply to running for the
+	// claim.
+	parentStates := append([]string{state.Apply.Pending}, claimableApplyStates()...)
+	parentStatePlaceholders := placeholders(len(parentStates))
+
+	// A child operation in any of these states is being driven, or is a crashed
+	// driver awaiting stale recovery. Either way the operation-claim path owns
+	// settling it through the engine (its drive observes the stop), so this path
+	// skips the apply whenever any operation is active — stale or fresh — and
+	// handles only applies with nothing active left to drive. recoverApplyPendingStop
+	// runs before the operation claim, so an active operation falls through to be
+	// recovered there, then a later tick reconciles the remaining pending siblings.
+	activeOpStates := claimableApplyStates()
+	activeOpStatePlaceholders := placeholders(len(activeOpStates))
+
+	queryArgs := stringArgs(parentStates)
+	queryArgs = append(queryArgs, storage.ControlOperationStop, storage.ControlRequestPending)
+	queryArgs = append(queryArgs, state.ApplyOperation.Pending)
+	queryArgs = append(queryArgs, stringArgs(activeOpStates)...)
+
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM applies a
+		WHERE a.state IN (%s)
+			AND EXISTS (
+				SELECT 1
+				FROM apply_control_requests cr
+				WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+			)
+			AND EXISTS (
+				SELECT 1
+				FROM apply_operations pending
+				WHERE pending.apply_id = a.id AND pending.state = ?
+			)
+			AND NOT EXISTS (
+				SELECT 1
+				FROM apply_operations active
+				WHERE active.apply_id = a.id
+					AND active.state IN (%s)
+			)
+		ORDER BY a.created_at
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED
+	`, applyColumns, parentStatePlaceholders, activeOpStatePlaceholders), queryArgs...)
+
+	apply, err := scanApplyInto(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // nothing to reconcile
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query next apply for stop reconciliation: %w", err)
+	}
+
+	// persistApplyClaim rotates the lease: an active apply just refreshes its
+	// heartbeat, while a pending apply transitions to running for the claim (no
+	// stopped apply reaches this path — terminal states are excluded above — so
+	// claimAcquiredCommitted, the stopped-only outcome, cannot occur and the
+	// caller always commits an acquired claim).
+	outcome, err := persistApplyClaim(ctx, s.db, tx, apply, owner)
+	if err != nil {
+		return nil, err
+	}
+	if outcome != claimAcquired {
+		return nil, nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claim apply %d (%s) for stop reconciliation: %w", apply.ID, apply.ApplyIdentifier, err)
+	}
+
+	return apply, nil
+}
+
 // claimOutcome describes how persistApplyClaim resolved a claim attempt and
 // who owns committing the transaction.
 type claimOutcome int

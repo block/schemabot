@@ -569,6 +569,12 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // continuation; the apply's pass/fail verdict and the merge gate stay
 // fail-closed on any failed deployment.
 //
+// A pending stop control request layers a hard halt on top: while a stop is
+// pending for the apply, no pending sibling is claimable for start, regardless
+// of cutover_policy or on_failure. This is what makes `stop` halt remaining
+// siblings under "continue" — without it a continue-exempted pending sibling
+// would still be started after the user asked to stop.
+//
 // The gate applies only to starting a pending row; an already-active row
 // re-leasing a stale heartbeat is recovering work it already started, so it
 // is never re-gated. While the operator flag is off and the single-deployment
@@ -617,6 +623,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		storage.OnFailureContinue,
 		state.ApplyOperation.Failed,
 	)
+	// Pending stop gate: a pending operation is not claimable for start while
+	// its apply has a pending stop control request. This is what makes `stop`
+	// halt remaining siblings under on_failure "continue" — without it, a
+	// continue-exempted pending sibling would still be claimed and started even
+	// though the user asked to stop the rollout. The gate covers only pending
+	// (not-yet-started) rows; an already-active row re-leasing a stale heartbeat
+	// is recovering work it started and is handled by the staleness clause below.
+	queryArgs = append(queryArgs,
+		storage.ControlOperationStop, storage.ControlRequestPending)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
@@ -689,6 +704,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						)
 						AND NOT (apply_operations.on_failure = ? AND earlier.state = ?)
 				)
+				AND NOT EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation = ?
+						AND cr.status = ?
+				)
 			)
 			OR (state IN (%s) AND updated_at < NOW() - INTERVAL %s)
 			OR (
@@ -759,13 +781,22 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		// Pending → running: stamp started_at, rotate the lease, and update the
 		// heartbeat in the same write. WHERE state = ? guards against a concurrent
 		// transition landing between the SELECT and this UPDATE; RowsAffected == 0
-		// means another writer already moved the row, so we back off cleanly.
+		// means another writer already moved the row, so we back off cleanly. The
+		// NOT EXISTS stop guard mirrors the SELECT's pending-stop gate so a stop
+		// request committed between the SELECT and this UPDATE still wins — the
+		// pending sibling is not started once a stop is pending.
 		result, err := tx.ExecContext(ctx, `
 			UPDATE apply_operations
 			SET state = ?, started_at = COALESCE(started_at, NOW()), updated_at = NOW(),
 			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
 			WHERE id = ? AND state = ?
-		`, state.ApplyOperation.Running, owner, leaseToken, ad.ID, state.ApplyOperation.Pending)
+				AND NOT EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ?
+				)
+		`, state.ApplyOperation.Running, owner, leaseToken, ad.ID, state.ApplyOperation.Pending,
+			ad.ApplyID, storage.ControlOperationStop, storage.ControlRequestPending)
 		if err != nil {
 			return nil, fmt.Errorf("claim pending apply_operation %d: %w", ad.ID, err)
 		}
@@ -856,6 +887,63 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 		}
 	}
 	return nil
+}
+
+// MarkPendingStoppedByApply transitions every still-pending operation of an
+// apply to stopped, returning the number of rows changed. It is the operator's
+// stop-reconciliation primitive: once a stop is pending the claim gate keeps
+// pending siblings from ever starting, so they must be terminalized here or the
+// apply would strand non-terminal under on_failure "continue" — a failed sibling
+// holds the projection running while the pending siblings never settle.
+//
+// Only pending rows are touched, never running or terminal: an in-flight
+// operation is left for its own driver (which observes the stop through the
+// engine) and an already-terminal operation keeps its recorded result. stopped
+// is resumable, so completed_at is left nil to match the apply-level convention.
+// Writes are apply-lease guarded when a lease is present in ctx, mirroring
+// DeleteByApply.
+func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error) {
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return 0, err
+	}
+	if !hasLease {
+		result, err := s.db.ExecContext(ctx, `
+			UPDATE apply_operations
+			SET state = ?, updated_at = NOW()
+			WHERE apply_id = ? AND state = ?
+		`, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending)
+		if err != nil {
+			return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
+		}
+		return rows, nil
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations ao
+		JOIN applies a ON a.id = ao.apply_id
+		SET ao.state = ?, ao.updated_at = NOW()
+		WHERE ao.apply_id = ? AND ao.state = ? AND a.lease_token = ?
+	`, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, lease.Token)
+	if err != nil {
+		return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
+	}
+	if rows == 0 {
+		// No pending rows changed: either there were none (lease still valid, a
+		// legitimate no-op) or the lease token no longer matches (ownership lost).
+		// Distinguish the two so a displaced worker fails closed.
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return 0, err
+		}
+	}
+	return rows, nil
 }
 
 // scanApplyOperation scans a single apply_operations row, returning nil if not found.

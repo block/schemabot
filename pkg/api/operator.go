@@ -184,6 +184,13 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 	owner := operatorLeaseOwner(workerID)
 
 	if s.config.OperatorClaimOperations {
+		// Service a pending stop with no claimable operation to carry it before
+		// claiming new operation work, so a queued stop wins over starting more
+		// deployments. When nothing needs stop reconciliation this is a cheap
+		// no-op and the worker falls through to the normal operation claim.
+		if s.recoverApplyPendingStop(ctx, workerID, owner) {
+			return
+		}
 		s.recoverApplyOperation(ctx, workerID, owner)
 		return
 	}
@@ -369,6 +376,19 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
+	// If a stop is pending, terminalize any still-pending sibling operations to
+	// stopped before deriving the parent. The claim gate keeps those siblings
+	// from ever starting, so under on_failure "continue" a failed sibling would
+	// otherwise hold the projection running with pending siblings that never
+	// settle — stranding the apply. Stopping them lets the derivation below reach
+	// a terminal verdict so the rollout (and the stop request) can resolve.
+	if err := s.stopPendingOperationsForPendingStop(applyLeaseCtx, workerID, apply); err != nil {
+		s.logger.Error("operator: failed to stop pending sibling operations for pending stop request; derived apply state not updated",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+		return
+	}
+
 	// Reload the parent apply so updateApplyStateFromOperations below re-derives
 	// the parent from its children against the durable apply.State (its
 	// terminal-to-non-terminal guard), not the in-memory object the resume path
@@ -399,6 +419,150 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
 		return
 	}
+
+	// If the derived state above settled the apply terminally and a stop is still
+	// pending, complete it now so the request does not linger after the rollout
+	// has stopped.
+	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, workerID, finalApply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending stop request for resolved apply",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
+		return
+	}
+}
+
+// recoverApplyPendingStop drives stop reconciliation for an apply that has a
+// pending stop request but no claimable operation to carry it. Under on_failure
+// "continue" a failed earlier sibling can leave an apply with only terminal and
+// pending operations; the claim gate keeps the pending ones from starting, so
+// the normal operation-claim path never visits the apply and its stop would
+// strand forever. This path claims such an apply directly, stops its pending
+// siblings, re-derives the parent, and completes the stop once the apply is
+// terminal.
+//
+// Returns true when this tick is consumed by stop reconciliation — an apply was
+// claimed (whether the reconciliation that followed succeeded or hit an error)
+// or the claim itself errored or returned an invalid lease — so the caller does
+// not also run the normal operation claim this tick. Returns false only when no
+// apply needed reconciliation.
+func (s *Service) recoverApplyPendingStop(ctx context.Context, workerID int, owner string) bool {
+	apply, err := s.storage.Applies().FindNextApplyForStopReconciliation(ctx, owner)
+	if err != nil {
+		s.logger.Error("operator: failed to claim apply for stop reconciliation",
+			"worker", workerID, "lease_owner", owner, "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "stop_reconciliation_claim_error")
+		return true
+	}
+	if apply == nil {
+		s.logger.Debug("operator: no apply needs stop reconciliation", "worker", workerID)
+		return false
+	}
+
+	lease := apply.Lease()
+	if !lease.Valid() {
+		s.logger.Error("operator: claimed apply for stop reconciliation without a valid lease token; skipping",
+			"worker", workerID, "lease_owner", owner,
+			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment)
+		metrics.RecordOperatorClaimFailure(ctx, "stop_reconciliation_missing_lease_token")
+		return true
+	}
+	applyLeaseCtx := storage.WithApplyLease(ctx, lease)
+
+	if err := s.stopPendingOperationsForPendingStop(applyLeaseCtx, workerID, apply); err != nil {
+		s.logger.Error("operator: failed to stop pending sibling operations during stop reconciliation",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment, "error", err)
+		return true
+	}
+
+	finalApply, err := s.storage.Applies().Get(applyLeaseCtx, apply.ID)
+	if err != nil {
+		s.logger.Error("operator: failed to reload apply during stop reconciliation; derived apply state not updated",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment, "error", err)
+		return true
+	}
+	if finalApply == nil {
+		s.logger.Error("operator: apply not found during stop reconciliation; derived apply state not updated",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment)
+		return true
+	}
+
+	if err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply); err != nil {
+		s.logger.Error("operator: failed to update derived apply state during stop reconciliation",
+			"worker", workerID, "apply_id", finalApply.ApplyIdentifier,
+			"database", finalApply.Database, "environment", finalApply.Environment, "error", err)
+		return true
+	}
+
+	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, workerID, finalApply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending stop request after stop reconciliation",
+			"worker", workerID, "apply_id", finalApply.ApplyIdentifier,
+			"database", finalApply.Database, "environment", finalApply.Environment, "error", err)
+		return true
+	}
+	return true
+}
+
+// stopPendingOperationsForPendingStop terminalizes still-pending sibling
+// operations to stopped when the apply has a pending stop request, so the
+// rollout can settle instead of stranding running with siblings the claim gate
+// keeps from ever starting. No-op when no stop is pending.
+func (s *Service) stopPendingOperationsForPendingStop(ctx context.Context, workerID int, apply *storage.Apply) error {
+	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	if err != nil {
+		return fmt.Errorf("load pending stop request for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if controlReq == nil {
+		return nil
+	}
+
+	stopped, err := s.storage.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("stop pending apply_operations for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if stopped > 0 {
+		s.logger.Info("operator: stopped pending sibling operations for pending stop request",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment,
+			"stopped_operation_count", stopped)
+	}
+	return nil
+}
+
+// completePendingStopIfApplyResolved completes a pending stop control request
+// once the apply has settled to a terminal state, so the request does not stay
+// pending forever after the rollout stops. The apply is reloaded because the
+// derived-state write operates on a copy and does not mutate the caller's row.
+// No-op when the apply is still non-terminal or no stop is pending.
+func (s *Service) completePendingStopIfApplyResolved(ctx context.Context, workerID int, applyID int64) error {
+	apply, err := s.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		return fmt.Errorf("reload apply %d before completing pending stop: %w", applyID, err)
+	}
+	if apply == nil {
+		return fmt.Errorf("reload apply %d before completing pending stop: %w", applyID, storage.ErrApplyNotFound)
+	}
+	if !state.IsTerminalApplyState(apply.State) {
+		return nil
+	}
+
+	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	if err != nil {
+		return fmt.Errorf("load pending stop request for resolved apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if controlReq == nil {
+		return nil
+	}
+
+	if err := s.storage.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
+		return fmt.Errorf("complete pending stop request for resolved apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	s.logger.Info("operator: completed pending stop request for resolved apply",
+		"worker", workerID, "apply_id", apply.ApplyIdentifier,
+		"database", apply.Database, "environment", apply.Environment, "state", apply.State)
+	return nil
 }
 
 // reconcileUnclaimableParent handles a claimed operation whose parent apply
