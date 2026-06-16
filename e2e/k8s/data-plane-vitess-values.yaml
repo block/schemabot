@@ -1,0 +1,54 @@
+# Data plane Helm values for the vitess-resolver k8s e2e.
+#
+# Resolves the opaque target through Etre to a PlanetScale organization, then
+# drives the schema change through the PlanetScale API (LocalScale). The token
+# secret is a PlanetScale token JSON decoded by the secret_ref backend; the
+# organization comes from the resolved entity, not the secret.
+
+image:
+  repository: schemabot
+  tag: test
+  pullPolicy: Never
+
+replicaCount: 2
+
+grpc:
+  enabled: true
+  port: 13370
+
+config:
+  storage:
+    dsn: "env:MYSQL_DSN"
+  target_resolver:
+    etre:
+      addr: "http://etre:8080"
+      database_type: vitess
+      entity_type: planetscale_database
+      target_label: dsid
+      env_label: env
+      vitess:
+        organization_attribute: organization
+        api_url: "http://localscale:8080"
+      credentials:
+        type: secret_ref
+        password_ref: "env:PS_TOKEN"
+
+env:
+  - name: MYSQL_DSN
+    value: "root:testpassword@tcp(mysql-data-plane:3306)/tern?parseTime=true&multiStatements=true"
+  # PlanetScale token secret in JSON form. LocalScale does not validate the
+  # token; the "name=value" form decodes to token_name/token_value.
+  - name: PS_TOKEN
+    value: '{"token":"localscale=localscale"}'
+  - name: TERN_ENVIRONMENT
+    value: "staging"
+  - name: LOG_LEVEL
+    value: "debug"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi

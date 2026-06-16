@@ -413,6 +413,9 @@ test-e2e-k8s: ## Run k8s e2e tests on minikube
 test-e2e-k8s-etre: ## Run the etre-resolver k8s e2e on minikube
 	@e2e/k8s/e2e-etre-test.sh
 
+test-e2e-k8s-vitess: ## Run the vitess-resolver k8s e2e on minikube
+	@e2e/k8s/e2e-vitess-test.sh
+
 # Start local dev environment with gRPC backend (separate Tern server)
 up-grpc:
 	docker compose -f deploy/local/docker-compose.grpc.yml up --build

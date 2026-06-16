@@ -1,0 +1,9 @@
+[
+  {
+    "name": "testapp-vitess",
+    "app": "testapp",
+    "dsid": "dsid-testapp-vitess-staging",
+    "env": "staging",
+    "organization": "localscale-staging"
+  }
+]

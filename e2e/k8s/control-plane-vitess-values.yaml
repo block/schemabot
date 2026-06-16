@@ -1,0 +1,39 @@
+# Control plane Helm values for the vitess-resolver k8s e2e.
+#
+# Routes the testapp-vitess database to the vitess data plane over gRPC,
+# carrying the opaque target (a DSID) the data plane resolves through Etre to a
+# PlanetScale organization.
+
+image:
+  repository: schemabot
+  tag: test
+  pullPolicy: Never
+
+config:
+  storage:
+    dsn: "env:MYSQL_DSN"
+  databases:
+    testapp-vitess:
+      type: vitess
+      environments:
+        staging:
+          # Opaque execution target — the DSID the data plane resolves via Etre.
+          target: dsid-testapp-vitess-staging
+          deployment: data-plane-vitess
+  tern_deployments:
+    data-plane-vitess:
+      staging: "data-plane-vitess-schemabot:13370"
+
+env:
+  - name: MYSQL_DSN
+    value: "root:testpassword@tcp(mysql-control-plane:3306)/schemabot?parseTime=true&multiStatements=true"
+  - name: LOG_LEVEL
+    value: "debug"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
