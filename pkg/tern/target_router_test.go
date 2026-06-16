@@ -81,6 +81,7 @@ type targetRouterRecordingClient struct {
 	progressReq        *ternv1.ProgressRequest
 	resumeApply        *storage.Apply
 	targetDSN          string
+	targetMetadata     map[string]string
 	pendingObserverSet bool
 	observerApplyID    int64
 	closed             bool
@@ -395,6 +396,63 @@ func TestTargetRouterFailsClosedOnIncompleteResolvedTarget(t *testing.T) {
 	assert.Empty(t, created, "no client should be created for an incomplete resolved target")
 }
 
+// A Vitess target reaches the database through the PlanetScale API, so it
+// carries connection details in metadata and has no DSN. Routing must accept it
+// and pass the metadata through to the client rather than rejecting the empty
+// DSN as incomplete.
+func TestTargetRouterAcceptsMetadataOnlyVitessTarget(t *testing.T) {
+	resolver := targetRouterResolverFunc(func(context.Context, inventory.Request) (*inventory.Target, error) {
+		return &inventory.Target{
+			Target:       "dsid-orders-vitess",
+			DatabaseType: storage.DatabaseTypeVitess,
+			Metadata: map[string]string{
+				inventory.MetadataOrganization: "acme",
+				inventory.MetadataTokenName:    "tok-id",
+				inventory.MetadataTokenValue:   "tok-secret",
+				inventory.MetadataAPIURL:       "https://localscale.test",
+			},
+		}, nil
+	})
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "dsid-orders-vitess", Type: storage.DatabaseTypeVitess})
+
+	require.NoError(t, err)
+	require.Len(t, created, 1, "the router should build a client for a metadata-only Vitess target")
+	client := created["orders"]
+	require.NotNil(t, client)
+	assert.Empty(t, client.targetDSN, "a Vitess client connects via metadata, not a DSN")
+	assert.Equal(t, "acme", client.targetMetadata[inventory.MetadataOrganization])
+	assert.Equal(t, "tok-secret", client.targetMetadata[inventory.MetadataTokenValue])
+}
+
+// A Vitess target missing its PlanetScale metadata cannot open a connection, so
+// routing must fail closed with the missing field rather than building a client
+// that errors confusingly on first API call.
+func TestTargetRouterFailsClosedOnVitessTargetMissingMetadata(t *testing.T) {
+	resolver := targetRouterResolverFunc(func(context.Context, inventory.Request) (*inventory.Target, error) {
+		return &inventory.Target{
+			Target:       "dsid-orders-vitess",
+			DatabaseType: storage.DatabaseTypeVitess,
+			Metadata: map[string]string{
+				inventory.MetadataOrganization: "acme",
+				inventory.MetadataTokenName:    "tok-id",
+				inventory.MetadataAPIURL:       "https://localscale.test",
+			},
+		}, nil
+	})
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "dsid-orders-vitess", Type: storage.DatabaseTypeVitess})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "incomplete target")
+	assert.Contains(t, err.Error(), inventory.MetadataTokenValue)
+	assert.Empty(t, created, "no client should be created for an incomplete Vitess target")
+}
+
 func TestTargetRouterCloseClosesCachedClients(t *testing.T) {
 	resolver := newStaticResolver(t)
 	created := make(map[string]*targetRouterRecordingClient)
@@ -429,7 +487,7 @@ func newTargetRouterForTest(t *testing.T, resolver inventory.Resolver, applyStor
 		Storage:  targetRouterStorage{applies: applyStore, plans: planStore},
 		Logger:   slog.Default(),
 		LocalClientFactory: func(cfg LocalConfig, _ storage.Storage, _ *slog.Logger) (Client, error) {
-			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN}
+			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN, targetMetadata: cfg.Metadata}
 			key := cfg.Database
 			if existing := created[key]; existing != nil {
 				key = fmt.Sprintf("%s#%d", cfg.Database, len(created)+1)
