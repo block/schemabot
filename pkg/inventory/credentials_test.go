@@ -44,3 +44,18 @@ func TestSecretRefCredentialResolverRejectsEmptyResolvedPassword(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "empty value")
 }
+
+// With a Decode set, the resolved secret is interpreted by the decoder — here a
+// PlanetScale token — rather than used directly as the password.
+func TestSecretRefCredentialResolverDecodes(t *testing.T) {
+	r := SecretRefCredentialResolver{
+		PasswordRef: `{"token":"tok-id=tok-secret"}`,
+		Decode:      DecodePlanetScaleSecret,
+	}
+
+	creds, err := r.ResolveCredentials(t.Context(), Request{Target: "orders-dsid"}, nil)
+	require.NoError(t, err)
+	assert.Empty(t, creds.Password)
+	assert.Equal(t, "tok-id", creds.Metadata[MetadataTokenName])
+	assert.Equal(t, "tok-secret", creds.Metadata[MetadataTokenValue])
+}

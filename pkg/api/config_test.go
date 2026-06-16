@@ -274,10 +274,11 @@ func TestServerConfig_Validate(t *testing.T) {
 			cfg: ServerConfig{
 				TargetResolver: TargetResolverConfig{
 					Etre: EtreConfig{
-						Addr:        "http://etre:8080",
-						EntityType:  "aurora_cluster",
-						TargetLabel: "dsid",
-						HostField:   "writer_endpoint",
+						Addr:         "http://etre:8080",
+						DatabaseType: storage.DatabaseTypeMySQL,
+						EntityType:   "aurora_cluster",
+						TargetLabel:  "dsid",
+						MySQL:        EtreMySQLConfig{HostField: "writer_endpoint"},
 						Credentials: EtreCredentialsConfig{
 							Username:    "spirit",
 							PasswordRef: "env:DDL_PASSWORD",

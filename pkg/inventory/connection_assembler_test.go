@@ -177,3 +177,51 @@ func TestVitessConnectionAssemblerRequiresToken(t *testing.T) {
 func TestVitessConnectionAssemblerDatabaseType(t *testing.T) {
 	assert.Equal(t, "vitess", VitessConnectionAssembler{}.DatabaseType())
 }
+
+// A per-target API URL carried in the credential metadata overrides the
+// assembler's configured default.
+func TestVitessConnectionAssemblerSecretAPIURLOverridesConfig(t *testing.T) {
+	a := VitessConnectionAssembler{APIURL: "https://configured.example"}
+
+	_, meta, err := a.Assemble(
+		"",
+		map[string]string{MetadataOrganization: "acme"},
+		&Credentials{Metadata: map[string]string{
+			MetadataTokenName:  "id",
+			MetadataTokenValue: "secret",
+			MetadataAPIURL:     "https://from-secret.example",
+		}},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "https://from-secret.example", meta[MetadataAPIURL])
+}
+
+// The PlanetScale secret decoder splits the "name=value" token and surfaces the
+// optional API URL, leaving organization to the inventory entity.
+func TestDecodePlanetScaleSecret(t *testing.T) {
+	creds, err := DecodePlanetScaleSecret(`{"token":"tok-id=tok-secret","api_url":"https://localscale.test"}`)
+	require.NoError(t, err)
+	assert.Empty(t, creds.Username)
+	assert.Empty(t, creds.Password)
+	assert.Equal(t, "tok-id", creds.Metadata[MetadataTokenName])
+	assert.Equal(t, "tok-secret", creds.Metadata[MetadataTokenValue])
+	assert.Equal(t, "https://localscale.test", creds.Metadata[MetadataAPIURL])
+	assert.NotContains(t, creds.Metadata, MetadataOrganization, "organization comes from the entity, not the secret")
+}
+
+func TestDecodePlanetScaleSecretOptionalAPIURL(t *testing.T) {
+	creds, err := DecodePlanetScaleSecret(`{"token":"tok-id=tok-secret"}`)
+	require.NoError(t, err)
+	assert.Equal(t, "tok-id", creds.Metadata[MetadataTokenName])
+	assert.NotContains(t, creds.Metadata, MetadataAPIURL, "api_url is optional in the secret")
+}
+
+func TestDecodePlanetScaleSecretRejectsBadInput(t *testing.T) {
+	_, err := DecodePlanetScaleSecret("not-json")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "JSON")
+
+	_, err = DecodePlanetScaleSecret(`{"token":"missing-separator"}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "name=value")
+}

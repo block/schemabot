@@ -28,7 +28,7 @@ func (f *fakeFetcher) FetchSecret(_ context.Context, accountID, secretName strin
 
 func TestResolverReadsJSONSecretForTargetAccount(t *testing.T) {
 	fetch := &fakeFetcher{payload: `{"username":"spirit","password":"s3cret"}`}
-	r := newResolver("aws_account_id", "ods-rds-spirit-password", fetch)
+	r := newResolver("aws_account_id", "ods-rds-spirit-password", fetch, nil)
 
 	creds, err := r.ResolveCredentials(t.Context(),
 		inventory.Request{Target: "orders-dsid"},
@@ -44,7 +44,7 @@ func TestResolverReadsJSONSecretForTargetAccount(t *testing.T) {
 // The secret name may carry a {target} placeholder for per-target secrets.
 func TestResolverTemplatesSecretNameByTarget(t *testing.T) {
 	fetch := &fakeFetcher{payload: `{"username":"ddl","password":"pw"}`}
-	r := newResolver("aws_account_id", "schemabot/{target}/ddl", fetch)
+	r := newResolver("aws_account_id", "schemabot/{target}/ddl", fetch, nil)
 
 	_, err := r.ResolveCredentials(t.Context(),
 		inventory.Request{Target: "orders-dsid"},
@@ -54,7 +54,7 @@ func TestResolverTemplatesSecretNameByTarget(t *testing.T) {
 }
 
 func TestResolverFailsWhenAccountAttributeMissing(t *testing.T) {
-	r := newResolver("aws_account_id", "secret", &fakeFetcher{payload: `{"username":"u","password":"p"}`})
+	r := newResolver("aws_account_id", "secret", &fakeFetcher{payload: `{"username":"u","password":"p"}`}, nil)
 
 	_, err := r.ResolveCredentials(t.Context(), inventory.Request{Target: "orders-dsid"}, nil)
 	require.Error(t, err)
@@ -62,7 +62,7 @@ func TestResolverFailsWhenAccountAttributeMissing(t *testing.T) {
 }
 
 func TestResolverPropagatesFetchError(t *testing.T) {
-	r := newResolver("aws_account_id", "secret", &fakeFetcher{err: fmt.Errorf("access denied")})
+	r := newResolver("aws_account_id", "secret", &fakeFetcher{err: fmt.Errorf("access denied")}, nil)
 
 	_, err := r.ResolveCredentials(t.Context(),
 		inventory.Request{Target: "orders-dsid"},
@@ -72,7 +72,7 @@ func TestResolverPropagatesFetchError(t *testing.T) {
 }
 
 func TestResolverFailsOnNonJSONSecret(t *testing.T) {
-	r := newResolver("aws_account_id", "secret", &fakeFetcher{payload: "not-json"})
+	r := newResolver("aws_account_id", "secret", &fakeFetcher{payload: "not-json"}, nil)
 
 	_, err := r.ResolveCredentials(t.Context(),
 		inventory.Request{Target: "orders-dsid"},
@@ -82,13 +82,29 @@ func TestResolverFailsOnNonJSONSecret(t *testing.T) {
 }
 
 func TestResolverFailsOnIncompleteSecret(t *testing.T) {
-	r := newResolver("aws_account_id", "secret", &fakeFetcher{payload: `{"username":"spirit"}`})
+	r := newResolver("aws_account_id", "secret", &fakeFetcher{payload: `{"username":"spirit"}`}, nil)
 
 	_, err := r.ResolveCredentials(t.Context(),
 		inventory.Request{Target: "orders-dsid"},
 		map[string]string{"aws_account_id": "123456789012"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing a username or password")
+}
+
+// With a Decode set, the resolver interprets the fetched secret with that
+// decoder instead of the default {username, password} parse — for example a
+// PlanetScale token read through the same assume-role path.
+func TestResolverUsesDecoder(t *testing.T) {
+	fetch := &fakeFetcher{payload: `{"token":"tok-id=tok-secret"}`}
+	r := newResolver("aws_account_id", "secret", fetch, inventory.DecodePlanetScaleSecret)
+
+	creds, err := r.ResolveCredentials(t.Context(),
+		inventory.Request{Target: "orders-dsid"},
+		map[string]string{"aws_account_id": "123456789012"})
+	require.NoError(t, err)
+	assert.Empty(t, creds.Username, "a PlanetScale credential carries no username")
+	assert.Equal(t, "tok-id", creds.Metadata["token_name"])
+	assert.Equal(t, "tok-secret", creds.Metadata["token_value"])
 }
 
 func TestNewValidatesConfig(t *testing.T) {

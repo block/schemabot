@@ -45,11 +45,12 @@ func TestBuildGRPCTernClientRoutesViaEtreResolver(t *testing.T) {
 	config := &api.ServerConfig{
 		TargetResolver: api.TargetResolverConfig{
 			Etre: api.EtreConfig{
-				Addr:        "https://etre.example",
-				EntityType:  "cluster",
-				TargetLabel: "dsid",
-				HostField:   "writer_endpoint",
-				Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+				Addr:         "https://etre.example",
+				DatabaseType: storage.DatabaseTypeMySQL,
+				EntityType:   "cluster",
+				TargetLabel:  "dsid",
+				MySQL:        api.EtreMySQLConfig{HostField: "writer_endpoint"},
+				Credentials:  api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
 			},
 		},
 	}
@@ -67,10 +68,11 @@ func TestBuildGRPCTernClientRoutesViaEtreWithAWSSMCredentials(t *testing.T) {
 	config := &api.ServerConfig{
 		TargetResolver: api.TargetResolverConfig{
 			Etre: api.EtreConfig{
-				Addr:        "https://etre.example",
-				EntityType:  "cluster",
-				TargetLabel: "dsid",
-				HostField:   "writer_endpoint",
+				Addr:         "https://etre.example",
+				DatabaseType: storage.DatabaseTypeMySQL,
+				EntityType:   "cluster",
+				TargetLabel:  "dsid",
+				MySQL:        api.EtreMySQLConfig{HostField: "writer_endpoint"},
 				Credentials: api.EtreCredentialsConfig{
 					Type:       "awssm",
 					Region:     "us-west-2",
@@ -91,7 +93,8 @@ func TestBuildGRPCTernClientRoutesViaEtreWithAWSSMCredentials(t *testing.T) {
 func TestBuildEtreResolverRejectsUnknownCredentialType(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	cfg := api.EtreConfig{
-		Addr: "https://etre.example", EntityType: "cluster", TargetLabel: "dsid", HostField: "writer_endpoint",
+		Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeMySQL, EntityType: "cluster", TargetLabel: "dsid",
+		MySQL:       api.EtreMySQLConfig{HostField: "writer_endpoint"},
 		Credentials: api.EtreCredentialsConfig{Type: "vault"},
 	}
 
@@ -110,7 +113,7 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 		SecretName: "{target}_ddl_password",
 	}
 
-	_, err := buildCredentialResolver(t.Context(), base)
+	_, err := buildCredentialResolver(t.Context(), base, nil)
 	require.NoError(t, err)
 
 	cases := map[string]func(*api.EtreCredentialsConfig){
@@ -121,7 +124,7 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 	for field, mutate := range cases {
 		cfg := base
 		mutate(&cfg)
-		_, err := buildCredentialResolver(t.Context(), cfg)
+		_, err := buildCredentialResolver(t.Context(), cfg, nil)
 		require.Error(t, err, field)
 		assert.Contains(t, err.Error(), field)
 	}
@@ -134,18 +137,74 @@ func TestCredentialAttributeFieldsIncludesAccountAttribute(t *testing.T) {
 		AttributeFields: []string{"region"},
 		Credentials:     api.EtreCredentialsConfig{Type: "awssm"},
 	}
-	assert.Equal(t, []string{"region", "aws_account_id"}, credentialAttributeFields(withDefault))
+	assert.Equal(t, []string{"region", "aws_account_id"}, resolverAttributeFields(withDefault))
 
 	custom := api.EtreConfig{
 		Credentials: api.EtreCredentialsConfig{Type: "awssm", AccountAttribute: "account"},
 	}
-	assert.Equal(t, []string{"account"}, credentialAttributeFields(custom))
+	assert.Equal(t, []string{"account"}, resolverAttributeFields(custom))
 
 	secretRef := api.EtreConfig{
 		AttributeFields: []string{"region"},
 		Credentials:     api.EtreCredentialsConfig{Type: "secret_ref"},
 	}
-	assert.Equal(t, []string{"region"}, credentialAttributeFields(secretRef))
+	assert.Equal(t, []string{"region"}, resolverAttributeFields(secretRef))
+}
+
+// A Vitess Etre resolver assembles PlanetScale API metadata, so it needs no
+// host_field and no credential username — the token secret carries the
+// credential. Startup wiring accepts this shape.
+func TestBuildEtreResolverVitess(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := api.EtreConfig{
+		Addr:         "https://etre.example",
+		DatabaseType: storage.DatabaseTypeVitess,
+		EntityType:   "planetscale_database",
+		TargetLabel:  "dsid",
+		EnvLabel:     "env",
+		Vitess:       api.EtreVitessConfig{APIURL: "https://api.planetscale.test"},
+		Credentials:  api.EtreCredentialsConfig{Type: "secret_ref", PasswordRef: `{"token":"id=value"}`},
+	}
+
+	resolver, err := buildEtreResolver(t.Context(), cfg, logger)
+	require.NoError(t, err)
+	require.NotNil(t, resolver)
+
+	// A Vitess resolver still requires the password ref that carries the token.
+	noToken := cfg
+	noToken.Credentials.PasswordRef = ""
+	_, err = buildEtreResolver(t.Context(), noToken, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "password_ref")
+}
+
+// An unsupported database_type fails closed at startup rather than silently
+// resolving as MySQL, so adding an engine (postgres, strata) is a deliberate
+// change at the assembler-selection site.
+func TestBuildEtreResolverRejectsUnsupportedEngine(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := api.EtreConfig{
+		Addr:         "https://etre.example",
+		DatabaseType: "postgres",
+		EntityType:   "pg_cluster",
+		TargetLabel:  "dsid",
+		Credentials:  api.EtreCredentialsConfig{Type: "secret_ref", Username: "ddl", PasswordRef: "env:PW"},
+	}
+
+	_, err := buildEtreResolver(t.Context(), cfg, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "postgres")
+	assert.Contains(t, err.Error(), "not supported")
+}
+
+// The Vitess organization attribute is surfaced to the resolver so the assembler
+// can read it, even when not listed in attribute_fields.
+func TestResolverAttributeFieldsIncludesOrganization(t *testing.T) {
+	defaultOrg := api.EtreConfig{DatabaseType: storage.DatabaseTypeVitess}
+	assert.Equal(t, []string{"organization"}, resolverAttributeFields(defaultOrg))
+
+	customOrg := api.EtreConfig{DatabaseType: storage.DatabaseTypeVitess, Vitess: api.EtreVitessConfig{OrganizationAttribute: "ps_org"}}
+	assert.Equal(t, []string{"ps_org"}, resolverAttributeFields(customOrg))
 }
 
 // Configuring both the Etre resolver and static targets is ambiguous until
@@ -160,7 +219,7 @@ func TestBuildGRPCTernClientErrorsWhenEtreAndStaticBothConfigured(t *testing.T) 
 			},
 			Etre: api.EtreConfig{
 				Addr: "https://etre.example", EntityType: "cluster", TargetLabel: "dsid",
-				HostField: "writer_endpoint", Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+				MySQL: api.EtreMySQLConfig{HostField: "writer_endpoint"}, Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
 			},
 		},
 	}
@@ -175,15 +234,15 @@ func TestBuildGRPCTernClientErrorsWhenEtreAndStaticBothConfigured(t *testing.T) 
 func TestBuildEtreResolverValidatesConfig(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	base := api.EtreConfig{
-		Addr: "https://etre.example", EntityType: "cluster", TargetLabel: "dsid",
-		HostField: "writer_endpoint", Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+		Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeMySQL, EntityType: "cluster", TargetLabel: "dsid",
+		MySQL: api.EtreMySQLConfig{HostField: "writer_endpoint"}, Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
 	}
 
 	_, err := buildEtreResolver(t.Context(), base, logger)
 	require.NoError(t, err)
 
 	noHost := base
-	noHost.HostField = ""
+	noHost.MySQL.HostField = ""
 	_, err = buildEtreResolver(t.Context(), noHost, logger)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "host_field")

@@ -394,14 +394,19 @@ func (c TargetResolverConfig) StaticInventory() inventory.StaticConfig {
 	return inventory.StaticConfig{Targets: c.Targets}
 }
 
-// EtreConfig configures the data-plane MySQL resolver backed by Etre: the Etre
-// lookup that maps an opaque target to a cluster endpoint, plus the credentials
-// for the assembled connection. It is the common-path dynamic resolver;
-// additional engines and per-target overrides layer on without reshaping it.
+// EtreConfig configures the data-plane resolver backed by Etre: the Etre lookup
+// that maps an opaque target to a cluster endpoint, plus the credentials for the
+// assembled connection. It is the common-path dynamic resolver; the engine is
+// selected by DatabaseType, and engine-specific knobs live in a per-engine block
+// so the shared config carries no engine semantics.
 type EtreConfig struct {
 	// Addr is the Etre server address (supports secret refs, e.g. env:ETRE_ADDR).
 	Addr string `yaml:"addr"`
-	// EntityType is the Etre entity type recording MySQL clusters.
+	// DatabaseType selects the engine the resolver assembles connections for and
+	// is required (no implicit default): "mysql" reads the MySQL block; "vitess"
+	// reads the Vitess block.
+	DatabaseType string `yaml:"database_type"`
+	// EntityType is the Etre entity type recording the target clusters.
 	EntityType string `yaml:"entity_type"`
 	// TargetLabel is the Etre label the request's opaque target matches.
 	TargetLabel string `yaml:"target_label"`
@@ -409,14 +414,34 @@ type EtreConfig struct {
 	EnvLabel string `yaml:"env_label,omitempty"`
 	// Labels are fixed selector predicates added to every lookup (e.g. a region).
 	Labels map[string]string `yaml:"labels,omitempty"`
+	// AttributeFields are entity fields surfaced to the credential resolver.
+	AttributeFields []string `yaml:"attribute_fields,omitempty"`
+	// MySQL holds the MySQL engine knobs, read when DatabaseType is "mysql".
+	MySQL EtreMySQLConfig `yaml:"mysql,omitempty"`
+	// Vitess holds the Vitess engine knobs, read when DatabaseType is "vitess".
+	Vitess EtreVitessConfig `yaml:"vitess,omitempty"`
+	// Credentials configures the credentials for the connection.
+	Credentials EtreCredentialsConfig `yaml:"credentials"`
+}
+
+// EtreMySQLConfig holds the MySQL-specific knobs for an Etre resolver: how to
+// turn a resolved entity into a connection host.
+type EtreMySQLConfig struct {
 	// HostField is the entity field holding the connection host.
 	HostField string `yaml:"host_field"`
 	// DefaultPort is appended to the host when it has no port.
 	DefaultPort string `yaml:"default_port,omitempty"`
-	// AttributeFields are entity fields surfaced to the credential resolver.
-	AttributeFields []string `yaml:"attribute_fields,omitempty"`
-	// Credentials configures the username and password for the connection.
-	Credentials EtreCredentialsConfig `yaml:"credentials"`
+}
+
+// EtreVitessConfig holds the Vitess (PlanetScale) knobs for an Etre resolver:
+// how to find the organization and reach the PlanetScale-compatible API.
+type EtreVitessConfig struct {
+	// OrganizationAttribute is the entity field holding the PlanetScale
+	// organization. Defaults to "organization".
+	OrganizationAttribute string `yaml:"organization_attribute,omitempty"`
+	// APIURL is the PlanetScale-compatible API base URL; a per-target override in
+	// the credential secret takes precedence.
+	APIURL string `yaml:"api_url,omitempty"`
 }
 
 // EtreCredentialsConfig configures credentials for an Etre-resolved target.

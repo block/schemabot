@@ -1,9 +1,11 @@
 package inventory
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
 	"net"
+	"strings"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -95,8 +97,9 @@ type VitessConnectionAssembler struct {
 	// OrganizationAttribute is the endpoint attribute holding the PlanetScale
 	// organization. Defaults to "organization" when empty.
 	OrganizationAttribute string
-	// APIURL is the PlanetScale-compatible API base URL. Defaults to
-	// DefaultPlanetScaleAPIURL when empty.
+	// APIURL is the PlanetScale-compatible API base URL. A per-target override in
+	// the credential secret (api_url) takes precedence; this is the deployment
+	// default, itself falling back to DefaultPlanetScaleAPIURL when empty.
 	APIURL string
 	// Metadata is attached to every assembled target for engine-specific
 	// configuration the data plane reads, merged after the resolved fields.
@@ -128,16 +131,56 @@ func (a VitessConnectionAssembler) Assemble(_ string, attrs map[string]string, c
 	if tokenName == "" || tokenValue == "" {
 		return "", nil, fmt.Errorf("vitess connection requires %q and %q credentials", MetadataTokenName, MetadataTokenValue)
 	}
-	apiURL := a.APIURL
+	// A per-target API URL from the secret wins; otherwise the deployment default,
+	// then the public PlanetScale endpoint.
+	apiURL := creds.Metadata[MetadataAPIURL]
+	if apiURL == "" {
+		apiURL = a.APIURL
+	}
 	if apiURL == "" {
 		apiURL = DefaultPlanetScaleAPIURL
 	}
-	metadata := map[string]string{
-		MetadataOrganization: organization,
-		MetadataTokenName:    tokenName,
-		MetadataTokenValue:   tokenValue,
-		MetadataAPIURL:       apiURL,
+	// Configured Metadata supplies extra engine fields (for example main_branch)
+	// but must not override the resolved connection fields, so it is written
+	// first and the authoritative fields last.
+	metadata := maps.Clone(a.Metadata)
+	if metadata == nil {
+		metadata = make(map[string]string, 4)
 	}
-	maps.Copy(metadata, a.Metadata)
+	metadata[MetadataOrganization] = organization
+	metadata[MetadataTokenName] = tokenName
+	metadata[MetadataTokenValue] = tokenValue
+	metadata[MetadataAPIURL] = apiURL
 	return "", metadata, nil
+}
+
+// DecodePlanetScaleSecret decodes a PlanetScale credential secret into engine
+// metadata for a Vitess target. The secret is JSON carrying a service token in
+// "name=value" form and an optional API URL override:
+//
+//	{"token": "<id>=<value>", "api_url": "https://..."}
+//
+// The organization is not part of the secret — it comes from the inventory
+// entity. As a SecretDecoder it plugs into any credential backend that fetches
+// the raw secret (a reference, or an assumed-role Secrets Manager read).
+func DecodePlanetScaleSecret(raw string) (*Credentials, error) {
+	var secret struct {
+		Token  string `json:"token"`
+		APIURL string `json:"api_url"`
+	}
+	if err := json.Unmarshal([]byte(raw), &secret); err != nil {
+		return nil, fmt.Errorf("parse planetscale secret as JSON: %w", err)
+	}
+	tokenName, tokenValue, ok := strings.Cut(secret.Token, "=")
+	if !ok || tokenName == "" || tokenValue == "" {
+		return nil, fmt.Errorf(`planetscale secret "token" must be in "name=value" form`)
+	}
+	metadata := map[string]string{
+		MetadataTokenName:  tokenName,
+		MetadataTokenValue: tokenValue,
+	}
+	if secret.APIURL != "" {
+		metadata[MetadataAPIURL] = secret.APIURL
+	}
+	return &Credentials{Metadata: metadata}, nil
 }

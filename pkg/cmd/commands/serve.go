@@ -397,15 +397,16 @@ func buildTargetResolver(ctx context.Context, cfg api.TargetResolverConfig, logg
 	return resolver, nil
 }
 
-// buildEtreResolver assembles the Etre-backed MySQL resolver from config: the
-// Etre query client, the namespace-free MySQL connection assembler, and the
-// configured credential resolver. Lazily-validated fields (host, credentials)
-// are checked here so a misconfiguration fails at startup, not first request.
+// buildEtreResolver assembles the Etre-backed resolver from config: the Etre
+// query client, the engine-specific connection assembler, and the configured
+// credential resolver. Lazily-validated fields (host, credentials) are checked
+// here so a misconfiguration fails at startup, not first request.
 func buildEtreResolver(ctx context.Context, cfg api.EtreConfig, logger *slog.Logger) (inventory.Resolver, error) {
-	if cfg.HostField == "" {
-		return nil, fmt.Errorf("target_resolver.etre.host_field is required")
+	assembler, decode, err := etreAssembler(cfg)
+	if err != nil {
+		return nil, err
 	}
-	creds, err := buildCredentialResolver(ctx, cfg.Credentials)
+	creds, err := buildCredentialResolver(ctx, cfg.Credentials, decode)
 	if err != nil {
 		return nil, err
 	}
@@ -427,11 +428,35 @@ func buildEtreResolver(ctx context.Context, cfg api.EtreConfig, logger *slog.Log
 		TargetLabel:     cfg.TargetLabel,
 		Labels:          cfg.Labels,
 		EnvLabel:        cfg.EnvLabel,
-		HostField:       cfg.HostField,
-		AttributeFields: credentialAttributeFields(cfg),
+		HostField:       cfg.MySQL.HostField,
+		AttributeFields: resolverAttributeFields(cfg),
 		Credentials:     creds,
-		Assembler:       inventory.MySQLConnectionAssembler{DefaultPort: cfg.DefaultPort},
+		Assembler:       assembler,
 	})
+}
+
+// etreAssembler selects the engine-specific connection assembler for the
+// configured database type, plus the secret decoder that backend needs. MySQL
+// builds a namespace-free DSN from the host; Vitess assembles PlanetScale API
+// metadata and decodes a token secret rather than a username/password. A new
+// engine (postgres, strata) is a new case here; an unsupported type fails closed.
+func etreAssembler(cfg api.EtreConfig) (inventory.ConnectionAssembler, inventory.SecretDecoder, error) {
+	switch cfg.DatabaseType {
+	case "":
+		return nil, nil, fmt.Errorf("target_resolver.etre.database_type is required (%q or %q)", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess)
+	case storage.DatabaseTypeMySQL:
+		if cfg.MySQL.HostField == "" {
+			return nil, nil, fmt.Errorf("target_resolver.etre.mysql.host_field is required for the %q engine", storage.DatabaseTypeMySQL)
+		}
+		return inventory.MySQLConnectionAssembler{DefaultPort: cfg.MySQL.DefaultPort}, nil, nil
+	case storage.DatabaseTypeVitess:
+		return inventory.VitessConnectionAssembler{
+			OrganizationAttribute: cfg.Vitess.OrganizationAttribute,
+			APIURL:                cfg.Vitess.APIURL,
+		}, inventory.DecodePlanetScaleSecret, nil
+	default:
+		return nil, nil, fmt.Errorf("target_resolver.etre.database_type %q is not supported", cfg.DatabaseType)
+	}
 }
 
 const (
@@ -451,16 +476,19 @@ func credentialType(cfg api.EtreCredentialsConfig) string {
 // buildCredentialResolver builds the configured credential backend. Each backend
 // is one inventory.CredentialResolver implementation; the data plane is not
 // coupled to any single secret store.
-func buildCredentialResolver(ctx context.Context, cfg api.EtreCredentialsConfig) (inventory.CredentialResolver, error) {
+func buildCredentialResolver(ctx context.Context, cfg api.EtreCredentialsConfig, decode inventory.SecretDecoder) (inventory.CredentialResolver, error) {
 	switch credentialType(cfg) {
 	case credentialTypeSecretRef:
-		if cfg.Username == "" {
-			return nil, fmt.Errorf("target_resolver.etre.credentials.username is required")
-		}
 		if cfg.PasswordRef == "" {
 			return nil, fmt.Errorf("target_resolver.etre.credentials.password_ref is required")
 		}
-		return inventory.SecretRefCredentialResolver{Username: cfg.Username, PasswordRef: cfg.PasswordRef}, nil
+		// A decoder (for example a Vitess token) produces the full credential from
+		// the secret, so no separate username is configured; require a username
+		// only for the plain username + password form.
+		if decode == nil && cfg.Username == "" {
+			return nil, fmt.Errorf("target_resolver.etre.credentials.username is required")
+		}
+		return inventory.SecretRefCredentialResolver{Username: cfg.Username, PasswordRef: cfg.PasswordRef, Decode: decode}, nil
 
 	case credentialTypeAWSSM:
 		// Validate required fields with config-path context before loading AWS
@@ -485,6 +513,7 @@ func buildCredentialResolver(ctx context.Context, cfg api.EtreCredentialsConfig)
 			ExternalID:       cfg.ExternalID,
 			SecretName:       cfg.SecretName,
 			AccountAttribute: cfg.AccountAttribute,
+			Decode:           decode,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("build target_resolver.etre.credentials awssm resolver: %w", err)
@@ -496,22 +525,37 @@ func buildCredentialResolver(ctx context.Context, cfg api.EtreCredentialsConfig)
 	}
 }
 
-// credentialAttributeFields returns the entity attribute fields the resolver
-// must surface, ensuring the assume-role backend's account attribute is included
+// resolverAttributeFields returns the entity attribute fields the resolver must
+// surface so the assembler and credential backend can locate their inputs: the
+// Vitess organization attribute and the assume-role backend's account attribute,
 // alongside any explicitly configured fields.
-func credentialAttributeFields(cfg api.EtreConfig) []string {
-	fields := cfg.AttributeFields
-	if credentialType(cfg.Credentials) != credentialTypeAWSSM {
+func resolverAttributeFields(cfg api.EtreConfig) []string {
+	fields := append([]string(nil), cfg.AttributeFields...)
+	// Engines that resolve a connection attribute rather than a host surface it
+	// here. A new such engine adds a branch; host-based engines (mysql) add none.
+	if cfg.DatabaseType == storage.DatabaseTypeVitess {
+		orgAttr := cfg.Vitess.OrganizationAttribute
+		if orgAttr == "" {
+			orgAttr = inventory.MetadataOrganization
+		}
+		fields = ensureField(fields, orgAttr)
+	}
+	if credentialType(cfg.Credentials) == credentialTypeAWSSM {
+		accountAttr := cfg.Credentials.AccountAttribute
+		if accountAttr == "" {
+			accountAttr = "aws_account_id"
+		}
+		fields = ensureField(fields, accountAttr)
+	}
+	return fields
+}
+
+// ensureField appends field unless it is already present.
+func ensureField(fields []string, field string) []string {
+	if slices.Contains(fields, field) {
 		return fields
 	}
-	accountAttr := cfg.Credentials.AccountAttribute
-	if accountAttr == "" {
-		accountAttr = "aws_account_id"
-	}
-	if slices.Contains(fields, accountAttr) {
-		return fields
-	}
-	return append(append([]string(nil), fields...), accountAttr)
+	return append(fields, field)
 }
 
 // grpcLocalClientFactory returns a LocalClientFactory that applies server-level

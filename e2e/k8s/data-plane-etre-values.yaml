@@ -22,13 +22,15 @@ config:
   target_resolver:
     etre:
       addr: "http://etre:8080"
+      database_type: mysql
       entity_type: aurora_cluster
       target_label: dsid
       env_label: env
       labels:
         aws_region: us-east-1
-      host_field: writer_endpoint
-      default_port: "3306"
+      mysql:
+        host_field: writer_endpoint
+        default_port: "3306"
       credentials:
         type: awssm
         region: us-east-1

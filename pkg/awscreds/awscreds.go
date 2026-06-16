@@ -50,6 +50,10 @@ type Config struct {
 	// AccountAttribute is the endpoint attribute holding the target's AWS account
 	// id. Defaults to "aws_account_id".
 	AccountAttribute string
+	// Decode, when set, interprets the fetched secret into Credentials (for
+	// example a PlanetScale token). When nil the secret is parsed as a JSON
+	// {username, password} payload.
+	Decode inventory.SecretDecoder
 }
 
 // Resolver resolves credentials from Secrets Manager via per-account assumed
@@ -58,6 +62,7 @@ type Resolver struct {
 	accountAttr string
 	secretName  string
 	fetch       secretFetcher
+	decode      inventory.SecretDecoder
 }
 
 var _ inventory.CredentialResolver = (*Resolver)(nil)
@@ -89,13 +94,13 @@ func New(cfg Config) (*Resolver, error) {
 		externalID: cfg.ExternalID,
 		clients:    make(map[string]*secretsmanager.Client),
 	}
-	return newResolver(accountAttr, cfg.SecretName, fetch), nil
+	return newResolver(accountAttr, cfg.SecretName, fetch, cfg.Decode), nil
 }
 
 // newResolver constructs a Resolver over a given fetcher, so tests can inject a
 // fake that does not call AWS.
-func newResolver(accountAttr, secretName string, fetch secretFetcher) *Resolver {
-	return &Resolver{accountAttr: accountAttr, secretName: secretName, fetch: fetch}
+func newResolver(accountAttr, secretName string, fetch secretFetcher, decode inventory.SecretDecoder) *Resolver {
+	return &Resolver{accountAttr: accountAttr, secretName: secretName, fetch: fetch, decode: decode}
 }
 
 // ResolveCredentials reads the target's account from attrs, fetches the secret
@@ -112,6 +117,14 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 	raw, err := r.fetch.FetchSecret(ctx, accountID, secretName)
 	if err != nil {
 		return nil, fmt.Errorf("fetch secret %q for target %q in account %s: %w", secretName, req.Target, accountID, err)
+	}
+
+	if r.decode != nil {
+		creds, err := r.decode(raw)
+		if err != nil {
+			return nil, fmt.Errorf("decode secret %q for target %q in account %s: %w", secretName, req.Target, accountID, err)
+		}
+		return creds, nil
 	}
 
 	var parsed struct {

@@ -20,6 +20,12 @@ type Credentials struct {
 	Metadata map[string]string
 }
 
+// SecretDecoder interprets a raw secret value into Credentials. It lets a
+// credential resolver fetch a secret one way — a reference, or an assumed-role
+// Secrets Manager read — and interpret it per engine without coupling the fetch
+// to the format: a plain password for MySQL, or a PlanetScale token for Vitess.
+type SecretDecoder func(raw string) (*Credentials, error)
+
 // CredentialResolver resolves credentials for a target, independently of
 // endpoint resolution so the two can be configured and overridden separately.
 //
@@ -44,6 +50,10 @@ type CredentialResolver interface {
 type SecretRefCredentialResolver struct {
 	Username    string
 	PasswordRef string
+	// Decode, when set, interprets the resolved secret value into Credentials
+	// (for example a PlanetScale token). When nil the secret is used directly as
+	// the password alongside the configured username.
+	Decode SecretDecoder
 }
 
 var _ CredentialResolver = SecretRefCredentialResolver{}
@@ -63,6 +73,13 @@ func (r SecretRefCredentialResolver) ResolveCredentials(_ context.Context, req R
 	// which would otherwise surface as an opaque DB auth error later.
 	if password == "" {
 		return nil, fmt.Errorf("password reference %q resolved to an empty value for target %q", ref, req.Target)
+	}
+	if r.Decode != nil {
+		creds, err := r.Decode(password)
+		if err != nil {
+			return nil, fmt.Errorf("decode secret for target %q: %w", req.Target, err)
+		}
+		return creds, nil
 	}
 	return &Credentials{Username: r.Username, Password: password}, nil
 }
