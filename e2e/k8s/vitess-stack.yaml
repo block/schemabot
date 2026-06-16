@@ -164,13 +164,18 @@ spec:
           imagePullPolicy: Never
           env:
             - { name: CONFIG_FILE, value: "/config/localscale.json" }
+            # Point VTDATAROOT at a dedicated emptyDir rather than the image's
+            # own /vt/vtdataroot. Under the cluster's overlay filesystem the
+            # image layer's directory is not reliably writable by the dropped
+            # vitess user, which makes vtcombo's mysqld fail to initialize its
+            # data dir. The emptyDir gives a clean writable path; the entrypoint
+            # chowns it to vitess before dropping privileges. /vt/config (the
+            # mycnf templates and init SQL) stays on the image, unmasked.
+            - { name: VTDATAROOT, value: "/vtdataroot" }
           ports: [{ containerPort: 8080 }]
-          # /vt/vtdataroot is left as the image's own writable path: vtcombo's
-          # mysqld needs the scaffolding the vttestserver image places there, and
-          # an emptyDir would mask it. The e2e pod is ephemeral, so no persistent
-          # volume is needed.
           volumeMounts:
             - { name: config, mountPath: /config, readOnly: true }
+            - { name: vtdataroot, mountPath: /vtdataroot }
           # vtcombo brings up MySQL and the per-shard sidecars before /health
           # returns 200 — about a minute — so allow a startup window past that.
           readinessProbe:
@@ -188,6 +193,8 @@ spec:
       volumes:
         - name: config
           configMap: { name: localscale-config }
+        - name: vtdataroot
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
