@@ -1,0 +1,233 @@
+# Etre + MongoDB + ministack for the k8s etre-resolver e2e.
+#
+# The data plane resolves an opaque target (DSID) through Etre to a MySQL
+# endpoint, then assembles credentials by assuming an IAM role and reading a
+# Secrets Manager secret — both emulated by ministack. The seed Jobs register a
+# generic cluster entity in Etre and the matching secret in ministack so a
+# plan/apply for the routed database resolves and connects end to end.
+
+---
+# MongoDB (single-node replica set — Etre's CDC needs the oplog).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etre-mongo
+  labels: { app: etre-mongo }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: etre-mongo }
+  template:
+    metadata:
+      labels: { app: etre-mongo }
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:6.0
+          command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+          ports: [{ containerPort: 27017 }]
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etre-mongo
+spec:
+  selector: { app: etre-mongo }
+  ports: [{ port: 27017 }]
+---
+# One-shot replica-set initiation (idempotent).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: etre-mongo-init
+spec:
+  backoffLimit: 30
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: init
+          image: mongo:6.0
+          command:
+            - sh
+            - -c
+            - |
+              until mongosh --host etre-mongo:27017 --quiet --eval "db.adminCommand('ping')"; do
+                echo "waiting for mongo..."; sleep 2;
+              done
+              mongosh --host etre-mongo:27017 --quiet --eval '
+                try { rs.status() }
+                catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "etre-mongo:27017"}]}) }'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: etre-config
+data:
+  config.yaml: |
+    server:
+      addr: ":8080"
+    datasource:
+      url: "mongodb://etre-mongo:27017/?replicaSet=rs0&directConnection=true"
+    cdc:
+      datasource:
+        url: "mongodb://etre-mongo:27017/?replicaSet=rs0&directConnection=true"
+    entity:
+      types:
+        - aurora_cluster
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etre
+  labels: { app: etre }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: etre }
+  template:
+    metadata:
+      labels: { app: etre }
+    spec:
+      containers:
+        - name: etre
+          image: etre:test
+          imagePullPolicy: Never
+          ports: [{ containerPort: 8080 }]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/etre
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap: { name: etre-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etre
+spec:
+  selector: { app: etre }
+  ports: [{ port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ministack
+  labels: { app: ministack }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: ministack }
+  template:
+    metadata:
+      labels: { app: ministack }
+    spec:
+      containers:
+        - name: ministack
+          image: ministackorg/ministack:1.3.64
+          ports: [{ containerPort: 4566 }]
+          readinessProbe:
+            tcpSocket: { port: 4566 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ministack
+spec:
+  selector: { app: ministack }
+  ports: [{ port: 4566 }]
+---
+# Load the entity fixtures into Etre. The fixtures live in
+# e2e/k8s/etre/fixtures/<entity_type>.json and are mounted via the etre-fixtures
+# ConfigMap, which the runner script builds from that directory. Each file is
+# POSTed to the collection named after the file. Seeding is skipped when a type
+# already has entities so a KEEP_NAMESPACE rerun does not create duplicate rows,
+# which would make resolution fail closed on an ambiguous match.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: etre-seed
+spec:
+  backoffLimit: 30
+  template:
+    spec:
+      restartPolicy: OnFailure
+      volumes:
+        - name: fixtures
+          configMap:
+            name: etre-fixtures
+      containers:
+        - name: seed
+          image: curlimages/curl:8.10.1
+          volumeMounts:
+            - { name: fixtures, mountPath: /fixtures }
+          command:
+            - sh
+            - -c
+            - |
+              until curl -sf "http://etre:8080/api/v1/entities/aurora_cluster?query=_id!=0" >/dev/null; do
+                echo "waiting for etre..."; sleep 2;
+              done
+              for f in /fixtures/*.json; do
+                entity_type=$(basename "$f" .json)
+                if curl -sf "http://etre:8080/api/v1/entities/$entity_type?query=_id!=0" | grep -q '"_id"'; then
+                  echo "$entity_type already seeded, skipping"
+                  continue
+                fi
+                echo "seeding $entity_type from $f"
+                curl -sf -X POST "http://etre:8080/api/v1/entities/$entity_type" \
+                  -H "Content-Type: application/json" \
+                  -d @"$f"
+              done
+              echo "etre seeded"
+---
+# Create the DDL credential secret in ministack as a JSON {username,password}
+# payload (the awssm credential resolver parses this shape).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ministack-seed
+spec:
+  backoffLimit: 30
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_ACCESS_KEY_ID, value: "test" }
+            - { name: AWS_SECRET_ACCESS_KEY, value: "test" }
+            - { name: AWS_DEFAULT_REGION, value: "us-east-1" }
+          command:
+            - sh
+            - -c
+            - |
+              until aws --endpoint-url http://ministack:4566 sts get-caller-identity >/dev/null 2>&1; do
+                echo "waiting for ministack..."; sleep 2;
+              done
+              # Create only when absent so reruns are idempotent, but let a real
+              # create failure propagate instead of masking an unhealthy ministack.
+              if ! aws --endpoint-url http://ministack:4566 iam get-role --role-name tern-assumed >/dev/null 2>&1; then
+                aws --endpoint-url http://ministack:4566 iam create-role \
+                  --role-name tern-assumed \
+                  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole"}]}'
+              fi
+              if ! aws --endpoint-url http://ministack:4566 secretsmanager describe-secret --secret-id "dsid-testapp-staging_ddl_password" >/dev/null 2>&1; then
+                aws --endpoint-url http://ministack:4566 secretsmanager create-secret \
+                  --name "dsid-testapp-staging_ddl_password" \
+                  --secret-string '{"username":"root","password":"testpassword"}'
+              fi
+              echo "ministack seeded"

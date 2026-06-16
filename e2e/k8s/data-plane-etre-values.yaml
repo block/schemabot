@@ -1,0 +1,60 @@
+# Data plane Helm values for the etre-resolver k8s e2e.
+#
+# Resolves the opaque target through Etre and assembles credentials by assuming
+# an IAM role + reading Secrets Manager — both emulated by ministack (pointed at
+# via AWS_ENDPOINT_URL). Distinct from data-plane-values.yaml, which binds a
+# single static database.
+
+image:
+  repository: schemabot
+  tag: test
+  pullPolicy: Never
+
+replicaCount: 2
+
+grpc:
+  enabled: true
+  port: 13370
+
+config:
+  storage:
+    dsn: "env:MYSQL_DSN"
+  target_resolver:
+    etre:
+      addr: "http://etre:8080"
+      entity_type: aurora_cluster
+      target_label: dsid
+      env_label: env
+      labels:
+        aws_region: us-east-1
+      host_field: writer_endpoint
+      default_port: "3306"
+      credentials:
+        type: awssm
+        region: us-east-1
+        role_arn: "arn:aws:iam::{account}:role/tern-assumed"
+        secret_name: "{target}_ddl_password"
+
+env:
+  - name: MYSQL_DSN
+    value: "root:testpassword@tcp(mysql-data-plane:3306)/tern?parseTime=true&multiStatements=true"
+  - name: AWS_ENDPOINT_URL
+    value: "http://ministack:4566"
+  - name: AWS_ACCESS_KEY_ID
+    value: "test"
+  - name: AWS_SECRET_ACCESS_KEY
+    value: "test"
+  - name: AWS_DEFAULT_REGION
+    value: "us-east-1"
+  - name: TERN_ENVIRONMENT
+    value: "staging"
+  - name: LOG_LEVEL
+    value: "debug"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
