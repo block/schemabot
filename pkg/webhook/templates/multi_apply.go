@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // MultiDeploymentApplyData is the input to the multi-deployment apply comment.
@@ -53,11 +54,12 @@ type MultiDeploymentApplyData struct {
 // it with RenderApplyStatusComment so that UX stays byte-for-byte unchanged.
 func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 	var sb strings.Builder
+	renderedAt := currentTimestamp()
 
 	// Aggregate header: reuse the single-deployment title map keyed on the
 	// derived aggregate state so the headline vocabulary is identical.
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State})
-	writeAggregateMetadata(&sb, data)
+	writeAggregateMetadata(&sb, data, renderedAt)
 	writeDeploymentCounts(&sb, data.Model.Counts)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
 	writeAggregateNextAction(&sb, data)
@@ -67,7 +69,10 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 	writeDeploymentSummaryList(&sb, data.Model.Deployments)
 
 	// Expandable per-deployment detail, in resolved order.
-	writeDeploymentSections(&sb, data)
+	writeDeploymentSections(&sb, data, renderedAt)
+	if !state.IsTerminalApplyState(data.Model.State) {
+		writeLastUpdatedFooter(&sb, renderedAt)
+	}
 
 	return sb.String()
 }
@@ -85,7 +90,7 @@ func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) str
 	var sb strings.Builder
 
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State})
-	writeAggregateMetadata(&sb, data)
+	writeAggregateMetadata(&sb, data, currentTimestamp())
 	writeDeploymentCounts(&sb, data.Model.Counts)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
 	writeAggregateNextAction(&sb, data)
@@ -102,7 +107,7 @@ func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) str
 // intentionally omitted — it is per-deployment and shown in each deployment's
 // section — so the aggregate carries only the environment, apply ID, elapsed
 // time, and requester.
-func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData) {
+func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData, renderedAt string) {
 	// Environment and ApplyID are always populated from the persisted apply, so
 	// they are rendered unconditionally; only the optional elapsed time is guarded.
 	parts := []string{
@@ -113,7 +118,7 @@ func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData) 
 		parts = append(parts, fmt.Sprintf("**Elapsed**: %s", elapsed))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	writeAppliedByOrTimestamp(sb, data.RequestedBy)
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, renderedAt)
 }
 
 // writeDeploymentCounts writes the per-status histogram so an operator sees
@@ -192,8 +197,10 @@ func writeDeploymentSummaryList(sb *strings.Builder, deps []presentation.Deploym
 
 // writeDeploymentSections writes the in-progress status detail per deployment,
 // reusing the single-deployment status renderer for each <details> body.
-func writeDeploymentSections(sb *strings.Builder, data MultiDeploymentApplyData) {
-	writeDeploymentDetailSections(sb, data, RenderApplyStatusComment)
+func writeDeploymentSections(sb *strings.Builder, data MultiDeploymentApplyData, renderedAt string) {
+	writeDeploymentDetailSections(sb, data, func(detail ApplyStatusCommentData) string {
+		return renderApplyStatusComment(detail, false, renderedAt)
+	})
 }
 
 // writeDeploymentSummarySections writes the terminal summary detail per

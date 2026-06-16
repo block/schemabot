@@ -1581,6 +1581,8 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
 </details>
 
 <details>
@@ -1703,6 +1705,8 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
 </details>
 
 <details>
@@ -1746,6 +1750,8 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
 </details>
 
 <details>
@@ -1788,6 +1794,8 @@ To stop this schema change:
 ```
 schemabot stop apply-a1b2c3d4e5f6
 ```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
 
@@ -1833,6 +1841,8 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
 </details>
 
 <details>
@@ -1875,6 +1885,8 @@ To stop this schema change:
 ```
 schemabot stop apply-a1b2c3d4e5f6
 ```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
 
@@ -2080,6 +2092,8 @@ To proceed with cutover:
 schemabot cutover apply-a1b2c3d4e5f6
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
 </details>
 
 <details>
@@ -2120,6 +2134,8 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ---
 
 Cutover in progress — typically completes within seconds.
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
 
@@ -4588,6 +4604,8 @@ _No details available yet._
 _No details available yet._
 
 </details>
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
 

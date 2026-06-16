@@ -49,13 +49,17 @@ type ApplyStatusCommentData struct {
 // When Tables is populated, per-table progress bars are shown.
 // When Tables is empty, a simple status message is rendered.
 func RenderApplyStatusComment(data ApplyStatusCommentData) string {
+	return renderApplyStatusComment(data, true, currentTimestamp())
+}
+
+func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bool, renderedAt string) string {
 	var sb strings.Builder
 
 	// Header varies by state
 	writeApplyHeader(&sb, data)
 
 	// Metadata line
-	writeApplyMetadata(&sb, data)
+	writeApplyMetadata(&sb, data, renderedAt)
 
 	// Cutover readiness summary
 	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
@@ -74,6 +78,9 @@ func RenderApplyStatusComment(data ApplyStatusCommentData) string {
 
 	// Footer with next actions
 	writeApplyFooter(&sb, data)
+	if includeLastUpdated && !state.IsTerminalApplyState(data.State) {
+		writeLastUpdatedFooter(&sb, renderedAt)
+	}
 
 	return sb.String()
 }
@@ -126,7 +133,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 }
 
 // writeApplyMetadata writes the database, environment, apply ID, elapsed time, and requester info.
-func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
+func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData, renderedAt string) {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
 	if data.Environment != "" {
@@ -139,7 +146,7 @@ func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
 		parts = append(parts, fmt.Sprintf("**Elapsed**: %s", elapsed))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	writeAppliedByOrTimestamp(sb, data.RequestedBy)
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, renderedAt)
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,

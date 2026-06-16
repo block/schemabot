@@ -24,6 +24,7 @@ func rollingOp(dep, st string) presentation.Operation {
 // title, a per-status count line, a single cutover next-action, an at-a-glance
 // per-deployment summary, and a <details> block per deployment in resolved order.
 func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:43:00 UTC")
 	model := presentation.Derive([]presentation.Operation{
 		barrierOp("eu", so.WaitingForCutover),
 		barrierOp("us", so.Running),
@@ -39,6 +40,8 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	assert.Contains(t, out, "## Schema Change In Progress")
 	assert.Contains(t, out, "**Environment**: `production`")
 	assert.Contains(t, out, "**Apply ID**: `apply-123`")
+	assert.Contains(t, out, "_Last updated: <relative-time datetime=\"2026-06-16T19:43:00Z\">2026-06-16 19:43:00 UTC</relative-time> (2026-06-16 19:43:00 UTC)_")
+	assert.NotContains(t, out, "**Last updated**")
 	assert.Contains(t, out, "**Deployments**: 1 ready for cutover, 1 running, 2 waiting")
 
 	// Single next-action points at the cutover-ready deployment, even though the
@@ -90,6 +93,39 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	// With no error detail on the failed operation, the first-failure line names
 	// the deployment without a reason.
 	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code>\n")
+}
+
+func TestRenderMultiDeploymentApplyComment_UsesOneRenderTimestamp(t *testing.T) {
+	original := TimestampFunc
+	timestamps := []string{"2026-06-16 19:43:00 UTC", "2026-06-16 19:43:01 UTC"}
+	TimestampFunc = func() string {
+		ts := timestamps[0]
+		timestamps = timestamps[1:]
+		return ts
+	}
+	t.Cleanup(func() { TimestampFunc = original })
+
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("us", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		Details: map[string]ApplyStatusCommentData{
+			"us": {
+				Database:    "payments_us",
+				Environment: "production",
+				State:       state.Apply.Running,
+				RequestedBy: "aparajon",
+			},
+		},
+	})
+
+	assert.Contains(t, out, "*Applied by @aparajon at 2026-06-16 19:43:00 UTC*")
+	assert.Contains(t, out, "<relative-time datetime=\"2026-06-16T19:43:00Z\">2026-06-16 19:43:00 UTC</relative-time>")
+	assert.NotContains(t, out, "2026-06-16 19:43:01 UTC")
 }
 
 // firstFailingOp builds a rolling, continue-policy operation carrying an error,
@@ -304,6 +340,7 @@ func TestRenderMultiDeploymentApplyComment_NoNextActionWhenCompleted(t *testing.
 	assert.NotContains(t, out, "schemabot revert")
 	assert.NotContains(t, out, "To resume:")
 	assert.NotContains(t, out, "To retry:")
+	assert.NotContains(t, out, "Last updated")
 }
 
 // Deployment names and labels come from configuration/engine state, so they are

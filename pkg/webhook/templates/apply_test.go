@@ -15,6 +15,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func withTemplateTimestamp(t *testing.T, timestamp string) {
+	t.Helper()
+	original := TimestampFunc
+	TimestampFunc = func() string { return timestamp }
+	t.Cleanup(func() { TimestampFunc = original })
+}
+
 func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 	rendered := RenderApplyBlockedByOtherPR(ApplyLockConflictData{
 		Database:    "example-db",
@@ -28,6 +35,7 @@ func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 }
 
 func TestRenderApplyStatusComment_Running(t *testing.T) {
+	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
 		Environment: "staging",
@@ -47,6 +55,8 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "@aparajon")
 	assert.Contains(t, result, "`testapp`")
 	assert.Contains(t, result, "`staging`")
+	assert.Contains(t, result, "_Last updated: <relative-time datetime=\"2026-06-16T19:42:00Z\">2026-06-16 19:42:00 UTC</relative-time> (2026-06-16 19:42:00 UTC)_")
+	assert.NotContains(t, result, "**Last updated**")
 	// Progress summary
 	assert.Contains(t, result, "📊 1/3 complete")
 	assert.Contains(t, result, "1 running (45%)")
@@ -93,6 +103,29 @@ func TestRenderApplyStatusComment_EstimateExceeded(t *testing.T) {
 	assert.NotContains(t, result, "100,000 / 100,000")
 }
 
+func TestRenderApplyStatusComment_UsesOneRenderTimestamp(t *testing.T) {
+	original := TimestampFunc
+	timestamps := []string{"2026-06-16 19:42:00 UTC", "2026-06-16 19:42:01 UTC"}
+	TimestampFunc = func() string {
+		ts := timestamps[0]
+		timestamps = timestamps[1:]
+		return ts
+	}
+	t.Cleanup(func() { TimestampFunc = original })
+
+	result := RenderApplyStatusComment(ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Running,
+		ApplyID:     "apply-abc123",
+	})
+
+	assert.Contains(t, result, "*Applied by @aparajon at 2026-06-16 19:42:00 UTC*")
+	assert.Contains(t, result, "<relative-time datetime=\"2026-06-16T19:42:00Z\">2026-06-16 19:42:00 UTC</relative-time>")
+	assert.NotContains(t, result, "2026-06-16 19:42:01 UTC")
+}
+
 func TestRenderApplyStatusComment_Completed(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
@@ -114,6 +147,7 @@ func TestRenderApplyStatusComment_Completed(t *testing.T) {
 	assert.Contains(t, result, "📊 2/2 complete")
 	// Each table has "✓ Complete" = 2 total
 	assert.Equal(t, 2, strings.Count(result, "Complete"))
+	assert.NotContains(t, result, "Last updated")
 }
 
 func TestRenderApplyStatusComment_SQLFencesAreTopLevel(t *testing.T) {

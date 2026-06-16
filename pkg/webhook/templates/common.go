@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"html"
 	"strings"
 	"time"
 )
@@ -88,18 +89,44 @@ func writeAppliedByOrTimestamp(sb *strings.Builder, appliedBy string) {
 	writeAttributionLine(sb, "Applied", appliedBy)
 }
 
+func writeAppliedByOrTimestampAt(sb *strings.Builder, appliedBy, timestamp string) {
+	writeAttributionLineAt(sb, "Applied", appliedBy, timestamp, "")
+}
+
 // writeAttributionLine writes a "*Verb by @user at timestamp*" line.
 func writeAttributionLine(sb *strings.Builder, verb, user string) {
 	writeAttributionLineWithSuffix(sb, verb, user, "")
 }
 
 func writeAttributionLineWithSuffix(sb *strings.Builder, verb, user, suffix string) {
-	ts := currentTimestamp()
+	writeAttributionLineAt(sb, verb, user, currentTimestamp(), suffix)
+}
+
+func writeAttributionLineAt(sb *strings.Builder, verb, user, timestamp, suffix string) {
 	if user != "" {
-		fmt.Fprintf(sb, "\n*%s by @%s at %s%s*\n", verb, user, ts, suffix)
+		fmt.Fprintf(sb, "\n*%s by @%s at %s%s*\n", verb, user, timestamp, suffix)
 	} else {
-		fmt.Fprintf(sb, "\n*Started at %s%s*\n", ts, suffix)
+		fmt.Fprintf(sb, "\n*Started at %s%s*\n", timestamp, suffix)
 	}
+}
+
+func writeLastUpdatedFooter(sb *strings.Builder, timestamp string) {
+	if !strings.HasSuffix(sb.String(), "\n") {
+		sb.WriteString("\n")
+	}
+	escapedTimestamp := html.EscapeString(timestamp)
+	fmt.Fprintf(sb, "\n_Last updated: <relative-time datetime=\"%s\">%s</relative-time> (%s)_\n",
+		escapeRelativeTimeDatetime(timestamp),
+		escapedTimestamp,
+		escapedTimestamp)
+}
+
+func escapeRelativeTimeDatetime(timestamp string) string {
+	parsed, err := time.Parse("2006-01-02 15:04:05 UTC", timestamp)
+	if err != nil {
+		return html.EscapeString(timestamp)
+	}
+	return parsed.UTC().Format(time.RFC3339)
 }
 
 // truncateDDL strips backtick-quoting from a DDL statement and truncates to maxLen characters.
