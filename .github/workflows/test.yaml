@@ -389,6 +389,17 @@ jobs:
             ~/.cache/go-build
           key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # The runner ships a preinstalled MySQL whose AppArmor profile confines
+      # /usr/sbin/mysqld to its packaged data dirs. LocalScale runs vtcombo's
+      # embedded mysqld (the same binary path) against a vttest data dir, so the
+      # host profile blocks it from reading its own my.cnf and the init aborts.
+      # Unload the profile on the runner so the embedded mysqld runs unconfined.
+      - name: "Disable host mysqld AppArmor profile"
+        run: |
+          if [ -f /etc/apparmor.d/usr.sbin.mysqld ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.mysqld || true
+            sudo ln -sf /etc/apparmor.d/usr.sbin.mysqld /etc/apparmor.d/disable/ || true
+          fi
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
