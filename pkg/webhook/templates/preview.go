@@ -911,6 +911,77 @@ func PreviewCommentMultiDeploymentApplyCompleted() string {
 	})
 }
 
+// PreviewCommentMultiDeploymentApplySummaryCompleted renders the final summary
+// comment for a fully completed rollout: the aggregate applied header with each
+// deployment's terminal summary in its section.
+func PreviewCommentMultiDeploymentApplySummaryCompleted() string {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "eu", State: state.ApplyOperation.Completed, HaltOnFailure: true},
+		{Deployment: "us", State: state.ApplyOperation.Completed, HaltOnFailure: true},
+		{Deployment: "au", State: state.ApplyOperation.Completed, HaltOnFailure: true},
+	})
+
+	completedTables := func() []TableProgressData {
+		tables := sampleApplyTables()
+		for i := range tables {
+			tables[i].Status = state.Task.Completed
+		}
+		return tables
+	}
+
+	return RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+		Details: map[string]ApplyStatusCommentData{
+			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, completedTables()),
+			"us": sampleDeploymentDetail("payments_us", state.Apply.Completed, completedTables()),
+			"au": sampleDeploymentDetail("payments_au", state.Apply.Completed, completedTables()),
+		},
+	})
+}
+
+// PreviewCommentMultiDeploymentApplySummaryFailed renders the final summary
+// comment for a halt-on-failure rollout where one deployment failed: completed
+// deployments carry their success summary, the failed deployment carries its
+// error and retry guidance, and later deployments are halted.
+func PreviewCommentMultiDeploymentApplySummaryFailed() string {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "eu", State: state.ApplyOperation.Completed, HaltOnFailure: true},
+		{Deployment: "us", State: state.ApplyOperation.Failed, HaltOnFailure: true, Error: PreviewErrorMiddleFailed},
+		{Deployment: "au", State: state.ApplyOperation.Pending, HaltOnFailure: true},
+		{Deployment: "ca", State: state.ApplyOperation.Pending, HaltOnFailure: true},
+	})
+
+	euTables := sampleApplyTables()
+	for i := range euTables {
+		euTables[i].Status = state.Task.Completed
+	}
+
+	usTables := sampleApplyTables()
+	usTables[0].Status = state.Task.Completed
+	usTables[1].Status = state.Task.Failed
+	usTables[2].Status = state.Task.Cancelled
+	usDetail := sampleDeploymentDetail("payments_us", state.Apply.Failed, usTables)
+	usDetail.ErrorMessage = PreviewErrorMiddleFailed
+
+	return RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().Add(-1 * time.Minute).UTC().Format(time.RFC3339),
+		Details: map[string]ApplyStatusCommentData{
+			"eu": sampleDeploymentDetail("payments_eu", state.Apply.Completed, euTables),
+			"us": usDetail,
+		},
+	})
+}
+
 // =============================================================================
 // Single-Table Apply Previews (most common case)
 // =============================================================================

@@ -25,6 +25,23 @@ func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperatio
 	return templates.RenderMultiDeploymentApplyComment(buildMultiApplyData(apply, ops, tasks))
 }
 
+// formatApplySummaryComment renders the terminal summary PR comment for an apply,
+// choosing the layout from how many deployments the apply owns, identically to
+// formatApplyStatusComment: zero or one operation renders today's
+// single-deployment summary byte-for-byte (legacy applies that predate
+// apply_operations fall here too), and two or more renders the aggregated
+// multi-deployment summary derived from pkg/presentation.
+//
+// ops must be in resolved deployment order (as returned by
+// ApplyOperations().ListByApply); tasks are the apply's tasks across all
+// deployments, regrouped per operation for the multi-deployment layout.
+func formatApplySummaryComment(apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task) string {
+	if len(ops) <= 1 {
+		return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks))
+	}
+	return templates.RenderMultiDeploymentApplySummaryComment(buildMultiApplyData(apply, ops, tasks))
+}
+
 // buildMultiApplyData assembles the multi-deployment comment input: the derived
 // rollup plus each deployment's own single-deployment comment data, so each
 // deployment's section reuses the existing per-table renderer.

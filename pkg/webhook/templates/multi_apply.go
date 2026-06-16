@@ -71,6 +71,31 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 	return sb.String()
 }
 
+// RenderMultiDeploymentApplySummaryComment renders the final summary PR comment
+// for a terminal apply that fans out across more than one deployment. It mirrors
+// RenderMultiDeploymentApplyComment's aggregate layout — terminal header,
+// metadata, per-status counts, the single next operator action, and the flat
+// per-deployment summary — but each <details> body is the deployment's terminal
+// summary (RenderApplySummaryComment) rather than its in-progress status.
+//
+// The single-deployment case is intentionally not handled here: callers render
+// it with RenderApplySummaryComment so that UX stays byte-for-byte unchanged.
+func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) string {
+	var sb strings.Builder
+
+	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State})
+	writeAggregateMetadata(&sb, data)
+	writeDeploymentCounts(&sb, data.Model.Counts)
+	writeAggregateNextAction(&sb, data)
+
+	writeDeploymentSummaryList(&sb, data.Model.Deployments)
+
+	// Expandable per-deployment terminal summary, in resolved order.
+	writeDeploymentSummarySections(&sb, data)
+
+	return sb.String()
+}
+
 // writeAggregateMetadata writes the apply-level metadata line. The database is
 // intentionally omitted — it is per-deployment and shown in each deployment's
 // section — so the aggregate carries only the environment, apply ID, elapsed
@@ -140,12 +165,27 @@ func writeDeploymentSummaryList(sb *strings.Builder, deps []presentation.Deploym
 	}
 }
 
-// writeDeploymentSections writes a <details> block per deployment in resolved
-// order. Active and problematic deployments default open; completed and queued
-// ones default collapsed (the model's Open flag). The body reuses the
-// single-deployment renderer so per-table progress, errors, and DDL keep today's
-// fidelity scoped to one deployment.
+// writeDeploymentSections writes the in-progress status detail per deployment,
+// reusing the single-deployment status renderer for each <details> body.
 func writeDeploymentSections(sb *strings.Builder, data MultiDeploymentApplyData) {
+	writeDeploymentDetailSections(sb, data, RenderApplyStatusComment)
+}
+
+// writeDeploymentSummarySections writes the terminal summary detail per
+// deployment, reusing the single-deployment summary renderer for each <details>
+// body.
+func writeDeploymentSummarySections(sb *strings.Builder, data MultiDeploymentApplyData) {
+	writeDeploymentDetailSections(sb, data, RenderApplySummaryComment)
+}
+
+// writeDeploymentDetailSections writes a <details> block per deployment in
+// resolved order, rendering each body with renderDetail (the status renderer for
+// an in-progress comment, the summary renderer for a terminal comment). Active
+// and problematic deployments default open; completed and queued ones default
+// collapsed (the model's Open flag). The per-deployment body keeps today's
+// single-deployment fidelity — per-table progress, errors, and DDL — scoped to
+// one deployment.
+func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentApplyData, renderDetail func(ApplyStatusCommentData) string) {
 	for _, d := range data.Model.Deployments {
 		openAttr := ""
 		if d.Open {
@@ -153,7 +193,7 @@ func writeDeploymentSections(sb *strings.Builder, data MultiDeploymentApplyData)
 		}
 		fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n\n", openAttr, deploymentTag(d), html.EscapeString(d.Label))
 		if detail, ok := data.Details[d.Deployment]; ok {
-			sb.WriteString(RenderApplyStatusComment(detail))
+			sb.WriteString(renderDetail(detail))
 		} else {
 			sb.WriteString("_No details available yet._\n")
 		}
