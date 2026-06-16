@@ -109,9 +109,14 @@ type Service struct {
 	config            *ServerConfig
 	ternClients       map[string]tern.Client // keyed by "deployment/environment", lazily created
 	routingTernClient *tern.RoutingClient
-	ternMu            sync.Mutex // protects tern client caches
+	ternMu            sync.Mutex // protects tern client caches and engineFactories
 	logger            *slog.Logger
 	clock             clock.Clock
+
+	// engineFactories holds engine implementations for database types this build
+	// does not provide natively, registered by an embedding service via
+	// RegisterEngine. Local clients the service builds receive them.
+	engineFactories map[string]tern.EngineFactory
 
 	// Operator loop management.
 	operatorMu           sync.Mutex
@@ -216,12 +221,37 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		storage:              st,
 		config:               config,
 		ternClients:          ternClients,
+		engineFactories:      make(map[string]tern.EngineFactory),
 		logger:               logger,
 		clock:                clock.Real{},
 		operatorPollInterval: OperatorPollInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
 		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
 	}
+}
+
+// RegisterEngine registers an Engine implementation for a database type this
+// build does not provide natively (the built-in types are unaffected). Call it
+// during setup, before serving: local clients the service builds for that type
+// use the registered factory. It is the extension point for an embedding
+// service to supply an engine without the core depending on its package.
+//
+// It validates its inputs so a misconfiguration fails fast at setup rather than
+// as a confusing downstream error (or a panic on a nil factory).
+func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory) error {
+	if databaseType == "" {
+		return fmt.Errorf("register engine: database type must not be empty")
+	}
+	if factory == nil {
+		return fmt.Errorf("register engine for database type %q: factory must not be nil", databaseType)
+	}
+	s.ternMu.Lock()
+	defer s.ternMu.Unlock()
+	if s.engineFactories == nil {
+		s.engineFactories = make(map[string]tern.EngineFactory)
+	}
+	s.engineFactories[databaseType] = factory
+	return nil
 }
 
 // SetClock overrides the time source used by orchestration loops (currently
@@ -464,11 +494,12 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		metadata["pending_drops"] = "false"
 	}
 	client, err := tern.NewLocalClient(tern.LocalConfig{
-		Database:     database,
-		Type:         dbType,
-		TargetDSN:    targetDSN,
-		Metadata:     metadata,
-		WakeOperator: s.wakeOperator,
+		Database:        database,
+		Type:            dbType,
+		TargetDSN:       targetDSN,
+		Metadata:        metadata,
+		WakeOperator:    s.wakeOperator,
+		EngineFactories: s.engineFactories,
 	}, s.storage, s.logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local tern client for %s: %w", key, err)

@@ -2325,3 +2325,95 @@ func TestLocalClient_PlanNamespaceUsesConfiguredDatabase(t *testing.T) {
 	assert.Equal(t, "testdb", client.planNamespace("default"))
 	assert.Equal(t, "analytics", client.planNamespace("analytics"))
 }
+
+// A database type without a built-in engine is served by a registered factory,
+// so an embedding service can supply an engine this build does not include.
+func TestNewLocalClientUsesRegisteredEngine(t *testing.T) {
+	fake := &fakeControlEngine{}
+	c, err := NewLocalClient(LocalConfig{
+		Database: "db",
+		Type:     "customengine",
+		EngineFactories: map[string]EngineFactory{
+			"customengine": func(LocalConfig, *slog.Logger) (engine.Engine, error) { return fake, nil },
+		},
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	assert.Same(t, fake, c.getEngine())
+}
+
+// Built-in engine types ignore the registry.
+func TestNewLocalClientBuiltinEngineIgnoresRegistry(t *testing.T) {
+	c, err := NewLocalClient(LocalConfig{Database: "db", Type: storage.DatabaseTypeMySQL}, nil, slog.Default())
+	require.NoError(t, err)
+	assert.NotNil(t, c.getEngine())
+}
+
+// A type with no built-in engine and no registered factory fails closed.
+func TestNewLocalClientErrorsWhenEngineUnregistered(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{Database: "db", Type: "customengine"}, nil, slog.Default())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no engine registered")
+}
+
+func TestNewLocalClientPropagatesEngineFactoryError(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{
+		Database: "db",
+		Type:     "customengine",
+		EngineFactories: map[string]EngineFactory{
+			"customengine": func(LocalConfig, *slog.Logger) (engine.Engine, error) {
+				return nil, errors.New("init failed")
+			},
+		},
+	}, nil, slog.Default())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "init failed")
+}
+
+// A factory that returns a nil engine must fail closed rather than yield a
+// client that no-ops or panics on first use.
+func TestNewLocalClientFactoryReturningNilFailsClosed(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{
+		Database: "db",
+		Type:     "customengine",
+		EngineFactories: map[string]EngineFactory{
+			"customengine": func(LocalConfig, *slog.Logger) (engine.Engine, error) { return nil, nil },
+		},
+	}, nil, slog.Default())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil engine")
+}
+
+// A registered key mapped to a nil factory must fail closed rather than panic
+// when the factory would be invoked.
+func TestNewLocalClientNilFactoryFailsClosed(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{
+		Database:        "db",
+		Type:            "customengine",
+		EngineFactories: map[string]EngineFactory{"customengine": nil},
+	}, nil, slog.Default())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is nil")
+}
+
+type namedEngine struct {
+	engine.Engine
+	name string
+}
+
+func (e namedEngine) Name() string { return e.name }
+
+// The reported proto engine reflects the engine actually backing the client, so
+// a registered engine is not misreported as the Spirit default.
+func TestLocalClientProtoEngineReflectsRegisteredEngine(t *testing.T) {
+	c, err := NewLocalClient(LocalConfig{
+		Database: "db",
+		Type:     "customengine",
+		EngineFactories: map[string]EngineFactory{
+			"customengine": func(LocalConfig, *slog.Logger) (engine.Engine, error) {
+				return namedEngine{name: storage.EngineStrata}, nil
+			},
+		},
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.Engine_ENGINE_STRATA, c.protoEngine())
+}

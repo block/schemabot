@@ -128,7 +128,8 @@ type LocalConfig struct {
 	// Database is the name of this database.
 	Database string
 
-	// Type is the database type: "mysql" or "vitess".
+	// Type is the database type. "mysql" and "vitess" have built-in engines; any
+	// other value requires a matching EngineFactories entry.
 	Type string
 
 	// TargetDSN is the connection string to the target database for schema changes.
@@ -147,16 +148,29 @@ type LocalConfig struct {
 	// recorded. The callback must not execute control actions itself; it only
 	// nudges the storage-claiming operator to process durable intent promptly.
 	WakeOperator func(applyIdentifier, database, environment string)
+
+	// EngineFactories supplies engine implementations for database types this
+	// build does not implement natively. An embedding service populates it (via
+	// api.Service.RegisterEngine); NewLocalClient uses the matching factory for a
+	// Type that has no built-in engine.
+	EngineFactories map[string]EngineFactory
 }
 
-// LocalClient implements Client by calling the Spirit engine directly.
-// This is used when SchemaBot runs as a single service with embedded engine.
-// It uses SchemaBot's storage for plans and tasks.
+// EngineFactory builds an Engine for a database type this build does not
+// implement natively. It is the extension point that lets an embedding service
+// supply an engine without the core depending on its package.
+type EngineFactory func(cfg LocalConfig, logger *slog.Logger) (engine.Engine, error)
+
+// LocalClient implements Client by calling an embedded engine directly — the
+// built-in Spirit (mysql) or PlanetScale (vitess) engine, or an engine supplied
+// by an embedder for another database type. It uses SchemaBot's storage for
+// plans and tasks.
 type LocalClient struct {
 	config            LocalConfig
 	storage           storage.Storage
 	spiritEngine      engine.Engine
 	planetscaleEngine engine.Engine
+	customEngine      engine.Engine
 	logger            *slog.Logger
 
 	// heartbeatInterval controls how often the apply heartbeat updates updated_at.
@@ -204,6 +218,28 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		})
 	}
 
+	// For a database type without a built-in engine, build it from a registered
+	// factory. This is the embedder extension point for engines this build does
+	// not include.
+	var customEngine engine.Engine
+	if cfg.Type != storage.DatabaseTypeMySQL && cfg.Type != storage.DatabaseTypeVitess {
+		factory, ok := cfg.EngineFactories[cfg.Type]
+		if !ok {
+			return nil, fmt.Errorf("no engine registered for database type %q", cfg.Type)
+		}
+		if factory == nil {
+			return nil, fmt.Errorf("engine factory registered for database type %q is nil", cfg.Type)
+		}
+		eng, err := factory(cfg, logger)
+		if err != nil {
+			return nil, fmt.Errorf("build engine for database type %q: %w", cfg.Type, err)
+		}
+		if eng == nil {
+			return nil, fmt.Errorf("engine factory for database type %q returned a nil engine", cfg.Type)
+		}
+		customEngine = eng
+	}
+
 	return &LocalClient{
 		config:  cfg,
 		storage: stor,
@@ -214,6 +250,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			DisablePendingDrops: cfg.Metadata["pending_drops"] == "false",
 		}),
 		planetscaleEngine: psEngine,
+		customEngine:      customEngine,
 		logger:            logger,
 		heartbeatInterval: 10 * time.Second,
 	}, nil
@@ -239,6 +276,15 @@ func (c *LocalClient) wakeOperatorForControlRequest(apply *storage.Apply) {
 
 // protoEngine returns the proto engine type based on database configuration.
 func (c *LocalClient) protoEngine() ternv1.Engine {
+	// Derive from the engine actually backing this client, so a registered
+	// engine reports its own type rather than the Spirit default.
+	if eng := c.getEngine(); eng != nil {
+		if e, err := engineNameToProto(eng.Name()); err == nil {
+			return e
+		}
+	}
+	// Fall back to the type default when there is no engine or its name has no
+	// proto representation.
 	if c.config.Type == storage.DatabaseTypeVitess {
 		return ternv1.Engine_ENGINE_PLANETSCALE
 	}
@@ -774,8 +820,8 @@ func pulledSchemaFileContent(database string, tbl spirittable.TableSchema) (stri
 
 // Plan generates a schema change plan from declarative schema files.
 func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL && c.config.Type != storage.DatabaseTypeVitess {
-		return nil, fmt.Errorf("type must be %q or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess)
+	if c.getEngine() == nil {
+		return nil, fmt.Errorf("no engine available for database type %q", c.config.Type)
 	}
 
 	// Convert schema files from proto to engine type.
@@ -1224,7 +1270,8 @@ func (c *LocalClient) getEngine() engine.Engine {
 	case storage.DatabaseTypeVitess:
 		return c.planetscaleEngine
 	default:
-		return nil
+		// A registered engine for a non-built-in type (nil if none registered).
+		return c.customEngine
 	}
 }
 

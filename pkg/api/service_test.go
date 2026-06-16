@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -271,6 +272,46 @@ func TestServiceDeploymentForDatabaseEnvironment(t *testing.T) {
 
 	_, err = service.deploymentForDatabaseEnvironment("missing", "", "staging")
 	require.Error(t, err)
+}
+
+type fakeRegisteredEngine struct{ engine.Engine }
+
+// A database type with no built-in engine fails closed until an embedding
+// service registers one; once registered, the service builds the local client
+// with the supplied engine.
+func TestServiceRegisterEngineSuppliesLocalClientEngine(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"customdb": {
+				Type: "customengine",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost:3306)/customdb"},
+				},
+			},
+		},
+	}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, err := service.TernClient("customdb", "staging")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no engine registered")
+
+	require.NoError(t, service.RegisterEngine("customengine", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
+		return &fakeRegisteredEngine{}, nil
+	}))
+	client, err := service.TernClient("customdb", "staging")
+	require.NoError(t, err)
+	require.NotNil(t, client)
+}
+
+// RegisterEngine validates its inputs so a misconfiguration fails fast at setup.
+func TestServiceRegisterEngineValidates(t *testing.T) {
+	service := New(nil, &ServerConfig{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	require.Error(t, service.RegisterEngine("", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
+		return &fakeRegisteredEngine{}, nil
+	}))
+	require.Error(t, service.RegisterEngine("customengine", nil))
 }
 
 // A PlanetScale token configured as a literal (the secrets resolver returns
