@@ -58,6 +58,25 @@ func TestQueryOneFailsClosedWhenNotFound(t *testing.T) {
 	assert.Contains(t, err.Error(), "no etre")
 }
 
+// Not-found is a distinguishable sentinel so a resolver spanning multiple entity
+// types can fall back on not-found while still aborting on ambiguous matches or
+// query errors.
+func TestQueryOneNotFoundIsErrNotFound(t *testing.T) {
+	notFound := newClient(mockClient(nil, nil, nil), "cluster", nil)
+	_, err := notFound.QueryOne(t.Context(), map[string]string{"name": "missing"})
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	ambiguous := newClient(mockClient(nil, []etre.Entity{{"name": "x"}, {"name": "x"}}, nil), "cluster", nil)
+	_, err = ambiguous.QueryOne(t.Context(), map[string]string{"name": "x"})
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrNotFound)
+
+	queryErr := newClient(mockClient(nil, nil, fmt.Errorf("etre unreachable")), "cluster", nil)
+	_, err = queryErr.QueryOne(t.Context(), map[string]string{"name": "x"})
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrNotFound)
+}
+
 // More than one match must fail closed rather than connect to an arbitrary one.
 func TestQueryOneFailsClosedOnMultipleMatches(t *testing.T) {
 	c := newClient(mockClient(nil, []etre.Entity{{"name": "orders"}, {"name": "orders"}}, nil), "cluster", nil)

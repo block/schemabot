@@ -10,6 +10,7 @@ package etre
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,13 @@ import (
 
 	"github.com/square/etre"
 )
+
+// ErrNotFound is wrapped by QueryOne when no entity matches the selector. A
+// resolver that looks a target up across more than one entity type (for
+// example one type for each database engine) can use errors.Is to fall back to
+// the next type on not-found, while still treating query errors and ambiguous
+// (more than one) matches as hard failures.
+var ErrNotFound = errors.New("no matching etre entity")
 
 // Config configures a Client. A Client is bound to a single entity type, which
 // mirrors the underlying Etre entity client.
@@ -94,7 +102,7 @@ func (c *Client) QueryOne(ctx context.Context, selector map[string]string) (etre
 	}
 	switch len(entities) {
 	case 0:
-		return nil, fmt.Errorf("no etre %q entity matched %q", c.entityType, query)
+		return nil, fmt.Errorf("no etre %q entity matched %q: %w", c.entityType, query, ErrNotFound)
 	case 1:
 		c.logger.Debug("etre: resolved one entity", "entity_type", c.entityType, "query", query)
 		return entities[0], nil
