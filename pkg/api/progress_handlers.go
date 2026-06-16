@@ -218,6 +218,10 @@ func (s *Service) progressOperationsForApply(ctx context.Context, apply *storage
 }
 
 func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string) {
+	if apply == nil {
+		s.logger.Warn("progress response will omit per-deployment operations: apply is nil")
+		return nil, nil
+	}
 	operations, deploymentByOperationID, err := s.progressOperationsForApply(ctx, apply)
 	if err != nil {
 		// Operation rows are observability enrichment, not an apply safety gate.

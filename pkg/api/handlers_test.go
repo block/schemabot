@@ -1861,6 +1861,78 @@ func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *
 	assert.Equal(t, "deploy-b", resp.Tables[1].Deployment)
 }
 
+func newActiveProgressServiceWithOperations(client tern.Client, apply *storage.Apply, operations storage.ApplyOperationStore) *Service {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		tasks:      &capturingTaskStore{},
+		controls:   &memoryControlRequestStore{},
+		operations: operations,
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": client,
+	}, logger)
+}
+
+func TestProgressByApplyIDActivePathIncludesOperations(t *testing.T) {
+	// The active (proto Progress RPC) path enriches the response with the
+	// apply's per-deployment operation rows from control-plane storage.
+	mock := &mockTernClient{
+		isRemote:     true,
+		progressResp: &ternv1.ProgressResponse{State: ternv1.State_STATE_RUNNING},
+	}
+	apply := activeTestApply("apply-active-ops")
+	apply.ExternalID = "remote-active-ops"
+	operations := &staticApplyOperationStore{operations: []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.Running},
+		{ID: 2, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.Failed, ErrorMessage: "engine failed"},
+	}}
+	svc := newActiveProgressServiceWithOperations(mock, apply, operations)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-active-ops", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, mock.progressReq, "active apply must reach the proto Progress RPC path")
+
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Operations, 2)
+	assert.Equal(t, "deploy-a", resp.Operations[0].Deployment)
+	assert.Equal(t, state.ApplyOperation.Running, resp.Operations[0].State)
+	assert.Equal(t, "deploy-b", resp.Operations[1].Deployment)
+	assert.Equal(t, "engine failed", resp.Operations[1].ErrorMessage)
+}
+
+func TestProgressByApplyIDActivePathToleratesOperationStorageError(t *testing.T) {
+	// Operation enrichment is observability, not a safety gate: a storage error
+	// from ListByApply must omit operations rather than fail the request.
+	mock := &mockTernClient{
+		isRemote:     true,
+		progressResp: &ternv1.ProgressResponse{State: ternv1.State_STATE_RUNNING},
+	}
+	apply := activeTestApply("apply-active-ops-err")
+	apply.ExternalID = "remote-active-ops-err"
+	operations := &staticApplyOperationStore{err: errors.New("operations store unavailable")}
+	svc := newActiveProgressServiceWithOperations(mock, apply, operations)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-active-ops-err", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, mock.progressReq, "active apply must reach the proto Progress RPC path")
+
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Operations)
+	assert.Equal(t, state.Apply.Running, resp.State)
+}
+
 func TestProgressFromLocalStorageSingleDeploymentOmitsOperationFields(t *testing.T) {
 	apply := &storage.Apply{ID: 20, ApplyIdentifier: "apply_single", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Engine: storage.EngineSpirit, State: state.Apply.Completed}
 	svc := New(&mockStorageWithApplyStores{
