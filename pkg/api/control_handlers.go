@@ -134,8 +134,8 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 	if plan == nil {
 		return apply, nil, fmt.Errorf("source plan %d not found for rollback apply %s", apply.PlanID, apply.ApplyIdentifier)
 	}
-	if len(plan.FlatOriginalSchema()) == 0 {
-		return apply, plan, controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema", apply.ApplyIdentifier)
+	if !plan.HasOriginalFilesCapture() {
+		return apply, plan, controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema files", apply.ApplyIdentifier)
 	}
 
 	latestTask, err := latestCompletedTaskForRollback(ctx, taskStore, apply.Database, apply.DatabaseType, apply.Environment)

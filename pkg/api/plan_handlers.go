@@ -548,6 +548,11 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		}
 	}
 
+	namespaces, err := protoChangesToNamespaces(resp.Changes, req.SchemaFiles)
+	if err != nil {
+		return nil, fmt.Errorf("convert plan namespaces: %w", err)
+	}
+
 	// Store plan in SchemaBot's storage (idempotent — duplicate is ignored)
 	storedPlan := &storage.Plan{
 		PlanIdentifier: resp.PlanId,
@@ -560,7 +565,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		SchemaPath:     trustedSchemaPath,
 		Environment:    req.Environment,
 		SchemaFiles:    protoToSchemaFiles(req.SchemaFiles),
-		Namespaces:     protoChangesToNamespaces(resp.Changes),
+		Namespaces:     namespaces,
 		HeadSHA:        ternReq.HeadSha,
 		CreatedAt:      time.Now(),
 	}
@@ -970,7 +975,7 @@ func (s *Service) createStoredApply(
 func applyTaskChanges(plan *storage.Plan) []storage.TableChange {
 	changes := append([]storage.TableChange{}, plan.FlatDDLChanges()...)
 	for namespace, nsData := range plan.Namespaces {
-		if len(nsData.VSchema) > 0 {
+		if nsData.Artifacts[vSchemaArtifactName] != "" {
 			changes = append(changes, storage.TableChange{
 				Table:     "VSchema: " + namespace,
 				Namespace: namespace,

@@ -684,7 +684,8 @@ func (s *actorAuthPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan
 		Environment:  s.apply.Environment,
 		Namespaces: map[string]*storage.NamespacePlanData{
 			s.apply.Database: {
-				OriginalSchema: map[string]string{"users": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"},
+				OriginalFiles:         map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"},
+				OriginalFilesCaptured: true,
 			},
 		},
 	}, nil

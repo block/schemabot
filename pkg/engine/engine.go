@@ -122,11 +122,6 @@ type PlanResult struct {
 	// Lint results from schema analysis. Violations with Severity "error" block
 	// apply unless overridden with --allow-unsafe.
 	LintViolations []LintViolation
-
-	// OriginalSchema contains the DB schema state at plan time (before applying).
-	// Maps table name -> CREATE TABLE statement.
-	// Used for rollback: applying OriginalSchema as target reverses the changes.
-	OriginalSchema map[string]string
 }
 
 // HasErrors returns true if any lint warning has error severity.
@@ -182,11 +177,17 @@ func (r *PlanResult) FlatTableChanges() []TableChange {
 	return tables
 }
 
-// SchemaChange groups all changes for a single namespace (keyspace/schema).
+// SchemaChange is a namespace-level bundle. Engines emit at most one
+// SchemaChange per namespace; OriginalFiles is captured once for that namespace
+// and applies to every table/artifact change in the bundle.
 type SchemaChange struct {
-	Namespace    string            // MySQL schema, Vitess keyspace, Postgres schema
-	TableChanges []TableChange     // Per-table DDL changes
-	Metadata     map[string]string // Engine-specific data (e.g., "vschema" → diff string for Vitess)
+	Namespace    string        // MySQL schema, Vitess keyspace, Postgres schema
+	TableChanges []TableChange // Per-table DDL changes
+	// Metadata contains engine-specific plan annotations, such as display diffs
+	// or apply flags. It is not rollback input; rollback uses OriginalFiles.
+	Metadata              map[string]string
+	OriginalFiles         map[string]string // Declarative schema files and artifacts for this namespace before applying
+	OriginalFilesCaptured bool              // True when OriginalFiles was captured, including an empty namespace
 }
 
 // LintViolation represents a lint finding from schema analysis.

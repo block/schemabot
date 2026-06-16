@@ -317,11 +317,21 @@ message TableChange {
   string unsafe_reason = 6;
 }
 
-// SchemaChange groups all changes for a single namespace (keyspace/schema).
+// SchemaChange is a namespace-level bundle. A PlanResponse must include at most
+// one SchemaChange per namespace; original_files is captured once for that
+// namespace and applies to every table/artifact change in the bundle.
 message SchemaChange {
   string namespace = 1;
   repeated TableChange table_changes = 2;
-  map<string, string> metadata = 3; // Engine-specific data (e.g., "vschema" → diff)
+  // Engine-specific annotations about the plan, such as a display diff or a
+  // flag telling the engine to apply an artifact. Metadata is not a rollback
+  // input; rollback uses original_files.
+  map<string, string> metadata = 3;
+  // Original declarative schema files captured before applying this namespace's changes.
+  // Engines can include table files and non-table artifacts such as Vitess vschema.json.
+  map<string, string> original_files = 4;
+  // True when original_files was captured, including an intentionally empty namespace.
+  bool original_files_captured = 5;
 }
 
 // LintViolation represents a schema linting violation.

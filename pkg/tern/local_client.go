@@ -87,7 +87,6 @@ package tern
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -113,6 +112,15 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+const vSchemaArtifactName = "vschema.json"
+
+func namespaceHasVSchemaArtifact(nsData *storage.NamespacePlanData) bool {
+	if nsData == nil {
+		return false
+	}
+	return nsData.Artifacts[vSchemaArtifactName] != ""
+}
 
 // LocalConfig holds configuration for the local Tern client.
 type LocalConfig struct {
@@ -610,36 +618,37 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Operation: ddl.StatementTypeToOp(tc.Operation),
 			})
 		}
-		// Only store VSchema when the Plan detected a change.
-		if sc.Metadata["vschema_changed"] == "true" {
-			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
-				if vs, ok := nsFiles.Files["vschema.json"]; ok {
-					nsData.VSchema = json.RawMessage(vs)
-				}
+		if len(sc.OriginalFiles) > 0 {
+			nsData.OriginalFiles = sc.OriginalFiles
+		}
+		if sc.OriginalFilesCaptured {
+			nsData.OriginalFilesCaptured = true
+			if nsData.OriginalFiles == nil {
+				nsData.OriginalFiles = map[string]string{}
 			}
 		}
-	}
-	// Store original schema for rollback support.
-	// For single-namespace (Spirit), attach to that namespace.
-	// For multi-namespace (Vitess), original schema is per-keyspace from the engine.
-	if result.OriginalSchema != nil {
-		if len(namespaces) == 1 {
-			for _, nsData := range namespaces {
-				nsData.OriginalSchema = result.OriginalSchema
+		// Only store VSchema artifacts when the Plan detected a change.
+		if sc.Metadata["vschema_changed"] == "true" {
+			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
+				if vs, ok := nsFiles.Files[vSchemaArtifactName]; ok && vs != "" {
+					if nsData.Artifacts == nil {
+						nsData.Artifacts = map[string]string{}
+					}
+					nsData.Artifacts[vSchemaArtifactName] = vs
+				}
 			}
 		}
 	}
 	if len(namespaces) == 0 {
 		namespaces[c.config.Database] = &storage.NamespacePlanData{
-			Tables:         ddlChanges,
-			OriginalSchema: result.OriginalSchema,
+			Tables: ddlChanges,
 		}
 	}
 
 	// Don't store empty plans — no DDL changes, no VSchema changes.
 	hasVSchemaChanges := false
 	for _, ns := range namespaces {
-		if len(ns.VSchema) > 0 {
+		if namespaceHasVSchemaArtifact(ns) {
 			hasVSchemaChanges = true
 			break
 		}
@@ -690,8 +699,10 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	var changes []*ternv1.SchemaChange
 	for _, sc := range result.Changes {
 		protoSC := &ternv1.SchemaChange{
-			Namespace: sc.Namespace,
-			Metadata:  sc.Metadata,
+			Namespace:             sc.Namespace,
+			Metadata:              sc.Metadata,
+			OriginalFiles:         sc.OriginalFiles,
+			OriginalFilesCaptured: sc.OriginalFilesCaptured,
 		}
 		for _, t := range sc.TableChanges {
 			protoSC.TableChanges = append(protoSC.TableChanges, &ternv1.TableChange{
@@ -870,7 +881,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// For VSchema-only deploys (0 DDL changes), this gives the progress API
 	// something to track.
 	for ns, nsData := range plan.Namespaces {
-		if len(nsData.VSchema) > 0 {
+		if namespaceHasVSchemaArtifact(nsData) {
 			ddlChanges = append(ddlChanges, storage.TableChange{
 				Table:     "VSchema: " + ns,
 				Namespace: ns,

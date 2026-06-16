@@ -38,6 +38,31 @@ func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
 	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
 }
 
+func TestPlanHasRollbackSchemaFilesAcceptsOriginalFiles(t *testing.T) {
+	assert.True(t, planHasRollbackSchemaFiles(&storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {
+				OriginalFiles: map[string]string{
+					"vschema.json": `{"tables":{"users":{}}}`,
+				},
+				OriginalFilesCaptured: true,
+			},
+		},
+	}))
+	assert.True(t, planHasRollbackSchemaFiles(&storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {
+				OriginalFilesCaptured: true,
+			},
+		},
+	}))
+	assert.False(t, planHasRollbackSchemaFiles(&storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {},
+		},
+	}))
+}
+
 type exactProgressApplyStore struct {
 	storage.ApplyStore
 	apply *storage.Apply

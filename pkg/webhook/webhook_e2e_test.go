@@ -2320,7 +2320,7 @@ func TestE2ERollbackPlanViaWebhook(t *testing.T) {
 	require.NoError(t, err)
 	_ = db.Close()
 
-	// Step 2: Plan + apply adding an index (this stores OriginalSchema for rollback)
+	// Step 2: Plan + apply adding an index (this stores original files for rollback)
 	schemaWithIndex := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
 	prNumber := int32(1)
 	planReq := api.PlanRequest{
@@ -2526,7 +2526,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	require.NoError(t, err)
 	_ = db.Close()
 
-	// Step 2: Plan + apply adding an index (creates OriginalSchema for rollback)
+	// Step 2: Plan + apply adding an index (captures original files for rollback)
 	schemaWithIndex := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
 	prNumber := int32(1)
 	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{

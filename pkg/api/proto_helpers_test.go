@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"testing"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -82,6 +83,78 @@ func TestProtoToSchemaFiles_NilNamespaceValue(t *testing.T) {
 	assert.Equal(t, map[string]string{
 		"users.sql": "CREATE TABLE users (id bigint primary key)",
 	}, result["payments"].Files)
+}
+
+func TestProtoChangesToNamespacesPreservesVSchemaFiles(t *testing.T) {
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{{
+		Namespace: "commerce",
+		Metadata:  map[string]string{"vschema_changed": "true"},
+		TableChanges: []*ternv1.TableChange{{
+			TableName:  "users",
+			Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		}},
+		OriginalFiles: map[string]string{
+			"users.sql":    "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)",
+			"vschema.json": `{"tables":{"users":{"column_vindexes":[{"column":"old_id","name":"hash"}]}}}`,
+		},
+		OriginalFilesCaptured: true,
+	}}, map[string]*ternv1.SchemaFiles{
+		"commerce": {Files: map[string]string{
+			"users.sql":    "CREATE TABLE `users` (`id` bigint unsigned NOT NULL, `email` varchar(255))",
+			"vschema.json": `{"tables":{"users":{"column_vindexes":[{"column":"id","name":"hash"}]}}}`,
+		}},
+	})
+
+	require.NoError(t, err)
+	require.Contains(t, namespaces, "commerce")
+	nsData := namespaces["commerce"]
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)", nsData.OriginalFiles["users.sql"])
+	assert.True(t, nsData.OriginalFilesCaptured)
+	assert.JSONEq(t, `{"tables":{"users":{"column_vindexes":[{"column":"old_id","name":"hash"}]}}}`, nsData.OriginalFiles["vschema.json"])
+	assert.JSONEq(t, `{"tables":{"users":{"column_vindexes":[{"column":"id","name":"hash"}]}}}`, nsData.Artifacts["vschema.json"])
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal([]byte(nsData.OriginalFiles["vschema.json"]), &decoded))
+}
+
+func TestProtoChangesToNamespacesPreservesOriginalFiles(t *testing.T) {
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{{
+		Namespace: "commerce",
+		Metadata:  map[string]string{"vschema_changed": "true"},
+		OriginalFiles: map[string]string{
+			"schema.sql": "CREATE SCHEMA commerce;",
+		},
+		OriginalFilesCaptured: true,
+	}}, map[string]*ternv1.SchemaFiles{
+		"commerce": {Files: map[string]string{"vschema.json": `{"tables":{"users":{}}}`}},
+	})
+
+	require.NoError(t, err)
+	require.Contains(t, namespaces, "commerce")
+	nsData := namespaces["commerce"]
+	assert.Equal(t, "CREATE SCHEMA commerce;", nsData.OriginalFiles["schema.sql"])
+	assert.True(t, nsData.OriginalFilesCaptured)
+}
+
+func TestProtoChangesToNamespacesRejectsDuplicateNamespaces(t *testing.T) {
+	_, err := protoChangesToNamespaces([]*ternv1.SchemaChange{
+		{Namespace: "commerce"},
+		{Namespace: "commerce"},
+	}, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `duplicate schema change namespace "commerce"`)
+}
+
+func TestProtoChangesToNamespacesRejectsDuplicateDefaultNamespaces(t *testing.T) {
+	_, err := protoChangesToNamespaces([]*ternv1.SchemaChange{
+		{},
+		{Namespace: "default"},
+	}, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `duplicate schema change namespace "default"`)
 }
 
 // schema_files with a null namespace value is rejected as a hard validation

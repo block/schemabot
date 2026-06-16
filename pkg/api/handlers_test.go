@@ -1822,7 +1822,7 @@ func TestProgressResponseFromProtoPreservesVSchemaChangeType(t *testing.T) {
 	assert.Equal(t, "vschema_update", resp.Tables[0].ChangeType)
 }
 
-func TestValidateRollbackSourceApplyAcceptsLatestCompletedApplyWithOriginalSchema(t *testing.T) {
+func TestValidateRollbackSourceApplyAcceptsLatestCompletedApplyWithOriginalFiles(t *testing.T) {
 	now := time.Now().UTC()
 	apply := rollbackGuardrailApply("apply_latest", 1, 10, now)
 	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, true), []*storage.Task{
@@ -1874,7 +1874,7 @@ func TestValidateRollbackSourceApplyRequiresPullRequestScopeWhenRequested(t *tes
 	assert.Contains(t, err.Error(), "repository is required")
 }
 
-func TestValidateRollbackSourceApplyRejectsPlanWithoutOriginalSchema(t *testing.T) {
+func TestValidateRollbackSourceApplyRejectsPlanWithoutOriginalFiles(t *testing.T) {
 	now := time.Now().UTC()
 	apply := rollbackGuardrailApply("apply_no_schema", 1, 10, now)
 	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, false), []*storage.Task{
@@ -1889,7 +1889,7 @@ func TestValidateRollbackSourceApplyRejectsPlanWithoutOriginalSchema(t *testing.
 	})
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no stored original schema")
+	assert.Contains(t, err.Error(), "no stored original schema files")
 }
 
 func TestValidateRollbackSourceApplyRejectsPlannerSourceMismatchForOlderApply(t *testing.T) {
@@ -1968,7 +1968,7 @@ func rollbackGuardrailApply(identifier string, id, planID int64, completedAt tim
 	}
 }
 
-func rollbackGuardrailPlan(id int64, includeOriginalSchema bool) *storage.Plan {
+func rollbackGuardrailPlan(id int64, includeOriginalFiles bool) *storage.Plan {
 	plan := &storage.Plan{
 		ID:           id,
 		Database:     "orders",
@@ -1978,10 +1978,11 @@ func rollbackGuardrailPlan(id int64, includeOriginalSchema bool) *storage.Plan {
 			"orders": {},
 		},
 	}
-	if includeOriginalSchema {
-		plan.Namespaces["orders"].OriginalSchema = map[string]string{
-			"users": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	if includeOriginalFiles {
+		plan.Namespaces["orders"].OriginalFiles = map[string]string{
+			"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 		}
+		plan.Namespaces["orders"].OriginalFilesCaptured = true
 	}
 	return plan
 }

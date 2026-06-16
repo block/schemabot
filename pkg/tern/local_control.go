@@ -924,25 +924,27 @@ func (c *LocalClient) RollbackPlan(ctx context.Context, database, environment st
 		return nil, fmt.Errorf("completed task for database %s environment %s points to plan for environment %s", database, environment, plan.Environment)
 	}
 
-	originalSchema := plan.FlatOriginalSchema()
-	if len(originalSchema) == 0 {
-		return nil, fmt.Errorf("no original schema available for rollback (plan may predate rollback feature)")
+	if !planHasRollbackSchemaFiles(plan) {
+		return nil, fmt.Errorf("no original schema files available for rollback")
 	}
 
-	// Convert OriginalSchema to SchemaFiles format for Plan request
+	// Use the captured original schema files as the Plan request target.
 	schemaFiles := make(map[string]*ternv1.SchemaFiles)
 	for ns, nsData := range plan.Namespaces {
-		if len(nsData.OriginalSchema) == 0 {
-			continue
+		if nsData == nil {
+			return nil, fmt.Errorf("no original schema files available for rollback namespace %q", ns)
 		}
-		sqlFiles := make(map[string]string)
-		for tableName, createSQL := range nsData.OriginalSchema {
-			sqlFiles[tableName+".sql"] = createSQL
+		if !nsData.OriginalFilesCaptured {
+			return nil, fmt.Errorf("no original schema files available for rollback namespace %q", ns)
 		}
-		schemaFiles[ns] = &ternv1.SchemaFiles{Files: sqlFiles}
+		files := nsData.OriginalFiles
+		if files == nil {
+			files = map[string]string{}
+		}
+		schemaFiles[ns] = &ternv1.SchemaFiles{Files: files}
 	}
 
-	// Generate a new plan using the original schema as the target
+	// Generate a new plan using the original schema files as the target.
 	return c.Plan(ctx, &ternv1.PlanRequest{
 		Database:    database,
 		Type:        c.config.Type,
@@ -950,6 +952,10 @@ func (c *LocalClient) RollbackPlan(ctx context.Context, database, environment st
 		Target:      plan.Target,
 		SchemaFiles: schemaFiles,
 	})
+}
+
+func planHasRollbackSchemaFiles(plan *storage.Plan) bool {
+	return plan.HasOriginalFilesCapture()
 }
 
 // getActiveTaskForDatabase finds the first non-terminal task for a database.
