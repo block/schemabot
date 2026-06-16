@@ -68,3 +68,76 @@ func (a MySQLConnectionAssembler) Assemble(host string, _ map[string]string, cre
 	}
 	return cfg.FormatDSN(), maps.Clone(a.Metadata), nil
 }
+
+// Metadata keys the Vitess (PlanetScale) engine reads from a resolved Target.
+const (
+	// MetadataOrganization is the PlanetScale organization that owns the database.
+	MetadataOrganization = "organization"
+	// MetadataTokenName is the PlanetScale service token id.
+	MetadataTokenName = "token_name"
+	// MetadataTokenValue is the PlanetScale service token secret.
+	MetadataTokenValue = "token_value"
+	// MetadataAPIURL is the PlanetScale-compatible API base URL.
+	MetadataAPIURL = "api_url"
+)
+
+// DefaultPlanetScaleAPIURL is the public PlanetScale API endpoint, used when the
+// assembler is not configured with an override (for example a LocalScale URL in
+// tests).
+const DefaultPlanetScaleAPIURL = "https://api.planetscale.com"
+
+// VitessConnectionAssembler assembles a metadata-only Target for Vitess via
+// PlanetScale. Vitess connects through the PlanetScale API rather than a MySQL
+// DSN, so connection details travel in Metadata: the organization comes from the
+// resolved endpoint's attributes, the service token from credentials, and the
+// API URL from deployment configuration.
+type VitessConnectionAssembler struct {
+	// OrganizationAttribute is the endpoint attribute holding the PlanetScale
+	// organization. Defaults to "organization" when empty.
+	OrganizationAttribute string
+	// APIURL is the PlanetScale-compatible API base URL. Defaults to
+	// DefaultPlanetScaleAPIURL when empty.
+	APIURL string
+	// Metadata is attached to every assembled target for engine-specific
+	// configuration the data plane reads, merged after the resolved fields.
+	Metadata map[string]string
+}
+
+var _ ConnectionAssembler = VitessConnectionAssembler{}
+
+// DatabaseType returns the Vitess engine type.
+func (VitessConnectionAssembler) DatabaseType() string { return "vitess" }
+
+// Assemble builds a metadata-only Vitess Target. The host is unused — Vitess
+// reaches the database through the PlanetScale API keyed by organization, not a
+// host endpoint. The returned DSN is always empty.
+func (a VitessConnectionAssembler) Assemble(_ string, attrs map[string]string, creds *Credentials) (string, map[string]string, error) {
+	if creds == nil {
+		return "", nil, fmt.Errorf("vitess connection requires credentials")
+	}
+	orgAttr := a.OrganizationAttribute
+	if orgAttr == "" {
+		orgAttr = MetadataOrganization
+	}
+	organization := attrs[orgAttr]
+	if organization == "" {
+		return "", nil, fmt.Errorf("vitess connection requires the %q endpoint attribute", orgAttr)
+	}
+	tokenName := creds.Metadata[MetadataTokenName]
+	tokenValue := creds.Metadata[MetadataTokenValue]
+	if tokenName == "" || tokenValue == "" {
+		return "", nil, fmt.Errorf("vitess connection requires %q and %q credentials", MetadataTokenName, MetadataTokenValue)
+	}
+	apiURL := a.APIURL
+	if apiURL == "" {
+		apiURL = DefaultPlanetScaleAPIURL
+	}
+	metadata := map[string]string{
+		MetadataOrganization: organization,
+		MetadataTokenName:    tokenName,
+		MetadataTokenValue:   tokenValue,
+		MetadataAPIURL:       apiURL,
+	}
+	maps.Copy(metadata, a.Metadata)
+	return "", metadata, nil
+}
