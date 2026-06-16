@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -294,11 +295,15 @@ func TestUpdateApplyStateFromOperations_ReopenFailedGuard(t *testing.T) {
 			applyStore := &recordingApplyStore{}
 			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: tc.ops}, applyStore)
 
+			// A terminal parent always carries a stamped completed_at; seed one
+			// so the reopen-clears-completed_at assertion is meaningful.
+			completedAt := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 			apply := &storage.Apply{
 				ID:              7,
 				ApplyIdentifier: "apply-reopen",
 				State:           tc.parent,
 				Environment:     "staging",
+				CompletedAt:     &completedAt,
 			}
 
 			err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, tc.reopen)
