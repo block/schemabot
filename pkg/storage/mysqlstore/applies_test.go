@@ -1092,6 +1092,19 @@ func TestApplyStore_UpdateDerivedStateOperationLeaseGuard(t *testing.T) {
 	precPersisted, err := store.Applies().Get(ctx, precApply.ID)
 	require.NoError(t, err)
 	assert.Equal(t, state.Apply.Running, precPersisted.State)
+
+	// A current operation lease whose expected state no longer matches the row is
+	// a benign CAS miss: swapped=false with no error, so a stale projection is
+	// reconciled on the next poll rather than mistaken for a lost lease.
+	missApply := runningApply("apply_op_cas_miss", "staging-miss", 904)
+	missOpID := createApplyOperationForLeaseTest(t, store, missApply.ID, "primary")
+	stampOperationLease(t, missOpID, "worker", "op-token")
+	swapped, err = store.Applies().UpdateDerivedState(opLeaseCtx(missApply.ID, missOpID, "op-token"), missApply.ID, state.Apply.Pending, state.Apply.Failed, "stale projection", nil, nil)
+	require.NoError(t, err, "a state mismatch under a current operation lease must not be reported as a lost lease")
+	assert.False(t, swapped, "the expected state no longer matches, so the swap must miss")
+	missPersisted, err := store.Applies().Get(ctx, missApply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, missPersisted.State, "a CAS miss must not write the projection")
 }
 
 // TestApplyStore_UpdateDerivedStateStampsStartedAt verifies that the projection
