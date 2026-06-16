@@ -228,7 +228,8 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 				Environment:     "staging",
 			}
 
-			require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
+			_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+			require.NoError(t, err)
 			require.NotNil(t, applyStore.updated, "derived state differs from current, so the apply must be persisted")
 			assert.Equal(t, state.Apply.Pending, applyStore.expectedState, "the write must compare-and-swap on the state read before deriving")
 			assert.Equal(t, tc.wantState, applyStore.updated.State)
@@ -319,7 +320,7 @@ func TestUpdateApplyStateFromOperations_ReopenFailedGuard(t *testing.T) {
 				CompletedAt:     &completedAt,
 			}
 
-			err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, tc.reopen)
+			_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, tc.reopen)
 			if tc.wantErr {
 				require.Error(t, err)
 				assert.Nil(t, applyStore.updated, "a rejected transition must not persist the apply")
@@ -446,7 +447,8 @@ func TestUpdateApplyStateFromOperations_StampsAggregateFailureMessage(t *testing
 		Environment:     "staging",
 	}
 
-	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
+	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
 	require.NotNil(t, applyStore.updated, "derived failed state differs from running, so the apply must be persisted")
 	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
 	assert.Equal(t, "deployment region-a failed: spirit: cutover failed", applyStore.updated.ErrorMessage,
@@ -473,7 +475,8 @@ func TestUpdateApplyStateFromOperations_FirstFailedDeploymentWins(t *testing.T) 
 		Environment:     "staging",
 	}
 
-	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
+	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
 	require.NotNil(t, applyStore.updated)
 	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
 	assert.Equal(t, "deployment region-a failed: spirit: region-a cutover failed", applyStore.updated.ErrorMessage,
@@ -499,11 +502,82 @@ func TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarri
 		ErrorMessage:    "prior reason",
 	}
 
-	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
+	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
 	require.NotNil(t, applyStore.updated)
 	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
 	assert.Equal(t, "prior reason", applyStore.updated.ErrorMessage,
 		"with no operation-level message the existing apply reason must be preserved")
+}
+
+// TestUpdateApplyStateFromOperations_ReturnsProjectionResult verifies the
+// structured projection result the writer returns: whether the compare-and-swap
+// advanced the apply row, the previous and derived states, and whether the swap
+// terminalized a previously non-terminal apply. Callers in the multi-deployment
+// fan-out work key the single-publisher terminal summary off this result, so the
+// fields must distinguish a winning terminal swap from a non-terminal swap, a
+// no-op match, and a lost race.
+func TestUpdateApplyStateFromOperations_ReturnsProjectionResult(t *testing.T) {
+	startedAt := time.Now().Add(-time.Minute)
+	cases := []struct {
+		name     string
+		ops      []*storage.ApplyOperation
+		apply    *storage.Apply
+		casMatch bool
+		want     applyProjectionResult
+	}{
+		{
+			name: "winning swap to terminal",
+			ops: []*storage.ApplyOperation{
+				{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed, ErrorMessage: "boom"},
+				{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Completed},
+			},
+			apply:    &storage.Apply{ID: 3, ApplyIdentifier: "apply-a", State: state.Apply.Running, StartedAt: &startedAt},
+			casMatch: true,
+			want:     applyProjectionResult{Swapped: true, PreviousState: state.Apply.Running, DerivedState: state.Apply.Failed, BecameTerminal: true},
+		},
+		{
+			name: "winning non-terminal swap",
+			ops: []*storage.ApplyOperation{
+				{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Running},
+				{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Pending},
+			},
+			apply:    &storage.Apply{ID: 3, ApplyIdentifier: "apply-b", State: state.Apply.Pending},
+			casMatch: true,
+			want:     applyProjectionResult{Swapped: true, PreviousState: state.Apply.Pending, DerivedState: state.Apply.Running, BecameTerminal: false},
+		},
+		{
+			name: "no-op match",
+			ops: []*storage.ApplyOperation{
+				{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Running},
+				{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Running},
+			},
+			apply:    &storage.Apply{ID: 3, ApplyIdentifier: "apply-c", State: state.Apply.Running, StartedAt: &startedAt},
+			casMatch: true,
+			want:     applyProjectionResult{Swapped: false, PreviousState: state.Apply.Running, DerivedState: state.Apply.Running, BecameTerminal: false},
+		},
+		{
+			name: "lost race",
+			ops: []*storage.ApplyOperation{
+				{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed, ErrorMessage: "boom"},
+				{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Completed},
+			},
+			apply:    &storage.Apply{ID: 3, ApplyIdentifier: "apply-d", State: state.Apply.Running, StartedAt: &startedAt},
+			casMatch: false,
+			want:     applyProjectionResult{Swapped: false, PreviousState: state.Apply.Running, DerivedState: state.Apply.Failed, BecameTerminal: false},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			applyStore := &recordingApplyStore{swapped: tc.casMatch}
+			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: tc.ops}, applyStore)
+
+			got, err := svc.updateApplyStateFromOperations(t.Context(), 1, tc.apply, allowLeaseScopedFailedReopen)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }
 
 // fakeControlRequestStore is a minimal ControlRequestStore for stop
@@ -655,7 +729,8 @@ func TestUpdateApplyStateFromOperations_StaleWriteSkipped(t *testing.T) {
 		Environment:     "staging",
 	}
 
-	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
+	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
 	assert.Equal(t, state.Apply.Pending, applyStore.expectedState, "the write must compare-and-swap on the state read before deriving")
 	assert.Nil(t, applyStore.updated, "a CAS miss must not record a persisted projection")
 }

@@ -420,7 +420,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
-	if err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen); err != nil {
+	if _, err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen); err != nil {
 		s.logger.Error("operator: failed to update derived apply state from apply_operations",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
@@ -496,7 +496,7 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, workerID int, own
 		return true
 	}
 
-	if err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen); err != nil {
+	if _, err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen); err != nil {
 		s.logger.Error("operator: failed to update derived apply state during stop reconciliation",
 			"worker", workerID, "apply_id", finalApply.ApplyIdentifier,
 			"database", finalApply.Database, "environment", finalApply.Environment, "error", err)
@@ -618,7 +618,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 		if !marked {
 			return
 		}
-		if err := s.updateApplyStateFromOperations(ctx, workerID, parent, rejectFailedApplyReopen); err != nil {
+		if _, err := s.updateApplyStateFromOperations(ctx, workerID, parent, rejectFailedApplyReopen); err != nil {
 			s.logger.Error("operator: failed to update derived apply state for terminal parent",
 				"worker", workerID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
 				"deployment", op.Deployment, "environment", parent.Environment, "error", err)
@@ -652,7 +652,7 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, wor
 			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
 		return
 	}
-	if err := s.updateApplyStateFromOperations(applyCtx, workerID, apply, allowLeaseScopedFailedReopen); err != nil {
+	if _, err := s.updateApplyStateFromOperations(applyCtx, workerID, apply, allowLeaseScopedFailedReopen); err != nil {
 		s.logger.Error("operator: failed to update derived apply state after failing task-less operation",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
@@ -1043,6 +1043,27 @@ const (
 	allowLeaseScopedFailedReopen failedApplyReopenPolicy = true
 )
 
+// applyProjectionResult reports what updateApplyStateFromOperations did to the
+// parent apply. It lets callers key apply-level terminal side-effects (the
+// single-publisher terminal summary in the multi-deployment fan-out work) off
+// the projection outcome — "did this drive win the swap that terminalized the
+// parent?" — rather than off the per-operation engine result. It carries no
+// behavior today: every current caller discards it and inspects only the error.
+type applyProjectionResult struct {
+	// Swapped is true when the derived-state compare-and-swap actually advanced
+	// the parent apply row. It is false for a no-op match (derived already
+	// equals the current state with nothing to stamp) and for a lost race (the
+	// CAS found the row already moved).
+	Swapped bool
+	// PreviousState is the parent apply state observed before the projection.
+	PreviousState string
+	// DerivedState is the state derived from the child apply_operations rows.
+	DerivedState string
+	// BecameTerminal is true when this projection won the swap and moved the
+	// parent from a non-terminal previous state to a terminal derived state.
+	BecameTerminal bool
+}
+
 // updateApplyStateFromOperations re-derives applies.state from the apply's child
 // apply_operations rows and persists it when it differs from the current value.
 //
@@ -1066,13 +1087,13 @@ const (
 // unscoped reconciliation path passes rejectFailedApplyReopen so it never
 // revives a terminal parent through a last-write-wins update; every other
 // terminal-to-non-terminal transition stays an error regardless.
-func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID int, apply *storage.Apply, reopen failedApplyReopenPolicy) error {
+func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID int, apply *storage.Apply, reopen failedApplyReopenPolicy) (applyProjectionResult, error) {
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
-		return fmt.Errorf("list apply_operations for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+		return applyProjectionResult{}, fmt.Errorf("list apply_operations for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
 	}
 	if len(ops) == 0 {
-		return fmt.Errorf("derive apply state for apply %s (%d): no apply_operations rows", apply.ApplyIdentifier, apply.ID)
+		return applyProjectionResult{}, fmt.Errorf("derive apply state for apply %s (%d): no apply_operations rows", apply.ApplyIdentifier, apply.ID)
 	}
 
 	childStates := make([]string, len(ops))
@@ -1100,7 +1121,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 		state.IsState(derived, state.Apply.Running)
 
 	if state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived) && !reopensContinuableFailedRollout {
-		return fmt.Errorf("derive apply state for terminal apply %s (%d): child operations derive non-terminal state %q from parent state %q",
+		return applyProjectionResult{}, fmt.Errorf("derive apply state for terminal apply %s (%d): child operations derive non-terminal state %q from parent state %q",
 			apply.ApplyIdentifier, apply.ID, derived, apply.State)
 	}
 
@@ -1119,7 +1140,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 			"worker", workerID, "apply_id", apply.ApplyIdentifier,
 			"database", apply.Database, "environment", apply.Environment,
 			"state", derived, "operation_count", len(ops))
-		return nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived}, nil
 	}
 
 	var completedAt *time.Time
@@ -1152,7 +1173,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 
 	swapped, err := s.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, errorMessage, startedAt, completedAt)
 	if err != nil {
-		return fmt.Errorf("update derived apply state for apply %s (%d) to %q: %w", apply.ApplyIdentifier, apply.ID, derived, err)
+		return applyProjectionResult{}, fmt.Errorf("update derived apply state for apply %s (%d) to %q: %w", apply.ApplyIdentifier, apply.ID, derived, err)
 	}
 	if !swapped {
 		// Another drive advanced the apply between our read and write; our
@@ -1161,13 +1182,18 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 			"worker", workerID, "apply_id", apply.ApplyIdentifier,
 			"database", apply.Database, "environment", apply.Environment,
 			"expected_state", apply.State, "derived_state", derived, "operation_count", len(ops))
-		return nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived}, nil
 	}
 	s.logger.Info("operator: updated derived apply state from apply_operations",
 		"worker", workerID, "apply_id", apply.ApplyIdentifier,
 		"database", apply.Database, "environment", apply.Environment,
 		"previous_state", apply.State, "derived_state", derived, "operation_count", len(ops))
-	return nil
+	return applyProjectionResult{
+		Swapped:        true,
+		PreviousState:  apply.State,
+		DerivedState:   derived,
+		BecameTerminal: !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived),
+	}, nil
 }
 
 func operatorLeaseOwner(workerID int) string {
