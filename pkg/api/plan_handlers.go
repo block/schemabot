@@ -926,6 +926,13 @@ func (s *Service) createStoredApply(
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
+	targets, err := s.config.ResolveDatabaseTargets(plan.Database, req.Environment)
+	if err != nil {
+		return nil, 0, fmt.Errorf("resolve targets for %s/%s: %w", plan.Database, req.Environment, err)
+	}
+	if len(targets) == 0 {
+		return nil, 0, fmt.Errorf("resolve targets for %s/%s: no targets", plan.Database, req.Environment)
+	}
 
 	var lockID int64
 	lock, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
@@ -955,51 +962,54 @@ func (s *Service) createStoredApply(
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
+	apply.Deployment = targets[0].Deployment
 
 	taskChanges := applyTaskChanges(plan)
-	tasks := make([]*storage.Task, 0, len(taskChanges))
-	for _, ddlChange := range taskChanges {
-		task := &storage.Task{
-			TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
-			PlanID:         plan.ID,
-			Database:       plan.Database,
-			DatabaseType:   plan.DatabaseType,
-			Engine:         storage.EngineForType(plan.DatabaseType),
-			Repository:     plan.Repository,
-			PullRequest:    plan.PullRequest,
-			Environment:    req.Environment,
-			State:          state.Task.Pending,
-			Options:        storage.MarshalApplyOptions(applyOpts),
-			Namespace:      ddlChange.Namespace,
-			TableName:      ddlChange.Table,
-			DDL:            ddlChange.DDL,
-			DDLAction:      ddlChange.Operation,
-			CreatedAt:      now,
-			UpdatedAt:      now,
+	buildTasks := func() []*storage.Task {
+		tasks := make([]*storage.Task, 0, len(taskChanges))
+		for _, ddlChange := range taskChanges {
+			task := &storage.Task{
+				TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
+				PlanID:         plan.ID,
+				Database:       plan.Database,
+				DatabaseType:   plan.DatabaseType,
+				Engine:         storage.EngineForType(plan.DatabaseType),
+				Repository:     plan.Repository,
+				PullRequest:    plan.PullRequest,
+				Environment:    req.Environment,
+				State:          state.Task.Pending,
+				Options:        storage.MarshalApplyOptions(applyOpts),
+				Namespace:      ddlChange.Namespace,
+				TableName:      ddlChange.Table,
+				DDL:            ddlChange.DDL,
+				DDLAction:      ddlChange.Operation,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+			tasks = append(tasks, task)
 		}
-		tasks = append(tasks, task)
+		return tasks
 	}
 
-	// Dual-write one apply_operations row alongside the applies row in the
-	// same transaction. Today the plan already carries the resolved
-	// (deployment, target) pair from plan-time `ResolveDatabaseTarget`, and
-	// the config layer hard-blocks multi-entry deployments maps, so we
-	// always write exactly one operation row that mirrors the apply's own
-	// routing. The data shape is what the operator claim-loop PR consumes
-	// once that gate is lifted and plans become deployment-agnostic.
 	cutoverPolicy := s.config.CutoverPolicyFor(plan.Database, req.Environment)
 	onFailure := s.config.OnFailure(plan.Database, req.Environment)
-	operations := []*storage.ApplyOperation{{
-		Deployment:    apply.Deployment,
-		Target:        plan.Target,
-		State:         state.ApplyOperation.Pending,
-		CutoverPolicy: cutoverPolicy,
-		OnFailure:     onFailure,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}}
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
+	for _, target := range targets {
+		groups = append(groups, &storage.ApplyOperationWithTasks{
+			Operation: &storage.ApplyOperation{
+				Deployment:    target.Deployment,
+				Target:        target.Target,
+				State:         state.ApplyOperation.Pending,
+				CutoverPolicy: cutoverPolicy,
+				OnFailure:     onFailure,
+				CreatedAt:     now,
+				UpdatedAt:     now,
+			},
+			Tasks: buildTasks(),
+		})
+	}
 
-	storedApplyID, err := s.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
 	}

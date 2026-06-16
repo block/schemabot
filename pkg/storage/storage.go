@@ -205,6 +205,12 @@ type ApplyStore interface {
 	// committed, so the operator never observes a partially-populated apply.
 	CreateWithTasksAndOperations(ctx context.Context, apply *Apply, tasks []*Task, operations []*ApplyOperation) (int64, error)
 
+	// CreateWithGroupedOperations stores a new apply and grouped per-deployment
+	// operation/task rows in a single transaction. Each operation row's ApplyID is
+	// set to the new apply ID before insert, and each group's tasks are linked to
+	// that operation after its auto-increment ID is known.
+	CreateWithGroupedOperations(ctx context.Context, apply *Apply, groups []*ApplyOperationWithTasks) (int64, error)
+
 	// Get returns an apply by ID, or nil if not found.
 	Get(ctx context.Context, id int64) (*Apply, error)
 
@@ -321,6 +327,12 @@ type ApplyStore interface {
 
 	// DeleteByPR removes all applies for a PR (cleanup on PR close/merge).
 	DeleteByPR(ctx context.Context, repo string, pr int) error
+}
+
+// ApplyOperationWithTasks groups one apply_operations row with the task rows it owns.
+type ApplyOperationWithTasks struct {
+	Operation *ApplyOperation
+	Tasks     []*Task
 }
 
 // RecentAppliesFilter controls recent apply queries for status views.
