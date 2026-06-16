@@ -138,6 +138,9 @@ data:
         }
       },
       "listen_addr": ":8080",
+      "proxy_advertise_host": "localscale",
+      "proxy_port_start": 19100,
+      "proxy_port_end": 19104,
       "revert_window_duration": "2s",
       "default_throttle_ratio": 0.85,
       "branch_creation_delay": "50ms",
@@ -172,7 +175,17 @@ spec:
             # chowns it to vitess before dropping privileges. /vt/config (the
             # mycnf templates and init SQL) stays on the image, unmasked.
             - { name: VTDATAROOT, value: "/vtdataroot" }
-          ports: [{ containerPort: 8080 }]
+          # 8080 is the PlanetScale API; 19100-19104 are the per-branch vtgate
+          # MySQL proxies the engine dials to apply DDL to a branch. The proxy
+          # port range is pinned in the config above so the Service can route
+          # exactly these ports (k8s Services cannot express a port range).
+          ports:
+            - { containerPort: 8080 }
+            - { containerPort: 19100 }
+            - { containerPort: 19101 }
+            - { containerPort: 19102 }
+            - { containerPort: 19103 }
+            - { containerPort: 19104 }
           volumeMounts:
             - { name: config, mountPath: /config, readOnly: true }
             - { name: vtdataroot, mountPath: /vtdataroot }
@@ -202,7 +215,15 @@ metadata:
   name: localscale
 spec:
   selector: { app: localscale }
-  ports: [{ port: 8080 }]
+  # Route the PlanetScale API (8080) and the pinned per-branch vtgate MySQL
+  # proxy ports (19100-19104) the engine dials to apply DDL to a branch.
+  ports:
+    - { name: api, port: 8080 }
+    - { name: proxy-0, port: 19100 }
+    - { name: proxy-1, port: 19101 }
+    - { name: proxy-2, port: 19102 }
+    - { name: proxy-3, port: 19103 }
+    - { name: proxy-4, port: 19104 }
 ---
 # Load the entity fixtures into Etre. The fixtures live in
 # e2e/k8s/vitess/fixtures/<entity_type>.json and are mounted via the
