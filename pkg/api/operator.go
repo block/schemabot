@@ -413,7 +413,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
-	if err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply); err != nil {
+	if err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen); err != nil {
 		s.logger.Error("operator: failed to update derived apply state from apply_operations",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
@@ -489,7 +489,7 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, workerID int, own
 		return true
 	}
 
-	if err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply); err != nil {
+	if err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen); err != nil {
 		s.logger.Error("operator: failed to update derived apply state during stop reconciliation",
 			"worker", workerID, "apply_id", finalApply.ApplyIdentifier,
 			"database", finalApply.Database, "environment", finalApply.Environment, "error", err)
@@ -611,7 +611,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, workerID int, 
 		if !marked {
 			return
 		}
-		if err := s.updateApplyStateFromOperations(ctx, workerID, parent); err != nil {
+		if err := s.updateApplyStateFromOperations(ctx, workerID, parent, rejectFailedApplyReopen); err != nil {
 			s.logger.Error("operator: failed to update derived apply state for terminal parent",
 				"worker", workerID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
 				"deployment", op.Deployment, "environment", parent.Environment, "error", err)
@@ -645,7 +645,7 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, wor
 			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
 		return
 	}
-	if err := s.updateApplyStateFromOperations(applyCtx, workerID, apply); err != nil {
+	if err := s.updateApplyStateFromOperations(applyCtx, workerID, apply, allowLeaseScopedFailedReopen); err != nil {
 		s.logger.Error("operator: failed to update derived apply state after failing task-less operation",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
@@ -1012,6 +1012,30 @@ func (s *Service) persistOperationState(ctx context.Context, workerID int, op *s
 	}
 }
 
+// failedApplyReopenPolicy controls whether updateApplyStateFromOperations may
+// reopen a terminal-failed parent apply back to running when the rollout
+// projection legitimately holds it active under on_failure "continue".
+//
+// The reopen write is only safe when the caller holds the parent apply lease:
+// reviving a failed parent through an unscoped, last-write-wins Applies().Update
+// could clobber a concurrent driver. So the lease-scoped drive paths opt in and
+// the unscoped terminal-parent reconciliation path opts out (it stays fail
+// closed, preserving its original invariant that a terminal parent is never
+// revived without a competing-driver guard).
+type failedApplyReopenPolicy bool
+
+const (
+	// rejectFailedApplyReopen keeps the terminal-to-non-terminal guard fully
+	// closed: a terminal parent (including failed) is never revived. Used by the
+	// unscoped reconcileUnclaimableParent path, which holds no parent lease.
+	rejectFailedApplyReopen failedApplyReopenPolicy = false
+	// allowLeaseScopedFailedReopen permits a failed parent to reopen to running
+	// when the continue projection holds it active. Used only by callers that
+	// pass a lease-scoped context, so the write fails closed after ownership
+	// changes.
+	allowLeaseScopedFailedReopen failedApplyReopenPolicy = true
+)
+
 // updateApplyStateFromOperations re-derives applies.state from the apply's child
 // apply_operations rows and persists it when it differs from the current value.
 //
@@ -1028,10 +1052,14 @@ func (s *Service) persistOperationState(ctx context.Context, workerID int, op *s
 //
 // The caller is responsible for lease scoping: the active operator path passes a
 // lease-scoped context so the write fails closed after ownership changes; the
-// terminal-parent reconciliation path passes an unscoped context, which is safe
-// because a terminal parent has no competing driver and the terminal-to-non-
-// terminal guard below refuses to revive it.
-func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID int, apply *storage.Apply) error {
+// terminal-parent reconciliation path passes an unscoped context. The reopen
+// parameter encodes the matching authority — a terminal parent may only be
+// reopened (failed → running, for the continue hold-active projection) by a
+// caller that holds the parent lease (allowLeaseScopedFailedReopen). The
+// unscoped reconciliation path passes rejectFailedApplyReopen so it never
+// revives a terminal parent through a last-write-wins update; every other
+// terminal-to-non-terminal transition stays an error regardless.
+func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID int, apply *storage.Apply, reopen failedApplyReopenPolicy) error {
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
 		return fmt.Errorf("list apply_operations for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
@@ -1040,16 +1068,31 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 		return fmt.Errorf("derive apply state for apply %s (%d): no apply_operations rows", apply.ApplyIdentifier, apply.ID)
 	}
 
+	childStates := make([]string, len(ops))
 	children := make([]state.RolloutChild, len(ops))
 	for i, op := range ops {
+		childStates[i] = op.State
 		children[i] = state.RolloutChild{
 			State:             op.State,
 			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
 		}
 	}
+	base := state.DeriveApplyState(childStates)
 	derived := state.DeriveRolloutApplyState(children)
 
-	if state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived) {
+	// A failed parent is the one terminal state the continue projection can
+	// legitimately reopen: a continuable sibling failure may have terminalized
+	// the parent before the rollout settled, and re-deriving over the operation
+	// rows holds it running until every sibling is terminal. Gate the exception
+	// narrowly — the parent must be failed, the child base must still be failed
+	// (a real continuable failure, not a stale parent over non-failed children),
+	// the derived projection must be running, and the caller must hold the lease.
+	reopensContinuableFailedRollout := bool(reopen) &&
+		state.IsState(apply.State, state.Apply.Failed) &&
+		state.IsState(base, state.Apply.Failed) &&
+		state.IsState(derived, state.Apply.Running)
+
+	if state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived) && !reopensContinuableFailedRollout {
 		return fmt.Errorf("derive apply state for terminal apply %s (%d): child operations derive non-terminal state %q from parent state %q",
 			apply.ApplyIdentifier, apply.ID, derived, apply.State)
 	}

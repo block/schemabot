@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -215,7 +216,7 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 				Environment:     "staging",
 			}
 
-			require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply))
+			require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
 			require.NotNil(t, applyStore.updated, "derived state differs from current, so the apply must be persisted")
 			assert.Equal(t, tc.wantState, applyStore.updated.State)
 			if tc.wantDone {
@@ -223,6 +224,102 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 			} else {
 				assert.Nil(t, applyStore.updated.CompletedAt, "non-terminal derived state leaves completed_at nil")
 			}
+		})
+	}
+}
+
+// TestUpdateApplyStateFromOperations_ReopenFailedGuard verifies the terminal
+// guard's reopen exception. Under on_failure "continue" a sibling failure can
+// terminalize the parent apply to failed before the rollout settles; once a
+// live sibling still derives the projection running, a lease-holding caller may
+// reopen the parent failed → running so the remaining siblings run to
+// completion. The exception is deliberately narrow: only a failed parent over a
+// genuinely failed child base may reopen, only to running, and only when the
+// caller holds the apply lease. Every other terminal-to-non-terminal transition
+// — including reviving a failed parent from an unscoped reconciliation path, and
+// any genuinely terminal verdict (completed/cancelled/reverted) — stays an error.
+func TestUpdateApplyStateFromOperations_ReopenFailedGuard(t *testing.T) {
+	cases := []struct {
+		name       string
+		parent     string
+		ops        []*storage.ApplyOperation
+		reopen     failedApplyReopenPolicy
+		wantErr    bool
+		wantState  string
+		wantUpdate bool
+	}{
+		{
+			name:   "lease-scoped reopen holds the failed apply running for a live sibling",
+			parent: state.Apply.Failed,
+			ops: []*storage.ApplyOperation{
+				{ID: 1, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue},
+				{ID: 2, State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue},
+			},
+			reopen:     allowLeaseScopedFailedReopen,
+			wantState:  state.Apply.Running,
+			wantUpdate: true,
+		},
+		{
+			name:   "unscoped reconciliation refuses to revive a failed apply",
+			parent: state.Apply.Failed,
+			ops: []*storage.ApplyOperation{
+				{ID: 1, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue},
+				{ID: 2, State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue},
+			},
+			reopen:  rejectFailedApplyReopen,
+			wantErr: true,
+		},
+		{
+			name:   "completed apply is never revived even with the lease",
+			parent: state.Apply.Completed,
+			ops: []*storage.ApplyOperation{
+				{ID: 1, State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue},
+				{ID: 2, State: state.ApplyOperation.Completed, OnFailure: storage.OnFailureContinue},
+			},
+			reopen:  allowLeaseScopedFailedReopen,
+			wantErr: true,
+		},
+		{
+			name:   "stale failed apply over a non-failed child base is not reopened",
+			parent: state.Apply.Failed,
+			ops: []*storage.ApplyOperation{
+				{ID: 1, State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue},
+				{ID: 2, State: state.ApplyOperation.Completed, OnFailure: storage.OnFailureContinue},
+			},
+			reopen:  allowLeaseScopedFailedReopen,
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			applyStore := &recordingApplyStore{}
+			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: tc.ops}, applyStore)
+
+			// A terminal parent always carries a stamped completed_at; seed one
+			// so the reopen-clears-completed_at assertion is meaningful.
+			completedAt := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+			apply := &storage.Apply{
+				ID:              7,
+				ApplyIdentifier: "apply-reopen",
+				State:           tc.parent,
+				Environment:     "staging",
+				CompletedAt:     &completedAt,
+			}
+
+			err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, tc.reopen)
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Nil(t, applyStore.updated, "a rejected transition must not persist the apply")
+				return
+			}
+			require.NoError(t, err)
+			if !tc.wantUpdate {
+				assert.Nil(t, applyStore.updated)
+				return
+			}
+			require.NotNil(t, applyStore.updated, "a reopened apply must be persisted")
+			assert.Equal(t, tc.wantState, applyStore.updated.State)
+			assert.Nil(t, applyStore.updated.CompletedAt, "a reopened running apply clears completed_at")
 		})
 	}
 }
@@ -336,7 +433,7 @@ func TestUpdateApplyStateFromOperations_StampsAggregateFailureMessage(t *testing
 		Environment:     "staging",
 	}
 
-	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply))
+	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
 	require.NotNil(t, applyStore.updated, "derived failed state differs from running, so the apply must be persisted")
 	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
 	assert.Equal(t, "deployment region-a failed: spirit: cutover failed", applyStore.updated.ErrorMessage,
@@ -362,7 +459,7 @@ func TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarri
 		ErrorMessage:    "prior reason",
 	}
 
-	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply))
+	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
 	require.NotNil(t, applyStore.updated)
 	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
 	assert.Equal(t, "prior reason", applyStore.updated.ErrorMessage,
