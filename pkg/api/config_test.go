@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
@@ -265,6 +266,39 @@ func TestServerConfig_Validate(t *testing.T) {
 				TernDeployments: TernConfig{},
 			},
 			wantErr: true,
+		},
+		{
+			// A data plane configured with a target_resolver resolves targets
+			// dynamically and needs no database registry.
+			name: "etre target_resolver without databases is valid",
+			cfg: ServerConfig{
+				TargetResolver: TargetResolverConfig{
+					Etre: EtreConfig{
+						Addr:        "http://etre:8080",
+						EntityType:  "aurora_cluster",
+						TargetLabel: "dsid",
+						HostField:   "writer_endpoint",
+						Credentials: EtreCredentialsConfig{
+							Username:    "spirit",
+							PasswordRef: "env:DDL_PASSWORD",
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			// The static-inventory backend is also exempt from the databases
+			// requirement.
+			name: "static target_resolver without databases is valid",
+			cfg: ServerConfig{
+				TargetResolver: TargetResolverConfig{
+					Targets: map[string]inventory.StaticTarget{
+						"dsid-orders-prod": {DatabaseType: "mysql", DSN: "root@tcp(localhost:3306)/"},
+					},
+				},
+			},
+			wantErr: false,
 		},
 		{
 			name: "deployment with no environments",

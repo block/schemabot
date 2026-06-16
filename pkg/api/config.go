@@ -383,6 +383,12 @@ func (c TargetResolverConfig) Configured() bool {
 	return len(c.Targets) > 0
 }
 
+// Enabled reports whether any target-resolver backend is configured (static
+// inventory or Etre). New backends are added here so callers stay correct.
+func (c TargetResolverConfig) Enabled() bool {
+	return c.Configured() || c.Etre.Configured()
+}
+
 // StaticInventory returns the static inventory config for NewStaticResolver.
 func (c TargetResolverConfig) StaticInventory() inventory.StaticConfig {
 	return inventory.StaticConfig{Targets: c.Targets}
@@ -671,11 +677,12 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 
-	// The database registry is required in both local mode and gRPC mode:
-	// local environments provide DSNs, while remote environments provide the
-	// server-owned target/deployment route.
-	if len(c.Databases) == 0 {
-		return fmt.Errorf("databases is required")
+	// The database registry is required for the control plane and for a
+	// single-database data plane. A data plane configured with a target_resolver
+	// resolves opaque targets dynamically and has no database registry, so it is
+	// exempt.
+	if len(c.Databases) == 0 && !c.TargetResolver.Enabled() {
+		return fmt.Errorf("databases or target_resolver is required")
 	}
 
 	if err := validateUniqueNames("environment_order", c.EnvironmentOrder); err != nil {
