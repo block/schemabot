@@ -135,16 +135,21 @@ func writeDeploymentCounts(sb *strings.Builder, counts []presentation.StateCount
 // reason is the first failed operation's error — the same operation the
 // persisted aggregate ErrorMessage is stamped from — and falls back to naming
 // the deployment when that operation carried no error detail.
+//
+// The deployment name is wrapped in a <code> element rather than Markdown
+// backticks: a name may contain HTML-significant characters (and backticks
+// themselves), and HTML-escaped text inside a code span would render its
+// entities literally.
 func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deployment) {
 	if failure == nil {
 		return
 	}
 	name := html.EscapeString(failure.Deployment)
 	if failure.Error == "" {
-		fmt.Fprintf(sb, "\n> ⚠️ **First failure:** `%s`\n", name)
+		fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code>\n", name)
 		return
 	}
-	fmt.Fprintf(sb, "\n> ⚠️ **First failure:** `%s` — %s\n", name, html.EscapeString(failure.Error))
+	fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(failure.Error))
 }
 
 // writeAggregateNextAction renders the single suggested operator action derived

@@ -203,12 +203,14 @@ func Derive(ops []Operation) Apply {
 // firstFailure returns the first deployment, in resolved order, whose raw
 // operation state is terminally failed, or nil when none failed. failed_retryable
 // is excluded: a retrying deployment is still in progress and surfaces no
-// operator-facing failure. The result aliases the slice element so the renderer
-// reads the same derived label and error.
+// operator-facing failure. The result is a copy, not an alias into Deployments,
+// so a caller that later re-slices or sorts Deployments cannot turn it into a
+// stale pointer.
 func firstFailure(deps []Deployment) *Deployment {
 	for i := range deps {
 		if deps[i].State == state.ApplyOperation.Failed {
-			return &deps[i]
+			failed := deps[i]
+			return &failed
 		}
 	}
 	return nil

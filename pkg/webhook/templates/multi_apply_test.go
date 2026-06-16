@@ -89,7 +89,7 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	assert.Contains(t, out, "<details open>\n<summary>⏸ au — halted — us failed</summary>")
 	// With no error detail on the failed operation, the first-failure line names
 	// the deployment without a reason.
-	assert.Contains(t, out, "> ⚠️ **First failure:** `us`\n")
+	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code>\n")
 }
 
 // firstFailingOp builds a rolling, continue-policy operation carrying an error,
@@ -116,9 +116,9 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureSurfacesError(t *testing.
 
 	// A later deployment is still running even though the aggregate is fail-closed.
 	assert.Contains(t, out, "- 🔄 au — running table copy")
-	assert.Contains(t, out, "> ⚠️ **First failure:** `us` — Error 1061: Duplicate key name idx\n")
+	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — Error 1061: Duplicate key name idx\n")
 	// Only the earliest failure is lifted to the header.
-	assert.NotContains(t, out, "First failure:** `eu`")
+	assert.NotContains(t, out, "First failure:** <code>eu</code>")
 }
 
 // A healthy rollout (no failed deployment) renders no first-failure line.
@@ -150,7 +150,23 @@ func TestRenderMultiDeploymentApplySummaryComment_FirstFailureSurfacesError(t *t
 		Environment: "production",
 	})
 
-	assert.Contains(t, out, "> ⚠️ **First failure:** `us` — boom &lt;script&gt;\n")
+	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — boom &lt;script&gt;\n")
+}
+
+// A deployment name with HTML-significant characters is escaped inside the
+// <code> element, so it renders correctly rather than leaking entities the way
+// an escaped Markdown code span would.
+func TestRenderMultiDeploymentApplyComment_FirstFailureEscapesName(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "us&ca", State: so.Failed, HaltOnFailure: true, Error: "boom"},
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us&amp;ca</code> — boom\n")
 }
 
 // Each deployment's <details> body is rendered by the single-deployment renderer,

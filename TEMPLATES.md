@@ -4603,7 +4603,7 @@ _No details available yet._
 
 **Deployments**: 1 completed, 2 halted, 1 failed
 
-> ⚠️ **First failure:** `us` — lock wait timeout exceeded; try restarting transaction
+> ⚠️ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -4953,7 +4953,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 **Deployments**: 1 completed, 2 halted, 1 failed
 
-> ⚠️ **First failure:** `us` — lock wait timeout exceeded; try restarting transaction
+> ⚠️ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
 
 ---
 
