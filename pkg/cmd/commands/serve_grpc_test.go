@@ -37,6 +37,90 @@ func TestBuildGRPCTernClientRoutesWhenTargetResolverConfigured(t *testing.T) {
 	assert.True(t, ok, "expected a TargetRouter when target_resolver is configured")
 }
 
+// When a target_resolver.etre block is configured, the data plane routes
+// through the Etre-backed resolver, resolving each target against Etre per
+// request rather than binding to one database.
+func TestBuildGRPCTernClientRoutesViaEtreResolver(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	config := &api.ServerConfig{
+		TargetResolver: api.TargetResolverConfig{
+			Etre: api.EtreConfig{
+				Addr:        "https://etre.example",
+				EntityType:  "cluster",
+				TargetLabel: "dsid",
+				HostField:   "writer_endpoint",
+				Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+			},
+		},
+	}
+
+	client, err := buildGRPCTernClient(config, mysqlstore.New(nil), logger, "")
+	require.NoError(t, err)
+	_, ok := client.(*tern.TargetRouter)
+	assert.True(t, ok, "expected a TargetRouter when target_resolver.etre is configured")
+}
+
+// Configuring both the Etre resolver and static targets is ambiguous until
+// per-target overrides exist, so startup fails closed rather than silently
+// picking one.
+func TestBuildGRPCTernClientErrorsWhenEtreAndStaticBothConfigured(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	config := &api.ServerConfig{
+		TargetResolver: api.TargetResolverConfig{
+			Targets: map[string]inventory.StaticTarget{
+				"dsid-orders-prod": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(localhost:3306)/"},
+			},
+			Etre: api.EtreConfig{
+				Addr: "https://etre.example", EntityType: "cluster", TargetLabel: "dsid",
+				HostField: "writer_endpoint", Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+			},
+		},
+	}
+
+	_, err := buildGRPCTernClient(config, mysqlstore.New(nil), logger, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "both etre and static")
+}
+
+// The Etre resolver's lazily-validated fields are checked at startup so a
+// misconfiguration fails fast instead of on the first request.
+func TestBuildEtreResolverValidatesConfig(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	base := api.EtreConfig{
+		Addr: "https://etre.example", EntityType: "cluster", TargetLabel: "dsid",
+		HostField: "writer_endpoint", Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+	}
+
+	_, err := buildEtreResolver(base, logger)
+	require.NoError(t, err)
+
+	noHost := base
+	noHost.HostField = ""
+	_, err = buildEtreResolver(noHost, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "host_field")
+
+	noPassword := base
+	noPassword.Credentials.PasswordRef = ""
+	_, err = buildEtreResolver(noPassword, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "password_ref")
+
+	noUsername := base
+	noUsername.Credentials.Username = ""
+	_, err = buildEtreResolver(noUsername, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "username")
+
+	// A secret ref that resolves to empty (e.g. an unset env var) fails closed
+	// with config context rather than a generic downstream error.
+	emptyAddr := base
+	emptyAddr.Addr = "env:UNSET_ETRE_ADDR"
+	_, err = buildEtreResolver(emptyAddr, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "addr resolved to an empty value")
+}
+
 // Without a target resolver the data plane falls back to a single LocalClient
 // bound to the first database configured for the environment, preserving the
 // pre-router single-database serving mode.

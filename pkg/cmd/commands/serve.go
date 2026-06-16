@@ -22,10 +22,12 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/etre"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
@@ -296,10 +298,17 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 // Otherwise it falls back to a single LocalClient bound to the one database
 // configured for env.
 func buildGRPCTernClient(config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string) (tern.Client, error) {
-	if config.TargetResolver.Configured() {
-		resolver, err := inventory.NewStaticResolver(config.TargetResolver.StaticInventory())
+	etreConfigured := config.TargetResolver.Etre.Configured()
+	staticConfigured := config.TargetResolver.Configured()
+
+	if etreConfigured && staticConfigured {
+		return nil, fmt.Errorf("target_resolver configures both etre and static targets; per-target overrides are not yet supported — use one")
+	}
+
+	if etreConfigured || staticConfigured {
+		resolver, err := buildTargetResolver(config.TargetResolver, logger)
 		if err != nil {
-			return nil, fmt.Errorf("build static target resolver: %w", err)
+			return nil, err
 		}
 		router, err := tern.NewTargetRouter(tern.TargetRouterConfig{
 			Resolver:           resolver,
@@ -310,7 +319,6 @@ func buildGRPCTernClient(config *api.ServerConfig, st *mysqlstore.Storage, logge
 		if err != nil {
 			return nil, fmt.Errorf("build target router: %w", err)
 		}
-		logger.Info("gRPC server routing by target resolver", "targets", len(config.TargetResolver.Targets))
 		return router, nil
 	}
 
@@ -357,6 +365,70 @@ func buildGRPCTernClient(config *api.ServerConfig, st *mysqlstore.Storage, logge
 	}
 	logger.Info("gRPC server using database", "database", dbName, "environment", env)
 	return client, nil
+}
+
+// buildTargetResolver builds the configured inventory.Resolver — the Etre
+// dynamic backend or the static inventory. The caller guarantees exactly one is
+// configured.
+func buildTargetResolver(cfg api.TargetResolverConfig, logger *slog.Logger) (inventory.Resolver, error) {
+	if cfg.Etre.Configured() {
+		resolver, err := buildEtreResolver(cfg.Etre, logger)
+		if err != nil {
+			return nil, fmt.Errorf("build etre resolver: %w", err)
+		}
+		logger.Info("gRPC server routing by etre resolver",
+			"entity_type", cfg.Etre.EntityType, "target_label", cfg.Etre.TargetLabel)
+		return resolver, nil
+	}
+
+	resolver, err := inventory.NewStaticResolver(cfg.StaticInventory())
+	if err != nil {
+		return nil, fmt.Errorf("build static target resolver: %w", err)
+	}
+	logger.Info("gRPC server routing by static target resolver", "targets", len(cfg.Targets))
+	return resolver, nil
+}
+
+// buildEtreResolver assembles the Etre-backed MySQL resolver from config: the
+// Etre query client, the namespace-free MySQL connection assembler, and the
+// secret-ref credential resolver. Lazily-validated fields (host, password ref)
+// are checked here so a misconfiguration fails at startup, not first request.
+func buildEtreResolver(cfg api.EtreConfig, logger *slog.Logger) (inventory.Resolver, error) {
+	if cfg.HostField == "" {
+		return nil, fmt.Errorf("target_resolver.etre.host_field is required")
+	}
+	if cfg.Credentials.Username == "" {
+		return nil, fmt.Errorf("target_resolver.etre.credentials.username is required")
+	}
+	if cfg.Credentials.PasswordRef == "" {
+		return nil, fmt.Errorf("target_resolver.etre.credentials.password_ref is required")
+	}
+	addr, err := secrets.Resolve(cfg.Addr, "")
+	if err != nil {
+		return nil, fmt.Errorf("resolve target_resolver.etre.addr: %w", err)
+	}
+	// A secret ref (env:/file:/secretsmanager:) can resolve to "" without error;
+	// surface that as a clear config error rather than a generic downstream one.
+	if addr == "" {
+		return nil, fmt.Errorf("target_resolver.etre.addr resolved to an empty value")
+	}
+	client, err := etre.New(etre.Config{Addr: addr, EntityType: cfg.EntityType, Logger: logger})
+	if err != nil {
+		return nil, fmt.Errorf("build etre client: %w", err)
+	}
+	return etre.NewEtreResolver(etre.EtreResolverConfig{
+		Client:          client,
+		TargetLabel:     cfg.TargetLabel,
+		Labels:          cfg.Labels,
+		EnvLabel:        cfg.EnvLabel,
+		HostField:       cfg.HostField,
+		AttributeFields: cfg.AttributeFields,
+		Credentials: inventory.SecretRefCredentialResolver{
+			Username:    cfg.Credentials.Username,
+			PasswordRef: cfg.Credentials.PasswordRef,
+		},
+		Assembler: inventory.MySQLConnectionAssembler{DefaultPort: cfg.DefaultPort},
+	})
 }
 
 // grpcLocalClientFactory returns a LocalClientFactory that applies server-level

@@ -371,11 +371,11 @@ type DSNFromConfigPaths struct {
 
 // TargetResolverConfig configures the data-plane connection resolver. Targets
 // is the static target -> connection inventory: the "no inventory service"
-// fallback and per-target overrides. A dynamic backend (e.g. Etre) discovers
-// targets by key and needs no enumeration here, so it will slot in as a sibling
-// field without changing this shape.
+// fallback. Etre is the dynamic backend that discovers targets by key at request
+// time. Each is one pluggable backend behind the same resolver interface.
 type TargetResolverConfig struct {
 	Targets map[string]inventory.StaticTarget `yaml:"targets,omitempty"`
+	Etre    EtreConfig                        `yaml:"etre,omitempty"`
 }
 
 // Configured reports whether the data plane has any static target inventory.
@@ -386,6 +386,45 @@ func (c TargetResolverConfig) Configured() bool {
 // StaticInventory returns the static inventory config for NewStaticResolver.
 func (c TargetResolverConfig) StaticInventory() inventory.StaticConfig {
 	return inventory.StaticConfig{Targets: c.Targets}
+}
+
+// EtreConfig configures the data-plane MySQL resolver backed by Etre: the Etre
+// lookup that maps an opaque target to a cluster endpoint, plus the credentials
+// for the assembled connection. It is the common-path dynamic resolver;
+// additional engines and per-target overrides layer on without reshaping it.
+type EtreConfig struct {
+	// Addr is the Etre server address (supports secret refs, e.g. env:ETRE_ADDR).
+	Addr string `yaml:"addr"`
+	// EntityType is the Etre entity type recording MySQL clusters.
+	EntityType string `yaml:"entity_type"`
+	// TargetLabel is the Etre label the request's opaque target matches.
+	TargetLabel string `yaml:"target_label"`
+	// EnvLabel, when set, scopes the lookup to the request environment.
+	EnvLabel string `yaml:"env_label,omitempty"`
+	// Labels are fixed selector predicates added to every lookup (e.g. a region).
+	Labels map[string]string `yaml:"labels,omitempty"`
+	// HostField is the entity field holding the connection host.
+	HostField string `yaml:"host_field"`
+	// DefaultPort is appended to the host when it has no port.
+	DefaultPort string `yaml:"default_port,omitempty"`
+	// AttributeFields are entity fields surfaced to the credential resolver.
+	AttributeFields []string `yaml:"attribute_fields,omitempty"`
+	// Credentials configures the username and password for the connection.
+	Credentials EtreCredentialsConfig `yaml:"credentials"`
+}
+
+// EtreCredentialsConfig configures credentials for an Etre-resolved target.
+// Credentials never come from Etre: the username is configured and the password
+// is a secret reference (env:, file:, secretsmanager:, or a literal), optionally
+// carrying a {target} placeholder for per-target secret naming.
+type EtreCredentialsConfig struct {
+	Username    string `yaml:"username"`
+	PasswordRef string `yaml:"password_ref"`
+}
+
+// Configured reports whether the data plane should resolve targets through Etre.
+func (c EtreConfig) Configured() bool {
+	return strings.TrimSpace(c.Addr) != ""
 }
 
 // DatabaseConfig holds configuration for a registered database.
