@@ -60,7 +60,7 @@ func (s *exactProgressApplyStore) Update(_ context.Context, apply *storage.Apply
 	return nil
 }
 
-func (s *exactProgressApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, completedAt *time.Time) (bool, error) {
+func (s *exactProgressApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
 	if s.err != nil {
 		return false, s.err
 	}
@@ -69,6 +69,9 @@ func (s *exactProgressApplyStore) UpdateDerivedState(_ context.Context, _ int64,
 	}
 	s.apply.State = newState
 	s.apply.ErrorMessage = errorMessage
+	if s.apply.StartedAt == nil {
+		s.apply.StartedAt = startedAt
+	}
 	s.apply.CompletedAt = completedAt
 	return true, nil
 }
@@ -107,7 +110,7 @@ func (s *snapshotApplyStore) Update(_ context.Context, apply *storage.Apply) err
 	return nil
 }
 
-func (s *snapshotApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, completedAt *time.Time) (bool, error) {
+func (s *snapshotApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
 	if s.err != nil {
 		return false, s.err
 	}
@@ -116,6 +119,9 @@ func (s *snapshotApplyStore) UpdateDerivedState(_ context.Context, _ int64, expe
 	}
 	s.stored.State = newState
 	s.stored.ErrorMessage = errorMessage
+	if s.stored.StartedAt == nil {
+		s.stored.StartedAt = startedAt
+	}
 	s.stored.CompletedAt = completedAt
 	return true, nil
 }
