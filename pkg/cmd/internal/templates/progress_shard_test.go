@@ -117,6 +117,19 @@ func TestFormatDurationSeconds(t *testing.T) {
 	}
 }
 
+func TestFormatShardLineDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+	line := formatShardLine(ShardProgress{
+		Shard:           "-80",
+		Status:          state.Task.Running,
+		RowsCopied:      3_000,
+		RowsTotal:       1_604_159,
+		PercentComplete: 0,
+	})
+
+	assert.Contains(t, line, "1% (3,000/1,604,159 rows)")
+	assert.NotContains(t, line, "0%")
+}
+
 func TestIsVSchemaTask(t *testing.T) {
 	assert.True(t, isVSchemaTask(TableProgress{TableName: "VSchema"}))
 	assert.True(t, isVSchemaTask(TableProgress{TableName: "vschema:myapp_sharded"}))

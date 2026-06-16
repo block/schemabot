@@ -64,6 +64,17 @@ func ClampPercent(pct int) int {
 	return pct
 }
 
+// RowCopyDisplayPercent returns the percentage to show for row-copy progress.
+// A non-zero copied row count means copying has begun, so display at least 1%
+// even when integer progress rounds down to 0%.
+func RowCopyDisplayPercent(pct int, rowsCopied int64) int {
+	displayPercent := ClampPercent(pct)
+	if displayPercent == 0 && rowsCopied > 0 {
+		return 1
+	}
+	return displayPercent
+}
+
 // NowFunc returns the current time. Override in previews for deterministic output.
 var NowFunc = time.Now
 

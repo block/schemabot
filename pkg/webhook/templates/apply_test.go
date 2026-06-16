@@ -68,6 +68,27 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "Queued")
 }
 
+func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Running,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "users", Status: state.Task.Completed},
+			{TableName: "orders", Status: state.Task.Running, RowsCopied: 3_000, RowsTotal: 1_604_159, PercentComplete: 0},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "1 running (1%)")
+	assert.Contains(t, result, "**`orders`**: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, result, "Rows: 3,000 / 1,604,159")
+	assert.NotContains(t, result, " 0%")
+}
+
 func TestRenderApplyStatusComment_EstimateExceeded(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",

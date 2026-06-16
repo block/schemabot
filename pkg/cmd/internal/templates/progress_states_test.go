@@ -242,6 +242,23 @@ func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	assert.NotContains(t, output, "Recovering state...")
 }
 
+func TestFormatTableProgress_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+	tp := TableProgress{
+		TableName:       "orders",
+		ChangeType:      "alter",
+		Status:          state.Apply.Running,
+		RowsCopied:      3_000,
+		RowsTotal:       1_604_159,
+		PercentComplete: 0,
+	}
+
+	output := FormatTableProgress(tp)
+
+	assert.Contains(t, output, "orders: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, output, "Rows: 3,000 / 1,604,159")
+	assert.NotContains(t, output, " 0%")
+}
+
 func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 	t.Run("with progress", func(t *testing.T) {
 		tp := TableProgress{
