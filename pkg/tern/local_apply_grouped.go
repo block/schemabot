@@ -317,6 +317,69 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 	return *task.ApplyOperationID, nil
 }
 
+// tasksForOperation returns the subset of tasks belonging to the given
+// apply_operation. It is nil-safe: a nil task or one without an
+// apply_operation_id is skipped. Callers use it to scope an apply-wide task set
+// (which spans multiple operations once an apply fans out) down to a single
+// operation before deriving that operation's state.
+func tasksForOperation(tasks []*storage.Task, operationID int64) []*storage.Task {
+	var scoped []*storage.Task
+	for _, task := range tasks {
+		if task == nil || task.ApplyOperationID == nil {
+			continue
+		}
+		if *task.ApplyOperationID == operationID {
+			scoped = append(scoped, task)
+		}
+	}
+	return scoped
+}
+
+// classifyOperationTasks reports how a task set maps to the apply-operation
+// model so deriveAggregateApplyState can distinguish three cases that must be
+// handled differently:
+//
+//   - No operation model (usesModel=false, err=nil): every task carries no
+//     apply_operation_id, or the set is empty. There are no siblings, so the
+//     per-task derivation is authoritative and may terminalize. This preserves
+//     single-writer/legacy behaviour for applies written before the apply-create
+//     path populated apply_operation_id.
+//   - Single operation (usesModel=true, err=nil): every task carries the same
+//     apply_operation_id. The sibling-row projection applies.
+//   - Ambiguous (err!=nil): the tasks span multiple operation ids, mix
+//     operation-model and legacy rows, or include a nil task. The set cannot be
+//     attributed to one operation, so a terminal aggregate derived from it would
+//     be unsafe; the caller must fail closed.
+//
+// It is intentionally stricter than applyOperationIDForTasks's "no operation"
+// fallback: a mixed set is an error here, not a legacy no-op-model case.
+func classifyOperationTasks(tasks []*storage.Task) (operationID int64, usesModel bool, err error) {
+	var sawNil, sawID bool
+	for _, task := range tasks {
+		if task == nil {
+			return 0, false, fmt.Errorf("apply operation task is nil")
+		}
+		if task.ApplyOperationID == nil || *task.ApplyOperationID == 0 {
+			sawNil = true
+			continue
+		}
+		id := *task.ApplyOperationID
+		if sawID && operationID != id {
+			return 0, false, fmt.Errorf("tasks span multiple apply operations: %d and %d", operationID, id)
+		}
+		operationID = id
+		sawID = true
+	}
+	switch {
+	case sawID && sawNil:
+		return 0, false, fmt.Errorf("tasks mix operation-model and legacy rows")
+	case sawID:
+		return operationID, true, nil
+	default:
+		return 0, false, nil
+	}
+}
+
 // deriveAggregateApplyState computes applies.state as the rollout projection
 // over every apply_operation row of the apply, accounting for each operation's
 // on_failure policy via state.DeriveRolloutApplyState. The boolean is false when
@@ -340,13 +403,19 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 // With one operation per apply the sibling set is the current operation alone,
 // so the projection collapses to the current deployment's derived state.
 //
-// Two outcomes are distinguished when the full sibling set is not available:
+// Three outcomes are distinguished when the full sibling set is not available:
 //
 //   - The apply does not use the operation model — its tasks carry no
 //     apply_operation_id, or the operation store is not configured. There are no
 //     siblings, so the per-task derivation is authoritative and may terminalize.
 //     This preserves single-writer/legacy behaviour for applies written before
 //     the apply-create path populated apply_operation_id.
+//
+//   - The task set is not scoped to one operation — it spans multiple
+//     apply_operation_ids or mixes operation-model and legacy rows. The set
+//     cannot be attributed to a single operation, so its derived state is not a
+//     meaningful per-operation state and must not terminalize the apply. The
+//     projection fails closed (ok=false) so the caller keeps the stored value.
 //
 //   - The apply uses the operation model (its tasks carry an apply_operation_id)
 //     but the sibling rows cannot be read consistently — the list call failed,
@@ -375,12 +444,21 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 		return currentOpState, true
 	}
 
-	operationID, err := applyOperationIDForTasks(tasks)
+	operationID, usesModel, err := classifyOperationTasks(tasks)
 	if err != nil {
+		// The task set cannot be attributed to a single apply operation: it spans
+		// multiple operation ids or mixes operation-model and legacy rows. The
+		// sibling states are unknowable from such a mix, so fail closed rather
+		// than task-deriving a possibly terminal aggregate from an ambiguous set.
+		c.logger.Warn("cannot determine aggregate apply state: task set is not scoped to one apply operation",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return failClosed()
+	}
+	if !usesModel {
 		// No operation model in use: tasks carry no apply_operation_id, so there
 		// are no siblings and the per-task derivation is authoritative.
 		c.logger.Debug("deriving apply state from tasks: apply has no operation model",
-			"apply_id", apply.ApplyIdentifier, "reason", err)
+			"apply_id", apply.ApplyIdentifier)
 		return currentOpState, true
 	}
 
