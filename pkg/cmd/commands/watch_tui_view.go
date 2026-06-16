@@ -41,6 +41,9 @@ func (m WatchModel) View() string {
 	if state.IsState(m.state, state.NoActiveChange) {
 		return "No active schema change for this database.\n"
 	}
+	if len(m.operations) > 1 {
+		return m.multiDeploymentProgressView()
+	}
 
 	return m.progressView()
 }
@@ -290,6 +293,7 @@ func toTemplateTables(tables []tableProgress) []templates.TableProgress {
 		}
 		tp := templates.TableProgress{
 			TableName:       t.Name,
+			Deployment:      t.Deployment,
 			Namespace:       t.Keyspace,
 			DDL:             t.DDL,
 			ChangeType:      t.ChangeType,

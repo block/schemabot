@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 type tuiPreviewScenario struct {
@@ -44,6 +45,32 @@ var tuiPreviewScenarios = map[string]tuiPreviewScenario{
 						RowsTotal:       100000000,
 						PercentComplete: 145,
 					},
+				},
+			}
+		},
+	},
+	"tui_multi_deploy": {
+		Name:        "tui_multi_deploy",
+		Description: "Multi-deployment apply rollout",
+		ApplyID:     "apply-multi-a1b2c3d4",
+		Progress: func(poll int64) apitypes.ProgressResponse {
+			return apitypes.ProgressResponse{
+				State:       state.Apply.Running,
+				Engine:      "Spirit",
+				ApplyID:     "apply-multi-a1b2c3d4",
+				Database:    "orders",
+				Environment: "production",
+				Caller:      "octocat",
+				StartedAt:   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339),
+				Operations: []*apitypes.ProgressOperationResponse{
+					{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
+					{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
+					{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
+				},
+				Tables: []*apitypes.TableProgressResponse{
+					{Deployment: "us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.WaitingForCutover, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
+					{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Running, RowsCopied: 42000 + poll*500, RowsTotal: 120000, PercentComplete: 35, ETASeconds: 240},
+					{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
 				},
 			}
 		},
@@ -98,11 +125,12 @@ func previewTUIStatic(scenario tuiPreviewScenario) error {
 	model.metadata = msg.metadata
 	model.state = msg.state
 	model.tables = msg.tables
+	model.operations = msg.operations
 	model.errorMsg = msg.errorMsg
 	model.currentVolume = msg.volume
 	model.initialized = true
 
-	fmt.Print(model.progressView())
+	fmt.Print(model.View())
 	return nil
 }
 

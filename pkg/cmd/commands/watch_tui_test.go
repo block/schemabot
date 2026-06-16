@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -12,7 +13,9 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -263,6 +266,87 @@ func TestWatchModel_EstimateExceededUsesActivityLabel(t *testing.T) {
 	assert.Contains(t, view, "Rows copied: 145,000 so far")
 	assert.Contains(t, view, "More rows than initially estimated, copying is still active and will continue")
 	assert.NotContains(t, view, "145%")
+}
+
+func TestWatchModel_MultiDeploymentView(t *testing.T) {
+	progress := multiDeploymentTUITestProgress()
+	msg := parseProgressResult(&progress)
+
+	m := NewWatchModel("http://localhost:8080", msg.database, msg.environment, false)
+	m.applyID = msg.applyID
+	m.state = msg.state
+	m.tables = msg.tables
+	m.operations = msg.operations
+	m.errorMsg = msg.errorMsg
+	m.initialized = true
+	m.activityLabelFrame = 2
+
+	view := m.View()
+
+	assert.Contains(t, view, "1 completed · 1 halted · 1 failed")
+	assert.Contains(t, view, "⚠ First failure: eu-west — duplicate key name 'idx_orders_source'")
+	assert.Contains(t, view, "Apply ID: apply-multi-test")
+	assert.Contains(t, view, "Environment: production")
+	assertContainsInOrder(t, view,
+		"✅ us-east — completed (orders-us-east)",
+		"❌ eu-west — failed (orders-eu-west)",
+		"⏸ ap-south — halted — eu-west failed (orders-ap-south)",
+	)
+	assert.Contains(t, view, "duplicate key name 'idx_orders_source'")
+	assert.Contains(t, view, "orders")
+	assert.Contains(t, view, "✓ Complete")
+	assert.Contains(t, view, "Failed")
+}
+
+func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "orders", "production", false)
+	m.applyID = "apply-single-test"
+	m.state = state.Apply.Running
+	m.initialized = true
+	m.tables = []tableProgress{{
+		Name:       "orders",
+		Status:     state.Task.Running,
+		RowsCopied: 420,
+		RowsTotal:  1000,
+		Percent:    42,
+	}}
+
+	withoutOperations := m.View()
+	m.operations = []templates.ProgressOperation{{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Running}}
+	withSingleOperation := m.View()
+
+	assert.Equal(t, withoutOperations, withSingleOperation)
+	assert.NotContains(t, withSingleOperation, "1 running")
+	assert.NotContains(t, withSingleOperation, "us-east — running table copy")
+}
+
+func multiDeploymentTUITestProgress() apitypes.ProgressResponse {
+	return apitypes.ProgressResponse{
+		State:       state.Apply.Failed,
+		ApplyID:     "apply-multi-test",
+		Database:    "orders",
+		Environment: "production",
+		Operations: []*apitypes.ProgressOperationResponse{
+			{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+			{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate key name 'idx_orders_source'"},
+			{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		},
+		Tables: []*apitypes.TableProgressResponse{
+			{Deployment: "us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
+			{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Failed},
+			{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
+		},
+	}
+}
+
+func assertContainsInOrder(t *testing.T, text string, values ...string) {
+	t.Helper()
+	start := 0
+	for _, value := range values {
+		idx := strings.Index(text[start:], value)
+		require.NotEqual(t, -1, idx, "expected %q after offset %d", value, start)
+		start += idx + len(value)
+	}
 }
 
 func TestWatchModel_SpinnerTickAdvancesActivityLabel(t *testing.T) {
