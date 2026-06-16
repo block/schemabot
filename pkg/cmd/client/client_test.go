@@ -65,6 +65,38 @@ func TestCallPullSchemaAPIError(t *testing.T) {
 	assert.Contains(t, err.Error(), "database not configured")
 }
 
+func TestListDatabases(t *testing.T) {
+	var gotType string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/api/databases", r.URL.Path)
+		gotType = r.URL.Query().Get("type")
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.DatabaseListResponse{
+			Databases: []*apitypes.DatabaseResponse{
+				{
+					Database: "orders",
+					Type:     "mysql",
+					Environments: []*apitypes.DatabaseEnvironmentResponse{
+						{Environment: "production", Deployments: []string{"pie"}},
+					},
+				},
+			},
+		}))
+	}))
+	t.Cleanup(server.Close)
+
+	result, err := ListDatabases(server.URL, ListDatabasesOptions{Type: "mysql"})
+	require.NoError(t, err)
+
+	assert.Equal(t, "mysql", gotType)
+	require.NotNil(t, result)
+	require.Len(t, result.Databases, 1)
+	assert.Equal(t, "orders", result.Databases[0].Database)
+	assert.Equal(t, "mysql", result.Databases[0].Type)
+	assert.Equal(t, []string{"pie"}, result.Databases[0].Environments[0].Deployments)
+}
+
 func TestGetStatusWithOptions(t *testing.T) {
 	var gotLimit, gotEnvironment, gotFailed string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

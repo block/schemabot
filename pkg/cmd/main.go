@@ -36,6 +36,7 @@ type CLI struct {
 	Revert     commands.RevertCmd     `cmd:"" help:"Revert a completed schema change during the revert window"`
 	SkipRevert commands.SkipRevertCmd `cmd:"" name:"skip-revert" help:"Skip the revert window, finalizing the schema change"`
 	Rollback   commands.RollbackCmd   `cmd:"" help:"Rollback to the previous schema state"`
+	Databases  commands.DatabasesCmd  `cmd:"" help:"List configured databases"`
 	Unlock     commands.UnlockCmd     `cmd:"" help:"Release a database lock"`
 	Locks      commands.LocksCmd      `cmd:"" help:"List all active database locks"`
 	Logs       commands.LogsCmd       `cmd:"" help:"View apply logs"`

@@ -52,6 +52,26 @@ func GetEnvironments(endpoint, database string) ([]string, error) {
 	return result.Environments, nil
 }
 
+// ListDatabasesOptions controls database list request fields.
+type ListDatabasesOptions struct {
+	Type string
+}
+
+// ListDatabases fetches the configured databases known to the server.
+func ListDatabases(endpoint string, opts ListDatabasesOptions) (*apitypes.DatabaseListResponse, error) {
+	requestPath := "/api/databases"
+	if opts.Type != "" {
+		values := url.Values{}
+		values.Set("type", opts.Type)
+		requestPath += "?" + values.Encode()
+	}
+	var result apitypes.DatabaseListResponse
+	if err := doGetInto(endpoint, requestPath, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // PullSchemaOptions controls optional live schema pull request fields.
 type PullSchemaOptions struct {
 	Namespaces    []string
