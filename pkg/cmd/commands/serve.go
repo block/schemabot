@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/awscreds"
 	"github.com/block/schemabot/pkg/etre"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/inventory"
@@ -266,7 +269,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 // execution target through a TargetRouter; otherwise it falls back to a single
 // LocalClient bound to the one database configured for TERN_ENVIRONMENT.
 func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, port string) (*grpc.Server, error) {
-	client, err := buildGRPCTernClient(config, st, logger, os.Getenv("TERN_ENVIRONMENT"))
+	client, err := buildGRPCTernClient(ctx, config, st, logger, os.Getenv("TERN_ENVIRONMENT"))
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +300,7 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 // environment is unused in this mode because each request carries its own.
 // Otherwise it falls back to a single LocalClient bound to the one database
 // configured for env.
-func buildGRPCTernClient(config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string) (tern.Client, error) {
+func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string) (tern.Client, error) {
 	etreConfigured := config.TargetResolver.Etre.Configured()
 	staticConfigured := config.TargetResolver.Configured()
 
@@ -306,7 +309,7 @@ func buildGRPCTernClient(config *api.ServerConfig, st *mysqlstore.Storage, logge
 	}
 
 	if etreConfigured || staticConfigured {
-		resolver, err := buildTargetResolver(config.TargetResolver, logger)
+		resolver, err := buildTargetResolver(ctx, config.TargetResolver, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -370,14 +373,15 @@ func buildGRPCTernClient(config *api.ServerConfig, st *mysqlstore.Storage, logge
 // buildTargetResolver builds the configured inventory.Resolver — the Etre
 // dynamic backend or the static inventory. The caller guarantees exactly one is
 // configured.
-func buildTargetResolver(cfg api.TargetResolverConfig, logger *slog.Logger) (inventory.Resolver, error) {
+func buildTargetResolver(ctx context.Context, cfg api.TargetResolverConfig, logger *slog.Logger) (inventory.Resolver, error) {
 	if cfg.Etre.Configured() {
-		resolver, err := buildEtreResolver(cfg.Etre, logger)
+		resolver, err := buildEtreResolver(ctx, cfg.Etre, logger)
 		if err != nil {
 			return nil, fmt.Errorf("build etre resolver: %w", err)
 		}
 		logger.Info("gRPC server routing by etre resolver",
-			"entity_type", cfg.Etre.EntityType, "target_label", cfg.Etre.TargetLabel)
+			"entity_type", cfg.Etre.EntityType, "target_label", cfg.Etre.TargetLabel,
+			"credentials", credentialType(cfg.Etre.Credentials))
 		return resolver, nil
 	}
 
@@ -391,17 +395,15 @@ func buildTargetResolver(cfg api.TargetResolverConfig, logger *slog.Logger) (inv
 
 // buildEtreResolver assembles the Etre-backed MySQL resolver from config: the
 // Etre query client, the namespace-free MySQL connection assembler, and the
-// secret-ref credential resolver. Lazily-validated fields (host, password ref)
+// configured credential resolver. Lazily-validated fields (host, credentials)
 // are checked here so a misconfiguration fails at startup, not first request.
-func buildEtreResolver(cfg api.EtreConfig, logger *slog.Logger) (inventory.Resolver, error) {
+func buildEtreResolver(ctx context.Context, cfg api.EtreConfig, logger *slog.Logger) (inventory.Resolver, error) {
 	if cfg.HostField == "" {
 		return nil, fmt.Errorf("target_resolver.etre.host_field is required")
 	}
-	if cfg.Credentials.Username == "" {
-		return nil, fmt.Errorf("target_resolver.etre.credentials.username is required")
-	}
-	if cfg.Credentials.PasswordRef == "" {
-		return nil, fmt.Errorf("target_resolver.etre.credentials.password_ref is required")
+	creds, err := buildCredentialResolver(ctx, cfg.Credentials)
+	if err != nil {
+		return nil, err
 	}
 	addr, err := secrets.Resolve(cfg.Addr, "")
 	if err != nil {
@@ -422,13 +424,90 @@ func buildEtreResolver(cfg api.EtreConfig, logger *slog.Logger) (inventory.Resol
 		Labels:          cfg.Labels,
 		EnvLabel:        cfg.EnvLabel,
 		HostField:       cfg.HostField,
-		AttributeFields: cfg.AttributeFields,
-		Credentials: inventory.SecretRefCredentialResolver{
-			Username:    cfg.Credentials.Username,
-			PasswordRef: cfg.Credentials.PasswordRef,
-		},
-		Assembler: inventory.MySQLConnectionAssembler{DefaultPort: cfg.DefaultPort},
+		AttributeFields: credentialAttributeFields(cfg),
+		Credentials:     creds,
+		Assembler:       inventory.MySQLConnectionAssembler{DefaultPort: cfg.DefaultPort},
 	})
+}
+
+const (
+	credentialTypeSecretRef = "secret_ref"
+	credentialTypeAWSSM     = "awssm"
+)
+
+// credentialType returns the configured credential backend, defaulting to
+// secret_ref.
+func credentialType(cfg api.EtreCredentialsConfig) string {
+	if cfg.Type == "" {
+		return credentialTypeSecretRef
+	}
+	return cfg.Type
+}
+
+// buildCredentialResolver builds the configured credential backend. Each backend
+// is one inventory.CredentialResolver implementation; the data plane is not
+// coupled to any single secret store.
+func buildCredentialResolver(ctx context.Context, cfg api.EtreCredentialsConfig) (inventory.CredentialResolver, error) {
+	switch credentialType(cfg) {
+	case credentialTypeSecretRef:
+		if cfg.Username == "" {
+			return nil, fmt.Errorf("target_resolver.etre.credentials.username is required")
+		}
+		if cfg.PasswordRef == "" {
+			return nil, fmt.Errorf("target_resolver.etre.credentials.password_ref is required")
+		}
+		return inventory.SecretRefCredentialResolver{Username: cfg.Username, PasswordRef: cfg.PasswordRef}, nil
+
+	case credentialTypeAWSSM:
+		// Validate required fields with config-path context before loading AWS
+		// config, so a misconfiguration fails fast and actionably instead of
+		// after (potentially slow) credential-chain resolution.
+		switch {
+		case cfg.Region == "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.region is required for the awssm backend")
+		case cfg.RoleARN == "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.role_arn is required for the awssm backend")
+		case cfg.SecretName == "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.secret_name is required for the awssm backend")
+		}
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("load AWS config for target_resolver.etre.credentials: %w", err)
+		}
+		resolver, err := awscreds.New(awscreds.Config{
+			AWSConfig:        awsCfg,
+			Region:           cfg.Region,
+			RoleARN:          cfg.RoleARN,
+			ExternalID:       cfg.ExternalID,
+			SecretName:       cfg.SecretName,
+			AccountAttribute: cfg.AccountAttribute,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("build target_resolver.etre.credentials awssm resolver: %w", err)
+		}
+		return resolver, nil
+
+	default:
+		return nil, fmt.Errorf("unknown target_resolver.etre.credentials.type %q (want %q or %q)", cfg.Type, credentialTypeSecretRef, credentialTypeAWSSM)
+	}
+}
+
+// credentialAttributeFields returns the entity attribute fields the resolver
+// must surface, ensuring the assume-role backend's account attribute is included
+// alongside any explicitly configured fields.
+func credentialAttributeFields(cfg api.EtreConfig) []string {
+	fields := cfg.AttributeFields
+	if credentialType(cfg.Credentials) != credentialTypeAWSSM {
+		return fields
+	}
+	accountAttr := cfg.Credentials.AccountAttribute
+	if accountAttr == "" {
+		accountAttr = "aws_account_id"
+	}
+	if slices.Contains(fields, accountAttr) {
+		return fields
+	}
+	return append(append([]string(nil), fields...), accountAttr)
 }
 
 // grpcLocalClientFactory returns a LocalClientFactory that applies server-level

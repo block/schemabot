@@ -420,12 +420,29 @@ type EtreConfig struct {
 }
 
 // EtreCredentialsConfig configures credentials for an Etre-resolved target.
-// Credentials never come from Etre: the username is configured and the password
-// is a secret reference (env:, file:, secretsmanager:, or a literal), optionally
-// carrying a {target} placeholder for per-target secret naming.
+// Credentials never come from Etre. Type selects the backend; each backend is
+// one pluggable implementation behind the same resolver interface, so the data
+// plane is not coupled to any single secret store.
 type EtreCredentialsConfig struct {
-	Username    string `yaml:"username"`
-	PasswordRef string `yaml:"password_ref"`
+	// Type selects the credential backend: "secret_ref" (default) or "awssm".
+	Type string `yaml:"type,omitempty"`
+
+	// secret_ref backend: a configured username plus a password secret reference
+	// (env:, file:, secretsmanager:, or a literal), optionally carrying a
+	// {target} placeholder for per-target secret naming.
+	Username    string `yaml:"username,omitempty"`
+	PasswordRef string `yaml:"password_ref,omitempty"`
+
+	// awssm backend: assume a per-target IAM role and read a JSON
+	// {username, password} secret from AWS Secrets Manager. RoleARN may carry an
+	// {account} placeholder and SecretName a {target} placeholder; ExternalID is
+	// an optional STS external id; AccountAttribute names the entity attribute
+	// holding the target's AWS account id (defaults to aws_account_id).
+	Region           string `yaml:"region,omitempty"`
+	RoleARN          string `yaml:"role_arn,omitempty"`
+	ExternalID       string `yaml:"external_id,omitempty"`
+	SecretName       string `yaml:"secret_name,omitempty"`
+	AccountAttribute string `yaml:"account_attribute,omitempty"`
 }
 
 // Configured reports whether the data plane should resolve targets through Etre.
