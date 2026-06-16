@@ -317,6 +317,69 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 	return *task.ApplyOperationID, nil
 }
 
+// tasksForOperation returns the subset of tasks belonging to the given
+// apply_operation. It is nil-safe: a nil task or one without an
+// apply_operation_id is skipped. Callers use it to scope an apply-wide task set
+// (which spans multiple operations once an apply fans out) down to a single
+// operation before deriving that operation's state.
+func tasksForOperation(tasks []*storage.Task, operationID int64) []*storage.Task {
+	var scoped []*storage.Task
+	for _, task := range tasks {
+		if task == nil || task.ApplyOperationID == nil {
+			continue
+		}
+		if *task.ApplyOperationID == operationID {
+			scoped = append(scoped, task)
+		}
+	}
+	return scoped
+}
+
+// classifyOperationTasks reports how a task set maps to the apply-operation
+// model so deriveAggregateApplyState can distinguish three cases that must be
+// handled differently:
+//
+//   - No operation model (usesModel=false, err=nil): every task carries no
+//     apply_operation_id, or the set is empty. There are no siblings, so the
+//     per-task derivation is authoritative and may terminalize. This preserves
+//     single-writer/legacy behaviour for applies written before the apply-create
+//     path populated apply_operation_id.
+//   - Single operation (usesModel=true, err=nil): every task carries the same
+//     apply_operation_id. The sibling-row projection applies.
+//   - Ambiguous (err!=nil): the tasks span multiple operation ids, mix
+//     operation-model and legacy rows, or include a nil task. The set cannot be
+//     attributed to one operation, so a terminal aggregate derived from it would
+//     be unsafe; the caller must fail closed.
+//
+// It is intentionally stricter than applyOperationIDForTasks's "no operation"
+// fallback: a mixed set is an error here, not a legacy no-op-model case.
+func classifyOperationTasks(tasks []*storage.Task) (operationID int64, usesModel bool, err error) {
+	var sawNil, sawID bool
+	for _, task := range tasks {
+		if task == nil {
+			return 0, false, fmt.Errorf("apply operation task is nil")
+		}
+		if task.ApplyOperationID == nil || *task.ApplyOperationID == 0 {
+			sawNil = true
+			continue
+		}
+		id := *task.ApplyOperationID
+		if sawID && operationID != id {
+			return 0, false, fmt.Errorf("tasks span multiple apply operations: %d and %d", operationID, id)
+		}
+		operationID = id
+		sawID = true
+	}
+	switch {
+	case sawID && sawNil:
+		return 0, false, fmt.Errorf("tasks mix operation-model and legacy rows")
+	case sawID:
+		return operationID, true, nil
+	default:
+		return 0, false, nil
+	}
+}
+
 // deriveAggregateApplyState computes applies.state as the rollout projection
 // over every apply_operation row of the apply, accounting for each operation's
 // on_failure policy via state.DeriveRolloutApplyState. The boolean is false when
@@ -340,13 +403,19 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 // With one operation per apply the sibling set is the current operation alone,
 // so the projection collapses to the current deployment's derived state.
 //
-// Two outcomes are distinguished when the full sibling set is not available:
+// Three outcomes are distinguished when the full sibling set is not available:
 //
 //   - The apply does not use the operation model — its tasks carry no
 //     apply_operation_id, or the operation store is not configured. There are no
 //     siblings, so the per-task derivation is authoritative and may terminalize.
 //     This preserves single-writer/legacy behaviour for applies written before
 //     the apply-create path populated apply_operation_id.
+//
+//   - The task set is not scoped to one operation — it spans multiple
+//     apply_operation_ids or mixes operation-model and legacy rows. The set
+//     cannot be attributed to a single operation, so its derived state is not a
+//     meaningful per-operation state and must not terminalize the apply. The
+//     projection fails closed (ok=false) so the caller keeps the stored value.
 //
 //   - The apply uses the operation model (its tasks carry an apply_operation_id)
 //     but the sibling rows cannot be read consistently — the list call failed,
@@ -375,12 +444,21 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 		return currentOpState, true
 	}
 
-	operationID, err := applyOperationIDForTasks(tasks)
+	operationID, usesModel, err := classifyOperationTasks(tasks)
 	if err != nil {
+		// The task set cannot be attributed to a single apply operation: it spans
+		// multiple operation ids or mixes operation-model and legacy rows. The
+		// sibling states are unknowable from such a mix, so fail closed rather
+		// than task-deriving a possibly terminal aggregate from an ambiguous set.
+		c.logger.Warn("cannot determine aggregate apply state: task set is not scoped to one apply operation",
+			"apply_id", apply.ApplyIdentifier, "error", err)
+		return failClosed()
+	}
+	if !usesModel {
 		// No operation model in use: tasks carry no apply_operation_id, so there
 		// are no siblings and the per-task derivation is authoritative.
 		c.logger.Debug("deriving apply state from tasks: apply has no operation model",
-			"apply_id", apply.ApplyIdentifier, "reason", err)
+			"apply_id", apply.ApplyIdentifier)
 		return currentOpState, true
 	}
 
@@ -449,9 +527,33 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 	}
 }
 
+// applyQuiesceDecision reports whether a drive should run the apply-level
+// terminal/pause side-effects — stamping completed_at, dropping the active-
+// applies metric, completing pending stop requests, notifying observers, and
+// stopping polling — based on the rollout-projected apply state rather than one
+// operation's engine result. Under on_failure=continue a failed operation holds
+// the apply running while siblings are still in flight, so its terminal engine
+// result must not quiesce the whole apply. retryablePause is reported separately
+// because failed_retryable pauses for operator retry (completed_at stays nil,
+// observers receive progress not terminal) rather than terminalizing the apply.
+func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, stampCompletedAt bool) {
+	retryablePause = state.IsState(projectedApplyState, state.Apply.FailedRetryable)
+	quiesce = state.IsTerminalApplyState(projectedApplyState) || retryablePause
+	// completed_at is stamped only when the apply is truly finished. Resumable
+	// states keep it nil so an operator can resume: failed_retryable is a retry
+	// pause, and stopped is terminal but explicitly resumable.
+	resumable := retryablePause || state.IsState(projectedApplyState, state.Apply.Stopped)
+	stampCompletedAt = quiesce && !resumable
+	return quiesce, retryablePause, stampCompletedAt
+}
+
 // handleAtomicProgressTick processes a single progress poll tick in atomic mode.
-// Returns true when polling should stop because the apply reached a terminal state
-// or this owner attempt must exit for operator retry.
+// Returns true when this operation's drive should stop polling: the aggregate
+// apply quiesced (terminal or paused for retry), this owner attempt must exit
+// for operator retry, or — under on_failure=continue — this operation's own
+// tasks settled while a sibling holds the apply running. The apply-level
+// wind-down runs only when the aggregate quiesces, not when a single operation
+// finishes ahead of its siblings.
 func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState) bool {
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
 		c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
@@ -653,26 +755,31 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		return true
 	}
 
-	if result.State.IsTerminal() {
-		retryableFailure := state.IsState(newState, state.Task.FailedRetryable)
-		if retryableFailure {
-			apply.CompletedAt = nil
-		} else {
+	// Gate apply-level terminal side-effects on the rollout-projected apply state
+	// (apply.State, derived above), not the current operation's engine result.
+	// Under on_failure=continue a failed operation holds the apply running while
+	// siblings are still in flight, so one operation's terminal engine result
+	// must not stamp completed_at, drop the active-applies metric, tear down
+	// observers, or stop polling for the whole apply. With one operation per
+	// apply the projection equals this operation's derived state, so this is a
+	// no-op until the multi-deployment fan-out lands.
+	quiesce, retryableFailure, stampCompletedAt := applyQuiesceDecision(apply.State)
+	if quiesce {
+		if stampCompletedAt {
 			apply.CompletedAt = &now
+		} else {
+			apply.CompletedAt = nil
 		}
-		// Propagate error message from failed tasks to the apply record
+		// Prefer this operation's engine failure message. Under on_failure=continue
+		// the rollout projection can resolve the apply to a failure because of a
+		// sibling operation while this engine result is non-failed, so fall back to
+		// the failed task rows to avoid persisting a failed apply with no message.
 		if result.State == engine.StateFailed {
 			if msg := progressFailureMessage(result); msg != "" {
 				apply.ErrorMessage = msg
-			} else {
-				for _, task := range tasks {
-					if (task.State == state.Task.Failed || task.State == state.Task.FailedRetryable) && task.ErrorMessage != "" {
-						apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", task.TableName, task.ErrorMessage)
-						break
-					}
-				}
 			}
 		}
+		ensureApplyFailureMessage(apply, tasks)
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
 		}
@@ -686,14 +793,14 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		case retryableFailure:
 			c.logger.Warn("apply paused for operator retry",
 				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
-		case result.State == engine.StateFailed:
+		case state.IsState(apply.State, state.Apply.Failed):
 			c.logger.Error("apply failed",
 				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
 		default:
 			c.logger.Info("apply completed",
-				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "state", result.State, "task_count", len(tasks))
+				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "state", apply.State, "task_count", len(tasks))
 		}
-		eventMessage := fmt.Sprintf("Apply completed with state: %s", result.State)
+		eventMessage := fmt.Sprintf("Apply completed with state: %s", apply.State)
 		if retryableFailure {
 			eventMessage = "Apply paused for operator retry after retryable engine failure"
 		}
@@ -722,6 +829,23 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// Notify observer of progress update
 	if obs := c.getObserver(apply.ID); obs != nil {
 		obs.OnProgress(apply, tasks)
+	}
+
+	// Exit this operation's drive once its own tasks have settled, even though
+	// the aggregate apply has not quiesced. The apply-level gate above keys off
+	// the rollout projection: under on_failure=continue a still-in-flight sibling
+	// holds the apply running, so it was skipped. This operation's work is done,
+	// so stop polling and let the operator persist its apply_operation row and
+	// re-derive the parent; the apply-level wind-down (completed_at, metric drop,
+	// observer teardown, stop-request completion) stays with the last sibling to
+	// settle. With one operation per apply the projection equals this operation's
+	// state, so the apply-level gate already fired when it finished and this is
+	// never reached — single-operation behaviour is unchanged.
+	opState := state.DeriveApplyState(taskStates(tasks))
+	if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
+		c.logger.Info("operation settled while apply continues; exiting operation drive",
+			"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "operation_state", opState, "apply_state", apply.State)
+		return true
 	}
 	return false
 }

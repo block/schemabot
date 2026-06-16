@@ -647,6 +647,25 @@ func firstFailedTaskError(tasks []*storage.Task) string {
 	return ""
 }
 
+// ensureApplyFailureMessage derives the apply's failure reason from the failed
+// task rows when the apply has resolved to a failure state but still carries no
+// message. Under on_failure=continue the rollout projection can resolve the
+// apply to failed/failed_retryable because of a sibling operation while the
+// finishing operation's own engine result is non-failed, so the per-operation
+// engine message is not always available. An ErrorMessage already on the apply
+// is authoritative and left untouched.
+func ensureApplyFailureMessage(apply *storage.Apply, tasks []*storage.Task) {
+	if apply.ErrorMessage != "" {
+		return
+	}
+	if !state.IsState(apply.State, state.Apply.Failed) && !state.IsState(apply.State, state.Apply.FailedRetryable) {
+		return
+	}
+	if msg := firstFailedTaskError(tasks); msg != "" {
+		apply.ErrorMessage = msg
+	}
+}
+
 // handleStopAllTasksTerminal handles the edge case where stop is requested but
 // every targeted task is already in a terminal state (completed, failed,
 // cancelled, or reverted). The apply row may still be non-terminal — e.g., a

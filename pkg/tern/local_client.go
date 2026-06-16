@@ -977,6 +977,18 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// Get ALL tasks for this apply (completed + running + pending)
 	currentApplyTasks := filterTasksByApply(tasks, activeTask.ApplyID)
 
+	// Scope to the active task's apply operation before deriving the aggregate
+	// apply state. currentApplyTasks is scoped by apply, so once an apply fans
+	// out to multiple operations it is a mixed set; deriving the aggregate from
+	// that mix would bypass the sibling operation rows and the on_failure policy.
+	// currentApplyTasks is still used below for the response table list and the
+	// all-terminal gate. With one operation per apply the two slices are equal,
+	// so this is a no-op until the multi-deployment fan-out lands.
+	opScopedTasks := currentApplyTasks
+	if activeTask.ApplyOperationID != nil {
+		opScopedTasks = tasksForOperation(currentApplyTasks, *activeTask.ApplyOperationID)
+	}
+
 	creds := c.credentials()
 	eng := c.getEngine()
 
@@ -1061,7 +1073,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 					if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err != nil {
 						c.logger.Warn("failed to load apply after progress task state update", "apply_id", activeTask.ApplyID, "error", err)
 					} else if apply != nil && !state.IsTerminalApplyState(apply.State) {
-						if derived, ok := c.deriveAggregateApplyState(ctx, apply, currentApplyTasks); ok {
+						if derived, ok := c.deriveAggregateApplyState(ctx, apply, opScopedTasks); ok {
 							apply.State = derived
 							apply.UpdatedAt = now
 							if err := c.storage.Applies().Update(ctx, apply); err != nil {
@@ -1088,21 +1100,39 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				if retryableFailure || allTerminal {
 					apply, _ := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
 					if apply != nil && !state.IsTerminalApplyState(apply.State) {
-						now := time.Now()
-						apply.State = taskStateToApplyState(taskState)
-						if retryableFailure {
-							apply.CompletedAt = nil
-						} else {
-							apply.CompletedAt = &now
+						// Terminalize the parent apply on the rollout projection
+						// over all sibling operations, not this operation's tasks
+						// alone: under on_failure=continue a failed operation must
+						// hold the apply running while siblings are in flight. With
+						// one operation per apply the projection equals this
+						// operation's derived state, so this is a no-op until the
+						// multi-deployment fan-out lands.
+						derived, ok := c.deriveAggregateApplyState(ctx, apply, opScopedTasks)
+						quiesce, _, stampCompletedAt := applyQuiesceDecision(derived)
+						if ok && quiesce {
+							now := time.Now()
+							apply.State = derived
+							if stampCompletedAt {
+								apply.CompletedAt = &now
+							} else {
+								apply.CompletedAt = nil
+							}
+							// Prefer this operation's engine failure message; fall back
+							// to the failed task rows when the rollout projection resolves
+							// the apply to a failure due to a sibling operation that this
+							// engine result doesn't reflect.
+							if result.State == engine.StateFailed {
+								if msg := progressFailureMessage(result); msg != "" {
+									apply.ErrorMessage = msg
+								}
+							}
+							ensureApplyFailureMessage(apply, opScopedTasks)
+							apply.UpdatedAt = now
+							if err := c.storage.Applies().Update(ctx, apply); err != nil {
+								c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
+							}
+							c.logger.Info("apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
 						}
-						if result.State == engine.StateFailed {
-							apply.ErrorMessage = progressFailureMessage(result)
-						}
-						apply.UpdatedAt = now
-						if err := c.storage.Applies().Update(ctx, apply); err != nil {
-							c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
-						}
-						c.logger.Info("apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
 					}
 				}
 			}

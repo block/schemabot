@@ -391,3 +391,43 @@ func TestDeriveVSchemaTaskState(t *testing.T) {
 		assert.Equal(t, state.Task.Completed, got)
 	})
 }
+
+// applyQuiesceDecision gates the apply-level terminal/pause side-effects on the
+// rollout-projected apply state. A drive must quiesce the whole apply only when
+// the projection is terminal or a retry-pause — never when a continue policy
+// holds the apply running while siblings are still in flight. completed_at is
+// stamped only for truly-finished states: failed_retryable (a retry pause) and
+// stopped (terminal but resumable) keep completed_at nil even though they
+// quiesce.
+func TestApplyQuiesceDecision(t *testing.T) {
+	cases := []struct {
+		name           string
+		projected      string
+		wantQuiesce    bool
+		wantRetryPause bool
+		wantStamp      bool
+	}{
+		{"completed", state.Apply.Completed, true, false, true},
+		{"failed", state.Apply.Failed, true, false, true},
+		{"cancelled", state.Apply.Cancelled, true, false, true},
+		{"reverted", state.Apply.Reverted, true, false, true},
+		{"stopped", state.Apply.Stopped, true, false, false},
+		{"failed_retryable", state.Apply.FailedRetryable, true, true, false},
+		{"running", state.Apply.Running, false, false, false},
+		{"pending", state.Apply.Pending, false, false, false},
+		{"waiting_for_cutover", state.Apply.WaitingForCutover, false, false, false},
+		{"waiting_for_deploy", state.Apply.WaitingForDeploy, false, false, false},
+		{"cutting_over", state.Apply.CuttingOver, false, false, false},
+		{"recovering", state.Apply.Recovering, false, false, false},
+		{"revert_window", state.Apply.RevertWindow, false, false, false},
+		{"empty/undetermined", "", false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			quiesce, retryPause, stamp := applyQuiesceDecision(tc.projected)
+			assert.Equal(t, tc.wantQuiesce, quiesce, "quiesce for projected state %q", tc.projected)
+			assert.Equal(t, tc.wantRetryPause, retryPause, "retryablePause for projected state %q", tc.projected)
+			assert.Equal(t, tc.wantStamp, stamp, "stampCompletedAt for projected state %q", tc.projected)
+		})
+	}
+}
