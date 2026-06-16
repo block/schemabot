@@ -592,6 +592,7 @@ func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
 	handle("GET /tern-health/{deployment}/{environment}", s.handleTernHealth)
 
 	// Config API (for CLI to discover environments)
+	handle("GET /api/databases", s.handleDatabaseList)
 	handle("GET /api/databases/{database}/environments", s.handleDatabaseEnvironments)
 
 	// Orchestration API

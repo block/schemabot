@@ -115,6 +115,26 @@ type PullSchemaResponse struct {
 	TableCount  int32                       `json:"table_count"`
 }
 
+// DatabaseListResponse is the HTTP response body for GET /api/databases.
+type DatabaseListResponse struct {
+	Databases []*DatabaseResponse `json:"databases"`
+}
+
+// DatabaseResponse describes one server-side database without
+// exposing connection strings, opaque execution targets, or endpoint addresses.
+type DatabaseResponse struct {
+	Database     string                         `json:"database"`
+	Type         string                         `json:"type"`
+	Environments []*DatabaseEnvironmentResponse `json:"environments"`
+}
+
+// DatabaseEnvironmentResponse describes one configured database environment
+// without exposing connection strings, opaque execution targets, or endpoints.
+type DatabaseEnvironmentResponse struct {
+	Environment string   `json:"environment"`
+	Deployments []string `json:"deployments,omitempty"`
+}
+
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
 	Database    string                  `json:"database"`

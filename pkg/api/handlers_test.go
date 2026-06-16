@@ -1654,6 +1654,125 @@ func TestDatabaseEnvironmentsUsesServerPromotionOrder(t *testing.T) {
 	assert.Equal(t, []string{"production", "staging", "sandbox"}, resp.Environments)
 }
 
+func TestDatabaseListSanitizesConfigAndReportsTopology(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"accounts": {
+				Type: storage.DatabaseTypeVitess,
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Target:     "accounts-prod-target",
+						Deployment: "sled",
+					},
+				},
+			},
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {
+						DSN: "orders_user:orders_password@tcp(localhost:3306)/orders_staging",
+					},
+					"production": {
+						Target:     "orders-prod-target",
+						Deployment: "pie",
+					},
+				},
+				AllowedRepos: []string{"octocat/orders"},
+				AllowedDirs:  []string{"schema/orders"},
+			},
+		},
+		TernDeployments: TernConfig{
+			"pie":  {"production": "pie.example:9090"},
+			"sled": {"production": "sled.example:9090"},
+		},
+		AllowedEnvironments: []string{"staging"},
+		EnvironmentOrder:    []string{"production", "staging"},
+	}, nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	body := w.Body.String()
+	assert.NotContains(t, body, "orders_password")
+	assert.NotContains(t, body, "orders-prod-target")
+	assert.NotContains(t, body, "pie.example")
+	assert.NotContains(t, body, "execution_mode")
+	assert.NotContains(t, body, "execution_target_count")
+	assert.NotContains(t, body, "server_handles_environment")
+
+	var resp apitypes.DatabaseListResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 2)
+
+	accounts := resp.Databases[0]
+	assert.Equal(t, "accounts", accounts.Database)
+	assert.Equal(t, storage.DatabaseTypeVitess, accounts.Type)
+	require.Len(t, accounts.Environments, 1)
+	assert.Equal(t, "production", accounts.Environments[0].Environment)
+	assert.Equal(t, []string{"sled"}, accounts.Environments[0].Deployments)
+
+	orders := resp.Databases[1]
+	assert.Equal(t, "orders", orders.Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, orders.Type)
+	require.Len(t, orders.Environments, 2)
+	assert.Equal(t, "production", orders.Environments[0].Environment)
+	assert.Equal(t, []string{"pie"}, orders.Environments[0].Deployments)
+	assert.Equal(t, "staging", orders.Environments[1].Environment)
+	assert.Empty(t, orders.Environments[1].Deployments)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=mysql", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, resp.Databases[0].Type)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=vitess", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "accounts", resp.Databases[0].Database)
+	assert.Equal(t, storage.DatabaseTypeVitess, resp.Databases[0].Type)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=strata", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Databases)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=postgres", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "type must be")
+}
+
+func TestDatabaseListRejectsInvalidDeploymentTopology(t *testing.T) {
+	_, err := databaseListResponse(&ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Deployments: map[string]DeploymentTarget{}},
+				},
+			},
+		},
+	}, "")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "orders" environment "production" deployments map is empty`)
+}
+
 func TestProgressByApplyIDResolvesExternalIDForRemoteApply(t *testing.T) {
 	mock := &mockTernClient{
 		isRemote: true,

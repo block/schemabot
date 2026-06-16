@@ -461,6 +461,106 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+// handleDatabaseList returns the sanitized databases registered on this
+// server. It intentionally exposes topology metadata only; connection
+// strings, opaque execution targets, and endpoint addresses stay server-side.
+func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
+	databaseType, err := parseDatabaseListTypeFilter(r)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	resp, err := databaseListResponse(s.config, databaseType)
+	if err != nil {
+		s.logger.Error("database list failed", "error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to list databases: "+err.Error())
+		return
+	}
+	s.writeJSON(w, http.StatusOK, resp)
+}
+
+func parseDatabaseListTypeFilter(r *http.Request) (string, error) {
+	databaseType := r.URL.Query().Get("type")
+	switch databaseType {
+	case "", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
+		return databaseType, nil
+	default:
+		return "", fmt.Errorf("type must be %q, %q, or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata)
+	}
+}
+
+func databaseListResponse(config *ServerConfig, databaseType string) (*apitypes.DatabaseListResponse, error) {
+	if config == nil {
+		return nil, fmt.Errorf("server config is nil")
+	}
+	databaseNames := make([]string, 0, len(config.Databases))
+	for database, dbConfig := range config.Databases {
+		if databaseType != "" && dbConfig.Type != databaseType {
+			continue
+		}
+		databaseNames = append(databaseNames, database)
+	}
+	sort.Strings(databaseNames)
+
+	resp := &apitypes.DatabaseListResponse{Databases: make([]*apitypes.DatabaseResponse, 0, len(databaseNames))}
+	for _, database := range databaseNames {
+		dbConfig := config.Databases[database]
+		environments, err := config.DatabaseEnvironments(database)
+		if err != nil {
+			return nil, fmt.Errorf("list database environments for database %q: %w", database, err)
+		}
+		databaseResp := &apitypes.DatabaseResponse{
+			Database:     database,
+			Type:         dbConfig.Type,
+			Environments: make([]*apitypes.DatabaseEnvironmentResponse, 0, len(environments)),
+		}
+		for _, environment := range environments {
+			envRoute, err := databaseEnvironmentResponse(database, dbConfig, environment)
+			if err != nil {
+				return nil, err
+			}
+			databaseResp.Environments = append(databaseResp.Environments, envRoute)
+		}
+		resp.Databases = append(resp.Databases, databaseResp)
+	}
+	return resp, nil
+}
+
+func databaseEnvironmentResponse(database string, dbConfig DatabaseConfig, environment string) (*apitypes.DatabaseEnvironmentResponse, error) {
+	envConfig, ok := dbConfig.Environments[environment]
+	if !ok {
+		return nil, fmt.Errorf("database %q environment %q is not configured on this server", database, environment)
+	}
+	deployments, err := sanitizedDatabaseDeployments(database, environment, envConfig)
+	if err != nil {
+		return nil, err
+	}
+	return &apitypes.DatabaseEnvironmentResponse{
+		Environment: environment,
+		Deployments: deployments,
+	}, nil
+}
+
+func sanitizedDatabaseDeployments(database, environment string, envConfig EnvironmentConfig) ([]string, error) {
+	if envConfig.HasLocalDSN() {
+		return nil, nil
+	}
+	if envConfig.Deployments != nil {
+		if len(envConfig.Deployments) == 0 {
+			return nil, fmt.Errorf("database %q environment %q deployments map is empty", database, environment)
+		}
+		deployments, err := orderedDeploymentKeys(envConfig.Deployments, envConfig.DeploymentOrder, fmt.Sprintf("database %q environment %q", database, environment))
+		if err != nil {
+			return nil, err
+		}
+		return deployments, nil
+	}
+	if envConfig.Deployment == "" {
+		return nil, fmt.Errorf("database %q environment %q missing server-side deployment", database, environment)
+	}
+	return []string{envConfig.Deployment}, nil
+}
+
 // handleStatus handles GET /api/status requests.
 // Returns recent schema changes.
 func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
