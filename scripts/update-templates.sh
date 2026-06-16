@@ -163,6 +163,7 @@ render_paired_section "Apply Flow"     "comment_apply_flow_all" "cli_apply_all"
 } >> "$SNAPSHOT"
 
 # === CLI-only sections ===
+render_cli_section "Multi-Deployment Apply (CLI)" "cli_multi_deploy_all"
 render_cli_section "Sequential Mode (CLI)" "sequential_all"
 render_cli_section "Defer Cutover (CLI)"   "defer_all"
 render_cli_section "Lint & Unsafe (CLI)"   "lint_all"

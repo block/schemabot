@@ -161,6 +161,14 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyCompleted())
 	case PreviewCommentMultiDeployAll:
 		previewCommentMultiDeployAllOutput()
+	case PreviewCLIMultiDeployInProgress:
+		previewCLIMultiDeploymentApplyInProgress()
+	case PreviewCLIMultiDeployFailed:
+		previewCLIMultiDeploymentApplyFailed()
+	case PreviewCLIMultiDeployCompleted:
+		previewCLIMultiDeploymentApplyCompleted()
+	case PreviewCLIMultiDeployAll:
+		previewCLIMultiDeployAllOutput()
 	case PreviewCommentSingleProgress:
 		fmt.Print(webhooktemplates.PreviewCommentApplySingleProgress())
 	case PreviewCommentSingleComplete:

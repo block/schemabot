@@ -136,6 +136,10 @@ const (
 	PreviewCommentMultiDeployFailed     PreviewType = "comment_multi_deploy_failed"      // Halt-on-failure: one deployment failed
 	PreviewCommentMultiDeployCompleted  PreviewType = "comment_multi_deploy_completed"   // All deployments completed
 	PreviewCommentMultiDeployAll        PreviewType = "comment_multi_deploy_all"         // Show all multi-deployment apply previews
+	PreviewCLIMultiDeployInProgress     PreviewType = "cli_multi_deploy_in_progress"     // Barrier rollout mid-flight
+	PreviewCLIMultiDeployFailed         PreviewType = "cli_multi_deploy_failed"          // Halt-on-failure: one deployment failed
+	PreviewCLIMultiDeployCompleted      PreviewType = "cli_multi_deploy_completed"       // All deployments completed
+	PreviewCLIMultiDeployAll            PreviewType = "cli_multi_deploy_all"             // Show all CLI multi-deployment apply previews
 
 	// Single-table apply comment previews (most common case)
 	PreviewCommentSingleProgress          PreviewType = "comment_single_progress"            // Single table running
