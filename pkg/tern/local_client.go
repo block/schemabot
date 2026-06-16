@@ -1425,7 +1425,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 							// Compare-and-swap on the just-read state so a stale
 							// projection cannot clobber a newer state a sibling
 							// drive already wrote.
-							swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, apply.ErrorMessage, apply.CompletedAt)
+							swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
 							if err != nil {
 								c.logger.Warn("failed to update apply after progress task state update", "apply_id", apply.ApplyIdentifier, "state", derived, "error", err)
 							} else if !swapped {
@@ -1484,7 +1484,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 							// Compare-and-swap on the just-read state so a stale
 							// projection cannot clobber a newer state a sibling
 							// drive already wrote.
-							swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.CompletedAt)
+							swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
 							switch {
 							case err != nil:
 								c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)

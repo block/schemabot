@@ -624,6 +624,18 @@ func (s *applyStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Ap
 
 // Update updates apply state and fields.
 func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
+	// A drive that holds only an operation lease must never write the parent
+	// applies row directly: under fan-out the parent state is owned solely by
+	// the rollout projection (UpdateDerivedState). A single-operation drive
+	// still carries the parent apply lease alongside the operation lease, so it
+	// keeps the direct-write path; only an operation-lease-only context is
+	// refused here.
+	if _, hasOpLease := storage.OperationLeaseFromContext(ctx); hasOpLease {
+		if _, hasApplyLease := storage.ApplyLeaseFromContext(ctx); !hasApplyLease {
+			return fmt.Errorf("operation lease does not authorize a direct update of apply %d; parent state is owned by the rollout projection: %w", apply.ID, storage.ErrApplyLeaseLost)
+		}
+	}
+
 	lease, hasLease, err := applyLeaseFromContext(ctx, apply.ID)
 	if err != nil {
 		return err
@@ -700,30 +712,100 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	return nil
 }
 
+// derivedStateGuard is the lease authorization for a rollout-projection write.
+// predicate is appended to the CAS UPDATE's WHERE clause and predicateArgs holds
+// its bind values; ensureStillOwned re-checks ownership on a zero-rows result so
+// the caller can fail closed on a lost lease (nil for an unguarded write).
+type derivedStateGuard struct {
+	predicate        string
+	predicateArgs    []any
+	ensureStillOwned func(ctx context.Context, db queryRower) error
+}
+
+// derivedStateGuardForContext selects how a UpdateDerivedState write is
+// authorized. An operation lease takes precedence over the parent apply lease,
+// mirroring taskStore.Update: a multi-operation drive advances the parent only
+// through the projection, scoped to an operation that still holds its token and
+// belongs to applyID. The apply-lease path keeps the single-operation behavior.
+func derivedStateGuardForContext(ctx context.Context, applyID int64) (derivedStateGuard, error) {
+	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
+		if !opLease.Valid() {
+			return derivedStateGuard{}, fmt.Errorf("invalid operation lease for apply %d: %w", applyID, storage.ErrApplyLeaseLost)
+		}
+		if opLease.ApplyID != applyID {
+			return derivedStateGuard{}, fmt.Errorf("operation lease for apply %d cannot write derived state for apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
+		}
+		return derivedStateGuard{
+			predicate: ` AND EXISTS (
+				SELECT 1 FROM apply_operations ao
+				WHERE ao.id = ? AND ao.apply_id = ? AND ao.lease_token = ?
+			)`,
+			predicateArgs: []any{opLease.OperationID, applyID, opLease.Token},
+			ensureStillOwned: func(ctx context.Context, db queryRower) error {
+				return ensureOperationLeaseOwnsApply(ctx, db, opLease, applyID)
+			},
+		}, nil
+	}
+
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return derivedStateGuard{}, err
+	}
+	if hasLease {
+		return derivedStateGuard{
+			predicate:     " AND lease_token = ?",
+			predicateArgs: []any{lease.Token},
+			ensureStillOwned: func(ctx context.Context, db queryRower) error {
+				return ensureApplyLeaseStillOwned(ctx, db, lease)
+			},
+		}, nil
+	}
+
+	return derivedStateGuard{}, nil
+}
+
+// ensureOperationLeaseOwnsApply returns ErrApplyLeaseLost unless the operation
+// row still holds the lease's token and still belongs to applyID, so a CAS that
+// missed because the operation was reassigned (or rebound to another apply)
+// fails closed instead of being read as a benign miss.
+func ensureOperationLeaseOwnsApply(ctx context.Context, db queryRower, lease storage.OperationLease, applyID int64) error {
+	var match int
+	err := db.QueryRowContext(ctx, `
+		SELECT 1
+		FROM apply_operations
+		WHERE id = ? AND apply_id = ? AND lease_token = ?
+	`, lease.OperationID, applyID, lease.Token).Scan(&match)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("operation lease for apply_operation %d (apply %d) is no longer current: %w", lease.OperationID, applyID, storage.ErrApplyLeaseLost)
+	}
+	if err != nil {
+		return fmt.Errorf("verify operation lease for apply_operation %d (apply %d): %w", lease.OperationID, applyID, err)
+	}
+	return nil
+}
+
 // UpdateDerivedState compare-and-swaps the rollout-projected applies.state.
 // It writes only the fields owned by the projection and only when the row still
 // holds expectedState, so a stale projection cannot clobber a newer state a
 // sibling drive already wrote. A lost lease fails closed with an error; a CAS
 // miss (state no longer matches) returns swapped=false so the caller can skip
 // side-effects and reconcile on the next poll.
-func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, completedAt *time.Time) (bool, error) {
-	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
+	guard, err := derivedStateGuardForContext(ctx, applyID)
 	if err != nil {
 		return false, err
 	}
 
-	args := []any{newState, errorMessage, completedAt, applyID, expectedState}
-	leasePredicate := ""
-	if hasLease {
-		leasePredicate = " AND lease_token = ?"
-		args = append(args, lease.Token)
-	}
+	// started_at is stamped only when it is still NULL so the projection can move
+	// the parent into an active state without ever rewinding a recorded start.
+	args := []any{newState, errorMessage, startedAt, completedAt, applyID, expectedState}
+	args = append(args, guard.predicateArgs...)
 
 	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE applies
-		SET state = ?, error_message = ?, completed_at = ?, updated_at = NOW()
+		SET state = ?, error_message = ?, started_at = COALESCE(started_at, ?), completed_at = ?, updated_at = NOW()
 		WHERE id = ? AND state = ?%s
-	`, leasePredicate), args...)
+	`, guard.predicate), args...)
 	if err != nil {
 		return false, fmt.Errorf("compare-and-swap derived apply state for apply %d (%q -> %q): %w", applyID, expectedState, newState, err)
 	}
@@ -738,8 +820,8 @@ func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expe
 	// Zero rows. A leased caller must distinguish a lost lease (fail closed) from
 	// a benign CAS outcome: the former is an ownership change the caller must
 	// surface, the latter is reconciled on the next poll.
-	if hasLease {
-		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+	if guard.ensureStillOwned != nil {
+		if err := guard.ensureStillOwned(ctx, s.db); err != nil {
 			return false, err
 		}
 	}

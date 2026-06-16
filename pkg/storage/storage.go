@@ -231,17 +231,25 @@ type ApplyStore interface {
 	// UpdateDerivedState compare-and-swaps the rollout-projected applies.state.
 	//
 	// It writes only the fields owned by the rollout projection (state,
-	// error_message, completed_at, updated_at) and only when the row still holds
-	// expectedState, so a stale projection computed from an earlier read cannot
-	// clobber a newer state another sibling drive already wrote. If ctx carries
-	// an apply lease the write additionally requires the current lease token.
+	// error_message, started_at, completed_at, updated_at) and only when the row
+	// still holds expectedState, so a stale projection computed from an earlier
+	// read cannot clobber a newer state another sibling drive already wrote.
+	// started_at is stamped only when it is still NULL, so the projection can
+	// move the parent into an active state without ever rewinding a recorded
+	// start time.
+	//
+	// The write is authorized by whichever lease is on the context: an operation
+	// lease (the operation row must still hold its token and belong to applyID)
+	// takes precedence over the parent apply lease, so a multi-operation drive
+	// can advance the parent only through this projection. If neither lease is
+	// present the write is unguarded.
 	//
 	// swapped=false means the row no longer matched expectedState: the caller's
 	// view is stale, so it must skip apply-level side-effects that assume its
 	// write landed and let the next poll reconcile. A lost lease is returned as
 	// an error (ErrApplyLeaseLost), not swapped=false, so leased callers still
 	// fail closed on ownership changes.
-	UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, completedAt *time.Time) (swapped bool, err error)
+	UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (swapped bool, err error)
 
 	// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
 	// Used by `schemabot status` (no args) to show recent activity.

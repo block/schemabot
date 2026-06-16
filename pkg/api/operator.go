@@ -1104,7 +1104,17 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 			apply.ApplyIdentifier, apply.ID, derived, apply.State)
 	}
 
-	if state.IsState(apply.State, derived) {
+	// Stamp started_at when the projection first moves the parent out of a
+	// pending state and no start time was recorded yet; UpdateDerivedState only
+	// applies it while started_at is still NULL, so a recorded start is never
+	// rewound. nil means "leave started_at as-is".
+	var startedAt *time.Time
+	if apply.StartedAt == nil && !state.IsState(derived, state.Apply.Pending) {
+		now := s.clock.Now()
+		startedAt = &now
+	}
+
+	if state.IsState(apply.State, derived) && startedAt == nil {
 		s.logger.Debug("operator: derived apply state matches current; no update",
 			"worker", workerID, "apply_id", apply.ApplyIdentifier,
 			"database", apply.Database, "environment", apply.Environment,
@@ -1140,7 +1150,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 		}
 	}
 
-	swapped, err := s.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, errorMessage, completedAt)
+	swapped, err := s.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, errorMessage, startedAt, completedAt)
 	if err != nil {
 		return fmt.Errorf("update derived apply state for apply %s (%d) to %q: %w", apply.ApplyIdentifier, apply.ID, derived, err)
 	}

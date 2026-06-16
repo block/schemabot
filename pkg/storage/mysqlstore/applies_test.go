@@ -920,7 +920,7 @@ func TestApplyStore_UpdateDerivedState(t *testing.T) {
 
 	// Matching expected state swaps and writes the projected fields.
 	completedAt := time.Now()
-	swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Failed, "deployment failed", &completedAt)
+	swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Failed, "deployment failed", nil, &completedAt)
 	require.NoError(t, err)
 	require.True(t, swapped, "expected state matched, so the swap must land")
 
@@ -932,7 +932,7 @@ func TestApplyStore_UpdateDerivedState(t *testing.T) {
 
 	// A stale expected state misses: the row already moved on, so the write is
 	// skipped and the row is left untouched.
-	swapped, err = store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Completed, "", nil)
+	swapped, err = store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Completed, "", nil, nil)
 	require.NoError(t, err)
 	assert.False(t, swapped, "expected state no longer matches, so the swap must miss")
 
@@ -957,12 +957,12 @@ func TestApplyStore_UpdateDerivedStateNoOpUnderChangedRows(t *testing.T) {
 	// Re-deriving the same running state with no other field change is a no-op
 	// that affects zero rows under changed-rows semantics, but the row still
 	// holds the expected state, so the swap is reported as successful.
-	swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Running, "", nil)
+	swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Running, "", nil, nil)
 	require.NoError(t, err)
 	assert.True(t, swapped, "a no-op write to a row already in the expected state is an idempotent swap, not a miss")
 
 	// A stale expected state still misses even under changed-rows semantics.
-	swapped, err = store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Pending, state.Apply.Pending, "", nil)
+	swapped, err = store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Pending, state.Apply.Pending, "", nil, nil)
 	require.NoError(t, err)
 	assert.False(t, swapped, "the row is not in the expected state, so the swap must miss")
 }
@@ -1010,7 +1010,7 @@ func TestApplyStore_UpdateDerivedStateLeaseGuard(t *testing.T) {
 
 	// A stale lease cannot write, even when the expected state matches.
 	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "worker-old", Token: "stale-token"})
-	_, err = store.Applies().UpdateDerivedState(staleCtx, apply.ID, expectedState, state.Apply.Failed, "stale", nil)
+	_, err = store.Applies().UpdateDerivedState(staleCtx, apply.ID, expectedState, state.Apply.Failed, "stale", nil, nil)
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
 
 	persisted, err := store.Applies().Get(ctx, apply.ID)
@@ -1019,13 +1019,166 @@ func TestApplyStore_UpdateDerivedStateLeaseGuard(t *testing.T) {
 
 	// The current lease holder's matching swap lands.
 	ownedCtx := storage.WithApplyLease(ctx, claimed.Lease())
-	swapped, err := store.Applies().UpdateDerivedState(ownedCtx, apply.ID, expectedState, state.Apply.Failed, "owned failure", nil)
+	swapped, err := store.Applies().UpdateDerivedState(ownedCtx, apply.ID, expectedState, state.Apply.Failed, "owned failure", nil, nil)
 	require.NoError(t, err)
 	assert.True(t, swapped)
 
 	updated, err := store.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Equal(t, state.Apply.Failed, updated.State)
+}
+
+// TestApplyStore_UpdateDerivedStateOperationLeaseGuard verifies that the
+// projection can be authorized by an operation lease (so a multi-operation drive
+// can advance the parent only through the aggregate CAS): the swap lands under a
+// current operation token, fails closed on a stale token or a token bound to a
+// different apply, and the operation lease takes precedence over a current apply
+// lease also on the context.
+func TestApplyStore_UpdateDerivedStateOperationLeaseGuard(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	opLeaseCtx := func(applyID, opID int64, token string) context.Context {
+		return storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: applyID, OperationID: opID, Owner: "worker", Token: token,
+		})
+	}
+
+	// Each running apply needs its own target so the active-apply uniqueness
+	// check does not reject the second one.
+	runningApply := func(identifier, env string, planID int64) *storage.Apply {
+		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, env)
+		return createTestApplyWithStateAndEnv(t, store, lock, identifier, planID, state.Apply.Running, env)
+	}
+
+	// A current operation lease authorizes the projection swap.
+	apply := runningApply("apply_op_cas_ok", "staging-ok", 900)
+	opID := createApplyOperationForLeaseTest(t, store, apply.ID, "primary")
+	stampOperationLease(t, opID, "worker", "op-token")
+	swapped, err := store.Applies().UpdateDerivedState(opLeaseCtx(apply.ID, opID, "op-token"), apply.ID, state.Apply.Running, state.Apply.Failed, "op failure", nil, nil)
+	require.NoError(t, err)
+	require.True(t, swapped, "a current operation lease must authorize the projection swap")
+	updated, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, updated.State)
+
+	// A stale operation token fails closed even when the expected state matches.
+	staleApply := runningApply("apply_op_cas_stale", "staging-stale", 901)
+	staleOpID := createApplyOperationForLeaseTest(t, store, staleApply.ID, "primary")
+	stampOperationLease(t, staleOpID, "worker", "op-token")
+	_, err = store.Applies().UpdateDerivedState(opLeaseCtx(staleApply.ID, staleOpID, "stale-op-token"), staleApply.ID, state.Apply.Running, state.Apply.Failed, "stale", nil, nil)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	persisted, err := store.Applies().Get(ctx, staleApply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, persisted.State, "a lost operation lease must not write the projection")
+
+	// An operation lease bound to a different apply cannot write the target.
+	_, err = store.Applies().UpdateDerivedState(opLeaseCtx(apply.ID, opID, "op-token"), staleApply.ID, state.Apply.Running, state.Apply.Failed, "cross", nil, nil)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+
+	// Operation lease takes precedence: a stale operation token fails closed even
+	// with a current apply lease also on the context.
+	precApply := runningApply("apply_op_cas_prec", "staging-prec", 903)
+	precOpID := createApplyOperationForLeaseTest(t, store, precApply.ID, "primary")
+	stampOperationLease(t, precOpID, "worker", "op-token")
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET lease_owner=?, lease_token=?, lease_acquired_at=NOW() WHERE id=?`, "current-worker", "apply-token", precApply.ID)
+	require.NoError(t, err)
+	bothCtx := storage.WithApplyLease(opLeaseCtx(precApply.ID, precOpID, "stale-op-token"), storage.ApplyLease{
+		ApplyID: precApply.ID, Owner: "current-worker", Token: "apply-token",
+	})
+	_, err = store.Applies().UpdateDerivedState(bothCtx, precApply.ID, state.Apply.Running, state.Apply.Failed, "prec", nil, nil)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	precPersisted, err := store.Applies().Get(ctx, precApply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, precPersisted.State)
+
+	// A current operation lease whose expected state no longer matches the row is
+	// a benign CAS miss: swapped=false with no error, so a stale projection is
+	// reconciled on the next poll rather than mistaken for a lost lease.
+	missApply := runningApply("apply_op_cas_miss", "staging-miss", 904)
+	missOpID := createApplyOperationForLeaseTest(t, store, missApply.ID, "primary")
+	stampOperationLease(t, missOpID, "worker", "op-token")
+	swapped, err = store.Applies().UpdateDerivedState(opLeaseCtx(missApply.ID, missOpID, "op-token"), missApply.ID, state.Apply.Pending, state.Apply.Failed, "stale projection", nil, nil)
+	require.NoError(t, err, "a state mismatch under a current operation lease must not be reported as a lost lease")
+	assert.False(t, swapped, "the expected state no longer matches, so the swap must miss")
+	missPersisted, err := store.Applies().Get(ctx, missApply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, missPersisted.State, "a CAS miss must not write the projection")
+}
+
+// TestApplyStore_UpdateDerivedStateStampsStartedAt verifies that the projection
+// stamps started_at when it is still NULL (so it can move the parent into an
+// active state) but never rewinds a start time a drive already recorded.
+func TestApplyStore_UpdateDerivedStateStampsStartedAt(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_started_stamp", 905, state.Apply.Running, "staging")
+
+	initial, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Nil(t, initial.StartedAt, "a freshly created apply has no recorded start time")
+
+	// A same-state projection stamps started_at while it is still NULL.
+	startedAt := time.Now().Truncate(time.Second)
+	swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Running, "", &startedAt, nil)
+	require.NoError(t, err)
+	require.True(t, swapped)
+	stamped, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stamped.StartedAt)
+	assert.WithinDuration(t, startedAt, *stamped.StartedAt, time.Second)
+
+	// A later projection must not rewind the recorded start time.
+	later := startedAt.Add(time.Hour)
+	swapped, err = store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Running, "", &later, nil)
+	require.NoError(t, err)
+	require.True(t, swapped)
+	preserved, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, preserved.StartedAt)
+	assert.WithinDuration(t, startedAt, *preserved.StartedAt, time.Second, "started_at must be preserved, not rewound")
+}
+
+// TestApplyStore_UpdateRejectsOperationLeaseOnlyContext verifies that a drive
+// holding only an operation lease cannot write the parent applies row directly:
+// the parent is owned by the projection. A single-operation drive carries the
+// parent apply lease alongside the operation lease, so its direct write still
+// lands.
+func TestApplyStore_UpdateRejectsOperationLeaseOnlyContext(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_update_oplease", 906, state.Apply.Running, "staging")
+	opID := createApplyOperationForLeaseTest(t, store, apply.ID, "primary")
+	stampOperationLease(t, opID, "worker", "op-token")
+
+	opOnlyCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID: apply.ID, OperationID: opID, Owner: "worker", Token: "op-token",
+	})
+
+	apply.State = state.Apply.Failed
+	apply.ErrorMessage = "direct write attempt"
+	err := store.Applies().Update(opOnlyCtx, apply)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost, "an operation-lease-only context must not directly write the parent apply")
+	unchanged, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, unchanged.State, "the parent row must be untouched")
+
+	// A single-operation drive carries both leases, so the direct write lands on
+	// the parent-lease path.
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET lease_owner=?, lease_token=?, lease_acquired_at=NOW() WHERE id=?`, "current-worker", "apply-token", apply.ID)
+	require.NoError(t, err)
+	dualCtx := storage.WithApplyLease(opOnlyCtx, storage.ApplyLease{ApplyID: apply.ID, Owner: "current-worker", Token: "apply-token"})
+	require.NoError(t, store.Applies().Update(dualCtx, apply))
+	written, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, written.State)
 }
 
 func TestApplyStore_GetInProgress(t *testing.T) {

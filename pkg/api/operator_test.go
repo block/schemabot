@@ -154,7 +154,7 @@ type recordingApplyStore struct {
 	swapped       bool
 }
 
-func (s *recordingApplyStore) UpdateDerivedState(_ context.Context, applyID int64, expectedState, newState, errorMessage string, completedAt *time.Time) (bool, error) {
+func (s *recordingApplyStore) UpdateDerivedState(_ context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
 	s.expectedState = expectedState
 	if !s.swapped {
 		return false, nil
@@ -163,6 +163,7 @@ func (s *recordingApplyStore) UpdateDerivedState(_ context.Context, applyID int6
 		ID:           applyID,
 		State:        newState,
 		ErrorMessage: errorMessage,
+		StartedAt:    startedAt,
 		CompletedAt:  completedAt,
 	}
 	return true, nil
