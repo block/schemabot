@@ -144,23 +144,77 @@ func TestOIDCAuthorizerValidTokenAllowed(t *testing.T) {
 	assert.Equal(t, []string{"a", "b"}, captured.Groups)
 }
 
-// A valid token grants access to write-method API endpoints too: tier/RBAC
-// gating is not part of this authenticator yet.
-func TestOIDCAuthorizerValidTokenAllowedForWriteMethods(t *testing.T) {
+// Read/visibility endpoints (incl. pull) are allowed for any valid token,
+// regardless of group membership.
+func TestOIDCAuthorizerReadAllowedForAnyValidToken(t *testing.T) {
 	p := newTestOIDCProvider(t)
-	authz := newAuthorizer(t, p, auth.OIDCConfig{Audience: "schemabot"})
-	token := p.issueToken(t, "user@example.com", "schemabot", "groups", nil, time.Now().Add(time.Hour))
+	authz := newAuthorizer(t, p, auth.OIDCConfig{Audience: "schemabot", AdminGroups: []string{"octocat/schema-admins"}})
+	token := p.issueToken(t, "user@example.com", "schemabot", "groups", []string{"other-team"}, time.Now().Add(time.Hour))
 
-	var ran bool
-	handler := authz.Middleware(okHandler(&ran, nil))
+	for _, tc := range []struct {
+		name, method, path string
+	}{
+		{"status", http.MethodGet, "/api/status"},
+		{"logs", http.MethodGet, "/api/logs/coffee"},
+		{"pull (read live schema)", http.MethodPost, "/api/pull"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ran bool
+			handler := authz.Middleware(okHandler(&ran, nil))
+			req := httptest.NewRequestWithContext(t.Context(), tc.method, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.True(t, ran)
+		})
+	}
+}
 
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.True(t, ran)
+// Write-tier endpoints — which include plan, since planning stages a change —
+// require an admin group; a valid non-admin token is 403.
+func TestOIDCAuthorizerWriteDeniedWithoutAdminGroup(t *testing.T) {
+	p := newTestOIDCProvider(t)
+	authz := newAuthorizer(t, p, auth.OIDCConfig{Audience: "schemabot", AdminGroups: []string{"octocat/schema-admins"}})
+	token := p.issueToken(t, "bob@example.com", "schemabot", "groups", []string{"engineers"}, time.Now().Add(time.Hour))
+
+	for _, path := range []string{"/api/plan", "/api/apply"} {
+		t.Run(path, func(t *testing.T) {
+			var ran bool
+			handler := authz.Middleware(okHandler(&ran, nil))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusForbidden, rec.Code)
+			assert.False(t, ran)
+		})
+	}
+}
+
+// An admin-group member clears the write tier (plan and apply). The token
+// carries the bare slug "schema-admins"; the config lists "octocat/schema-admins"
+// — slug match.
+func TestOIDCAuthorizerWriteAllowedForAdminGroup(t *testing.T) {
+	p := newTestOIDCProvider(t)
+	authz := newAuthorizer(t, p, auth.OIDCConfig{Audience: "schemabot", AdminGroups: []string{"octocat/schema-admins"}})
+	token := p.issueToken(t, "alice@example.com", "schemabot", "groups", []string{"schema-admins"}, time.Now().Add(time.Hour))
+
+	for _, path := range []string{"/api/plan", "/api/apply"} {
+		t.Run(path, func(t *testing.T) {
+			var ran bool
+			handler := authz.Middleware(okHandler(&ran, nil))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.True(t, ran)
+		})
+	}
 }
 
 func TestOIDCAuthorizerMissingTokenRejected(t *testing.T) {

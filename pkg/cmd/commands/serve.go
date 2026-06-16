@@ -211,7 +211,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	// allow-all NoneAuthorizer that lets every request through (attaching an
 	// anonymous user); with "oidc" it validates Bearer JWTs and bypasses
 	// non-API paths (/webhook, /metrics, health) itself.
-	authz, err := buildAuthorizer(ctx, serverConfig.Auth, logger)
+	authz, err := buildAuthorizer(ctx, serverConfig.Auth, serverConfig.PRCommandAuthorization.AdminTeams, logger)
 	if err != nil {
 		return fmt.Errorf("setup auth: %w", err)
 	}
@@ -661,20 +661,24 @@ func getEnv(key, defaultValue string) string {
 // in context); "oidc" validates Bearer JWTs against the issuer's JWKS. Unknown
 // types are rejected so a misconfigured auth type fails closed at startup
 // rather than silently disabling auth.
-func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, logger *slog.Logger) (auth.Authorizer, error) {
+func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []string, logger *slog.Logger) (auth.Authorizer, error) {
 	switch cfg.Type {
 	case "", "none":
 		logger.Info("API authentication disabled — all requests allowed")
 		return auth.NoneAuthorizer{}, nil
 	case "oidc":
-		logger.Info("initializing OIDC authentication", "issuer", cfg.Issuer)
+		logger.Info("initializing OIDC authentication", "issuer", cfg.Issuer, "admin_groups", len(adminGroups))
 		authz, err := auth.NewOIDCAuthorizer(ctx, auth.OIDCConfig{
 			Issuer:      cfg.Issuer,
 			Audience:    cfg.Audience,
 			GroupsClaim: cfg.GroupsClaim,
+			AdminGroups: adminGroups,
 		}, logger)
 		if err != nil {
 			return nil, err
+		}
+		if len(adminGroups) == 0 {
+			logger.Warn("OIDC authentication enabled with no admin groups configured: all write operations will be denied (read and plan still work). Set pr_command_authorization.admin_teams to allow writes.")
 		}
 		logger.Info("OIDC authentication enabled", "issuer", cfg.Issuer)
 		return authz, nil

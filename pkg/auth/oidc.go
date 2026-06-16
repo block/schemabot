@@ -23,19 +23,29 @@ type OIDCConfig struct {
 
 	// GroupsClaim is the JWT claim containing group memberships (default: "groups").
 	GroupsClaim string
+
+	// AdminGroups are the groups whose members may call write-tier endpoints.
+	// Sourced from pr_command_authorization.admin_teams; matched against the
+	// token's groups claim by exact string or team slug. When empty, no token
+	// can perform write-tier operations (read-only/visibility still works).
+	AdminGroups []string
 }
 
 // OIDCAuthorizer validates OIDC JWTs on incoming API requests using JWKS
-// discovery to verify token signatures. It authenticates the caller and
-// records their subject and group memberships in the request context.
+// discovery to verify token signatures, then enforces a per-endpoint access
+// tier. Read (visibility) endpoints require only a valid token; write endpoints
+// — which include planning, since a plan stages a change against a database —
+// additionally require membership in a configured admin group. The authenticated
+// caller (subject + groups) is recorded in the request context.
 //
-// It does not yet make tier/role decisions: any request carrying a valid token
-// is allowed, and unauthenticated requests are rejected. Tier and RBAC
-// enforcement (read vs write, admin/operator groups) are layered on top of this
-// authenticator in a follow-up.
+// Write access is gated on the configured admin groups — the direct-API/CLI
+// write path is intentionally for a small privileged set. The CLI path does not
+// honor per-database operator groups; those gate the PR-comment workflow, which
+// is where general users (and per-database teams) make changes.
 type OIDCAuthorizer struct {
 	verifier    *oidc.IDTokenVerifier
 	groupsClaim string
+	adminGroups []string
 	logger      *slog.Logger
 }
 
@@ -70,15 +80,17 @@ func NewOIDCAuthorizer(ctx context.Context, cfg OIDCConfig, logger *slog.Logger)
 	return &OIDCAuthorizer{
 		verifier:    provider.Verifier(verifierConfig),
 		groupsClaim: groupsClaim,
+		adminGroups: cfg.AdminGroups,
 		logger:      logger,
 	}, nil
 }
 
-// Middleware validates the Bearer token on API requests and records the
-// authenticated user in the request context. Non-API paths that authenticate
-// themselves (webhooks via HMAC) or are unauthenticated infrastructure
-// endpoints (health, metrics) bypass validation. Any request with a valid token
-// is allowed through; tier/RBAC enforcement is added on top of this seam.
+// Middleware validates the Bearer token on API requests, enforces the
+// endpoint's access tier, and records the authenticated user in the request
+// context. Non-API paths that authenticate themselves (webhooks via HMAC) or
+// are unauthenticated infrastructure endpoints (health, metrics) bypass
+// validation. A valid token clears the read tier; the write tier (which
+// includes planning) additionally requires membership in a configured admin group.
 func (a *OIDCAuthorizer) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if skipAuth(r.URL.Path) {
@@ -86,16 +98,34 @@ func (a *OIDCAuthorizer) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
+		tier := tierForRequest(r.Method, r.URL.Path)
+
 		user, err := a.authenticate(r.Context(), r)
 		if err != nil {
 			a.logger.Warn("authentication failed", "path", r.URL.Path, "error", err)
+			authDecision(r, tier, "deny", "unauthenticated")
 			writeAuthError(w, http.StatusUnauthorized, "invalid or missing authentication token")
 			return
 		}
 
+		if tier == TierWrite && !a.isAdmin(user.Groups) {
+			a.logger.Warn("authorization denied for write operation",
+				"path", r.URL.Path, "subject", user.Subject)
+			authDecision(r, tier, "deny", "not_admin")
+			writeAuthError(w, http.StatusForbidden, "this operation requires membership in an admin group")
+			return
+		}
+
+		authDecision(r, tier, "allow", "")
 		ctx := WithUser(r.Context(), user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// isAdmin reports whether any of the caller's groups matches a configured admin
+// group (by exact string or team slug).
+func (a *OIDCAuthorizer) isAdmin(groups []string) bool {
+	return matchesAnyGroup(groups, a.adminGroups)
 }
 
 // authenticate extracts the Bearer token from the Authorization header, verifies
