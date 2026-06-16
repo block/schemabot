@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"maps"
 	"strings"
 
@@ -13,14 +14,110 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+const vSchemaArtifactName = "vschema.json"
+
 func pullSchemaResponseFromProto(resp *ternv1.PullSchemaResponse) *apitypes.PullSchemaResponse {
 	return &apitypes.PullSchemaResponse{
 		Database:    resp.Database,
 		Type:        resp.Type,
 		Environment: resp.Environment,
-		SchemaFiles: protoSchemaFilesToAPI(resp.SchemaFiles),
+		Namespaces:  protoPulledNamespacesToAPI(resp.Namespaces),
 		TableCount:  resp.TableCount,
 	}
+}
+
+func protoPulledNamespacesToAPI(namespaces map[string]*ternv1.PulledNamespace) map[string]*apitypes.PulledNamespace {
+	result := make(map[string]*apitypes.PulledNamespace, len(namespaces))
+	for namespace, pulled := range namespaces {
+		if pulled == nil {
+			result[namespace] = &apitypes.PulledNamespace{Tables: map[string]string{}}
+			continue
+		}
+		tables := make(map[string]string, len(pulled.Tables))
+		maps.Copy(tables, pulled.Tables)
+		artifacts := make(map[string]string, len(pulled.Artifacts))
+		maps.Copy(artifacts, pulled.Artifacts)
+		result[namespace] = &apitypes.PulledNamespace{
+			Tables:           tables,
+			Artifacts:        artifacts,
+			NamespaceCatalog: protoNamespaceCatalogToAPI(pulled.NamespaceCatalog),
+			TableCatalog:     protoTableCatalogToAPI(pulled.TableCatalog),
+		}
+	}
+	return result
+}
+
+func protoNamespaceCatalogToAPI(catalog *ternv1.NamespaceCatalog) *apitypes.NamespaceCatalog {
+	if catalog == nil {
+		return nil
+	}
+	return &apitypes.NamespaceCatalog{
+		Name:       catalog.Name,
+		Engine:     catalog.Engine,
+		TableCount: catalog.TableCount,
+	}
+}
+
+func protoTableCatalogToAPI(catalog map[string]*ternv1.TableCatalog) map[string]*apitypes.TableCatalog {
+	if len(catalog) == 0 {
+		return nil
+	}
+	result := make(map[string]*apitypes.TableCatalog, len(catalog))
+	for table, protoTable := range catalog {
+		if protoTable == nil {
+			result[table] = &apitypes.TableCatalog{Name: table}
+			continue
+		}
+		result[table] = &apitypes.TableCatalog{
+			Name:    protoTable.Name,
+			Kind:    protoTable.Kind,
+			Comment: protoTable.Comment,
+			Columns: protoColumnCatalogToAPI(protoTable.Columns),
+			Indexes: protoIndexCatalogToAPI(protoTable.Indexes),
+		}
+	}
+	return result
+}
+
+func protoColumnCatalogToAPI(columns []*ternv1.ColumnCatalog) []*apitypes.ColumnCatalog {
+	if len(columns) == 0 {
+		return nil
+	}
+	result := make([]*apitypes.ColumnCatalog, 0, len(columns))
+	for _, column := range columns {
+		if column == nil {
+			continue
+		}
+		result = append(result, &apitypes.ColumnCatalog{
+			Name:         column.Name,
+			Type:         column.Type,
+			Nullable:     column.Nullable,
+			DefaultValue: column.DefaultValue,
+			Comment:      column.Comment,
+		})
+	}
+	return result
+}
+
+func protoIndexCatalogToAPI(indexes []*ternv1.IndexCatalog) []*apitypes.IndexCatalog {
+	if len(indexes) == 0 {
+		return nil
+	}
+	result := make([]*apitypes.IndexCatalog, 0, len(indexes))
+	for _, index := range indexes {
+		if index == nil {
+			continue
+		}
+		parts := make([]string, len(index.Parts))
+		copy(parts, index.Parts)
+		result = append(result, &apitypes.IndexCatalog{
+			Name:    index.Name,
+			Primary: index.Primary,
+			Unique:  index.Unique,
+			Parts:   parts,
+		})
+	}
+	return result
 }
 
 func protoSchemaFilesToAPI(sf map[string]*ternv1.SchemaFiles) map[string]*apitypes.SchemaFiles {
@@ -84,12 +181,20 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 }
 
 // protoChangesToNamespaces converts proto SchemaChanges to storage namespace plan data.
-func protoChangesToNamespaces(changes []*ternv1.SchemaChange) map[string]*storage.NamespacePlanData {
+// SchemaChange is namespace-scoped, so duplicate namespace entries are rejected
+// instead of merged or overwritten.
+func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[string]*ternv1.SchemaFiles) (map[string]*storage.NamespacePlanData, error) {
 	result := make(map[string]*storage.NamespacePlanData)
-	for _, sc := range changes {
+	for i, sc := range changes {
+		if sc == nil {
+			return nil, fmt.Errorf("schema change %d is null", i)
+		}
 		ns := sc.Namespace
 		if ns == "" {
 			ns = "default"
+		}
+		if _, ok := result[ns]; ok {
+			return nil, fmt.Errorf("duplicate schema change namespace %q", ns)
 		}
 		nsData := &storage.NamespacePlanData{}
 		for _, t := range sc.TableChanges {
@@ -99,9 +204,25 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange) map[string]*storag
 				Operation: protoChangeTypeToOperation(t.ChangeType),
 			})
 		}
+		if len(sc.OriginalFiles) > 0 {
+			nsData.OriginalFiles = sc.OriginalFiles
+		}
+		if sc.OriginalFilesCaptured {
+			nsData.OriginalFilesCaptured = true
+			if nsData.OriginalFiles == nil {
+				nsData.OriginalFiles = map[string]string{}
+			}
+		}
+		if sc.Metadata["vschema_changed"] == "true" {
+			if nsFiles := schemaFiles[ns]; nsFiles != nil {
+				if vschema := nsFiles.Files[vSchemaArtifactName]; vschema != "" {
+					nsData.Artifacts = map[string]string{vSchemaArtifactName: vschema}
+				}
+			}
+		}
 		result[ns] = nsData
 	}
-	return result
+	return result, nil
 }
 
 // protoChangeTypeToOperation converts a proto ChangeType enum to a storage operation string.

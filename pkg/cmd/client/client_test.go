@@ -28,23 +28,26 @@ func TestCallPullSchemaAPI(t *testing.T) {
 			Type:        "mysql",
 			Environment: "production",
 			TableCount:  1,
-			SchemaFiles: map[string]*apitypes.SchemaFiles{
-				"orders": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 			},
 		}))
 	}))
 	t.Cleanup(server.Close)
 
-	result, err := CallPullSchemaAPI(server.URL, "orders", "mysql", "production")
+	result, err := CallPullSchemaAPIWithOptions(server.URL, "orders", "mysql", "production", PullSchemaOptions{
+		Namespaces:    []string{"orders_production", "orders_audit_production"},
+		CatalogDetail: "detailed",
+	})
 	require.NoError(t, err)
 
-	assert.Equal(t, apitypes.PullSchemaRequest{Database: "orders", Type: "mysql", Environment: "production"}, gotReq)
+	assert.Equal(t, apitypes.PullSchemaRequest{Database: "orders", Type: "mysql", Environment: "production", Namespaces: []string{"orders_production", "orders_audit_production"}, CatalogDetail: "detailed"}, gotReq)
 	require.NotNil(t, result)
 	assert.Equal(t, "orders", result.Database)
 	assert.Equal(t, "mysql", result.Type)
 	assert.Equal(t, "production", result.Environment)
 	assert.Equal(t, int32(1), result.TableCount)
-	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", result.SchemaFiles["orders"].Files["users.sql"])
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", result.Namespaces["orders"].Tables["users"])
 }
 
 func TestCallPullSchemaAPIError(t *testing.T) {
@@ -60,6 +63,38 @@ func TestCallPullSchemaAPIError(t *testing.T) {
 
 	assert.Nil(t, result)
 	assert.Contains(t, err.Error(), "database not configured")
+}
+
+func TestListDatabases(t *testing.T) {
+	var gotType string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/api/databases", r.URL.Path)
+		gotType = r.URL.Query().Get("type")
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.DatabaseListResponse{
+			Databases: []*apitypes.DatabaseResponse{
+				{
+					Database: "orders",
+					Type:     "mysql",
+					Environments: []*apitypes.DatabaseEnvironmentResponse{
+						{Environment: "production", Deployments: []string{"pie"}},
+					},
+				},
+			},
+		}))
+	}))
+	t.Cleanup(server.Close)
+
+	result, err := ListDatabases(server.URL, ListDatabasesOptions{Type: "mysql"})
+	require.NoError(t, err)
+
+	assert.Equal(t, "mysql", gotType)
+	require.NotNil(t, result)
+	require.Len(t, result.Databases, 1)
+	assert.Equal(t, "orders", result.Databases[0].Database)
+	assert.Equal(t, "mysql", result.Databases[0].Type)
+	assert.Equal(t, []string{"pie"}, result.Databases[0].Environments[0].Deployments)
 }
 
 func TestGetStatusWithOptions(t *testing.T) {

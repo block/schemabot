@@ -430,7 +430,7 @@ func planNamespacesToChanges(namespaces map[string]*storage.NamespacePlanData) [
 			})
 		}
 		metadata := make(map[string]string)
-		if len(nsData.VSchema) > 0 {
+		if namespaceHasVSchemaArtifact(nsData) {
 			metadata["vschema_changed"] = "true"
 		}
 		changes = append(changes, engine.SchemaChange{

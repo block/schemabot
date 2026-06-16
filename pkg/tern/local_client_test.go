@@ -38,6 +38,31 @@ func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
 	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
 }
 
+func TestPlanHasOriginalFilesCaptureAcceptsOriginalFiles(t *testing.T) {
+	assert.True(t, (&storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {
+				OriginalFiles: map[string]string{
+					"vschema.json": `{"tables":{"users":{}}}`,
+				},
+				OriginalFilesCaptured: true,
+			},
+		},
+	}).HasOriginalFilesCapture())
+	assert.True(t, (&storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {
+				OriginalFilesCaptured: true,
+			},
+		},
+	}).HasOriginalFilesCapture())
+	assert.False(t, (&storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {},
+		},
+	}).HasOriginalFilesCapture())
+}
+
 type exactProgressApplyStore struct {
 	storage.ApplyStore
 	apply *storage.Apply
@@ -978,6 +1003,66 @@ func TestLocalClient_ProcessPendingStartControlRequestStartsDeferredDeploy(t *te
 	assert.Nil(t, startReq)
 }
 
+func TestLocalClient_StartQueuesOwnerRequest(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              123,
+		ApplyIdentifier: "apply-stopped-start",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+		UpdatedAt:       time.Now(),
+	}
+	task := &storage.Task{
+		ID:             456,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stopped-start",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Stopped,
+		UpdatedAt:      time.Now(),
+	}
+	controlRequests := &testControlRequestStore{}
+	var wakeApplyID, wakeDatabase, wakeEnvironment string
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+			WakeOperator: func(applyIdentifier, database, environment string) {
+				wakeApplyID = applyIdentifier
+				wakeDatabase = database
+				wakeEnvironment = environment
+			},
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: &fakeControlEngine{},
+		logger:       slog.Default(),
+	}
+
+	resp, err := client.Start(t.Context(), &ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.StartedCount)
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Equal(t, state.Task.Stopped, task.State)
+
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, startReq)
+	assert.Equal(t, "tern-grpc", startReq.RequestedBy)
+	assert.Equal(t, apply.ApplyIdentifier, wakeApplyID)
+	assert.Equal(t, apply.Database, wakeDatabase)
+	assert.Equal(t, apply.Environment, wakeEnvironment)
+}
+
 // A revert-window apply has already cut over, so a durable stop request against
 // it is a permanent rejection. Processing it must resolve the request terminally
 // (failed) with the operator-facing reason instead of bubbling a retryable error
@@ -1324,7 +1409,7 @@ func TestLocalClient_StopPreservesTerminalCancelledApply(t *testing.T) {
 		logger:            slog.Default(),
 	}
 
-	resp, err := client.stop(t.Context(), &ternv1.StopRequest{
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: apply.Environment,
 	}, "cli:second")
@@ -2138,6 +2223,32 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
 	})
 
+	t.Run("pull namespace must match database-bound DSN", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/orders_schema",
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForMySQLPullNamespace("orders_schema")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+
+		_, err = c.credentialsForMySQLPullNamespace("audit_schema")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not match requested namespace")
+	})
+
+	t.Run("pull namespace-free DSN injects the namespace as the connection schema", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForMySQLPullNamespace("orders_schema")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+	})
+
 	t.Run("namespace-free DSN without a namespace is an error", func(t *testing.T) {
 		c := &LocalClient{config: LocalConfig{
 			Type:      storage.DatabaseTypeMySQL,
@@ -2202,4 +2313,15 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 		assert.Equal(t, "vtgate-dsn", creds.DSN)
 		assert.Equal(t, "acme", creds.Metadata["organization"])
 	})
+}
+
+func TestLocalClient_PlanNamespaceUsesConfiguredDatabase(t *testing.T) {
+	client := &LocalClient{config: LocalConfig{
+		Database: "testdb",
+		Type:     storage.DatabaseTypeMySQL,
+	}}
+
+	assert.Equal(t, "testdb", client.planNamespace(""))
+	assert.Equal(t, "testdb", client.planNamespace("default"))
+	assert.Equal(t, "analytics", client.planNamespace("analytics"))
 }

@@ -282,11 +282,6 @@ func (c *RoutingClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRe
 	return client.SkipRevert(ctx, routedReq)
 }
 
-// RollbackPlan is not routable without an environment-scoped request.
-func (c *RoutingClient) RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error) {
-	return nil, fmt.Errorf("rollback plan for database %q requires an environment-scoped client", database)
-}
-
 // Health is not routable without a specific deployment and environment.
 func (c *RoutingClient) Health(ctx context.Context) error {
 	return fmt.Errorf("routing client health requires a deployment-scoped client")

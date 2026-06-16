@@ -513,6 +513,8 @@ type mockTernClient struct {
 	pullSchemaResp    *ternv1.PullSchemaResponse
 	pullSchemaErr     error
 	pullSchemaReq     *ternv1.PullSchemaRequest
+	pullSchemaReqs    []*ternv1.PullSchemaRequest
+	pullSchemaHook    func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
 	applyResp         *ternv1.ApplyResponse
 	applyErr          error
 	applyReq          *ternv1.ApplyRequest
@@ -551,6 +553,10 @@ type mockTernClient struct {
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
 func (m *mockTernClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	m.pullSchemaReq = req
+	m.pullSchemaReqs = append(m.pullSchemaReqs, req)
+	if m.pullSchemaHook != nil {
+		return m.pullSchemaHook(req)
+	}
 	if m.pullSchemaResp != nil {
 		return m.pullSchemaResp, m.pullSchemaErr
 	}
@@ -621,9 +627,6 @@ func (m *mockTernClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertR
 		return m.skipRevertResp, m.skipRevertErr
 	}
 	return nil, m.skipRevertErr
-}
-func (m *mockTernClient) RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error) {
-	return nil, nil
 }
 func (m *mockTernClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
 	m.resumeMu.Lock()
@@ -915,8 +918,8 @@ func TestExecutePullSchemaRoutesConfiguredMySQLTarget(t *testing.T) {
 			Database:    "orders",
 			Type:        storage.DatabaseTypeMySQL,
 			Environment: "production",
-			SchemaFiles: map[string]*ternv1.SchemaFiles{
-				"orders": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 			},
 			TableCount: 1,
 		},
@@ -955,9 +958,67 @@ func TestExecutePullSchemaRoutesConfiguredMySQLTarget(t *testing.T) {
 	assert.Equal(t, int32(1), resp.TableCount)
 	require.NotNil(t, mockClient.pullSchemaReq)
 	assert.Equal(t, "orders-production", mockClient.pullSchemaReq.Target)
+	assert.Empty(t, mockClient.pullSchemaReq.Namespace)
 	assert.Equal(t, "production", mockClient.pullSchemaReq.Environment)
 	assert.Equal(t, storage.DatabaseTypeMySQL, mockClient.pullSchemaReq.Type)
-	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", resp.SchemaFiles["orders"].Files["users.sql"])
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", resp.Namespaces["orders"].Tables["users"])
+}
+
+func TestExecutePullSchemaPullsRequestedNamespaces(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaHook: func(req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+			return &ternv1.PullSchemaResponse{
+				Database:    req.Database,
+				Type:        req.Type,
+				Environment: req.Environment,
+				Namespaces: map[string]*ternv1.PulledNamespace{
+					req.Namespace: {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+				},
+				TableCount: 1,
+			}, nil
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders-logical": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:      "orders-logical",
+		Environment:   "production",
+		Type:          storage.DatabaseTypeMySQL,
+		Namespaces:    []string{"orders_production", "orders_audit_production"},
+		CatalogDetail: "detailed",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "orders-logical", resp.Database)
+	assert.Equal(t, int32(2), resp.TableCount)
+	assert.Contains(t, resp.Namespaces, "orders_production")
+	assert.Contains(t, resp.Namespaces, "orders_audit_production")
+	require.Len(t, mockClient.pullSchemaReqs, 2)
+	assert.Equal(t, "orders-logical", mockClient.pullSchemaReqs[0].Database)
+	assert.Equal(t, "orders_production", mockClient.pullSchemaReqs[0].Namespace)
+	assert.Equal(t, ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED, mockClient.pullSchemaReqs[0].CatalogDetail)
+	assert.Equal(t, "orders_audit_production", mockClient.pullSchemaReqs[1].Namespace)
+	assert.Equal(t, ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED, mockClient.pullSchemaReqs[1].CatalogDetail)
 }
 
 func TestExecutePullSchemaRejectsUnsupportedType(t *testing.T) {
@@ -1619,6 +1680,125 @@ func TestDatabaseEnvironmentsUsesServerPromotionOrder(t *testing.T) {
 	assert.Equal(t, []string{"production", "staging", "sandbox"}, resp.Environments)
 }
 
+func TestDatabaseListSanitizesConfigAndReportsTopology(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"accounts": {
+				Type: storage.DatabaseTypeVitess,
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Target:     "accounts-prod-target",
+						Deployment: "sled",
+					},
+				},
+			},
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {
+						DSN: "orders_user:orders_password@tcp(localhost:3306)/orders_staging",
+					},
+					"production": {
+						Target:     "orders-prod-target",
+						Deployment: "pie",
+					},
+				},
+				AllowedRepos: []string{"octocat/orders"},
+				AllowedDirs:  []string{"schema/orders"},
+			},
+		},
+		TernDeployments: TernConfig{
+			"pie":  {"production": "pie.example:9090"},
+			"sled": {"production": "sled.example:9090"},
+		},
+		AllowedEnvironments: []string{"staging"},
+		EnvironmentOrder:    []string{"production", "staging"},
+	}, nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	body := w.Body.String()
+	assert.NotContains(t, body, "orders_password")
+	assert.NotContains(t, body, "orders-prod-target")
+	assert.NotContains(t, body, "pie.example")
+	assert.NotContains(t, body, "execution_mode")
+	assert.NotContains(t, body, "execution_target_count")
+	assert.NotContains(t, body, "server_handles_environment")
+
+	var resp apitypes.DatabaseListResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 2)
+
+	accounts := resp.Databases[0]
+	assert.Equal(t, "accounts", accounts.Database)
+	assert.Equal(t, storage.DatabaseTypeVitess, accounts.Type)
+	require.Len(t, accounts.Environments, 1)
+	assert.Equal(t, "production", accounts.Environments[0].Environment)
+	assert.Equal(t, []string{"sled"}, accounts.Environments[0].Deployments)
+
+	orders := resp.Databases[1]
+	assert.Equal(t, "orders", orders.Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, orders.Type)
+	require.Len(t, orders.Environments, 2)
+	assert.Equal(t, "production", orders.Environments[0].Environment)
+	assert.Equal(t, []string{"pie"}, orders.Environments[0].Deployments)
+	assert.Equal(t, "staging", orders.Environments[1].Environment)
+	assert.Empty(t, orders.Environments[1].Deployments)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=mysql", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, resp.Databases[0].Type)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=vitess", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "accounts", resp.Databases[0].Database)
+	assert.Equal(t, storage.DatabaseTypeVitess, resp.Databases[0].Type)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=strata", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Databases)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=postgres", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "type must be")
+}
+
+func TestDatabaseListRejectsInvalidDeploymentTopology(t *testing.T) {
+	_, err := databaseListResponse(&ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Deployments: map[string]DeploymentTarget{}},
+				},
+			},
+		},
+	}, "")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "orders" environment "production" deployments map is empty`)
+}
+
 func TestProgressByApplyIDResolvesExternalIDForRemoteApply(t *testing.T) {
 	mock := &mockTernClient{
 		isRemote: true,
@@ -1950,7 +2130,7 @@ func TestProgressFromLocalStorageSingleDeploymentOmitsOperationFields(t *testing
 	assert.Empty(t, resp.Tables[0].Deployment)
 }
 
-func TestValidateRollbackSourceApplyAcceptsLatestCompletedApplyWithOriginalSchema(t *testing.T) {
+func TestValidateRollbackSourceApplyAcceptsLatestCompletedApplyWithOriginalFiles(t *testing.T) {
 	now := time.Now().UTC()
 	apply := rollbackGuardrailApply("apply_latest", 1, 10, now)
 	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, true), []*storage.Task{
@@ -2002,7 +2182,7 @@ func TestValidateRollbackSourceApplyRequiresPullRequestScopeWhenRequested(t *tes
 	assert.Contains(t, err.Error(), "repository is required")
 }
 
-func TestValidateRollbackSourceApplyRejectsPlanWithoutOriginalSchema(t *testing.T) {
+func TestValidateRollbackSourceApplyRejectsPlanWithoutOriginalFiles(t *testing.T) {
 	now := time.Now().UTC()
 	apply := rollbackGuardrailApply("apply_no_schema", 1, 10, now)
 	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, false), []*storage.Task{
@@ -2017,7 +2197,7 @@ func TestValidateRollbackSourceApplyRejectsPlanWithoutOriginalSchema(t *testing.
 	})
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no stored original schema")
+	assert.Contains(t, err.Error(), "no stored original schema files")
 }
 
 func TestValidateRollbackSourceApplyRejectsPlannerSourceMismatchForOlderApply(t *testing.T) {
@@ -2096,7 +2276,7 @@ func rollbackGuardrailApply(identifier string, id, planID int64, completedAt tim
 	}
 }
 
-func rollbackGuardrailPlan(id int64, includeOriginalSchema bool) *storage.Plan {
+func rollbackGuardrailPlan(id int64, includeOriginalFiles bool) *storage.Plan {
 	plan := &storage.Plan{
 		ID:           id,
 		Database:     "orders",
@@ -2106,10 +2286,11 @@ func rollbackGuardrailPlan(id int64, includeOriginalSchema bool) *storage.Plan {
 			"orders": {},
 		},
 	}
-	if includeOriginalSchema {
-		plan.Namespaces["orders"].OriginalSchema = map[string]string{
-			"users": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	if includeOriginalFiles {
+		plan.Namespaces["orders"].OriginalFiles = map[string]string{
+			"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 		}
+		plan.Namespaces["orders"].OriginalFilesCaptured = true
 	}
 	return plan
 }
@@ -2863,7 +3044,7 @@ func TestStopHandler(t *testing.T) {
 		assert.Equal(t, int64(1), resp.StoppedCount)
 	})
 
-	t.Run("remote stop queues durable request without immediate remote stop", func(t *testing.T) {
+	t.Run("remote stop queues durable request and propagates to remote durable queue", func(t *testing.T) {
 		mock := &mockTernClient{isRemote: true, stopResp: &ternv1.StopResponse{Accepted: true}}
 		apply := activeTestApply("apply-remote-stop")
 		apply.ExternalID = "remote-apply-stop"
@@ -2884,7 +3065,9 @@ func TestStopHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		assert.Nil(t, mock.stopReq, "remote stop must be reconciled by the operator owner")
+		require.NotNil(t, mock.stopReq, "remote stop propagation should queue data-plane durable intent")
+		assert.Equal(t, "remote-apply-stop", mock.stopReq.ApplyId)
+		assert.Equal(t, "staging", mock.stopReq.Environment)
 		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 		require.NoError(t, err)
 		require.NotNil(t, controlReq)
@@ -3844,4 +4027,35 @@ func TestDeriveErrorCode(t *testing.T) {
 			assert.Equal(t, tt.expected, deriveErrorCode(tt.state, tt.errMsg))
 		})
 	}
+}
+
+func TestRollbackSchemaFilesAllowsCapturedEmptyOriginalFiles(t *testing.T) {
+	plan := &storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"shop": {
+				OriginalFiles:         map[string]string{},
+				OriginalFilesCaptured: true,
+			},
+		},
+	}
+
+	schemaFiles, err := rollbackSchemaFiles(plan)
+	require.NoError(t, err)
+	require.Contains(t, schemaFiles, "shop")
+	assert.Empty(t, schemaFiles["shop"].Files)
+}
+
+func TestRollbackSchemaFilesRejectsPlanWithoutCapturedOriginalFiles(t *testing.T) {
+	plan := &storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"shop": {
+				OriginalFiles: map[string]string{},
+			},
+		},
+	}
+
+	schemaFiles, err := rollbackSchemaFiles(plan)
+	require.Error(t, err)
+	assert.Nil(t, schemaFiles)
+	assert.Contains(t, err.Error(), `no original schema files available for rollback namespace "shop"`)
 }

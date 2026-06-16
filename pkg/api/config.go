@@ -371,11 +371,11 @@ type DSNFromConfigPaths struct {
 
 // TargetResolverConfig configures the data-plane connection resolver. Targets
 // is the static target -> connection inventory: the "no inventory service"
-// fallback and per-target overrides. A dynamic backend (e.g. Etre) discovers
-// targets by key and needs no enumeration here, so it will slot in as a sibling
-// field without changing this shape.
+// fallback. Etre is the dynamic backend that discovers targets by key at request
+// time. Each is one pluggable backend behind the same resolver interface.
 type TargetResolverConfig struct {
 	Targets map[string]inventory.StaticTarget `yaml:"targets,omitempty"`
+	Etre    EtreConfig                        `yaml:"etre,omitempty"`
 }
 
 // Configured reports whether the data plane has any static target inventory.
@@ -383,9 +383,96 @@ func (c TargetResolverConfig) Configured() bool {
 	return len(c.Targets) > 0
 }
 
+// Enabled reports whether any target-resolver backend is configured (static
+// inventory or Etre). New backends are added here so callers stay correct.
+func (c TargetResolverConfig) Enabled() bool {
+	return c.Configured() || c.Etre.Configured()
+}
+
 // StaticInventory returns the static inventory config for NewStaticResolver.
 func (c TargetResolverConfig) StaticInventory() inventory.StaticConfig {
 	return inventory.StaticConfig{Targets: c.Targets}
+}
+
+// EtreConfig configures the data-plane resolver backed by Etre: the Etre lookup
+// that maps an opaque target to a cluster endpoint, plus the credentials for the
+// assembled connection. It is the common-path dynamic resolver; the engine is
+// selected by DatabaseType, and engine-specific knobs live in a per-engine block
+// so the shared config carries no engine semantics.
+type EtreConfig struct {
+	// Addr is the Etre server address (supports secret refs, e.g. env:ETRE_ADDR).
+	Addr string `yaml:"addr"`
+	// DatabaseType selects the engine the resolver assembles connections for and
+	// is required (no implicit default): "mysql" reads the MySQL block; "vitess"
+	// reads the Vitess block.
+	DatabaseType string `yaml:"database_type"`
+	// EntityType is the Etre entity type recording the target clusters.
+	EntityType string `yaml:"entity_type"`
+	// TargetLabel is the Etre label the request's opaque target matches.
+	TargetLabel string `yaml:"target_label"`
+	// EnvLabel, when set, scopes the lookup to the request environment.
+	EnvLabel string `yaml:"env_label,omitempty"`
+	// Labels are fixed selector predicates added to every lookup (e.g. a region).
+	Labels map[string]string `yaml:"labels,omitempty"`
+	// AttributeFields are entity fields surfaced to the credential resolver.
+	AttributeFields []string `yaml:"attribute_fields,omitempty"`
+	// MySQL holds the MySQL engine knobs, read when DatabaseType is "mysql".
+	MySQL EtreMySQLConfig `yaml:"mysql,omitempty"`
+	// Vitess holds the Vitess engine knobs, read when DatabaseType is "vitess".
+	Vitess EtreVitessConfig `yaml:"vitess,omitempty"`
+	// Credentials configures the credentials for the connection.
+	Credentials EtreCredentialsConfig `yaml:"credentials"`
+}
+
+// EtreMySQLConfig holds the MySQL-specific knobs for an Etre resolver: how to
+// turn a resolved entity into a connection host.
+type EtreMySQLConfig struct {
+	// HostField is the entity field holding the connection host.
+	HostField string `yaml:"host_field"`
+	// DefaultPort is appended to the host when it has no port.
+	DefaultPort string `yaml:"default_port,omitempty"`
+}
+
+// EtreVitessConfig holds the Vitess (PlanetScale) knobs for an Etre resolver:
+// how to find the organization and reach the PlanetScale-compatible API.
+type EtreVitessConfig struct {
+	// OrganizationAttribute is the entity field holding the PlanetScale
+	// organization. Defaults to "organization".
+	OrganizationAttribute string `yaml:"organization_attribute,omitempty"`
+	// APIURL is the PlanetScale-compatible API base URL; a per-target override in
+	// the credential secret takes precedence.
+	APIURL string `yaml:"api_url,omitempty"`
+}
+
+// EtreCredentialsConfig configures credentials for an Etre-resolved target.
+// Credentials never come from Etre. Type selects the backend; each backend is
+// one pluggable implementation behind the same resolver interface, so the data
+// plane is not coupled to any single secret store.
+type EtreCredentialsConfig struct {
+	// Type selects the credential backend: "secret_ref" (default) or "awssm".
+	Type string `yaml:"type,omitempty"`
+
+	// secret_ref backend: a configured username plus a password secret reference
+	// (env:, file:, secretsmanager:, or a literal), optionally carrying a
+	// {target} placeholder for per-target secret naming.
+	Username    string `yaml:"username,omitempty"`
+	PasswordRef string `yaml:"password_ref,omitempty"`
+
+	// awssm backend: assume a per-target IAM role and read a JSON
+	// {username, password} secret from AWS Secrets Manager. RoleARN may carry an
+	// {account} placeholder and SecretName a {target} placeholder; ExternalID is
+	// an optional STS external id; AccountAttribute names the entity attribute
+	// holding the target's AWS account id (defaults to aws_account_id).
+	Region           string `yaml:"region,omitempty"`
+	RoleARN          string `yaml:"role_arn,omitempty"`
+	ExternalID       string `yaml:"external_id,omitempty"`
+	SecretName       string `yaml:"secret_name,omitempty"`
+	AccountAttribute string `yaml:"account_attribute,omitempty"`
+}
+
+// Configured reports whether the data plane should resolve targets through Etre.
+func (c EtreConfig) Configured() bool {
+	return strings.TrimSpace(c.Addr) != ""
 }
 
 // DatabaseConfig holds configuration for a registered database.
@@ -632,11 +719,12 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 
-	// The database registry is required in both local mode and gRPC mode:
-	// local environments provide DSNs, while remote environments provide the
-	// server-owned target/deployment route.
-	if len(c.Databases) == 0 {
-		return fmt.Errorf("databases is required")
+	// The database registry is required for the control plane and for a
+	// single-database data plane. A data plane configured with a target_resolver
+	// resolves opaque targets dynamically and has no database registry, so it is
+	// exempt.
+	if len(c.Databases) == 0 && !c.TargetResolver.Enabled() {
+		return fmt.Errorf("databases or target_resolver is required")
 	}
 
 	if err := validateUniqueNames("environment_order", c.EnvironmentOrder); err != nil {
@@ -809,9 +897,20 @@ func (c *ServerConfig) Validate() error {
 // When Type is empty or "none" (the default), authentication is disabled and
 // all requests are allowed — unchanged from deployments without this config.
 type AuthConfig struct {
-	// Type selects the authenticator: "none" (or "", the default).
-	// Additional types (e.g. "oidc") are introduced in later changes.
+	// Type selects the authenticator: "none" (or "", the default) or "oidc".
 	Type string `yaml:"type"`
+
+	// Issuer is the OIDC provider's issuer URL. Required when Type is "oidc".
+	Issuer string `yaml:"issuer"`
+
+	// Audience is the expected token audience (aud) claim. Required when Type is
+	// "oidc" — without it a token minted for another app sharing the issuer
+	// would be accepted.
+	Audience string `yaml:"audience"`
+
+	// GroupsClaim is the JWT claim carrying group memberships. Defaults to
+	// "groups" when empty.
+	GroupsClaim string `yaml:"groups_claim"`
 }
 
 // Validate checks the auth configuration. Unknown types are rejected so a
@@ -820,8 +919,19 @@ func (a *AuthConfig) Validate() error {
 	switch a.Type {
 	case "", "none":
 		return nil
+	case "oidc":
+		if strings.TrimSpace(a.Issuer) == "" {
+			return fmt.Errorf("issuer is required when auth type is oidc")
+		}
+		if a.Issuer != strings.TrimSpace(a.Issuer) {
+			return fmt.Errorf("issuer must not have leading or trailing whitespace")
+		}
+		if strings.TrimSpace(a.Audience) == "" {
+			return fmt.Errorf("audience is required when auth type is oidc")
+		}
+		return nil
 	default:
-		return fmt.Errorf("unknown auth type %q (supported: none)", a.Type)
+		return fmt.Errorf("unknown auth type %q (supported: none, oidc)", a.Type)
 	}
 }
 

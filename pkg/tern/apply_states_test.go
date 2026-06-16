@@ -1,7 +1,6 @@
 package tern
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -182,8 +181,8 @@ func TestApplyEventStateTransition(t *testing.T) {
 func TestPlanNamespacesToChanges_VSchemaOnlyWhenStored(t *testing.T) {
 	namespaces := map[string]*storage.NamespacePlanData{
 		"ks_with_vschema": {
-			Tables:  []storage.TableChange{{Table: "users", DDL: "ALTER TABLE users ADD COLUMN x INT", Operation: "alter"}},
-			VSchema: json.RawMessage(`{"tables":{"users":{}}}`),
+			Tables:    []storage.TableChange{{Table: "users", DDL: "ALTER TABLE users ADD COLUMN x INT", Operation: "alter"}},
+			Artifacts: map[string]string{"vschema.json": `{"tables":{"users":{}}}`},
 		},
 		"ks_without_vschema": {
 			Tables: []storage.TableChange{{Table: "orders", DDL: "ALTER TABLE orders ADD COLUMN y INT", Operation: "alter"}},
@@ -291,11 +290,11 @@ func TestVSchemaTasksCreatedAlongsideDDL(t *testing.T) {
 	plan := &storage.Plan{
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"myapp_sharded": {
-				Tables:  []storage.TableChange{{Table: "users", DDL: "ALTER TABLE users ADD COLUMN phone VARCHAR(20)", Operation: "alter", Namespace: "myapp_sharded"}},
-				VSchema: json.RawMessage(`{"sharded": true, "tables": {"users": {}}}`),
+				Tables:    []storage.TableChange{{Table: "users", DDL: "ALTER TABLE users ADD COLUMN phone VARCHAR(20)", Operation: "alter", Namespace: "myapp_sharded"}},
+				Artifacts: map[string]string{"vschema.json": `{"sharded": true, "tables": {"users": {}}}`},
 			},
 			"myapp": {
-				VSchema: json.RawMessage(`{"tables": {"users_seq": {"type": "sequence"}}}`),
+				Artifacts: map[string]string{"vschema.json": `{"tables": {"users_seq": {"type": "sequence"}}}`},
 			},
 		},
 	}
@@ -304,7 +303,7 @@ func TestVSchemaTasksCreatedAlongsideDDL(t *testing.T) {
 	require.Len(t, ddlChanges, 1, "should have 1 DDL change")
 
 	for ns, nsData := range plan.Namespaces {
-		if len(nsData.VSchema) > 0 {
+		if namespaceHasVSchemaArtifact(nsData) {
 			ddlChanges = append(ddlChanges, storage.TableChange{
 				Table:     "VSchema: " + ns,
 				Namespace: ns,

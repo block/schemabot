@@ -23,4 +23,32 @@ func TestAuthConfigValidate(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unknown auth type")
 	})
+
+	t.Run("oidc requires issuer", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "oidc"}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "issuer")
+	})
+
+	t.Run("oidc with issuer and audience is valid", func(t *testing.T) {
+		require.NoError(t, (&api.AuthConfig{Type: "oidc", Issuer: "https://issuer.example.com", Audience: "schemabot"}).Validate())
+	})
+
+	t.Run("oidc requires audience", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "oidc", Issuer: "https://issuer.example.com"}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "audience")
+	})
+
+	t.Run("oidc whitespace-only issuer is rejected", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "oidc", Issuer: "   "}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "issuer")
+	})
+
+	t.Run("oidc issuer with surrounding whitespace is rejected", func(t *testing.T) {
+		err := (&api.AuthConfig{Type: "oidc", Issuer: " https://issuer.example.com "}).Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "whitespace")
+	})
 }

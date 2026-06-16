@@ -158,7 +158,7 @@ See [Check Runs](../../docs/check-runs.md) for the current lifecycle, `apply_id`
 ## Command Syntax
 
 ```text
-schemabot <command> [-e <environment>] [-d <database>] [--defer-cutover] [--allow-unsafe] [--skip-revert]
+schemabot <command> [args] [-e <environment>] [-d <database>] [--defer-cutover] [--allow-unsafe] [--skip-revert] [--enable-revert]
 ```
 
 | Command | `-e` required | Description |
@@ -167,7 +167,11 @@ schemabot <command> [-e <environment>] [-d <database>] [--defer-cutover] [--allo
 | `apply` | Yes | Lock plan for deployment |
 | `apply-confirm` | Yes | Execute locked plan |
 | `unlock` | No | Discard locked plans |
-| `rollback` | Yes | Generate rollback plan |
+| `cancel` | Yes | Cancel in-progress apply |
+| `cutover` | Yes | Complete deferred cutover |
+| `revert` | Yes | Revert (within revert window) |
+| `skip-revert` | Yes | Make changes permanent |
+| `rollback <apply-id>` | Yes | Generate rollback plan |
 | `rollback-confirm` | Yes | Execute rollback |
 | `fix-lint` | No | Auto-fix lint warnings |
 | `help` | No | Show command reference |

@@ -320,6 +320,54 @@ jobs:
           echo "=== All pods ==="
           kubectl get pods -n schemabot-e2e -o wide 2>/dev/null || true
 
+  e2e-k8s-etre:
+    name: "E2E K8s Etre Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - name: "Start minikube"
+        uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
+        with:
+          driver: docker
+          cpus: 2
+          memory: 4096
+      # The script builds both the schemabot and etre images into minikube's
+      # docker daemon, so no separate build step is needed here.
+      - name: "Deploy and test"
+        run: e2e/k8s/e2e-etre-test.sh
+      - name: "Pod logs on failure"
+        if: failure()
+        run: |
+          echo "=== Control Plane ==="
+          kubectl logs -n schemabot-e2e-etre -l app.kubernetes.io/instance=control-plane-etre --tail=200 2>/dev/null || true
+          echo "=== Data Plane ==="
+          kubectl logs -n schemabot-e2e-etre -l app.kubernetes.io/instance=data-plane-etre --tail=200 2>/dev/null || true
+          echo "=== Etre ==="
+          kubectl logs -n schemabot-e2e-etre -l app=etre --tail=100 2>/dev/null || true
+          echo "=== ministack ==="
+          kubectl logs -n schemabot-e2e-etre -l app=ministack --tail=100 2>/dev/null || true
+          echo "=== Seed jobs ==="
+          kubectl logs -n schemabot-e2e-etre -l job-name=etre-seed --tail=50 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-etre -l job-name=ministack-seed --tail=50 2>/dev/null || true
+          echo "=== All pods ==="
+          kubectl get pods -n schemabot-e2e-etre -o wide 2>/dev/null || true
+
   # Rollup jobs that match the old required check names.
   # Remove these after updating branch protection to use the new job names.
   #

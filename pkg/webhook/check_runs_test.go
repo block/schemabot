@@ -32,6 +32,22 @@ func (s *emptyStorage) Applies() storage.ApplyStore {
 	return &emptyApplyStore{}
 }
 
+func (s *emptyStorage) Locks() storage.LockStore {
+	return &emptyLockStore{}
+}
+
+type emptyLockStore struct {
+	storage.LockStore
+}
+
+func (s *emptyLockStore) Get(ctx context.Context, database, dbType string) (*storage.Lock, error) {
+	return nil, nil
+}
+
+func (s *emptyLockStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Lock, error) {
+	return nil, nil
+}
+
 type emptyCheckStore struct {
 	storage.CheckStore
 }
@@ -49,6 +65,10 @@ type emptyApplyStore struct {
 }
 
 func (s *emptyApplyStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Apply, error) {
+	return nil, nil
+}
+
+func (s *emptyApplyStore) GetByApplyIdentifier(ctx context.Context, applyIdentifier string) (*storage.Apply, error) {
 	return nil, nil
 }
 

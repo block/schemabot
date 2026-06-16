@@ -31,7 +31,7 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 				"users.sql": "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 			},
 		}
-		changes, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.NoError(t, err)
 		assert.Empty(t, changes, "matching schemas should produce no changes")
 	})
@@ -47,7 +47,7 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 				"users.sql": "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  `phone` varchar(20) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 			},
 		}
-		changes, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.NoError(t, err)
 		require.Len(t, changes, 1, "should detect one ALTER TABLE change")
 		assert.Equal(t, "users", changes[0].Table)
@@ -65,7 +65,7 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 				"users.sql": "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 			},
 		}
-		changes, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.NoError(t, err)
 		require.Len(t, changes, 1, "should detect DROP COLUMN for stale column")
 		assert.Equal(t, "users", changes[0].Table)
@@ -81,7 +81,7 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 				"users.sql": "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 			},
 		}
-		changes, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.NoError(t, err)
 		require.Len(t, changes, 1, "should detect CREATE TABLE")
 		assert.Equal(t, "users", changes[0].Table)

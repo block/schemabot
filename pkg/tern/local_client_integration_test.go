@@ -16,7 +16,7 @@ import (
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
+	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go/modules/mysql"
@@ -486,7 +486,7 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `pull_schema_users`, `pull_schema_users_archive_2026_06_12`")
 		assert.NoError(t, cleanupErr, "drop pull schema tables")
 	})
-	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, PRIMARY KEY (`id`), UNIQUE KEY `idx_email` (`email`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL COMMENT 'login email', `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`), UNIQUE KEY `idx_email` (`email`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='users table'")
 	require.NoError(t, err, "create pull schema table")
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users_archive_2026_06_12` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err, "create archive table")
@@ -501,8 +501,9 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	defer utils.CloseAndLog(client)
 
 	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
-		Type:        storage.DatabaseTypeMySQL,
-		Environment: localClientTestEnvironment,
+		Type:          storage.DatabaseTypeMySQL,
+		Environment:   localClientTestEnvironment,
+		CatalogDetail: ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED,
 	})
 
 	require.NoError(t, err, "pull schema")
@@ -510,13 +511,129 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	assert.Equal(t, "testdb", resp.Database)
 	assert.Equal(t, storage.DatabaseTypeMySQL, resp.Type)
 	assert.Equal(t, localClientTestEnvironment, resp.Environment)
-	require.Contains(t, resp.SchemaFiles, "testdb")
-	ddl := resp.SchemaFiles["testdb"].Files["pull_schema_users.sql"]
+	require.Contains(t, resp.Namespaces, "testdb")
+	pulledNamespace := resp.Namespaces["testdb"]
+	ddl := pulledNamespace.Tables["pull_schema_users"]
 	assert.Contains(t, ddl, "CREATE TABLE `pull_schema_users`")
 	assert.Contains(t, ddl, "`email` varchar(255) NOT NULL")
 	assert.NotContains(t, ddl, "AUTO_INCREMENT=")
 	assert.True(t, strings.HasSuffix(ddl, "\n"), "pulled schema file should end with a newline")
-	assert.NotContains(t, resp.SchemaFiles["testdb"].Files, "pull_schema_users_archive_2026_06_12.sql")
+	assert.NotContains(t, pulledNamespace.Tables, "pull_schema_users_archive_2026_06_12")
+	require.NotNil(t, pulledNamespace.NamespaceCatalog)
+	assert.Equal(t, "testdb", pulledNamespace.NamespaceCatalog.Name)
+	assert.Equal(t, storage.DatabaseTypeMySQL, pulledNamespace.NamespaceCatalog.Engine)
+	assert.Equal(t, int32(len(pulledNamespace.Tables)), pulledNamespace.NamespaceCatalog.TableCount)
+	require.Contains(t, pulledNamespace.TableCatalog, "pull_schema_users")
+	tableCatalog := pulledNamespace.TableCatalog["pull_schema_users"]
+	assert.Equal(t, "pull_schema_users", tableCatalog.Name)
+	assert.Equal(t, "table", tableCatalog.Kind)
+	assert.Equal(t, "users table", tableCatalog.Comment)
+	require.Len(t, tableCatalog.Columns, 3)
+	assert.Equal(t, "id", tableCatalog.Columns[0].Name)
+	assert.Equal(t, "bigint unsigned", tableCatalog.Columns[0].Type)
+	assert.False(t, tableCatalog.Columns[0].Nullable)
+	assert.Equal(t, "email", tableCatalog.Columns[1].Name)
+	assert.Equal(t, "varchar(255)", tableCatalog.Columns[1].Type)
+	assert.False(t, tableCatalog.Columns[1].Nullable)
+	assert.Equal(t, "login email", tableCatalog.Columns[1].Comment)
+	assert.Equal(t, "created_at", tableCatalog.Columns[2].Name)
+	assert.Equal(t, "timestamp", tableCatalog.Columns[2].Type)
+	assert.True(t, tableCatalog.Columns[2].Nullable)
+	assert.Equal(t, "CURRENT_TIMESTAMP", tableCatalog.Columns[2].DefaultValue)
+	require.Len(t, tableCatalog.Indexes, 2)
+	indexesByName := make(map[string]*ternv1.IndexCatalog, len(tableCatalog.Indexes))
+	for _, index := range tableCatalog.Indexes {
+		indexesByName[index.Name] = index
+	}
+	require.Contains(t, indexesByName, "PRIMARY")
+	assert.True(t, indexesByName["PRIMARY"].Primary)
+	assert.True(t, indexesByName["PRIMARY"].Unique)
+	assert.Equal(t, []string{"id"}, indexesByName["PRIMARY"].Parts)
+	require.Contains(t, indexesByName, "idx_email")
+	assert.False(t, indexesByName["idx_email"].Primary)
+	assert.True(t, indexesByName["idx_email"].Unique)
+	assert.Equal(t, []string{"email"}, indexesByName["idx_email"].Parts)
+
+	basicResp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err, "pull schema with basic catalog detail")
+	basicCatalog := basicResp.Namespaces["testdb"].TableCatalog["pull_schema_users"]
+	require.NotNil(t, basicCatalog)
+	assert.Empty(t, basicCatalog.Columns)
+	assert.Empty(t, basicCatalog.Indexes)
+}
+
+// Pulling all live MySQL namespaces discovers application schemas while
+// excluding system, SchemaBot storage, pending-drop, and underscore-prefixed
+// namespaces from the exported declarative files.
+func TestLocalClient_PullSchemaDiscoversNonReservedNamespaces(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container // container is managed by TestMain
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "open database")
+	defer utils.CloseAndLog(db)
+
+	for _, stmt := range []string{
+		"CREATE DATABASE IF NOT EXISTS `pull_primary`",
+		"CREATE DATABASE IF NOT EXISTS `pull_audit`",
+		"CREATE DATABASE IF NOT EXISTS `_pull_reserved`",
+		"CREATE TABLE IF NOT EXISTS `pull_primary`.`users` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		"CREATE TABLE IF NOT EXISTS `pull_audit`.`events` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		"CREATE TABLE IF NOT EXISTS `_pull_reserved`.`old_users` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	} {
+		_, err = db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, "prepare namespace discovery schema")
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		require.NoError(t, cleanupErr, "open database for namespace discovery cleanup")
+		defer utils.CloseAndLog(cleanupDB)
+		for _, stmt := range []string{
+			"DROP DATABASE IF EXISTS `pull_primary`",
+			"DROP DATABASE IF EXISTS `pull_audit`",
+			"DROP DATABASE IF EXISTS `_pull_reserved`",
+		} {
+			_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, stmt)
+			assert.NoError(t, cleanupErr, "cleanup namespace discovery schema")
+		}
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "logicaldb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsnWithoutDatabase(t, dsn),
+	}, nil, logger)
+	require.NoError(t, err, "create client")
+	defer utils.CloseAndLog(client)
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "logicaldb",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+	})
+
+	require.NoError(t, err, "pull all namespaces")
+	assert.Contains(t, resp.Namespaces, "pull_primary")
+	assert.Contains(t, resp.Namespaces, "pull_audit")
+	assert.NotContains(t, resp.Namespaces, "_pull_reserved")
+	assert.NotContains(t, resp.Namespaces, "schemabot")
+}
+
+func dsnWithoutDatabase(t *testing.T, dsn string) string {
+	t.Helper()
+	cfg, err := drivermysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	cfg.DBName = ""
+	return cfg.FormatDSN()
 }
 
 func TestLocalClient_Plan(t *testing.T) {
@@ -552,7 +669,7 @@ func TestLocalClient_Plan(t *testing.T) {
 		Type:     "mysql",
 		Database: "testdb",
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"default": {
+			"testdb": {
 				Files: map[string]string{
 					"users.sql": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
 				},
@@ -562,7 +679,12 @@ func TestLocalClient_Plan(t *testing.T) {
 	require.NoError(t, err, "Plan() returned error")
 
 	assert.NotEmpty(t, resp.PlanId, "expected plan_id but got empty string")
-	assert.NotEmpty(t, resp.Changes, "expected at least one schema change")
+	require.NotEmpty(t, resp.Changes, "expected at least one schema change")
+	assert.Contains(t, resp.Changes[0].OriginalFiles["users.sql"], "CREATE TABLE `users`")
+	assert.True(t, resp.Changes[0].OriginalFilesCaptured)
+	assert.Equal(t, "testdb", resp.Changes[0].Namespace)
+	require.NotEmpty(t, resp.Changes[0].TableChanges)
+	assert.Equal(t, "testdb", resp.Changes[0].TableChanges[0].Namespace)
 }
 
 func TestLocalClient_Plan_UsesConfigDatabase(t *testing.T) {
@@ -595,7 +717,7 @@ func TestLocalClient_Plan_UsesConfigDatabase(t *testing.T) {
 		Type:     "mysql",
 		Database: "", // ignored in local mode
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"default": {
+			"testdb": {
 				Files: map[string]string{
 					"users.sql": "CREATE TABLE users (id INT PRIMARY KEY)",
 				},
@@ -677,7 +799,7 @@ func TestLocalClient_Apply(t *testing.T) {
 		Type:     "mysql",
 		Database: "testdb",
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"default": {
+			"testdb": {
 				Files: schemaFiles,
 			},
 		},
@@ -2578,7 +2700,7 @@ func TestLocalClient_Apply_MultiTableSequential(t *testing.T) {
 		Type:     "mysql",
 		Database: "testdb",
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"default": {
+			"testdb": {
 				Files: schemaFiles,
 			},
 		},

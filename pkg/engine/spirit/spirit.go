@@ -304,12 +304,6 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}
 	}
 
-	// Build OriginalSchema map from current schema for rollback support
-	originalSchema := make(map[string]string, len(currentSchema))
-	for _, ts := range currentSchema {
-		originalSchema[ts.Name] = ts.Schema
-	}
-
 	// Build per-namespace SchemaChanges.
 	// Spirit operates on a single database, but we group table changes by the
 	// namespace they belong to (from SchemaFiles keys) for consistency with
@@ -322,11 +316,34 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}
 		changesByNS[ns] = append(changesByNS[ns], tc)
 	}
+	originalFilesByNS := make(map[string]map[string]string, len(changesByNS))
+	for ns := range changesByNS {
+		originalFilesByNS[ns] = map[string]string{}
+	}
+	if len(req.SchemaFiles) == 1 {
+		for ns := range req.SchemaFiles {
+			for _, ts := range currentSchema {
+				originalFilesByNS[ns][ts.Name+".sql"] = ts.Schema
+			}
+		}
+	} else {
+		for _, ts := range currentSchema {
+			ns, err := namespaceForTable(ts.Name, req.SchemaFiles)
+			if err != nil {
+				return nil, fmt.Errorf("namespace lookup for original table %q: %w", ts.Name, err)
+			}
+			if _, ok := originalFilesByNS[ns]; ok {
+				originalFilesByNS[ns][ts.Name+".sql"] = ts.Schema
+			}
+		}
+	}
 	var schemaChanges []engine.SchemaChange
 	for ns, tableChanges := range changesByNS {
 		schemaChanges = append(schemaChanges, engine.SchemaChange{
-			Namespace:    ns,
-			TableChanges: tableChanges,
+			Namespace:             ns,
+			TableChanges:          tableChanges,
+			OriginalFiles:         originalFilesByNS[ns],
+			OriginalFilesCaptured: true,
 		})
 	}
 
@@ -334,7 +351,6 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		PlanID:         fmt.Sprintf("plan-%d", time.Now().UnixNano()),
 		Changes:        schemaChanges,
 		LintViolations: lintViolations,
-		OriginalSchema: originalSchema,
 	}, nil
 }
 

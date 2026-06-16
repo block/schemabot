@@ -1,0 +1,40 @@
+# Control plane Helm values for the etre-resolver k8s e2e.
+#
+# Routes the testapp database to the etre data plane over gRPC, carrying the
+# opaque target (a DSID) the data plane resolves through Etre. Mirrors
+# control-plane-values.yaml but points at the data-plane-etre release and uses
+# a DSID target instead of a static one.
+
+image:
+  repository: schemabot
+  tag: test
+  pullPolicy: Never
+
+config:
+  storage:
+    dsn: "env:MYSQL_DSN"
+  databases:
+    testapp:
+      type: mysql
+      environments:
+        staging:
+          # Opaque execution target — the DSID the data plane resolves via Etre.
+          target: dsid-testapp-staging
+          deployment: data-plane-etre
+  tern_deployments:
+    data-plane-etre:
+      staging: "data-plane-etre-schemabot:13370"
+
+env:
+  - name: MYSQL_DSN
+    value: "root:testpassword@tcp(mysql-control-plane:3306)/schemabot?parseTime=true&multiStatements=true"
+  - name: LOG_LEVEL
+    value: "debug"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi

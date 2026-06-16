@@ -3,12 +3,32 @@ package etre
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/square/etre"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// New must produce a usable client when no HTTPClient is configured: the
+// underlying Etre client does not default a nil HTTP client and would panic on
+// the first request. This drives the real client over HTTP, not the mock.
+func TestNewQueriesOverRealHTTPClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"name":"orders","host":"orders.example:3306"}]`))
+	}))
+	defer srv.Close()
+
+	c, err := New(Config{Addr: srv.URL, EntityType: "cluster"})
+	require.NoError(t, err)
+
+	got, err := c.QueryOne(t.Context(), map[string]string{"name": "orders"})
+	require.NoError(t, err)
+	assert.Equal(t, "orders.example:3306", StringField(got, "host"))
+}
 
 // mockClient builds an etre.MockEntityClient (shipped by the library) that
 // records the query it received and returns the configured result.

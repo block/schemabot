@@ -255,14 +255,66 @@ message PullSchemaRequest {
   string environment = 3;
   // Opaque identifier for endpoint discovery. Defaults to database if empty.
   string target = 4;
+  // Optional namespace to export. For MySQL this is the schema name from SHOW DATABASES.
+  string namespace = 5;
+  // Controls how much structured catalog data is returned alongside canonical DDL.
+  PullCatalogDetail catalog_detail = 6;
 }
 
-// PullSchemaResponse contains live schema files grouped by namespace.
+enum PullCatalogDetail {
+  PULL_CATALOG_DETAIL_BASIC = 0;
+  PULL_CATALOG_DETAIL_DETAILED = 1;
+}
+
+// PulledNamespace contains live schema content for a namespace. It describes
+// database objects rather than repository filenames so clients can choose the
+// file layout they write.
+message PulledNamespace {
+  // Table name → canonical CREATE TABLE statement.
+  map<string, string> tables = 1;
+  // Optional engine-specific namespace content, such as Vitess VSchema JSON.
+  map<string, string> artifacts = 2;
+  NamespaceCatalog namespace_catalog = 3;
+  map<string, TableCatalog> table_catalog = 4;
+}
+
+message NamespaceCatalog {
+  string name = 1;
+  string engine = 2;
+  int32 table_count = 3;
+}
+
+message TableCatalog {
+  string name = 1;
+  string kind = 2;
+  string comment = 3;
+  repeated ColumnCatalog columns = 4;
+  repeated IndexCatalog indexes = 5;
+}
+
+message ColumnCatalog {
+  string name = 1;
+  string type = 2;
+  bool nullable = 3;
+  string default_value = 4;
+  string comment = 5;
+}
+
+message IndexCatalog {
+  string name = 1;
+  bool primary = 2;
+  bool unique = 3;
+  // Ordered index key parts. Each part may be a column name or an expression,
+  // depending on the database engine.
+  repeated string parts = 4;
+}
+
+// PullSchemaResponse contains live schema content grouped by namespace.
 message PullSchemaResponse {
   string database = 1;
   string type = 2;
   string environment = 3;
-  map<string, SchemaFiles> schema_files = 4;
+  map<string, PulledNamespace> namespaces = 4;
   int32 table_count = 5;
 }
 
@@ -305,11 +357,21 @@ message TableChange {
   string unsafe_reason = 6;
 }
 
-// SchemaChange groups all changes for a single namespace (keyspace/schema).
+// SchemaChange is a namespace-level bundle. A PlanResponse must include at most
+// one SchemaChange per namespace; original_files is captured once for that
+// namespace and applies to every table/artifact change in the bundle.
 message SchemaChange {
   string namespace = 1;
   repeated TableChange table_changes = 2;
-  map<string, string> metadata = 3; // Engine-specific data (e.g., "vschema" → diff)
+  // Engine-specific annotations about the plan, such as a display diff or a
+  // flag telling the engine to apply an artifact. Metadata is not a rollback
+  // input; rollback uses original_files.
+  map<string, string> metadata = 3;
+  // Original declarative schema files captured before applying this namespace's changes.
+  // Engines can include table files and non-table artifacts such as Vitess vschema.json.
+  map<string, string> original_files = 4;
+  // True when original_files was captured, including an intentionally empty namespace.
+  bool original_files_captured = 5;
 }
 
 // LintViolation represents a schema linting violation.

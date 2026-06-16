@@ -259,12 +259,55 @@ func TestApplyOperationStore_ListByApply(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 3)
 
-	// ListByApply is ordered by id (insertion order).
+	// ListByApply is ordered by (created_at, id); rows inserted in the same
+	// second tie-break on id, preserving insertion (deployment) order.
 	deps := make([]string, len(got))
 	for i, ad := range got {
 		deps[i] = ad.Deployment
 	}
 	assert.Equal(t, []string{"region-a", "region-b", "region-c"}, deps)
+}
+
+// TestApplyOperationStore_ListByApply_OrderedByCreatedAt proves ListByApply
+// honours created_at before id, matching the deployment order the claim gate
+// enforces. A row inserted later but stamped with an earlier created_at must
+// sort ahead of its lower-id siblings, so the aggregate projection and the
+// first-failed-deployment message agree with the order the rollout runs in.
+func TestApplyOperationStore_ListByApply_OrderedByCreatedAt(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_md_list_order", 1)
+
+	ids := make(map[string]int64, 3)
+	for _, dep := range []string{"region-a", "region-b", "region-c"} {
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: dep, Target: "payments",
+		})
+		require.NoError(t, err)
+		ids[dep] = id
+	}
+
+	// Backdate the last-inserted (highest-id) row so its created_at precedes its
+	// siblings. Ordering by id alone would keep it last; ordering by created_at
+	// must move it to the front.
+	_, err := testDB.ExecContext(ctx,
+		"UPDATE apply_operations SET created_at = '2000-01-01 00:00:00' WHERE id = ?",
+		ids["region-c"])
+	require.NoError(t, err)
+
+	got, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+
+	deps := make([]string, len(got))
+	for i, ad := range got {
+		deps[i] = ad.Deployment
+	}
+	assert.Equal(t, []string{"region-c", "region-a", "region-b"}, deps,
+		"created_at must take precedence over id in ListByApply ordering")
 }
 
 func TestApplyOperationStore_ListByApply_Isolation(t *testing.T) {

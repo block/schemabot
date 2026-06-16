@@ -49,13 +49,17 @@ type ApplyStatusCommentData struct {
 // When Tables is populated, per-table progress bars are shown.
 // When Tables is empty, a simple status message is rendered.
 func RenderApplyStatusComment(data ApplyStatusCommentData) string {
+	return renderApplyStatusComment(data, true, currentTimestamp())
+}
+
+func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bool, renderedAt string) string {
 	var sb strings.Builder
 
 	// Header varies by state
 	writeApplyHeader(&sb, data)
 
 	// Metadata line
-	writeApplyMetadata(&sb, data)
+	writeApplyMetadata(&sb, data, renderedAt)
 
 	// Cutover readiness summary
 	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
@@ -74,6 +78,9 @@ func RenderApplyStatusComment(data ApplyStatusCommentData) string {
 
 	// Footer with next actions
 	writeApplyFooter(&sb, data)
+	if includeLastUpdated && !state.IsTerminalApplyState(data.State) {
+		writeLastUpdatedFooter(&sb, renderedAt)
+	}
 
 	return sb.String()
 }
@@ -126,7 +133,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 }
 
 // writeApplyMetadata writes the database, environment, apply ID, elapsed time, and requester info.
-func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
+func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData, renderedAt string) {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
 	if data.Environment != "" {
@@ -139,7 +146,7 @@ func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
 		parts = append(parts, fmt.Sprintf("**Elapsed**: %s", elapsed))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
-	writeAppliedByOrTimestamp(sb, data.RequestedBy)
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, renderedAt)
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
@@ -208,7 +215,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
 				runningEstimateExceeded = true
 			} else {
-				runningPct = ui.ClampPercent(t.PercentComplete)
+				runningPct = ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			}
 		case state.Task.Pending:
 			queued++
@@ -352,7 +359,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 
 	case state.Task.Recovering:
 		if recoveringIsCopyingRows(table) {
-			pct := ui.ClampPercent(table.PercentComplete)
+			pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied)
 			bar := ui.ProgressBarRowCopy(pct)
 			fmt.Fprintf(sb, "**`%s`**: %s Row copy in progress (%d%%)\n", table.TableName, bar, pct)
 			writeDDLLine(sb, table.DDL)
@@ -369,12 +376,12 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, globalSta
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Failed:
-		bar := ui.ProgressBarFailed(table.PercentComplete)
+		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
 		fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.FailedRetryable:
-		bar := ui.ProgressBarStopped(ui.ClampPercent(table.PercentComplete))
+		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
 		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
@@ -412,7 +419,7 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 			return
 		}
 
-		pct := ui.ClampPercent(table.PercentComplete)
+		pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied)
 		bar := ui.ProgressBarRowCopy(pct)
 		fmt.Fprintf(sb, "**`%s`**: %s %d%%\n", table.TableName, bar, pct)
 		writeDDLLine(sb, table.DDL)
@@ -435,7 +442,7 @@ func recoveringCopyPercent(tables []TableProgressData) (int, bool) {
 		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || !recoveringIsCopyingRows(table) {
 			continue
 		}
-		percent = min(percent, ui.ClampPercent(table.PercentComplete))
+		percent = min(percent, ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
 		found = true
 	}
 	return percent, found
@@ -447,8 +454,8 @@ func renderStoppedTable(sb *strings.Builder, table TableProgressData) {
 	case table.PercentComplete >= 100:
 		bar := ui.ProgressBarStopped(100)
 		fmt.Fprintf(sb, "**`%s`**: %s \u23f9\ufe0f Stopped (was waiting for cutover)\n", table.TableName, bar)
-	case table.PercentComplete > 0:
-		pct := ui.ClampPercent(table.PercentComplete)
+	case table.PercentComplete > 0 || table.RowsCopied > 0:
+		pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied)
 		bar := ui.ProgressBarStopped(pct)
 		fmt.Fprintf(sb, "**`%s`**: %s \u23f9\ufe0f Stopped at %d%%\n", table.TableName, bar, pct)
 	default:
@@ -458,7 +465,7 @@ func renderStoppedTable(sb *strings.Builder, table TableProgressData) {
 	writeDDLLine(sb, table.DDL)
 
 	// Show rows (no ETA) for stopped tables with progress
-	if table.RowsTotal > 0 && table.PercentComplete > 0 {
+	if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
 		fmt.Fprintf(sb, "Rows: %s / %s\n",
 			ui.FormatNumber(ui.ClampRows(table.RowsCopied, table.RowsTotal)),
 			ui.FormatNumber(table.RowsTotal))
@@ -821,14 +828,14 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
 		fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
 	case state.Task.Failed:
 		label := "Failed"
-		if t.PercentComplete > 0 {
-			label = fmt.Sprintf("Failed at %d%%", ui.ClampPercent(t.PercentComplete))
+		if t.PercentComplete > 0 || t.RowsCopied > 0 {
+			label = fmt.Sprintf("Failed at %d%%", ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
 		}
 		fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, label)
 	case state.Task.Stopped:
 		label := "Stopped"
-		if t.PercentComplete > 0 {
-			label = fmt.Sprintf("Stopped at %d%%", ui.ClampPercent(t.PercentComplete))
+		if t.PercentComplete > 0 || t.RowsCopied > 0 {
+			label = fmt.Sprintf("Stopped at %d%%", ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
 		}
 		fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, label)
 	case "reverted":

@@ -30,11 +30,242 @@ func TestBuildGRPCTernClientRoutesWhenTargetResolverConfigured(t *testing.T) {
 		},
 	}
 
-	client, err := buildGRPCTernClient(config, mysqlstore.New(nil), logger, "production")
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "production")
 	require.NoError(t, err)
 	require.NotNil(t, client)
 	_, ok := client.(*tern.TargetRouter)
 	assert.True(t, ok, "expected a TargetRouter when target_resolver is configured")
+}
+
+// When a target_resolver.etre block is configured, the data plane routes
+// through the Etre-backed resolver, resolving each target against Etre per
+// request rather than binding to one database.
+func TestBuildGRPCTernClientRoutesViaEtreResolver(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	config := &api.ServerConfig{
+		TargetResolver: api.TargetResolverConfig{
+			Etre: api.EtreConfig{
+				Addr:         "https://etre.example",
+				DatabaseType: storage.DatabaseTypeMySQL,
+				EntityType:   "cluster",
+				TargetLabel:  "dsid",
+				MySQL:        api.EtreMySQLConfig{HostField: "writer_endpoint"},
+				Credentials:  api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+			},
+		},
+	}
+
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "")
+	require.NoError(t, err)
+	_, ok := client.(*tern.TargetRouter)
+	assert.True(t, ok, "expected a TargetRouter when target_resolver.etre is configured")
+}
+
+// The credential backend is selectable: with credentials.type=awssm the data
+// plane uses the assume-role Secrets Manager resolver instead of a secret ref.
+func TestBuildGRPCTernClientRoutesViaEtreWithAWSSMCredentials(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	config := &api.ServerConfig{
+		TargetResolver: api.TargetResolverConfig{
+			Etre: api.EtreConfig{
+				Addr:         "https://etre.example",
+				DatabaseType: storage.DatabaseTypeMySQL,
+				EntityType:   "cluster",
+				TargetLabel:  "dsid",
+				MySQL:        api.EtreMySQLConfig{HostField: "writer_endpoint"},
+				Credentials: api.EtreCredentialsConfig{
+					Type:       "awssm",
+					Region:     "us-west-2",
+					RoleARN:    "arn:aws:iam::{account}:role/tern-assumed",
+					SecretName: "schemabot/{target}/ddl",
+				},
+			},
+		},
+	}
+
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "")
+	require.NoError(t, err)
+	_, ok := client.(*tern.TargetRouter)
+	assert.True(t, ok, "expected a TargetRouter with awssm credentials")
+}
+
+// An unknown credentials.type fails closed at startup.
+func TestBuildEtreResolverRejectsUnknownCredentialType(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := api.EtreConfig{
+		Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeMySQL, EntityType: "cluster", TargetLabel: "dsid",
+		MySQL:       api.EtreMySQLConfig{HostField: "writer_endpoint"},
+		Credentials: api.EtreCredentialsConfig{Type: "vault"},
+	}
+
+	_, err := buildEtreResolver(t.Context(), cfg, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vault")
+}
+
+// The awssm backend validates its required fields with config-path context at
+// startup, before any AWS work, so a misconfiguration fails fast.
+func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
+	base := api.EtreCredentialsConfig{
+		Type:       "awssm",
+		Region:     "us-east-1",
+		RoleARN:    "arn:aws:iam::{account}:role/tern-assumed",
+		SecretName: "{target}_ddl_password",
+	}
+
+	_, err := buildCredentialResolver(t.Context(), base, nil)
+	require.NoError(t, err)
+
+	cases := map[string]func(*api.EtreCredentialsConfig){
+		"region":      func(c *api.EtreCredentialsConfig) { c.Region = "" },
+		"role_arn":    func(c *api.EtreCredentialsConfig) { c.RoleARN = "" },
+		"secret_name": func(c *api.EtreCredentialsConfig) { c.SecretName = "" },
+	}
+	for field, mutate := range cases {
+		cfg := base
+		mutate(&cfg)
+		_, err := buildCredentialResolver(t.Context(), cfg, nil)
+		require.Error(t, err, field)
+		assert.Contains(t, err.Error(), field)
+	}
+}
+
+// The assume-role backend's account attribute is surfaced to the resolver even
+// when not listed in attribute_fields, so credential resolution can read it.
+func TestCredentialAttributeFieldsIncludesAccountAttribute(t *testing.T) {
+	withDefault := api.EtreConfig{
+		AttributeFields: []string{"region"},
+		Credentials:     api.EtreCredentialsConfig{Type: "awssm"},
+	}
+	assert.Equal(t, []string{"region", "aws_account_id"}, resolverAttributeFields(withDefault))
+
+	custom := api.EtreConfig{
+		Credentials: api.EtreCredentialsConfig{Type: "awssm", AccountAttribute: "account"},
+	}
+	assert.Equal(t, []string{"account"}, resolverAttributeFields(custom))
+
+	secretRef := api.EtreConfig{
+		AttributeFields: []string{"region"},
+		Credentials:     api.EtreCredentialsConfig{Type: "secret_ref"},
+	}
+	assert.Equal(t, []string{"region"}, resolverAttributeFields(secretRef))
+}
+
+// A Vitess Etre resolver assembles PlanetScale API metadata, so it needs no
+// host_field and no credential username — the token secret carries the
+// credential. Startup wiring accepts this shape.
+func TestBuildEtreResolverVitess(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := api.EtreConfig{
+		Addr:         "https://etre.example",
+		DatabaseType: storage.DatabaseTypeVitess,
+		EntityType:   "planetscale_database",
+		TargetLabel:  "dsid",
+		EnvLabel:     "env",
+		Vitess:       api.EtreVitessConfig{APIURL: "https://api.planetscale.test"},
+		Credentials:  api.EtreCredentialsConfig{Type: "secret_ref", PasswordRef: `{"token":"id=value"}`},
+	}
+
+	resolver, err := buildEtreResolver(t.Context(), cfg, logger)
+	require.NoError(t, err)
+	require.NotNil(t, resolver)
+
+	// A Vitess resolver still requires the password ref that carries the token.
+	noToken := cfg
+	noToken.Credentials.PasswordRef = ""
+	_, err = buildEtreResolver(t.Context(), noToken, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "password_ref")
+}
+
+// An unsupported database_type fails closed at startup rather than silently
+// resolving as MySQL, so adding an engine (postgres, strata) is a deliberate
+// change at the assembler-selection site.
+func TestBuildEtreResolverRejectsUnsupportedEngine(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := api.EtreConfig{
+		Addr:         "https://etre.example",
+		DatabaseType: "postgres",
+		EntityType:   "pg_cluster",
+		TargetLabel:  "dsid",
+		Credentials:  api.EtreCredentialsConfig{Type: "secret_ref", Username: "ddl", PasswordRef: "env:PW"},
+	}
+
+	_, err := buildEtreResolver(t.Context(), cfg, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "postgres")
+	assert.Contains(t, err.Error(), "not supported")
+}
+
+// The Vitess organization attribute is surfaced to the resolver so the assembler
+// can read it, even when not listed in attribute_fields.
+func TestResolverAttributeFieldsIncludesOrganization(t *testing.T) {
+	defaultOrg := api.EtreConfig{DatabaseType: storage.DatabaseTypeVitess}
+	assert.Equal(t, []string{"organization"}, resolverAttributeFields(defaultOrg))
+
+	customOrg := api.EtreConfig{DatabaseType: storage.DatabaseTypeVitess, Vitess: api.EtreVitessConfig{OrganizationAttribute: "ps_org"}}
+	assert.Equal(t, []string{"ps_org"}, resolverAttributeFields(customOrg))
+}
+
+// Configuring both the Etre resolver and static targets is ambiguous until
+// per-target overrides exist, so startup fails closed rather than silently
+// picking one.
+func TestBuildGRPCTernClientErrorsWhenEtreAndStaticBothConfigured(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	config := &api.ServerConfig{
+		TargetResolver: api.TargetResolverConfig{
+			Targets: map[string]inventory.StaticTarget{
+				"dsid-orders-prod": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(localhost:3306)/"},
+			},
+			Etre: api.EtreConfig{
+				Addr: "https://etre.example", EntityType: "cluster", TargetLabel: "dsid",
+				MySQL: api.EtreMySQLConfig{HostField: "writer_endpoint"}, Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+			},
+		},
+	}
+
+	_, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "both etre and static")
+}
+
+// The Etre resolver's lazily-validated fields are checked at startup so a
+// misconfiguration fails fast instead of on the first request.
+func TestBuildEtreResolverValidatesConfig(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	base := api.EtreConfig{
+		Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeMySQL, EntityType: "cluster", TargetLabel: "dsid",
+		MySQL: api.EtreMySQLConfig{HostField: "writer_endpoint"}, Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+	}
+
+	_, err := buildEtreResolver(t.Context(), base, logger)
+	require.NoError(t, err)
+
+	noHost := base
+	noHost.MySQL.HostField = ""
+	_, err = buildEtreResolver(t.Context(), noHost, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "host_field")
+
+	noPassword := base
+	noPassword.Credentials.PasswordRef = ""
+	_, err = buildEtreResolver(t.Context(), noPassword, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "password_ref")
+
+	noUsername := base
+	noUsername.Credentials.Username = ""
+	_, err = buildEtreResolver(t.Context(), noUsername, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "username")
+
+	// A secret ref that resolves to empty (e.g. an unset env var) fails closed
+	// with config context rather than a generic downstream error.
+	emptyAddr := base
+	emptyAddr.Addr = "env:UNSET_ETRE_ADDR"
+	_, err = buildEtreResolver(t.Context(), emptyAddr, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "addr resolved to an empty value")
 }
 
 // Without a target resolver the data plane falls back to a single LocalClient
@@ -53,7 +284,7 @@ func TestBuildGRPCTernClientFallsBackToSingleDatabase(t *testing.T) {
 		},
 	}
 
-	client, err := buildGRPCTernClient(config, mysqlstore.New(nil), logger, "production")
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "production")
 	require.NoError(t, err)
 	require.NotNil(t, client)
 	_, ok := client.(*tern.LocalClient)
@@ -75,7 +306,7 @@ func TestBuildGRPCTernClientRoutesWithoutEnvironment(t *testing.T) {
 		},
 	}
 
-	client, err := buildGRPCTernClient(config, mysqlstore.New(nil), logger, "")
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "")
 	require.NoError(t, err)
 	_, ok := client.(*tern.TargetRouter)
 	assert.True(t, ok, "resolver mode should not require an environment")
@@ -93,7 +324,7 @@ func TestBuildGRPCTernClientErrorsWhenEnvMissingInFallback(t *testing.T) {
 		},
 	}
 
-	_, err := buildGRPCTernClient(config, mysqlstore.New(nil), logger, "")
+	_, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "TERN_ENVIRONMENT")
 }
@@ -116,7 +347,7 @@ func TestBuildGRPCTernClientErrorsOnAmbiguousFallback(t *testing.T) {
 		},
 	}
 
-	_, err := buildGRPCTernClient(config, mysqlstore.New(nil), logger, "production")
+	_, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "production")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "orders")
 	assert.Contains(t, err.Error(), "payments")
@@ -127,7 +358,7 @@ func TestBuildGRPCTernClientErrorsOnAmbiguousFallback(t *testing.T) {
 func TestBuildGRPCTernClientErrorsWhenNothingConfigured(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 
-	_, err := buildGRPCTernClient(&api.ServerConfig{}, mysqlstore.New(nil), logger, "production")
+	_, err := buildGRPCTernClient(t.Context(), &api.ServerConfig{}, mysqlstore.New(nil), logger, "production")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "production")
 }

@@ -58,10 +58,16 @@ func New(cfg Config) (*Client, error) {
 	if strings.TrimSpace(cfg.EntityType) == "" {
 		return nil, fmt.Errorf("etre entity type is required")
 	}
+	// The Etre client does not default a nil HTTP client and would panic on the
+	// first request, so default it here.
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
 	entities := etre.NewEntityClientWithConfig(etre.EntityClientConfig{
 		EntityType: cfg.EntityType,
 		Addr:       cfg.Addr,
-		HTTPClient: cfg.HTTPClient,
+		HTTPClient: httpClient,
 		Retry:      cfg.Retry,
 	})
 	return newClient(entities, cfg.EntityType, cfg.Logger), nil

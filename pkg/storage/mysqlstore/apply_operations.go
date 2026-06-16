@@ -121,13 +121,17 @@ func (s *applyOperationStore) GetByApplyAndDeployment(ctx context.Context, apply
 	return scanApplyOperation(row)
 }
 
-// ListByApply returns all child rows for an apply, ordered by id ascending.
+// ListByApply returns all child rows for an apply, ordered by (created_at, id)
+// ascending — the same deployment order the claim gate enforces. Keeping the
+// projection and "first failed deployment" derivation on this order means the
+// aggregate apply state and its surfaced failure reason agree with the order the
+// rollout actually drives deployments in.
 func (s *applyOperationStore) ListByApply(ctx context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+applyOperationColumns+`
 		FROM apply_operations
 		WHERE apply_id = ?
-		ORDER BY id
+		ORDER BY created_at, id
 	`, applyID)
 	if err != nil {
 		return nil, fmt.Errorf("query apply_operations for apply %d: %w", applyID, err)

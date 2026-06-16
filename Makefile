@@ -407,6 +407,12 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 test-e2e-k8s: ## Run k8s e2e tests on minikube
 	@e2e/k8s/e2e-test.sh
 
+# Run the etre-resolver k8s e2e on minikube: the data plane resolves a target
+# (DSID) through Etre and assembles credentials via assume-role + Secrets
+# Manager, both emulated by ministack in-cluster.
+test-e2e-k8s-etre: ## Run the etre-resolver k8s e2e on minikube
+	@e2e/k8s/e2e-etre-test.sh
+
 # Start local dev environment with gRPC backend (separate Tern server)
 up-grpc:
 	docker compose -f deploy/local/docker-compose.grpc.yml up --build

@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -15,14 +16,62 @@ import (
 )
 
 // Start resumes a stopped schema change.
-// On resume, we re-plan against the current DB state to find which DDLs are still
-// needed. Tables that completed before the stop are detected as no-ops by the
-// diff and their tasks are marked completed. Only the remaining DDLs are sent to
-// the engine, which auto-detects Spirit checkpoints for partially-copied tables.
 func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
+	apply, startedCount, skippedCount, err := c.resolveStartRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available")
+	}
+	metadata, err := json.Marshal(localStartControlRequestMetadata{
+		StartedCount: startedCount,
+		SkippedCount: skippedCount,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal start control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "tern-grpc",
+		Metadata:    metadata,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("record start control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if alreadyPending {
+		c.logger.Info("start request already pending for apply owner",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment)
+	} else {
+		c.logger.Info("start request queued for apply owner",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested, storage.LogSourceSchemaBot,
+			"Start request queued for apply owner", "", "")
+	}
+	c.wakeOperatorForControlRequest(apply)
+	return &ternv1.StartResponse{
+		Accepted:     true,
+		StartedCount: startedCount,
+		SkippedCount: skippedCount,
+	}, nil
+}
+
+type localStartControlRequestMetadata struct {
+	StartedCount int64 `json:"started_count,omitempty"`
+	SkippedCount int64 `json:"skipped_count,omitempty"`
+}
+
+func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.StartRequest) (*storage.Apply, int64, int64, error) {
 	tasks, err := c.storage.Tasks().GetByDatabase(ctx, c.config.Database)
 	if err != nil {
-		return nil, fmt.Errorf("get tasks failed: %w", err)
+		return nil, 0, 0, fmt.Errorf("get tasks failed: %w", err)
 	}
 
 	// Find the target apply: either from the request's apply_id or the most recent stopped apply.
@@ -41,7 +90,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		// Use the explicitly requested apply
 		a, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
 		if err != nil || a == nil {
-			return nil, fmt.Errorf("apply %s not found", req.ApplyId)
+			return nil, 0, 0, fmt.Errorf("apply %s not found", req.ApplyId)
 		}
 		apply = a
 		c.logger.Info("Start: found apply", "apply_internal_id", apply.ID, "apply_identifier", apply.ApplyIdentifier, "state", apply.State)
@@ -64,34 +113,22 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 	}
 
 	if apply == nil {
-		return nil, fmt.Errorf("no stopped schema change to resume")
+		return nil, 0, 0, fmt.Errorf("no stopped schema change to resume")
 	}
 
 	// Deferred deploy that isn't ready yet — reject with a clear message.
 	if apply.GetOptions().DeferDeploy && apply.State != state.Apply.WaitingForDeploy {
-		return nil, fmt.Errorf("schema change is not ready for deploy (current state: %s)", apply.State)
+		return nil, 0, 0, fmt.Errorf("schema change is not ready for deploy (current state: %s)", apply.State)
+	}
+	if state.IsState(apply.State, state.Apply.WaitingForDeploy) {
+		return apply, 1, 0, nil
+	}
+	if !state.IsState(apply.State, state.Apply.Stopped, state.Apply.Running) {
+		return nil, 0, 0, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
 	}
 
-	// Deferred deploy: call engine Start to trigger the deploy request.
-	// This is a separate path from the stopped-task resume flow below.
-	if apply.State == state.Apply.WaitingForDeploy {
-		if controlReq, err := pendingStopControlRequest(ctx, c.storage, apply); err != nil {
-			return nil, fmt.Errorf("check pending stop before deferred deploy start for apply %s: %w", apply.ApplyIdentifier, err)
-		} else if controlReq != nil {
-			c.logger.Info("deferred deploy start blocked because stop request is pending",
-				"apply_id", apply.ApplyIdentifier,
-				"requested_by", controlRequestCaller(controlReq))
-			return nil, fmt.Errorf("schema change has a pending stop request; start is blocked until stop is processed")
-		}
-		started, err := c.startDeferredDeploy(ctx, apply, "")
-		if err != nil {
-			return nil, err
-		}
-		return started.response, nil
-	}
-
-	// Second pass: collect stopped tasks ONLY from the target apply
-	var stoppedTasks []*storage.Task
+	var startedCount int64
+	var skippedCount int64
 	for _, task := range tasks {
 		c.logger.Info("Start: checking task",
 			"task_id", task.TaskIdentifier,
@@ -110,87 +147,18 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 			c.logger.Info("skipping old stopped task", "task_id", task.TaskIdentifier, "updated_at", task.UpdatedAt)
 			continue
 		}
-		stoppedTasks = append(stoppedTasks, task)
-	}
-
-	if len(stoppedTasks) == 0 {
-		return nil, fmt.Errorf("no stopped schema change to resume (found %d tasks for database, apply has ID %d)", len(tasks), apply.ID)
-	}
-
-	// Re-plan: diff current DB state against the plan's desired schema to find
-	// which DDLs are still needed. Tables that already completed will not appear
-	// in the re-plan result.
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
-	if err != nil || plan == nil {
-		return nil, fmt.Errorf("plan not found for apply %s", apply.ApplyIdentifier)
-	}
-
-	rp, err := c.replanAndFilterTasks(ctx, apply, stoppedTasks, plan)
-	if err != nil {
-		return nil, err
-	}
-
-	resumeTasks := rp.ActiveTasks
-	completedCount := rp.CompletedCount
-	now := time.Now()
-
-	if len(resumeTasks) == 0 {
-		// All tasks were already done — mark apply completed
-		apply.State = state.Apply.Completed
-		apply.CompletedAt = &now
-		apply.UpdatedAt = now
-		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
+		switch {
+		case state.IsState(task.State, state.Task.Stopped):
+			startedCount++
+		case state.IsTerminalTaskState(task.State):
+			skippedCount++
 		}
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			"All tasks already completed on resume (re-plan shows no changes)", apply.State, state.Apply.Completed)
-
-		return &ternv1.StartResponse{
-			Accepted:     true,
-			StartedCount: 0,
-			SkippedCount: completedCount,
-		}, nil
 	}
 
-	options := buildApplyOptions(apply)
-	oldApplyState := apply.State
-
-	if apply.GetOptions().DeferCutover {
-		logMsg := fmt.Sprintf("Resume requested: %d tasks resumed, %d already completed", len(resumeTasks), completedCount)
-		if err := c.launchAtomicResume(ctx, apply, resumeTasks, plan, options, logMsg, false, false); err != nil {
-			return nil, err
-		}
-	} else {
-		// Sequential mode: process each task one at a time in a background goroutine.
-		// Mark tasks as PENDING synchronously so the progress API shows a non-stopped
-		// state immediately — the watcher exits on STOPPED and would miss the resume.
-		for _, task := range resumeTasks {
-			c.transitionTaskState(ctx, task, 0, state.Task.Pending, "")
-		}
-
-		apply.State = state.Apply.Running
-		apply.UpdatedAt = now
-		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Running, "error", err)
-		}
-
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Resume requested (sequential): %d tasks to resume, %d already completed", len(resumeTasks), completedCount), oldApplyState, state.Apply.Running)
-
-		resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
-		cancelGeneration := c.setApplyCancel(cancelResume)
-		go func() {
-			defer c.clearApplyCancel(cancelGeneration)
-			defer cancelResume()
-			c.resumeApplySequential(resumeCtx, apply, resumeTasks, plan, options)
-		}()
+	if startedCount == 0 {
+		return nil, 0, 0, fmt.Errorf("no stopped schema change to resume (found %d tasks for database, apply has ID %d)", len(tasks), apply.ID)
 	}
-
-	return &ternv1.StartResponse{
-		Accepted:     true,
-		StartedCount: int64(len(resumeTasks)),
-		SkippedCount: completedCount,
-	}, nil
+	return apply, startedCount, skippedCount, nil
 }
 
 type deferredDeployStart struct {

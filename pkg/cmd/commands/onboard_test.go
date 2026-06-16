@@ -18,11 +18,11 @@ func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
 		Type:        "mysql",
 		Environment: "production",
 		TableCount:  2,
-		SchemaFiles: map[string]*apitypes.SchemaFiles{
+		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {
-				Files: map[string]string{
-					"users.sql":  "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
-					"orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL);\n",
+				Tables: map[string]string{
+					"users":  "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+					"orders": "CREATE TABLE `orders` (`id` bigint NOT NULL);\n",
 				},
 			},
 		},
@@ -44,6 +44,47 @@ func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
 	assert.Equal(t, "CREATE TABLE `orders` (`id` bigint NOT NULL);\n", string(orders))
 }
 
+func TestOnboardPullNamespacesUseConcreteLiveNamespaces(t *testing.T) {
+	pullNamespaces, err := onboardPullNamespaces([]string{"orders_production", "orders_audit_production"})
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"orders_production", "orders_audit_production"}, pullNamespaces)
+
+	_, err = onboardPullNamespaces([]string{"orders_$ENV"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be a concrete live namespace")
+}
+
+func TestRewriteOnboardNamespacesInfersEnvironmentTemplate(t *testing.T) {
+	resp := &apitypes.PullSchemaResponse{
+		Database:    "orders-logical",
+		Type:        "mysql",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders_production":       {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			"orders_audit_production": {Tables: map[string]string{"events": "CREATE TABLE `events` (`id` bigint NOT NULL);\n"}},
+		},
+	}
+	require.NoError(t, rewriteOnboardNamespaces(resp, "production", true))
+	assert.Contains(t, resp.Namespaces, "orders_$ENV")
+	assert.Contains(t, resp.Namespaces, "orders_audit_$ENV")
+	assert.NotContains(t, resp.Namespaces, "orders_production")
+}
+
+func TestRewriteOnboardNamespacesKeepsConcreteNamesByDefault(t *testing.T) {
+	resp := &apitypes.PullSchemaResponse{
+		Database:    "orders-logical",
+		Type:        "mysql",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders_production": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	}
+	require.NoError(t, rewriteOnboardNamespaces(resp, "production", false))
+	assert.Contains(t, resp.Namespaces, "orders_production")
+	assert.NotContains(t, resp.Namespaces, "orders_$ENV")
+}
+
 func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: old\ntype: mysql\n"), 0o644))
@@ -51,8 +92,8 @@ func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {
 		Database:    "orders",
 		Type:        "mysql",
 		Environment: "production",
-		SchemaFiles: map[string]*apitypes.SchemaFiles{
-			"orders": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
 	})
 	require.NoError(t, err)
@@ -70,12 +111,12 @@ func TestBuildOnboardWritePlanRejectsUnsafeResponsePaths(t *testing.T) {
 		Database:    "orders",
 		Type:        "mysql",
 		Environment: "production",
-		SchemaFiles: map[string]*apitypes.SchemaFiles{
-			"orders": {Files: map[string]string{"../users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"../users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "schema file")
+	assert.Contains(t, err.Error(), "table")
 }
 
 func TestBuildOnboardWritePlanRejectsInvalidPullResponse(t *testing.T) {
@@ -118,11 +159,11 @@ func TestBuildOnboardWritePlanRejectsInvalidPullResponse(t *testing.T) {
 				Database:    "orders",
 				Type:        "mysql",
 				Environment: "production",
-				SchemaFiles: map[string]*apitypes.SchemaFiles{
-					"orders": {Files: map[string]string{}},
+				Namespaces: map[string]*apitypes.PulledNamespace{
+					"orders": {Tables: map[string]string{}},
 				},
 			},
-			want: "contain no tables",
+			want: "contains no tables or artifacts",
 		},
 	}
 
@@ -180,8 +221,8 @@ func validPullSchemaResponse() *apitypes.PullSchemaResponse {
 		Database:    "orders",
 		Type:        "mysql",
 		Environment: "production",
-		SchemaFiles: map[string]*apitypes.SchemaFiles{
-			"orders": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
 	}
 }

@@ -20,5 +20,5 @@ func TestWritePullSchemaResponseReturnsSchemaAsJSON(t *testing.T) {
 	assert.Equal(t, "orders", got.Database)
 	assert.Equal(t, "mysql", got.Type)
 	assert.Equal(t, "production", got.Environment)
-	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", got.SchemaFiles["orders"].Files["users.sql"])
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", got.Namespaces["orders"].Tables["users"])
 }

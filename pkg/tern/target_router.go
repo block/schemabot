@@ -86,7 +86,11 @@ func (r *TargetRouter) PullSchema(ctx context.Context, req *ternv1.PullSchemaReq
 	if req == nil {
 		return nil, fmt.Errorf("pull schema request is required: %w", ErrPullSchemaInvalidRequest)
 	}
-	client, resolved, err := r.clientForTarget(ctx, targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, req.Database)
+	localDatabase := req.Database
+	if req.GetNamespace() != "" {
+		localDatabase = req.GetNamespace()
+	}
+	client, resolved, err := r.clientForTarget(ctx, targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, localDatabase)
 	if err != nil {
 		return nil, err
 	}
@@ -281,16 +285,6 @@ func (r *TargetRouter) SkipRevert(ctx context.Context, req *ternv1.SkipRevertReq
 	return client.SkipRevert(ctx, req)
 }
 
-// RollbackPlan generates a rollback plan for a target. The database argument is
-// treated as the target key because rollback has no target-aware proto request.
-func (r *TargetRouter) RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error) {
-	client, _, err := r.clientForTarget(ctx, database, "", environment, database)
-	if err != nil {
-		return nil, err
-	}
-	return client.RollbackPlan(ctx, database, environment)
-}
-
 // Health checks storage connectivity for the data-plane router.
 func (r *TargetRouter) Health(ctx context.Context) error {
 	return r.storage.Ping(ctx)
@@ -461,13 +455,20 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 		return nil, nil, err
 	}
 	// Fail closed on a nil or incomplete resolver result rather than building a
-	// client with an empty type/DSN and surfacing a confusing connection error
-	// later. Don't log the DSN — it carries credentials.
+	// client that surfaces a confusing connection error later. Keep the causes
+	// separate so the log names the missing field, and never log the DSN or
+	// secret values — only field names.
 	if resolved == nil {
 		return nil, nil, fmt.Errorf("resolver returned no target for %q", target)
 	}
-	if resolved.Target == "" || resolved.DatabaseType == "" || resolved.DSN == "" {
-		return nil, nil, fmt.Errorf("resolver returned an incomplete target for %q (target=%q, type=%q, dsn_empty=%t)", target, resolved.Target, resolved.DatabaseType, resolved.DSN == "")
+	if resolved.Target == "" {
+		return nil, nil, fmt.Errorf("resolver returned a target with no identifier for %q", target)
+	}
+	if resolved.DatabaseType == "" {
+		return nil, nil, fmt.Errorf("resolver returned a target with no database type for %q", target)
+	}
+	if err := resolvedTargetConnectable(resolved); err != nil {
+		return nil, nil, fmt.Errorf("resolver returned an incomplete target for %q (type=%q): %w", target, resolved.DatabaseType, err)
 	}
 	key := cacheKeyForResolvedTarget(resolved, environment, namespace)
 	r.mu.Lock()
@@ -547,6 +548,30 @@ func (r *TargetRouter) takePendingObserver(key targetClientKey) ProgressObserver
 
 func cacheKeyForTargetRequest(req inventory.Request) targetClientKey {
 	return targetClientKey{target: req.Target, databaseType: req.DatabaseType, environment: req.Environment}
+}
+
+// resolvedTargetConnectable verifies a resolved target carries enough to open a
+// connection for its engine. Vitess reaches the database through the PlanetScale
+// API using metadata (organization, service token, API URL) and carries no DSN;
+// every other engine connects via a DSN.
+func resolvedTargetConnectable(resolved *inventory.Target) error {
+	if resolved.DatabaseType == storage.DatabaseTypeVitess {
+		for _, key := range []string{
+			inventory.MetadataOrganization,
+			inventory.MetadataTokenName,
+			inventory.MetadataTokenValue,
+			inventory.MetadataAPIURL,
+		} {
+			if resolved.Metadata[key] == "" {
+				return fmt.Errorf("missing %q metadata", key)
+			}
+		}
+		return nil
+	}
+	if resolved.DSN == "" {
+		return fmt.Errorf("missing DSN")
+	}
+	return nil
 }
 
 func cacheKeyForResolvedTarget(target *inventory.Target, environment, namespace string) targetClientKey {

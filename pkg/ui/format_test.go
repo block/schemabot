@@ -40,6 +40,14 @@ func TestProgressBarActivity(t *testing.T) {
 	assert.Zero(t, strings.Count(bar, ColorEmpty))
 }
 
+func TestRowCopyDisplayPercent(t *testing.T) {
+	assert.Equal(t, 0, RowCopyDisplayPercent(0, 0))
+	assert.Equal(t, 1, RowCopyDisplayPercent(0, 42))
+	assert.Equal(t, 1, RowCopyDisplayPercent(-3, 42))
+	assert.Equal(t, 2, RowCopyDisplayPercent(2, 42))
+	assert.Equal(t, 100, RowCopyDisplayPercent(145, 42))
+}
+
 func TestCleanLintReason(t *testing.T) {
 	tests := []struct {
 		name   string

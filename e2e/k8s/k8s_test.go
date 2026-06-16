@@ -634,6 +634,22 @@ func waitForDataPlaneProgress(t *testing.T, client ternv1.TernClient, applyID st
 		})
 }
 
+func waitForDataPlaneHealthRPC(t *testing.T, client ternv1.TernClient) {
+	t.Helper()
+
+	var lastErr error
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			ctx, cancel := context.WithTimeout(t.Context(), testutil.ProgressTimeout)
+			_, lastErr = client.Health(ctx, &ternv1.HealthRequest{})
+			cancel()
+			return lastErr == nil
+		},
+		func() string {
+			return fmt.Sprintf("timeout waiting for data-plane gRPC health: last_err=%v", lastErr)
+		})
+}
+
 func waitForControlPlaneStartControlRequestCompleted(t *testing.T, applyID string) {
 	t.Helper()
 	waitForControlPlaneControlRequestCompleted(t, applyID, storage.ControlOperationStart)
@@ -697,6 +713,60 @@ func TestK8s_ProgressStableAcrossDataPlaneReplicas(t *testing.T) {
 
 	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
 	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
+}
+
+// TestK8s_DataPlaneStopWithoutLocalRunnerQueuesOwnerStop verifies the
+// multi-replica data-plane safety invariant for stop. A pod that can see shared
+// storage but does not own a live Spirit runner records durable stop intent for
+// the apply owner instead of recording stopped state itself.
+func TestK8s_DataPlaneStopWithoutLocalRunnerQueuesOwnerStop(t *testing.T) {
+	cleanupState(t)
+	pods := podNamesForInstance(t, "data-plane")
+	require.NotEmpty(t, pods, "expected data-plane pods")
+	tableName := testutil.UniqueTableName("table_dp_stop_no_runner")
+
+	dataPlaneApplyID := createStoredK8sApplyWithTask(t, storageDSNs(t)[0], &storage.Apply{
+		ApplyIdentifier: testutil.UniqueTableName("apply-dp-stop-no-runner"),
+		Database:        "testapp",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testapp",
+		Environment:     "staging",
+		Caller:          "e2e",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+	}, &storage.Task{
+		TaskIdentifier: testutil.UniqueTableName("task-dp-stop-no-runner"),
+		Database:       "testapp",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Namespace:      "testapp",
+		TableName:      tableName,
+		DDL:            fmt.Sprintf("ALTER TABLE `%s` ADD INDEX `idx_account_created` (`account_id`, `created_at`)", tableName),
+		DDLAction:      "alter",
+		Engine:         storage.EngineSpirit,
+		Environment:    "staging",
+		State:          state.Task.Running,
+	})
+
+	conn, err := grpc.NewClient(startDataPlanePodGRPCPortForward(t, pods[0]), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(conn)
+
+	dataPlaneClient := ternv1.NewTernClient(conn)
+	waitForDataPlaneHealthRPC(t, dataPlaneClient)
+	ctx, cancel := context.WithTimeout(t.Context(), testutil.ProgressTimeout)
+	defer cancel()
+	resp, err := dataPlaneClient.Stop(ctx, &ternv1.StopRequest{
+		ApplyId:     dataPlaneApplyID,
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	waitForDataPlaneStopControlRequestPending(t, storageDSNs(t)[0], dataPlaneApplyID)
+
+	applyState, taskState := storedK8sApplyAndTaskStates(t, storageDSNs(t)[0], dataPlaneApplyID)
+	assert.Equal(t, state.Apply.Running, applyState, "non-owner stop must leave the data-plane apply active for the owner")
+	assert.Equal(t, state.Task.Running, taskState, "non-owner stop must leave the data-plane task active for the owner")
 }
 
 type dataPlanePodEndpoint struct {
@@ -774,6 +844,47 @@ func formatPodProgressResponses(responses map[string]*ternv1.ProgressResponse) s
 
 func hasRowCopyProgress(rowsTotal, rowsCopied int64, percentComplete int32) bool {
 	return rowsTotal > 0 && (rowsCopied > 0 || percentComplete > 0)
+}
+
+func storedK8sApplyAndTaskStates(t *testing.T, dsn, applyID string) (string, string) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()))
+
+	var applyState, taskState string
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		SELECT a.state, t.state
+		FROM applies a
+		JOIN tasks t ON t.apply_id = a.id
+		WHERE a.apply_identifier = ?
+	`, applyID).Scan(&applyState, &taskState))
+	return applyState, taskState
+}
+
+func waitForDataPlaneStopControlRequestPending(t *testing.T, dsn, applyID string) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()))
+
+	var status string
+	var lastErr error
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			lastErr = db.QueryRowContext(t.Context(), `
+				SELECT cr.status
+				FROM apply_control_requests cr
+				JOIN applies a ON a.id = cr.apply_id
+				WHERE a.apply_identifier = ? AND cr.operation = ?
+			`, applyID, storage.ControlOperationStop).Scan(&status)
+			return lastErr == nil && status == string(storage.ControlRequestPending)
+		},
+		func() string {
+			return fmt.Sprintf("stop control request was not pending for %s: status=%q last_err=%v", applyID, status, lastErr)
+		})
 }
 
 // TestK8s_Operator_DataPlanePodRestartRecoversIndexAdd verifies operator

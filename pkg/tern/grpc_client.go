@@ -583,6 +583,11 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending remote stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		if hasPendingStart, startErr := hasPendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
+			return true, startErr
+		} else if hasPendingStart {
+			return false, nil
+		}
 		return true, nil
 	}
 	if state.IsTerminalApplyState(apply.State) {
@@ -659,6 +664,11 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
 			return true, err
 		}
+		if hasPendingStart, startErr := hasPendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
+			return true, startErr
+		} else if hasPendingStart {
+			return false, nil
+		}
 		return true, nil
 	}
 
@@ -672,7 +682,14 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return true, fmt.Errorf("sync nonterminal remote gRPC stop state for %s: %w", apply.ApplyIdentifier, err)
 	}
-	return true, fmt.Errorf("remote gRPC stop for apply %s accepted but remote state is still %s", apply.ApplyIdentifier, remoteState)
+	slog.Info("remote gRPC stop request accepted and remains pending for remote apply owner",
+		"apply_id", apply.ApplyIdentifier,
+		"external_id", apply.ExternalID,
+		"database", apply.Database,
+		"environment", apply.Environment,
+		"requested_by", controlRequestCaller(controlReq),
+		"remote_state", remoteState)
+	return false, nil
 }
 
 func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope) (bool, error) {
@@ -780,13 +797,6 @@ func (c *GRPCClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*te
 
 func (c *GRPCClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error) {
 	return c.client.SkipRevert(ctx, req)
-}
-
-// RollbackPlan is not supported via gRPC client.
-// Rollback functionality requires access to storage for plan lookup, which is only
-// available in local mode. Use LocalClient for rollback operations.
-func (c *GRPCClient) RollbackPlan(ctx context.Context, database, environment string) (*ternv1.PlanResponse, error) {
-	return nil, fmt.Errorf("rollback is not supported via gRPC client - use local mode")
 }
 
 func (c *GRPCClient) Health(ctx context.Context) error {
@@ -916,6 +926,11 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		return err
 	}
 	startRequested := startControlReq != nil
+	if startRequested {
+		if err := c.waitForPendingStopBeforeStart(ctx, apply, scope, startControlReq); err != nil {
+			return err
+		}
+	}
 	if startRequested && state.IsState(apply.State, state.Apply.WaitingForDeploy) {
 		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
 			return err
@@ -1015,7 +1030,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 
 		// Only call Start if Tern confirms the apply is actually stopped.
 		if state.IsState(apply.State, state.Apply.Stopped) {
-			if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+			if err := c.completePendingStopBeforeRemoteStart(ctx, apply); err != nil {
 				return err
 			}
 			_, err := c.client.Start(ctx, &ternv1.StartRequest{
@@ -1067,6 +1082,69 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	}
 
 	return c.pollForCompletion(ctx, apply, startRequested, scope)
+}
+
+func (c *GRPCClient) completePendingStopBeforeRemoteStart(ctx context.Context, apply *storage.Apply) error {
+	controlReq, err := pendingStopControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return fmt.Errorf("check pending stop before starting stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if controlReq == nil {
+		return nil
+	}
+	if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
+		return fmt.Errorf("complete pending stop before starting stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	slog.Info("completed pending gRPC stop request before starting stopped remote apply",
+		"apply_id", apply.ApplyIdentifier,
+		"external_id", apply.ExternalID,
+		"database", apply.Database,
+		"environment", apply.Environment,
+		"requested_by", controlRequestCaller(controlReq),
+		"state", apply.State)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Pending remote stop request completed before start%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+	return nil
+}
+
+func hasPendingStartControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (bool, error) {
+	controlReq, err := pendingStartControlRequest(ctx, store, apply)
+	if err != nil {
+		return false, err
+	}
+	return controlReq != nil, nil
+}
+
+func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *storage.Apply, scope applyTaskScope, startControlReq *storage.ApplyControlRequest) error {
+	loggedWait := false
+	for {
+		stopReq, err := pendingStopControlRequest(ctx, c.storage, apply)
+		if err != nil {
+			return fmt.Errorf("check pending stop before pending gRPC start for apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		if stopReq == nil {
+			return nil
+		}
+		if !loggedWait {
+			slog.Info("pending gRPC start request is waiting for pending stop request to finish",
+				"apply_id", apply.ApplyIdentifier,
+				"external_id", apply.ExternalID,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"requested_by", controlRequestCaller(startControlReq),
+				"stop_requested_by", controlRequestCaller(stopReq),
+				"state", apply.State)
+			loggedWait = true
+		}
+		if _, err := c.processPendingStopControlRequest(ctx, apply, scope); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(grpcProgressPollInterval):
+		}
+	}
 }
 
 func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, apply *storage.Apply) error {

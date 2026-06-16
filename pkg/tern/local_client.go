@@ -87,9 +87,10 @@ package tern
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"log/slog"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -113,6 +114,15 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+const vSchemaArtifactName = "vschema.json"
+
+func namespaceHasVSchemaArtifact(nsData *storage.NamespacePlanData) bool {
+	if nsData == nil {
+		return false
+	}
+	return nsData.Artifacts[vSchemaArtifactName] != ""
+}
+
 // LocalConfig holds configuration for the local Tern client.
 type LocalConfig struct {
 	// Database is the name of this database.
@@ -132,6 +142,11 @@ type LocalConfig struct {
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
 	// quarantine so DROP TABLE executes directly).
 	Metadata map[string]string
+
+	// WakeOperator notifies the owner loop after an external control request is
+	// recorded. The callback must not execute control actions itself; it only
+	// nudges the storage-claiming operator to process durable intent promptly.
+	WakeOperator func(applyIdentifier, database, environment string)
 }
 
 // LocalClient implements Client by calling the Spirit engine directly.
@@ -210,6 +225,17 @@ func (c *LocalClient) IsRemote() bool { return false }
 
 // Endpoint returns the database name for this local client.
 func (c *LocalClient) Endpoint() string { return c.config.Database }
+
+func (c *LocalClient) wakeOperatorForControlRequest(apply *storage.Apply) {
+	if c.config.WakeOperator == nil {
+		c.logger.Debug("operator wake skipped because no wake callback is configured",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment)
+		return
+	}
+	c.config.WakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+}
 
 // protoEngine returns the proto engine type based on database configuration.
 func (c *LocalClient) protoEngine() ternv1.Engine {
@@ -323,11 +349,19 @@ func mysqlDSNWithDatabase(dsn, database string) (string, error) {
 }
 
 func mysqlDSNHasDatabase(dsn string) (bool, error) {
+	database, err := mysqlDSNDatabase(dsn)
+	if err != nil {
+		return false, err
+	}
+	return database != "", nil
+}
+
+func mysqlDSNDatabase(dsn string) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
-		return false, fmt.Errorf("parse MySQL DSN: %w", err)
+		return "", fmt.Errorf("parse MySQL DSN: %w", err)
 	}
-	return cfg.DBName != "", nil
+	return cfg.DBName, nil
 }
 
 func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *storage.Apply) (bool, bool, error) {
@@ -349,6 +383,28 @@ func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *st
 	return exists, true, nil
 }
 
+func (c *LocalClient) normalizeSchemaFiles(schemaFiles schema.SchemaFiles) (schema.SchemaFiles, error) {
+	if c.config.Type != storage.DatabaseTypeMySQL {
+		return schemaFiles, nil
+	}
+	normalized := make(schema.SchemaFiles, len(schemaFiles))
+	for ns, files := range schemaFiles {
+		targetNamespace := c.planNamespace(ns)
+		if normalized[targetNamespace] != nil {
+			return nil, fmt.Errorf("schema files contain duplicate namespace %q", targetNamespace)
+		}
+		normalized[targetNamespace] = files
+	}
+	return normalized, nil
+}
+
+func (c *LocalClient) planNamespace(ns string) string {
+	if ns == "" || (c.config.Type == storage.DatabaseTypeMySQL && ns == "default") {
+		return c.config.Database
+	}
+	return ns
+}
+
 // Health checks the service health.
 func (c *LocalClient) Health(ctx context.Context) error {
 	return c.storage.Ping(ctx)
@@ -362,58 +418,346 @@ func (c *LocalClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequ
 	if req.Type != "" && req.Type != c.config.Type {
 		return nil, fmt.Errorf("pull schema for database %s: request type %q does not match client type %q: %w", c.config.Database, req.Type, c.config.Type, ErrPullSchemaInvalidRequest)
 	}
+	if req.GetNamespace() == "" {
+		return c.pullAllNamespaces(ctx, req)
+	}
+	return c.pullSchemaNamespace(ctx, req, req.GetNamespace())
+}
 
+func (c *LocalClient) pullAllNamespaces(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	namespaces, err := c.discoverPullNamespaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	merged := &ternv1.PullSchemaResponse{
+		Database:    c.pullResponseDatabase(req),
+		Type:        c.config.Type,
+		Environment: req.Environment,
+		Namespaces:  make(map[string]*ternv1.PulledNamespace, len(namespaces)),
+	}
+	for _, namespace := range namespaces {
+		resp, err := c.pullSchemaNamespace(ctx, req, namespace)
+		if err != nil {
+			return nil, err
+		}
+		merged.TableCount += resp.TableCount
+		maps.Copy(merged.Namespaces, resp.Namespaces)
+	}
+	return merged, nil
+}
+
+func (c *LocalClient) discoverPullNamespaces(ctx context.Context) ([]string, error) {
+	if database, err := mysqlDSNDatabase(c.config.TargetDSN); err != nil {
+		return nil, fmt.Errorf("inspect MySQL target DSN for namespace discovery: %w", err)
+	} else if database != "" {
+		c.logger.Info("LocalClient.PullSchema: using target DSN database as live namespace", "database", c.config.Database, "namespace", database)
+		return []string{database}, nil
+	}
+
+	attrs := []any{"database", c.config.Database}
+	attrs = append(attrs, dsnLogAttrs(c.config.TargetDSN)...)
+	c.logger.Info("LocalClient.PullSchema: discovering live namespaces", attrs...)
+
+	db, err := mysqlconn.Open(c.config.TargetDSN)
+	if err != nil {
+		return nil, fmt.Errorf("open database target for namespace discovery: %w", err)
+	}
+	defer utils.CloseAndLog(db)
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping database target for namespace discovery: %w", err)
+	}
+	rows, err := db.QueryContext(ctx, `SELECT schema_name FROM information_schema.schemata ORDER BY schema_name`)
+	if err != nil {
+		return nil, fmt.Errorf("list namespaces for schema pull: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var namespaces []string
+	for rows.Next() {
+		var namespace string
+		if err := rows.Scan(&namespace); err != nil {
+			return nil, fmt.Errorf("scan namespace for schema pull: %w", err)
+		}
+		if schema.IsReservedPullNamespace(namespace) {
+			c.logger.Debug("LocalClient.PullSchema: skipping reserved namespace", "database", c.config.Database, "namespace", namespace)
+			continue
+		}
+		namespaces = append(namespaces, namespace)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate namespaces for schema pull: %w", err)
+	}
+	c.logger.Info("LocalClient.PullSchema: discovered live namespaces", "database", c.config.Database, "namespace_count", len(namespaces))
+	return namespaces, nil
+}
+
+func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullSchemaRequest, namespace string) (*ternv1.PullSchemaResponse, error) {
 	targetDSN := c.config.TargetDSN
 	if c.config.Type == storage.DatabaseTypeMySQL {
-		creds, err := c.credentialsForMySQLNamespace(c.config.Database)
+		creds, err := c.credentialsForMySQLPullNamespace(namespace)
 		if err != nil {
-			return nil, fmt.Errorf("resolve database %s credentials for schema pull: %w", c.config.Database, err)
+			return nil, fmt.Errorf("resolve database %s namespace %s credentials for schema pull: %w", c.config.Database, namespace, err)
 		}
 		targetDSN = creds.DSN
 	}
 
-	attrs := []any{"database", c.config.Database}
+	attrs := []any{"database", c.config.Database, "namespace", namespace}
 	attrs = append(attrs, dsnLogAttrs(targetDSN)...)
 	c.logger.Info("LocalClient.PullSchema: loading live schema", attrs...)
 
 	db, err := mysqlconn.Open(targetDSN)
 	if err != nil {
-		return nil, fmt.Errorf("open database %s for schema pull: %w", c.config.Database, err)
+		return nil, fmt.Errorf("open database %s namespace %s for schema pull: %w", c.config.Database, namespace, err)
 	}
 	defer utils.CloseAndLog(db)
 
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping database %s for schema pull: %w", c.config.Database, err)
+		return nil, fmt.Errorf("ping database %s namespace %s for schema pull: %w", c.config.Database, namespace, err)
 	}
 
 	tables, err := spirittable.LoadSchemaFromDB(ctx, db, spirittable.WithoutUnderscoreTables, spirittable.WithoutArchiveTables, spirittable.WithStrippedAutoIncrement)
 	if err != nil {
-		return nil, fmt.Errorf("load live schema for database %s: %w", c.config.Database, err)
+		return nil, fmt.Errorf("load live schema for database %s namespace %s: %w", c.config.Database, namespace, err)
 	}
 	sort.Slice(tables, func(i, j int) bool { return tables[i].Name < tables[j].Name })
 
-	files := make(map[string]string, len(tables))
+	pulledTables := make(map[string]string, len(tables))
 	for _, tbl := range tables {
-		content, err := pulledSchemaFileContent(c.config.Database, tbl)
+		content, err := pulledSchemaFileContent(namespace, tbl)
 		if err != nil {
 			return nil, err
 		}
-		files[tbl.Name+".sql"] = content
+		pulledTables[tbl.Name] = content
+	}
+	catalog, err := c.pullNamespaceCatalog(ctx, db, namespace, pulledTables, req.GetCatalogDetail())
+	if err != nil {
+		return nil, err
 	}
 
 	c.logger.Info("LocalClient.PullSchema: loaded live schema",
 		"database", c.config.Database,
+		"namespace", namespace,
 		"table_count", len(tables),
 	)
 
 	return &ternv1.PullSchemaResponse{
-		Database:    c.config.Database,
+		Database:    c.pullResponseDatabase(req),
 		Type:        c.config.Type,
 		Environment: req.Environment,
-		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			c.config.Database: {Files: files},
+		Namespaces: map[string]*ternv1.PulledNamespace{
+			namespace: {
+				Tables:           pulledTables,
+				NamespaceCatalog: catalog.namespace,
+				TableCatalog:     catalog.tables,
+			},
 		},
 		TableCount: int32(len(tables)),
+	}, nil
+}
+
+type pulledCatalog struct {
+	namespace *ternv1.NamespaceCatalog
+	tables    map[string]*ternv1.TableCatalog
+}
+
+func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalogDetail ternv1.PullCatalogDetail) (*pulledCatalog, error) {
+	catalog := &pulledCatalog{
+		namespace: &ternv1.NamespaceCatalog{
+			Name:       namespace,
+			Engine:     c.config.Type,
+			TableCount: int32(len(pulledTables)),
+		},
+		tables: make(map[string]*ternv1.TableCatalog, len(pulledTables)),
+	}
+	if len(pulledTables) == 0 {
+		return catalog, nil
+	}
+	if err := c.loadTableCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+		return nil, err
+	}
+	if catalogDetail != ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED {
+		return catalog, nil
+	}
+	if err := c.loadColumnCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+		return nil, err
+	}
+	if err := c.loadIndexCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+		return nil, err
+	}
+	return catalog, nil
+}
+
+func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+	rows, err := db.QueryContext(ctx, `
+		SELECT table_name, table_type, table_comment
+		FROM information_schema.tables
+		WHERE table_schema = ?
+		ORDER BY table_name`, namespace)
+	if err != nil {
+		return fmt.Errorf("load table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	for rows.Next() {
+		var tableName, tableType, tableComment string
+		if err := rows.Scan(&tableName, &tableType, &tableComment); err != nil {
+			return fmt.Errorf("scan table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		}
+		if _, ok := pulledTables[tableName]; ok {
+			catalog[tableName] = &ternv1.TableCatalog{
+				Name:    tableName,
+				Kind:    normalizedTableKind(tableType),
+				Comment: tableComment,
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	return nil
+}
+
+func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+	rows, err := db.QueryContext(ctx, `
+		SELECT table_name, column_name, column_type, is_nullable, column_default, column_comment
+		FROM information_schema.columns
+		WHERE table_schema = ?
+		ORDER BY table_name, ordinal_position`, namespace)
+	if err != nil {
+		return fmt.Errorf("load column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	for rows.Next() {
+		var tableName, columnName, columnType, nullable, comment string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&tableName, &columnName, &columnType, &nullable, &defaultValue, &comment); err != nil {
+			return fmt.Errorf("scan column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		}
+		if _, ok := pulledTables[tableName]; ok {
+			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
+			column := &ternv1.ColumnCatalog{
+				Name:     columnName,
+				Type:     columnType,
+				Nullable: nullable == "YES",
+				Comment:  comment,
+			}
+			if defaultValue.Valid {
+				column.DefaultValue = defaultValue.String
+			}
+			tableCatalog.Columns = append(tableCatalog.Columns, column)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	return nil
+}
+
+func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+	rows, err := db.QueryContext(ctx, `
+		SELECT table_name, index_name, non_unique, column_name, expression
+		FROM information_schema.statistics
+		WHERE table_schema = ?
+		ORDER BY table_name, index_name, seq_in_index`, namespace)
+	if err != nil {
+		return fmt.Errorf("load index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	indexesByTable := make(map[string]map[string]*ternv1.IndexCatalog)
+	for rows.Next() {
+		var tableName, indexName string
+		var columnName, expression sql.NullString
+		var nonUnique int32
+		if err := rows.Scan(&tableName, &indexName, &nonUnique, &columnName, &expression); err != nil {
+			return fmt.Errorf("scan index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		}
+		if _, ok := pulledTables[tableName]; ok {
+			indexedValue := ""
+			switch {
+			case columnName.Valid:
+				indexedValue = columnName.String
+			case expression.Valid:
+				indexedValue = expression.String
+			default:
+				c.logger.Warn("LocalClient.PullSchema: skipping index part without column or expression", "database", c.config.Database, "namespace", namespace, "table", tableName, "index", indexName)
+				continue
+			}
+			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
+			if indexesByTable[tableName] == nil {
+				indexesByTable[tableName] = make(map[string]*ternv1.IndexCatalog)
+			}
+			idx := indexesByTable[tableName][indexName]
+			if idx == nil {
+				idx = &ternv1.IndexCatalog{
+					Name:    indexName,
+					Primary: indexName == "PRIMARY",
+					Unique:  nonUnique == 0,
+				}
+				indexesByTable[tableName][indexName] = idx
+				tableCatalog.Indexes = append(tableCatalog.Indexes, idx)
+			}
+			idx.Parts = append(idx.Parts, indexedValue)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	return nil
+}
+
+func ensurePulledTableCatalog(catalog map[string]*ternv1.TableCatalog, tableName string) *ternv1.TableCatalog {
+	tableCatalog := catalog[tableName]
+	if tableCatalog == nil {
+		tableCatalog = &ternv1.TableCatalog{Name: tableName}
+		catalog[tableName] = tableCatalog
+	}
+	return tableCatalog
+}
+
+func normalizedTableKind(tableType string) string {
+	switch tableType {
+	case "BASE TABLE":
+		return "table"
+	case "VIEW":
+		return "view"
+	default:
+		return strings.ToLower(strings.ReplaceAll(tableType, " ", "_"))
+	}
+}
+
+func (c *LocalClient) pullResponseDatabase(req *ternv1.PullSchemaRequest) string {
+	if req.GetDatabase() != "" {
+		return req.GetDatabase()
+	}
+	return c.config.Database
+}
+
+func (c *LocalClient) credentialsForMySQLPullNamespace(namespace string) (*engine.Credentials, error) {
+	if c.config.Type != storage.DatabaseTypeMySQL {
+		return c.credentials(), nil
+	}
+	database, err := mysqlDSNDatabase(c.config.TargetDSN)
+	if err != nil {
+		return nil, fmt.Errorf("inspect MySQL target DSN for namespace injection: %w", err)
+	}
+	if database != "" {
+		if database != namespace {
+			return nil, fmt.Errorf("target DSN database %q does not match requested namespace %q", database, namespace)
+		}
+		return c.credentials(), nil
+	}
+	if namespace == "" {
+		return nil, fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
+	}
+	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, namespace)
+	if err != nil {
+		return nil, err
+	}
+	return &engine.Credentials{
+		DSN:      dsn,
+		Metadata: c.config.Metadata,
 	}, nil
 }
 
@@ -434,8 +778,11 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		return nil, fmt.Errorf("type must be %q or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess)
 	}
 
-	// Convert schema files from proto to engine type
-	schemaFiles := protoToSchemaFiles(req.SchemaFiles)
+	// Convert schema files from proto to engine type.
+	schemaFiles, err := c.normalizeSchemaFiles(protoToSchemaFiles(req.SchemaFiles))
+	if err != nil {
+		return nil, err
+	}
 
 	planLogAttrs := []any{"database", c.config.Database}
 	planLogAttrs = append(planLogAttrs, dsnLogAttrs(c.config.TargetDSN)...)
@@ -477,10 +824,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// For Vitess, each namespace is a keyspace. For Spirit, there's one namespace.
 	namespaces := make(map[string]*storage.NamespacePlanData)
 	for _, sc := range result.Changes {
-		ns := sc.Namespace
-		if ns == "" {
-			ns = c.config.Database
-		}
+		ns := c.planNamespace(sc.Namespace)
 		nsData := namespaces[ns]
 		if nsData == nil {
 			nsData = &storage.NamespacePlanData{}
@@ -493,36 +837,37 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Operation: ddl.StatementTypeToOp(tc.Operation),
 			})
 		}
-		// Only store VSchema when the Plan detected a change.
-		if sc.Metadata["vschema_changed"] == "true" {
-			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
-				if vs, ok := nsFiles.Files["vschema.json"]; ok {
-					nsData.VSchema = json.RawMessage(vs)
-				}
+		if len(sc.OriginalFiles) > 0 {
+			nsData.OriginalFiles = sc.OriginalFiles
+		}
+		if sc.OriginalFilesCaptured {
+			nsData.OriginalFilesCaptured = true
+			if nsData.OriginalFiles == nil {
+				nsData.OriginalFiles = map[string]string{}
 			}
 		}
-	}
-	// Store original schema for rollback support.
-	// For single-namespace (Spirit), attach to that namespace.
-	// For multi-namespace (Vitess), original schema is per-keyspace from the engine.
-	if result.OriginalSchema != nil {
-		if len(namespaces) == 1 {
-			for _, nsData := range namespaces {
-				nsData.OriginalSchema = result.OriginalSchema
+		// Only store VSchema artifacts when the Plan detected a change.
+		if sc.Metadata["vschema_changed"] == "true" {
+			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
+				if vs, ok := nsFiles.Files[vSchemaArtifactName]; ok && vs != "" {
+					if nsData.Artifacts == nil {
+						nsData.Artifacts = map[string]string{}
+					}
+					nsData.Artifacts[vSchemaArtifactName] = vs
+				}
 			}
 		}
 	}
 	if len(namespaces) == 0 {
 		namespaces[c.config.Database] = &storage.NamespacePlanData{
-			Tables:         ddlChanges,
-			OriginalSchema: result.OriginalSchema,
+			Tables: ddlChanges,
 		}
 	}
 
 	// Don't store empty plans — no DDL changes, no VSchema changes.
 	hasVSchemaChanges := false
 	for _, ns := range namespaces {
-		if len(ns.VSchema) > 0 {
+		if namespaceHasVSchemaArtifact(ns) {
 			hasVSchemaChanges = true
 			break
 		}
@@ -572,9 +917,12 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Convert engine SchemaChanges to proto SchemaChanges.
 	var changes []*ternv1.SchemaChange
 	for _, sc := range result.Changes {
+		ns := c.planNamespace(sc.Namespace)
 		protoSC := &ternv1.SchemaChange{
-			Namespace: sc.Namespace,
-			Metadata:  sc.Metadata,
+			Namespace:             ns,
+			Metadata:              sc.Metadata,
+			OriginalFiles:         sc.OriginalFiles,
+			OriginalFilesCaptured: sc.OriginalFilesCaptured,
 		}
 		for _, t := range sc.TableChanges {
 			protoSC.TableChanges = append(protoSC.TableChanges, &ternv1.TableChange{
@@ -583,7 +931,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Ddl:          t.DDL,
 				IsUnsafe:     t.IsUnsafe,
 				UnsafeReason: t.UnsafeReason,
-				Namespace:    sc.Namespace,
+				Namespace:    ns,
 			})
 		}
 		changes = append(changes, protoSC)
@@ -753,7 +1101,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// For VSchema-only deploys (0 DDL changes), this gives the progress API
 	// something to track.
 	for ns, nsData := range plan.Namespaces {
-		if len(nsData.VSchema) > 0 {
+		if namespaceHasVSchemaArtifact(nsData) {
 			ddlChanges = append(ddlChanges, storage.TableChange{
 				Table:     "VSchema: " + ns,
 				Namespace: ns,

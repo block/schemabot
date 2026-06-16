@@ -52,12 +52,45 @@ func GetEnvironments(endpoint, database string) ([]string, error) {
 	return result.Environments, nil
 }
 
+// ListDatabasesOptions controls database list request fields.
+type ListDatabasesOptions struct {
+	Type string
+}
+
+// ListDatabases fetches the configured databases known to the server.
+func ListDatabases(endpoint string, opts ListDatabasesOptions) (*apitypes.DatabaseListResponse, error) {
+	requestPath := "/api/databases"
+	if opts.Type != "" {
+		values := url.Values{}
+		values.Set("type", opts.Type)
+		requestPath += "?" + values.Encode()
+	}
+	var result apitypes.DatabaseListResponse
+	if err := doGetInto(endpoint, requestPath, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// PullSchemaOptions controls optional live schema pull request fields.
+type PullSchemaOptions struct {
+	Namespaces    []string
+	CatalogDetail string
+}
+
 // CallPullSchemaAPI fetches live schema files for a database/environment pair.
-func CallPullSchemaAPI(endpoint, database, dbType, environment string) (*apitypes.PullSchemaResponse, error) {
+func CallPullSchemaAPI(endpoint, database, dbType, environment string, namespaces ...string) (*apitypes.PullSchemaResponse, error) {
+	return CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment, PullSchemaOptions{Namespaces: namespaces})
+}
+
+// CallPullSchemaAPIWithOptions fetches live schema with optional namespace and catalog controls.
+func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string, opts PullSchemaOptions) (*apitypes.PullSchemaResponse, error) {
 	req := apitypes.PullSchemaRequest{
-		Database:    database,
-		Type:        dbType,
-		Environment: environment,
+		Database:      database,
+		Type:          dbType,
+		Environment:   environment,
+		Namespaces:    opts.Namespaces,
+		CatalogDetail: opts.CatalogDetail,
 	}
 	var result apitypes.PullSchemaResponse
 	if err := doPostInto(endpoint, "/api/pull", req, &result); err != nil {

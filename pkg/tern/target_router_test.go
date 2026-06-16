@@ -79,10 +79,9 @@ type targetRouterRecordingClient struct {
 	planReq            *ternv1.PlanRequest
 	applyReq           *ternv1.ApplyRequest
 	progressReq        *ternv1.ProgressRequest
-	rollbackDatabase   string
-	rollbackEnv        string
 	resumeApply        *storage.Apply
 	targetDSN          string
+	targetMetadata     map[string]string
 	pendingObserverSet bool
 	observerApplyID    int64
 	closed             bool
@@ -130,12 +129,6 @@ func (c *targetRouterRecordingClient) Revert(context.Context, *ternv1.RevertRequ
 
 func (c *targetRouterRecordingClient) SkipRevert(context.Context, *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error) {
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
-}
-
-func (c *targetRouterRecordingClient) RollbackPlan(_ context.Context, database, environment string) (*ternv1.PlanResponse, error) {
-	c.rollbackDatabase = database
-	c.rollbackEnv = environment
-	return &ternv1.PlanResponse{PlanId: "rollback-plan"}, nil
 }
 
 func (c *targetRouterRecordingClient) Health(context.Context) error { return nil }
@@ -204,30 +197,6 @@ func TestTargetRouterRoutesPlanThroughStaticTarget(t *testing.T) {
 	_, err = router.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders-logical", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: "dsid-orders-prod"})
 	require.NoError(t, err)
 	assert.Len(t, created, 1, "the router should cache LocalClients by resolved target route and namespace")
-}
-
-func TestTargetRouterRollbackPlanRoutesEnvironment(t *testing.T) {
-	var resolvedReq inventory.Request
-	resolver := targetRouterResolverFunc(func(_ context.Context, req inventory.Request) (*inventory.Target, error) {
-		resolvedReq = req
-		return &inventory.Target{
-			Target:       req.Target,
-			DatabaseType: storage.DatabaseTypeMySQL,
-			DSN:          "root@tcp(localhost:3306)/",
-		}, nil
-	})
-	created := make(map[string]*targetRouterRecordingClient)
-	router := newTargetRouterForTest(t, resolver, nil, nil, created)
-
-	resp, err := router.RollbackPlan(t.Context(), "dsid-orders-prod", "staging")
-
-	require.NoError(t, err)
-	assert.Equal(t, "rollback-plan", resp.PlanId)
-	assert.Equal(t, inventory.Request{Target: "dsid-orders-prod", Environment: "staging"}, resolvedReq)
-	client := created["dsid-orders-prod"]
-	require.NotNil(t, client)
-	assert.Equal(t, "dsid-orders-prod", client.rollbackDatabase)
-	assert.Equal(t, "staging", client.rollbackEnv)
 }
 
 func TestTargetRouterApplyUsesTargetScopedPendingObserver(t *testing.T) {
@@ -427,6 +396,63 @@ func TestTargetRouterFailsClosedOnIncompleteResolvedTarget(t *testing.T) {
 	assert.Empty(t, created, "no client should be created for an incomplete resolved target")
 }
 
+// A Vitess target reaches the database through the PlanetScale API, so it
+// carries connection details in metadata and has no DSN. Routing must accept it
+// and pass the metadata through to the client rather than rejecting the empty
+// DSN as incomplete.
+func TestTargetRouterAcceptsMetadataOnlyVitessTarget(t *testing.T) {
+	resolver := targetRouterResolverFunc(func(context.Context, inventory.Request) (*inventory.Target, error) {
+		return &inventory.Target{
+			Target:       "dsid-orders-vitess",
+			DatabaseType: storage.DatabaseTypeVitess,
+			Metadata: map[string]string{
+				inventory.MetadataOrganization: "acme",
+				inventory.MetadataTokenName:    "tok-id",
+				inventory.MetadataTokenValue:   "tok-secret",
+				inventory.MetadataAPIURL:       "https://localscale.test",
+			},
+		}, nil
+	})
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "dsid-orders-vitess", Type: storage.DatabaseTypeVitess})
+
+	require.NoError(t, err)
+	require.Len(t, created, 1, "the router should build a client for a metadata-only Vitess target")
+	client := created["orders"]
+	require.NotNil(t, client)
+	assert.Empty(t, client.targetDSN, "a Vitess client connects via metadata, not a DSN")
+	assert.Equal(t, "acme", client.targetMetadata[inventory.MetadataOrganization])
+	assert.Equal(t, "tok-secret", client.targetMetadata[inventory.MetadataTokenValue])
+}
+
+// A Vitess target missing its PlanetScale metadata cannot open a connection, so
+// routing must fail closed with the missing field rather than building a client
+// that errors confusingly on first API call.
+func TestTargetRouterFailsClosedOnVitessTargetMissingMetadata(t *testing.T) {
+	resolver := targetRouterResolverFunc(func(context.Context, inventory.Request) (*inventory.Target, error) {
+		return &inventory.Target{
+			Target:       "dsid-orders-vitess",
+			DatabaseType: storage.DatabaseTypeVitess,
+			Metadata: map[string]string{
+				inventory.MetadataOrganization: "acme",
+				inventory.MetadataTokenName:    "tok-id",
+				inventory.MetadataAPIURL:       "https://localscale.test",
+			},
+		}, nil
+	})
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "dsid-orders-vitess", Type: storage.DatabaseTypeVitess})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "incomplete target")
+	assert.Contains(t, err.Error(), inventory.MetadataTokenValue)
+	assert.Empty(t, created, "no client should be created for an incomplete Vitess target")
+}
+
 func TestTargetRouterCloseClosesCachedClients(t *testing.T) {
 	resolver := newStaticResolver(t)
 	created := make(map[string]*targetRouterRecordingClient)
@@ -461,7 +487,7 @@ func newTargetRouterForTest(t *testing.T, resolver inventory.Resolver, applyStor
 		Storage:  targetRouterStorage{applies: applyStore, plans: planStore},
 		Logger:   slog.Default(),
 		LocalClientFactory: func(cfg LocalConfig, _ storage.Storage, _ *slog.Logger) (Client, error) {
-			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN}
+			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN, targetMetadata: cfg.Metadata}
 			key := cfg.Database
 			if existing := created[key]; existing != nil {
 				key = fmt.Sprintf("%s#%d", cfg.Database, len(created)+1)

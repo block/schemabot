@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -22,10 +24,13 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/awscreds"
+	"github.com/block/schemabot/pkg/etre"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
@@ -164,7 +169,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	var grpcServer *grpc.Server
 	grpcPort := os.Getenv("GRPC_PORT")
 	if grpcPort != "" {
-		grpcServer, err = startGRPCServer(ctx, serverConfig, storage, logger, grpcPort)
+		grpcServer, err = startGRPCServer(ctx, serverConfig, storage, logger, grpcPort, svc.WakeOperator)
 		if err != nil {
 			return fmt.Errorf("start grpc server: %w", err)
 		}
@@ -204,10 +209,9 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 
 	// Authentication middleware. With the default (none) auth this is an
 	// allow-all NoneAuthorizer that lets every request through (attaching an
-	// anonymous user); it gates nothing until an auth type is configured. The
-	// authorizer is responsible for bypassing non-API paths (/webhook, /metrics,
-	// health) once real enforcement is added.
-	authz, err := buildAuthorizer(serverConfig.Auth, logger)
+	// anonymous user); with "oidc" it validates Bearer JWTs and bypasses
+	// non-API paths (/webhook, /metrics, health) itself.
+	authz, err := buildAuthorizer(ctx, serverConfig.Auth, serverConfig.PRCommandAuthorization.AdminTeams, logger)
 	if err != nil {
 		return fmt.Errorf("setup auth: %w", err)
 	}
@@ -264,8 +268,8 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 // plane is configured with a target resolver, requests are routed by opaque
 // execution target through a TargetRouter; otherwise it falls back to a single
 // LocalClient bound to the one database configured for TERN_ENVIRONMENT.
-func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, port string) (*grpc.Server, error) {
-	client, err := buildGRPCTernClient(config, st, logger, os.Getenv("TERN_ENVIRONMENT"))
+func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, port string, wakeOperator func(applyIdentifier, database, environment string)) (*grpc.Server, error) {
+	client, err := buildGRPCTernClient(ctx, config, st, logger, os.Getenv("TERN_ENVIRONMENT"), wakeOperator)
 	if err != nil {
 		return nil, err
 	}
@@ -296,22 +300,32 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 // environment is unused in this mode because each request carries its own.
 // Otherwise it falls back to a single LocalClient bound to the one database
 // configured for env.
-func buildGRPCTernClient(config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string) (tern.Client, error) {
-	if config.TargetResolver.Configured() {
-		resolver, err := inventory.NewStaticResolver(config.TargetResolver.StaticInventory())
+func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string, wakeOperator ...func(applyIdentifier, database, environment string)) (tern.Client, error) {
+	var wake func(applyIdentifier, database, environment string)
+	if len(wakeOperator) > 0 {
+		wake = wakeOperator[0]
+	}
+	etreConfigured := config.TargetResolver.Etre.Configured()
+	staticConfigured := config.TargetResolver.Configured()
+
+	if etreConfigured && staticConfigured {
+		return nil, fmt.Errorf("target_resolver configures both etre and static targets; per-target overrides are not yet supported — use one")
+	}
+
+	if etreConfigured || staticConfigured {
+		resolver, err := buildTargetResolver(ctx, config.TargetResolver, logger)
 		if err != nil {
-			return nil, fmt.Errorf("build static target resolver: %w", err)
+			return nil, err
 		}
 		router, err := tern.NewTargetRouter(tern.TargetRouterConfig{
 			Resolver:           resolver,
 			Storage:            st,
 			Logger:             logger,
-			LocalClientFactory: grpcLocalClientFactory(config),
+			LocalClientFactory: grpcLocalClientFactory(config, wake),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("build target router: %w", err)
 		}
-		logger.Info("gRPC server routing by target resolver", "targets", len(config.TargetResolver.Targets))
 		return router, nil
 	}
 
@@ -348,7 +362,7 @@ func buildGRPCTernClient(config *api.ServerConfig, st *mysqlstore.Storage, logge
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 	}
-	client, err := grpcLocalClientFactory(config)(tern.LocalConfig{
+	client, err := grpcLocalClientFactory(config, wake)(tern.LocalConfig{
 		Database:  dbName,
 		Type:      dbConfig.Type,
 		TargetDSN: targetDSN,
@@ -360,10 +374,194 @@ func buildGRPCTernClient(config *api.ServerConfig, st *mysqlstore.Storage, logge
 	return client, nil
 }
 
+// buildTargetResolver builds the configured inventory.Resolver — the Etre
+// dynamic backend or the static inventory. The caller guarantees exactly one is
+// configured.
+func buildTargetResolver(ctx context.Context, cfg api.TargetResolverConfig, logger *slog.Logger) (inventory.Resolver, error) {
+	if cfg.Etre.Configured() {
+		resolver, err := buildEtreResolver(ctx, cfg.Etre, logger)
+		if err != nil {
+			return nil, fmt.Errorf("build etre resolver: %w", err)
+		}
+		logger.Info("gRPC server routing by etre resolver",
+			"entity_type", cfg.Etre.EntityType, "target_label", cfg.Etre.TargetLabel,
+			"credentials", credentialType(cfg.Etre.Credentials))
+		return resolver, nil
+	}
+
+	resolver, err := inventory.NewStaticResolver(cfg.StaticInventory())
+	if err != nil {
+		return nil, fmt.Errorf("build static target resolver: %w", err)
+	}
+	logger.Info("gRPC server routing by static target resolver", "targets", len(cfg.Targets))
+	return resolver, nil
+}
+
+// buildEtreResolver assembles the Etre-backed resolver from config: the Etre
+// query client, the engine-specific connection assembler, and the configured
+// credential resolver. Lazily-validated fields (host, credentials) are checked
+// here so a misconfiguration fails at startup, not first request.
+func buildEtreResolver(ctx context.Context, cfg api.EtreConfig, logger *slog.Logger) (inventory.Resolver, error) {
+	assembler, decode, err := etreAssembler(cfg)
+	if err != nil {
+		return nil, err
+	}
+	creds, err := buildCredentialResolver(ctx, cfg.Credentials, decode)
+	if err != nil {
+		return nil, err
+	}
+	addr, err := secrets.Resolve(cfg.Addr, "")
+	if err != nil {
+		return nil, fmt.Errorf("resolve target_resolver.etre.addr: %w", err)
+	}
+	// A secret ref (env:/file:/secretsmanager:) can resolve to "" without error;
+	// surface that as a clear config error rather than a generic downstream one.
+	if addr == "" {
+		return nil, fmt.Errorf("target_resolver.etre.addr resolved to an empty value")
+	}
+	client, err := etre.New(etre.Config{Addr: addr, EntityType: cfg.EntityType, Logger: logger})
+	if err != nil {
+		return nil, fmt.Errorf("build etre client: %w", err)
+	}
+	return etre.NewEtreResolver(etre.EtreResolverConfig{
+		Client:          client,
+		TargetLabel:     cfg.TargetLabel,
+		Labels:          cfg.Labels,
+		EnvLabel:        cfg.EnvLabel,
+		HostField:       cfg.MySQL.HostField,
+		AttributeFields: resolverAttributeFields(cfg),
+		Credentials:     creds,
+		Assembler:       assembler,
+	})
+}
+
+// etreAssembler selects the engine-specific connection assembler for the
+// configured database type, plus the secret decoder that backend needs. MySQL
+// builds a namespace-free DSN from the host; Vitess assembles PlanetScale API
+// metadata and decodes a token secret rather than a username/password. A new
+// engine (postgres, strata) is a new case here; an unsupported type fails closed.
+func etreAssembler(cfg api.EtreConfig) (inventory.ConnectionAssembler, inventory.SecretDecoder, error) {
+	switch cfg.DatabaseType {
+	case "":
+		return nil, nil, fmt.Errorf("target_resolver.etre.database_type is required (%q or %q)", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess)
+	case storage.DatabaseTypeMySQL:
+		if cfg.MySQL.HostField == "" {
+			return nil, nil, fmt.Errorf("target_resolver.etre.mysql.host_field is required for the %q engine", storage.DatabaseTypeMySQL)
+		}
+		return inventory.MySQLConnectionAssembler{DefaultPort: cfg.MySQL.DefaultPort}, nil, nil
+	case storage.DatabaseTypeVitess:
+		return inventory.VitessConnectionAssembler{
+			OrganizationAttribute: cfg.Vitess.OrganizationAttribute,
+			APIURL:                cfg.Vitess.APIURL,
+		}, inventory.DecodePlanetScaleSecret, nil
+	default:
+		return nil, nil, fmt.Errorf("target_resolver.etre.database_type %q is not supported", cfg.DatabaseType)
+	}
+}
+
+const (
+	credentialTypeSecretRef = "secret_ref"
+	credentialTypeAWSSM     = "awssm"
+)
+
+// credentialType returns the configured credential backend, defaulting to
+// secret_ref.
+func credentialType(cfg api.EtreCredentialsConfig) string {
+	if cfg.Type == "" {
+		return credentialTypeSecretRef
+	}
+	return cfg.Type
+}
+
+// buildCredentialResolver builds the configured credential backend. Each backend
+// is one inventory.CredentialResolver implementation; the data plane is not
+// coupled to any single secret store.
+func buildCredentialResolver(ctx context.Context, cfg api.EtreCredentialsConfig, decode inventory.SecretDecoder) (inventory.CredentialResolver, error) {
+	switch credentialType(cfg) {
+	case credentialTypeSecretRef:
+		if cfg.PasswordRef == "" {
+			return nil, fmt.Errorf("target_resolver.etre.credentials.password_ref is required")
+		}
+		// A decoder (for example a Vitess token) produces the full credential from
+		// the secret, so no separate username is configured; require a username
+		// only for the plain username + password form.
+		if decode == nil && cfg.Username == "" {
+			return nil, fmt.Errorf("target_resolver.etre.credentials.username is required")
+		}
+		return inventory.SecretRefCredentialResolver{Username: cfg.Username, PasswordRef: cfg.PasswordRef, Decode: decode}, nil
+
+	case credentialTypeAWSSM:
+		// Validate required fields with config-path context before loading AWS
+		// config, so a misconfiguration fails fast and actionably instead of
+		// after (potentially slow) credential-chain resolution.
+		switch {
+		case cfg.Region == "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.region is required for the awssm backend")
+		case cfg.RoleARN == "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.role_arn is required for the awssm backend")
+		case cfg.SecretName == "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.secret_name is required for the awssm backend")
+		}
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("load AWS config for target_resolver.etre.credentials: %w", err)
+		}
+		resolver, err := awscreds.New(awscreds.Config{
+			AWSConfig:        awsCfg,
+			Region:           cfg.Region,
+			RoleARN:          cfg.RoleARN,
+			ExternalID:       cfg.ExternalID,
+			SecretName:       cfg.SecretName,
+			AccountAttribute: cfg.AccountAttribute,
+			Decode:           decode,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("build target_resolver.etre.credentials awssm resolver: %w", err)
+		}
+		return resolver, nil
+
+	default:
+		return nil, fmt.Errorf("unknown target_resolver.etre.credentials.type %q (want %q or %q)", cfg.Type, credentialTypeSecretRef, credentialTypeAWSSM)
+	}
+}
+
+// resolverAttributeFields returns the entity attribute fields the resolver must
+// surface so the assembler and credential backend can locate their inputs: the
+// Vitess organization attribute and the assume-role backend's account attribute,
+// alongside any explicitly configured fields.
+func resolverAttributeFields(cfg api.EtreConfig) []string {
+	fields := append([]string(nil), cfg.AttributeFields...)
+	// Engines that resolve a connection attribute rather than a host surface it
+	// here. A new such engine adds a branch; host-based engines (mysql) add none.
+	if cfg.DatabaseType == storage.DatabaseTypeVitess {
+		orgAttr := cfg.Vitess.OrganizationAttribute
+		if orgAttr == "" {
+			orgAttr = inventory.MetadataOrganization
+		}
+		fields = ensureField(fields, orgAttr)
+	}
+	if credentialType(cfg.Credentials) == credentialTypeAWSSM {
+		accountAttr := cfg.Credentials.AccountAttribute
+		if accountAttr == "" {
+			accountAttr = "aws_account_id"
+		}
+		fields = ensureField(fields, accountAttr)
+	}
+	return fields
+}
+
+// ensureField appends field unless it is already present.
+func ensureField(fields []string, field string) []string {
+	if slices.Contains(fields, field) {
+		return fields
+	}
+	return append(fields, field)
+}
+
 // grpcLocalClientFactory returns a LocalClientFactory that applies server-level
 // policy (pending drops) to every LocalClient the data plane builds, so the
 // router and single-database paths share identical execution semantics.
-func grpcLocalClientFactory(config *api.ServerConfig) tern.LocalClientFactory {
+func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIdentifier, database, environment string)) tern.LocalClientFactory {
 	pendingDropsDisabled := !config.PendingDropsEnabled()
 	return func(cfg tern.LocalConfig, st storage.Storage, logger *slog.Logger) (tern.Client, error) {
 		if pendingDropsDisabled {
@@ -371,6 +569,9 @@ func grpcLocalClientFactory(config *api.ServerConfig) tern.LocalClientFactory {
 				cfg.Metadata = map[string]string{}
 			}
 			cfg.Metadata["pending_drops"] = "false"
+		}
+		if cfg.WakeOperator == nil {
+			cfg.WakeOperator = wakeOperator
 		}
 		return tern.NewLocalClient(cfg, st, logger)
 	}
@@ -499,16 +700,32 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// buildAuthorizer selects the API authorizer from config. Today only the
-// allow-all NoneAuthorizer is supported (every request allowed, with an
-// anonymous user in context); other types are rejected so a misconfigured auth
-// type fails closed at startup rather than silently disabling auth. OIDC
-// support is layered on top of this seam.
-func buildAuthorizer(cfg api.AuthConfig, logger *slog.Logger) (auth.Authorizer, error) {
+// buildAuthorizer selects the API authorizer from config. The default
+// allow-all NoneAuthorizer lets every request through (with an anonymous user
+// in context); "oidc" validates Bearer JWTs against the issuer's JWKS. Unknown
+// types are rejected so a misconfigured auth type fails closed at startup
+// rather than silently disabling auth.
+func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups []string, logger *slog.Logger) (auth.Authorizer, error) {
 	switch cfg.Type {
 	case "", "none":
 		logger.Info("API authentication disabled — all requests allowed")
 		return auth.NoneAuthorizer{}, nil
+	case "oidc":
+		logger.Info("initializing OIDC authentication", "issuer", cfg.Issuer, "admin_groups", len(adminGroups))
+		authz, err := auth.NewOIDCAuthorizer(ctx, auth.OIDCConfig{
+			Issuer:      cfg.Issuer,
+			Audience:    cfg.Audience,
+			GroupsClaim: cfg.GroupsClaim,
+			AdminGroups: adminGroups,
+		}, logger)
+		if err != nil {
+			return nil, err
+		}
+		if len(adminGroups) == 0 {
+			logger.Warn("OIDC authentication enabled with no admin groups configured: all write operations will be denied (read and plan still work). Set pr_command_authorization.admin_teams to allow writes.")
+		}
+		logger.Info("OIDC authentication enabled", "issuer", cfg.Issuer)
+		return authz, nil
 	default:
 		return nil, fmt.Errorf("auth type %q is not yet supported", cfg.Type)
 	}

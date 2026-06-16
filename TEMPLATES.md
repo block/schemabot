@@ -161,10 +161,10 @@ schemabot apply -e staging
 </details>
 
 <details>
-<summary><a name="vitess-apply-plan-locked--options"></a><strong>Vitess Apply Plan (Locked + Options)</strong></summary>
+<summary><a name="schema-change-apply-locked--options"></a><strong>Schema Change Apply (Locked + Options)</strong></summary>
 
 
-## Vitess Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `commerce` | **Environment**: `staging`
 
@@ -1334,10 +1334,10 @@ No active locks.
 ### PR Comments
 
 <details>
-<summary><a name="mysql-apply-plan-lock--confirm"></a><strong>MySQL Apply Plan (Lock + Confirm)</strong></summary>
+<summary><a name="schema-change-apply-lock--confirm"></a><strong>Schema Change Apply (Lock + Confirm)</strong></summary>
 
 
-## MySQL Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
@@ -1388,10 +1388,10 @@ schemabot unlock
 </details>
 
 <details>
-<summary><a name="mysql-apply-plan-with-options"></a><strong>MySQL Apply Plan (With Options)</strong></summary>
+<summary><a name="schema-change-apply-with-options"></a><strong>Schema Change Apply (With Options)</strong></summary>
 
 
-## MySQL Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
@@ -1444,10 +1444,10 @@ schemabot unlock
 </details>
 
 <details>
-<summary><a name="vitess-apply-plan-locked--options"></a><strong>Vitess Apply Plan (Locked + Options)</strong></summary>
+<summary><a name="schema-change-apply-vitess--options"></a><strong>Schema Change Apply (Vitess + Options)</strong></summary>
 
 
-## Vitess Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `commerce` | **Environment**: `staging`
 
@@ -1581,6 +1581,8 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
 </details>
 
 <details>
@@ -1703,6 +1705,8 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
 </details>
 
 <details>
@@ -1746,6 +1750,8 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
 </details>
 
 <details>
@@ -1788,6 +1794,8 @@ To stop this schema change:
 ```
 schemabot stop apply-a1b2c3d4e5f6
 ```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
 
@@ -1833,6 +1841,8 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
 </details>
 
 <details>
@@ -1875,6 +1885,8 @@ To stop this schema change:
 ```
 schemabot stop apply-a1b2c3d4e5f6
 ```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
 
@@ -2080,6 +2092,8 @@ To proceed with cutover:
 schemabot cutover apply-a1b2c3d4e5f6
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
 </details>
 
 <details>
@@ -2120,6 +2134,8 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ---
 
 Cutover in progress — typically completes within seconds.
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
 
@@ -3996,10 +4012,10 @@ No schema changes found for database 'new-db'
 ### PR Comments
 
 <details>
-<summary><a name="apply-plan-lock--confirm"></a><strong>Apply Plan (Lock + Confirm)</strong></summary>
+<summary><a name="apply-gate-schema-change-apply-lock--confirm"></a><strong>Apply Gate: Schema Change Apply (Lock + Confirm)</strong></summary>
 
 
-## MySQL Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
@@ -4051,10 +4067,10 @@ schemabot unlock
 </details>
 
 <details>
-<summary><a name="apply-plan-with-options"></a><strong>Apply Plan (With Options)</strong></summary>
+<summary><a name="apply-gate-schema-change-apply-with-options"></a><strong>Apply Gate: Schema Change Apply (With Options)</strong></summary>
 
 
-## MySQL Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
@@ -4588,6 +4604,8 @@ _No details available yet._
 _No details available yet._
 
 </details>
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
 

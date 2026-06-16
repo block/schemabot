@@ -83,7 +83,7 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 			continue
 		}
 
-		ddlChanges, vschemaChanged, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
+		ddlChanges, vschemaChanged, _, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
 		if err != nil {
 			return fmt.Errorf("validate keyspace %s: %w", ks, err)
 		}
@@ -176,9 +176,10 @@ func (e *Engine) fetchBranchSchemaViaMySQL(ctx context.Context, password *ps.Dat
 }
 
 // diffKeyspace diffs a single keyspace's schema between a branch and the
-// desired schema files. Returns DDL changes and whether VSchema differs.
+// desired schema files. Returns DDL changes, whether VSchema differs, and the
+// current VSchema content fetched for that diff.
 // Shared by Plan() and verifyBranchMatchesDesired().
-func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) ([]engine.TableChange, bool, error) {
+func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) ([]engine.TableChange, bool, string, error) {
 	var currentTableSchemas []table.TableSchema
 	if tables, ok := currentSchema[ks]; ok {
 		currentTableSchemas = append(currentTableSchemas, tables...)
@@ -186,12 +187,12 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 
 	desiredTableSchemas, parseErr := parseDesiredSchemas(ks, ns)
 	if parseErr != nil {
-		return nil, false, parseErr
+		return nil, false, "", parseErr
 	}
 
 	plan, planErr := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
 	if planErr != nil {
-		return nil, false, fmt.Errorf("plan changes for keyspace %s: %w", ks, planErr)
+		return nil, false, "", fmt.Errorf("plan changes for keyspace %s: %w", ks, planErr)
 	}
 
 	if len(plan.Changes) > 0 {
@@ -227,7 +228,7 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 	for _, pc := range plan.Changes {
 		stmtType, _, classifyErr := ddl.ClassifyStatement(pc.Statement)
 		if classifyErr != nil {
-			return nil, false, fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
+			return nil, false, "", fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
 		}
 		change := engine.TableChange{
 			Table:     pc.TableName,
@@ -247,6 +248,7 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 
 	// Check VSchema diff
 	vschemaChanged := false
+	currentVSchemaRaw := ""
 	if content, ok := ns.Files["vschema.json"]; ok && content != "" {
 		currentVSchema, fetchErr := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
 			Organization: org,
@@ -255,10 +257,8 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 			Keyspace:     ks,
 		})
 		if fetchErr != nil {
-			e.logger.Warn("failed to fetch VSchema for diff, treating as empty",
-				"keyspace", ks, "error", fetchErr)
+			return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
 		}
-		currentVSchemaRaw := ""
 		if currentVSchema != nil {
 			currentVSchemaRaw = currentVSchema.Raw
 		}
@@ -273,7 +273,7 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 		}
 	}
 
-	return tableChanges, vschemaChanged, nil
+	return tableChanges, vschemaChanged, currentVSchemaRaw, nil
 }
 
 // verifyBranchMatchesMain uses Spirit's differ to compare the branch schema
@@ -311,7 +311,7 @@ func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PS
 			mainNS.Files[t.Name+".sql"] = t.Schema + ";"
 		}
 
-		changes, _, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema)
+		changes, _, _, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema)
 		if diffErr != nil {
 			return fmt.Errorf("diff branch vs main for %s: %w", ks, diffErr)
 		}

@@ -39,8 +39,8 @@ func previewCommentAllOutput() {
 	}{
 		{"PLAN COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
 		{"PLAN COMMENT (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
-		{"APPLY PLAN (LOCKED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
-		{"APPLY PLAN (UNSAFE + ALLOWED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanUnsafe()) }},
+		{"SCHEMA CHANGE APPLY (LOCKED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
+		{"SCHEMA CHANGE APPLY (UNSAFE + ALLOWED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanUnsafe()) }},
 		{"UNSAFE CHANGES BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentUnsafeBlocked()) }},
 		{"MULTI-ENV PLAN (IDENTICAL)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlan()) }},
 		{"MULTI-ENV PLAN (DIFFERENT)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlanDiff()) }},
@@ -89,8 +89,8 @@ func previewApplyCommandAllOutput() {
 		name string
 		fn   func()
 	}{
-		{"APPLY PLAN (LOCK + CONFIRM)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
-		{"APPLY PLAN (WITH OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanOptions()) }},
+		{"APPLY GATE: SCHEMA CHANGE APPLY (LOCK + CONFIRM)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
+		{"APPLY GATE: SCHEMA CHANGE APPLY (WITH OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanOptions()) }},
 		{"APPLY STARTED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStarted()) }},
 		{"UNLOCK SUCCESS", func() { fmt.Print(webhooktemplates.PreviewCommentUnlockSuccess()) }},
 		{"APPLY BLOCKED BY OTHER PR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByOtherPR()) }},
@@ -146,7 +146,7 @@ func previewCommentPlanAllOutput() {
 		{"MYSQL PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
 		{"MYSQL PLAN (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
 		{"VITESS PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlan()) }},
-		{"VITESS APPLY PLAN (LOCKED + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
+		{"SCHEMA CHANGE APPLY (LOCKED + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
 		{"MYSQL MULTI-SCHEMA PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentMySQLMultiSchema()) }},
 		{"MULTI-ENV PLAN (IDENTICAL)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlan()) }},
 		{"MULTI-ENV PLAN (DIFFERENT)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlanDiff()) }},
@@ -189,9 +189,9 @@ func previewCommentApplyFlowAllOutput() {
 		name string
 		fn   func()
 	}{
-		{"MYSQL APPLY PLAN (LOCK + CONFIRM)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
-		{"MYSQL APPLY PLAN (WITH OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanOptions()) }},
-		{"VITESS APPLY PLAN (LOCKED + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
+		{"SCHEMA CHANGE APPLY (LOCK + CONFIRM)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlan()) }},
+		{"SCHEMA CHANGE APPLY (WITH OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPlanOptions()) }},
+		{"SCHEMA CHANGE APPLY (VITESS + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
 		{"APPLY STARTED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStarted()) }},
 		// Single-table (most common case)
 		{"SINGLE TABLE: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleProgress()) }},

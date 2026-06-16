@@ -1,0 +1,29 @@
+[
+  {
+    "name": "testapp-cluster",
+    "app": "testapp",
+    "dsid": "dsid-testapp-staging",
+    "env": "staging",
+    "aws_region": "us-east-1",
+    "aws_account_id": "000000000000",
+    "writer_endpoint": "mysql-data-plane"
+  },
+  {
+    "name": "orders-cluster",
+    "app": "orders",
+    "dsid": "dsid-orders-staging",
+    "env": "staging",
+    "aws_region": "us-east-1",
+    "aws_account_id": "000000000000",
+    "writer_endpoint": "orders-staging.cluster-cr8s4mn2plq7.us-east-1.rds.amazonaws.com"
+  },
+  {
+    "name": "payments-cluster",
+    "app": "payments",
+    "dsid": "dsid-payments-staging",
+    "env": "staging",
+    "aws_region": "us-east-1",
+    "aws_account_id": "000000000000",
+    "writer_endpoint": "payments-staging.cluster-zk31d9c7vh20.us-east-1.rds.amazonaws.com"
+  }
+]

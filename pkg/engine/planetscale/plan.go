@@ -3,12 +3,9 @@ package planetscale
 import (
 	"context"
 	"fmt"
-	"maps"
 	"strings"
 	"sync"
 	"time"
-
-	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
@@ -51,7 +48,6 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	type keyspaceResult struct {
 		change     engine.SchemaChange
 		violations []engine.LintViolation
-		schemas    map[string]string // keyspace.table -> CREATE TABLE
 		hasChanges bool
 	}
 
@@ -65,7 +61,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		g.Go(func() error {
 			ns := req.SchemaFiles[ks]
 
-			tableChanges, vschemaChanged, diffErr := e.diffKeyspace(gCtx, client, org, req.Database, branch, ks, ns, currentSchema)
+			tableChanges, vschemaChanged, currentVSchemaRaw, diffErr := e.diffKeyspace(gCtx, client, org, req.Database, branch, ks, ns, currentSchema)
 			if diffErr != nil {
 				return diffErr
 			}
@@ -75,17 +71,29 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				Metadata:     make(map[string]string),
 				TableChanges: tableChanges,
 			}
+			if tables, ok := currentSchema[ks]; ok {
+				sc.OriginalFiles = make(map[string]string, len(tables)+1)
+				for _, t := range tables {
+					sc.OriginalFiles[t.Name+".sql"] = t.Schema
+				}
+			}
 
 			if vschemaChanged {
-				currentVSchemaRaw := ""
-				currentVSchema, _ := client.GetKeyspaceVSchema(gCtx, &ps.GetKeyspaceVSchemaRequest{
-					Organization: org, Database: req.Database, Branch: branch, Keyspace: ks,
-				})
-				if currentVSchema != nil {
-					currentVSchemaRaw = currentVSchema.Raw
-				}
 				sc.Metadata["vschema_changed"] = "true"
 				sc.Metadata["vschema"] = VSchemaDiff(currentVSchemaRaw, ns.Files["vschema.json"])
+				if strings.TrimSpace(currentVSchemaRaw) == "" {
+					currentVSchemaRaw = "{}"
+				}
+				if sc.OriginalFiles == nil {
+					sc.OriginalFiles = make(map[string]string, 1)
+				}
+				sc.OriginalFiles["vschema.json"] = currentVSchemaRaw
+			}
+			if len(sc.TableChanges) > 0 || vschemaChanged {
+				sc.OriginalFilesCaptured = true
+				if sc.OriginalFiles == nil {
+					sc.OriginalFiles = make(map[string]string)
+				}
 			}
 
 			var currentTableSchemas []table.TableSchema
@@ -94,13 +102,6 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			}
 			desiredTableSchemas, _ := parseDesiredSchemas(ks, ns)
 			plan, _ := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
-
-			schemas := make(map[string]string)
-			if tables, ok := currentSchema[ks]; ok {
-				for _, t := range tables {
-					schemas[ks+"."+t.Name] = t.Schema
-				}
-			}
 
 			var violations []engine.LintViolation
 			if plan != nil {
@@ -120,7 +121,6 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			results[ks] = &keyspaceResult{
 				change:     sc,
 				violations: violations,
-				schemas:    schemas,
 				hasChanges: len(sc.TableChanges) > 0 || sc.Metadata["vschema_changed"] == "true",
 			}
 			mu.Unlock()
@@ -135,13 +135,11 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	var changes []engine.SchemaChange
 	var lintViolations []engine.LintViolation
 	seenLint := make(map[string]bool)
-	originalSchema := make(map[string]string)
 	for _, ks := range keyspaces {
 		r := results[ks]
 		if r == nil {
 			continue
 		}
-		maps.Copy(originalSchema, r.schemas)
 		for _, v := range r.violations {
 			key := v.Table + "\x00" + v.Message
 			if !seenLint[key] {
@@ -165,7 +163,6 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		PlanID:         fmt.Sprintf("plan-%d", time.Now().UnixNano()),
 		Changes:        changes,
 		LintViolations: lintViolations,
-		OriginalSchema: originalSchema,
 	}, nil
 }
 

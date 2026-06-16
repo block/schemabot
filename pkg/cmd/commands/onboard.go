@@ -16,13 +16,15 @@ import (
 
 // OnboardCmd pulls live schema into a new declarative schema directory.
 type OnboardCmd struct {
-	Database    string `short:"d" required:"" help:"Database name from SchemaBot server config"`
-	Environment string `short:"e" required:"" help:"Source environment to pull from"`
-	SchemaDir   string `short:"s" required:"" help:"Schema root to write schemabot.yaml and namespace directories" name:"schema_dir"`
-	Type        string `help:"Database type" default:"mysql" enum:"mysql"`
-	DryRun      bool   `help:"Preview files without writing them" name:"dry-run"`
-	Force       bool   `help:"Overwrite existing generated files"`
-	SkipVerify  bool   `help:"Skip plan verification after writing files" name:"skip-verify"`
+	Database          string   `short:"d" required:"" help:"Database name from SchemaBot server config"`
+	Environment       string   `short:"e" required:"" help:"Source environment to pull from"`
+	SchemaDir         string   `short:"s" required:"" help:"Schema root to write schemabot.yaml and namespace directories" name:"schema_dir"`
+	Type              string   `help:"Database type" default:"mysql" enum:"mysql"`
+	Namespaces        []string `name:"namespace" help:"Concrete live namespace to onboard. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
+	TemplateEnvSuffix bool     `help:"Write namespaces ending in _<environment> as _$ENV directories" name:"template-env-suffix"`
+	DryRun            bool     `help:"Preview files without writing them" name:"dry-run"`
+	Force             bool     `help:"Overwrite existing generated files"`
+	SkipVerify        bool     `help:"Skip plan verification after writing files" name:"skip-verify"`
 }
 
 // Run executes the onboard command.
@@ -32,12 +34,19 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 		return err
 	}
 
-	resp, err := client.CallPullSchemaAPI(ep, cmd.Database, cmd.Type, cmd.Environment)
+	pullNamespaces, err := onboardPullNamespaces(cmd.Namespaces)
+	if err != nil {
+		return err
+	}
+	resp, err := client.CallPullSchemaAPI(ep, cmd.Database, cmd.Type, cmd.Environment, pullNamespaces...)
 	if err != nil {
 		if outputSchemaPullRequestError("Onboard", cmd.Database, cmd.Environment, err) {
 			return ErrSilent
 		}
 		return fmt.Errorf("pull schema for database %s environment %s: %w", cmd.Database, cmd.Environment, err)
+	}
+	if err := rewriteOnboardNamespaces(resp, cmd.Environment, cmd.TemplateEnvSuffix); err != nil {
+		return err
 	}
 	plan, err := buildOnboardWritePlan(cmd.SchemaDir, resp)
 	if err != nil {
@@ -93,6 +102,58 @@ type onboardWritePlan struct {
 	files map[string]string
 }
 
+func onboardPullNamespaces(namespaces []string) ([]string, error) {
+	if len(namespaces) == 0 {
+		return nil, nil
+	}
+	pullNamespaces := make([]string, 0, len(namespaces))
+	seen := make(map[string]struct{}, len(namespaces))
+	for _, outputNamespace := range namespaces {
+		if strings.TrimSpace(outputNamespace) != outputNamespace || outputNamespace == "" {
+			return nil, fmt.Errorf("namespace %q must be non-empty and contain no leading or trailing whitespace", outputNamespace)
+		}
+		if err := validateRelativePathPart("namespace", outputNamespace); err != nil {
+			return nil, err
+		}
+		if strings.Contains(outputNamespace, "$ENV") {
+			return nil, fmt.Errorf("namespace %q must be a concrete live namespace; use --template-env-suffix to write _$ENV directories when a live namespace ends with _<environment>", outputNamespace)
+		}
+		if _, ok := seen[outputNamespace]; ok {
+			return nil, fmt.Errorf("duplicate namespace %q", outputNamespace)
+		}
+		seen[outputNamespace] = struct{}{}
+		pullNamespaces = append(pullNamespaces, outputNamespace)
+	}
+	return pullNamespaces, nil
+}
+
+func rewriteOnboardNamespaces(resp *apitypes.PullSchemaResponse, environment string, templateEnvSuffix bool) error {
+	if resp == nil || len(resp.Namespaces) == 0 {
+		return nil
+	}
+	rewritten := make(map[string]*apitypes.PulledNamespace, len(resp.Namespaces))
+	for pullNamespace, pulled := range resp.Namespaces {
+		outputNamespace := onboardOutputNamespace(pullNamespace, environment, templateEnvSuffix)
+		if _, ok := rewritten[outputNamespace]; ok {
+			return fmt.Errorf("multiple pulled namespaces resolve to output namespace %q", outputNamespace)
+		}
+		rewritten[outputNamespace] = pulled
+	}
+	resp.Namespaces = rewritten
+	return nil
+}
+
+func onboardOutputNamespace(namespace, environment string, templateEnvSuffix bool) string {
+	if !templateEnvSuffix {
+		return namespace
+	}
+	environmentSuffix := "_" + environment
+	if environment != "" && strings.HasSuffix(namespace, environmentSuffix) {
+		return strings.TrimSuffix(namespace, environmentSuffix) + "_$ENV"
+	}
+	return namespace
+}
+
 func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse) (*onboardWritePlan, error) {
 	if strings.TrimSpace(schemaRoot) == "" {
 		return nil, fmt.Errorf("schema root is required")
@@ -106,7 +167,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse)
 	if resp.Type != storage.DatabaseTypeMySQL {
 		return nil, fmt.Errorf("onboard currently supports %s databases; got %s", storage.DatabaseTypeMySQL, resp.Type)
 	}
-	if len(resp.SchemaFiles) == 0 {
+	if len(resp.Namespaces) == 0 {
 		return nil, fmt.Errorf("pull schema returned no tables for database %s environment %s", resp.Database, resp.Environment)
 	}
 	root := filepath.Clean(schemaRoot)
@@ -114,8 +175,8 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse)
 		"schemabot.yaml": fmt.Sprintf("database: %s\ntype: %s\n", resp.Database, resp.Type),
 	}
 
-	namespaces := make([]string, 0, len(resp.SchemaFiles))
-	for namespace := range resp.SchemaFiles {
+	namespaces := make([]string, 0, len(resp.Namespaces))
+	for namespace := range resp.Namespaces {
 		namespaces = append(namespaces, namespace)
 	}
 	sort.Strings(namespaces)
@@ -123,23 +184,26 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse)
 		if err := validateRelativePathPart("namespace", namespace); err != nil {
 			return nil, err
 		}
-		nsFiles := resp.SchemaFiles[namespace]
-		if nsFiles == nil {
-			return nil, fmt.Errorf("schema files for namespace %s are empty", namespace)
+		pulled := resp.Namespaces[namespace]
+		if pulled == nil {
+			return nil, fmt.Errorf("pulled namespace %s is empty", namespace)
 		}
-		if len(nsFiles.Files) == 0 {
-			return nil, fmt.Errorf("schema files for namespace %s contain no tables", namespace)
+		if len(pulled.Tables) == 0 && len(pulled.Artifacts) == 0 {
+			return nil, fmt.Errorf("pulled namespace %s contains no tables or artifacts", namespace)
 		}
-		filenames := make([]string, 0, len(nsFiles.Files))
-		for filename := range nsFiles.Files {
-			filenames = append(filenames, filename)
+		tableNames := make([]string, 0, len(pulled.Tables))
+		for tableName := range pulled.Tables {
+			tableNames = append(tableNames, tableName)
 		}
-		sort.Strings(filenames)
-		for _, filename := range filenames {
-			if err := validateRelativePathPart("schema file", filename); err != nil {
+		sort.Strings(tableNames)
+		for _, tableName := range tableNames {
+			if err := validateRelativePathPart("table", tableName); err != nil {
 				return nil, err
 			}
-			files[filepath.Join(namespace, filename)] = nsFiles.Files[filename]
+			files[filepath.Join(namespace, tableName+".sql")] = pulled.Tables[tableName]
+		}
+		if vschema := pulled.Artifacts["vschema"]; vschema != "" {
+			files[filepath.Join(namespace, "vschema.json")] = vschema
 		}
 	}
 

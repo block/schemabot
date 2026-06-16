@@ -134,8 +134,8 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 	if plan == nil {
 		return apply, nil, fmt.Errorf("source plan %d not found for rollback apply %s", apply.PlanID, apply.ApplyIdentifier)
 	}
-	if len(plan.FlatOriginalSchema()) == 0 {
-		return apply, plan, controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema", apply.ApplyIdentifier)
+	if !plan.HasOriginalFilesCapture() {
+		return apply, plan, controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema files", apply.ApplyIdentifier)
 	}
 
 	latestTask, err := latestCompletedTaskForRollback(ctx, taskStore, apply.Database, apply.DatabaseType, apply.Environment)
@@ -762,7 +762,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 		return
 	}
 	if client.IsRemote() {
-		s.logger.Info("immediate stop skipped for remote Tern client; durable stop request remains pending for operator-owned reconciliation",
+		s.logger.Info("propagating stop request to remote Tern durable queue",
 			"apply_id", apply.ApplyIdentifier,
 			"tern_apply_id", ternApplyID,
 			"database", apply.Database,
@@ -770,8 +770,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"environment", apply.Environment,
 			"requested_by", caller)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
-			"Immediate stop skipped for remote Tern client; durable operator owner will reconcile stop state")
-		return
+			"Stop request propagation to remote Tern durable queue started")
 	}
 	resp, err := client.Stop(ctx, &ternv1.StopRequest{
 		ApplyId:     ternApplyID,
@@ -1685,7 +1684,7 @@ func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.ExecuteRollbackPlan(r.Context(), apply.Database, apply.Environment, apply.Deployment)
+	resp, err := s.ExecuteRollbackPlanForApply(r.Context(), apply)
 	if err != nil {
 		metrics.RecordControlOperation(r.Context(), "rollback_plan", apply.Database, apply.Deployment, apply.Environment, "error")
 		s.writeControlError(w, "rollback plan", apply, err)

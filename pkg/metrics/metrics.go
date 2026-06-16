@@ -406,6 +406,28 @@ func RecordPRCommandActorAuthorization(ctx context.Context, command, database, e
 	)
 }
 
+// RecordAuthDecision increments the counter for API auth decisions on the
+// direct (OIDC) request path. Labels are inherently low-cardinality: tier is
+// read/plan/write, decision is allow/deny, reason is a fixed set.
+func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.auth_decisions.total",
+		otelmetric.WithDescription("Total API auth decisions on the OIDC request path"),
+		otelmetric.WithUnit("{decision}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create auth decisions counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("tier", tier),
+			attribute.String("decision", decision),
+			attribute.String("reason", reason),
+		),
+	)
+}
+
 // knownCheckOwnershipOperations limits metric cardinality to expected check
 // ownership miss paths.
 var knownCheckOwnershipOperations = map[string]bool{

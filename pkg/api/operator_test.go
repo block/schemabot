@@ -452,6 +452,33 @@ func TestUpdateApplyStateFromOperations_StampsAggregateFailureMessage(t *testing
 		"the failure reason must come from the failed operation, not the successful last sibling")
 }
 
+// TestUpdateApplyStateFromOperations_FirstFailedDeploymentWins verifies that
+// when more than one deployment fails the surfaced reason comes from the first
+// failed operation in deployment order — the order ListByApply returns rows in,
+// matching the order the claim gate drives them. The rollout's failure verdict
+// is the first failure, so a later failed sibling's message must not override it.
+func TestUpdateApplyStateFromOperations_FirstFailedDeploymentWins(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed, ErrorMessage: "spirit: region-a cutover failed"},
+		{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Failed, ErrorMessage: "spirit: region-b cutover failed"},
+	}
+	applyStore := &recordingApplyStore{swapped: true}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Running,
+		Environment:     "staging",
+	}
+
+	require.NoError(t, svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen))
+	require.NotNil(t, applyStore.updated)
+	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+	assert.Equal(t, "deployment region-a failed: spirit: region-a cutover failed", applyStore.updated.ErrorMessage,
+		"the reason must come from the first failed deployment in order, not a later failed sibling")
+}
+
 // TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarriesOne
 // verifies that a derived failed verdict preserves the apply's existing message
 // when no failed operation row carries one, rather than blanking the reason.

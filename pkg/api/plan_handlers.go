@@ -21,6 +21,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -110,6 +111,10 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if _, err := pullCatalogDetail(req.CatalogDetail); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	resp, err := s.ExecutePullSchema(r.Context(), req)
 	if err != nil {
@@ -180,6 +185,18 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.SetStatus(otelcodes.Error, "unsupported database type")
 		return nil, unsupportedErr
 	}
+	namespaces, err := pullNamespaces(req.Namespaces)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "invalid namespaces")
+		return nil, err
+	}
+	catalogDetail, err := pullCatalogDetail(req.CatalogDetail)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "invalid catalog detail")
+		return nil, err
+	}
 
 	client, err := s.RoutingTernClient()
 	if err != nil {
@@ -195,47 +212,134 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		"deployment", resolvedTarget.Deployment,
 		"target", resolvedTarget.Target,
 		"environment", req.Environment,
+		"pull_call_count", len(namespaces),
+		"explicit_namespace_count", len(req.Namespaces),
 		"is_remote", isRemoteTarget,
 	)
 
-	resp, err := client.PullSchema(ctx, &ternv1.PullSchemaRequest{
+	merged := &ternv1.PullSchemaResponse{
 		Database:    req.Database,
-		Type:        req.Type,
+		Type:        resolvedTarget.DatabaseType,
 		Environment: req.Environment,
-	})
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "pull schema failed")
-		s.logger.Error("ExecutePullSchema: routing client PullSchema failed",
-			"database", req.Database,
-			"type", resolvedTarget.DatabaseType,
-			"deployment", resolvedTarget.Deployment,
-			"target", resolvedTarget.Target,
-			"environment", req.Environment,
-			"endpoint", client.Endpoint(),
-			"is_remote", isRemoteTarget,
-			"error", err,
-		)
-		if isRemoteTarget && grpcstatus.Code(err) == grpccodes.Unavailable {
-			return nil, &RemoteDeploymentUnavailableError{
-				Deployment: resolvedTarget.Deployment,
-				Target:     resolvedTarget.Target,
-				Err:        err,
+		Namespaces:  make(map[string]*ternv1.PulledNamespace),
+	}
+	for _, namespace := range namespaces {
+		resp, pullErr := client.PullSchema(ctx, &ternv1.PullSchemaRequest{
+			Database:      req.Database,
+			Type:          resolvedTarget.DatabaseType,
+			Environment:   req.Environment,
+			Namespace:     namespace,
+			CatalogDetail: catalogDetail,
+		})
+		if pullErr != nil {
+			span.RecordError(pullErr)
+			span.SetStatus(otelcodes.Error, "pull schema failed")
+			s.logger.Error("ExecutePullSchema: routing client PullSchema failed",
+				"database", req.Database,
+				"type", resolvedTarget.DatabaseType,
+				"deployment", resolvedTarget.Deployment,
+				"target", resolvedTarget.Target,
+				"environment", req.Environment,
+				"namespace", namespace,
+				"endpoint", client.Endpoint(),
+				"is_remote", isRemoteTarget,
+				"error", pullErr,
+			)
+			if isRemoteTarget && grpcstatus.Code(pullErr) == grpccodes.Unavailable {
+				return nil, &RemoteDeploymentUnavailableError{
+					Deployment: resolvedTarget.Deployment,
+					Target:     resolvedTarget.Target,
+					Err:        pullErr,
+				}
 			}
+			return nil, pullErr
 		}
-		return nil, err
+		if err := mergePullSchemaResponse(merged, resp, namespace); err != nil {
+			span.RecordError(err)
+			span.SetStatus(otelcodes.Error, "merge pull schema response")
+			return nil, err
+		}
 	}
 
-	span.SetAttributes(attribute.Int("table_count", int(resp.TableCount)))
+	span.SetAttributes(attribute.Int("table_count", int(merged.TableCount)))
 	s.logger.Info("ExecutePullSchema: pull schema response",
-		"database", resp.Database,
-		"type", resp.Type,
-		"environment", resp.Environment,
-		"table_count", resp.TableCount,
-		"namespace_count", len(resp.SchemaFiles),
+		"database", merged.Database,
+		"type", merged.Type,
+		"environment", merged.Environment,
+		"table_count", merged.TableCount,
+		"namespace_count", len(merged.Namespaces),
 	)
 
-	return pullSchemaResponseFromProto(resp), nil
+	return pullSchemaResponseFromProto(merged), nil
+}
+
+func pullNamespaces(namespaces []string) ([]string, error) {
+	if len(namespaces) == 0 {
+		return []string{""}, nil
+	}
+	result := make([]string, 0, len(namespaces))
+	seenOutput := make(map[string]struct{}, len(namespaces))
+	for _, namespace := range namespaces {
+		if strings.TrimSpace(namespace) != namespace || namespace == "" {
+			return nil, fmt.Errorf("pull namespace %q must be non-empty and contain no leading or trailing whitespace", namespace)
+		}
+		if strings.Contains(namespace, "..") || strings.ContainsAny(namespace, `/\`) {
+			return nil, fmt.Errorf("pull namespace %q must be a single path component", namespace)
+		}
+		if strings.Contains(namespace, "$ENV") {
+			return nil, fmt.Errorf("pull namespace %q must be a concrete live namespace; resolve $ENV before calling pull", namespace)
+		}
+		if schema.IsReservedPullNamespace(namespace) {
+			return nil, fmt.Errorf("pull namespace %q is reserved and cannot be pulled", namespace)
+		}
+		if _, ok := seenOutput[namespace]; ok {
+			return nil, fmt.Errorf("duplicate pull namespace %q", namespace)
+		}
+		seenOutput[namespace] = struct{}{}
+		result = append(result, namespace)
+	}
+	return result, nil
+}
+
+func pullCatalogDetail(detail string) (ternv1.PullCatalogDetail, error) {
+	switch detail {
+	case "", "basic":
+		return ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_BASIC, nil
+	case "detailed":
+		return ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED, nil
+	default:
+		return ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_BASIC, fmt.Errorf("catalog_detail %q must be basic or detailed", detail)
+	}
+}
+
+func mergePullSchemaResponse(merged, resp *ternv1.PullSchemaResponse, requestedNamespace string) error {
+	if resp == nil {
+		return fmt.Errorf("pull schema response is empty")
+	}
+	if requestedNamespace != "" {
+		if len(resp.Namespaces) != 1 {
+			return fmt.Errorf("pull namespace %q returned %d namespaces; expected 1", requestedNamespace, len(resp.Namespaces))
+		}
+		for responseNamespace, pulled := range resp.Namespaces {
+			if responseNamespace != requestedNamespace {
+				return fmt.Errorf("pull namespace %q returned namespace %q", requestedNamespace, responseNamespace)
+			}
+			if _, ok := merged.Namespaces[responseNamespace]; ok {
+				return fmt.Errorf("pull schema response contains duplicate namespace %q", responseNamespace)
+			}
+			merged.Namespaces[responseNamespace] = pulled
+		}
+		merged.TableCount += resp.TableCount
+		return nil
+	}
+	for responseNamespace, pulled := range resp.Namespaces {
+		if _, ok := merged.Namespaces[responseNamespace]; ok {
+			return fmt.Errorf("pull schema response contains duplicate namespace %q", responseNamespace)
+		}
+		merged.Namespaces[responseNamespace] = pulled
+	}
+	merged.TableCount += resp.TableCount
+	return nil
 }
 
 func (s *Service) executionTargetUsesRemoteClient(deployment, environment string) bool {
@@ -466,27 +570,60 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 		}
 	}
 
-	// Store plan in SchemaBot's storage (idempotent — duplicate is ignored)
+	route := storedPlanRoute{
+		DatabaseType: resolvedTarget.DatabaseType,
+		Deployment:   deployment,
+		Target:       resolvedTarget.Target,
+	}
+	if err := s.storePlanResponse(ctx, req, resp, route); err != nil {
+		return nil, err
+	}
+
+	return planResponseFromProto(resp), nil
+}
+
+type storedPlanRoute struct {
+	DatabaseType string
+	Deployment   string
+	Target       string
+}
+
+func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *ternv1.PlanResponse, route storedPlanRoute) error {
+	prInt := 0
+	if req.PullRequest != nil {
+		prInt = int(*req.PullRequest)
+	}
+	trustedSchemaPath := ""
+	if req.SourceTrusted {
+		trustedSchemaPath = req.SchemaPath
+	}
+	headSHA := ""
+	if req.HeadSHA != nil {
+		headSHA = *req.HeadSHA
+	}
+	namespaces, err := protoChangesToNamespaces(resp.Changes, req.SchemaFiles)
+	if err != nil {
+		return fmt.Errorf("convert plan namespaces: %w", err)
+	}
 	storedPlan := &storage.Plan{
 		PlanIdentifier: resp.PlanId,
 		Database:       req.Database,
-		DatabaseType:   resolvedTarget.DatabaseType,
-		Deployment:     deployment,
-		Target:         resolvedTarget.Target,
+		DatabaseType:   route.DatabaseType,
+		Deployment:     route.Deployment,
+		Target:         route.Target,
 		Repository:     req.Repository,
 		PullRequest:    prInt,
 		SchemaPath:     trustedSchemaPath,
 		Environment:    req.Environment,
 		SchemaFiles:    protoToSchemaFiles(req.SchemaFiles),
-		Namespaces:     protoChangesToNamespaces(resp.Changes),
-		HeadSHA:        ternReq.HeadSha,
+		Namespaces:     namespaces,
+		HeadSHA:        headSHA,
 		CreatedAt:      time.Now(),
 	}
 	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
-		return nil, fmt.Errorf("store plan: %w", err)
+		return fmt.Errorf("store plan: %w", err)
 	}
-
-	return planResponseFromProto(resp), nil
+	return nil
 }
 
 // handleApply handles POST /api/apply requests.
@@ -888,7 +1025,7 @@ func (s *Service) createStoredApply(
 func applyTaskChanges(plan *storage.Plan) []storage.TableChange {
 	changes := append([]storage.TableChange{}, plan.FlatDDLChanges()...)
 	for namespace, nsData := range plan.Namespaces {
-		if len(nsData.VSchema) > 0 {
+		if nsData.Artifacts[vSchemaArtifactName] != "" {
 			changes = append(changes, storage.TableChange{
 				Table:     "VSchema: " + namespace,
 				Namespace: namespace,
@@ -899,27 +1036,97 @@ func applyTaskChanges(plan *storage.Plan) []storage.TableChange {
 	return changes
 }
 
-// ExecuteRollbackPlan generates a rollback plan via the Tern client.
-// The plan is automatically stored by the Tern client's RollbackPlan method
-// (which calls Plan internally). This is the shared implementation used by
-// both the HTTP handler and the webhook handler.
-func (s *Service) ExecuteRollbackPlan(ctx context.Context, database, environment, deployment string) (*apitypes.PlanResponse, error) {
-	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
-	if err != nil {
-		return nil, fmt.Errorf("resolve deployment for rollback plan: %w", err)
+// ExecuteRollbackPlanForApply generates a rollback plan for a specific apply.
+func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storage.Apply) (*apitypes.PlanResponse, error) {
+	if apply == nil {
+		return nil, fmt.Errorf("apply is required")
+	}
+	if !state.IsState(apply.State, state.Apply.Completed) {
+		return nil, fmt.Errorf("apply %s is in state %q; only completed applies can be rolled back", apply.ApplyIdentifier, apply.State)
 	}
 
-	client, err := s.TernClient(deployment, environment)
+	plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
-		return nil, fmt.Errorf("database %q (%s): %w", database, environment, err)
+		return nil, fmt.Errorf("get rollback source plan: %w", err)
 	}
-
-	resp, err := client.RollbackPlan(ctx, database, environment)
+	if plan == nil {
+		return nil, fmt.Errorf("plan not found for apply %s", apply.ApplyIdentifier)
+	}
+	if !rollbackSourcePlanMatchesApply(plan, apply) {
+		return nil, fmt.Errorf("source plan %s belongs to %s/%s/%s, not apply %s for %s/%s/%s",
+			plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Environment,
+			apply.ApplyIdentifier, apply.Database, apply.DatabaseType, apply.Environment)
+	}
+	schemaFiles, err := rollbackSchemaFiles(plan)
 	if err != nil {
 		return nil, err
 	}
 
+	deployment, err := storedDeploymentForApply(apply)
+	if err != nil {
+		return nil, err
+	}
+	if plan.Target == "" {
+		return nil, fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
+	}
+	client, err := s.TernClient(deployment, apply.Environment)
+	if err != nil {
+		return nil, fmt.Errorf("database %q (%s): %w", apply.Database, apply.Environment, err)
+	}
+
+	prNumber := int32(apply.PullRequest)
+	req := PlanRequest{
+		Database:    apply.Database,
+		Environment: apply.Environment,
+		Type:        apply.DatabaseType,
+		SchemaFiles: schemaFiles,
+		Repository:  apply.Repository,
+		PullRequest: &prNumber,
+	}
+	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
+		Database:    req.Database,
+		Type:        req.Type,
+		SchemaFiles: req.SchemaFiles,
+		Repository:  req.Repository,
+		PullRequest: prNumber,
+		Environment: req.Environment,
+		Target:      plan.Target,
+	})
+	if err != nil {
+		return nil, err
+	}
+	route := storedPlanRoute{
+		DatabaseType: apply.DatabaseType,
+		Deployment:   deployment,
+		Target:       plan.Target,
+	}
+	if err := s.storePlanResponse(ctx, req, resp, route); err != nil {
+		return nil, err
+	}
+
 	return planResponseFromProto(resp), nil
+}
+
+func rollbackSourcePlanMatchesApply(plan *storage.Plan, apply *storage.Apply) bool {
+	return plan.Database == apply.Database &&
+		plan.DatabaseType == apply.DatabaseType &&
+		plan.Environment == apply.Environment
+}
+
+func rollbackSchemaFiles(plan *storage.Plan) (map[string]*ternv1.SchemaFiles, error) {
+	schemaFiles := make(map[string]*ternv1.SchemaFiles)
+	for ns, nsData := range plan.Namespaces {
+		if nsData == nil || !nsData.OriginalFilesCaptured {
+			return nil, fmt.Errorf("no original schema files available for rollback namespace %q", ns)
+		}
+		files := make(map[string]string, len(nsData.OriginalFiles))
+		maps.Copy(files, nsData.OriginalFiles)
+		schemaFiles[ns] = &ternv1.SchemaFiles{Files: files}
+	}
+	if len(schemaFiles) == 0 {
+		return nil, fmt.Errorf("no namespaces available for rollback")
+	}
+	return schemaFiles, nil
 }
 
 // validateSchemaFiles checks that schema_files has at least one namespace and
