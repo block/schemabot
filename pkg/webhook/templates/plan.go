@@ -78,7 +78,7 @@ func RenderPlanComment(data PlanCommentData) string {
 		dbTypeLabel = "MySQL"
 	}
 	if data.IsLocked {
-		fmt.Fprintf(&sb, "## %s Schema Change Plan (Apply)\n\n", dbTypeLabel)
+		sb.WriteString("## Schema Change Apply\n\n")
 	} else {
 		fmt.Fprintf(&sb, "## %s Schema Change Plan\n\n", dbTypeLabel)
 	}

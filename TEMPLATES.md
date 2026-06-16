@@ -161,10 +161,10 @@ schemabot apply -e staging
 </details>
 
 <details>
-<summary><a name="vitess-apply-plan-locked--options"></a><strong>Vitess Apply Plan (Locked + Options)</strong></summary>
+<summary><a name="schema-change-apply-locked--options"></a><strong>Schema Change Apply (Locked + Options)</strong></summary>
 
 
-## Vitess Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `commerce` | **Environment**: `staging`
 
@@ -1334,10 +1334,10 @@ No active locks.
 ### PR Comments
 
 <details>
-<summary><a name="mysql-apply-plan-lock--confirm"></a><strong>MySQL Apply Plan (Lock + Confirm)</strong></summary>
+<summary><a name="schema-change-apply-lock--confirm"></a><strong>Schema Change Apply (Lock + Confirm)</strong></summary>
 
 
-## MySQL Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
@@ -1388,10 +1388,10 @@ schemabot unlock
 </details>
 
 <details>
-<summary><a name="mysql-apply-plan-with-options"></a><strong>MySQL Apply Plan (With Options)</strong></summary>
+<summary><a name="schema-change-apply-with-options"></a><strong>Schema Change Apply (With Options)</strong></summary>
 
 
-## MySQL Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
@@ -1444,10 +1444,10 @@ schemabot unlock
 </details>
 
 <details>
-<summary><a name="vitess-apply-plan-locked--options"></a><strong>Vitess Apply Plan (Locked + Options)</strong></summary>
+<summary><a name="schema-change-apply-vitess--options"></a><strong>Schema Change Apply (Vitess + Options)</strong></summary>
 
 
-## Vitess Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `commerce` | **Environment**: `staging`
 
@@ -3996,10 +3996,10 @@ No schema changes found for database 'new-db'
 ### PR Comments
 
 <details>
-<summary><a name="apply-plan-lock--confirm"></a><strong>Apply Plan (Lock + Confirm)</strong></summary>
+<summary><a name="apply-gate-schema-change-apply-lock--confirm"></a><strong>Apply Gate: Schema Change Apply (Lock + Confirm)</strong></summary>
 
 
-## MySQL Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 
@@ -4051,10 +4051,10 @@ schemabot unlock
 </details>
 
 <details>
-<summary><a name="apply-plan-with-options"></a><strong>Apply Plan (With Options)</strong></summary>
+<summary><a name="apply-gate-schema-change-apply-with-options"></a><strong>Apply Gate: Schema Change Apply (With Options)</strong></summary>
 
 
-## MySQL Schema Change Plan (Apply)
+## Schema Change Apply
 
 **Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
 

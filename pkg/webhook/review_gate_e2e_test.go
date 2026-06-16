@@ -305,7 +305,7 @@ func TestE2EApplyProceedsWithApproval(t *testing.T) {
 	// Should get a plan comment (not blocked), confirming the gate passed
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "## Schema Change Apply")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.NotContains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
@@ -467,7 +467,7 @@ func TestE2EApplyNoCodeownersFile_Approved(t *testing.T) {
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "## Schema Change Apply")
 		assert.NotContains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for plan comment")
@@ -533,7 +533,7 @@ func TestE2EApplyTeamSlugApproval(t *testing.T) {
 	// Team member approved — should proceed to plan
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "## Schema Change Apply")
 		assert.NotContains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for plan comment")
@@ -655,7 +655,7 @@ func TestE2EApplyCodeownersOptIn(t *testing.T) {
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "## Schema Change Apply")
 		assert.NotContains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for plan comment")
@@ -705,7 +705,7 @@ func TestE2EApplyReviewGateDisabled(t *testing.T) {
 	// Should proceed to plan (gate is off, so no review check)
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "## Schema Change Apply")
 		assert.NotContains(t, body, "Review Required")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for plan comment")

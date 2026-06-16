@@ -66,7 +66,7 @@ func TestE2EApplyWithChanges(t *testing.T) {
 	// The apply handler runs as a goroutine — wait for the apply plan confirmation comment
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "## Schema Change Apply")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 		assert.Contains(t, body, "Lock acquired by")
@@ -1103,7 +1103,7 @@ func TestE2EApplyStaleLockReacquire(t *testing.T) {
 	// Should succeed: release stale lock, re-plan, acquire new lock, post confirmation
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "## Schema Change Apply")
 		assert.Contains(t, body, "Lock acquired by")
 		assert.Contains(t, body, "schemabot apply-confirm -e staging")
 	case <-time.After(30 * time.Second):
@@ -1303,7 +1303,7 @@ func TestE2EApplyAutoConfirmExecutes(t *testing.T) {
 	// First comment: plan with "Applying automatically"
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "## Schema Change Apply")
 		assert.Contains(t, body, "Applying automatically")
 		assert.Contains(t, body, "-y")
 	case <-time.After(30 * time.Second):
@@ -2352,7 +2352,7 @@ func TestE2EApplyStoresServerSideTarget(t *testing.T) {
 	// Wait for the apply plan confirmation comment.
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Schema Change Plan (Apply)")
+		assert.Contains(t, body, "## Schema Change Apply")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
 	case <-time.After(30 * time.Second):
