@@ -58,16 +58,52 @@ type SchemaFiles struct {
 // MySQL, keyspace for Vitess). It intentionally describes database objects, not
 // repository filenames; clients decide how to materialize tables and artifacts.
 type PulledNamespace struct {
-	Tables    map[string]string `json:"tables,omitempty"`
-	Artifacts map[string]string `json:"artifacts,omitempty"`
+	Tables           map[string]string        `json:"tables,omitempty"`
+	Artifacts        map[string]string        `json:"artifacts,omitempty"`
+	NamespaceCatalog *NamespaceCatalog        `json:"namespace_catalog,omitempty"`
+	TableCatalog     map[string]*TableCatalog `json:"table_catalog,omitempty"`
+}
+
+// NamespaceCatalog contains structured metadata for a pulled namespace.
+type NamespaceCatalog struct {
+	Name       string `json:"name"`
+	Engine     string `json:"engine"`
+	TableCount int32  `json:"table_count"`
+}
+
+// TableCatalog contains structured metadata for a pulled table or view.
+type TableCatalog struct {
+	Name    string           `json:"name"`
+	Kind    string           `json:"kind"`
+	Comment string           `json:"comment,omitempty"`
+	Columns []*ColumnCatalog `json:"columns,omitempty"`
+	Indexes []*IndexCatalog  `json:"indexes,omitempty"`
+}
+
+// ColumnCatalog contains structured metadata for a pulled table column.
+type ColumnCatalog struct {
+	Name         string `json:"name"`
+	Type         string `json:"type"`
+	Nullable     bool   `json:"nullable"`
+	DefaultValue string `json:"default_value,omitempty"`
+	Comment      string `json:"comment,omitempty"`
+}
+
+// IndexCatalog contains structured metadata for a pulled table index.
+type IndexCatalog struct {
+	Name    string   `json:"name"`
+	Primary bool     `json:"primary,omitempty"`
+	Unique  bool     `json:"unique,omitempty"`
+	Parts   []string `json:"parts,omitempty"`
 }
 
 // PullSchemaRequest is the HTTP request body for POST /api/pull.
 type PullSchemaRequest struct {
-	Database    string   `json:"database"`
-	Environment string   `json:"environment"`
-	Type        string   `json:"type"`
-	Namespaces  []string `json:"namespaces,omitempty"`
+	Database      string   `json:"database"`
+	Environment   string   `json:"environment"`
+	Type          string   `json:"type"`
+	Namespaces    []string `json:"namespaces,omitempty"`
+	CatalogDetail string   `json:"catalog_detail,omitempty"`
 }
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.

@@ -35,10 +35,13 @@ func TestCallPullSchemaAPI(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	result, err := CallPullSchemaAPI(server.URL, "orders", "mysql", "production", "orders_production", "orders_audit_production")
+	result, err := CallPullSchemaAPIWithOptions(server.URL, "orders", "mysql", "production", PullSchemaOptions{
+		Namespaces:    []string{"orders_production", "orders_audit_production"},
+		CatalogDetail: "detailed",
+	})
 	require.NoError(t, err)
 
-	assert.Equal(t, apitypes.PullSchemaRequest{Database: "orders", Type: "mysql", Environment: "production", Namespaces: []string{"orders_production", "orders_audit_production"}}, gotReq)
+	assert.Equal(t, apitypes.PullSchemaRequest{Database: "orders", Type: "mysql", Environment: "production", Namespaces: []string{"orders_production", "orders_audit_production"}, CatalogDetail: "detailed"}, gotReq)
 	require.NotNil(t, result)
 	assert.Equal(t, "orders", result.Database)
 	assert.Equal(t, "mysql", result.Type)

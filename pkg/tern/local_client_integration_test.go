@@ -486,7 +486,7 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `pull_schema_users`, `pull_schema_users_archive_2026_06_12`")
 		assert.NoError(t, cleanupErr, "drop pull schema tables")
 	})
-	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, PRIMARY KEY (`id`), UNIQUE KEY `idx_email` (`email`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL COMMENT 'login email', `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`), UNIQUE KEY `idx_email` (`email`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='users table'")
 	require.NoError(t, err, "create pull schema table")
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users_archive_2026_06_12` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err, "create archive table")
@@ -501,8 +501,9 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	defer utils.CloseAndLog(client)
 
 	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
-		Type:        storage.DatabaseTypeMySQL,
-		Environment: localClientTestEnvironment,
+		Type:          storage.DatabaseTypeMySQL,
+		Environment:   localClientTestEnvironment,
+		CatalogDetail: ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED,
 	})
 
 	require.NoError(t, err, "pull schema")
@@ -511,12 +512,57 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	assert.Equal(t, storage.DatabaseTypeMySQL, resp.Type)
 	assert.Equal(t, localClientTestEnvironment, resp.Environment)
 	require.Contains(t, resp.Namespaces, "testdb")
-	ddl := resp.Namespaces["testdb"].Tables["pull_schema_users"]
+	pulledNamespace := resp.Namespaces["testdb"]
+	ddl := pulledNamespace.Tables["pull_schema_users"]
 	assert.Contains(t, ddl, "CREATE TABLE `pull_schema_users`")
 	assert.Contains(t, ddl, "`email` varchar(255) NOT NULL")
 	assert.NotContains(t, ddl, "AUTO_INCREMENT=")
 	assert.True(t, strings.HasSuffix(ddl, "\n"), "pulled schema file should end with a newline")
-	assert.NotContains(t, resp.Namespaces["testdb"].Tables, "pull_schema_users_archive_2026_06_12")
+	assert.NotContains(t, pulledNamespace.Tables, "pull_schema_users_archive_2026_06_12")
+	require.NotNil(t, pulledNamespace.NamespaceCatalog)
+	assert.Equal(t, "testdb", pulledNamespace.NamespaceCatalog.Name)
+	assert.Equal(t, storage.DatabaseTypeMySQL, pulledNamespace.NamespaceCatalog.Engine)
+	assert.Equal(t, int32(len(pulledNamespace.Tables)), pulledNamespace.NamespaceCatalog.TableCount)
+	require.Contains(t, pulledNamespace.TableCatalog, "pull_schema_users")
+	tableCatalog := pulledNamespace.TableCatalog["pull_schema_users"]
+	assert.Equal(t, "pull_schema_users", tableCatalog.Name)
+	assert.Equal(t, "table", tableCatalog.Kind)
+	assert.Equal(t, "users table", tableCatalog.Comment)
+	require.Len(t, tableCatalog.Columns, 3)
+	assert.Equal(t, "id", tableCatalog.Columns[0].Name)
+	assert.Equal(t, "bigint unsigned", tableCatalog.Columns[0].Type)
+	assert.False(t, tableCatalog.Columns[0].Nullable)
+	assert.Equal(t, "email", tableCatalog.Columns[1].Name)
+	assert.Equal(t, "varchar(255)", tableCatalog.Columns[1].Type)
+	assert.False(t, tableCatalog.Columns[1].Nullable)
+	assert.Equal(t, "login email", tableCatalog.Columns[1].Comment)
+	assert.Equal(t, "created_at", tableCatalog.Columns[2].Name)
+	assert.Equal(t, "timestamp", tableCatalog.Columns[2].Type)
+	assert.True(t, tableCatalog.Columns[2].Nullable)
+	assert.Equal(t, "CURRENT_TIMESTAMP", tableCatalog.Columns[2].DefaultValue)
+	require.Len(t, tableCatalog.Indexes, 2)
+	indexesByName := make(map[string]*ternv1.IndexCatalog, len(tableCatalog.Indexes))
+	for _, index := range tableCatalog.Indexes {
+		indexesByName[index.Name] = index
+	}
+	require.Contains(t, indexesByName, "PRIMARY")
+	assert.True(t, indexesByName["PRIMARY"].Primary)
+	assert.True(t, indexesByName["PRIMARY"].Unique)
+	assert.Equal(t, []string{"id"}, indexesByName["PRIMARY"].Parts)
+	require.Contains(t, indexesByName, "idx_email")
+	assert.False(t, indexesByName["idx_email"].Primary)
+	assert.True(t, indexesByName["idx_email"].Unique)
+	assert.Equal(t, []string{"email"}, indexesByName["idx_email"].Parts)
+
+	basicResp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err, "pull schema with basic catalog detail")
+	basicCatalog := basicResp.Namespaces["testdb"].TableCatalog["pull_schema_users"]
+	require.NotNil(t, basicCatalog)
+	assert.Empty(t, basicCatalog.Columns)
+	assert.Empty(t, basicCatalog.Indexes)
 }
 
 // Pulling all live MySQL namespaces discovers application schemas while

@@ -257,6 +257,13 @@ message PullSchemaRequest {
   string target = 4;
   // Optional namespace to export. For MySQL this is the schema name from SHOW DATABASES.
   string namespace = 5;
+  // Controls how much structured catalog data is returned alongside canonical DDL.
+  PullCatalogDetail catalog_detail = 6;
+}
+
+enum PullCatalogDetail {
+  PULL_CATALOG_DETAIL_BASIC = 0;
+  PULL_CATALOG_DETAIL_DETAILED = 1;
 }
 
 // PulledNamespace contains live schema content for a namespace. It describes
@@ -267,6 +274,39 @@ message PulledNamespace {
   map<string, string> tables = 1;
   // Optional engine-specific namespace content, such as Vitess VSchema JSON.
   map<string, string> artifacts = 2;
+  NamespaceCatalog namespace_catalog = 3;
+  map<string, TableCatalog> table_catalog = 4;
+}
+
+message NamespaceCatalog {
+  string name = 1;
+  string engine = 2;
+  int32 table_count = 3;
+}
+
+message TableCatalog {
+  string name = 1;
+  string kind = 2;
+  string comment = 3;
+  repeated ColumnCatalog columns = 4;
+  repeated IndexCatalog indexes = 5;
+}
+
+message ColumnCatalog {
+  string name = 1;
+  string type = 2;
+  bool nullable = 3;
+  string default_value = 4;
+  string comment = 5;
+}
+
+message IndexCatalog {
+  string name = 1;
+  bool primary = 2;
+  bool unique = 3;
+  // Ordered index key parts. Each part may be a column name or an expression,
+  // depending on the database engine.
+  repeated string parts = 4;
 }
 
 // PullSchemaResponse contains live schema content grouped by namespace.

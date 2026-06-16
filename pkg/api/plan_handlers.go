@@ -111,6 +111,10 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if _, err := pullCatalogDetail(req.CatalogDetail); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	resp, err := s.ExecutePullSchema(r.Context(), req)
 	if err != nil {
@@ -187,6 +191,12 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.SetStatus(otelcodes.Error, "invalid namespaces")
 		return nil, err
 	}
+	catalogDetail, err := pullCatalogDetail(req.CatalogDetail)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "invalid catalog detail")
+		return nil, err
+	}
 
 	client, err := s.RoutingTernClient()
 	if err != nil {
@@ -215,10 +225,11 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	}
 	for _, namespace := range namespaces {
 		resp, pullErr := client.PullSchema(ctx, &ternv1.PullSchemaRequest{
-			Database:    req.Database,
-			Type:        resolvedTarget.DatabaseType,
-			Environment: req.Environment,
-			Namespace:   namespace,
+			Database:      req.Database,
+			Type:          resolvedTarget.DatabaseType,
+			Environment:   req.Environment,
+			Namespace:     namespace,
+			CatalogDetail: catalogDetail,
 		})
 		if pullErr != nil {
 			span.RecordError(pullErr)
@@ -288,6 +299,17 @@ func pullNamespaces(namespaces []string) ([]string, error) {
 		result = append(result, namespace)
 	}
 	return result, nil
+}
+
+func pullCatalogDetail(detail string) (ternv1.PullCatalogDetail, error) {
+	switch detail {
+	case "", "basic":
+		return ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_BASIC, nil
+	case "detailed":
+		return ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED, nil
+	default:
+		return ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_BASIC, fmt.Errorf("catalog_detail %q must be basic or detailed", detail)
+	}
 }
 
 func mergePullSchemaResponse(merged, resp *ternv1.PullSchemaResponse, requestedNamespace string) error {

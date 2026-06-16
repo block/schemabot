@@ -87,6 +87,7 @@ package tern
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -490,6 +491,10 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 		}
 		pulledTables[tbl.Name] = content
 	}
+	catalog, err := c.pullNamespaceCatalog(ctx, db, namespace, pulledTables, req.GetCatalogDetail())
+	if err != nil {
+		return nil, err
+	}
 
 	c.logger.Info("LocalClient.PullSchema: loaded live schema",
 		"database", c.config.Database,
@@ -502,10 +507,186 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 		Type:        c.config.Type,
 		Environment: req.Environment,
 		Namespaces: map[string]*ternv1.PulledNamespace{
-			namespace: {Tables: pulledTables},
+			namespace: {
+				Tables:           pulledTables,
+				NamespaceCatalog: catalog.namespace,
+				TableCatalog:     catalog.tables,
+			},
 		},
 		TableCount: int32(len(tables)),
 	}, nil
+}
+
+type pulledCatalog struct {
+	namespace *ternv1.NamespaceCatalog
+	tables    map[string]*ternv1.TableCatalog
+}
+
+func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalogDetail ternv1.PullCatalogDetail) (*pulledCatalog, error) {
+	catalog := &pulledCatalog{
+		namespace: &ternv1.NamespaceCatalog{
+			Name:       namespace,
+			Engine:     c.config.Type,
+			TableCount: int32(len(pulledTables)),
+		},
+		tables: make(map[string]*ternv1.TableCatalog, len(pulledTables)),
+	}
+	if len(pulledTables) == 0 {
+		return catalog, nil
+	}
+	if err := c.loadTableCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+		return nil, err
+	}
+	if catalogDetail != ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED {
+		return catalog, nil
+	}
+	if err := c.loadColumnCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+		return nil, err
+	}
+	if err := c.loadIndexCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+		return nil, err
+	}
+	return catalog, nil
+}
+
+func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+	rows, err := db.QueryContext(ctx, `
+		SELECT table_name, table_type, table_comment
+		FROM information_schema.tables
+		WHERE table_schema = ?
+		ORDER BY table_name`, namespace)
+	if err != nil {
+		return fmt.Errorf("load table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	for rows.Next() {
+		var tableName, tableType, tableComment string
+		if err := rows.Scan(&tableName, &tableType, &tableComment); err != nil {
+			return fmt.Errorf("scan table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		}
+		if _, ok := pulledTables[tableName]; ok {
+			catalog[tableName] = &ternv1.TableCatalog{
+				Name:    tableName,
+				Kind:    normalizedTableKind(tableType),
+				Comment: tableComment,
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	return nil
+}
+
+func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+	rows, err := db.QueryContext(ctx, `
+		SELECT table_name, column_name, column_type, is_nullable, column_default, column_comment
+		FROM information_schema.columns
+		WHERE table_schema = ?
+		ORDER BY table_name, ordinal_position`, namespace)
+	if err != nil {
+		return fmt.Errorf("load column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	for rows.Next() {
+		var tableName, columnName, columnType, nullable, comment string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&tableName, &columnName, &columnType, &nullable, &defaultValue, &comment); err != nil {
+			return fmt.Errorf("scan column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		}
+		if _, ok := pulledTables[tableName]; ok {
+			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
+			column := &ternv1.ColumnCatalog{
+				Name:     columnName,
+				Type:     columnType,
+				Nullable: nullable == "YES",
+				Comment:  comment,
+			}
+			if defaultValue.Valid {
+				column.DefaultValue = defaultValue.String
+			}
+			tableCatalog.Columns = append(tableCatalog.Columns, column)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	return nil
+}
+
+func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+	rows, err := db.QueryContext(ctx, `
+		SELECT table_name, index_name, non_unique, column_name, expression
+		FROM information_schema.statistics
+		WHERE table_schema = ?
+		ORDER BY table_name, index_name, seq_in_index`, namespace)
+	if err != nil {
+		return fmt.Errorf("load index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	indexesByTable := make(map[string]map[string]*ternv1.IndexCatalog)
+	for rows.Next() {
+		var tableName, indexName string
+		var columnName, expression sql.NullString
+		var nonUnique int32
+		if err := rows.Scan(&tableName, &indexName, &nonUnique, &columnName, &expression); err != nil {
+			return fmt.Errorf("scan index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		}
+		if _, ok := pulledTables[tableName]; ok {
+			indexedValue := ""
+			switch {
+			case columnName.Valid:
+				indexedValue = columnName.String
+			case expression.Valid:
+				indexedValue = expression.String
+			default:
+				c.logger.Warn("LocalClient.PullSchema: skipping index part without column or expression", "database", c.config.Database, "namespace", namespace, "table", tableName, "index", indexName)
+				continue
+			}
+			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
+			if indexesByTable[tableName] == nil {
+				indexesByTable[tableName] = make(map[string]*ternv1.IndexCatalog)
+			}
+			idx := indexesByTable[tableName][indexName]
+			if idx == nil {
+				idx = &ternv1.IndexCatalog{
+					Name:    indexName,
+					Primary: indexName == "PRIMARY",
+					Unique:  nonUnique == 0,
+				}
+				indexesByTable[tableName][indexName] = idx
+				tableCatalog.Indexes = append(tableCatalog.Indexes, idx)
+			}
+			idx.Parts = append(idx.Parts, indexedValue)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+	}
+	return nil
+}
+
+func ensurePulledTableCatalog(catalog map[string]*ternv1.TableCatalog, tableName string) *ternv1.TableCatalog {
+	tableCatalog := catalog[tableName]
+	if tableCatalog == nil {
+		tableCatalog = &ternv1.TableCatalog{Name: tableName}
+		catalog[tableName] = tableCatalog
+	}
+	return tableCatalog
+}
+
+func normalizedTableKind(tableType string) string {
+	switch tableType {
+	case "BASE TABLE":
+		return "table"
+	case "VIEW":
+		return "view"
+	default:
+		return strings.ToLower(strings.ReplaceAll(tableType, " ", "_"))
+	}
 }
 
 func (c *LocalClient) pullResponseDatabase(req *ternv1.PullSchemaRequest) string {

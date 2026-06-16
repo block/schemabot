@@ -977,10 +977,11 @@ func TestExecutePullSchemaPullsRequestedNamespaces(t *testing.T) {
 	}, logger)
 
 	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
-		Database:    "orders-logical",
-		Environment: "production",
-		Type:        storage.DatabaseTypeMySQL,
-		Namespaces:  []string{"orders_production", "orders_audit_production"},
+		Database:      "orders-logical",
+		Environment:   "production",
+		Type:          storage.DatabaseTypeMySQL,
+		Namespaces:    []string{"orders_production", "orders_audit_production"},
+		CatalogDetail: "detailed",
 	})
 
 	require.NoError(t, err)
@@ -992,7 +993,9 @@ func TestExecutePullSchemaPullsRequestedNamespaces(t *testing.T) {
 	require.Len(t, mockClient.pullSchemaReqs, 2)
 	assert.Equal(t, "orders-logical", mockClient.pullSchemaReqs[0].Database)
 	assert.Equal(t, "orders_production", mockClient.pullSchemaReqs[0].Namespace)
+	assert.Equal(t, ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED, mockClient.pullSchemaReqs[0].CatalogDetail)
 	assert.Equal(t, "orders_audit_production", mockClient.pullSchemaReqs[1].Namespace)
+	assert.Equal(t, ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED, mockClient.pullSchemaReqs[1].CatalogDetail)
 }
 
 func TestExecutePullSchemaRejectsUnsupportedType(t *testing.T) {

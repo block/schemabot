@@ -12,10 +12,11 @@ import (
 
 // PullCmd returns live schema from a source environment without writing files.
 type PullCmd struct {
-	Database    string   `short:"d" required:"" help:"Database name from SchemaBot server config"`
-	Environment string   `short:"e" required:"" help:"Source environment to pull from"`
-	Type        string   `help:"Database type" default:"mysql" enum:"mysql"`
-	Namespaces  []string `name:"namespace" help:"Concrete live namespace to pull. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
+	Database      string   `short:"d" required:"" help:"Database name from SchemaBot server config"`
+	Environment   string   `short:"e" required:"" help:"Source environment to pull from"`
+	Type          string   `help:"Database type" default:"mysql" enum:"mysql"`
+	Namespaces    []string `name:"namespace" help:"Concrete live namespace to pull. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
+	CatalogDetail string   `help:"Structured catalog detail to include" default:"basic" enum:"basic,detailed"`
 }
 
 // Run executes the pull command.
@@ -24,7 +25,10 @@ func (cmd *PullCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
-	resp, err := client.CallPullSchemaAPI(ep, cmd.Database, cmd.Type, cmd.Environment, cmd.Namespaces...)
+	resp, err := client.CallPullSchemaAPIWithOptions(ep, cmd.Database, cmd.Type, cmd.Environment, client.PullSchemaOptions{
+		Namespaces:    cmd.Namespaces,
+		CatalogDetail: cmd.CatalogDetail,
+	})
 	if err != nil {
 		if outputSchemaPullRequestError("Pull", cmd.Database, cmd.Environment, err) {
 			return ErrSilent
