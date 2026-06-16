@@ -223,6 +223,7 @@ Log Output Mode (-o log):
 
 Interactive TUI:
   tui_estimate_exceeded Show a TUI snapshot for an estimate-exceeded apply
+  tui_multi_deploy      Show a TUI snapshot for a multi-deployment apply
   --live                Run TUI previews against a fake in-process API
 
 Comment Templates (GitHub PR comments):

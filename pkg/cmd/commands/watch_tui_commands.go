@@ -225,6 +225,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 
 	msg := progressMsg{
 		state:       data.State,
+		operations:  data.Operations,
 		errorMsg:    data.ErrorMessage,
 		volume:      int(result.Volume),
 		applyID:     result.ApplyID,
@@ -239,6 +240,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 	for _, tbl := range filtered {
 		tp := tableProgress{
 			Name:           tbl.TableName,
+			Deployment:     tbl.Deployment,
 			Keyspace:       tbl.Keyspace,
 			DDL:            tbl.DDL,
 			ChangeType:     tbl.ChangeType,

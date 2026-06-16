@@ -5691,6 +5691,37 @@ ESC detach • s stop • v volume
 ```
 
 
+## Multi-Deployment Apply TUI (CLI)
+
+```
+⣾ running
+1 ready for cutover · 1 running · 1 waiting
+Apply ID: apply-multi-a1b2c3d4
+Environment: production
+
+🟢 us-east — ready for cutover — next in order (orders-us-east)
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+🔄 eu-west — running table copy (orders-eu-west)
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       • Rows: 42,500 / 120,000
+
+
+⏳ ap-south — waiting for eu-west (orders-ap-south)
+
+     ~ orders: ⏳ Queued
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+ESC to detach
+```
+
+
 ## Exit Context (CLI)
 
 === Exit Context: MySQL Detach ===

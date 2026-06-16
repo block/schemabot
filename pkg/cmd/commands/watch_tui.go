@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -33,6 +34,7 @@ type WatchModel struct {
 	// State from API
 	state         string
 	tables        []tableProgress
+	operations    []templates.ProgressOperation
 	errorMsg      string
 	currentVolume int // Current volume (1-11)
 
@@ -58,6 +60,7 @@ type WatchModel struct {
 // tableProgress represents progress for a single table.
 type tableProgress struct {
 	Name           string
+	Deployment     string
 	Keyspace       string
 	DDL            string
 	ChangeType     string
@@ -106,6 +109,7 @@ func isRetryableFetchError(err error) bool {
 type progressMsg struct {
 	state       string
 	tables      []tableProgress
+	operations  []templates.ProgressOperation
 	errorMsg    string // Human-readable error message
 	failed      bool   // true when the API call didn't return usable progress data
 	retryable   bool   // when failed, whether the TUI should keep polling
@@ -239,6 +243,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.volumeChanging || len(m.tables) == 0 {
 			m.tables = msg.tables
 		}
+		m.operations = msg.operations
 		m.errorMsg = msg.errorMsg
 
 		// Timeout skip-revert if state hasn't transitioned after 10s.
