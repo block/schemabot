@@ -96,18 +96,18 @@ func (c *Client) QueryOne(ctx context.Context, selector map[string]string) (etre
 	query := buildQuery(selector)
 	c.logger.Debug("etre: querying for one entity", "entity_type", c.entityType, "query", query)
 
-	entities, err := c.entities.Query(ctx, query, etre.QueryFilter{})
+	matches, err := c.entities.Query(ctx, query, etre.QueryFilter{})
 	if err != nil {
-		return nil, fmt.Errorf("etre query %q for %q: %w", c.entityType, query, err)
+		return nil, fmt.Errorf("query etre %q entities matching %q: %w", c.entityType, query, err)
 	}
-	switch len(entities) {
+	switch len(matches) {
 	case 0:
 		return nil, fmt.Errorf("no etre %q entity matched %q: %w", c.entityType, query, ErrNotFound)
 	case 1:
 		c.logger.Debug("etre: resolved one entity", "entity_type", c.entityType, "query", query)
-		return entities[0], nil
+		return matches[0], nil
 	default:
-		return nil, fmt.Errorf("etre %q query %q matched %d entities (expected exactly one); narrow the selector to disambiguate", c.entityType, query, len(entities))
+		return nil, fmt.Errorf("%d etre %q entities matched %q (expected exactly one); narrow the selector to disambiguate", len(matches), c.entityType, query)
 	}
 }
 

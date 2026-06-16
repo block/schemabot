@@ -83,7 +83,8 @@ func TestQueryOneFailsClosedOnMultipleMatches(t *testing.T) {
 
 	_, err := c.QueryOne(t.Context(), map[string]string{"name": "orders"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "matched 2 entities")
+	assert.Contains(t, err.Error(), "2 etre")
+	assert.Contains(t, err.Error(), "expected exactly one")
 }
 
 func TestQueryOnePropagatesQueryError(t *testing.T) {
