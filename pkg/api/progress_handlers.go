@@ -183,6 +183,56 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 	return httpResp
 }
 
+func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.ProgressOperationResponse {
+	resp := &apitypes.ProgressOperationResponse{
+		Deployment:   op.Deployment,
+		Target:       op.Target,
+		State:        op.State,
+		ErrorCode:    deriveErrorCode(op.State, op.ErrorMessage),
+		ErrorMessage: op.ErrorMessage,
+	}
+	if op.StartedAt != nil {
+		resp.StartedAt = op.StartedAt.Format(time.RFC3339)
+	}
+	if op.CompletedAt != nil {
+		resp.CompletedAt = op.CompletedAt.Format(time.RFC3339)
+	}
+	return resp
+}
+
+func (s *Service) progressOperationsForApply(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string, error) {
+	if apply == nil {
+		return nil, nil, fmt.Errorf("apply is required")
+	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list apply operations for apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
+	}
+	responses := make([]*apitypes.ProgressOperationResponse, 0, len(ops))
+	deploymentByOperationID := make(map[int64]string, len(ops))
+	for _, op := range ops {
+		responses = append(responses, progressOperationResponseFromStorage(op))
+		deploymentByOperationID[op.ID] = op.Deployment
+	}
+	return responses, deploymentByOperationID, nil
+}
+
+func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string) {
+	operations, deploymentByOperationID, err := s.progressOperationsForApply(ctx, apply)
+	if err != nil {
+		// Operation rows are observability enrichment, not an apply safety gate.
+		// Serve progress without the enrichment and log the storage uncertainty.
+		s.logger.Warn("progress response will omit per-deployment operations",
+			"apply_id", apply.ApplyIdentifier,
+			"apply_db_id", apply.ID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"error", err)
+		return nil, nil
+	}
+	return operations, deploymentByOperationID
+}
+
 // handleProgressByApplyID handles GET /api/progress/apply/{apply_id} requests.
 // Returns progress for a specific apply by its external identifier.
 func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +309,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	}
 
 	httpResp := progressResponseFromProto(resp)
+	httpResp.Operations, _ = s.bestEffortProgressOperations(r.Context(), apply)
 	httpResp.ApplyID = apply.ApplyIdentifier
 	httpResp.Database = apply.Database
 	httpResp.Environment = apply.Environment
@@ -637,6 +688,8 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 	overlayApplyOptions(httpResp, apply)
 	s.overlayVitessMetadata(ctx, httpResp, apply)
+	operations, deploymentByOperationID := s.bestEffortProgressOperations(ctx, apply)
+	httpResp.Operations = operations
 
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{
@@ -650,6 +703,11 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			PercentComplete: int32(task.ProgressPercent),
 			IsInstant:       task.IsInstant,
 			TaskID:          task.TaskIdentifier,
+		}
+		if task.ApplyOperationID != nil {
+			if deployment, ok := deploymentByOperationID[*task.ApplyOperationID]; ok {
+				tpr.Deployment = deployment
+			}
 		}
 		if task.StartedAt != nil {
 			tpr.StartedAt = task.StartedAt.Format(time.RFC3339)

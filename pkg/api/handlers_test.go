@@ -88,12 +88,13 @@ func (m *mockStorageWithPlanLookup) Plans() storage.PlanStore { return m.plans }
 
 type mockStorageWithApplyStores struct {
 	mockStorage
-	plans     storage.PlanStore
-	applies   storage.ApplyStore
-	tasks     storage.TaskStore
-	locks     storage.LockStore
-	applyLogs storage.ApplyLogStore
-	controls  storage.ControlRequestStore
+	plans      storage.PlanStore
+	applies    storage.ApplyStore
+	tasks      storage.TaskStore
+	locks      storage.LockStore
+	applyLogs  storage.ApplyLogStore
+	controls   storage.ControlRequestStore
+	operations storage.ApplyOperationStore
 }
 
 func (m *mockStorageWithApplyStores) Plans() storage.PlanStore         { return m.plans }
@@ -103,6 +104,31 @@ func (m *mockStorageWithApplyStores) Locks() storage.LockStore         { return 
 func (m *mockStorageWithApplyStores) ApplyLogs() storage.ApplyLogStore { return m.applyLogs }
 func (m *mockStorageWithApplyStores) ControlRequests() storage.ControlRequestStore {
 	return m.controls
+}
+func (m *mockStorageWithApplyStores) ApplyOperations() storage.ApplyOperationStore {
+	if m.operations == nil {
+		return &staticApplyOperationStore{}
+	}
+	return m.operations
+}
+
+type staticApplyOperationStore struct {
+	storage.ApplyOperationStore
+	operations []*storage.ApplyOperation
+	err        error
+}
+
+func (s *staticApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	operations := make([]*storage.ApplyOperation, 0, len(s.operations))
+	for _, op := range s.operations {
+		if op.ApplyID == applyID {
+			operations = append(operations, op)
+		}
+	}
+	return operations, nil
 }
 
 type staticPlanStore struct {
@@ -1759,6 +1785,97 @@ func TestProgressResponseFromProtoPreservesVSchemaChangeType(t *testing.T) {
 
 	require.Len(t, resp.Tables, 1)
 	assert.Equal(t, "vschema_update", resp.Tables[0].ChangeType)
+}
+
+func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *testing.T) {
+	startedAt := time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC)
+	completedAt := startedAt.Add(5 * time.Minute)
+	opAID := int64(101)
+	opBID := int64(102)
+	apply := &storage.Apply{
+		ID:              10,
+		ApplyIdentifier: "apply_multi_deploy",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+	}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{
+				ApplyID:          apply.ID,
+				ApplyOperationID: &opAID,
+				TaskIdentifier:   "task_users",
+				TableName:        "users",
+				Namespace:        "testdb",
+				DDLAction:        "alter",
+				DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+				State:            state.Task.Running,
+				ProgressPercent:  42,
+				RowsCopied:       420,
+				RowsTotal:        1000,
+				Database:         "testdb",
+				DatabaseType:     storage.DatabaseTypeMySQL,
+				Engine:           storage.EngineSpirit,
+				Environment:      "staging",
+			},
+			{
+				ApplyID:          apply.ID,
+				ApplyOperationID: &opBID,
+				TaskIdentifier:   "task_orders",
+				TableName:        "orders",
+				Namespace:        "testdb",
+				DDLAction:        "alter",
+				DDL:              "ALTER TABLE orders ADD COLUMN shipped_at timestamp NULL",
+				State:            state.Task.Completed,
+				ProgressPercent:  100,
+				RowsCopied:       50,
+				RowsTotal:        50,
+				Database:         "testdb",
+				DatabaseType:     storage.DatabaseTypeMySQL,
+				Engine:           storage.EngineSpirit,
+				Environment:      "staging",
+			},
+		}},
+		operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
+			{ID: opAID, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.Running, StartedAt: &startedAt},
+			{ID: opBID, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.Failed, ErrorMessage: "engine failed", StartedAt: &startedAt, CompletedAt: &completedAt},
+		}},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+	require.NoError(t, err)
+	require.Len(t, resp.Operations, 2)
+	assert.Equal(t, "deploy-a", resp.Operations[0].Deployment)
+	assert.Equal(t, "target-a", resp.Operations[0].Target)
+	assert.Equal(t, state.ApplyOperation.Running, resp.Operations[0].State)
+	assert.Equal(t, startedAt.Format(time.RFC3339), resp.Operations[0].StartedAt)
+	assert.Equal(t, "deploy-b", resp.Operations[1].Deployment)
+	assert.Equal(t, apitypes.ErrCodeEngineError, resp.Operations[1].ErrorCode)
+	assert.Equal(t, "engine failed", resp.Operations[1].ErrorMessage)
+	assert.Equal(t, completedAt.Format(time.RFC3339), resp.Operations[1].CompletedAt)
+	require.Len(t, resp.Tables, 2)
+	assert.Equal(t, "deploy-a", resp.Tables[0].Deployment)
+	assert.Equal(t, "deploy-b", resp.Tables[1].Deployment)
+}
+
+func TestProgressFromLocalStorageSingleDeploymentOmitsOperationFields(t *testing.T) {
+	apply := &storage.Apply{ID: 20, ApplyIdentifier: "apply_single", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Engine: storage.EngineSpirit, State: state.Apply.Completed}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{ApplyID: apply.ID, TaskIdentifier: "task_users", TableName: "users", Namespace: "testdb", DDLAction: "alter", DDL: "ALTER TABLE users ADD COLUMN email varchar(255)", State: state.Task.Completed, Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineSpirit, Environment: "staging"},
+		}},
+		operations: &staticApplyOperationStore{},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.Empty(t, resp.Operations)
+	require.Len(t, resp.Tables, 1)
+	assert.Empty(t, resp.Tables[0].Deployment)
 }
 
 func TestValidateRollbackSourceApplyAcceptsLatestCompletedApplyWithOriginalSchema(t *testing.T) {

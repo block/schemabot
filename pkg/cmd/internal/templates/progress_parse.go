@@ -26,14 +26,27 @@ type ProgressData struct {
 	ErrorMessage   string
 	StartedAt      string // RFC3339 format
 	CompletedAt    string // RFC3339 format
+	Operations     []ProgressOperation
 	Tables         []TableProgress
 	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
 	Metadata       map[string]string // Engine metadata (e.g., deploy_request_url, branch_name)
 }
 
+// ProgressOperation represents progress for one deployment operation.
+type ProgressOperation struct {
+	Deployment   string
+	Target       string
+	State        string
+	ErrorMessage string
+	ErrorCode    string
+	StartedAt    string
+	CompletedAt  string
+}
+
 // TableProgress represents progress for a single table schema change.
 type TableProgress struct {
 	TableName       string
+	Deployment      string
 	Namespace       string // Keyspace (Vitess) or schema name (MySQL)
 	ChangeType      string // create, alter, drop
 	DDL             string
@@ -131,9 +144,22 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		Metadata:     result.Metadata,
 	}
 
+	for _, op := range result.Operations {
+		data.Operations = append(data.Operations, ProgressOperation{
+			Deployment:   op.Deployment,
+			Target:       op.Target,
+			State:        state.NormalizeState(op.State),
+			ErrorMessage: op.ErrorMessage,
+			ErrorCode:    op.ErrorCode,
+			StartedAt:    op.StartedAt,
+			CompletedAt:  op.CompletedAt,
+		})
+	}
+
 	for _, tbl := range result.Tables {
 		tp := TableProgress{
 			TableName:       tbl.TableName,
+			Deployment:      tbl.Deployment,
 			Namespace:       tbl.Keyspace,
 			ChangeType:      tbl.ChangeType,
 			DDL:             tbl.DDL,
