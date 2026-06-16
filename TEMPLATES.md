@@ -5071,6 +5071,127 @@ _No details available yet._
 </details>
 </details>
 
+## Multi-Deployment Apply (CLI)
+
+<details>
+<summary><a name="barrier-rollout-in-progress"></a><strong>Barrier Rollout In Progress</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                           │
+│  Environment:  production                                     │
+│  State:        running                                        │
+│  Caller:       octocat                                        │
+│  Started:      Jan 15 14:22:00 UTC                            │
+│  Duration:     8m                                             │
+│  Deployments:  1 ready for cutover · 1 running · 1 waiting    │
+└───────────────────────────────────────────────────────────────┘
+
+  Next: cut over us-east
+
+🟢 us-east — ready for cutover — next in order (orders-us-east)
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+🔄 eu-west — running table copy (orders-eu-west)
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       • Rows: 42,000 / 120,000 · ETA: 4m 0s
+
+
+⏳ ap-south — waiting for eu-west (orders-ap-south)
+
+     ~ orders: ⏳ Queued
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+
+```
+</details>
+
+<details>
+<summary><a name="halt-on-failure-one-deployment-failed"></a><strong>Halt On Failure (One Deployment Failed)</strong></summary>
+
+```
+
+┌─────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                 │
+│  Environment:  production                           │
+│  State:        failed                               │
+│  Caller:       octocat                              │
+│  Started:      Jan 15 14:22:00 UTC                  │
+│  Duration:     8m                                   │
+│  Deployments:  1 completed · 1 halted · 1 failed    │
+└─────────────────────────────────────────────────────┘
+
+  ⚠ First failure: eu-west — duplicate key name 'idx_orders_source'
+
+  Next: review failure in eu-west
+
+✅ us-east — completed (orders-us-east)
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+❌ eu-west — failed (orders-eu-west)
+  duplicate key name 'idx_orders_source'
+
+     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_orders_source`(`source`);
+
+
+⏸ ap-south — halted — eu-west failed (orders-ap-south)
+
+     ~ orders: ⊘ Cancelled (not started)
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+
+```
+</details>
+
+<details>
+<summary><a name="all-deployments-completed"></a><strong>All Deployments Completed</strong></summary>
+
+```
+
+┌──────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4  │
+│  Environment:  production            │
+│  State:        completed             │
+│  Caller:       octocat               │
+│  Started:      Jan 15 14:22:00 UTC   │
+│  Duration:     7m                    │
+│  Deployments:  3 completed           │
+└──────────────────────────────────────┘
+
+✅ us-east — completed (orders-us-east)
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+✅ eu-west — completed (orders-eu-west)
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+✅ ap-south — completed (orders-ap-south)
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+```
+</details>
+
+
 ## Sequential Mode (CLI)
 
 <details>
@@ -5585,6 +5706,37 @@ The following changes will permanently delete data:
 
 
 ESC detach • s stop • v volume
+```
+
+
+## Multi-Deployment Apply TUI (CLI)
+
+```
+⣾ running
+1 ready for cutover · 1 running · 1 waiting
+Apply ID: apply-multi-a1b2c3d4
+Environment: production
+
+🟢 us-east — ready for cutover — next in order (orders-us-east)
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Waiting for cutover
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+🔄 eu-west — running table copy (orders-eu-west)
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       • Rows: 42,500 / 120,000
+
+
+⏳ ap-south — waiting for eu-west (orders-ap-south)
+
+     ~ orders: ⏳ Queued
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+ESC to detach
 ```
 
 

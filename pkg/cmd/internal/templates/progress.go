@@ -60,6 +60,10 @@ func WriteProgress(data ProgressData) {
 		fmt.Println("No active schema change")
 		return
 	}
+	if len(data.Operations) > 1 {
+		writeMultiDeploymentProgress(data)
+		return
+	}
 
 	// Build key/value pairs for the detail box
 	displayState := state.Label(data.State)

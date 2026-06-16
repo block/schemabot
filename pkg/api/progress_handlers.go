@@ -185,11 +185,13 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 
 func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.ProgressOperationResponse {
 	resp := &apitypes.ProgressOperationResponse{
-		Deployment:   op.Deployment,
-		Target:       op.Target,
-		State:        op.State,
-		ErrorCode:    deriveErrorCode(op.State, op.ErrorMessage),
-		ErrorMessage: op.ErrorMessage,
+		Deployment:    op.Deployment,
+		Target:        op.Target,
+		State:         op.State,
+		CutoverPolicy: op.CutoverPolicy,
+		OnFailure:     op.OnFailure,
+		ErrorCode:     deriveErrorCode(op.State, op.ErrorMessage),
+		ErrorMessage:  op.ErrorMessage,
 	}
 	if op.StartedAt != nil {
 		resp.StartedAt = op.StartedAt.Format(time.RFC3339)

@@ -85,6 +85,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
 		templates.PreviewCommentMultiDeployInProgress, templates.PreviewCommentMultiDeployFailed,
 		templates.PreviewCommentMultiDeployCompleted, templates.PreviewCommentMultiDeployAll,
+		templates.PreviewCLIMultiDeployInProgress, templates.PreviewCLIMultiDeployFailed,
+		templates.PreviewCLIMultiDeployCompleted, templates.PreviewCLIMultiDeployAll,
 		templates.PreviewCommentSingleProgress, templates.PreviewCommentSingleComplete,
 		templates.PreviewCommentSingleFailed, templates.PreviewCommentSingleStopped,
 		templates.PreviewCommentSummaryCompleted, templates.PreviewCommentSummaryFailed,
@@ -221,6 +223,7 @@ Log Output Mode (-o log):
 
 Interactive TUI:
   tui_estimate_exceeded Show a TUI snapshot for an estimate-exceeded apply
+  tui_multi_deploy      Show a TUI snapshot for a multi-deployment apply
   --live                Run TUI previews against a fake in-process API
 
 Comment Templates (GitHub PR comments):
@@ -244,6 +247,10 @@ Comment Templates (GitHub PR comments):
   comment_apply_stopped         Multi-table: stopped (partial progress)
   comment_apply_waiting_cutover Waiting for cutover
   comment_apply_cutting_over    Cutting over
+  cli_multi_deploy_in_progress  CLI multi-deployment apply in progress
+  cli_multi_deploy_failed       CLI multi-deployment apply with one failed deployment
+  cli_multi_deploy_completed    CLI multi-deployment apply completed
+  cli_multi_deploy_all          Show all CLI multi-deployment apply previews
   comment_summary_completed       Summary: apply completed
   comment_summary_failed          Summary: apply failed (with error)
   comment_summary_stopped         Summary: apply stopped

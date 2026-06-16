@@ -375,9 +375,13 @@ type ProgressResponse struct {
 
 // ProgressOperationResponse represents progress for one deployment operation.
 type ProgressOperationResponse struct {
-	Deployment   string `json:"deployment"`
-	Target       string `json:"target,omitempty"`
-	State        string `json:"state"`
+	Deployment string `json:"deployment"`
+	Target     string `json:"target,omitempty"`
+	State      string `json:"state"`
+	// CutoverPolicy is the rollout boundary policy for this deployment operation.
+	CutoverPolicy string `json:"cutover_policy,omitempty"`
+	// OnFailure is the rollout failure policy for this deployment operation.
+	OnFailure    string `json:"on_failure,omitempty"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
 	StartedAt    string `json:"started_at,omitempty"`

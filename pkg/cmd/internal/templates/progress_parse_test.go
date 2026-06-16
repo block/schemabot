@@ -15,13 +15,15 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 		State: state.Apply.Running,
 		Operations: []*apitypes.ProgressOperationResponse{
 			{
-				Deployment:   "deploy-a",
-				Target:       "target-a",
-				State:        "STATE_RUNNING",
-				ErrorCode:    "engine_error_retryable",
-				ErrorMessage: "retryable failure",
-				StartedAt:    "2026-06-16T10:00:00Z",
-				CompletedAt:  "2026-06-16T10:05:00Z",
+				Deployment:    "deploy-a",
+				Target:        "target-a",
+				State:         "STATE_RUNNING",
+				CutoverPolicy: "barrier",
+				OnFailure:     "continue",
+				ErrorCode:     "engine_error_retryable",
+				ErrorMessage:  "retryable failure",
+				StartedAt:     "2026-06-16T10:00:00Z",
+				CompletedAt:   "2026-06-16T10:05:00Z",
 			},
 		},
 		Tables: []*apitypes.TableProgressResponse{
@@ -42,6 +44,8 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 	assert.Equal(t, "deploy-a", data.Operations[0].Deployment)
 	assert.Equal(t, "target-a", data.Operations[0].Target)
 	assert.Equal(t, state.Apply.Running, data.Operations[0].State)
+	assert.Equal(t, "barrier", data.Operations[0].CutoverPolicy)
+	assert.Equal(t, "continue", data.Operations[0].OnFailure)
 	assert.Equal(t, "engine_error_retryable", data.Operations[0].ErrorCode)
 	assert.Equal(t, "retryable failure", data.Operations[0].ErrorMessage)
 	assert.Equal(t, "2026-06-16T10:00:00Z", data.Operations[0].StartedAt)
