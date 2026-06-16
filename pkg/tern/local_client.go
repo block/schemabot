@@ -141,6 +141,11 @@ type LocalConfig struct {
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
 	// quarantine so DROP TABLE executes directly).
 	Metadata map[string]string
+
+	// WakeOperator notifies the owner loop after an external control request is
+	// recorded. The callback must not execute control actions itself; it only
+	// nudges the storage-claiming operator to process durable intent promptly.
+	WakeOperator func(applyIdentifier, database, environment string)
 }
 
 // LocalClient implements Client by calling the Spirit engine directly.
@@ -219,6 +224,17 @@ func (c *LocalClient) IsRemote() bool { return false }
 
 // Endpoint returns the database name for this local client.
 func (c *LocalClient) Endpoint() string { return c.config.Database }
+
+func (c *LocalClient) wakeOperatorForControlRequest(apply *storage.Apply) {
+	if c.config.WakeOperator == nil {
+		c.logger.Debug("operator wake skipped because no wake callback is configured",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment)
+		return
+	}
+	c.config.WakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+}
 
 // protoEngine returns the proto engine type based on database configuration.
 func (c *LocalClient) protoEngine() ternv1.Engine {

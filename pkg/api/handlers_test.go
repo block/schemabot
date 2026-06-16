@@ -2736,7 +2736,7 @@ func TestStopHandler(t *testing.T) {
 		assert.Equal(t, int64(1), resp.StoppedCount)
 	})
 
-	t.Run("remote stop queues durable request without immediate remote stop", func(t *testing.T) {
+	t.Run("remote stop queues durable request and propagates to remote durable queue", func(t *testing.T) {
 		mock := &mockTernClient{isRemote: true, stopResp: &ternv1.StopResponse{Accepted: true}}
 		apply := activeTestApply("apply-remote-stop")
 		apply.ExternalID = "remote-apply-stop"
@@ -2757,7 +2757,9 @@ func TestStopHandler(t *testing.T) {
 		mux.ServeHTTP(w, req)
 
 		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-		assert.Nil(t, mock.stopReq, "remote stop must be reconciled by the operator owner")
+		require.NotNil(t, mock.stopReq, "remote stop propagation should queue data-plane durable intent")
+		assert.Equal(t, "remote-apply-stop", mock.stopReq.ApplyId)
+		assert.Equal(t, "staging", mock.stopReq.Environment)
 		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 		require.NoError(t, err)
 		require.NotNil(t, controlReq)

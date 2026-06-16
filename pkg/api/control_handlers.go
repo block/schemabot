@@ -762,7 +762,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 		return
 	}
 	if client.IsRemote() {
-		s.logger.Info("immediate stop skipped for remote Tern client; durable stop request remains pending for operator-owned reconciliation",
+		s.logger.Info("propagating stop request to remote Tern durable queue",
 			"apply_id", apply.ApplyIdentifier,
 			"tern_apply_id", ternApplyID,
 			"database", apply.Database,
@@ -770,8 +770,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 			"environment", apply.Environment,
 			"requested_by", caller)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
-			"Immediate stop skipped for remote Tern client; durable operator owner will reconcile stop state")
-		return
+			"Stop request propagation to remote Tern durable queue started")
 	}
 	resp, err := client.Stop(ctx, &ternv1.StopRequest{
 		ApplyId:     ternApplyID,

@@ -464,10 +464,11 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		metadata["pending_drops"] = "false"
 	}
 	client, err := tern.NewLocalClient(tern.LocalConfig{
-		Database:  database,
-		Type:      dbType,
-		TargetDSN: targetDSN,
-		Metadata:  metadata,
+		Database:     database,
+		Type:         dbType,
+		TargetDSN:    targetDSN,
+		Metadata:     metadata,
+		WakeOperator: s.wakeOperator,
 	}, s.storage, s.logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local tern client for %s: %w", key, err)

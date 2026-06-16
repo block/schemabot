@@ -169,7 +169,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	var grpcServer *grpc.Server
 	grpcPort := os.Getenv("GRPC_PORT")
 	if grpcPort != "" {
-		grpcServer, err = startGRPCServer(ctx, serverConfig, storage, logger, grpcPort)
+		grpcServer, err = startGRPCServer(ctx, serverConfig, storage, logger, grpcPort, svc.WakeOperator)
 		if err != nil {
 			return fmt.Errorf("start grpc server: %w", err)
 		}
@@ -268,8 +268,8 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 // plane is configured with a target resolver, requests are routed by opaque
 // execution target through a TargetRouter; otherwise it falls back to a single
 // LocalClient bound to the one database configured for TERN_ENVIRONMENT.
-func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, port string) (*grpc.Server, error) {
-	client, err := buildGRPCTernClient(ctx, config, st, logger, os.Getenv("TERN_ENVIRONMENT"))
+func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, port string, wakeOperator func(applyIdentifier, database, environment string)) (*grpc.Server, error) {
+	client, err := buildGRPCTernClient(ctx, config, st, logger, os.Getenv("TERN_ENVIRONMENT"), wakeOperator)
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +300,11 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 // environment is unused in this mode because each request carries its own.
 // Otherwise it falls back to a single LocalClient bound to the one database
 // configured for env.
-func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string) (tern.Client, error) {
+func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string, wakeOperator ...func(applyIdentifier, database, environment string)) (tern.Client, error) {
+	var wake func(applyIdentifier, database, environment string)
+	if len(wakeOperator) > 0 {
+		wake = wakeOperator[0]
+	}
 	etreConfigured := config.TargetResolver.Etre.Configured()
 	staticConfigured := config.TargetResolver.Configured()
 
@@ -317,7 +321,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 			Resolver:           resolver,
 			Storage:            st,
 			Logger:             logger,
-			LocalClientFactory: grpcLocalClientFactory(config),
+			LocalClientFactory: grpcLocalClientFactory(config, wake),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("build target router: %w", err)
@@ -358,7 +362,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 	}
-	client, err := grpcLocalClientFactory(config)(tern.LocalConfig{
+	client, err := grpcLocalClientFactory(config, wake)(tern.LocalConfig{
 		Database:  dbName,
 		Type:      dbConfig.Type,
 		TargetDSN: targetDSN,
@@ -513,7 +517,7 @@ func credentialAttributeFields(cfg api.EtreConfig) []string {
 // grpcLocalClientFactory returns a LocalClientFactory that applies server-level
 // policy (pending drops) to every LocalClient the data plane builds, so the
 // router and single-database paths share identical execution semantics.
-func grpcLocalClientFactory(config *api.ServerConfig) tern.LocalClientFactory {
+func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIdentifier, database, environment string)) tern.LocalClientFactory {
 	pendingDropsDisabled := !config.PendingDropsEnabled()
 	return func(cfg tern.LocalConfig, st storage.Storage, logger *slog.Logger) (tern.Client, error) {
 		if pendingDropsDisabled {
@@ -521,6 +525,9 @@ func grpcLocalClientFactory(config *api.ServerConfig) tern.LocalClientFactory {
 				cfg.Metadata = map[string]string{}
 			}
 			cfg.Metadata["pending_drops"] = "false"
+		}
+		if cfg.WakeOperator == nil {
+			cfg.WakeOperator = wakeOperator
 		}
 		return tern.NewLocalClient(cfg, st, logger)
 	}

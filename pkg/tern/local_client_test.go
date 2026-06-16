@@ -1003,6 +1003,66 @@ func TestLocalClient_ProcessPendingStartControlRequestStartsDeferredDeploy(t *te
 	assert.Nil(t, startReq)
 }
 
+func TestLocalClient_StartQueuesOwnerRequest(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              123,
+		ApplyIdentifier: "apply-stopped-start",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+		UpdatedAt:       time.Now(),
+	}
+	task := &storage.Task{
+		ID:             456,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stopped-start",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Stopped,
+		UpdatedAt:      time.Now(),
+	}
+	controlRequests := &testControlRequestStore{}
+	var wakeApplyID, wakeDatabase, wakeEnvironment string
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+			WakeOperator: func(applyIdentifier, database, environment string) {
+				wakeApplyID = applyIdentifier
+				wakeDatabase = database
+				wakeEnvironment = environment
+			},
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: &fakeControlEngine{},
+		logger:       slog.Default(),
+	}
+
+	resp, err := client.Start(t.Context(), &ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.StartedCount)
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Equal(t, state.Task.Stopped, task.State)
+
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, startReq)
+	assert.Equal(t, "tern-grpc", startReq.RequestedBy)
+	assert.Equal(t, apply.ApplyIdentifier, wakeApplyID)
+	assert.Equal(t, apply.Database, wakeDatabase)
+	assert.Equal(t, apply.Environment, wakeEnvironment)
+}
+
 // A revert-window apply has already cut over, so a durable stop request against
 // it is a permanent rejection. Processing it must resolve the request terminally
 // (failed) with the operator-facing reason instead of bubbling a retryable error
@@ -1349,7 +1409,7 @@ func TestLocalClient_StopPreservesTerminalCancelledApply(t *testing.T) {
 		logger:            slog.Default(),
 	}
 
-	resp, err := client.stop(t.Context(), &ternv1.StopRequest{
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: apply.Environment,
 	}, "cli:second")

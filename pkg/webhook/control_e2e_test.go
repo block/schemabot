@@ -140,10 +140,10 @@ func TestE2EStopCommandRecordsDurableRequest(t *testing.T) {
 	assertReactionEventually(t, reactions)
 }
 
-// TestE2EStopCommandStopsDeferredCutoverLocalApply verifies that a PR comment
-// stop command stops an active local schema change that is waiting for deferred
-// cutover instead of issuing cutover.
-func TestE2EStopCommandStopsDeferredCutoverLocalApply(t *testing.T) {
+// TestE2EStopCommandQueuesDeferredCutoverLocalApplyWithoutRunner verifies that
+// a PR comment stop command records durable stop intent when storage has an
+// active local schema change but this process does not own the Spirit runner.
+func TestE2EStopCommandQueuesDeferredCutoverLocalApplyWithoutRunner(t *testing.T) {
 	ctx := t.Context()
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
@@ -219,15 +219,16 @@ func TestE2EStopCommandStopsDeferredCutoverLocalApply(t *testing.T) {
 	storedApply, err = store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
 	require.NoError(t, err)
 	require.NotNil(t, storedApply)
-	assert.Equal(t, state.Apply.Stopped, storedApply.State)
+	assert.Equal(t, state.Apply.WaitingForCutover, storedApply.State)
 	assert.True(t, storedApply.GetOptions().DeferCutover)
 	storedTasks, err = store.Tasks().GetByApplyID(ctx, applyID)
 	require.NoError(t, err)
 	require.Len(t, storedTasks, 1)
-	assert.Equal(t, state.Task.Stopped, storedTasks[0].State)
+	assert.Equal(t, state.Task.WaitingForCutover, storedTasks[0].State)
 	pendingStop, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStop)
 	require.NoError(t, err)
-	assert.Nil(t, pendingStop)
+	require.NotNil(t, pendingStop)
+	assert.Equal(t, storage.ControlRequestPending, pendingStop.Status)
 	assertReactionEventually(t, reactions)
 }
 

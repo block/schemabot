@@ -170,9 +170,10 @@ func newMySQLControlTestClient(apply *storage.Apply, tasks []*storage.Task, eng 
 			TargetDSN: "root@tcp(localhost:3306)/",
 		},
 		storage: &controlTestStorage{
-			applies:   &controlTestApplyStore{apply: apply},
-			tasks:     &controlTestTaskStore{tasks: tasks},
-			applyLogs: &controlTestApplyLogStore{},
+			applies:         &controlTestApplyStore{apply: apply},
+			tasks:           &controlTestTaskStore{tasks: tasks},
+			applyLogs:       &controlTestApplyLogStore{},
+			controlRequests: &testControlRequestStore{},
 		},
 		spiritEngine: eng,
 		logger:       slog.Default(),
@@ -242,7 +243,7 @@ func TestLocalClient_StopMarksMySQLApplyStopped(t *testing.T) {
 	eng := &controlCaptureEngine{}
 	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
 
-	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
 	assert.True(t, resp.Accepted)
@@ -251,6 +252,84 @@ func TestLocalClient_StopMarksMySQLApplyStopped(t *testing.T) {
 	assert.Equal(t, state.Apply.Stopped, apply.State)
 	assert.Nil(t, apply.CompletedAt)
 	require.NotNil(t, eng.stopReq, "stop should call the engine")
+}
+
+// External Stop records durable intent in shared storage. The apply owner
+// observes the pending request and performs the local engine stop, so any
+// replica can accept the request without mutating stopped state itself.
+func TestLocalClient_StopQueuesStopRequestForApplyOwner(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-queued",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-queued",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	eng := &controlCaptureEngine{}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+	var wakeApplyID, wakeDatabase, wakeEnvironment string
+	client.config.WakeOperator = func(applyIdentifier, database, environment string) {
+		wakeApplyID = applyIdentifier
+		wakeDatabase = database
+		wakeEnvironment = environment
+	}
+
+	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Nil(t, eng.stopReq, "external stop should not call the local engine directly")
+	assert.Equal(t, state.Task.Running, task.State)
+	assert.Equal(t, state.Apply.Running, apply.State)
+	controlReq, err := client.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq)
+	assert.Equal(t, "tern-grpc", controlReq.RequestedBy)
+	assert.Equal(t, apply.ApplyIdentifier, wakeApplyID)
+	assert.Equal(t, apply.Database, wakeDatabase)
+	assert.Equal(t, apply.Environment, wakeEnvironment)
+}
+
+// Apply-owner stop is only authoritative after the local Spirit runner stops.
+// If the engine cannot stop, storage must remain active so user-facing status
+// does not diverge from a runner that is still copying rows.
+func TestLocalClient_StopOwnedApplyReturnsMySQLEngineStopError(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-non-owner",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-non-owner",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	stopErr := errors.New("no active schema change to stop")
+	eng := &controlCaptureEngine{stopErr: stopErr}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, stopErr)
+	require.NotNil(t, eng.stopReq, "stop should call the local engine before mutating storage")
+	assert.Equal(t, state.Task.Running, task.State)
+	assert.Equal(t, state.Apply.Running, apply.State)
+	assert.Nil(t, apply.CompletedAt)
 }
 
 // Sequential MySQL applies can contain tasks from multiple namespaces, but only
@@ -285,7 +364,7 @@ func TestLocalClient_StopSnapshotsProgressWithStoppedTaskNamespace(t *testing.T)
 	eng := &controlCaptureEngine{}
 	client := newMySQLControlTestClient(apply, []*storage.Task{pendingTask, liveTask}, eng)
 
-	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
 	assert.True(t, resp.Accepted)
@@ -377,7 +456,7 @@ func TestLocalClient_StopAllTasksTerminalDerivesApplyState(t *testing.T) {
 			}
 			client := newMySQLControlTestClient(apply, tasks, &controlCaptureEngine{})
 
-			resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+			resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 			require.NoError(t, err)
 			assert.True(t, resp.Accepted)
@@ -545,7 +624,7 @@ func TestLocalClient_StopReturnsVitessEngineStopError(t *testing.T) {
 	eng := &controlCaptureEngine{stopErr: stopErr}
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
-	_, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.ErrorIs(t, err, stopErr)
 	require.NotNil(t, eng.stopReq, "stop should call the engine with deploy metadata")
@@ -578,7 +657,7 @@ func TestLocalClient_StopRecoveringMySQLStopsEngineBeforeStorage(t *testing.T) {
 	eng.onStop = func() { stateAtEngineStop = task.State }
 	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
 
-	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
 	assert.True(t, resp.Accepted)
@@ -620,7 +699,7 @@ func TestLocalClient_StopWaitingForDeployCancelsDeployRequest(t *testing.T) {
 	eng.onStop = func() { stateAtEngineStop = task.State }
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
-	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
 	assert.True(t, resp.Accepted)
@@ -665,7 +744,7 @@ func TestLocalClient_StopFailedRetryableCancelsDeployRequest(t *testing.T) {
 	eng.onStop = func() { stateAtEngineStop = task.State }
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
-	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
 	assert.True(t, resp.Accepted)

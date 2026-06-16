@@ -232,10 +232,95 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 
 // Stop pauses an in-progress schema change.
 func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
-	return c.stop(ctx, req, "")
+	return c.requestStop(ctx, req, "")
 }
 
-func (c *LocalClient) stop(ctx context.Context, req *ternv1.StopRequest, caller string) (*ternv1.StopResponse, error) {
+func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, caller string) (*ternv1.StopResponse, error) {
+	c.logger.Info("Stop requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
+	apply, err := c.resolveStopApply(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("no active schema change")
+	}
+
+	if revertWindow, err := c.applyHasRevertWindowTask(ctx, apply); err != nil {
+		return nil, err
+	} else if revertWindow {
+		c.logger.Warn("stop rejected: schema change is in the revert window and has already cut over",
+			"apply_id", apply.ApplyIdentifier,
+			"state", apply.State)
+		return nil, errors.New(revertWindowStopRejectionMessage(apply.ApplyIdentifier))
+	}
+
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available")
+	}
+	requestedBy := caller
+	if requestedBy == "" {
+		requestedBy = "tern-grpc"
+	}
+	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: requestedBy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("record stop control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if alreadyPending {
+		c.logger.Info("stop request already pending for apply owner",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", requestedBy)
+	} else {
+		c.logger.Info("stop request queued for apply owner",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", requestedBy)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Stop request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
+	}
+	c.wakeOperatorForControlRequest(apply)
+	return &ternv1.StopResponse{Accepted: true}, nil
+}
+
+func (c *LocalClient) resolveStopApply(ctx context.Context, req *ternv1.StopRequest) (*storage.Apply, error) {
+	if req.ApplyId != "" {
+		apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+		if err != nil {
+			return nil, fmt.Errorf("load apply %s before stop: %w", req.ApplyId, err)
+		}
+		if apply == nil {
+			return nil, fmt.Errorf("load apply %s before stop: %w", req.ApplyId, storage.ErrApplyNotFound)
+		}
+		return apply, nil
+	}
+
+	task, err := c.getActiveTaskForDatabase(ctx, c.config.Database)
+	if err != nil {
+		return nil, err
+	}
+	if task == nil {
+		c.logger.Info("stop request found no active task", "database", c.config.Database, "type", c.config.Type)
+		return nil, nil
+	}
+	apply, err := c.storage.Applies().Get(ctx, task.ApplyID)
+	if err != nil {
+		return nil, fmt.Errorf("load apply %d before stop: %w", task.ApplyID, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("load apply %d before stop: %w", task.ApplyID, storage.ErrApplyNotFound)
+	}
+	return apply, nil
+}
+
+func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopRequest, caller string) (*ternv1.StopResponse, error) {
 	c.logger.Info("Stop requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId)
 	tasks, err := c.storage.Tasks().GetByDatabase(ctx, c.config.Database)
 	if err != nil {
@@ -399,7 +484,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	}
 
 	stopCtx := context.WithoutCancel(ctx)
-	resp, err := c.stop(stopCtx, &ternv1.StopRequest{
+	resp, err := c.stopOwnedApply(stopCtx, &ternv1.StopRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
@@ -523,9 +608,8 @@ func hasLiveEngineWork(taskState string) bool {
 }
 
 // stopEngineForTasks calls eng.Stop() if any targeted task has live engine work.
-// Returns an error if the engine stop fails (e.g., PlanetScale deploy request
-// cancellation failed). For Spirit, stop errors are non-fatal since the runner
-// may have already exited.
+// Returns an error if the engine stop fails. Storage must not record stopped
+// state until the apply owner has stopped the live engine work.
 //
 // It stops at the first task with live engine work and returns: an apply drives
 // a single engine operation (one Spirit runner or one PlanetScale deploy
@@ -561,8 +645,7 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 			if c.config.Type == storage.DatabaseTypeVitess {
 				return nil, fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, err)
 			}
-			c.logger.Warn("engine stop returned error (runner may have already exited)",
-				"task_id", task.TaskIdentifier, "error", err)
+			return nil, fmt.Errorf("stop local engine for task %s: %w", task.TaskIdentifier, err)
 		}
 		return creds, nil
 	}

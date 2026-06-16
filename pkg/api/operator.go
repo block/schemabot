@@ -132,6 +132,13 @@ func (s *Service) wakeOperator(applyIdentifier, database, environment string) {
 	}
 }
 
+// WakeOperator nudges the operator worker pool to claim queued durable work.
+// Storage locking still decides ownership; this does not execute apply control
+// actions directly.
+func (s *Service) WakeOperator(applyIdentifier, database, environment string) {
+	s.wakeOperator(applyIdentifier, database, environment)
+}
+
 // operatorWorker is a single worker that claims at most one apply on startup
 // and on each operator poll tick. Wake signals share the same claim path as
 // polling; storage locking decides whether a worker actually owns work.

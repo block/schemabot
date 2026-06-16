@@ -2194,6 +2194,59 @@ func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
 	assert.Nil(t, controlReq)
 }
 
+func TestGRPCClient_ResumeApplyCompletesQueuedStopBeforeQueuedStart(t *testing.T) {
+	// Start can arrive immediately after stop progress is visible. The operator
+	// should consume the resolved stop request and continue with the queued start
+	// in the same claim instead of requiring another scheduler pass.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-start-after-stop",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-start-after-stop",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "stop-caller",
+		},
+		{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStart,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "start-caller",
+		},
+	}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.NoError(t, err)
+
+	assert.Equal(t, "remote-start-after-stop", server.getStartApplyID())
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, stopReq)
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, startReq)
+}
+
 func TestGRPCClient_ResumeApplyStartsDeferredDeployFromPendingRequest(t *testing.T) {
 	server := &capturingTernServer{
 		progressState:    ternv1.State_STATE_COMPLETED,
