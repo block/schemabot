@@ -232,7 +232,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 	if activeCommentState == state.Comment.Cutover {
 		// Cutover comment gets the summary format — Apply ID, DDL, success message.
 		// No separate summary needed since the cutover comment IS the completion comment.
-		finalBody := formatSummaryComment(apply, tasks)
+		finalBody := o.formatTerminalSummaryComment(apply, tasks)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 
 		// Upsert a summary marker so FindMissingSummaryComment (outbox query)
@@ -246,7 +246,7 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		// Post a separate summary comment. A new comment is more reliable than
 		// an edit — GitHub renders edits with a delay, but new comments appear
 		// immediately and trigger notifications for PR subscribers.
-		summaryBody := formatSummaryComment(apply, tasks)
+		summaryBody := o.formatTerminalSummaryComment(apply, tasks)
 		o.postAndTrackComment(apply, state.Comment.Summary, summaryBody)
 	}
 
@@ -277,6 +277,26 @@ func (o *CommentObserver) formatStatusComment(apply *storage.Apply, tasks []*sto
 		return formatProgressComment(apply, tasks)
 	}
 	return formatApplyStatusComment(apply, ops, tasks)
+}
+
+// formatTerminalSummaryComment renders the apply's terminal summary comment,
+// choosing the single- or multi-deployment layout by the apply's operation-row
+// count via formatApplySummaryComment. It loads the operation rows (as returned
+// by ListByApply) so a multi-deployment apply renders the aggregated summary;
+// a single operation (every apply today, until the fan-out lands) renders the
+// single-deployment summary byte-for-byte. A load failure falls back to the
+// single-deployment summary so a transient storage error never blocks the
+// terminal comment.
+func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply, tasks []*storage.Task) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
+	if err != nil {
+		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
+			"apply_id", o.applyID, "error", err)
+		return formatSummaryComment(apply, tasks)
+	}
+	return formatApplySummaryComment(apply, ops, tasks)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {

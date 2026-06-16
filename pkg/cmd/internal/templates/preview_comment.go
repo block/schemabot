@@ -235,6 +235,8 @@ func previewCommentMultiDeployAllOutput() {
 		{"BARRIER ROLLOUT IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyInProgress()) }},
 		{"HALT ON FAILURE (ONE DEPLOYMENT FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyFailed()) }},
 		{"ALL DEPLOYMENTS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyCompleted()) }},
+		{"SUMMARY: ALL DEPLOYMENTS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplySummaryCompleted()) }},
+		{"SUMMARY: HALT ON FAILURE (ONE DEPLOYMENT FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplySummaryFailed()) }},
 	}
 	printSections(sections)
 }

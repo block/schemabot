@@ -302,7 +302,17 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 			"pr", apply.PullRequest,
 			"state", apply.State)
 
-		summaryBody := formatSummaryComment(apply, tasks)
+		// Choose the single- or multi-deployment summary layout by the apply's
+		// operation-row count. A load failure leaves ops nil, which renders the
+		// single-deployment summary so a transient storage error never blocks
+		// the reconciled comment.
+		ops, err := h.service.Storage().ApplyOperations().ListByApply(ctx, apply.ID)
+		if err != nil {
+			h.logger.Error("failed to load apply operations for summary reconciliation; rendering single-deployment layout",
+				"apply_id", apply.ApplyIdentifier, "error", err)
+			ops = nil
+		}
+		summaryBody := formatApplySummaryComment(apply, ops, tasks)
 		h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, apply.InstallationID, apply.ID, state.Comment.Summary, summaryBody)
 	}
 }

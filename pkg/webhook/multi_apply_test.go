@@ -52,6 +52,46 @@ func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 	assert.Contains(t, out, "- 🔄 us — running table copy")
 }
 
+func completedApply() *storage.Apply {
+	a := runningApply()
+	a.State = state.Apply.Completed
+	return a
+}
+
+// An apply with no operation rows (legacy) renders the single-deployment summary
+// unchanged — no aggregate header.
+func TestFormatApplySummaryComment_NoOperationsRendersSingle(t *testing.T) {
+	out := formatApplySummaryComment(completedApply(), nil, nil)
+	assert.Contains(t, out, "## ✅ Schema Change Applied")
+	assert.NotContains(t, out, "**Deployments**:")
+}
+
+// A single-deployment apply (one operation) also renders the single-deployment
+// summary — the multi-deployment hierarchy only appears with more than one.
+func TestFormatApplySummaryComment_OneOperationRendersSingle(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
+	}
+	out := formatApplySummaryComment(completedApply(), ops, nil)
+	assert.NotContains(t, out, "**Deployments**:")
+	assert.NotContains(t, out, "- ✅ eu")
+}
+
+// An apply that fans out across two deployments renders the aggregate terminal
+// header, the per-status count line, and a per-deployment summary in resolved
+// order.
+func TestFormatApplySummaryComment_MultipleOperationsRendersMulti(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
+		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed},
+	}
+	out := formatApplySummaryComment(completedApply(), ops, nil)
+	assert.Contains(t, out, "## ✅ Schema Change Applied")
+	assert.Contains(t, out, "**Deployments**: 2 completed")
+	assert.Contains(t, out, "- ✅ eu — completed")
+	assert.Contains(t, out, "- ✅ us — completed")
+}
+
 // Each deployment's tasks are routed into that deployment's section only, by
 // apply_operation_id — a task for `us` must not appear under `eu`.
 func TestBuildMultiApplyData_RoutesTasksByOperation(t *testing.T) {
