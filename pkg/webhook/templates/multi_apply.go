@@ -59,6 +59,7 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State})
 	writeAggregateMetadata(&sb, data)
 	writeDeploymentCounts(&sb, data.Model.Counts)
+	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
 	writeAggregateNextAction(&sb, data)
 
 	// Flat per-deployment summary (always visible — survives any later size
@@ -86,6 +87,7 @@ func RenderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData) str
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State})
 	writeAggregateMetadata(&sb, data)
 	writeDeploymentCounts(&sb, data.Model.Counts)
+	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
 	writeAggregateNextAction(&sb, data)
 
 	writeDeploymentSummaryList(&sb, data.Model.Deployments)
@@ -125,6 +127,29 @@ func writeDeploymentCounts(sb *strings.Builder, counts []presentation.StateCount
 		parts = append(parts, fmt.Sprintf("%d %s", c.Count, c.Label))
 	}
 	fmt.Fprintf(sb, "\n**Deployments**: %s\n", strings.Join(parts, ", "))
+}
+
+// writeAggregateFirstFailure lifts the first failed deployment's error to the
+// aggregate header so an operator sees what failed without expanding that
+// deployment's section. It renders nothing when no deployment has failed. The
+// reason is the first failed operation's error — the same operation the
+// persisted aggregate ErrorMessage is stamped from — and falls back to naming
+// the deployment when that operation carried no error detail.
+//
+// The deployment name is wrapped in a <code> element rather than Markdown
+// backticks: a name may contain HTML-significant characters (and backticks
+// themselves), and HTML-escaped text inside a code span would render its
+// entities literally.
+func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deployment) {
+	if failure == nil {
+		return
+	}
+	name := html.EscapeString(failure.Deployment)
+	if failure.Error == "" {
+		fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code>\n", name)
+		return
+	}
+	fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(failure.Error))
 }
 
 // writeAggregateNextAction renders the single suggested operator action derived

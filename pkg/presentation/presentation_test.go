@@ -297,3 +297,54 @@ func TestDerive_FailedDeploymentCarriesError(t *testing.T) {
 	require.Len(t, got.Deployments, 1)
 	assert.Equal(t, "lock wait timeout", got.Deployments[0].Error)
 }
+
+// TestDerive_FirstFailureNoneWhenHealthy: a rollout with no failed deployment
+// exposes no first failure.
+func TestDerive_FirstFailureNoneWhenHealthy(t *testing.T) {
+	got := Derive([]Operation{
+		rolling("eu", so.Completed),
+		rolling("us", so.Running),
+	})
+	assert.Nil(t, got.FirstFailure)
+}
+
+// TestDerive_FirstFailurePicksEarliestInOrder: with more than one failed
+// deployment, the first failure is the earliest in resolved order and carries
+// its error, mirroring the first-failed-operation the persisted aggregate
+// ErrorMessage is stamped from.
+func TestDerive_FirstFailurePicksEarliestInOrder(t *testing.T) {
+	got := Derive([]Operation{
+		{Deployment: "eu", State: so.Completed, HaltOnFailure: false},
+		{Deployment: "us", State: so.Failed, HaltOnFailure: false, Error: "first boom"},
+		{Deployment: "au", State: so.Failed, HaltOnFailure: false, Error: "second boom"},
+	})
+	require.NotNil(t, got.FirstFailure)
+	assert.Equal(t, "us", got.FirstFailure.Deployment)
+	assert.Equal(t, "first boom", got.FirstFailure.Error)
+}
+
+// TestDerive_FirstFailureWhileSiblingStillRunning: under on_failure continue an
+// earlier deployment can be failed while a later one is still copying. The
+// aggregate is fail-closed to failed, but the in-progress comment still has a
+// running deployment, so surfacing the first failure here lifts the reason onto
+// the status comment rather than waiting for the terminal summary.
+func TestDerive_FirstFailureWhileSiblingStillRunning(t *testing.T) {
+	got := Derive([]Operation{
+		{Deployment: "eu", State: so.Failed, HaltOnFailure: false, Error: "boom"},
+		{Deployment: "us", State: so.Running, HaltOnFailure: false},
+	})
+	assert.Equal(t, state.Apply.Failed, got.State)
+	assert.Equal(t, StateRunningCopy, got.Deployments[1].Presentation)
+	require.NotNil(t, got.FirstFailure)
+	assert.Equal(t, "eu", got.FirstFailure.Deployment)
+}
+
+// TestDerive_FirstFailureExcludesRetrying: a failed_retryable deployment is
+// still in progress, so it is not surfaced as a first failure.
+func TestDerive_FirstFailureExcludesRetrying(t *testing.T) {
+	got := Derive([]Operation{
+		rolling("eu", so.Completed),
+		rolling("us", so.FailedRetryable),
+	})
+	assert.Nil(t, got.FirstFailure)
+}

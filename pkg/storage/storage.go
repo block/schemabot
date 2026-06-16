@@ -4,6 +4,7 @@ package storage
 
 import (
 	"context"
+	"time"
 )
 
 // Storage provides access to all stores.
@@ -226,6 +227,21 @@ type ApplyStore interface {
 	// would overlap another active apply for the same database, database type,
 	// and environment.
 	Update(ctx context.Context, apply *Apply) error
+
+	// UpdateDerivedState compare-and-swaps the rollout-projected applies.state.
+	//
+	// It writes only the fields owned by the rollout projection (state,
+	// error_message, completed_at, updated_at) and only when the row still holds
+	// expectedState, so a stale projection computed from an earlier read cannot
+	// clobber a newer state another sibling drive already wrote. If ctx carries
+	// an apply lease the write additionally requires the current lease token.
+	//
+	// swapped=false means the row no longer matched expectedState: the caller's
+	// view is stale, so it must skip apply-level side-effects that assume its
+	// write landed and let the next poll reconcile. A lost lease is returned as
+	// an error (ErrApplyLeaseLost), not swapped=false, so leased callers still
+	// fail closed on ownership changes.
+	UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, completedAt *time.Time) (swapped bool, err error)
 
 	// GetRecent returns the most recent applies across all databases, ordered by creation time desc.
 	// Used by `schemabot status` (no args) to show recent activity.

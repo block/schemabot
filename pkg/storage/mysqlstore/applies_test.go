@@ -907,6 +907,127 @@ func TestApplyStore_UpdateNonExistent(t *testing.T) {
 	require.NoError(t, store.Applies().Update(ctx, apply))
 }
 
+// TestApplyStore_UpdateDerivedState verifies the rollout-projection compare-and-
+// swap: the write lands only when the row still holds the expected state, so a
+// stale projection cannot clobber a newer state another drive already wrote.
+func TestApplyStore_UpdateDerivedState(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_derived_cas", 800, state.Apply.Running, "staging")
+
+	// Matching expected state swaps and writes the projected fields.
+	completedAt := time.Now()
+	swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Failed, "deployment failed", &completedAt)
+	require.NoError(t, err)
+	require.True(t, swapped, "expected state matched, so the swap must land")
+
+	updated, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, updated.State)
+	assert.Equal(t, "deployment failed", updated.ErrorMessage)
+	require.NotNil(t, updated.CompletedAt)
+
+	// A stale expected state misses: the row already moved on, so the write is
+	// skipped and the row is left untouched.
+	swapped, err = store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Completed, "", nil)
+	require.NoError(t, err)
+	assert.False(t, swapped, "expected state no longer matches, so the swap must miss")
+
+	unchanged, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, unchanged.State, "a CAS miss must not overwrite the newer state")
+	assert.Equal(t, "deployment failed", unchanged.ErrorMessage)
+}
+
+// TestApplyStore_UpdateDerivedStateNoOpUnderChangedRows verifies that under
+// production changed-rows semantics a no-op projection write (the steady-state
+// case where the derived state equals the current state) reports a successful
+// swap rather than a false CAS miss, so progress side-effects still fire.
+func TestApplyStore_UpdateDerivedStateNoOpUnderChangedRows(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := newChangedRowsStore(t)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_derived_cas_noop", 802, state.Apply.Running, "staging")
+
+	// Re-deriving the same running state with no other field change is a no-op
+	// that affects zero rows under changed-rows semantics, but the row still
+	// holds the expected state, so the swap is reported as successful.
+	swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Running, state.Apply.Running, "", nil)
+	require.NoError(t, err)
+	assert.True(t, swapped, "a no-op write to a row already in the expected state is an idempotent swap, not a miss")
+
+	// A stale expected state still misses even under changed-rows semantics.
+	swapped, err = store.Applies().UpdateDerivedState(ctx, apply.ID, state.Apply.Pending, state.Apply.Pending, "", nil)
+	require.NoError(t, err)
+	assert.False(t, swapped, "the row is not in the expected state, so the swap must miss")
+}
+
+// TestApplyStore_UpdateDerivedStateLeaseGuard verifies that a leased projection
+// write fails closed on a lost lease (an ownership change the caller must
+// surface) while the current lease holder's matching swap succeeds.
+func TestApplyStore_UpdateDerivedStateLeaseGuard(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_derived_cas_lease", 801, state.Apply.Pending, "staging")
+
+	task := &storage.Task{
+		TaskIdentifier: "task_derived_cas_lease",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Pending,
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `cas_note` varchar(255)",
+		DDLAction:      "alter",
+		Options:        []byte("{}"),
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	taskID, err := store.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+
+	claimed, err := store.Applies().FindNextApply(ctx, "worker-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	// The claim may rotate the persisted state, so read the row to learn the
+	// state the compare-and-swap must expect.
+	leased, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	expectedState := leased.State
+
+	// A stale lease cannot write, even when the expected state matches.
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "worker-old", Token: "stale-token"})
+	_, err = store.Applies().UpdateDerivedState(staleCtx, apply.ID, expectedState, state.Apply.Failed, "stale", nil)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, expectedState, persisted.State, "a lost lease must not write the projection")
+
+	// The current lease holder's matching swap lands.
+	ownedCtx := storage.WithApplyLease(ctx, claimed.Lease())
+	swapped, err := store.Applies().UpdateDerivedState(ownedCtx, apply.ID, expectedState, state.Apply.Failed, "owned failure", nil)
+	require.NoError(t, err)
+	assert.True(t, swapped)
+
+	updated, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, updated.State)
+}
+
 func TestApplyStore_GetInProgress(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

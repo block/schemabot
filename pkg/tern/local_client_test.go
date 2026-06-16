@@ -60,6 +60,19 @@ func (s *exactProgressApplyStore) Update(_ context.Context, apply *storage.Apply
 	return nil
 }
 
+func (s *exactProgressApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, completedAt *time.Time) (bool, error) {
+	if s.err != nil {
+		return false, s.err
+	}
+	if s.apply == nil || !state.IsState(s.apply.State, expectedState) {
+		return false, nil
+	}
+	s.apply.State = newState
+	s.apply.ErrorMessage = errorMessage
+	s.apply.CompletedAt = completedAt
+	return true, nil
+}
+
 // snapshotApplyStore returns a copy of the stored apply on reads and replaces
 // the stored copy on Update, so in-memory mutations to the apply passed into a
 // drive do not leak into the next storage read. This mirrors a real store, where
@@ -92,6 +105,19 @@ func (s *snapshotApplyStore) Update(_ context.Context, apply *storage.Apply) err
 	}
 	s.stored = *apply
 	return nil
+}
+
+func (s *snapshotApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, completedAt *time.Time) (bool, error) {
+	if s.err != nil {
+		return false, s.err
+	}
+	if !state.IsState(s.stored.State, expectedState) {
+		return false, nil
+	}
+	s.stored.State = newState
+	s.stored.ErrorMessage = errorMessage
+	s.stored.CompletedAt = completedAt
+	return true, nil
 }
 
 type exactProgressTaskStore struct {

@@ -87,6 +87,86 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	assert.Contains(t, out, "- ❌ us — failed")
 	assert.Contains(t, out, "- ⏸ au — halted — us failed")
 	assert.Contains(t, out, "<details open>\n<summary>⏸ au — halted — us failed</summary>")
+	// With no error detail on the failed operation, the first-failure line names
+	// the deployment without a reason.
+	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code>\n")
+}
+
+// firstFailingOp builds a rolling, continue-policy operation carrying an error,
+// so a fan-out can fail one deployment and keep going.
+func firstFailingOp(dep, st, errMsg string) presentation.Operation {
+	return presentation.Operation{Deployment: dep, State: st, HaltOnFailure: false, Error: errMsg}
+}
+
+// A failed deployment's reason is lifted to the aggregate header so an operator
+// sees what failed without expanding that deployment's section. Under on_failure
+// continue a later deployment is still copying, so the reason surfaces on the
+// in-progress status comment, and only the first failure in resolved order shows.
+func TestRenderMultiDeploymentApplyComment_FirstFailureSurfacesError(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		firstFailingOp("us", so.Failed, "Error 1061: Duplicate key name idx"),
+		firstFailingOp("eu", so.Failed, "second failure"),
+		{Deployment: "au", State: so.Running, HaltOnFailure: false},
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	// A later deployment is still running even though the aggregate is fail-closed.
+	assert.Contains(t, out, "- 🔄 au — running table copy")
+	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — Error 1061: Duplicate key name idx\n")
+	// Only the earliest failure is lifted to the header.
+	assert.NotContains(t, out, "First failure:** <code>eu</code>")
+}
+
+// A healthy rollout (no failed deployment) renders no first-failure line.
+func TestRenderMultiDeploymentApplyComment_NoFirstFailureWhenHealthy(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Completed),
+		rollingOp("us", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	assert.NotContains(t, out, "First failure:")
+}
+
+// The terminal summary comment surfaces the same first-failure line, and escapes
+// HTML in the error so a failure message can never inject markup.
+func TestRenderMultiDeploymentApplySummaryComment_FirstFailureSurfacesError(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Completed),
+		{Deployment: "us", State: so.Failed, HaltOnFailure: true, Error: "boom <script>"},
+		rollingOp("au", so.Pending),
+	})
+	out := RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — boom &lt;script&gt;\n")
+}
+
+// A deployment name with HTML-significant characters is escaped inside the
+// <code> element, so it renders correctly rather than leaking entities the way
+// an escaped Markdown code span would.
+func TestRenderMultiDeploymentApplyComment_FirstFailureEscapesName(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "us&ca", State: so.Failed, HaltOnFailure: true, Error: "boom"},
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us&amp;ca</code> — boom\n")
 }
 
 // Each deployment's <details> body is rendered by the single-deployment renderer,

@@ -151,6 +151,16 @@ type Apply struct {
 	// NextAction is the suggested next operator action, if any.
 	NextAction NextAction
 
+	// FirstFailure is the first deployment, in resolved order, whose operation
+	// is terminally failed, or nil when no deployment has failed. It is the
+	// rendering counterpart of the persisted aggregate ErrorMessage (which is
+	// also stamped from the first failed operation): surfaces lift the failed
+	// deployment and its error to the aggregate header so an operator sees what
+	// failed without expanding a per-deployment section. Under on_failure
+	// continue this is populated while the aggregate is still running, so the
+	// failure surfaces eagerly rather than only on the terminal comment.
+	FirstFailure *Deployment
+
 	// Deployments are the per-deployment presentations in resolved deployment
 	// order (the order the caller supplies, which mirrors the rollout order).
 	Deployments []Deployment
@@ -181,12 +191,29 @@ func Derive(ops []Operation) Apply {
 
 	aggState := state.DeriveApplyState(rawStates)
 	return Apply{
-		State:       aggState,
-		Label:       aggregateLabel(aggState),
-		Counts:      summaryCounts(deployments),
-		NextAction:  nextAction(aggState, deployments),
-		Deployments: deployments,
+		State:        aggState,
+		Label:        aggregateLabel(aggState),
+		Counts:       summaryCounts(deployments),
+		NextAction:   nextAction(aggState, deployments),
+		FirstFailure: firstFailure(deployments),
+		Deployments:  deployments,
 	}
+}
+
+// firstFailure returns the first deployment, in resolved order, whose raw
+// operation state is terminally failed, or nil when none failed. failed_retryable
+// is excluded: a retrying deployment is still in progress and surfaces no
+// operator-facing failure. The result is a copy, not an alias into Deployments,
+// so a caller that later re-slices or sorts Deployments cannot turn it into a
+// stale pointer.
+func firstFailure(deps []Deployment) *Deployment {
+	for i := range deps {
+		if deps[i].State == state.ApplyOperation.Failed {
+			failed := deps[i]
+			return &failed
+		}
+	}
+	return nil
 }
 
 // deriveDeployment projects operation i, using its earlier siblings for the
