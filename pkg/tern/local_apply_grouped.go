@@ -548,8 +548,12 @@ func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, 
 }
 
 // handleAtomicProgressTick processes a single progress poll tick in atomic mode.
-// Returns true when polling should stop because the apply reached a terminal state
-// or this owner attempt must exit for operator retry.
+// Returns true when this operation's drive should stop polling: the aggregate
+// apply quiesced (terminal or paused for retry), this owner attempt must exit
+// for operator retry, or — under on_failure=continue — this operation's own
+// tasks settled while a sibling holds the apply running. The apply-level
+// wind-down runs only when the aggregate quiesces, not when a single operation
+// finishes ahead of its siblings.
 func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState) bool {
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
 		c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
@@ -825,6 +829,23 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// Notify observer of progress update
 	if obs := c.getObserver(apply.ID); obs != nil {
 		obs.OnProgress(apply, tasks)
+	}
+
+	// Exit this operation's drive once its own tasks have settled, even though
+	// the aggregate apply has not quiesced. The apply-level gate above keys off
+	// the rollout projection: under on_failure=continue a still-in-flight sibling
+	// holds the apply running, so it was skipped. This operation's work is done,
+	// so stop polling and let the operator persist its apply_operation row and
+	// re-derive the parent; the apply-level wind-down (completed_at, metric drop,
+	// observer teardown, stop-request completion) stays with the last sibling to
+	// settle. With one operation per apply the projection equals this operation's
+	// state, so the apply-level gate already fired when it finished and this is
+	// never reached — single-operation behaviour is unchanged.
+	opState := state.DeriveApplyState(taskStates(tasks))
+	if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
+		c.logger.Info("operation settled while apply continues; exiting operation drive",
+			"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "operation_state", opState, "apply_state", apply.State)
+		return true
 	}
 	return false
 }

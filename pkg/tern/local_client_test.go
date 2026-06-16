@@ -60,6 +60,40 @@ func (s *exactProgressApplyStore) Update(_ context.Context, apply *storage.Apply
 	return nil
 }
 
+// snapshotApplyStore returns a copy of the stored apply on reads and replaces
+// the stored copy on Update, so in-memory mutations to the apply passed into a
+// drive do not leak into the next storage read. This mirrors a real store, where
+// a reload reflects the last persisted write rather than uncommitted state.
+type snapshotApplyStore struct {
+	storage.ApplyStore
+	stored storage.Apply
+	err    error
+}
+
+func (s *snapshotApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	cp := s.stored
+	return &cp, nil
+}
+
+func (s *snapshotApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	cp := s.stored
+	return &cp, nil
+}
+
+func (s *snapshotApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.stored = *apply
+	return nil
+}
+
 type exactProgressTaskStore struct {
 	storage.TaskStore
 	tasks []*storage.Task
@@ -1887,6 +1921,78 @@ func TestTasksForOperation(t *testing.T) {
 	require.Len(t, got, 2)
 	assert.Equal(t, "a", got[0].TaskIdentifier)
 	assert.Equal(t, "c", got[1].TaskIdentifier)
+}
+
+// handleAtomicProgressTick must separate "this operation is done" from "the
+// apply should quiesce". Under on_failure=continue an operation whose own tasks
+// have settled exits its drive while a still-pending sibling holds the apply
+// running, so the apply-level wind-down (completed_at, observer teardown, metric
+// drop) is deferred to the last sibling. With one operation per apply the
+// aggregate equals the operation's own state, so finishing the operation
+// quiesces the apply exactly as before.
+func TestHandleAtomicProgressTickOperationGate(t *testing.T) {
+	const currentOpID = int64(1)
+
+	newApply := func() *storage.Apply {
+		return &storage.Apply{
+			ID:              7,
+			ApplyIdentifier: "apply-op-gate",
+			Database:        "testdb",
+			State:           state.Apply.Running,
+			Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		}
+	}
+	completedEngine := func() *fakeControlEngine {
+		return &fakeControlEngine{progressResult: &engine.ProgressResult{
+			State:  engine.StateCompleted,
+			Tables: []engine.TableProgress{{Namespace: "testdb", Table: "users", State: state.Task.Completed, Progress: 100}},
+		}}
+	}
+	runTick := func(t *testing.T, apply *storage.Apply, ops []*storage.ApplyOperation) (bool, *storage.Apply) {
+		t.Helper()
+		opID := currentOpID
+		tasks := []*storage.Task{{
+			TaskIdentifier:   "task-users",
+			ApplyID:          apply.ID,
+			ApplyOperationID: &opID,
+			State:            state.Task.Running,
+			TableName:        "users",
+			Namespace:        "testdb",
+		}}
+		stor := &exactProgressStorage{
+			applies:         &snapshotApplyStore{stored: *apply},
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &listApplyOperationStore{ops: ops},
+		}
+		client := &LocalClient{storage: stor, logger: slog.Default()}
+		ps := &atomicPollState{lastProgressLog: time.Now()}
+		done := client.handleAtomicProgressTick(t.Context(), completedEngine(), apply, tasks, &engine.Credentials{}, nil, ps)
+		return done, apply
+	}
+
+	// A completed operation with a still-pending continue sibling exits its drive
+	// but must not terminalize the apply or stamp completed_at.
+	t.Run("operation completes while sibling holds the apply running", func(t *testing.T) {
+		done, apply := runTick(t, newApply(), []*storage.ApplyOperation{
+			{ID: currentOpID, State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue},
+			{ID: 2, State: state.ApplyOperation.Pending, OnFailure: storage.OnFailureContinue},
+		})
+		assert.True(t, done, "operation drive must exit once its own tasks are terminal")
+		assert.False(t, state.IsTerminalApplyState(apply.State), "the apply must stay non-terminal while the sibling is in flight, got %q", apply.State)
+		assert.Nil(t, apply.CompletedAt, "the apply-level wind-down must not stamp completed_at for a finished operation")
+	})
+
+	// With one operation per apply the aggregate equals the operation's state, so
+	// the apply-level gate fires and terminalizes the apply as before.
+	t.Run("single operation terminalizes the apply", func(t *testing.T) {
+		done, apply := runTick(t, newApply(), []*storage.ApplyOperation{
+			{ID: currentOpID, State: state.ApplyOperation.Running},
+		})
+		assert.True(t, done, "polling must stop when the apply quiesces")
+		assert.Equal(t, state.Apply.Completed, apply.State, "a single-operation apply terminalizes when its operation completes")
+		assert.NotNil(t, apply.CompletedAt, "a completed apply stamps completed_at")
+	})
 }
 
 // capturedLog records a single emitted log record's level, message, and
