@@ -458,11 +458,15 @@ type EtreCredentialsConfig struct {
 	Username    string `yaml:"username,omitempty"`
 	PasswordRef string `yaml:"password_ref,omitempty"`
 
-	// awssm backend: assume a per-target IAM role and read a JSON
-	// {username, password} secret from AWS Secrets Manager. RoleARN may carry an
-	// {account} placeholder and SecretName a {target} placeholder; ExternalID is
-	// an optional STS external id; AccountAttribute names the entity attribute
-	// holding the target's AWS account id (defaults to aws_account_id).
+	// awssm backend: read a secret from AWS Secrets Manager and parse it as a JSON
+	// {username, password} payload (or, for engines like Vitess, a token decoded
+	// by the assembler). SecretName may carry {target} and {attribute} placeholders
+	// to locate per-target or per-cluster secrets. RoleARN is optional: when set,
+	// the backend assumes a per-target role (carrying an {account} placeholder) so
+	// one data plane can read secrets across accounts, and AccountAttribute names
+	// the entity attribute holding the target's AWS account id (defaults to
+	// aws_account_id); when empty, secrets are read from the caller's own account.
+	// ExternalID is an optional STS external id used only with RoleARN.
 	Region           string `yaml:"region,omitempty"`
 	RoleARN          string `yaml:"role_arn,omitempty"`
 	ExternalID       string `yaml:"external_id,omitempty"`
