@@ -2,9 +2,12 @@ package client
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 
+	"github.com/block/spirit/pkg/utils"
 	"gopkg.in/yaml.v3"
 )
 
@@ -17,6 +20,10 @@ type Config struct {
 // Profile represents a named configuration profile.
 type Profile struct {
 	Endpoint string `yaml:"endpoint"`
+	// Token is the cached Bearer token for this profile's endpoint, written by
+	// `schemabot login`. Scoping it to a profile keeps a token bound to the
+	// server it was issued for, so it is never sent to a different endpoint.
+	Token string `yaml:"token,omitempty"`
 }
 
 // ConfigPath returns the path to the config file (~/.schemabot/config.yaml).
@@ -36,24 +43,72 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	data, err := os.ReadFile(path)
+	// Open once and read the permission bits from the same file descriptor we
+	// read the token from, so the credential check below applies to the exact
+	// file loaded — not a different file swapped in between a separate stat and
+	// read.
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &Config{Profiles: make(map[string]Profile)}, nil
 		}
-		return nil, fmt.Errorf("read config: %w", err)
+		return nil, fmt.Errorf("open config %s: %w", path, err)
+	}
+	defer utils.CloseAndLog(f)
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat config %s: %w", path, err)
+	}
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
 
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
 	if cfg.Profiles == nil {
 		cfg.Profiles = make(map[string]Profile)
 	}
 
+	// A config that caches a token is a credential file: refuse to use it if it
+	// is accessible by other users, so a leaked-permission token fails closed.
+	if configHasToken(&cfg) {
+		if err := requireSecureConfigMode(path, info.Mode()); err != nil {
+			return nil, err
+		}
+	}
+
 	return &cfg, nil
+}
+
+// configHasToken reports whether any profile carries a cached token.
+func configHasToken(cfg *Config) bool {
+	for _, p := range cfg.Profiles {
+		if p.Token != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// requireSecureConfigMode verifies the config file is not readable or writable
+// by group or other users. The mode comes from an fstat on the open file the
+// token was read from, so the check applies to that exact file. On Windows the
+// reported mode is synthetic, so file ACLs are relied on instead and the check
+// is skipped.
+func requireSecureConfigMode(path string, mode os.FileMode) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	if perm := mode.Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("config file %s caches a token but is accessible by other users (mode %#o); restrict it with: chmod 600 %s", path, perm, path)
+	}
+	return nil
 }
 
 // SaveConfig saves the configuration to ~/.schemabot/config.yaml.
@@ -154,13 +209,40 @@ func ResolveEndpointWithProfile(endpointFlag, profileFlag string, configEndpoint
 // ResolveToken returns the Bearer token to authenticate with, checking in order:
 // 1. Explicit --token flag
 // 2. SCHEMABOT_TOKEN environment variable
+// 3. Cached token on the resolved profile (from `schemabot login`)
 // An empty result means no token is configured, which is correct against a
 // server with auth disabled.
-func ResolveToken(tokenFlag string) string {
+//
+// A cached profile token is bound to the endpoint it was issued for. The
+// endpoint override (--endpoint flag or SCHEMABOT_ENDPOINT) is passed in so the
+// profile token is attached only when the request is actually going to that
+// profile's endpoint: an override pointing elsewhere must never receive a token
+// issued for a different server. An explicit --token / SCHEMABOT_TOKEN always
+// wins, since the caller is supplying a credential for whatever endpoint they
+// chose.
+func ResolveToken(tokenFlag, endpointFlag, profileFlag string) (string, error) {
 	if tokenFlag != "" {
-		return tokenFlag
+		return tokenFlag, nil
 	}
-	return os.Getenv("SCHEMABOT_TOKEN")
+	if env := os.Getenv("SCHEMABOT_TOKEN"); env != "" {
+		return env, nil
+	}
+	profile, err := GetProfile(profileFlag)
+	if err != nil {
+		return "", err
+	}
+	if profile.Token == "" {
+		return "", nil
+	}
+
+	endpointOverride := endpointFlag
+	if endpointOverride == "" {
+		endpointOverride = os.Getenv("SCHEMABOT_ENDPOINT")
+	}
+	if endpointOverride != "" && trimSlash(endpointOverride) != trimSlash(profile.Endpoint) {
+		return "", nil
+	}
+	return profile.Token, nil
 }
 
 func trimSlash(s string) string {
