@@ -7,6 +7,10 @@ on:
       - master
       - main
   pull_request:
+  # Run in the merge queue so the full suite gates merges. Required for the
+  # planned PR-smoke / queue-full e2e split. Inert until a repo admin enables
+  # the merge queue in branch protection.
+  merge_group:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
