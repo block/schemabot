@@ -883,7 +883,7 @@ func TestLaunchAtomicResumeSaveFailureStaysRecoverable(t *testing.T) {
 	}
 	client, apply, tasks, plan, applyStore := reattachResumeFixture(store, applyResult)
 
-	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, buildApplyOptions(apply), "Recovering from checkpoint", false, false)
+	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, apply.GetOptions().Map(), "Recovering from checkpoint", false, false, false)
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
@@ -914,7 +914,7 @@ func TestLaunchAtomicResumeMissingMetadataStaysRecoverable(t *testing.T) {
 	}
 	client, apply, tasks, plan, applyStore := reattachResumeFixture(store, applyResult)
 
-	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, buildApplyOptions(apply), "Recovering from checkpoint", false, false)
+	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, apply.GetOptions().Map(), "Recovering from checkpoint", false, false, false)
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errGroupedResumeStateUnavailable)
@@ -1092,7 +1092,7 @@ func TestLocalClient_ProcessPendingStartControlRequestWaitsForPendingStop(t *tes
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingStartControlRequest(t.Context(), apply)
+	handled, err := client.processPendingStartControlRequest(t.Context(), apply, apply.GetOptions().Map(), false)
 	require.NoError(t, err)
 	assert.False(t, handled)
 	assert.Equal(t, 0, fakeEngine.startCount, "pending stop must win before start is processed")
@@ -1142,7 +1142,7 @@ func TestLocalClient_ProcessPendingStartControlRequestStartsDeferredDeploy(t *te
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingStartControlRequest(t.Context(), apply)
+	handled, err := client.processPendingStartControlRequest(t.Context(), apply, apply.GetOptions().Map(), false)
 	require.NoError(t, err)
 	assert.True(t, handled)
 	assert.Equal(t, 1, fakeEngine.startCount)
@@ -2227,7 +2227,7 @@ func TestHandleAtomicProgressTickOperationGate(t *testing.T) {
 		}
 		client := &LocalClient{storage: stor, logger: slog.Default()}
 		ps := &atomicPollState{lastProgressLog: time.Now()}
-		done := client.handleAtomicProgressTick(t.Context(), completedEngine(), apply, tasks, &engine.Credentials{}, nil, ps)
+		done := client.handleAtomicProgressTick(t.Context(), completedEngine(), apply, tasks, &engine.Credentials{}, nil, ps, apply.GetOptions().Map(), false)
 		return done, apply
 	}
 
@@ -2252,6 +2252,66 @@ func TestHandleAtomicProgressTickOperationGate(t *testing.T) {
 		assert.True(t, done, "polling must stop when the apply quiesces")
 		assert.Equal(t, state.Apply.Completed, apply.State, "a single-operation apply terminalizes when its operation completes")
 		assert.NotNil(t, apply.CompletedAt, "a completed apply stamps completed_at")
+	})
+}
+
+// Under an ordered-cutover policy a multi-deployment operation runs its copy
+// phase and then parks at the barrier: the copy drive must exit (release the
+// claim) so the operator can persist the operation row at waiting_for_cutover
+// and the deployment-ordered cutover claim can drive the swap later. A drive
+// that is not releasing at the barrier (single-op / manual --defer-cutover)
+// keeps polling and holds the claim for a manual cutover.
+func TestHandleAtomicProgressTickReleasesAtCutoverBarrier(t *testing.T) {
+	newApply := func() *storage.Apply {
+		return &storage.Apply{
+			ID:              9,
+			ApplyIdentifier: "apply-barrier-park",
+			Database:        "testdb",
+			State:           state.Apply.Running,
+			Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		}
+	}
+	waitingForCutoverEngine := func() *fakeControlEngine {
+		return &fakeControlEngine{progressResult: &engine.ProgressResult{
+			State:  engine.StateWaitingForCutover,
+			Tables: []engine.TableProgress{{Namespace: "testdb", Table: "users", State: state.Task.WaitingForCutover, Progress: 100}},
+		}}
+	}
+	runTick := func(t *testing.T, releaseAtCutoverBarrier bool) (bool, *storage.Apply) {
+		t.Helper()
+		apply := newApply()
+		opID := int64(1)
+		tasks := []*storage.Task{{
+			TaskIdentifier:   "task-users",
+			ApplyID:          apply.ID,
+			ApplyOperationID: &opID,
+			State:            state.Task.Running,
+			TableName:        "users",
+			Namespace:        "testdb",
+		}}
+		stor := &exactProgressStorage{
+			applies:         &snapshotApplyStore{stored: *apply},
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &listApplyOperationStore{ops: []*storage.ApplyOperation{{ID: opID, State: state.ApplyOperation.Running}}},
+		}
+		client := &LocalClient{storage: stor, logger: slog.Default()}
+		ps := &atomicPollState{lastProgressLog: time.Now()}
+		done := client.handleAtomicProgressTick(t.Context(), waitingForCutoverEngine(), apply, tasks, &engine.Credentials{}, nil, ps, apply.GetOptions().Map(), releaseAtCutoverBarrier)
+		return done, apply
+	}
+
+	t.Run("barrier auto-park exits the drive without terminalizing", func(t *testing.T) {
+		done, apply := runTick(t, true)
+		assert.True(t, done, "the copy drive must exit so the operation can be persisted parked")
+		assert.False(t, state.IsTerminalApplyState(apply.State), "a parked operation must not terminalize the apply, got %q", apply.State)
+		assert.Nil(t, apply.CompletedAt, "a parked operation must not stamp completed_at")
+	})
+
+	t.Run("manual defer keeps polling for a manual cutover", func(t *testing.T) {
+		done, apply := runTick(t, false)
+		assert.False(t, done, "a manual --defer-cutover drive must keep polling for a manual cutover")
+		assert.Nil(t, apply.CompletedAt, "waiting for cutover must not stamp completed_at")
 	})
 }
 

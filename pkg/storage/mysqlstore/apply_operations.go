@@ -637,6 +637,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStop, storage.ControlRequestPending)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
+	// Stale-active barrier-park exemption (see the staleness clause below): a
+	// multi-deployment operation parked at the cutover barrier under the barrier
+	// policy is reserved for the deployment-ordered cutover claim, so the copy
+	// claim must not re-lease it as stale-active work. A single-operation apply
+	// has no sibling and is never exempted, so manual --defer-cutover behaviour
+	// is unchanged.
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.WaitingForCutover, storage.CutoverPolicyBarrier)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
@@ -716,7 +724,20 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 				)
 			)
-			OR (state IN (%s) AND updated_at < NOW() - INTERVAL %s)
+			OR (
+				state IN (%s)
+				AND updated_at < NOW() - INTERVAL %s
+				AND NOT (
+					state = ?
+					AND cutover_policy = ?
+					AND EXISTS (
+						SELECT 1
+						FROM apply_operations AS sibling
+						WHERE sibling.apply_id = apply_operations.apply_id
+							AND sibling.id <> apply_operations.id
+					)
+				)
+			)
 			OR (
 				state = ?
 				AND EXISTS (

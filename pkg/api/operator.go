@@ -1020,6 +1020,16 @@ func (s *Service) persistOperationState(ctx context.Context, workerID int, op *s
 			return false, fmt.Errorf("update failed_retryable apply_operation %d state (deployment %q): %w", op.ID, op.Deployment, err)
 		}
 		return true, nil
+	case state.IsState(derived, state.Apply.WaitingForCutover):
+		// Under an ordered-cutover policy the copy drive parks a deployment at the
+		// barrier and releases it: persist waiting_for_cutover (completed_at nil,
+		// the work is not done) so the row is durable and the deployment-ordered
+		// cutover claim picks it up later. Without this the row would fall through
+		// to the "leave claimable" default and the copy claim would re-drive it.
+		if err := opStore.UpdateState(ctx, op.ID, derived); err != nil {
+			return false, fmt.Errorf("update waiting_for_cutover apply_operation %d state (deployment %q): %w", op.ID, op.Deployment, err)
+		}
+		return true, nil
 	case state.IsTerminalApplyState(derived):
 		// cancelled / reverted — non-resumable terminal states; stamp completed_at.
 		if err := opStore.MarkTerminal(ctx, op.ID, derived); err != nil {

@@ -228,8 +228,13 @@ func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply,
 	fn()
 }
 
-func groupedApplyMode(apply *storage.Apply) string {
-	opts := apply.GetOptions()
+// groupedApplyMode classifies the grouped-apply strategy for a drive. It reads
+// DeferCutover from the effective options map (which may carry an automatic
+// barrier-park decision, see effectiveCopyDriveOptions) rather than from
+// apply.GetOptions(), so an operation-scoped copy drive that must park at the
+// cutover barrier takes the atomic-cutover path.
+func groupedApplyMode(apply *storage.Apply, options map[string]string) string {
+	opts := storage.ApplyOptionsFromMap(options)
 	switch {
 	case apply.DatabaseType == storage.DatabaseTypeMySQL && opts.DeferCutover:
 		return "spirit_atomic_cutover"
@@ -240,8 +245,8 @@ func groupedApplyMode(apply *storage.Apply) string {
 	}
 }
 
-func groupedApplyModeDescription(apply *storage.Apply) string {
-	switch groupedApplyMode(apply) {
+func groupedApplyModeDescription(apply *storage.Apply, options map[string]string) string {
+	switch groupedApplyMode(apply, options) {
 	case "spirit_atomic_cutover":
 		return "Spirit atomic cutover"
 	case "vitess_deploy_request":
@@ -251,11 +256,11 @@ func groupedApplyModeDescription(apply *storage.Apply) string {
 	}
 }
 
-func (c *LocalClient) usesGroupedApply(apply *storage.Apply) bool {
+func (c *LocalClient) usesGroupedApply(apply *storage.Apply, options map[string]string) bool {
 	if apply.DatabaseType == storage.DatabaseTypeVitess {
 		return true
 	}
-	return apply.DatabaseType == storage.DatabaseTypeMySQL && apply.GetOptions().DeferCutover
+	return apply.DatabaseType == storage.DatabaseTypeMySQL && storage.ApplyOptionsFromMap(options).DeferCutover
 }
 
 func (c *LocalClient) setApplyCancel(cancel context.CancelFunc) uint64 {
@@ -292,18 +297,18 @@ func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
 	c.cancelMu.Unlock()
 }
 
-func (c *LocalClient) startApplyExecution(ctx context.Context, cancelGeneration uint64, cancel context.CancelFunc, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+func (c *LocalClient) startApplyExecution(ctx context.Context, cancelGeneration uint64, cancel context.CancelFunc, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
 	go func() {
 		defer c.clearApplyCancel(cancelGeneration)
 		defer cancel()
-		c.runApplyExecution(ctx, apply, tasks, plan, options)
+		c.runApplyExecution(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
 	}()
 }
 
-func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
-	if c.usesGroupedApply(apply) {
+func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+	if c.usesGroupedApply(apply, options) {
 		c.runWithRecovery(ctx, apply, tasks, func() {
-			c.executeGroupedApply(ctx, apply, tasks, plan, options)
+			c.executeGroupedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
 		})
 		return
 	}

@@ -1395,7 +1395,10 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// Start apply in background with cancellable context (Stop() cancels this)
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
 	cancelGeneration := c.setApplyCancel(cancelApply)
-	c.startApplyExecution(applyCtx, cancelGeneration, cancelApply, apply, tasks, plan, options)
+	// A fresh dispatch (including a remote gRPC drive) has no operation context,
+	// so it never auto-parks at the cutover barrier; ordered-cutover parking is
+	// driven by the operator's operation-scoped resume path.
+	c.startApplyExecution(applyCtx, cancelGeneration, cancelApply, apply, tasks, plan, options, false)
 
 	return &ternv1.ApplyResponse{
 		Accepted: true,

@@ -1597,6 +1597,106 @@ func TestApplyOperationStore_FindNextApplyOperation_BarrierHaltsOnFailedSibling(
 	assert.Nil(t, claimed, "barrier must still halt the rollout on a failed earlier deployment")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_SkipsStaleMultiOpBarrierParked
+// verifies the copy claim does NOT re-lease a multi-deployment operation parked
+// at the cutover barrier, even once its heartbeat goes stale: that row is
+// reserved for the deployment-ordered cutover claim. Without the exemption the
+// copy claim would re-drive a parked deployment and loop.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsStaleMultiOpBarrierParked(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_barrier_parked_skip", 1)
+
+	parkedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	// A completed sibling makes this a multi-operation apply without leaving any
+	// other claimable (pending) row, so the parked row is the only candidate.
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b",
+		State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	// Backdate the parked row past the staleness window so only the new
+	// barrier-park exemption — not freshness — keeps it from being re-claimed.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, parkedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "the copy claim must not re-lease a parked multi-op barrier deployment")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleSingleOpBarrierParked
+// verifies the exemption is scoped to multi-deployment applies: a single-op
+// barrier apply (no sibling) parked at the cutover barrier is still re-claimed
+// when stale, preserving manual --defer-cutover crash-recovery behaviour.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleSingleOpBarrierParked(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_barrier_parked_single", 1)
+
+	parkedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, parkedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a single-op barrier apply has no sibling, so a stale parked row is still recoverable")
+	assert.Equal(t, parkedID, claimed.ID)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleMultiOpRollingParked
+// verifies the exemption is scoped to the barrier policy: a multi-op rolling
+// deployment that is stale at waiting_for_cutover is still re-claimed by the
+// copy claim, because rolling drives copy and cutover inline.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleMultiOpRollingParked(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_rolling_parked", 1)
+
+	// Default (rolling) policy: leave CutoverPolicy unset so it resolves to rolling.
+	parkedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.WaitingForCutover,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.Completed,
+	})
+	require.NoError(t, err)
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, parkedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "rolling drives cutover inline, so a stale parked row is still recoverable")
+	assert.Equal(t, parkedID, claimed.ID)
+}
+
 // --- FindNextApplyOperationCutover (OC-1): the cutover-claim predicate ---
 //
 // These tests pin the cutover gate, the counterpart to the copy gate above.

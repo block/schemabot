@@ -3303,7 +3303,7 @@ func TestLocalClient_AtomicRetryableFailureQueuesOperatorRetry(t *testing.T) {
 	// The engine reports a failed result with Retryable=true. The local Tern
 	// worker should stop this attempt, keep the apply non-terminal, and leave
 	// already-completed task work untouched for the operator retry.
-	client.pollForCompletionAtomic(ctx, apply, tasks, &engine.Credentials{DSN: dsn}, nil)
+	client.pollForCompletionAtomic(ctx, apply, tasks, &engine.Credentials{DSN: dsn}, nil, apply.GetOptions().Map(), false)
 
 	failedApply, err := stor.Applies().Get(ctx, applyID)
 	require.NoError(t, err)

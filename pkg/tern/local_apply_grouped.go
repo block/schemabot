@@ -15,12 +15,12 @@ import (
 
 // executeGroupedApply runs all DDLs in one engine operation. For Spirit with
 // defer_cutover, this is atomic cutover; for Vitess, this is one deploy request.
-func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
 	ctx, cancelApply := context.WithCancel(ctx)
 	defer cancelApply()
 	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
-	mode := groupedApplyMode(apply)
-	modeDescription := groupedApplyModeDescription(apply)
+	mode := groupedApplyMode(apply, options)
+	modeDescription := groupedApplyModeDescription(apply, options)
 
 	// Extract all DDLs and table names from tasks
 	ddl := make([]string, len(tasks))
@@ -233,7 +233,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		fmt.Sprintf("All %d tables started copying in parallel", len(tasks)), state.Apply.Pending, apply.State)
 
 	// Poll for completion - all tasks share the same state
-	c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState)
+	c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 }
 
 func (c *LocalClient) saveEngineResumeState(ctx context.Context, tasks []*storage.Task, resumeState *engine.ResumeState) error {
@@ -508,7 +508,7 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 // Each table copies and cuts over independently.
 
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
-func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) {
+func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) {
 	eng := c.getEngine()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -520,7 +520,7 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps); done {
+			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps, options, releaseAtCutoverBarrier); done {
 				return
 			}
 		}
@@ -554,7 +554,7 @@ func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, 
 // tasks settled while a sibling holds the apply running. The apply-level
 // wind-down runs only when the aggregate quiesces, not when a single operation
 // finishes ahead of its siblings.
-func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState) bool {
+func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState, options map[string]string, releaseAtCutoverBarrier bool) bool {
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
 		c.logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "error", err)
@@ -643,7 +643,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		return true
 	}
 
-	opts := apply.GetOptions()
+	opts := storage.ApplyOptionsFromMap(options)
 	controlReq := &engine.ControlRequest{
 		Database:    apply.Database,
 		Credentials: creds,
@@ -682,8 +682,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
-	// Timeout: cancel the apply if waiting for manual cutover too long.
-	if result.State == engine.StateWaitingForCutover && opts.DeferCutover &&
+	// Timeout: cancel the apply if waiting for manual cutover too long. An
+	// operation parking at the barrier under an ordered-cutover policy is exempt:
+	// it releases the copy drive below for the deployment-ordered cutover claim
+	// to pick up later, so it must not be cancelled for "inaction".
+	if result.State == engine.StateWaitingForCutover && opts.DeferCutover && !releaseAtCutoverBarrier &&
 		!ps.stateEnteredAt.IsZero() && time.Since(ps.stateEnteredAt) > waitingForManualActionTimeout {
 		c.logger.Info("waiting-for-cutover timed out, cancelling apply",
 			"apply_id", apply.ApplyIdentifier, "timeout", waitingForManualActionTimeout)
@@ -810,13 +813,13 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		switch {
 		case retryableFailure:
 			c.logger.Warn("apply paused for operator retry",
-				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
+				"mode", groupedApplyMode(apply, options), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
 		case state.IsState(apply.State, state.Apply.Failed):
 			c.logger.Error("apply failed",
-				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
+				"mode", groupedApplyMode(apply, options), "apply_id", apply.ApplyIdentifier, "error", apply.ErrorMessage, "task_count", len(tasks))
 		default:
 			c.logger.Info("apply completed",
-				"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "state", apply.State, "task_count", len(tasks))
+				"mode", groupedApplyMode(apply, options), "apply_id", apply.ApplyIdentifier, "state", apply.State, "task_count", len(tasks))
 		}
 		eventMessage := fmt.Sprintf("Apply completed with state: %s", apply.State)
 		if retryableFailure {
@@ -868,9 +871,22 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// state, so the apply-level gate already fired when it finished and this is
 	// never reached — single-operation behaviour is unchanged.
 	opState := state.DeriveApplyState(taskStates(tasks))
+	// Park-and-release at the cutover barrier. Under an ordered-cutover policy a
+	// multi-deployment operation runs its copy phase and then stops at
+	// waiting_for_cutover instead of holding the claim for a manual cutover: the
+	// drive exits so the operator persists the operation row at
+	// waiting_for_cutover (completed_at nil) and frees it for the
+	// deployment-ordered cutover claim. releaseAtCutoverBarrier is set only for
+	// multi-operation barrier operations, so single-operation drives (including
+	// manual --defer-cutover) keep waiting for a manual cutover unchanged.
+	if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
+		c.logger.Info("operation parked at cutover barrier; exiting copy drive",
+			"mode", groupedApplyMode(apply, options), "apply_id", apply.ApplyIdentifier, "operation_state", opState, "apply_state", apply.State)
+		return true
+	}
 	if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
 		c.logger.Info("operation settled while apply continues; exiting operation drive",
-			"mode", groupedApplyMode(apply), "apply_id", apply.ApplyIdentifier, "operation_state", opState, "apply_state", apply.State)
+			"mode", groupedApplyMode(apply, options), "apply_id", apply.ApplyIdentifier, "operation_state", opState, "apply_state", apply.State)
 		return true
 	}
 	return false

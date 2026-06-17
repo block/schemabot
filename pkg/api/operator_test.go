@@ -427,6 +427,47 @@ func TestMarkOperationFromOwnResult_LeavesNonTerminalClaimable(t *testing.T) {
 	assert.False(t, opStore.called, "no terminal write should occur for a non-terminal operation")
 }
 
+// updateStateRecordingApplyOperationStore records UpdateState so a test can
+// assert a parked operation is persisted at waiting_for_cutover (completed_at nil).
+type updateStateRecordingApplyOperationStore struct {
+	storage.ApplyOperationStore
+	called       bool
+	updatedID    int64
+	updatedState string
+}
+
+func (s *updateStateRecordingApplyOperationStore) UpdateState(_ context.Context, id int64, newState string) error {
+	s.called = true
+	s.updatedID = id
+	s.updatedState = newState
+	return nil
+}
+
+// TestMarkOperationFromOwnResult_PersistsWaitingForCutover verifies that an
+// operation whose own tasks have parked at the cutover barrier is durably
+// recorded at waiting_for_cutover via UpdateState (not a terminal write), so the
+// row survives the copy drive's release and the deployment-ordered cutover claim
+// can pick it up later.
+func TestMarkOperationFromOwnResult_PersistsWaitingForCutover(t *testing.T) {
+	opStore := &updateStateRecordingApplyOperationStore{}
+	taskStore := &stubTaskStore{tasks: []*storage.Task{
+		{State: state.Task.WaitingForCutover},
+		{State: state.Task.WaitingForCutover},
+	}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithTasksAndOperations{tasks: taskStore, applyOps: opStore}, testServerConfig(), nil, logger)
+
+	op := &storage.ApplyOperation{ID: 13, Deployment: "region-d", CutoverPolicy: storage.CutoverPolicyBarrier}
+
+	marked, err := svc.markOperationFromOwnResult(t.Context(), 1, op)
+	require.NoError(t, err)
+	assert.True(t, marked, "a parked operation must be durably recorded so the copy claim does not re-drive it")
+	assert.True(t, opStore.called, "the operation row must be updated to waiting_for_cutover from its own tasks")
+	assert.Equal(t, int64(13), opStore.updatedID)
+	assert.True(t, state.IsState(opStore.updatedState, state.Apply.WaitingForCutover),
+		"the parked operation must be persisted at waiting_for_cutover, got %q", opStore.updatedState)
+}
+
 // TestUpdateApplyStateFromOperations_StampsAggregateFailureMessage verifies that
 // when the rollout settles to failed the parent apply's ErrorMessage is surfaced
 // from the first failed operation, not from the last-driven (here, successful)

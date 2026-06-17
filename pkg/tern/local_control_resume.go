@@ -212,7 +212,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	}, nil
 }
 
-func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, apply *storage.Apply, options map[string]string, releaseAtCutoverBarrier bool) (bool, error) {
 	controlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
 		return false, err
@@ -270,7 +270,7 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 		"environment", apply.Environment,
 		"requested_by", controlRequestCaller(controlReq),
 		"state", apply.State)
-	c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState)
+	c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState, options, releaseAtCutoverBarrier)
 	return true, ctx.Err()
 }
 
@@ -432,11 +432,6 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 	return &replanResult{ActiveTasks: activeTasks, CompletedCount: completedCount}, nil
 }
 
-// buildApplyOptions converts apply options to the string map used by the engine.
-func buildApplyOptions(apply *storage.Apply) map[string]string {
-	return apply.GetOptions().Map()
-}
-
 // prepareRetryableTasksForResume queues only the task work that previously
 // stopped on a retryable engine failure. Completed tasks remain completed, and
 // pending tasks remain queued behind the retried work.
@@ -516,7 +511,7 @@ func (c *LocalClient) markApplyRecovering(ctx context.Context, apply *storage.Ap
 // retry-waiting state; user start calls poll in the background and returns
 // after the engine accepts the resume.
 func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.Apply,
-	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string, block bool, startRequested bool) error {
+	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string, block bool, startRequested bool, releaseAtCutoverBarrier bool) error {
 
 	allTasks := tasks
 	eng := c.getEngine()
@@ -656,7 +651,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		defer cancelPoll()
 		stopHeartbeat := c.startApplyHeartbeat(pollCtx, apply, cancelPoll)
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState)
+		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 		return nil
 	}
 
@@ -665,7 +660,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	go func() {
 		defer cancelResume()
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState)
+		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 	}()
 	return nil
 }
@@ -780,7 +775,9 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	if err != nil {
 		return fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	return c.resumeApplyWithTasks(ctx, apply, tasks)
+	// Whole-apply scope has no single operation to order, so the stored apply
+	// options govern the drive directly (no automatic barrier park).
+	return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false)
 }
 
 // ResumeApplyOperation starts or resumes a single apply_operation (one
@@ -800,13 +797,31 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	if len(tasks) == 0 {
 		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 	}
-	return c.resumeApplyWithTasks(ctx, apply, tasks)
+	op, err := c.storage.ApplyOperations().Get(ctx, applyOperationID)
+	if err != nil {
+		return fmt.Errorf("get apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
+	}
+	if op == nil {
+		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
+	}
+	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	multiOperation := len(siblings) > 1
+	// A multi-deployment barrier operation auto-defers its cutover and parks
+	// (releases) the copy drive at the barrier; the deployment-ordered cutover
+	// claim drives the swap later. Single-operation or rolling drives are
+	// unchanged.
+	releaseAtCutoverBarrier := shouldAutoDeferCutover(multiOperation, op)
+	options := effectiveCopyDriveOptions(apply, multiOperation, op).Map()
+	return c.resumeApplyWithTasks(ctx, apply, tasks, options, releaseAtCutoverBarrier)
 }
 
 // resumeApplyWithTasks drives an apply (or one of its operations) from the set
 // of tasks the caller has loaded. Callers choose whether tasks are scoped to the
 // whole apply or to a single operation.
-func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
+func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool) error {
 	if len(tasks) == 0 {
 		c.logger.Warn("no tasks found for apply, marking as failed",
 			"apply_id", apply.ApplyIdentifier)
@@ -822,7 +837,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); handled || err != nil {
 		return err
 	}
-	if handled, err := c.processPendingStartControlRequest(ctx, apply); handled || err != nil {
+	if handled, err := c.processPendingStartControlRequest(ctx, apply, options, releaseAtCutoverBarrier); handled || err != nil {
 		return err
 	}
 
@@ -842,7 +857,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	if state.IsState(apply.State, state.Apply.Pending) && apply.StartedAt == nil {
-		c.dispatchQueuedApply(ctx, apply, tasks, plan)
+		c.dispatchQueuedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
 		return ctx.Err()
 	}
 
@@ -873,12 +888,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				if err := c.markApplyRecovering(ctx, apply, tasks); err != nil {
 					return err
 				}
-				options := buildApplyOptions(apply)
 				resumeCtx, cancelResume := context.WithCancel(ctx)
 				cancelGeneration := c.setApplyCancel(cancelResume)
 				defer c.clearApplyCancel(cancelGeneration)
 				defer cancelResume()
-				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering from checkpoint", true, false); err != nil {
+				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering from checkpoint", true, false, releaseAtCutoverBarrier); err != nil {
 					if errors.Is(err, errGroupedResumeStateUnavailable) {
 						c.logger.Warn("deferred cutover recovery could not load persisted engine resume state; current apply owner will exit for operator retry",
 							"apply_id", apply.ApplyIdentifier,
@@ -953,14 +967,12 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
 	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
 
-	options := buildApplyOptions(apply)
-
-	if c.usesGroupedApply(apply) {
+	if c.usesGroupedApply(apply, options) {
 		resumeCtx, cancelResume := context.WithCancel(ctx)
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
-		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply)), true, startRequested); err != nil {
+		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply, options)), true, startRequested, releaseAtCutoverBarrier); err != nil {
 			if errors.Is(err, errGroupedResumeStateUnavailable) {
 				c.logger.Warn("grouped resume could not load persisted engine resume state; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier,
@@ -1027,8 +1039,7 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	return err
 }
 
-func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) {
-	options := buildApplyOptions(apply)
+func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
 	applyCtx, cancelApply := context.WithCancel(ctx)
 	cancelGeneration := c.setApplyCancel(cancelApply)
 	defer c.clearApplyCancel(cancelGeneration)
@@ -1041,5 +1052,5 @@ func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Ap
 		"task_count", len(tasks),
 	)
 
-	c.runApplyExecution(applyCtx, apply, tasks, plan, options)
+	c.runApplyExecution(applyCtx, apply, tasks, plan, options, releaseAtCutoverBarrier)
 }
