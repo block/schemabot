@@ -2856,7 +2856,7 @@ func TestGRPCClient_ResumeApplyProcessesQueuedCutover(t *testing.T) {
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote cutover accepted for apply remote-cutover-claimed (caller: cli:alice)"))
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote cutover accepted for apply apply-cutover-claimed (remote remote-cutover-claimed) (caller: cli:alice)"))
 }
 
 func TestGRPCClient_ProcessPendingCutoverWaitsWhenNotReady(t *testing.T) {
@@ -2999,7 +2999,7 @@ func TestGRPCClient_ResumeApplyCutoverErrorFailsPendingRequest(t *testing.T) {
 	require.Len(t, controlRequests.requests, 1)
 	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
 	assert.Contains(t, controlRequests.requests[0].ErrorMessage, "remote cutover failed")
-	assert.True(t, hasLogMessageContaining(logs.logs, "Remote cutover failed for apply remote-cutover-error (caller: cli:alice)"))
+	assert.True(t, hasLogMessageContaining(logs.logs, "Remote cutover failed for apply apply-cutover-error (remote remote-cutover-error) (caller: cli:alice)"))
 }
 
 func TestGRPCClient_ResumeApplyCompletesQueuedStartWhenRemoteAlreadyActive(t *testing.T) {
