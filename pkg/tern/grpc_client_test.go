@@ -623,6 +623,7 @@ type mockTaskStore struct {
 	tasks               []*storage.Task
 	getByApplyIDErr     error
 	getByOperationIDErr error
+	updateErr           error
 	lastOperationID     int64
 }
 
@@ -640,7 +641,7 @@ func (m *mockTaskStore) GetByApplyOperationID(_ context.Context, applyOperationI
 	}
 	return m.tasks, nil
 }
-func (m *mockTaskStore) Update(context.Context, *storage.Task) error { return nil }
+func (m *mockTaskStore) Update(context.Context, *storage.Task) error { return m.updateErr }
 
 type mockApplyLogStore struct {
 	storage.ApplyLogStore
@@ -1703,9 +1704,11 @@ func TestGRPCClient_PollSetsTerminalTaskMetadataFromRemoteTaskProgress(t *testin
 	require.NotNil(t, task.CompletedAt)
 }
 
-func TestGRPCClient_PollReturnsErrorWhenTerminalRemoteApplyLeavesStoredTaskActive(t *testing.T) {
-	// A terminal remote apply with no terminal remote task state is inconsistent.
-	// The control plane should retry instead of inventing a stored task result.
+func TestGRPCClient_PollReconcilesLaggingTaskWhenRemoteApplyCompletedAndTaskProgressOmitted(t *testing.T) {
+	// A terminal remote apply is authoritative: the remote will send no more task
+	// progress, so a stored task the remote no longer reports is reconciled to the
+	// apply's terminal state and the apply finalizes — rather than looping forever
+	// waiting for progress that will never arrive.
 	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
 		progressState:    ternv1.State_STATE_COMPLETED,
 		progressStateSet: true,
@@ -1738,10 +1741,100 @@ func TestGRPCClient_PollReturnsErrorWhenTerminalRemoteApplyLeavesStoredTaskActiv
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Apply.Completed, applyStore.apply.State)
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Equal(t, 100, task.ProgressPercent)
+	require.NotNil(t, task.CompletedAt)
+}
+
+// A storage failure while reconciling a lagging task is genuinely transient, so
+// the apply is kept active for operator retry rather than finalized.
+func TestGRPCClient_PollKeepsApplyActiveWhenReconcilingLaggingTaskStorageFails(t *testing.T) {
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
+		progressState:    ternv1.State_STATE_COMPLETED,
+		progressStateSet: true,
+	})
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              19,
+		ApplyIdentifier: "apply-terminal-task-update-fails",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-terminal-task-update-fails",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             23,
+		TaskIdentifier: "task-terminal-update-fails",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies: applyStore,
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}, updateErr: errors.New("storage unavailable")},
+		logs:    &mockApplyLogStore{},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "stored task task-terminal-missing-state is still running")
+	assert.Contains(t, err.Error(), "storage unavailable")
 	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
 	assert.Nil(t, applyStore.apply.CompletedAt)
+}
+
+// When a stop drives the remote apply to a terminal state but the remote no
+// longer reports the per-task progress (the remote cohort is already terminal
+// and gone), the terminal remote apply is authoritative: the lagging stored task
+// must be reconciled to the matching terminal state so the stop finalizes. The
+// control plane must not loop forever waiting for task progress the terminal
+// remote will never send again.
+func TestGRPCClient_PollReconcilesLaggingTaskWhenRemoteApplyStoppedAndTaskProgressOmitted(t *testing.T) {
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		// No progressTables: the terminal remote cohort no longer reports the task.
+	})
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              31,
+		ApplyIdentifier: "apply-stop-terminal-cohort",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-stop-terminal-cohort",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             41,
+		TaskIdentifier: "task-stop-terminal-cohort",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies: applyStore,
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    &mockApplyLogStore{},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Apply.Stopped, applyStore.apply.State)
+	assert.Equal(t, state.Task.Stopped, task.State,
+		"lagging stored task should be reconciled to the apply's stopped state, got %q", task.State)
 }
 
 func hasLogMessageContaining(logs []*storage.ApplyLog, want string) bool {

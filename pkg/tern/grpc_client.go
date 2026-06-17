@@ -1622,7 +1622,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	if err := c.syncStoredTasksFromRemoteTasks(ctx, storedApply, storedTasks, remoteTasks, now); err != nil {
 		return err
 	}
-	if err := ensureStoredTasksResolvedForTerminalRemoteApply(remoteApply, storedTasks); err != nil {
+	if err := c.reconcileStoredTasksForTerminalRemoteApply(ctx, storedApply, remoteApply, storedTasks, now); err != nil {
 		return err
 	}
 	return c.persistTerminalStateFromRemote(ctx, storedApply, remoteApply, now)
@@ -1770,22 +1770,60 @@ func remoteTaskOmittedRowTotals(storedTask *storage.Task, remoteTask *ternv1.Tab
 	return storedTask.RowsTotal > 0 && remoteTask.RowsTotal <= 0
 }
 
-func ensureStoredTasksResolvedForTerminalRemoteApply(remoteApply *storage.Apply, storedTasks []*storage.Task) error {
+// reconcileStoredTasksForTerminalRemoteApply force-resolves any stored task the
+// remote progress left unresolved once the remote apply itself is terminal. A
+// terminal remote apply is authoritative: the remote will send no further task
+// progress, so a lagging task is driven to the apply's terminal state and
+// persisted rather than blocking finalization (which would otherwise re-poll the
+// already-terminal remote forever). A storage failure is still returned so the
+// operator retries that genuinely-transient case.
+func (c *GRPCClient) reconcileStoredTasksForTerminalRemoteApply(ctx context.Context, storedApply, remoteApply *storage.Apply, storedTasks []*storage.Task, now time.Time) error {
+	terminalTaskState, ok := terminalTaskStateForApply(remoteApply.State)
+	if !ok {
+		return fmt.Errorf("reconcile stored tasks for %s: remote apply state %q is not terminal", storedApply.ApplyIdentifier, remoteApply.State)
+	}
 	for _, storedTask := range storedTasks {
 		if storedTaskResolvedForTerminalRemoteApply(remoteApply.State, storedTask.State) {
 			continue
 		}
-		slog.Warn("terminal remote gRPC apply still has unresolved stored task after syncing remote task progress",
-			"apply_id", remoteApply.ApplyIdentifier,
-			"external_id", remoteApply.ExternalID,
+		oldTaskState := storedTask.State
+		storedTask.State = terminalTaskState
+		if state.IsState(terminalTaskState, state.Task.Completed) {
+			storedTask.ProgressPercent = 100
+		}
+		if state.IsTerminalTaskState(terminalTaskState) && storedTask.CompletedAt == nil {
+			storedTask.CompletedAt = &now
+		}
+		storedTask.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, storedTask); err != nil {
+			return fmt.Errorf("reconcile lagging task %s to %s for terminal remote gRPC apply %s: %w", storedTask.TaskIdentifier, terminalTaskState, storedApply.ApplyIdentifier, err)
+		}
+		slog.Warn("reconciled lagging stored task to terminal remote gRPC apply state",
+			"apply_id", storedApply.ApplyIdentifier,
+			"external_id", storedApply.ExternalID,
 			"remote_apply_state", remoteApply.State,
 			"task_id", storedTask.TaskIdentifier,
 			"table", storedTask.TableName,
-			"stored_task_state", storedTask.State)
-		return fmt.Errorf("terminal remote gRPC apply %s is %s but stored task %s is still %s after syncing remote task progress",
-			remoteApply.ApplyIdentifier, remoteApply.State, storedTask.TaskIdentifier, storedTask.State)
+			"old_task_state", oldTaskState,
+			"new_task_state", terminalTaskState)
+		c.logTaskStateTransition(ctx, storedApply.ID, storedTask, fmt.Sprintf("Task %s reconciled to %s for terminal remote apply state %s", storedTask.TableName, terminalTaskState, remoteApply.State), oldTaskState)
 	}
 	return nil
+}
+
+// terminalTaskStateForApply maps a terminal apply state to the task state a
+// lagging stored task must adopt when its terminal apply is authoritative.
+func terminalTaskStateForApply(applyState string) (string, bool) {
+	switch {
+	case state.IsState(applyState, state.Apply.Completed):
+		return state.Task.Completed, true
+	case state.IsState(applyState, state.Apply.Stopped):
+		return state.Task.Stopped, true
+	case state.IsState(applyState, state.Apply.Failed):
+		return state.Task.Failed, true
+	default:
+		return "", false
+	}
 }
 
 func storedTaskResolvedForTerminalRemoteApply(remoteApplyState, storedTaskState string) bool {
