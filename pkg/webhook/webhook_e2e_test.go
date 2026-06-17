@@ -82,6 +82,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/block/spirit/pkg/utils"
+
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -348,6 +350,10 @@ func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() [
 // schemaSQL maps filename -> content. Files are placed under schema/{namespace}/.
 // namespace is the MySQL schema name (required).
 func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string) *planFlowResult {
+	return setupFakeGitHubForPlanWithPRFiles(t, mux, schemaSQL, schemabotConfig, ns, nil)
+}
+
+func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
 	t.Helper()
 
 	result := &planFlowResult{
@@ -375,6 +381,10 @@ func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[stri
 
 	// PR changed files — report schema files changed (in namespace subdir)
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
+		if prFiles != nil {
+			_ = json.NewEncoder(w).Encode(prFiles)
+			return
+		}
 		var files []*gh.CommitFile
 		for name := range schemaSQL {
 			files = append(files, &gh.CommitFile{
@@ -2056,7 +2066,8 @@ func TestE2EPlanWithNoCurrentSchemaFilesExplainsInProgressApply(t *testing.T) {
 	assert.Contains(t, body, "schemabot stop apply-empty-diff -e staging")
 	assert.Contains(t, body, "schemabot rollback apply-empty-diff -e staging")
 	assert.Contains(t, body, "schemabot plan -e staging -d webhook_empty_diff_apply")
-	assert.Contains(t, body, "do not run `schemabot plan` on this empty-diff PR")
+	assert.Contains(t, body, "push a no-op `schemabot.yaml` edit to trigger a fresh plan")
+	assert.NotContains(t, body, "ask an operator")
 	assert.NotContains(t, body, "truncated repository tree")
 	assert.NotContains(t, body, "schemabot status")
 }
@@ -2074,10 +2085,80 @@ func TestE2EPlanWithNoCurrentSchemaFilesExplainsCompletedApply(t *testing.T) {
 	assert.Contains(t, body, "Undo the live schema change")
 	assert.Contains(t, body, "schemabot rollback apply-empty-diff -e staging")
 	assert.Contains(t, body, "schemabot plan -e staging -d webhook_empty_diff_apply")
-	assert.Contains(t, body, "do not run `schemabot plan` on this empty-diff PR")
-	assert.Contains(t, body, "clear the blocked check state")
+	assert.Contains(t, body, "push a no-op `schemabot.yaml` edit to trigger a fresh plan")
+	assert.NotContains(t, body, "ask an operator")
 	assert.NotContains(t, body, "truncated repository tree")
 	assert.NotContains(t, body, "Git reverting")
+}
+
+// TestE2EAutoPlanWithOnlySchemaBotConfigChangeClearsRollbackCheck verifies the
+// self-serve reconciliation path for a PR whose live database already matches
+// the current schema files. A no-op schemabot.yaml edit should make config
+// discovery deterministic, auto-plan no changes, and clear the
+// rollback-created blocking check state without operator intervention.
+func TestE2EAutoPlanWithOnlySchemaBotConfigChangeClearsRollbackCheck(t *testing.T) {
+	dbName := "webhook_noop_config_reconcile"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	schemaSQL := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	cfg.DBName = dbName
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(ctx))
+	_, err = db.ExecContext(ctx, strings.TrimSuffix(schemaSQL, ";"))
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		HeadSHA:        "abc123",
+		Environment:    "staging",
+		DatabaseType:   "mysql",
+		DatabaseName:   dbName,
+		CheckRunID:     100,
+		HasChanges:     true,
+		Status:         checkStatusCompleted,
+		Conclusion:     checkConclusionActionRequired,
+		BlockingReason: rollbackCompletedBlock.blockingReason,
+		ErrorMessage:   rollbackCompletedBlock.message,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	setupFakeGitHubForPlanWithPRFiles(t, mux, map[string]string{"users.sql": schemaSQL}, schemabotConfig, dbName, []*gh.CommitFile{
+		{
+			Filename: new("schema/schemabot.yaml"),
+			Status:   new("modified"),
+		},
+	})
+
+	h := newE2EHandler(t, svc, client)
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "synchronize"}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	var check *storage.Check
+	require.Eventually(t, func() bool {
+		check, err = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+		return err == nil && check != nil && check.Status == checkStatusCompleted && check.Conclusion == checkConclusionSuccess
+	}, webhookIntegrationPollDeadline, 500*time.Millisecond, "no-op config auto-plan should clear rollback-created blocking check")
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.False(t, check.HasChanges)
+	assert.Zero(t, check.ApplyID)
+	assert.Empty(t, check.BlockingReason)
+	assert.Empty(t, check.ErrorMessage)
 }
 
 // TestE2EApplyWithNoCurrentSchemaFilesExplainsInProgressApply verifies that

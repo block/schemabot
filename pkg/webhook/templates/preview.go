@@ -18,6 +18,13 @@ const (
 	previewRequestedBy       = "jackjackbits"
 )
 
+func previewSupportChannel() SupportChannelData {
+	return SupportChannelData{
+		Name: "#schema-help",
+		URL:  "https://chat.example.com/schema-help",
+	}
+}
+
 // PreviewCommentPlan renders a sample plan comment with DDL changes and lint violations.
 func PreviewCommentPlan() string {
 	return RenderPlanComment(PlanCommentData{
@@ -74,7 +81,7 @@ func PreviewCommentNoManagedSchemaChanges() string {
 // comment for a PR whose current diff no longer contains managed schema files
 // while a stored apply from that PR is still running.
 func PreviewCommentSchemaReconciliationInProgress() string {
-	return RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{
+	return RenderSupportChannelFooter(RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{
 		RequestedBy: previewRequestedBy,
 		Timestamp:   "2026-03-15 14:30:00",
 		Items: []SchemaChangeReconciliationItem{
@@ -86,14 +93,14 @@ func PreviewCommentSchemaReconciliationInProgress() string {
 				InProgress:  true,
 			},
 		},
-	})
+	}), previewSupportChannel())
 }
 
 // PreviewCommentSchemaReconciliationCompleted renders the reconciliation
 // comment for a PR whose current diff no longer contains managed schema files
 // after a stored apply from that PR has completed.
 func PreviewCommentSchemaReconciliationCompleted() string {
-	return RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{
+	return RenderSupportChannelFooter(RenderSchemaChangeReconciliationRequired(SchemaChangeReconciliationData{
 		RequestedBy: previewRequestedBy,
 		Timestamp:   "2026-03-15 14:30:00",
 		Items: []SchemaChangeReconciliationItem{
@@ -104,7 +111,7 @@ func PreviewCommentSchemaReconciliationCompleted() string {
 				State:       state.Apply.Completed,
 			},
 		},
-	})
+	}), previewSupportChannel())
 }
 
 // PreviewCommentHelp renders the help command reference comment.
@@ -114,14 +121,10 @@ func PreviewCommentHelp() string {
 
 // PreviewCommentSupportChannel renders a sample error comment with a support-channel footer.
 func PreviewCommentSupportChannel() string {
-	support := SupportChannelData{
-		Name: "#schema-help",
-		URL:  "https://chat.example.com/schema-help",
-	}
 	return "### Invalid command\n\n" +
-		RenderSupportChannelFooter(RenderInvalidCommand(), support) +
+		RenderSupportChannelFooter(RenderInvalidCommand(), previewSupportChannel()) +
 		"\n\n### Apply failure\n\n" +
-		RenderSupportChannelFooter(PreviewCommentApplyFailed(), support)
+		RenderSupportChannelFooter(PreviewCommentApplyFailed(), previewSupportChannel())
 }
 
 // PreviewCommentErrorNoConfig renders the "no config found" error comment.

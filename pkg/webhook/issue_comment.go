@@ -375,6 +375,7 @@ func shouldShowSupportChannel(body string) bool {
 		"not found",
 		"no valid",
 		"multiple",
+		"reconciliation required",
 	} {
 		if strings.Contains(firstLine, marker) {
 			return true

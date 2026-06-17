@@ -118,10 +118,9 @@ The live database operation was already started and may continue independently o
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-     After rollback completes, do not run `schemabot plan` on this empty-diff PR unless you first add managed schema files back to the PR. Ask a SchemaBot operator to verify the live schema matches the current desired schema and clear the blocked check state.
+     After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.
 
-The PR check will remain blocked until the live database and PR schema files agree.
-
+> 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 </details>
 
 <details>
@@ -154,11 +153,9 @@ Choose one:
      ```
      schemabot rollback apply-09f8ba28fb67492e -e staging
      ```
-   - after rollback completes, do not run `schemabot plan` on this empty-diff PR unless you first add managed schema files back to the PR
-   - ask a SchemaBot operator to verify the live schema matches the current desired schema and clear the blocked check state
+   - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan
 
-The PR check will remain blocked until the live database and PR schema files agree.
-
+> 💬 Support: [#schema-help](https://chat.example.com/schema-help).
 </details>
 
 <details>
