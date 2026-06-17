@@ -348,6 +348,105 @@ func TestApplyStore_CreateWithGroupedOperationsRejectsInvalidGroups(t *testing.T
 	}
 }
 
+// TestApplyStore_CreateWithGroupedOperationsBlocksOverlapOnSecondaryDeployment
+// proves the active-apply invariant covers every deployment a fan-out apply
+// owns, not just the parent's primary deployment. A non-terminal apply spanning
+// deployments [payments-a, payments-b] must block a new apply whose secondary
+// deployment is payments-b, while still allowing a new apply whose deployments
+// are disjoint from the active apply.
+func TestApplyStore_CreateWithGroupedOperationsBlocksOverlapOnSecondaryDeployment(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	groupedApply := func(identifier, primary string) *storage.Apply {
+		a := newGroupedCreateApply(now, identifier)
+		a.Deployment = primary
+		return a
+	}
+
+	first := groupedApply("apply_fanout_first", "payments-a")
+	_, err := store.Applies().CreateWithGroupedOperations(ctx, first, []*storage.ApplyOperationWithTasks{
+		newGroupedCreateGroup(now, "payments-a", "payments-a-target", "users"),
+		newGroupedCreateGroup(now, "payments-b", "payments-b-target", "users"),
+	})
+	require.NoError(t, err)
+
+	// A new apply whose secondary deployment overlaps payments-b is rejected,
+	// even though its primary (payments-x) is otherwise free. Distinct table
+	// names keep the globally-unique task identifiers from colliding.
+	overlapping := groupedApply("apply_fanout_overlap", "payments-x")
+	_, err = store.Applies().CreateWithGroupedOperations(ctx, overlapping, []*storage.ApplyOperationWithTasks{
+		newGroupedCreateGroup(now, "payments-x", "payments-x-target", "accounts"),
+		newGroupedCreateGroup(now, "payments-b", "payments-b-target", "accounts"),
+	})
+	require.ErrorIs(t, err, storage.ErrActiveApplyExists)
+
+	// A new apply whose deployments are disjoint from the active apply is allowed.
+	disjoint := groupedApply("apply_fanout_disjoint", "payments-y")
+	_, err = store.Applies().CreateWithGroupedOperations(ctx, disjoint, []*storage.ApplyOperationWithTasks{
+		newGroupedCreateGroup(now, "payments-y", "payments-y-target", "ledger"),
+		newGroupedCreateGroup(now, "payments-z", "payments-z-target", "ledger"),
+	})
+	require.NoError(t, err)
+}
+
+// TestApplyStore_ClaimStoppedFanOutRefusedWhenSecondaryDeploymentActive proves
+// the stopped→running claim re-check covers every deployment a fan-out apply
+// owns. A stopped apply spanning [region-a, region-b] must not restart while a
+// different active apply already owns region-b, even though the stopped apply's
+// primary deployment (region-a) is free.
+func TestApplyStore_ClaimStoppedFanOutRefusedWhenSecondaryDeploymentActive(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	stopped := newGroupedCreateApply(now, "apply_fanout_stopped")
+	stopped.Deployment = "region-a"
+	stopped.State = state.Apply.Stopped
+	stoppedID, err := store.Applies().CreateWithGroupedOperations(ctx, stopped, []*storage.ApplyOperationWithTasks{
+		newGroupedCreateGroup(now, "region-a", "region-a-target", "users"),
+		newGroupedCreateGroup(now, "region-b", "region-b-target", "users"),
+	})
+	require.NoError(t, err)
+
+	// A different active apply owns region-b, one of the stopped apply's
+	// secondary deployments.
+	_, err = store.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply_region_b_active",
+		PlanID:          2,
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "production",
+		Deployment:      "region-b",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+	})
+	require.NoError(t, err)
+
+	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:   stoppedID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, stoppedID, "test-owner")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "claim must be refused while another active apply owns a secondary deployment")
+
+	persisted, err := store.Applies().Get(ctx, stoppedID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Stopped, persisted.State, "refused claim must leave the apply stopped")
+}
+
 func newGroupedCreateApply(now time.Time, identifier string) *storage.Apply {
 	return &storage.Apply{
 		ApplyIdentifier: identifier,
