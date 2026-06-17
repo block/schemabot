@@ -338,6 +338,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 			"apply_operation_id", op.ID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
+			"deployment", op.Deployment,
 			"apply_deployment", apply.Deployment,
 			"environment", apply.Environment)
 		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_deployment")
