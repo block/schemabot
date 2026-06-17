@@ -82,6 +82,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/block/spirit/pkg/utils"
+
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -348,6 +350,10 @@ func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() [
 // schemaSQL maps filename -> content. Files are placed under schema/{namespace}/.
 // namespace is the MySQL schema name (required).
 func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string) *planFlowResult {
+	return setupFakeGitHubForPlanWithPRFiles(t, mux, schemaSQL, schemabotConfig, ns, nil)
+}
+
+func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
 	t.Helper()
 
 	result := &planFlowResult{
@@ -375,6 +381,10 @@ func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[stri
 
 	// PR changed files — report schema files changed (in namespace subdir)
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
+		if prFiles != nil {
+			_ = json.NewEncoder(w).Encode(prFiles)
+			return
+		}
 		var files []*gh.CommitFile
 		for name := range schemaSQL {
 			files = append(files, &gh.CommitFile{
@@ -2040,6 +2050,241 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for terminal blocking aggregate check run")
+	}
+}
+
+// TestE2EPlanWithNoCurrentSchemaFilesExplainsInProgressApply verifies that a
+// PR whose current diff no longer contains managed schema files does not fall
+// back to whole-repo config discovery when an apply from that PR is still
+// running. The command should tell the user how to reconcile the in-flight apply.
+func TestE2EPlanWithNoCurrentSchemaFilesExplainsInProgressApply(t *testing.T) {
+	body, treeCalls := runCommandWithNoCurrentSchemaFilesAndApplyOwnedCheck(t, "schemabot plan -e staging", state.Apply.Running, checkStatusInProgress, "")
+
+	assert.Zero(t, treeCalls, "empty-diff plan should not use whole-repo git tree discovery")
+	assert.Contains(t, body, "SchemaBot is still applying a schema change from this PR")
+	assert.Contains(t, body, "The live database operation was already started")
+	assert.Contains(t, body, "schemabot stop apply-empty-diff -e staging")
+	assert.Contains(t, body, "schemabot rollback apply-empty-diff -e staging")
+	assert.Contains(t, body, "schemabot plan -e staging -d webhook_empty_diff_apply")
+	assert.Contains(t, body, "push a no-op `schemabot.yaml` edit to trigger a fresh plan")
+	assert.NotContains(t, body, "ask an operator")
+	assert.NotContains(t, body, "truncated repository tree")
+	assert.NotContains(t, body, "schemabot status")
+}
+
+// TestE2EPlanWithNoCurrentSchemaFilesExplainsCompletedApply verifies that a PR
+// whose current diff no longer contains managed schema files produces a clear
+// reconciliation-required comment after the apply has reached a terminal state.
+func TestE2EPlanWithNoCurrentSchemaFilesExplainsCompletedApply(t *testing.T) {
+	body, treeCalls := runCommandWithNoCurrentSchemaFilesAndApplyOwnedCheck(t, "schemabot plan -e staging", state.Apply.Completed, checkStatusCompleted, checkConclusionActionRequired)
+
+	assert.Zero(t, treeCalls, "empty-diff plan should not use whole-repo git tree discovery")
+	assert.Contains(t, body, "SchemaBot already applied a schema change from this PR")
+	assert.Contains(t, body, "The live database was already updated")
+	assert.Contains(t, body, "Keep the live schema change")
+	assert.Contains(t, body, "Undo the live schema change")
+	assert.Contains(t, body, "schemabot rollback apply-empty-diff -e staging")
+	assert.Contains(t, body, "schemabot plan -e staging -d webhook_empty_diff_apply")
+	assert.Contains(t, body, "push a no-op `schemabot.yaml` edit to trigger a fresh plan")
+	assert.NotContains(t, body, "ask an operator")
+	assert.NotContains(t, body, "truncated repository tree")
+	assert.NotContains(t, body, "Git reverting")
+}
+
+// TestE2EAutoPlanWithOnlySchemaBotConfigChangeClearsRollbackCheck verifies the
+// self-serve reconciliation path for a PR whose live database already matches
+// the current schema files. A no-op schemabot.yaml edit should make config
+// discovery deterministic, auto-plan no changes, and clear the
+// rollback-created blocking check state without operator intervention.
+func TestE2EAutoPlanWithOnlySchemaBotConfigChangeClearsRollbackCheck(t *testing.T) {
+	dbName := "webhook_noop_config_reconcile"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	schemaSQL := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	cfg.DBName = dbName
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(ctx))
+	_, err = db.ExecContext(ctx, strings.TrimSuffix(schemaSQL, ";"))
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		HeadSHA:        "abc123",
+		Environment:    "staging",
+		DatabaseType:   "mysql",
+		DatabaseName:   dbName,
+		CheckRunID:     100,
+		HasChanges:     true,
+		Status:         checkStatusCompleted,
+		Conclusion:     checkConclusionActionRequired,
+		BlockingReason: rollbackCompletedBlock.blockingReason,
+		ErrorMessage:   rollbackCompletedBlock.message,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	setupFakeGitHubForPlanWithPRFiles(t, mux, map[string]string{"users.sql": schemaSQL}, schemabotConfig, dbName, []*gh.CommitFile{
+		{
+			Filename: new("schema/schemabot.yaml"),
+			Status:   new("modified"),
+		},
+	})
+
+	h := newE2EHandler(t, svc, client)
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "synchronize"}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	var check *storage.Check
+	require.Eventually(t, func() bool {
+		check, err = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+		return err == nil && check != nil && check.Status == checkStatusCompleted && check.Conclusion == checkConclusionSuccess
+	}, webhookIntegrationPollDeadline, 500*time.Millisecond, "no-op config auto-plan should clear rollback-created blocking check")
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.False(t, check.HasChanges)
+	assert.Zero(t, check.ApplyID)
+	assert.Empty(t, check.BlockingReason)
+	assert.Empty(t, check.ErrorMessage)
+}
+
+// TestE2EApplyWithNoCurrentSchemaFilesExplainsInProgressApply verifies that
+// apply uses the same reconciliation guard as plan instead of falling back to
+// whole-repo config discovery after the current PR diff no longer contains
+// managed schema files.
+func TestE2EApplyWithNoCurrentSchemaFilesExplainsInProgressApply(t *testing.T) {
+	body, treeCalls := runCommandWithNoCurrentSchemaFilesAndApplyOwnedCheck(t, "schemabot apply -e staging", state.Apply.Running, checkStatusInProgress, "")
+
+	assert.Zero(t, treeCalls, "empty-diff apply should not use whole-repo git tree discovery")
+	assert.Contains(t, body, "SchemaBot is still applying a schema change from this PR")
+	assert.Contains(t, body, "schemabot rollback apply-empty-diff -e staging")
+	assert.NotContains(t, body, "truncated repository tree")
+}
+
+// TestE2EApplyConfirmWithNoCurrentSchemaFilesExplainsInProgressApply verifies
+// that apply-confirm also fails closed before discovery when a PR no longer has
+// managed schema files but still owns an in-flight apply.
+func TestE2EApplyConfirmWithNoCurrentSchemaFilesExplainsInProgressApply(t *testing.T) {
+	body, treeCalls := runCommandWithNoCurrentSchemaFilesAndApplyOwnedCheck(t, "schemabot apply-confirm -e staging", state.Apply.Running, checkStatusInProgress, "")
+
+	assert.Zero(t, treeCalls, "empty-diff apply-confirm should not use whole-repo git tree discovery")
+	assert.Contains(t, body, "SchemaBot is still applying a schema change from this PR")
+	assert.Contains(t, body, "schemabot stop apply-empty-diff -e staging")
+	assert.Contains(t, body, "schemabot rollback apply-empty-diff -e staging")
+	assert.NotContains(t, body, "truncated repository tree")
+}
+
+func runCommandWithNoCurrentSchemaFilesAndApplyOwnedCheck(t *testing.T, comment, applyState, checkStatus, checkConclusion string) (string, int64) {
+	t.Helper()
+
+	dbName := "webhook_empty_diff_apply"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-empty-diff",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           applyState,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatus,
+		Conclusion:   checkConclusion,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{
+				Ref: new("feature-branch"),
+				SHA: new("newsha222"),
+			},
+			Base: &gh.PullRequestBranch{
+				Ref: new("main"),
+				SHA: new("def456"),
+			},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{})
+	})
+
+	var treeCalls atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, _ *http.Request) {
+		treeCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(gh.Tree{
+			SHA:       new("newsha222"),
+			Entries:   []*gh.TreeEntry{},
+			Truncated: new(true),
+		})
+	})
+
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: comment,
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-comments:
+		return body, treeCalls.Load()
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for reconciliation comment")
+		return "", treeCalls.Load()
 	}
 }
 

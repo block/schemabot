@@ -184,6 +184,7 @@ func TestIsTerminalApplyState(t *testing.T) {
 	nonTerminalStates := []string{
 		Apply.Pending,
 		Apply.Running,
+		Apply.RunningDegraded,
 		Apply.FailedRetryable,
 		Apply.WaitingForCutover,
 		Apply.CuttingOver,
@@ -201,6 +202,28 @@ func TestIsTerminalApplyState(t *testing.T) {
 	assert.False(t, IsTerminalApplyState("STATE_RUNNING"))
 }
 
+// TestIsRunningApplyState pins the running-family set that control gates key
+// off: running and running_degraded are running-family; other non-terminal
+// states (pending, waiting_for_cutover, recovering) are not.
+func TestIsRunningApplyState(t *testing.T) {
+	for _, s := range []string{Apply.Running, Apply.RunningDegraded, "RUNNING", "STATE_RUNNING_DEGRADED", "running_degraded"} {
+		assert.Truef(t, IsRunningApplyState(s), "%s should be running-family", s)
+	}
+	for _, s := range []string{
+		Apply.Pending,
+		Apply.WaitingForDeploy,
+		Apply.WaitingForCutover,
+		Apply.Recovering,
+		Apply.CuttingOver,
+		Apply.FailedRetryable,
+		Apply.Completed,
+		Apply.Failed,
+		Apply.Stopped,
+	} {
+		assert.Falsef(t, IsRunningApplyState(s), "%s should NOT be running-family", s)
+	}
+}
+
 func TestNormalizeState(t *testing.T) {
 	testCases := []struct {
 		input    string
@@ -210,6 +233,8 @@ func TestNormalizeState(t *testing.T) {
 		{"pending", Apply.Pending},
 		{"RUNNING", Apply.Running},
 		{"running", Apply.Running},
+		{"RUNNING_DEGRADED", Apply.RunningDegraded},
+		{"running_degraded", Apply.RunningDegraded},
 		{"WAITING_FOR_DEPLOY", Apply.WaitingForDeploy},
 		{"waiting_for_deploy", Apply.WaitingForDeploy},
 		{"WAITING_FOR_CUTOVER", Apply.WaitingForCutover},
@@ -369,14 +394,14 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 		want     string
 	}{
 		{
-			name:     "continue failure with pending sibling holds running",
+			name:     "continue failure with pending sibling holds running_degraded",
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Pending, true)},
-			want:     Apply.Running,
+			want:     Apply.RunningDegraded,
 		},
 		{
-			name:     "continue failure with running sibling holds running",
+			name:     "continue failure with running sibling holds running_degraded",
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Running, true)},
-			want:     Apply.Running,
+			want:     Apply.RunningDegraded,
 		},
 		{
 			name:     "continue failure with all siblings terminal settles failed",
@@ -399,9 +424,9 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 			want:     Apply.Failed,
 		},
 		{
-			name:     "continue failure with completed and pending holds running",
+			name:     "continue failure with completed and pending holds running_degraded",
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Completed, true), rc(Apply.Pending, true)},
-			want:     Apply.Running,
+			want:     Apply.RunningDegraded,
 		},
 	}
 	for _, tc := range cases {

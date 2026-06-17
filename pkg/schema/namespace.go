@@ -87,7 +87,7 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 // from schema pull discovery and rejected for explicit pull requests.
 func IsReservedPullNamespace(namespace string) bool {
 	switch strings.ToLower(namespace) {
-	case "_pending_drops", "dbadmin", "information_schema", "mysql", "performance_schema", "schemabot", "sys":
+	case "_pending_drops", "dbadmin", "information_schema", "innodb", "mysql", "performance_schema", "polt", "rdsmon", "schemabot", "sys", "tmp", "topo":
 		return true
 	default:
 		return strings.HasPrefix(namespace, "_")

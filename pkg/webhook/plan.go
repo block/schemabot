@@ -32,6 +32,16 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
+	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, environment, databaseName, requestedBy); err != nil {
+		h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, err.Error())
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema reconciliation check failed"})
+		return
+	} else if handled {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "no managed schema changes handled"})
+		return
+	}
+
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
 	if err != nil {

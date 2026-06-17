@@ -101,11 +101,13 @@ if [ -z "$changed_go_files" ]; then
 fi
 
 # Map changed files to package directories that still exist and contain Go
-# source. A package whose directory was entirely removed is dropped (nothing to
-# test there).
+# source for the default build. A package whose directory was entirely removed
+# or whose files are all excluded by build tags is dropped (nothing to test in
+# the unit-test hook).
 pkgs=""
 for dir in $(printf '%s\n' "$changed_go_files" | xargs -n1 dirname | sort -u); do
-    if [ -d "$dir" ] && ls "$dir"/*.go >/dev/null 2>&1; then
+    testable_pkg=$(go list -e -f '{{if or (or .GoFiles .TestGoFiles) .XTestGoFiles}}{{.ImportPath}}{{end}}' "./$dir" 2>/dev/null || true)
+    if [ -d "$dir" ] && [ -n "$testable_pkg" ]; then
         pkgs="$pkgs ./$dir"
     fi
 done

@@ -273,7 +273,7 @@ func TestServerConfig_Validate(t *testing.T) {
 			name: "etre target_resolver without databases is valid",
 			cfg: ServerConfig{
 				TargetResolver: TargetResolverConfig{
-					Etre: EtreConfig{
+					Etre: []EtreConfig{{
 						Addr:         "http://etre:8080",
 						DatabaseType: storage.DatabaseTypeMySQL,
 						EntityType:   "aurora_cluster",
@@ -283,7 +283,7 @@ func TestServerConfig_Validate(t *testing.T) {
 							Username:    "spirit",
 							PasswordRef: "env:DDL_PASSWORD",
 						},
-					},
+					}},
 				},
 			},
 			wantErr: false,

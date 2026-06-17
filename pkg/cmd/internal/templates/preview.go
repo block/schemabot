@@ -110,6 +110,9 @@ const (
 	// Comment template previews (GitHub PR comments)
 	PreviewCommentPlan                  PreviewType = "comment_plan"                    // Plan comment with DDL changes + lint violations
 	PreviewCommentPlanEmpty             PreviewType = "comment_plan_empty"              // Plan comment with no changes
+	PreviewCommentNoManagedSchema       PreviewType = "comment_no_managed_schema"       // No managed schema changes in current PR
+	PreviewCommentReconcileInProgress   PreviewType = "comment_reconcile_in_progress"   // Empty diff with in-progress apply-owned state
+	PreviewCommentReconcileCompleted    PreviewType = "comment_reconcile_completed"     // Empty diff with completed apply-owned state
 	PreviewCommentMultiEnv              PreviewType = "comment_multi_env"               // Multi-env plan (identical, deduplicated)
 	PreviewCommentMultiEnvDiff          PreviewType = "comment_multi_env_diff"          // Multi-env plan (different per env)
 	PreviewCommentMultiEnvLint          PreviewType = "comment_multi_env_lint"          // Multi-env plan with lint violations

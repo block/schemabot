@@ -9,7 +9,7 @@ func previewLockAcquiredOutput() {
 	WriteLockAcquired(LockData{
 		Database:     "testapp",
 		DatabaseType: "mysql",
-		Owner:        "cli:aparajon@macbook",
+		Owner:        "cli:jackjackbits@macbook",
 		CreatedAt:    previewTime,
 	})
 }
@@ -38,7 +38,7 @@ func previewLocksListOutput() {
 		{
 			Database:     "testapp",
 			DatabaseType: "mysql",
-			Owner:        "cli:aparajon@macbook",
+			Owner:        "cli:jackjackbits@macbook",
 			CreatedAt:    previewTime.Add(-30 * time.Minute),
 			UpdatedAt:    previewTime.Add(-5 * time.Minute),
 		},

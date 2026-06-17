@@ -198,12 +198,12 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 		wantDone  bool
 	}{
 		{
-			name: "continue holds the apply running past a failed deployment",
+			name: "continue holds the apply running_degraded past a failed deployment",
 			ops: []*storage.ApplyOperation{
 				{ID: 1, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue},
 				{ID: 2, State: state.ApplyOperation.Pending, OnFailure: storage.OnFailureContinue},
 			},
-			wantState: state.Apply.Running,
+			wantState: state.Apply.RunningDegraded,
 			wantDone:  false,
 		},
 		{
@@ -245,11 +245,12 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 // TestUpdateApplyStateFromOperations_ReopenFailedGuard verifies the terminal
 // guard's reopen exception. Under on_failure "continue" a sibling failure can
 // terminalize the parent apply to failed before the rollout settles; once a
-// live sibling still derives the projection running, a lease-holding caller may
-// reopen the parent failed → running so the remaining siblings run to
-// completion. The exception is deliberately narrow: only a failed parent over a
-// genuinely failed child base may reopen, only to running, and only when the
-// caller holds the apply lease. Every other terminal-to-non-terminal transition
+// live sibling still derives the projection running_degraded, a lease-holding
+// caller may reopen the parent failed → running_degraded so the remaining
+// siblings run to completion. The exception is deliberately narrow: only a
+// failed parent over a genuinely failed child base may reopen, only to
+// running_degraded, and only when the caller holds the apply lease. Every other
+// terminal-to-non-terminal transition
 // — including reviving a failed parent from an unscoped reconciliation path, and
 // any genuinely terminal verdict (completed/cancelled/reverted) — stays an error.
 func TestUpdateApplyStateFromOperations_ReopenFailedGuard(t *testing.T) {
@@ -263,14 +264,14 @@ func TestUpdateApplyStateFromOperations_ReopenFailedGuard(t *testing.T) {
 		wantUpdate bool
 	}{
 		{
-			name:   "lease-scoped reopen holds the failed apply running for a live sibling",
+			name:   "lease-scoped reopen holds the failed apply running_degraded for a live sibling",
 			parent: state.Apply.Failed,
 			ops: []*storage.ApplyOperation{
 				{ID: 1, State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue},
 				{ID: 2, State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue},
 			},
 			reopen:     allowLeaseScopedFailedReopen,
-			wantState:  state.Apply.Running,
+			wantState:  state.Apply.RunningDegraded,
 			wantUpdate: true,
 		},
 		{

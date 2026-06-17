@@ -637,7 +637,7 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 		}
 		return cutoverRequestNotReady, nil
 	}
-	if !state.IsState(apply.State, state.Apply.Running) {
+	if !state.IsRunningApplyState(apply.State) {
 		return cutoverRequestNotReady, nil
 	}
 	taskStore := s.storage.Tasks()
@@ -1253,7 +1253,7 @@ func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *stora
 		}
 		return nil, "", startNotAllowedForState(apply)
 	}
-	if state.IsState(apply.State, state.Apply.Running) {
+	if state.IsRunningApplyState(apply.State) {
 		s.logger.Info("queueing start for stopped tasks while stored apply is still running",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
@@ -1294,7 +1294,7 @@ func (s *Service) queueRemoteStoppedApplyForOperator(ctx context.Context, client
 	if startedCount == 0 {
 		startedCount = 1
 	}
-	if state.IsState(apply.State, state.Apply.Running) {
+	if state.IsRunningApplyState(apply.State) {
 		s.logger.Info("queueing remote start while stored apply is still running",
 			"apply_id", apply.ApplyIdentifier,
 			"external_id", apply.ExternalID,
@@ -1312,7 +1312,7 @@ func (s *Service) queueRemoteStoppedApplyForOperator(ctx context.Context, client
 }
 
 func (s *Service) ensureStoredApplyStoppedForStartClaim(ctx context.Context, apply *storage.Apply) error {
-	if !state.IsState(apply.State, state.Apply.Running) {
+	if !state.IsRunningApplyState(apply.State) {
 		return nil
 	}
 	applyStore := s.storage.Applies()
@@ -1453,7 +1453,7 @@ func startResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (*
 // says running.
 func storedApplyMayHaveStoppedTasksForStart(storedApplyState string) bool {
 	return state.IsState(storedApplyState, state.Apply.Stopped) ||
-		state.IsState(storedApplyState, state.Apply.Running)
+		state.IsRunningApplyState(storedApplyState)
 }
 
 func validateStartRequestState(apply *storage.Apply) error {
@@ -1475,6 +1475,7 @@ func isStartRequestAllowedState(applyState string) bool {
 		state.Apply.WaitingForDeploy,
 		state.Apply.Pending,
 		state.Apply.Running,
+		state.Apply.RunningDegraded,
 		state.Apply.Stopped,
 	)
 }
@@ -1483,7 +1484,7 @@ func startNotAllowedForState(apply *storage.Apply) error {
 	switch {
 	case state.IsState(apply.State, state.Apply.Pending):
 		return controlConflictf("schema change is pending and no start request is queued")
-	case state.IsState(apply.State, state.Apply.Running):
+	case state.IsRunningApplyState(apply.State):
 		// Running applies may reach this helper after the handler checks for
 		// stopped task rows. Without stopped task rows, there is no operator
 		// start work to queue.

@@ -16,6 +16,10 @@ on:
     tags: ["v*"]
     branches: [main]
   pull_request:
+  # Required status checks must also report on the merge queue, or the queue
+  # waits forever. The build runs to validate; pushes stay gated on push events,
+  # so the queue never publishes. Inert until a repo admin enables the queue.
+  merge_group:
 
 permissions: {}
 
@@ -128,14 +132,14 @@ jobs:
           done
 
       - name: Set up QEMU
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push'
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # docker/setup-buildx-action@v3
 
       - name: Login to GitHub Container Registry
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -166,15 +170,16 @@ jobs:
         with:
           context: .
           file: deploy/Dockerfile
-          # Multi-arch on push/tag, single platform on PR for speed
-          platforms: ${{ github.event_name != 'pull_request' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
-          push: ${{ github.event_name != 'pull_request' }}
+          # Multi-arch only when publishing (push/tag); single platform on PRs
+          # and in the merge queue for speed (those validate the build, no push)
+          platforms: ${{ github.event_name == 'push' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ github.ref_name }}
             COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at || github.run_started_at }}
 
       # LocalScale image — fake PlanetScale API for testing.
       # Published to ghcr.io/block/schemabot/localscale:<sha|latest>
@@ -196,7 +201,7 @@ jobs:
           context: .
           file: deploy/local/Dockerfile.localscale
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.localscale-meta.outputs.tags }}
           labels: ${{ steps.localscale-meta.outputs.labels }}
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -223,6 +225,61 @@ func TestService_RoutingTernClientRoutesApplyThroughStoredPlanTarget(t *testing.
 	assert.Equal(t, "appdb-target", deploymentClient.applyReq.Options["target"])
 }
 
+// A configured default client (e.g. a TargetRouter) serves any deployment and
+// environment that has no static or registered client, so the operator can
+// resume dynamically-routed applies without a per-deployment registration. A
+// registered client still takes precedence, and without a default the lookup
+// fails closed.
+func TestService_TernClientFallsBackToDefaultClient(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := &mockStorageWithApplyStores{plans: &staticPlanStore{}, applies: &staticApplyStore{}}
+	svc := New(store, &ServerConfig{}, nil, logger)
+
+	// No static config and no default client → fail closed.
+	_, err := svc.TernClient("unconfigured", "staging")
+	require.Error(t, err)
+
+	// Default client serves any deployment/environment otherwise unresolved.
+	def := &mockTernClient{}
+	svc.SetDefaultTernClient(def)
+	got, err := svc.TernClient("unconfigured", "staging")
+	require.NoError(t, err)
+	assert.Same(t, def, got)
+
+	// A registered client takes precedence over the default.
+	registered := &mockTernClient{}
+	svc.RegisterTernClient("primary", "staging", registered)
+	got, err = svc.TernClient("primary", "staging")
+	require.NoError(t, err)
+	assert.Same(t, registered, got)
+}
+
+func TestService_TernClientPrefersConfiguredEndpointOverDefault(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := &mockStorageWithApplyStores{plans: &staticPlanStore{}, applies: &staticApplyStore{}}
+	cfg := &ServerConfig{
+		TernDeployments: TernConfig{
+			"primary":       {"staging": "localhost:9090"},
+			"misconfigured": {"staging": ""}, // present but empty endpoint
+		},
+	}
+	svc := New(store, cfg, nil, logger)
+	svc.SetDefaultTernClient(&mockTernClient{})
+
+	// An explicitly configured gRPC endpoint takes precedence over the default client.
+	got, err := svc.TernClient("primary", "staging")
+	require.NoError(t, err)
+	grpcClient, ok := got.(*tern.GRPCClient)
+	require.True(t, ok, "expected a gRPC client for a configured endpoint, got %T", got)
+	assert.Equal(t, "localhost:9090", grpcClient.Endpoint())
+
+	// A configured-but-misconfigured endpoint fails closed even when a default exists.
+	_, err = svc.TernClient("misconfigured", "staging")
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, errTernDeploymentNotConfigured),
+		"misconfigured endpoint must not be treated as unconfigured")
+}
+
 func TestTernConfig_Endpoint_EmptyEndpoint(t *testing.T) {
 	config := TernConfig{
 		"default": {
@@ -271,6 +328,46 @@ func TestServiceDeploymentForDatabaseEnvironment(t *testing.T) {
 
 	_, err = service.deploymentForDatabaseEnvironment("missing", "", "staging")
 	require.Error(t, err)
+}
+
+type fakeRegisteredEngine struct{ engine.Engine }
+
+// A database type with no built-in engine fails closed until an embedding
+// service registers one; once registered, the service builds the local client
+// with the supplied engine.
+func TestServiceRegisterEngineSuppliesLocalClientEngine(t *testing.T) {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"customdb": {
+				Type: "customengine",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost:3306)/customdb"},
+				},
+			},
+		},
+	}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, err := service.TernClient("customdb", "staging")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no engine registered")
+
+	require.NoError(t, service.RegisterEngine("customengine", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
+		return &fakeRegisteredEngine{}, nil
+	}))
+	client, err := service.TernClient("customdb", "staging")
+	require.NoError(t, err)
+	require.NotNil(t, client)
+}
+
+// RegisterEngine validates its inputs so a misconfiguration fails fast at setup.
+func TestServiceRegisterEngineValidates(t *testing.T) {
+	service := New(nil, &ServerConfig{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	require.Error(t, service.RegisterEngine("", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
+		return &fakeRegisteredEngine{}, nil
+	}))
+	require.Error(t, service.RegisterEngine("customengine", nil))
 }
 
 // A PlanetScale token configured as a literal (the secrets resolver returns

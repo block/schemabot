@@ -36,7 +36,7 @@ func (cmd *StartCmd) Run(g *Globals) error {
 		fmt.Println("Schema change already complete - nothing to start")
 		return nil
 	}
-	if state.IsState(curState, state.Apply.Running, state.Apply.CuttingOver) {
+	if state.IsState(curState, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.CuttingOver) {
 		fmt.Println("Schema change already running")
 		if cmd.Watch {
 			return WatchApplyProgressByApplyID(ep, cmd.ApplyID, true)

@@ -239,11 +239,10 @@ func TestFetchSchemaFilesOptimizedFailsClosedWhenDirectoryAtCap(t *testing.T) {
 
 	entries := make([]gh.RepositoryContent, 0, maxGitHubDirEntries)
 	for i := range maxGitHubDirEntries {
-		name := "t" + strconv.Itoa(i) + ".sql"
 		entries = append(entries, gh.RepositoryContent{
 			Type: new("file"),
-			Name: new(name),
-			Path: new("schema/" + name),
+			Name: new("t" + strconv.Itoa(i) + ".sql"),
+			Path: new("schema/t" + strconv.Itoa(i) + ".sql"),
 		})
 	}
 	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schema", func(w http.ResponseWriter, _ *http.Request) {

@@ -15,6 +15,7 @@ import "strings"
 var Apply = struct {
 	Pending           string
 	Running           string
+	RunningDegraded   string
 	WaitingForDeploy  string
 	WaitingForCutover string
 	Recovering        string
@@ -38,6 +39,7 @@ var Apply = struct {
 }{
 	Pending:           "pending",
 	Running:           "running",
+	RunningDegraded:   "running_degraded",
 	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
 	Recovering:        "recovering",
@@ -161,8 +163,9 @@ type RolloutChild struct {
 //     failure stands and the apply is failed (fail closed, matching halt); else
 //   - if every child is terminal, the rollout is settled and the apply is
 //     failed (the verdict still reflects the failure); else
-//   - the apply is held running so the still-in-flight siblings can run to
-//     completion under continue.
+//   - the apply is held running_degraded so the still-in-flight siblings can
+//     run to completion under continue while surfacing that a sibling has
+//     already failed.
 //
 // An empty child set returns Pending, matching DeriveApplyState.
 func DeriveRolloutApplyState(children []RolloutChild) string {
@@ -191,7 +194,7 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 	if allTerminal {
 		return Apply.Failed
 	}
-	return Apply.Running
+	return Apply.RunningDegraded
 }
 
 // normalizeApplyState converts a task state string to its canonical lowercase form.
@@ -201,6 +204,8 @@ func normalizeApplyState(raw string) string {
 		return Apply.Pending
 	case "RUNNING":
 		return Apply.Running
+	case "RUNNING_DEGRADED":
+		return Apply.RunningDegraded
 	case "WAITING_FOR_DEPLOY":
 		return Apply.WaitingForDeploy
 	case "WAITING_FOR_CUTOVER":
@@ -254,6 +259,18 @@ func IsState(s string, expected ...string) bool {
 func IsTerminalApplyState(s string) bool {
 	info, ok := LookupApply(NormalizeState(s))
 	return ok && info.Terminal
+}
+
+// IsRunningApplyState reports whether an apply is in a running-family state:
+// running, or running_degraded (a continue rollout still in flight after a
+// sibling deployment failed). Control gates that mean "the apply is actively
+// running" — cutover readiness, start reconciliation, stop/volume eligibility —
+// must use this so a degraded rollout is not mistaken for a non-running apply.
+// This is narrower than "active" (non-terminal): pending, waiting_for_cutover,
+// recovering, and other non-terminal states are not running-family.
+// Accepts any format (proto, uppercase, or canonical lowercase).
+func IsRunningApplyState(s string) bool {
+	return IsState(s, Apply.Running, Apply.RunningDegraded)
 }
 
 // IsSetupPhase returns true if the apply state is an engine-lifecycle phase

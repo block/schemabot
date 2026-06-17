@@ -375,7 +375,11 @@ type DSNFromConfigPaths struct {
 // time. Each is one pluggable backend behind the same resolver interface.
 type TargetResolverConfig struct {
 	Targets map[string]inventory.StaticTarget `yaml:"targets,omitempty"`
-	Etre    EtreConfig                        `yaml:"etre,omitempty"`
+	// Etre lists one or more Etre-backed resolvers. A single entry resolves every
+	// request directly; multiple entries compose into a per-type router (keyed by
+	// each entry's database_type) so one data plane can serve several engines at
+	// once and the request's database type selects among them.
+	Etre []EtreConfig `yaml:"etre,omitempty"`
 }
 
 // Configured reports whether the data plane has any static target inventory.
@@ -386,7 +390,7 @@ func (c TargetResolverConfig) Configured() bool {
 // Enabled reports whether any target-resolver backend is configured (static
 // inventory or Etre). New backends are added here so callers stay correct.
 func (c TargetResolverConfig) Enabled() bool {
-	return c.Configured() || c.Etre.Configured()
+	return c.Configured() || len(c.Etre) > 0
 }
 
 // StaticInventory returns the static inventory config for NewStaticResolver.
@@ -452,31 +456,33 @@ type EtreCredentialsConfig struct {
 	// Type selects the credential backend: "secret_ref" (default) or "awssm".
 	Type string `yaml:"type,omitempty"`
 
-	// secret_ref backend: a configured username plus a password secret reference
-	// (env:, file:, secretsmanager:, or a literal), optionally carrying a
-	// {target} placeholder for per-target secret naming.
+	// Username is the database user. For secret_ref it is a literal username. For
+	// awssm it is optional: when set, it is a template (over {target} and
+	// {attribute} placeholders, e.g. "{app}_ddl") and the fetched secret is treated
+	// as the plain-text password instead of a JSON payload. For awssm it is mutually
+	// exclusive with token-decoding engines (e.g. vitess), which interpret the
+	// secret themselves.
+	// PasswordRef (secret_ref) is a password secret reference (env:, file:,
+	// secretsmanager:, or a literal), optionally carrying a {target} placeholder.
 	Username    string `yaml:"username,omitempty"`
 	PasswordRef string `yaml:"password_ref,omitempty"`
 
-	// awssm backend: read a secret from AWS Secrets Manager and parse it as a JSON
-	// {username, password} payload (or, for engines like Vitess, a token decoded
-	// by the assembler). SecretName may carry {target} and {attribute} placeholders
-	// to locate per-target or per-cluster secrets. RoleARN is optional: when set,
-	// the backend assumes a per-target role (carrying an {account} placeholder) so
-	// one data plane can read secrets across accounts, and AccountAttribute names
-	// the entity attribute holding the target's AWS account id (defaults to
-	// aws_account_id); when empty, secrets are read from the caller's own account.
-	// ExternalID is an optional STS external id used only with RoleARN.
+	// awssm backend: read a secret from AWS Secrets Manager. By default it is parsed
+	// as a JSON {username, password} payload (or, for engines like Vitess, a token
+	// decoded by the assembler); set Username to instead derive the user from entity
+	// attributes and treat the secret as a plain-text password. SecretName may carry
+	// {target} and {attribute} placeholders to locate per-target or per-cluster
+	// secrets. RoleARN is optional: when set, the backend assumes a per-target role
+	// (carrying an {account} placeholder) so one data plane can read secrets across
+	// accounts, and AccountAttribute names the entity attribute holding the target's
+	// AWS account id (defaults to aws_account_id); when empty, secrets are read from
+	// the caller's own account. ExternalID is an optional STS external id used only
+	// with RoleARN.
 	Region           string `yaml:"region,omitempty"`
 	RoleARN          string `yaml:"role_arn,omitempty"`
 	ExternalID       string `yaml:"external_id,omitempty"`
 	SecretName       string `yaml:"secret_name,omitempty"`
 	AccountAttribute string `yaml:"account_attribute,omitempty"`
-}
-
-// Configured reports whether the data plane should resolve targets through Etre.
-func (c EtreConfig) Configured() bool {
-	return strings.TrimSpace(c.Addr) != ""
 }
 
 // DatabaseConfig holds configuration for a registered database.

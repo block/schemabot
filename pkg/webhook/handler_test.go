@@ -165,6 +165,29 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
 
+	t.Run("appends to reconciliation required comments", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderSchemaChangeReconciliationRequired(templates.SchemaChangeReconciliationData{
+			RequestedBy: "alice",
+			Timestamp:   "2026-06-14 12:34:56",
+			Items: []templates.SchemaChangeReconciliationItem{{
+				Database:    "orders",
+				Environment: "staging",
+				ApplyID:     "apply-1234",
+				State:       "completed",
+			}},
+		}))
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
 	t.Run("escapes markdown link text", func(t *testing.T) {
 		cfg := &api.ServerConfig{
 			SupportChannel: api.SupportChannelConfig{

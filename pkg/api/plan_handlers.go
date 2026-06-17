@@ -53,7 +53,7 @@ type unsupportedPullSchemaError struct {
 }
 
 func (e *unsupportedPullSchemaError) Error() string {
-	return fmt.Sprintf("pull schema supports %s databases; got %s", storage.DatabaseTypeMySQL, e.DatabaseType)
+	return fmt.Sprintf("pull schema supports %s and %s databases; got %s", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, e.DatabaseType)
 }
 
 type ambiguousPullSchemaTargetError struct {
@@ -180,7 +180,7 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		return nil, typeErr
 	}
-	if resolvedTarget.DatabaseType != storage.DatabaseTypeMySQL {
+	if resolvedTarget.DatabaseType != storage.DatabaseTypeMySQL && resolvedTarget.DatabaseType != storage.DatabaseTypeVitess {
 		unsupportedErr := &unsupportedPullSchemaError{DatabaseType: resolvedTarget.DatabaseType}
 		span.RecordError(unsupportedErr)
 		span.SetStatus(otelcodes.Error, "unsupported database type")

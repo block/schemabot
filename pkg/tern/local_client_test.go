@@ -10,32 +10,175 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/statement"
-	spirittable "github.com/block/spirit/pkg/table"
+	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
 func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
-	content, err := pulledSchemaFileContent("orders", spirittable.TableSchema{
-		Name:   "users",
-		Schema: "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-	})
+	content, err := pulledSchemaFileContent("orders", "users", "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 
 	require.NoError(t, err)
 	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n", content)
 
-	_, err = pulledSchemaFileContent("orders", spirittable.TableSchema{
-		Name:   "broken_users",
-		Schema: "CREATE TABLE",
-	})
+	_, err = pulledSchemaFileContent("orders", "broken_users", "CREATE TABLE")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
+}
+
+type pullSchemaPSClient struct {
+	psclient.PSClient
+	keyspaces   []*ps.Keyspace
+	schemas     map[string][]*ps.Diff
+	vschemas    map[string]*ps.VSchema
+	listReq     *ps.ListKeyspacesRequest
+	schemaReqs  []*ps.BranchSchemaRequest
+	vschemaReqs []*ps.GetKeyspaceVSchemaRequest
+}
+
+func (c *pullSchemaPSClient) ListKeyspaces(_ context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
+	c.listReq = req
+	return c.keyspaces, nil
+}
+
+func (c *pullSchemaPSClient) GetBranchSchema(_ context.Context, req *ps.BranchSchemaRequest) ([]*ps.Diff, error) {
+	c.schemaReqs = append(c.schemaReqs, req)
+	return c.schemas[req.Keyspace], nil
+}
+
+func (c *pullSchemaPSClient) GetKeyspaceVSchema(_ context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {
+	c.vschemaReqs = append(c.vschemaReqs, req)
+	return c.vschemas[req.Keyspace], nil
+}
+
+func TestLocalClient_PullSchemaLoadsVitessKeyspaceWithVSchemaArtifact(t *testing.T) {
+	psClient := &pullSchemaPSClient{
+		schemas: map[string][]*ps.Diff{
+			"commerce_sharded": {
+				{Name: "users", Raw: "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"},
+			},
+		},
+		vschemas: map[string]*ps.VSchema{
+			"commerce_sharded": {Raw: "{\"sharded\":true,\"tables\":{\"users\":{}}}"},
+		},
+	}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "commerce",
+			Type:     storage.DatabaseTypeVitess,
+			Metadata: map[string]string{
+				"organization": "test-org",
+				"main_branch":  "production",
+			},
+		},
+		psClientFunc: func(_, _ string) (psclient.PSClient, error) { return psClient, nil },
+		logger:       slog.Default(),
+	}
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "commerce",
+		Type:        storage.DatabaseTypeVitess,
+		Environment: "production",
+		Namespace:   "commerce_sharded",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, storage.DatabaseTypeVitess, resp.Type)
+	assert.Equal(t, int32(1), resp.TableCount)
+	ns := resp.Namespaces["commerce_sharded"]
+	require.NotNil(t, ns)
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n", ns.Tables["users"])
+	assert.JSONEq(t, "{\"sharded\":true,\"tables\":{\"users\":{}}}", ns.Artifacts[vSchemaArtifactName])
+	assert.Equal(t, "commerce_sharded", ns.NamespaceCatalog.Name)
+	assert.Equal(t, storage.DatabaseTypeVitess, ns.NamespaceCatalog.Engine)
+	assert.Equal(t, int32(1), ns.NamespaceCatalog.TableCount)
+	require.Len(t, psClient.schemaReqs, 1)
+	assert.Equal(t, "test-org", psClient.schemaReqs[0].Organization)
+	assert.Equal(t, "commerce", psClient.schemaReqs[0].Database)
+	assert.Equal(t, "production", psClient.schemaReqs[0].Branch)
+	assert.Equal(t, "commerce_sharded", psClient.schemaReqs[0].Keyspace)
+	require.Len(t, psClient.vschemaReqs, 1)
+	assert.Equal(t, "commerce_sharded", psClient.vschemaReqs[0].Keyspace)
+}
+
+func TestLocalClient_PullSchemaDiscoversVitessKeyspaces(t *testing.T) {
+	psClient := &pullSchemaPSClient{
+		keyspaces: []*ps.Keyspace{{Name: "commerce_sharded"}, {Name: "_vt"}, {Name: "commerce"}},
+		schemas: map[string][]*ps.Diff{
+			"commerce":         {{Name: "settings", Raw: "CREATE TABLE `settings` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+			"commerce_sharded": {{Name: "users", Raw: "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+		},
+		vschemas: map[string]*ps.VSchema{
+			"commerce":         {Raw: "{\"sharded\":false}"},
+			"commerce_sharded": {Raw: "{\"sharded\":true}"},
+		},
+	}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "commerce",
+			Type:     storage.DatabaseTypeVitess,
+			Metadata: map[string]string{"organization": "test-org"},
+		},
+		psClientFunc: func(_, _ string) (psclient.PSClient, error) { return psClient, nil },
+		logger:       slog.Default(),
+	}
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "commerce",
+		Type:        storage.DatabaseTypeVitess,
+		Environment: "production",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, int32(2), resp.TableCount)
+	assert.Contains(t, resp.Namespaces, "commerce")
+	assert.Contains(t, resp.Namespaces, "commerce_sharded")
+	assert.NotContains(t, resp.Namespaces, "_vt")
+	require.NotNil(t, psClient.listReq)
+	assert.Equal(t, "test-org", psClient.listReq.Organization)
+	assert.Equal(t, "commerce", psClient.listReq.Database)
+	assert.Equal(t, "main", psClient.listReq.Branch)
+	require.Len(t, psClient.schemaReqs, 2)
+	assert.Equal(t, "commerce", psClient.schemaReqs[0].Keyspace)
+	assert.Equal(t, "commerce_sharded", psClient.schemaReqs[1].Keyspace)
+}
+
+func TestLocalClient_PullSchemaRejectsInvalidVitessDDL(t *testing.T) {
+	psClient := &pullSchemaPSClient{
+		schemas: map[string][]*ps.Diff{
+			"commerce": {{Name: "broken_users", Raw: "CREATE TABLE"}},
+		},
+		vschemas: map[string]*ps.VSchema{"commerce": {Raw: "{}"}},
+	}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "commerce",
+			Type:     storage.DatabaseTypeVitess,
+			Metadata: map[string]string{"organization": "test-org"},
+		},
+		psClientFunc: func(_, _ string) (psclient.PSClient, error) { return psClient, nil },
+		logger:       slog.Default(),
+	}
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "commerce",
+		Type:        storage.DatabaseTypeVitess,
+		Environment: "production",
+		Namespace:   "commerce",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fetch Vitess schema for database commerce branch main keyspace commerce")
+	assert.Contains(t, err.Error(), "parse pulled schema for database commerce table broken_users")
 }
 
 func TestPlanHasOriginalFilesCaptureAcceptsOriginalFiles(t *testing.T) {
@@ -1804,9 +1947,9 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 
 	// Under on_failure "continue" a terminally failed deployment does not
 	// terminalize the apply while a sibling is still pending: the apply is held
-	// running so the remaining deployment gets its turn, then settles to failed
-	// once every sibling is terminal.
-	t.Run("continue policy holds the apply active past a failed deployment", func(t *testing.T) {
+	// running_degraded so the remaining deployment gets its turn, then settles to
+	// failed once every sibling is terminal.
+	t.Run("continue policy holds the apply degraded past a failed deployment", func(t *testing.T) {
 		tasks := []*storage.Task{taskWith(state.Task.Failed)}
 		client := &LocalClient{
 			storage: &exactProgressStorage{
@@ -1823,7 +1966,7 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 
 		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
 		assert.True(t, ok, "current op row present, projection must be determined")
-		assert.Equal(t, state.Apply.Running, got, "continue policy must hold the apply active until the pending sibling settles")
+		assert.Equal(t, state.Apply.RunningDegraded, got, "continue policy must hold the apply degraded until the pending sibling settles")
 	})
 
 	// Default policy (on_failure unset) fails closed: a terminally failed
@@ -2330,4 +2473,96 @@ func TestLocalClient_PlanNamespaceUsesConfiguredDatabase(t *testing.T) {
 	assert.Equal(t, "testdb", client.planNamespace(""))
 	assert.Equal(t, "testdb", client.planNamespace("default"))
 	assert.Equal(t, "analytics", client.planNamespace("analytics"))
+}
+
+// A database type without a built-in engine is served by a registered factory,
+// so an embedding service can supply an engine this build does not include.
+func TestNewLocalClientUsesRegisteredEngine(t *testing.T) {
+	fake := &fakeControlEngine{}
+	c, err := NewLocalClient(LocalConfig{
+		Database: "db",
+		Type:     "customengine",
+		EngineFactories: map[string]EngineFactory{
+			"customengine": func(LocalConfig, *slog.Logger) (engine.Engine, error) { return fake, nil },
+		},
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	assert.Same(t, fake, c.getEngine())
+}
+
+// Built-in engine types ignore the registry.
+func TestNewLocalClientBuiltinEngineIgnoresRegistry(t *testing.T) {
+	c, err := NewLocalClient(LocalConfig{Database: "db", Type: storage.DatabaseTypeMySQL}, nil, slog.Default())
+	require.NoError(t, err)
+	assert.NotNil(t, c.getEngine())
+}
+
+// A type with no built-in engine and no registered factory fails closed.
+func TestNewLocalClientErrorsWhenEngineUnregistered(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{Database: "db", Type: "customengine"}, nil, slog.Default())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no engine registered")
+}
+
+func TestNewLocalClientPropagatesEngineFactoryError(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{
+		Database: "db",
+		Type:     "customengine",
+		EngineFactories: map[string]EngineFactory{
+			"customengine": func(LocalConfig, *slog.Logger) (engine.Engine, error) {
+				return nil, errors.New("init failed")
+			},
+		},
+	}, nil, slog.Default())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "init failed")
+}
+
+// A factory that returns a nil engine must fail closed rather than yield a
+// client that no-ops or panics on first use.
+func TestNewLocalClientFactoryReturningNilFailsClosed(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{
+		Database: "db",
+		Type:     "customengine",
+		EngineFactories: map[string]EngineFactory{
+			"customengine": func(LocalConfig, *slog.Logger) (engine.Engine, error) { return nil, nil },
+		},
+	}, nil, slog.Default())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil engine")
+}
+
+// A registered key mapped to a nil factory must fail closed rather than panic
+// when the factory would be invoked.
+func TestNewLocalClientNilFactoryFailsClosed(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{
+		Database:        "db",
+		Type:            "customengine",
+		EngineFactories: map[string]EngineFactory{"customengine": nil},
+	}, nil, slog.Default())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is nil")
+}
+
+type namedEngine struct {
+	engine.Engine
+	name string
+}
+
+func (e namedEngine) Name() string { return e.name }
+
+// The reported proto engine reflects the engine actually backing the client, so
+// a registered engine is not misreported as the Spirit default.
+func TestLocalClientProtoEngineReflectsRegisteredEngine(t *testing.T) {
+	c, err := NewLocalClient(LocalConfig{
+		Database: "db",
+		Type:     "customengine",
+		EngineFactories: map[string]EngineFactory{
+			"customengine": func(LocalConfig, *slog.Logger) (engine.Engine, error) {
+				return namedEngine{name: storage.EngineStrata}, nil
+			},
+		},
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.Engine_ENGINE_STRATA, c.protoEngine())
 }

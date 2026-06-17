@@ -20,6 +20,7 @@ the stored task rows.
 |-------|-------|-------------|
 | Pending | `pending` | Apply created, no tasks started |
 | Running | `running` | At least one task is actively executing |
+| RunningDegraded | `running_degraded` | A multi-deployment rollout is still in flight, but a deployment has already failed under `on_failure: continue`. Projected from the operation rows; the apply still settles to `failed` once every sibling is terminal |
 | ValidatingBranch | `validating_branch` | Branch schema validation in progress after DDL apply (PlanetScale only) |
 | ValidatingDeployRequest | `validating_deploy_request` | PlanetScale is validating the deploy request diff (PlanetScale only) |
 | WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only). Without `--defer-deploy`, auto-advances immediately. |
@@ -51,6 +52,9 @@ stateDiagram-v2
     running --> cancelled : permanent (PlanetScale only)
     running --> waiting_for_cutover : atomic mode
     running --> revert_window : PlanetScale only
+    running --> running_degraded : sibling deployment failed (on_failure continue)
+    running_degraded --> failed : all siblings terminal
+    failed --> running_degraded : lease-scoped reopen while a sibling runs
     failed_retryable --> running : scheduler retry
     failed_retryable --> failed : retry budget or recovery window exhausted
 
@@ -67,6 +71,7 @@ stateDiagram-v2
 
 - `waiting_for_deploy`: PlanetScale only. The deploy request is created and ready, but not yet executed. With `--defer-deploy`, the user reviews the deploy request diff on PlanetScale and triggers via `schemabot cutover`. Without `--defer-deploy`, the system auto-advances through this state. For instant DDL, the deploy completes immediately after triggering. `--defer-deploy` and `--defer-cutover` compose: the first pauses before deploy, the second pauses before cutover.
 - `waiting_for_cutover`/`cutting_over`: Only with `--defer-cutover` or atomic mode (Spirit). Note: `--defer-cutover` is a no-op for instant DDL (no cutover exists).
+- `running_degraded`: Projected (not engine-reported) apply state for a multi-deployment rollout that is still in flight after a deployment failed under `on_failure: continue`. It is non-terminal and active — recovery can reclaim a stale degraded parent, and the one-active-apply overlap invariant keeps the whole target set reserved while it holds. It is unreachable for single-operation applies (one failed operation is already terminal, so the apply settles straight to `failed`); it only appears once an apply owns more than one operation. The `continue` policy governs rollout continuation, not the pass/fail verdict, so the apply still settles to `failed` once every sibling reaches a terminal state.
 - `recovering`: Temporary restart recovery. Current MySQL/Spirit deferred-cutover recovery enters this state only after durable storage had already reached `waiting_for_cutover`. That stored cutover-ready state is authoritative: recovery must not move durable storage backward to `running` if Spirit reports row-copy progress after reattaching. Row-copy counters can still be displayed while storage remains `recovering`. Recovery exits to `waiting_for_cutover` only after cutover readiness is proven again, or to `completed` when live-schema reconciliation proves the data plane already reached the desired schema. Control operations that require a later phase are blocked while recovery is active.
 - `revert_window`: Only with `--enable-revert`. Spirit auto-advances through it; PlanetScale holds until expiry or user action. Maps from PlanetScale's `complete_pending_revert` deploy state
 - `stopped`: Spirit only — resumable via `schemabot start`. Spirit checkpoints progress for resume.

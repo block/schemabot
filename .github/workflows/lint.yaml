@@ -7,6 +7,9 @@ on:
       - master
       - main
   pull_request:
+  # Required status checks must also report on the merge queue, or the queue
+  # waits forever. Inert until a repo admin enables the merge queue.
+  merge_group:
 permissions:
   contents: read
 jobs:

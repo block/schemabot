@@ -46,7 +46,7 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 			return fmt.Errorf("cannot rollback: a schema change is waiting for deploy")
 		case state.IsState(active.State, state.Apply.WaitingForCutover):
 			return fmt.Errorf("cannot rollback: a schema change is waiting for cutover")
-		case state.IsState(active.State, state.Apply.Running):
+		case state.IsRunningApplyState(active.State):
 			return fmt.Errorf("cannot rollback: a schema change is already running")
 		case state.IsState(active.State, state.Apply.CuttingOver):
 			return fmt.Errorf("cannot rollback: a schema change is currently cutting over")

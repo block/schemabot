@@ -71,6 +71,9 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIOutput(previewType)
 	// Comment template types
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanEmpty,
+		templates.PreviewCommentNoManagedSchema,
+		templates.PreviewCommentReconcileInProgress,
+		templates.PreviewCommentReconcileCompleted,
 		templates.PreviewCommentMultiEnv, templates.PreviewCommentMultiEnvDiff,
 		templates.PreviewCommentMultiEnvLint,
 		templates.PreviewCommentVitessPlan, templates.PreviewCommentVitessApplyPlan,
@@ -229,6 +232,9 @@ Interactive TUI:
 Comment Templates (GitHub PR comments):
   comment_plan                  Plan comment with DDL changes + lint violations
   comment_plan_empty            Plan comment with no changes
+  comment_no_managed_schema     No managed schema changes in current PR
+  comment_reconcile_in_progress Empty diff with an in-progress apply
+  comment_reconcile_completed   Empty diff with a completed apply
   comment_multi_env             Multi-env plan (identical plans, deduplicated)
   comment_multi_env_diff        Multi-env plan (different plans per environment)
   comment_multi_env_lint        Multi-env plan with lint violations

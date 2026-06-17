@@ -84,6 +84,31 @@ func TestComputeAggregate(t *testing.T) {
 	}
 }
 
+func TestValidateRequestedDatabaseEnvironmentUsesServerConfig(t *testing.T) {
+	service := api.New(&emptyStorage{}, &api.ServerConfig{
+		Databases: map[string]api.DatabaseConfig{
+			"orders": {
+				Environments: map[string]api.EnvironmentConfig{
+					"production": {Deployment: "default", Target: "orders"},
+				},
+			},
+		},
+	}, nil, testLogger())
+	t.Cleanup(func() { utils.CloseAndLog(service) })
+	h := &Handler{service: service}
+
+	assert.NoError(t, h.validateRequestedDatabaseEnvironment("orders", "production"))
+	assert.NoError(t, h.validateRequestedDatabaseEnvironment("orders", ""))
+
+	err := h.validateRequestedDatabaseEnvironment("orders", "staging")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "orders" environment "staging" is not configured on this server`)
+
+	err = h.validateRequestedDatabaseEnvironment("payments", "production")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "payments" is not configured on this server`)
+}
+
 func TestIsAggregateCheck(t *testing.T) {
 	t.Run("global aggregate", func(t *testing.T) {
 		aggregate := &storage.Check{

@@ -1129,11 +1129,12 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 	// rows holds it running until every sibling is terminal. Gate the exception
 	// narrowly — the parent must be failed, the child base must still be failed
 	// (a real continuable failure, not a stale parent over non-failed children),
-	// the derived projection must be running, and the caller must hold the lease.
+	// the derived projection must be the held-running degraded state, and the
+	// caller must hold the lease.
 	reopensContinuableFailedRollout := bool(reopen) &&
 		state.IsState(apply.State, state.Apply.Failed) &&
 		state.IsState(base, state.Apply.Failed) &&
-		state.IsState(derived, state.Apply.Running)
+		state.IsState(derived, state.Apply.RunningDegraded)
 
 	if state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived) && !reopensContinuableFailedRollout {
 		return applyProjectionResult{}, fmt.Errorf("derive apply state for terminal apply %s (%d): child operations derive non-terminal state %q from parent state %q",

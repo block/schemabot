@@ -72,7 +72,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 			stateMsg = "A schema change is waiting for deploy."
 		case state.IsState(active.State, state.Apply.WaitingForCutover):
 			stateMsg = "A schema change is waiting for cutover."
-		case state.IsState(active.State, state.Apply.Running):
+		case state.IsRunningApplyState(active.State):
 			stateMsg = "A schema change is already running."
 		case state.IsState(active.State, state.Apply.CuttingOver):
 			stateMsg = "A schema change is currently cutting over."
