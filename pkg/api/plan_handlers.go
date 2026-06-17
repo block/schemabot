@@ -21,6 +21,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -874,7 +875,7 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		client.SetObserver(storedApplyID, observer)
 	}
 
-	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, deployment, options, attachObserver)
+	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
 	if err != nil {
 		recordApplyError("enqueue apply", err)
 		return nil, 0, err
@@ -900,12 +901,11 @@ func (s *Service) enqueueApply(
 	ctx context.Context,
 	plan *storage.Plan,
 	req ApplyRequest,
-	deployment string,
 	options map[string]string,
 	onApplyCreated func(int64),
 ) (string, int64, error) {
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, deployment, options, applyIdentifier, "")
+	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier, "")
 	if err != nil {
 		return "", 0, err
 	}
@@ -919,13 +919,31 @@ func (s *Service) createStoredApply(
 	ctx context.Context,
 	plan *storage.Plan,
 	req ApplyRequest,
-	deployment string,
 	options map[string]string,
 	applyIdentifier string,
 	externalID string,
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
+
+	// The plan already carries the resolved primary (deployment, target) from
+	// plan time, and is authoritative for single-deployment applies and the
+	// config-light trusted control-plane enqueue path. Multi-deployment fan-out
+	// additionally needs the full ordered target set, which only the server
+	// config knows; use it only when it defines more than one deployment so
+	// single-deployment creation stays unchanged and does not depend on
+	// database config being present.
+	targets := []routing.ExecutionTarget{{
+		DatabaseType: plan.DatabaseType,
+		Deployment:   plan.Deployment,
+		Target:       plan.Target,
+	}}
+	if resolved, err := s.config.ResolveDatabaseTargets(plan.Database, req.Environment); err != nil {
+		s.logger.Debug("createStoredApply: using plan's stored target; config did not resolve database targets",
+			"database", plan.Database, "environment", req.Environment, "error", err)
+	} else if len(resolved) > 1 {
+		targets = resolved
+	}
 
 	var lockID int64
 	lock, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
@@ -945,7 +963,7 @@ func (s *Service) createStoredApply(
 		Repository:      plan.Repository,
 		PullRequest:     plan.PullRequest,
 		Environment:     req.Environment,
-		Deployment:      deployment,
+		Deployment:      targets[0].Deployment,
 		Caller:          req.Caller,
 		InstallationID:  req.InstallationID,
 		ExternalID:      externalID,
@@ -957,49 +975,51 @@ func (s *Service) createStoredApply(
 	}
 
 	taskChanges := applyTaskChanges(plan)
-	tasks := make([]*storage.Task, 0, len(taskChanges))
-	for _, ddlChange := range taskChanges {
-		task := &storage.Task{
-			TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
-			PlanID:         plan.ID,
-			Database:       plan.Database,
-			DatabaseType:   plan.DatabaseType,
-			Engine:         storage.EngineForType(plan.DatabaseType),
-			Repository:     plan.Repository,
-			PullRequest:    plan.PullRequest,
-			Environment:    req.Environment,
-			State:          state.Task.Pending,
-			Options:        storage.MarshalApplyOptions(applyOpts),
-			Namespace:      ddlChange.Namespace,
-			TableName:      ddlChange.Table,
-			DDL:            ddlChange.DDL,
-			DDLAction:      ddlChange.Operation,
-			CreatedAt:      now,
-			UpdatedAt:      now,
+	buildTasks := func() []*storage.Task {
+		tasks := make([]*storage.Task, 0, len(taskChanges))
+		for _, ddlChange := range taskChanges {
+			task := &storage.Task{
+				TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
+				PlanID:         plan.ID,
+				Database:       plan.Database,
+				DatabaseType:   plan.DatabaseType,
+				Engine:         storage.EngineForType(plan.DatabaseType),
+				Repository:     plan.Repository,
+				PullRequest:    plan.PullRequest,
+				Environment:    req.Environment,
+				State:          state.Task.Pending,
+				Options:        storage.MarshalApplyOptions(applyOpts),
+				Namespace:      ddlChange.Namespace,
+				TableName:      ddlChange.Table,
+				DDL:            ddlChange.DDL,
+				DDLAction:      ddlChange.Operation,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+			tasks = append(tasks, task)
 		}
-		tasks = append(tasks, task)
+		return tasks
 	}
 
-	// Dual-write one apply_operations row alongside the applies row in the
-	// same transaction. Today the plan already carries the resolved
-	// (deployment, target) pair from plan-time `ResolveDatabaseTarget`, and
-	// the config layer hard-blocks multi-entry deployments maps, so we
-	// always write exactly one operation row that mirrors the apply's own
-	// routing. The data shape is what the operator claim-loop PR consumes
-	// once that gate is lifted and plans become deployment-agnostic.
 	cutoverPolicy := s.config.CutoverPolicyFor(plan.Database, req.Environment)
 	onFailure := s.config.OnFailure(plan.Database, req.Environment)
-	operations := []*storage.ApplyOperation{{
-		Deployment:    apply.Deployment,
-		Target:        plan.Target,
-		State:         state.ApplyOperation.Pending,
-		CutoverPolicy: cutoverPolicy,
-		OnFailure:     onFailure,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}}
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
+	for _, target := range targets {
+		groups = append(groups, &storage.ApplyOperationWithTasks{
+			Operation: &storage.ApplyOperation{
+				Deployment:    target.Deployment,
+				Target:        target.Target,
+				State:         state.ApplyOperation.Pending,
+				CutoverPolicy: cutoverPolicy,
+				OnFailure:     onFailure,
+				CreatedAt:     now,
+				UpdatedAt:     now,
+			},
+			Tasks: buildTasks(),
+		})
+	}
 
-	storedApplyID, err := s.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
 	}
