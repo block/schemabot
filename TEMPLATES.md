@@ -607,6 +607,38 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="drop-column-blocked"></a><strong>Drop Column Blocked</strong></summary>
+
+
+## MySQL Schema Change Plan
+
+**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `customers` DROP COLUMN `nickname`;
+```
+
+📋 **Plan**: **1** table to alter
+
+---
+
+**⛔ Unsafe Changes Detected:**
+- `customers`: Unsafe operation detected: DROP COLUMN `nickname`
+
+**Destructive drop guidance:**
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+```
+schemabot apply -e staging --allow-unsafe
+```
+
+</details>
+
+<details>
 <summary><a name="help-comment"></a><strong>Help Comment</strong></summary>
 
 

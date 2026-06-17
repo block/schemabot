@@ -362,6 +362,53 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, allowUn
 		}
 	}
 	sb.WriteString("\n")
+	writeUnsafeDropGuidance(sb, changes)
+}
+
+func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData) {
+	usageTarget, ok := unsafeDropUsageTarget(changes)
+	if !ok {
+		return
+	}
+
+	sb.WriteString("**Destructive drop guidance:**\n\n")
+	fmt.Fprintf(sb, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to %s.\n\n", usageTarget)
+}
+
+func unsafeDropUsageTarget(changes []UnsafeChangeData) (string, bool) {
+	dropColumns := 0
+	dropTables := 0
+	for _, change := range changes {
+		upperReason := strings.ToUpper(change.Reason)
+		dropColumns += strings.Count(upperReason, "DROP COLUMN")
+		dropTables += strings.Count(upperReason, "DROP TABLE")
+	}
+
+	if dropColumns > 1 && dropTables > 1 {
+		return "any dropped tables or columns", true
+	}
+	if dropColumns == 1 && dropTables == 1 {
+		return "the dropped table and column", true
+	}
+	if dropColumns == 1 && dropTables > 1 {
+		return "any dropped tables and the dropped column", true
+	}
+	if dropColumns > 1 && dropTables == 1 {
+		return "the dropped table and any dropped columns", true
+	}
+	if dropColumns == 1 {
+		return "the dropped column", true
+	}
+	if dropColumns > 1 {
+		return "any dropped columns", true
+	}
+	if dropTables == 1 {
+		return "the dropped table", true
+	}
+	if dropTables > 1 {
+		return "any dropped tables", true
+	}
+	return "", false
 }
 
 func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {

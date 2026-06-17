@@ -123,6 +123,7 @@ const (
 	PreviewCommentSupportChannel        PreviewType = "comment_support_channel"         // Comment with support-channel footer
 	PreviewCommentErrors                PreviewType = "comment_errors"                  // All error comment templates
 	PreviewCommentUnsafeBlocked         PreviewType = "comment_unsafe_blocked"          // Unsafe changes blocked (no --allow-unsafe)
+	PreviewCommentDropColumnBlocked     PreviewType = "comment_drop_column_blocked"     // Drop column blocked with destructive-drop guidance
 	PreviewCommentApplyPlan             PreviewType = "comment_apply_plan"              // Locked apply-plan comment
 	PreviewCommentApplyPlanOptions      PreviewType = "comment_apply_plan_options"      // Locked apply-plan with options
 	PreviewCommentApplyPlanUnsafe       PreviewType = "comment_apply_plan_unsafe"       // Locked apply-plan with unsafe warning

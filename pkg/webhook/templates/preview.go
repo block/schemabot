@@ -367,6 +367,35 @@ func PreviewCommentUnsafeBlocked() string {
 	})
 }
 
+// PreviewCommentDropColumnBlocked renders a sample plan where a destructive
+// column drop is blocked until the application rollout is safe.
+func PreviewCommentDropColumnBlocked() string {
+	return RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `customers` DROP COLUMN `nickname`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{
+				Table:  "customers",
+				Reason: "Unsafe operation detected: DROP COLUMN `nickname`",
+			},
+		},
+	})
+}
+
 // PreviewCommentApplyPlan renders a sample locked apply-plan comment.
 func PreviewCommentApplyPlan() string {
 	return RenderPlanComment(PlanCommentData{

@@ -228,6 +228,13 @@ func TestEngine_Plan_DropColumn(t *testing.T) {
 	require.NotEmpty(t, result.FlatDDL(), "expected DDL statements")
 
 	t.Logf("DDL statements: %v", result.FlatDDL())
+	require.NotEmpty(t, result.Changes)
+	require.NotEmpty(t, result.Changes[0].TableChanges)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, "products", change.Table)
+	assert.True(t, change.IsUnsafe)
+	assert.Contains(t, change.UnsafeReason, "Unsafe operation detected: DROP COLUMN `deprecated_field`")
+	assert.True(t, result.HasErrors(), "Spirit unsafe drop lint should remain the blocking gate")
 }
 
 func TestEngine_Plan_NoChanges(t *testing.T) {

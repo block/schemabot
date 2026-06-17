@@ -80,6 +80,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentMySQLMultiSchema,
 		templates.PreviewCommentHelp, templates.PreviewCommentSupportChannel,
 		templates.PreviewCommentErrors, templates.PreviewCommentUnsafeBlocked,
+		templates.PreviewCommentDropColumnBlocked,
 		templates.PreviewCommentApplyPlan, templates.PreviewCommentApplyPlanOptions,
 		templates.PreviewCommentApplyPlanUnsafe,
 		templates.PreviewCommentApplyProgress, templates.PreviewCommentApplyCompleted,
@@ -242,6 +243,7 @@ Comment Templates (GitHub PR comments):
   comment_support_channel       Comment with support-channel footer
   comment_errors                All error comment templates
   comment_unsafe_blocked        Unsafe changes blocked (no --allow-unsafe)
+  comment_drop_column_blocked   Drop column blocked with destructive-drop guidance
   comment_single_progress       Single table: running (most common case)
   comment_single_complete       Single table: completed
   comment_single_failed         Single table: failed

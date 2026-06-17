@@ -34,6 +34,103 @@ func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 	assert.NotContains(t, rendered, "schemabot unlock -d example-db -e staging --force")
 }
 
+func TestUnsafeDropUsageTarget(t *testing.T) {
+	tests := []struct {
+		name    string
+		changes []UnsafeChangeData
+		want    string
+		wantOK  bool
+	}{
+		{
+			name: "drop column",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
+			},
+			want:   "the dropped column",
+			wantOK: true,
+		},
+		{
+			name: "multiple drop columns",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
+			},
+			want:   "any dropped columns",
+			wantOK: true,
+		},
+		{
+			name: "drop table",
+			changes: []UnsafeChangeData{
+				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+			},
+			want:   "the dropped table",
+			wantOK: true,
+		},
+		{
+			name: "multiple drop tables",
+			changes: []UnsafeChangeData{
+				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+			},
+			want:   "any dropped tables",
+			wantOK: true,
+		},
+		{
+			name: "drop column and table",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+			},
+			want:   "the dropped table and column",
+			wantOK: true,
+		},
+		{
+			name: "multiple drop columns and one drop table",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+			},
+			want:   "the dropped table and any dropped columns",
+			wantOK: true,
+		},
+		{
+			name: "multiple drop tables and one drop column",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+			},
+			want:   "any dropped tables and the dropped column",
+			wantOK: true,
+		},
+		{
+			name: "multiple drop columns and tables",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+			},
+			want:   "any dropped tables or columns",
+			wantOK: true,
+		},
+		{
+			name: "other unsafe change",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: MODIFY COLUMN"},
+			},
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := unsafeDropUsageTarget(tt.changes)
+
+			assert.Equal(t, tt.wantOK, ok)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestRenderApplyStatusComment_Running(t *testing.T) {
 	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
 	data := ApplyStatusCommentData{

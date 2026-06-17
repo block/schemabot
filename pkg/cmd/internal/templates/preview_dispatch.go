@@ -139,6 +139,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewCommentErrorsOutput()
 	case PreviewCommentUnsafeBlocked:
 		fmt.Print(webhooktemplates.PreviewCommentUnsafeBlocked())
+	case PreviewCommentDropColumnBlocked:
+		fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked())
 	case PreviewCommentApplyPlan:
 		fmt.Print(webhooktemplates.PreviewCommentApplyPlan())
 	case PreviewCommentApplyPlanOptions:

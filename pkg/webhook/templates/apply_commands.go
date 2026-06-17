@@ -127,6 +127,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 		}
 	}
 	sb.WriteString("\n")
+	writeUnsafeDropGuidance(&sb, data.UnsafeChanges)
 
 	sb.WriteString("**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s --allow-unsafe\n```\n", data.Environment)
