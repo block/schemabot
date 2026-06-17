@@ -1821,6 +1821,10 @@ func terminalTaskStateForApply(applyState string) (string, bool) {
 		return state.Task.Stopped, true
 	case state.IsState(applyState, state.Apply.Failed):
 		return state.Task.Failed, true
+	case state.IsState(applyState, state.Apply.Cancelled):
+		return state.Task.Cancelled, true
+	case state.IsState(applyState, state.Apply.Reverted):
+		return state.Task.Reverted, true
 	default:
 		return "", false
 	}

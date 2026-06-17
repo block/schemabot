@@ -1791,31 +1791,31 @@ func TestGRPCClient_PollKeepsApplyActiveWhenReconcilingLaggingTaskStorageFails(t
 }
 
 // When a stop drives the remote apply to a terminal state but the remote no
-// longer reports the per-task progress (the remote cohort is already terminal
-// and gone), the terminal remote apply is authoritative: the lagging stored task
-// must be reconciled to the matching terminal state so the stop finalizes. The
-// control plane must not loop forever waiting for task progress the terminal
-// remote will never send again.
+// longer reports the per-task progress (the remote apply is already terminal and
+// drops the task from its payload), the terminal remote apply is authoritative:
+// the lagging stored task must be reconciled to the matching terminal state so
+// the stop finalizes. The control plane must not loop forever waiting for task
+// progress the terminal remote will never send again.
 func TestGRPCClient_PollReconcilesLaggingTaskWhenRemoteApplyStoppedAndTaskProgressOmitted(t *testing.T) {
 	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
 		progressState:    ternv1.State_STATE_STOPPED,
 		progressStateSet: true,
-		// No progressTables: the terminal remote cohort no longer reports the task.
+		// No progressTables: the terminal remote apply no longer reports the task.
 	})
 	defer cleanup()
 
 	apply := &storage.Apply{
 		ID:              31,
-		ApplyIdentifier: "apply-stop-terminal-cohort",
+		ApplyIdentifier: "apply-stop-terminal-remote",
 		Database:        "testdb",
 		Environment:     "staging",
-		ExternalID:      "remote-stop-terminal-cohort",
+		ExternalID:      "remote-stop-terminal-apply",
 		State:           state.Apply.Running,
 	}
 	storedApply := *apply
 	task := &storage.Task{
 		ID:             41,
-		TaskIdentifier: "task-stop-terminal-cohort",
+		TaskIdentifier: "task-stop-terminal-remote",
 		ApplyID:        apply.ID,
 		TableName:      "users",
 		State:          state.Task.Running,
@@ -1835,6 +1835,48 @@ func TestGRPCClient_PollReconcilesLaggingTaskWhenRemoteApplyStoppedAndTaskProgre
 	assert.Equal(t, state.Apply.Stopped, applyStore.apply.State)
 	assert.Equal(t, state.Task.Stopped, task.State,
 		"lagging stored task should be reconciled to the apply's stopped state, got %q", task.State)
+}
+
+// terminalTaskStateForApply must map every terminal apply state a remote can
+// report — including the less-common cancelled and reverted outcomes — to the
+// task state a lagging stored task adopts. A terminal apply state with no
+// mapping would make terminal reconciliation error and re-poll the already
+// terminal remote forever.
+func TestTerminalTaskStateForApply(t *testing.T) {
+	tests := []struct {
+		name       string
+		applyState string
+		wantTask   string
+		wantOK     bool
+	}{
+		{name: "completed", applyState: state.Apply.Completed, wantTask: state.Task.Completed, wantOK: true},
+		{name: "stopped", applyState: state.Apply.Stopped, wantTask: state.Task.Stopped, wantOK: true},
+		{name: "failed", applyState: state.Apply.Failed, wantTask: state.Task.Failed, wantOK: true},
+		{name: "cancelled", applyState: state.Apply.Cancelled, wantTask: state.Task.Cancelled, wantOK: true},
+		{name: "reverted", applyState: state.Apply.Reverted, wantTask: state.Task.Reverted, wantOK: true},
+		{name: "running is not terminal", applyState: state.Apply.Running, wantOK: false},
+		{name: "failed-retryable is not terminal", applyState: state.Apply.FailedRetryable, wantOK: false},
+		{name: "pending is not terminal", applyState: state.Apply.Pending, wantOK: false},
+		{name: "waiting-for-cutover is not terminal", applyState: state.Apply.WaitingForCutover, wantOK: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := terminalTaskStateForApply(tt.applyState)
+			assert.Equal(t, tt.wantOK, ok)
+			assert.Equal(t, tt.wantTask, got)
+		})
+	}
+
+	// Every terminal apply state in the registry must have a task mapping so the
+	// reconcile path can never error on a terminal remote apply.
+	for _, applyState := range []string{
+		state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped,
+		state.Apply.Cancelled, state.Apply.Reverted,
+	} {
+		require.True(t, state.IsTerminalApplyState(applyState), "%q should be a terminal apply state", applyState)
+		_, ok := terminalTaskStateForApply(applyState)
+		assert.True(t, ok, "terminal apply state %q must map to a task state", applyState)
+	}
 }
 
 func hasLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
