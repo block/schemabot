@@ -659,12 +659,16 @@ func RecordOperatorResumeFailure(ctx context.Context, database, deployment, envi
 }
 
 var knownOperatorClaimFailureReasons = map[string]bool{
-	"expire_retryable_error":         true,
-	"missing_lease_token":            true,
-	"storage_error":                  true,
-	"operation_storage_error":        true,
-	"operation_parent_claim_error":   true,
-	"operation_parent_not_claimable": true,
+	"expire_retryable_error":                  true,
+	"missing_lease_token":                     true,
+	"storage_error":                           true,
+	"operation_storage_error":                 true,
+	"missing_operation_lease_token":           true,
+	"operation_parent_claim_error":            true,
+	"operation_parent_not_claimable":          true,
+	"missing_operation_deployment":            true,
+	"stop_reconciliation_claim_error":         true,
+	"stop_reconciliation_missing_lease_token": true,
 }
 
 // RecordOperatorClaimFailure increments the operator claim failure counter.

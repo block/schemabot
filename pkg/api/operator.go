@@ -228,7 +228,7 @@ func (s *Service) recoverApplies(ctx context.Context, workerID int) {
 	// Legacy FindNextApply path drives the whole apply (applyOperationID == 0).
 	// Failures are handled inside resumeClaimedApply; the whole-apply path has no
 	// operation row to terminalize, so the return values are not needed here.
-	_, _ = s.resumeClaimedApply(ctx, workerID, apply, 0)
+	_, _ = s.resumeClaimedApply(ctx, workerID, apply, 0, "")
 }
 
 // recoverApplyOperation claims work at the apply_operations (per-deployment)
@@ -324,21 +324,24 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 	dualLeaseCtx := storage.WithOperationLease(applyLeaseCtx, opLease)
 
 	// The claimed operation row's deployment is the authoritative routing key
-	// for the drive, but resumeClaimedApply selects the Tern client from the
-	// parent apply's stored deployment. These are identical while one operation
-	// maps to one apply; if they ever diverge the worker would drive the wrong
-	// deployment, so fail closed rather than route to the parent's deployment.
-	if op.Deployment != apply.Deployment {
-		s.logger.Error("operator: claimed operation deployment does not match parent apply deployment; operation will not be driven",
+	// for the drive: RoutingClient.ResumeApplyOperation reloads the operation
+	// row, routes by its deployment, and fails closed when no client is
+	// configured for that deployment/environment. The parent apply's stored
+	// deployment is only the primary deployment and is not the routing source,
+	// so an operation deployment that differs from the parent is expected for
+	// multi-deployment applies. An empty operation deployment is a corrupt row
+	// with no routing key, so fail closed rather than fall back to a default.
+	if op.Deployment == "" {
+		s.logger.Error("operator: claimed operation is missing deployment metadata; operation will not be driven",
 			"worker", workerID,
 			"lease_owner", owner,
 			"apply_operation_id", op.ID,
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
-			"operation_deployment", op.Deployment,
+			"deployment", op.Deployment,
 			"apply_deployment", apply.Deployment,
 			"environment", apply.Environment)
-		metrics.RecordOperatorClaimFailure(ctx, "deployment_mismatch")
+		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_deployment")
 		return
 	}
 
@@ -351,7 +354,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 	stopHeartbeat := s.startApplyOperationHeartbeat(runCtx, workerID, op, apply, cancelRun)
 	defer stopHeartbeat()
 
-	resumed, resumeErr := s.resumeClaimedApply(runCtx, workerID, apply, op.ID)
+	resumed, resumeErr := s.resumeClaimedApply(runCtx, workerID, apply, op.ID, op.Deployment)
 	stopHeartbeat()
 	if !resumed {
 		if errors.Is(resumeErr, tern.ErrNoTasksForApplyOperation) {
@@ -671,15 +674,38 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, wor
 // the bool lets the operation-level claim loop decide whether to mark its
 // operation terminal, and the returned error lets it distinguish the fail-closed
 // no-tasks case (tern.ErrNoTasksForApplyOperation) from transient failures.
-func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *storage.Apply, applyOperationID int64) (bool, error) {
+func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *storage.Apply, applyOperationID int64, operationDeployment string) (bool, error) {
 	lease := apply.Lease()
 	start := s.clock.Now()
+
+	// operationDeployment is observability attribution only — RoutingClient
+	// reloads the operation row and routes by its own deployment. The
+	// operation-claim path passes the claimed op's deployment so logs/metrics
+	// name the deployment actually being driven; the legacy whole-apply path
+	// passes "" and falls back to the apply's stored deployment. For single-op
+	// applies the two are equal, so the attribution is unchanged.
+	deployment := operationDeployment
+	if deployment == "" {
+		stored, err := storedDeploymentForApply(apply)
+		if err != nil {
+			s.logger.Error("operator: claimed apply is missing stored deployment metadata",
+				"worker", workerID,
+				"apply_id", apply.ApplyIdentifier,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, "", apply.Environment, "missing_deployment")
+			return false, err
+		}
+		deployment = stored
+	}
+
 	s.logger.Info("operator: claimed apply",
 		"worker", workerID,
 		"lease_owner", lease.Owner,
 		"apply_id", apply.ApplyIdentifier,
 		"database", apply.Database,
-		"deployment", apply.Deployment,
+		"deployment", deployment,
 		"environment", apply.Environment,
 		"state", apply.State,
 		"last_heartbeat", apply.UpdatedAt)
@@ -692,17 +718,6 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 
 	previousState := apply.State
 
-	deployment, err := storedDeploymentForApply(apply)
-	if err != nil {
-		s.logger.Error("operator: claimed apply is missing stored deployment metadata",
-			"worker", workerID,
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"error", err)
-		metrics.RecordOperatorResumeFailure(ctx, apply.Database, "", apply.Environment, "missing_deployment")
-		return false, err
-	}
 	client, err := s.RoutingTernClient()
 	if err != nil {
 		s.logger.Error("operator: failed to get routing client",
