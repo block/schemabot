@@ -500,6 +500,8 @@ func buildCredentialResolver(ctx context.Context, cfg api.EtreCredentialsConfig,
 			return nil, fmt.Errorf("target_resolver.etre.credentials.region is required for the awssm backend")
 		case cfg.SecretName == "":
 			return nil, fmt.Errorf("target_resolver.etre.credentials.secret_name is required for the awssm backend")
+		case cfg.Username != "" && decode != nil:
+			return nil, fmt.Errorf("target_resolver.etre.credentials.username (plain-password secrets) cannot be combined with a token-decoding engine such as vitess")
 		}
 		awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 		if err != nil {

@@ -134,6 +134,14 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 		require.Error(t, err, field)
 		assert.Contains(t, err.Error(), field)
 	}
+
+	// A username template (plain-password mode) combined with a token-decoding
+	// engine fails fast with a config-path error, before any AWS config loading.
+	withUsername := base
+	withUsername.Username = "{app}_ddl"
+	_, err = buildCredentialResolver(t.Context(), withUsername, inventory.DecodePlanetScaleSecret)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "username")
 }
 
 // The assume-role backend's account attribute is surfaced to the resolver even

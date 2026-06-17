@@ -196,15 +196,19 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 		return creds, nil
 	}
 
-	// Username template mode: the secret is the plain-text password.
+	// Username template mode: the secret is the plain-text password. Trim
+	// surrounding whitespace, which a stored password rarely intends but a secret
+	// pasted or uploaded from a file commonly carries (a trailing newline), so the
+	// failure mode is a clear config error here rather than an opaque auth failure.
 	if r.usernameTmpl != "" {
 		if username == "" {
 			return nil, fmt.Errorf("username template %q for %s resolved to an empty username", r.usernameTmpl, where)
 		}
-		if raw == "" {
+		password := strings.TrimSpace(raw)
+		if password == "" {
 			return nil, fmt.Errorf("secret %q for %s is empty (expected a password)", secretName, where)
 		}
-		return &inventory.Credentials{Username: username, Password: raw}, nil
+		return &inventory.Credentials{Username: username, Password: password}, nil
 	}
 
 	var parsed struct {

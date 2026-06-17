@@ -152,10 +152,11 @@ func TestTemplateAttributes(t *testing.T) {
 	assert.Empty(t, TemplateAttributes("static-secret"))
 }
 
-// CAKE-style credentials derive the username from an entity attribute and store
-// only the password as a plain-text secret.
+// Some conventions derive the username from an entity attribute and store only
+// the password as a plain-text secret rather than a JSON payload.
 func TestResolverUsernameTemplateWithPlainPassword(t *testing.T) {
-	fetch := &fakeFetcher{payload: "s3cret-pw"}
+	// A trailing newline (common in file-uploaded secrets) is trimmed.
+	fetch := &fakeFetcher{payload: "s3cret-pw\n"}
 	r := newResolver("aws_account_id", "{name}_ddl_password", "{app}_ddl", fetch, nil, false)
 
 	creds, err := r.ResolveCredentials(t.Context(),
