@@ -928,6 +928,16 @@ func (s applyTaskScope) usesOperationRemoteResume() bool {
 	return s.multiOperation && s.operation != nil
 }
 
+// suppressesDirectParentApplyWrites reports whether this drive must not write
+// the parent applies row (state, heartbeat) or run parent-level side effects
+// (parent stop-request completion, active-apply metrics). Multi-operation drives
+// own only their operation: the parent applies.state is moved solely by the
+// operation-authorized projection CAS in the operator. Single-operation and
+// whole-apply drives keep writing the parent directly.
+func (s applyTaskScope) suppressesDirectParentApplyWrites() bool {
+	return s.usesOperationRemoteResume()
+}
+
 // remoteApplyID resolves the remote Tern apply id sent on this drive's
 // Progress/Stop/Start/Cutover calls. Multi-operation drives read the claimed
 // operation's engine_resume_context (which may be empty before dispatch);
@@ -1556,12 +1566,15 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		apply.StartedAt = &now
 	}
 	apply.UpdatedAt = now
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+	persisted, err := c.persistParentApply(ctx, apply, scope, "dispatch gRPC apply")
+	if err != nil {
 		return fmt.Errorf("update dispatched gRPC apply %s after storing remote apply id %s: %w", apply.ApplyIdentifier, resp.ApplyId, err)
 	}
-	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo,
-		fmt.Sprintf("Apply dispatched to remote Tern: target=%s deployment=%s remote_apply_id=%s", target, apply.Deployment, resp.ApplyId),
-		oldApplyState)
+	if persisted {
+		c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo,
+			fmt.Sprintf("Apply dispatched to remote Tern: target=%s deployment=%s remote_apply_id=%s", target, apply.Deployment, resp.ApplyId),
+			oldApplyState)
+	}
 
 	return c.pollForCompletion(ctx, apply, false, scope)
 }
@@ -1721,6 +1734,38 @@ func logSkippedRemoteApplyTransition(operation string, remoteApply, storedApply 
 	}
 }
 
+// persistParentApply writes the parent applies row unless the drive is a
+// multi-operation operation-only drive, in which case the parent state is owned
+// by the operator's projection CAS and the direct write is skipped. It reports
+// whether the write happened so callers can gate parent-level side effects
+// (state-transition logs, active-apply metrics) on an actual persist.
+func (c *GRPCClient) persistParentApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope, action string) (bool, error) {
+	if scope.suppressesDirectParentApplyWrites() {
+		slog.Debug("skipping direct parent apply write during multi-operation drive; parent state is owned by the rollout projection",
+			"apply_id", apply.ApplyIdentifier,
+			"apply_db_id", apply.ID,
+			"apply_operation_id", scope.applyOperationID,
+			"deployment", scope.operation.Deployment,
+			"environment", apply.Environment,
+			"action", action)
+		return false, nil
+	}
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// heartbeatScopedDrive refreshes the lease keeping a long drive claimed. A
+// multi-operation drive heartbeats its own operation row (it holds no parent
+// apply lease); every other drive heartbeats the parent applies row.
+func (c *GRPCClient) heartbeatScopedDrive(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
+	if scope.suppressesDirectParentApplyWrites() {
+		return c.storage.ApplyOperations().Heartbeat(ctx, scope.applyOperationID)
+	}
+	return c.storage.Applies().Heartbeat(ctx, apply.ID)
+}
+
 func (c *GRPCClient) markRemoteApplyFailed(ctx context.Context, remoteApply *storage.Apply, storedTasks []*storage.Task, message string, retryable bool, scope applyTaskScope) error {
 	return c.markRemoteApplyFailedWithOptions(ctx, remoteApply, storedTasks, message, retryable, false, scope)
 }
@@ -1775,6 +1820,21 @@ func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remot
 		if err := c.storage.Tasks().Update(ctx, storedTask); err != nil {
 			return fmt.Errorf("update task %s after remote gRPC apply failure %s: %w", storedTask.TaskIdentifier, storedApply.ApplyIdentifier, err)
 		}
+	}
+
+	// A multi-operation drive records only its operation's task failures here.
+	// The operator derives the failed operation row from those tasks and moves
+	// the parent applies.state via the projection CAS; the driver must not write
+	// the parent failure or run its parent-level side effects.
+	if scope.suppressesDirectParentApplyWrites() {
+		slog.Debug("recorded operation task failures during multi-operation drive; parent failure is owned by the rollout projection",
+			"apply_id", storedApply.ApplyIdentifier,
+			"apply_db_id", storedApply.ID,
+			"apply_operation_id", scope.applyOperationID,
+			"deployment", scope.operation.Deployment,
+			"environment", storedApply.Environment,
+			"failure_task_state", taskState)
+		return nil
 	}
 
 	oldState := storedApply.State
@@ -1856,7 +1916,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	if err := c.reconcileStoredTasksForTerminalRemoteApply(ctx, storedApply, remoteApply, storedTasks, now); err != nil {
 		return err
 	}
-	return c.persistTerminalStateFromRemote(ctx, storedApply, remoteApply, now)
+	return c.persistTerminalStateFromRemote(ctx, storedApply, remoteApply, now, scope)
 }
 
 func storedStoppedApplyCanAdoptRemoteTerminalState(storedApply, remoteApply *storage.Apply) bool {
@@ -1865,7 +1925,22 @@ func storedStoppedApplyCanAdoptRemoteTerminalState(storedApply, remoteApply *sto
 		!state.IsState(remoteApply.State, state.Apply.Stopped)
 }
 
-func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedApply, remoteApply *storage.Apply, now time.Time) error {
+func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedApply, remoteApply *storage.Apply, now time.Time, scope applyTaskScope) error {
+	// A multi-operation drive owns only its operation. The terminal task states
+	// were already synced by the caller; the operation row is derived from those
+	// tasks by the operator, which then moves the parent applies.state via the
+	// projection CAS and completes any parent control requests. The driver must
+	// not write the parent row or run its parent-level side effects here.
+	if scope.suppressesDirectParentApplyWrites() {
+		slog.Debug("skipping parent terminal write during multi-operation drive; operation tasks are resolved and parent state is owned by the rollout projection",
+			"apply_id", storedApply.ApplyIdentifier,
+			"apply_db_id", storedApply.ID,
+			"apply_operation_id", scope.applyOperationID,
+			"deployment", scope.operation.Deployment,
+			"environment", storedApply.Environment,
+			"remote_state", remoteApply.State)
+		return nil
+	}
 	oldState := storedApply.State
 	storedApply.State = remoteApply.State
 	storedApply.ErrorMessage = remoteApply.ErrorMessage
@@ -2142,8 +2217,10 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-heartbeatTicker.C:
-			// Heartbeat: bump updated_at to maintain lease
-			if err := c.storage.Applies().Heartbeat(ctx, apply.ID); err != nil {
+			// Heartbeat: bump updated_at to maintain the lease. A multi-operation
+			// drive heartbeats its own operation row; every other drive
+			// heartbeats the parent applies row.
+			if err := c.heartbeatScopedDrive(ctx, apply, scope); err != nil {
 				return fmt.Errorf("heartbeat gRPC apply %s: %w", apply.ApplyIdentifier, err)
 			}
 		case <-ticker.C:
@@ -2299,10 +2376,11 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			if err := c.syncStoredTasksFromRemoteTasks(ctx, apply, storedTasks, resp.Tables, now); err != nil {
 				return err
 			}
-			if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			persisted, err := c.persistParentApply(ctx, apply, scope, "sync nonterminal gRPC progress")
+			if err != nil {
 				return fmt.Errorf("sync apply %s from gRPC progress: %w", apply.ApplyIdentifier, err)
 			}
-			if oldApplyState != apply.State {
+			if persisted && oldApplyState != apply.State {
 				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply changed state: %s -> %s", oldApplyState, apply.State), oldApplyState)
 			}
 		}

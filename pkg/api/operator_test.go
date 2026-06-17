@@ -108,6 +108,44 @@ func TestResumeClaimedApplyRoutesRecoveredObserver(t *testing.T) {
 	assert.Equal(t, observer, deploymentClient.observer)
 }
 
+// A multi-operation drive must not register the per-driver progress/terminal
+// observer: the aggregate terminal summary is published once by the projection
+// CAS winner, not per deployment. resumeClaimedApplyWithOptions suppresses the
+// OnApplyRecovered hook so no observer is set for the drive.
+func TestResumeClaimedApplyWithOptions_SuppressesRecoveredObserverForMultiOp(t *testing.T) {
+	deploymentClient := &mockTernClient{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, &ServerConfig{}, map[string]tern.Client{
+		"east/staging": deploymentClient,
+	}, logger)
+	observerSet := false
+	svc.OnApplyRecovered = func(apply *storage.Apply) {
+		observerSet = true
+		svc.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, apply.ID, noopProgressObserver{})
+	}
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Deployment:      "east",
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+
+	resumed, err := svc.resumeClaimedApplyWithOptions(t.Context(), 1, apply, 0, "east",
+		resumeClaimedApplyOptions{suppressRecoveredObserver: true})
+
+	require.NoError(t, err)
+	assert.True(t, resumed)
+	assert.Same(t, apply, deploymentClient.resumeApply)
+	assert.False(t, observerSet, "a multi-op drive must not fire the per-driver observer hook")
+	assert.Zero(t, deploymentClient.observerApplyID, "no observer must be registered for a multi-op drive")
+	assert.Nil(t, deploymentClient.observer)
+}
+
 // TestMarkOperationFromApplyState_MirrorsFailedRetryable verifies that a parent
 // apply in failed_retryable mirrors that state (not a terminal one) onto the
 // operation row via UpdateState, leaving it reclaimable for retry. Returning
