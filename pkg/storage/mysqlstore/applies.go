@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -263,30 +264,94 @@ func closeApplyTargetLockConn(ctx context.Context, conn *sql.Conn, lockName, ope
 	}
 }
 
-// checkNoActiveApplyForTarget enforces the "one active apply per target"
-// invariant, scoped to the 4-tuple (database, type, environment, deployment).
-// Deployment is part of the identity because each deployment is a distinct
-// physical target (its own Tern endpoint): two applies for the same
-// environment but different deployments touch different databases and may run
-// concurrently, while a second apply for the same deployment is rejected.
+// dedupeDeployments returns the input deployments as a sorted, de-duplicated
+// slice. The empty string is a valid deployment value: it is the column default
+// for single-deployment applies that predate fan-out, so it must be matched
+// like any other key rather than dropped. An empty result means the caller
+// passed no deployments at all, which the overlap check treats as a fail-closed
+// error rather than skipping the check.
+func dedupeDeployments(deployments []string) []string {
+	seen := make(map[string]struct{}, len(deployments))
+	out := make([]string, 0, len(deployments))
+	for _, deployment := range deployments {
+		if _, ok := seen[deployment]; ok {
+			continue
+		}
+		seen[deployment] = struct{}{}
+		out = append(out, deployment)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// operationDeploymentsForApply returns the deployments of an apply's
+// apply_operations rows. It is used to build the full target set of an existing
+// apply being started/resumed/reclaimed so the overlap check covers every
+// deployment the apply owns, not just the parent's primary deployment.
+func operationDeploymentsForApply(ctx context.Context, tx *sql.Tx, applyID int64) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT deployment FROM apply_operations WHERE apply_id = ?`, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("list operation deployments for apply %d: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var deployments []string
+	for rows.Next() {
+		var deployment string
+		if err := rows.Scan(&deployment); err != nil {
+			return nil, fmt.Errorf("scan operation deployment for apply %d: %w", applyID, err)
+		}
+		deployments = append(deployments, deployment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate operation deployments for apply %d: %w", applyID, err)
+	}
+	return deployments, nil
+}
+
+// checkNoActiveApplyForTargets enforces the "one active apply per physical
+// deployment" invariant across the full target set an apply owns. Each
+// deployment is a distinct physical target (its own Tern endpoint): two applies
+// in the same environment that touch disjoint deployments may run concurrently,
+// while a new apply is rejected if any of its deployments overlaps a deployment
+// owned by a non-terminal apply.
 //
-// While the config layer hard-blocks more than one deployment per environment
-// there is a 1-to-1 mapping between (database, type, environment) and the
-// 4-tuple, so this scoping is a no-op today; it only diverges once that
-// hard-block lifts and an environment fans out across deployments.
-func checkNoActiveApplyForTarget(ctx context.Context, tx *sql.Tx, database, dbType, environment, deployment string, excludeApplyID int64) error {
-	statePredicate, stateArgs := nonTerminalApplyStatePredicate("state")
+// A non-terminal PARENT apply blocks every deployment in its operation set,
+// even deployments whose own operation already completed under on_failure
+// "continue": the apply is the unit of safety and reconciliation, so its whole
+// target set stays reserved until the parent reaches a terminal state. Overlap
+// is matched against both the parent applies.deployment (the primary) and the
+// apply_operations.deployment rows, so single-operation applies (where the two
+// are equal) behave exactly as before.
+func checkNoActiveApplyForTargets(ctx context.Context, tx *sql.Tx, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
+	deployments = dedupeDeployments(deployments)
+	if len(deployments) == 0 {
+		return fmt.Errorf("active apply target requires at least one deployment for %s/%s/%s", database, dbType, environment)
+	}
+
+	statePredicate, stateArgs := nonTerminalApplyStatePredicate("a.state")
+	deploymentPlaceholders := placeholders(len(deployments))
 	query := fmt.Sprintf(`
-		SELECT 1 FROM applies FORCE INDEX (idx_database_env_deployment)
-		WHERE database_name = ?
-		AND database_type = ?
-		AND environment = ?
-		AND deployment = ?
+		SELECT 1 FROM applies a FORCE INDEX (idx_database_env_deployment)
+		WHERE a.database_name = ?
+		AND a.database_type = ?
+		AND a.environment = ?
 		AND %s
-	`, statePredicate)
-	args := append([]any{database, dbType, environment, deployment}, stateArgs...)
+		AND (
+			a.deployment IN (%s)
+			OR EXISTS (
+				SELECT 1 FROM apply_operations o
+				WHERE o.apply_id = a.id
+				AND o.deployment IN (%s)
+			)
+		)
+	`, statePredicate, deploymentPlaceholders, deploymentPlaceholders)
+	args := []any{database, dbType, environment}
+	args = append(args, stateArgs...)
+	args = append(args, stringArgs(deployments)...)
+	args = append(args, stringArgs(deployments)...)
 	if excludeApplyID > 0 {
-		query += " AND id != ?"
+		query += " AND a.id != ?"
 		args = append(args, excludeApplyID)
 	}
 	query += " LIMIT 1"
@@ -297,9 +362,9 @@ func checkNoActiveApplyForTarget(ctx context.Context, tx *sql.Tx, database, dbTy
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("check active applies for %s/%s/%s/%s: %w", database, dbType, environment, deployment, err)
+		return fmt.Errorf("check active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
 	}
-	return fmt.Errorf("active apply exists for %s/%s/%s/%s: %w", database, dbType, environment, deployment, storage.ErrActiveApplyExists)
+	return fmt.Errorf("active apply exists for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, storage.ErrActiveApplyExists)
 }
 
 func applyLeaseFromContext(ctx context.Context, applyID int64) (storage.ApplyLease, bool, error) {
@@ -394,7 +459,7 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	defer writeTx.close(ctx, "create apply")
 
 	if lockTarget {
-		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment, 0); err != nil {
+		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, []string{apply.Deployment}, 0); err != nil {
 			return 0, err
 		}
 	}
@@ -443,7 +508,11 @@ type applyCreateWriter func(ctx context.Context, tx *sql.Tx, apply *storage.Appl
 // reader observes a partially-populated apply.
 func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, operations []*storage.ApplyOperation) (int64, error) {
 	const opName = "create apply with tasks"
-	return s.createWithRows(ctx, apply, opName, func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error {
+	deployments := []string{apply.Deployment}
+	for _, op := range operations {
+		deployments = append(deployments, op.Deployment)
+	}
+	return s.createWithRows(ctx, apply, opName, deployments, func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error {
 		return insertApplyTasksAndOperations(ctx, tx, apply, applyID, tasks, operations)
 	})
 }
@@ -451,12 +520,18 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 // CreateWithGroupedOperations stores an apply with per-operation task groups in one transaction.
 func (s *applyStore) CreateWithGroupedOperations(ctx context.Context, apply *storage.Apply, groups []*storage.ApplyOperationWithTasks) (int64, error) {
 	const opName = "create apply with grouped operations"
-	return s.createWithRows(ctx, apply, opName, func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error {
+	deployments := []string{apply.Deployment}
+	for _, group := range groups {
+		if group != nil && group.Operation != nil {
+			deployments = append(deployments, group.Operation.Deployment)
+		}
+	}
+	return s.createWithRows(ctx, apply, opName, deployments, func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error {
 		return insertApplyGroupedOperations(ctx, tx, apply, applyID, groups)
 	})
 }
 
-func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, opName string, writeRows applyCreateWriter) (int64, error) {
+func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, opName string, newDeployments []string, writeRows applyCreateWriter) (int64, error) {
 	// Ensure options has valid JSON (empty object if nil)
 	options := apply.Options
 	if len(options) == 0 {
@@ -480,7 +555,7 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 	defer writeTx.close(ctx, opName)
 
 	if lockTarget {
-		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment, 0); err != nil {
+		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, newDeployments, 0); err != nil {
 			return 0, err
 		}
 	}
@@ -726,7 +801,12 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	defer writeTx.close(ctx, "update apply")
 
 	if shouldLockTarget {
-		if err := checkNoActiveApplyForTarget(ctx, writeTx.tx, database, dbType, environment, deployment, apply.ID); err != nil {
+		deployments, err := operationDeploymentsForApply(ctx, writeTx.tx, apply.ID)
+		if err != nil {
+			return err
+		}
+		deployments = append(deployments, deployment)
+		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, database, dbType, environment, deployments, apply.ID); err != nil {
 			return err
 		}
 	}
@@ -1361,7 +1441,12 @@ func claimStoppedApplyUnderTargetLock(ctx context.Context, db *sql.DB, tx *sql.T
 	}
 	defer releaseApplyTargetLockConn(ctx, conn, lockName, "claim stopped apply")
 
-	if err := checkNoActiveApplyForTarget(ctx, tx, database, dbType, environment, deployment, apply.ID); err != nil {
+	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
+	if err != nil {
+		return claimLostRace, err
+	}
+	deployments = append(deployments, deployment)
+	if err := checkNoActiveApplyForTargets(ctx, tx, database, dbType, environment, deployments, apply.ID); err != nil {
 		if !errors.Is(err, storage.ErrActiveApplyExists) {
 			return claimLostRace, err
 		}
