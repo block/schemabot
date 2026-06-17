@@ -434,6 +434,8 @@ func (s *applyStore) CreateWithTasks(ctx context.Context, apply *storage.Apply, 
 	return s.CreateWithTasksAndOperations(ctx, apply, tasks, nil)
 }
 
+type applyCreateWriter func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error
+
 // CreateWithTasksAndOperations is the unified atomic apply-create path: it
 // inserts the applies row, the initial tasks, and (optionally) the
 // per-deployment apply_operations rows in a single transaction. Pending
@@ -441,7 +443,20 @@ func (s *applyStore) CreateWithTasks(ctx context.Context, apply *storage.Apply, 
 // reader observes a partially-populated apply.
 func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, operations []*storage.ApplyOperation) (int64, error) {
 	const opName = "create apply with tasks"
+	return s.createWithRows(ctx, apply, opName, func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error {
+		return insertApplyTasksAndOperations(ctx, tx, apply, applyID, tasks, operations)
+	})
+}
 
+// CreateWithGroupedOperations stores an apply with per-operation task groups in one transaction.
+func (s *applyStore) CreateWithGroupedOperations(ctx context.Context, apply *storage.Apply, groups []*storage.ApplyOperationWithTasks) (int64, error) {
+	const opName = "create apply with grouped operations"
+	return s.createWithRows(ctx, apply, opName, func(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64) error {
+		return insertApplyGroupedOperations(ctx, tx, apply, applyID, groups)
+	})
+}
+
+func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, opName string, writeRows applyCreateWriter) (int64, error) {
 	// Ensure options has valid JSON (empty object if nil)
 	options := apply.Options
 	if len(options) == 0 {
@@ -493,6 +508,18 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 		return 0, fmt.Errorf("read inserted apply id for %s: %w", apply.ApplyIdentifier, err)
 	}
 
+	if err := writeRows(ctx, writeTx.tx, apply, id); err != nil {
+		return 0, err
+	}
+
+	if err := writeTx.commit(); err != nil {
+		return 0, fmt.Errorf("commit %s: %w", opName, err)
+	}
+
+	return id, nil
+}
+
+func insertApplyTasksAndOperations(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64, tasks []*storage.Task, operations []*storage.ApplyOperation) error {
 	// Operations are inserted BEFORE tasks so each task can be persisted
 	// with the apply_operation_id of the operation it belongs to. Today
 	// the config layer hard-blocks multi-entry deployments so there is
@@ -501,9 +528,9 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 	// tasks out per-operation, the per-task mapping needs to be encoded
 	// by the caller (see the multi-op guard below).
 	for _, op := range operations {
-		op.ApplyID = id
-		if _, err := insertApplyOperation(ctx, writeTx.tx, op); err != nil {
-			return 0, fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", op.Deployment, apply.ApplyIdentifier, err)
+		op.ApplyID = applyID
+		if _, err := insertApplyOperation(ctx, tx, op); err != nil {
+			return fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", op.Deployment, apply.ApplyIdentifier, err)
 		}
 	}
 
@@ -526,7 +553,7 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 		// invalid because there is no row it can reference for this apply.
 		for _, task := range tasks {
 			if task.ApplyOperationID != nil {
-				return 0, fmt.Errorf("create apply %s: task %s has apply_operation_id=%d but apply has no operations", apply.ApplyIdentifier, task.TaskIdentifier, *task.ApplyOperationID)
+				return fmt.Errorf("create apply %s: task %s has apply_operation_id=%d but apply has no operations", apply.ApplyIdentifier, task.TaskIdentifier, *task.ApplyOperationID)
 			}
 		}
 	case len(operations) == 1:
@@ -539,7 +566,7 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 				continue
 			}
 			if _, ok := insertedOpIDs[*task.ApplyOperationID]; !ok {
-				return 0, fmt.Errorf("create apply %s: task %s apply_operation_id=%d does not match any inserted operation for this apply", apply.ApplyIdentifier, task.TaskIdentifier, *task.ApplyOperationID)
+				return fmt.Errorf("create apply %s: task %s apply_operation_id=%d does not match any inserted operation for this apply", apply.ApplyIdentifier, task.TaskIdentifier, *task.ApplyOperationID)
 			}
 		}
 	case len(operations) > 1:
@@ -549,28 +576,62 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 		// mapping the moment multi-entry deployments are unblocked.
 		for _, task := range tasks {
 			if task.ApplyOperationID == nil {
-				return 0, fmt.Errorf("create apply %s: task %s missing apply_operation_id (apply has %d operations; caller must encode the per-task mapping)", apply.ApplyIdentifier, task.TaskIdentifier, len(operations))
+				return fmt.Errorf("create apply %s: task %s missing apply_operation_id (apply has %d operations; caller must encode the per-task mapping)", apply.ApplyIdentifier, task.TaskIdentifier, len(operations))
 			}
 			if _, ok := insertedOpIDs[*task.ApplyOperationID]; !ok {
-				return 0, fmt.Errorf("create apply %s: task %s apply_operation_id=%d does not match any inserted operation for this apply", apply.ApplyIdentifier, task.TaskIdentifier, *task.ApplyOperationID)
+				return fmt.Errorf("create apply %s: task %s apply_operation_id=%d does not match any inserted operation for this apply", apply.ApplyIdentifier, task.TaskIdentifier, *task.ApplyOperationID)
 			}
 		}
 	}
 
 	for _, task := range tasks {
-		task.ApplyID = id
-		taskID, err := insertTask(ctx, writeTx.tx, task)
+		task.ApplyID = applyID
+		taskID, err := insertTask(ctx, tx, task)
 		if err != nil {
-			return 0, fmt.Errorf("insert task %s for apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			return fmt.Errorf("insert task %s for apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 		task.ID = taskID
 	}
+	return nil
+}
 
-	if err := writeTx.commit(); err != nil {
-		return 0, fmt.Errorf("commit %s: %w", opName, err)
+func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, apply *storage.Apply, applyID int64, groups []*storage.ApplyOperationWithTasks) error {
+	if len(groups) == 0 {
+		return fmt.Errorf("create apply %s: grouped operations are empty", apply.ApplyIdentifier)
 	}
+	for _, group := range groups {
+		deployment := ""
+		if group != nil && group.Operation != nil {
+			deployment = group.Operation.Deployment
+		}
+		if group == nil {
+			return fmt.Errorf("create apply %s deployment %s: grouped operation is nil", apply.ApplyIdentifier, deployment)
+		}
+		if group.Operation == nil {
+			return fmt.Errorf("create apply %s deployment %s: grouped operation is missing its operation row", apply.ApplyIdentifier, deployment)
+		}
+		if len(group.Tasks) == 0 {
+			return fmt.Errorf("create apply %s deployment %s: grouped operation has no tasks", apply.ApplyIdentifier, deployment)
+		}
 
-	return id, nil
+		group.Operation.ApplyID = applyID
+		if _, err := insertApplyOperation(ctx, tx, group.Operation); err != nil {
+			return fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", group.Operation.Deployment, apply.ApplyIdentifier, err)
+		}
+		for _, task := range group.Tasks {
+			if task == nil {
+				return fmt.Errorf("create apply %s deployment %s: grouped operation has a nil task", apply.ApplyIdentifier, group.Operation.Deployment)
+			}
+			task.ApplyID = applyID
+			task.ApplyOperationID = &group.Operation.ID
+			taskID, err := insertTask(ctx, tx, task)
+			if err != nil {
+				return fmt.Errorf("insert task %s for apply %s deployment %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, group.Operation.Deployment, err)
+			}
+			task.ID = taskID
+		}
+	}
+	return nil
 }
 
 // Get returns an apply by ID, or nil if not found.
