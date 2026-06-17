@@ -31,13 +31,28 @@ func setTokenForTest(t *testing.T, token string) {
 	SetAuthToken(token)
 }
 
+// sendThroughTransport drives a request through the shared httpClient (and thus
+// the bearer transport), tying it to the test lifecycle via t.Context(). The
+// optional preset header is set before the transport runs, to verify the
+// transport does not clobber caller-provided headers.
+func sendThroughTransport(t *testing.T, rawURL string, presetAuth string) (*http.Response, error) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
+	require.NoError(t, err)
+	if presetAuth != "" {
+		req.Header.Set("Authorization", presetAuth)
+	}
+	return httpClient.Do(req)
+}
+
 func TestAuthTokenAttachedAsBearer(t *testing.T) {
 	var gotAuth string
 	srv := captureAuthServer(t, &gotAuth)
 	setTokenForTest(t, "tok-abc123")
 
-	var out map[string]any
-	require.NoError(t, doGetInto(srv.URL, "/api/status", &out))
+	resp, err := sendThroughTransport(t, srv.URL+"/api/status", "")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
 	assert.Equal(t, "Bearer tok-abc123", gotAuth)
 }
 
@@ -46,8 +61,9 @@ func TestNoAuthTokenSendsNoHeader(t *testing.T) {
 	srv := captureAuthServer(t, &gotAuth)
 	setTokenForTest(t, "")
 
-	var out map[string]any
-	require.NoError(t, doGetInto(srv.URL, "/api/status", &out))
+	resp, err := sendThroughTransport(t, srv.URL+"/api/status", "")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
 	assert.Empty(t, gotAuth)
 }
 
@@ -56,18 +72,21 @@ func TestAuthTokenTrimmed(t *testing.T) {
 	srv := captureAuthServer(t, &gotAuth)
 	setTokenForTest(t, "  tok-padded\n")
 
-	var out map[string]any
-	require.NoError(t, doPostInto(srv.URL, "/api/plan", map[string]string{}, &out))
+	resp, err := sendThroughTransport(t, srv.URL+"/api/status", "")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
 	assert.Equal(t, "Bearer tok-padded", gotAuth)
 }
 
-func TestAuthTokenRefusedOverInsecureRemote(t *testing.T) {
+func TestExistingAuthorizationHeaderPreserved(t *testing.T) {
+	var gotAuth string
+	srv := captureAuthServer(t, &gotAuth)
 	setTokenForTest(t, "tok-abc123")
 
-	var out map[string]any
-	err := doGetInto("http://schemabot.example.com", "/api/status", &out)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "insecure connection")
+	resp, err := sendThroughTransport(t, srv.URL+"/api/status", "Basic dXNlcjpwYXNz")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, "Basic dXNlcjpwYXNz", gotAuth)
 }
 
 func TestAuthTokenAllowedOverLoopbackHTTP(t *testing.T) {
@@ -77,20 +96,29 @@ func TestAuthTokenAllowedOverLoopbackHTTP(t *testing.T) {
 	srv := captureAuthServer(t, &gotAuth)
 	setTokenForTest(t, "tok-local")
 
-	var out map[string]any
-	require.NoError(t, doGetInto(srv.URL, "/api/status", &out))
+	resp, err := sendThroughTransport(t, srv.URL+"/api/status", "")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
 	assert.Equal(t, "Bearer tok-local", gotAuth)
+}
+
+func TestAuthTokenRefusedOverInsecureRemote(t *testing.T) {
+	setTokenForTest(t, "tok-abc123")
+
+	var out map[string]any
+	err := doGetIntoCtx(t.Context(), "http://schemabot.example.com", "/api/status", &out)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInsecureTokenTransport)
 }
 
 func TestNoTokenAllowedOverInsecureRemote(t *testing.T) {
 	// Without a token there is nothing to leak, so the insecure-transport guard
-	// must not block ordinary unauthenticated requests.
+	// must not block ordinary unauthenticated requests: the request proceeds
+	// past the guard and fails on connection, not on the token guard.
 	setTokenForTest(t, "")
 
 	var out map[string]any
-	err := doGetInto("http://schemabot.example.com", "/api/status", &out)
-	// The request proceeds past the guard and fails on connection, not on the
-	// token guard.
+	err := doGetIntoCtx(t.Context(), "http://schemabot.example.com", "/api/status", &out)
 	require.Error(t, err)
-	assert.NotContains(t, err.Error(), "insecure connection")
+	assert.NotErrorIs(t, err, ErrInsecureTokenTransport)
 }
