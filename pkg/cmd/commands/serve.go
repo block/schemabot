@@ -445,7 +445,12 @@ func buildEtreResolvers(ctx context.Context, etres []api.EtreConfig, logger *slo
 	if err != nil {
 		return nil, fmt.Errorf("build per-type etre resolver routing: %w", err)
 	}
-	logger.Info("gRPC server routing by per-type etre resolvers", "database_types", len(byType))
+	routedTypes := make([]string, 0, len(byType))
+	for databaseType := range byType {
+		routedTypes = append(routedTypes, databaseType)
+	}
+	sort.Strings(routedTypes)
+	logger.Info("gRPC server routing by per-type etre resolvers", "database_types", routedTypes)
 	return router, nil
 }
 
