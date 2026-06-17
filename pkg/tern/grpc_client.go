@@ -608,6 +608,18 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
+		if scope.usesOperationRemoteResume() {
+			// A multi-operation apply has one stop request shared by every
+			// deployment. Stopping this undispatched operation must not
+			// terminalize the parent or complete the apply-level request:
+			// sibling deployments with their own remote apply id still need to
+			// observe the durable stop. Stop only this operation and leave the
+			// request pending for the siblings.
+			if err := c.stopUndispatchedApplyOperation(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
+				return true, err
+			}
+			return true, nil
+		}
 		if err := c.stopUndispatchedApply(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
 			return true, err
 		}
@@ -785,6 +797,76 @@ func (c *GRPCClient) stopUndispatchedApply(ctx context.Context, apply *storage.A
 	return nil
 }
 
+// stopUndispatchedApplyOperation stops a single undispatched operation of a
+// multi-operation apply. It terminalizes only this operation's tasks and the
+// operation row, never the parent apply, and never completes the apply-level
+// stop request: that request is shared across deployments and must remain
+// pending so sibling operations with their own remote apply id still observe
+// the stop.
+func (c *GRPCClient) stopUndispatchedApplyOperation(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope) error {
+	if !scope.usesOperationRemoteResume() {
+		return fmt.Errorf("undispatched operation stop for apply %s requires multi-operation scope", apply.ApplyIdentifier)
+	}
+	op := scope.operation
+	now := time.Now()
+	taskState := state.Task.Stopped
+	operationState := state.ApplyOperation.Stopped
+	if apply.DatabaseType == storage.DatabaseTypeVitess {
+		taskState = state.Task.Cancelled
+		operationState = state.ApplyOperation.Cancelled
+	}
+	tasks, err := c.loadApplyTasks(ctx, apply, scope)
+	if err != nil {
+		return fmt.Errorf("load tasks for undispatched operation stop %s apply_operation %d: %w", apply.ApplyIdentifier, op.ID, err)
+	}
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			slog.Info("leaving terminal gRPC task unchanged during undispatched operation stop",
+				"apply_id", apply.ApplyIdentifier,
+				"apply_operation_id", op.ID,
+				"deployment", op.Deployment,
+				"task_id", task.TaskIdentifier,
+				"table", task.TableName,
+				"task_state", task.State)
+			continue
+		}
+		task.State = taskState
+		if state.IsState(taskState, state.Task.Cancelled) {
+			task.CompletedAt = &now
+		}
+		task.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			return fmt.Errorf("update task %s for undispatched operation stop %s apply_operation %d: %w", task.TaskIdentifier, apply.ApplyIdentifier, op.ID, err)
+		}
+	}
+	oldState := op.State
+	if state.IsState(operationState, state.ApplyOperation.Cancelled) {
+		if err := c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, operationState); err != nil {
+			return fmt.Errorf("mark undispatched gRPC apply_operation %d cancelled for apply %s: %w", op.ID, apply.ApplyIdentifier, err)
+		}
+		op.CompletedAt = &now
+	} else {
+		if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, operationState); err != nil {
+			return fmt.Errorf("mark undispatched gRPC apply_operation %d stopped for apply %s: %w", op.ID, apply.ApplyIdentifier, err)
+		}
+		op.CompletedAt = nil
+	}
+	op.State = operationState
+	op.UpdatedAt = now
+	slog.Info("stopped undispatched multi-operation gRPC apply operation; apply-level stop request remains pending for siblings",
+		"apply_id", apply.ApplyIdentifier,
+		"apply_operation_id", op.ID,
+		"deployment", op.Deployment,
+		"database", apply.Database,
+		"environment", apply.Environment,
+		"requested_by", caller,
+		"old_operation_state", oldState,
+		"new_operation_state", operationState)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
+		fmt.Sprintf("Remote apply operation %d (deployment %s) stopped before dispatch: %s%s; pending apply stop request remains for sibling operations", op.ID, op.Deployment, operationState, callerApplyLogSuffix(caller)), "", "")
+	return nil
+}
+
 func (c *GRPCClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	return c.client.Start(ctx, req)
 }
@@ -877,6 +959,9 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 	operation, err := c.storage.ApplyOperations().Get(ctx, applyOperationID)
 	if err != nil {
 		return applyTaskScope{}, fmt.Errorf("load apply_operation %d for apply %s: %w", applyOperationID, apply.ApplyIdentifier, err)
+	}
+	if operation == nil {
+		return applyTaskScope{}, fmt.Errorf("apply_operation %d not found for apply %s", applyOperationID, apply.ApplyIdentifier)
 	}
 	if operation.ApplyID != apply.ID {
 		return applyTaskScope{}, fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", applyOperationID, operation.ApplyID, apply.ApplyIdentifier, apply.ID)

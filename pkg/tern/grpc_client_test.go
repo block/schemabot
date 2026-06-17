@@ -705,6 +705,26 @@ func (m *mockApplyOperationStore) ListByApply(_ context.Context, applyID int64) 
 	return ops, nil
 }
 
+func (m *mockApplyOperationStore) UpdateState(_ context.Context, id int64, newState string) error {
+	op, ok := m.ops[id]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	op.State = newState
+	return nil
+}
+
+func (m *mockApplyOperationStore) MarkTerminal(_ context.Context, id int64, newState string) error {
+	op, ok := m.ops[id]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	now := time.Now()
+	op.State = newState
+	op.CompletedAt = &now
+	return nil
+}
+
 func (m *mockApplyOperationStore) SaveEngineResumeState(_ context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
 	if m.saveErr != nil {
 		return m.saveErr
@@ -1003,6 +1023,69 @@ func TestGRPCClient_ResumeApplyOperationStoresRemoteIDOnOperationForMultiOpApply
 	require.NotNil(t, req)
 	require.Len(t, req.DdlChanges, 1)
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
+}
+
+func TestGRPCClient_ResumeApplyOperationStopsUndispatchedOperationWithoutCompletingApplyStop(t *testing.T) {
+	// A multi-deployment apply has one durable stop request shared by every
+	// deployment. Stopping a claimed-but-undispatched operation (no remote apply
+	// id yet) must terminalize only that operation, leave the parent apply
+	// untouched, and keep the apply-level stop request pending so sibling
+	// deployments that already dispatched still observe the stop.
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op-stop",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		State:            state.Task.Running,
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Running},
+		siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Running, EngineResumeContext: "remote-east"},
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: apply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+		operations:      operationStore,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.NoError(t, err)
+
+	assert.Empty(t, server.getStopApplyID(), "no remote stop should be sent for an undispatched operation")
+	assert.Equal(t, state.Task.Stopped, task.State, "the operation's task should be stopped")
+	assert.Equal(t, state.ApplyOperation.Stopped, operationStore.ops[operationID].State, "the claimed operation should be stopped")
+	assert.Equal(t, state.Apply.Running, apply.State, "the parent apply must not be terminalized by one undispatched operation")
+	assert.Equal(t, "remote-east", operationStore.ops[siblingID].EngineResumeContext, "the sibling's remote id must be untouched")
+
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, stopReq, "the apply-level stop request must remain pending for sibling operations")
 }
 
 func TestGRPCClient_ResumeApplyOperationRejectsMissingOperationID(t *testing.T) {
