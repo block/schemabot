@@ -512,6 +512,7 @@ func buildCredentialResolver(ctx context.Context, cfg api.EtreCredentialsConfig,
 			ExternalID:       cfg.ExternalID,
 			SecretName:       cfg.SecretName,
 			AccountAttribute: cfg.AccountAttribute,
+			Username:         cfg.Username,
 			Decode:           decode,
 		})
 		if err != nil {
@@ -549,9 +550,12 @@ func resolverAttributeFields(cfg api.EtreConfig) []string {
 			}
 			fields = ensureField(fields, accountAttr)
 		}
-		// The secret name may template over resolved attributes; surface those so
-		// the resolver fetches them for the credential backend.
-		for _, attr := range awscreds.SecretNameAttributes(cfg.Credentials.SecretName) {
+		// The secret name and username may template over resolved attributes;
+		// surface those so the resolver fetches them for the credential backend.
+		for _, attr := range awscreds.TemplateAttributes(cfg.Credentials.SecretName) {
+			fields = ensureField(fields, attr)
+		}
+		for _, attr := range awscreds.TemplateAttributes(cfg.Credentials.Username) {
 			fields = ensureField(fields, attr)
 		}
 	}

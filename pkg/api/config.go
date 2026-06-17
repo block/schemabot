@@ -452,21 +452,26 @@ type EtreCredentialsConfig struct {
 	// Type selects the credential backend: "secret_ref" (default) or "awssm".
 	Type string `yaml:"type,omitempty"`
 
-	// secret_ref backend: a configured username plus a password secret reference
-	// (env:, file:, secretsmanager:, or a literal), optionally carrying a
-	// {target} placeholder for per-target secret naming.
+	// Username is the database user. For secret_ref it is a literal username. For
+	// awssm it is optional: when set, it is a template (over {target} and
+	// {attribute} placeholders, e.g. "{app}_ddl") and the fetched secret is treated
+	// as the plain-text password instead of a JSON payload.
+	// PasswordRef (secret_ref) is a password secret reference (env:, file:,
+	// secretsmanager:, or a literal), optionally carrying a {target} placeholder.
 	Username    string `yaml:"username,omitempty"`
 	PasswordRef string `yaml:"password_ref,omitempty"`
 
-	// awssm backend: read a secret from AWS Secrets Manager and parse it as a JSON
-	// {username, password} payload (or, for engines like Vitess, a token decoded
-	// by the assembler). SecretName may carry {target} and {attribute} placeholders
-	// to locate per-target or per-cluster secrets. RoleARN is optional: when set,
-	// the backend assumes a per-target role (carrying an {account} placeholder) so
-	// one data plane can read secrets across accounts, and AccountAttribute names
-	// the entity attribute holding the target's AWS account id (defaults to
-	// aws_account_id); when empty, secrets are read from the caller's own account.
-	// ExternalID is an optional STS external id used only with RoleARN.
+	// awssm backend: read a secret from AWS Secrets Manager. By default it is parsed
+	// as a JSON {username, password} payload (or, for engines like Vitess, a token
+	// decoded by the assembler); set Username to instead derive the user from entity
+	// attributes and treat the secret as a plain-text password. SecretName may carry
+	// {target} and {attribute} placeholders to locate per-target or per-cluster
+	// secrets. RoleARN is optional: when set, the backend assumes a per-target role
+	// (carrying an {account} placeholder) so one data plane can read secrets across
+	// accounts, and AccountAttribute names the entity attribute holding the target's
+	// AWS account id (defaults to aws_account_id); when empty, secrets are read from
+	// the caller's own account. ExternalID is an optional STS external id used only
+	// with RoleARN.
 	Region           string `yaml:"region,omitempty"`
 	RoleARN          string `yaml:"role_arn,omitempty"`
 	ExternalID       string `yaml:"external_id,omitempty"`
