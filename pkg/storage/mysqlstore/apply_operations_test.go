@@ -2579,3 +2579,58 @@ func TestApplyOperationStore_MarkPendingStoppedByApply(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), again, "no pending rows remain to stop")
 }
+
+// Under fan-out multi-operation mode the driving worker holds only an operation
+// lease, not the parent apply lease. MarkPendingStoppedByApply must still let it
+// stop the apply's pending siblings, authorized by the owning operation row's
+// own lease token, and must fail closed when that token is stale or names a
+// different apply so a displaced driver cannot stop siblings it no longer owns.
+func TestApplyOperationStore_MarkPendingStoppedByApply_OperationLease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_mark_stopped_oplease", 1, state.Apply.Running, "staging")
+
+	// The owning operation the driver holds a lease on. It is running (driving),
+	// so MarkPendingStoppedByApply never touches it.
+	ownerID := createApplyOperationForLeaseTest(t, store, apply.ID, "region-owner")
+	require.NoError(t, store.ApplyOperations().UpdateState(ctx, ownerID, state.ApplyOperation.Running))
+	stampOperationLease(t, ownerID, "worker", "op-token")
+
+	pendingID := createApplyOperationForLeaseTest(t, store, apply.ID, "region-pending")
+
+	opCtx := func(applyID, opID int64, token string) context.Context {
+		return storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID:     applyID,
+			OperationID: opID,
+			Owner:       "worker",
+			Token:       token,
+		})
+	}
+
+	// A stale operation token while a pending sibling remains fails closed and
+	// leaves the sibling pending.
+	_, err := store.ApplyOperations().MarkPendingStoppedByApply(opCtx(apply.ID, ownerID, "stale-op-token"), apply.ID)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assertApplyOperationState(t, store, pendingID, state.ApplyOperation.Pending)
+
+	// An operation lease naming a different apply does not authorize the stop.
+	_, err = store.ApplyOperations().MarkPendingStoppedByApply(opCtx(apply.ID+1, ownerID, "op-token"), apply.ID)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assertApplyOperationState(t, store, pendingID, state.ApplyOperation.Pending)
+
+	// The current operation token stops the pending sibling and leaves the
+	// running owner untouched.
+	stopped, err := store.ApplyOperations().MarkPendingStoppedByApply(opCtx(apply.ID, ownerID, "op-token"), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), stopped)
+	assertApplyOperationState(t, store, pendingID, state.ApplyOperation.Stopped)
+	assertApplyOperationState(t, store, ownerID, state.ApplyOperation.Running)
+
+	// A repeat under the current token is a clean no-op (lease still owned).
+	again, err := store.ApplyOperations().MarkPendingStoppedByApply(opCtx(apply.ID, ownerID, "op-token"), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), again)
+}

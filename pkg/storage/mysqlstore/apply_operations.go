@@ -1060,6 +1060,47 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 // Writes are apply-lease guarded when a lease is present in ctx, mirroring
 // DeleteByApply.
 func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error) {
+	// An operation-lease-only drive (fan-out multi-operation mode) holds no
+	// parent apply lease, but it is still an authorized driver of the apply's
+	// rollout and may terminalize the apply's still-pending sibling operations
+	// under a pending stop. Authorize the bulk stop by joining the owning
+	// operation row and requiring it still carries the lease token, so a
+	// displaced driver that lost its lease fails closed instead of stopping
+	// siblings it no longer owns. Operation lease takes precedence over the
+	// parent apply lease, matching operationWriteGuardFromContext.
+	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
+		if !opLease.Valid() {
+			return 0, fmt.Errorf("invalid operation lease for stopping pending apply_operations of apply %d: %w", applyID, storage.ErrApplyLeaseLost)
+		}
+		if opLease.ApplyID != applyID {
+			return 0, fmt.Errorf("operation lease for apply %d does not authorize stopping pending operations of apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
+		}
+		result, err := s.db.ExecContext(ctx, `
+			UPDATE apply_operations ao
+			JOIN apply_operations owner_op ON owner_op.apply_id = ao.apply_id
+			SET ao.state = ?, ao.updated_at = NOW()
+			WHERE ao.apply_id = ? AND ao.state = ?
+			  AND owner_op.id = ? AND owner_op.lease_token = ?
+		`, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, opLease.OperationID, opLease.Token)
+		if err != nil {
+			return 0, fmt.Errorf("stop pending apply_operations for apply %d under operation lease: %w", applyID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
+		}
+		if rows == 0 {
+			// No pending rows changed: either there were none (lease still
+			// valid, a legitimate no-op) or the operation lease token no longer
+			// matches (ownership lost). Distinguish so a displaced driver fails
+			// closed.
+			if err := ensureOperationLeaseStillOwned(ctx, s.db, opLease); err != nil {
+				return 0, err
+			}
+		}
+		return rows, nil
+	}
+
 	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
 	if err != nil {
 		return 0, err

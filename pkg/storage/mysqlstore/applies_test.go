@@ -1459,6 +1459,45 @@ func TestApplyStore_UpdateRejectsOperationLeaseOnlyContext(t *testing.T) {
 	assert.Equal(t, state.Apply.Failed, written.State)
 }
 
+// TestApplyStore_HeartbeatRejectsOperationLeaseOnlyContext verifies that a drive
+// holding only an operation lease cannot heartbeat the parent applies row: the
+// parent's liveness is owned by the parent lease and the rollout projection. A
+// single-operation drive carries the parent apply lease alongside the operation
+// lease, so its heartbeat still lands.
+func TestApplyStore_HeartbeatRejectsOperationLeaseOnlyContext(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_heartbeat_oplease", 907, state.Apply.Running, "staging")
+	opID := createApplyOperationForLeaseTest(t, store, apply.ID, "primary")
+	stampOperationLease(t, opID, "worker", "op-token")
+
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 5 MINUTE WHERE id = ?`, apply.ID)
+	require.NoError(t, err)
+	before, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+
+	opOnlyCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID: apply.ID, OperationID: opID, Owner: "worker", Token: "op-token",
+	})
+	require.ErrorIs(t, store.Applies().Heartbeat(opOnlyCtx, apply.ID), storage.ErrApplyLeaseLost,
+		"an operation-lease-only context must not heartbeat the parent apply")
+	unchanged, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, before.UpdatedAt, unchanged.UpdatedAt, "the parent row must be untouched")
+
+	// A single-operation drive carries both leases, so the heartbeat lands.
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET lease_owner=?, lease_token=?, lease_acquired_at=NOW() WHERE id=?`, "current-worker", "apply-token", apply.ID)
+	require.NoError(t, err)
+	dualCtx := storage.WithApplyLease(opOnlyCtx, storage.ApplyLease{ApplyID: apply.ID, Owner: "current-worker", Token: "apply-token"})
+	require.NoError(t, store.Applies().Heartbeat(dualCtx, apply.ID))
+	after, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, after.UpdatedAt.After(before.UpdatedAt), "the heartbeat must move updated_at forward")
+}
+
 func TestApplyStore_GetInProgress(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

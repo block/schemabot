@@ -1552,6 +1552,18 @@ func failPendingStartControlRequestTx(ctx context.Context, tx *sql.Tx, applyID i
 // When ctx has an apply lease, a stale token returns ErrApplyLeaseLost so the
 // old operator owner stops before writing state or external side effects.
 func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
+	// A drive that holds only an operation lease must never bump the parent
+	// applies row: under fan-out the parent's liveness is owned by the parent
+	// lease and the rollout projection, not a per-operation drive. A
+	// single-operation drive still carries the parent apply lease alongside the
+	// operation lease, so it keeps the heartbeat; only an operation-lease-only
+	// context is refused here. Mirrors the guard in Update.
+	if _, hasOpLease := storage.OperationLeaseFromContext(ctx); hasOpLease {
+		if _, hasApplyLease := storage.ApplyLeaseFromContext(ctx); !hasApplyLease {
+			return fmt.Errorf("operation lease does not authorize a heartbeat of apply %d; parent liveness is owned by the parent lease: %w", applyID, storage.ErrApplyLeaseLost)
+		}
+	}
+
 	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
 	if err != nil {
 		return err
