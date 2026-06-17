@@ -129,16 +129,6 @@ func escapeRelativeTimeDatetime(timestamp string) string {
 	return parsed.UTC().Format(time.RFC3339)
 }
 
-// truncateDDL strips backtick-quoting from a DDL statement and truncates to maxLen characters.
-// Used in summary comments where DDL should be inline and scannable, not verbose.
-func truncateDDL(ddl string, maxLen int) string {
-	cleaned := strings.ReplaceAll(ddl, "`", "")
-	if len(cleaned) > maxLen {
-		return cleaned[:maxLen-3] + "..."
-	}
-	return cleaned
-}
-
 // writeDBEnvLine writes the **Database** | **Environment** metadata line.
 func writeDBEnvLine(sb *strings.Builder, database, environment string) {
 	if environment != "" {

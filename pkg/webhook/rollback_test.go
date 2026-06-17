@@ -319,7 +319,7 @@ func TestHandleRollbackConfirmAlreadyRolledBackReleasesLock(t *testing.T) {
 	locks := &actorAuthLockStore{locks: []*storage.Lock{prOwnedRollbackLock()}}
 	h, comments := newRollbackConfirmNoopHandler(t, locks, testLogger())
 
-	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.RollbackConfirm})
+	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", 12345, "hubot", CommandResult{Action: action.RollbackConfirm})
 
 	body := requireComment(t, comments, "already-rolled-back comment")
 	assert.Contains(t, body, "Already Rolled Back")
@@ -343,7 +343,7 @@ func TestHandleRollbackConfirmAlreadyRolledBackLockReleaseFails(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 	h, comments := newRollbackConfirmNoopHandler(t, locks, logger)
 
-	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.RollbackConfirm})
+	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", 12345, "hubot", CommandResult{Action: action.RollbackConfirm})
 
 	body := requireComment(t, comments, "already-rolled-back lock-held comment")
 	assert.Contains(t, body, "Already Rolled Back")

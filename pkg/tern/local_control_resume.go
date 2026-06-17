@@ -337,7 +337,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			continue
 		}
 
-		action = c.runEngineTask(ctx, apply, task, plan, options, creds)
+		action = c.runEngineTask(ctx, apply, task, options, creds)
 
 		taskID := task.ID
 		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,

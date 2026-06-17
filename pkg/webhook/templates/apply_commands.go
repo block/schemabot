@@ -106,14 +106,14 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	sb.WriteString("\n")
 
 	// Count and show changes
-	totalStatements, keyspacesWithDDL, keyspacesWithVSchema := countChanges(data.Changes)
+	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
 	if totalChanges > 0 {
 		writeKeyspaceChanges(&sb, data)
 	}
 
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithDDL, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
 
 	// Unsafe changes blocked section
 	sb.WriteString("---\n\n")

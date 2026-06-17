@@ -374,6 +374,20 @@ func (s *capturingApplyStore) CreateWithTasksAndOperations(ctx context.Context, 
 	return applyID, nil
 }
 
+func (s *capturingApplyStore) CreateWithGroupedOperations(ctx context.Context, apply *storage.Apply, groups []*storage.ApplyOperationWithTasks) (int64, error) {
+	operations := make([]*storage.ApplyOperation, 0, len(groups))
+	var tasks []*storage.Task
+	for i, group := range groups {
+		group.Operation.ID = int64(i + 1)
+		operations = append(operations, group.Operation)
+		for _, task := range group.Tasks {
+			task.ApplyOperationID = &group.Operation.ID
+			tasks = append(tasks, task)
+		}
+	}
+	return s.CreateWithTasksAndOperations(ctx, apply, tasks, operations)
+}
+
 func (s *capturingApplyStore) Update(_ context.Context, apply *storage.Apply) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -673,6 +687,14 @@ func (m *mockTernClient) Close() error { return nil }
 // should create their own config or add it to the mock ternClients.
 func testServerConfig() *ServerConfig {
 	return &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"testdb": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {Target: "testdb", Deployment: DefaultDeployment},
+				},
+			},
+		},
 		TernDeployments: TernConfig{
 			"default": TernEndpoints{
 				"staging": "localhost:9090",
@@ -726,7 +748,30 @@ func stoppedTestApply(applyID string) *storage.Apply {
 }
 
 func newExecuteApplyTestService(client tern.Client, applies storage.ApplyStore) (*Service, *capturingTaskStore) {
-	return newQueueApplyTestService(executeApplyTestPlan(), client, applies)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	if capturingApplies, ok := applies.(*capturingApplyStore); ok {
+		capturingApplies.taskStore = tasks
+	}
+	cfg := testServerConfig()
+	cfg.Databases = map[string]DatabaseConfig{
+		"testdb": {
+			Type: storage.DatabaseTypeMySQL,
+			Environments: map[string]EnvironmentConfig{
+				"staging": {Target: "testdb", Deployment: DefaultDeployment},
+			},
+		},
+	}
+	return New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: executeApplyTestPlan()},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, cfg, map[string]tern.Client{
+		"default/staging": client,
+	}, logger), tasks
 }
 
 func newQueueApplyTestService(plan *storage.Plan, client tern.Client, applies storage.ApplyStore) (*Service, *capturingTaskStore) {
@@ -735,6 +780,15 @@ func newQueueApplyTestService(plan *storage.Plan, client tern.Client, applies st
 	if capturingApplies, ok := applies.(*capturingApplyStore); ok {
 		capturingApplies.taskStore = tasks
 	}
+	cfg := testServerConfig()
+	cfg.Databases = map[string]DatabaseConfig{
+		"testdb": {
+			Type: storage.DatabaseTypeMySQL,
+			Environments: map[string]EnvironmentConfig{
+				"staging": {Target: "testdb", Deployment: DefaultDeployment},
+			},
+		},
+	}
 	return New(&mockStorageWithApplyStores{
 		plans:     &staticPlanStore{plan: plan},
 		applies:   applies,
@@ -742,7 +796,7 @@ func newQueueApplyTestService(plan *storage.Plan, client tern.Client, applies st
 		locks:     &emptyLockStore{},
 		applyLogs: &noopApplyLogStore{},
 		controls:  &memoryControlRequestStore{},
-	}, testServerConfig(), map[string]tern.Client{
+	}, cfg, map[string]tern.Client{
 		"default/staging": client,
 	}, logger), tasks
 }
@@ -1298,14 +1352,14 @@ func trustedQueueApplyTestPlan() *storage.Plan {
 }
 
 // A data-plane deployment executes applies dispatched by a control plane that
-// already evaluated source policy against its own database config. The data
-// plane has no database config of its own, so EnqueueAuthorizedApply queues the trusted
+// already evaluated source policy. EnqueueAuthorizedApply queues the trusted
 // plan without re-evaluating source policy, while ExecuteApply on the same
-// service keeps failing closed.
+// service keeps failing closed until database routing is configured.
 func TestEnqueueAuthorizedApplyQueuesTrustedPlanWithoutDatabaseConfig(t *testing.T) {
 	applies := &capturingApplyStore{}
 	mockClient := &mockTernClient{isRemote: true}
 	svc, tasks := newQueueApplyTestService(trustedQueueApplyTestPlan(), mockClient, applies)
+	svc.config.Databases = nil
 
 	_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{
 		PlanID:      "plan-1",
@@ -1314,6 +1368,14 @@ func TestEnqueueAuthorizedApplyQueuesTrustedPlanWithoutDatabaseConfig(t *testing
 	var policyErr *SourcePolicyError
 	require.True(t, errors.As(err, &policyErr), "ExecuteApply must fail closed without database config")
 	assert.Equal(t, SourcePolicyReasonMissingDatabaseConfig, policyErr.Reason)
+	svc.config.Databases = map[string]DatabaseConfig{
+		"testdb": {
+			Type: storage.DatabaseTypeMySQL,
+			Environments: map[string]EnvironmentConfig{
+				"staging": {Target: "testdb", Deployment: DefaultDeployment},
+			},
+		},
+	}
 
 	resp, applyID, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{
 		PlanID:      "plan-1",
@@ -1597,13 +1659,71 @@ func TestExecuteApplyQueuesRemoteApplyForOperator(t *testing.T) {
 	assert.Nil(t, mock.applyReq, "request path should not call remote Tern before operator claim")
 	require.Len(t, tasks.tasks, 1)
 	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
-	// Apply create dual-writes one apply_operations row mirroring the apply's
-	// (deployment, target). Today's hard-block keeps this at one row; the
-	// operator claim-loop PR is what consumes them.
+	// Apply create writes one apply_operations row mirroring the apply's
+	// (deployment, target) and links the queued tasks to it.
 	require.Len(t, applies.operations, 1)
 	assert.Equal(t, DefaultDeployment, applies.operations[0].Deployment)
 	assert.Equal(t, "testdb", applies.operations[0].Target)
 	assert.Equal(t, state.ApplyOperation.Pending, applies.operations[0].State)
+	require.NotNil(t, tasks.tasks[0].ApplyOperationID)
+	assert.Equal(t, applies.operations[0].ID, *tasks.tasks[0].ApplyOperationID)
+}
+
+func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
+	// Multi-target apply creation creates an independent operation and task set
+	// for each resolved deployment while preserving the first deployment on the parent apply.
+	applies := &capturingApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	cfg := testServerConfig()
+	cfg.Databases = map[string]DatabaseConfig{}
+	cfg.Databases["testdb"] = DatabaseConfig{
+		Type: storage.DatabaseTypeMySQL,
+		Environments: map[string]EnvironmentConfig{
+			"staging": {
+				Deployments: map[string]DeploymentTarget{
+					"default-a": {Target: "testdb-a"},
+					"default-b": {Target: "testdb-b"},
+				},
+				DeploymentOrder: []string{"default-a", "default-b"},
+				CutoverPolicy:   storage.CutoverPolicyBarrier,
+				OnFailure:       storage.OnFailureContinue,
+			},
+		},
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: executeApplyTestPlan()},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, cfg, map[string]tern.Client{}, logger)
+
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout", "")
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(123), storedApplyID)
+	require.NotNil(t, apply)
+	assert.Equal(t, "default-a", apply.Deployment)
+	require.Len(t, applies.operations, 2)
+	assert.Equal(t, "default-a", applies.operations[0].Deployment)
+	assert.Equal(t, "testdb-a", applies.operations[0].Target)
+	assert.Equal(t, storage.CutoverPolicyBarrier, applies.operations[0].CutoverPolicy)
+	assert.Equal(t, storage.OnFailureContinue, applies.operations[0].OnFailure)
+	assert.Equal(t, "default-b", applies.operations[1].Deployment)
+	assert.Equal(t, "testdb-b", applies.operations[1].Target)
+	assert.Equal(t, storage.CutoverPolicyBarrier, applies.operations[1].CutoverPolicy)
+	assert.Equal(t, storage.OnFailureContinue, applies.operations[1].OnFailure)
+	require.Len(t, tasks.tasks, 2)
+	assert.NotEqual(t, tasks.tasks[0].TaskIdentifier, tasks.tasks[1].TaskIdentifier)
+	assert.Equal(t, "users", tasks.tasks[0].TableName)
+	assert.Equal(t, "users", tasks.tasks[1].TableName)
+	require.NotNil(t, tasks.tasks[0].ApplyOperationID)
+	require.NotNil(t, tasks.tasks[1].ApplyOperationID)
+	assert.Equal(t, applies.operations[0].ID, *tasks.tasks[0].ApplyOperationID)
+	assert.Equal(t, applies.operations[1].ID, *tasks.tasks[1].ApplyOperationID)
 }
 
 func TestProgressByApplyIDServesQueuedRemoteApplyFromStorage(t *testing.T) {

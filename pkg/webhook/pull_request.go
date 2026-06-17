@@ -155,9 +155,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 				h.logger.Error("failed to create GitHub client for passing aggregate", "error", err)
 				return
 			}
-			h.postPassingAggregates(ctx, c, repo, pr, headSHA,
-				"No managed schema changes",
-				"This PR does not contain schema changes managed by SchemaBot.")
+			h.postPassingAggregates(ctx, c, repo, pr, headSHA)
 		})
 		return "no schema files in PR"
 	}

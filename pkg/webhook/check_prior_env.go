@@ -32,7 +32,7 @@ func (h *Handler) checkPriorEnvironments(
 	ctx context.Context, repo string, pr int,
 	database, dbType, environment string,
 	environments []string,
-	installationID int64, requestedBy string,
+	installationID int64,
 ) bool {
 	config := h.service.Config()
 

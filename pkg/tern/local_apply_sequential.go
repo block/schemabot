@@ -65,7 +65,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			"elapsed_ms", time.Since(seqStart).Milliseconds(),
 		)
 
-		action = c.runEngineTask(ctx, apply, task, plan, options, creds)
+		action = c.runEngineTask(ctx, apply, task, options, creds)
 
 		// Notify observer after each task completes
 		if obs := c.getObserver(apply.ID); obs != nil {
@@ -138,7 +138,7 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, task *storage.Task) ta
 
 // runEngineTask calls the engine for a single DDL, marks the task running, and polls to completion.
 // Returns the outcome: taskContinue (completed), taskFailed, or taskStopped.
-func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, plan *storage.Plan, options map[string]string, creds *engine.Credentials) taskAction {
+func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string, creds *engine.Credentials) taskAction {
 	if handled, err := c.processPendingStopControlRequest(ctx, apply); err != nil {
 		c.logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for operator retry",
 			"apply_id", apply.ApplyIdentifier, "task_id", task.TaskIdentifier, "error", err)

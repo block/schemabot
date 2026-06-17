@@ -144,7 +144,7 @@ lint-fix: ## Run golangci-lint with auto-fix enabled
 
 setup: ## Set up git hooks for development
 	git config core.hooksPath .githooks
-	@echo "Setup complete. Git hooks enabled (.githooks/pre-commit)."
+	@echo "Setup complete. Git hooks enabled (.githooks/pre-commit, .githooks/pre-push)."
 
 clean: ## Clean build artifacts
 	@echo "Cleaning..."

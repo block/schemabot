@@ -22,7 +22,7 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	sb.WriteString("\n")
 
 	// Count changes
-	totalStatements, keyspacesWithDDL, keyspacesWithVSchema := countChanges(data.Changes)
+	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
 	// Summary
@@ -48,7 +48,7 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	}
 
 	// Summary (after DDL, matching CLI layout)
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithDDL, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
 
 	// Footer
 	sb.WriteString("---\n\n")

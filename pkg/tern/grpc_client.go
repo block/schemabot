@@ -321,7 +321,7 @@ func (c *GRPCClient) clearObserver(applyID int64) {
 // logApplyEvent appends a control-plane apply log entry for gRPC applies. The
 // remote Tern service writes its own local logs, but operators read SchemaBot's
 // control-plane apply history from SchemaBot storage.
-func (c *GRPCClient) logApplyEvent(ctx context.Context, applyID int64, taskID *int64, level, eventType, source, message string, oldState, newState string) {
+func (c *GRPCClient) logApplyEvent(ctx context.Context, applyID int64, taskID *int64, level, eventType, message string, oldState, newState string) {
 	logStore := c.storage.ApplyLogs()
 	if logStore == nil {
 		slog.Error("missing apply log store for gRPC apply event",
@@ -335,7 +335,7 @@ func (c *GRPCClient) logApplyEvent(ctx context.Context, applyID int64, taskID *i
 		TaskID:    taskID,
 		Level:     level,
 		EventType: eventType,
-		Source:    source,
+		Source:    storage.LogSourceSchemaBot,
 		Message:   message,
 		OldState:  oldState,
 		NewState:  newState,
@@ -351,18 +351,18 @@ func (c *GRPCClient) logApplyEvent(ctx context.Context, applyID int64, taskID *i
 }
 
 func (c *GRPCClient) logApplyStateTransition(ctx context.Context, apply *storage.Apply, level, message, oldState string) {
-	c.logApplyEvent(ctx, apply.ID, nil, level, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+	c.logApplyEvent(ctx, apply.ID, nil, level, storage.LogEventStateTransition,
 		message, oldState, apply.State)
 }
 
 func (c *GRPCClient) logTaskStateTransition(ctx context.Context, applyID int64, task *storage.Task, message, oldState string) {
 	taskID := task.ID
-	c.logApplyEvent(ctx, applyID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+	c.logApplyEvent(ctx, applyID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition,
 		message, oldState, task.State)
 }
 
 func (c *GRPCClient) logApplyWarning(ctx context.Context, apply *storage.Apply, message string) {
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError,
 		message, apply.State, apply.State)
 }
 
@@ -459,7 +459,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 			"environment", apply.Environment,
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
 			fmt.Sprintf("Pending remote cutover request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		return completePendingCutoverControlRequests(ctx, c.storage, apply)
 	}
@@ -519,7 +519,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		if failErr := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); failErr != nil {
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, apply.ExternalID, err, failErr)
 		}
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
 			fmt.Sprintf("Remote cutover failed for apply %s%s: %v", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq)), err), "", "")
 		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w", apply.ApplyIdentifier, apply.ExternalID, err)
 	}
@@ -528,7 +528,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
 			return err
 		}
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
 			fmt.Sprintf("Remote cutover returned no response for apply %s%s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s", apply.ApplyIdentifier, apply.ExternalID, errorMessage)
 	}
@@ -540,11 +540,11 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, errorMessage); err != nil {
 			return err
 		}
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
 			fmt.Sprintf("Remote cutover was not accepted for apply %s%s: %s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq)), errorMessage), "", "")
 		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s", apply.ApplyIdentifier, apply.ExternalID, errorMessage)
 	}
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
 		fmt.Sprintf("Remote cutover accepted for apply %s%s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	if err := completePendingCutoverControlRequests(ctx, c.storage, apply); err != nil {
 		return err
@@ -581,7 +581,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			"environment", apply.Environment,
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 			fmt.Sprintf("Pending remote stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if hasPendingStart, startErr := hasPendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
 			return true, startErr
@@ -598,7 +598,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			"environment", apply.Environment,
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 			fmt.Sprintf("Pending remote stop request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
 			return true, err
@@ -634,7 +634,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		}
 		return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %s", apply.ApplyIdentifier, apply.ExternalID, errorMessage)
 	}
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 		fmt.Sprintf("Remote stop accepted for apply %s%s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 
 	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
@@ -734,7 +734,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
 		return false, err
 	}
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 		fmt.Sprintf("Remote stop request completed from terminal progress after stop error%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	return true, nil
 }
@@ -1102,7 +1102,7 @@ func (c *GRPCClient) completePendingStopBeforeRemoteStart(ctx context.Context, a
 		"environment", apply.Environment,
 		"requested_by", controlRequestCaller(controlReq),
 		"state", apply.State)
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 		fmt.Sprintf("Pending remote stop request completed before start%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	return nil
 }

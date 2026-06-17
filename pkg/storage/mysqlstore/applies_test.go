@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -216,6 +217,184 @@ func TestApplyStore_CreateWithTasksAndOperationsCommitsAtomically(t *testing.T) 
 	assert.Equal(t, operations[0].ID, *tasks[0].ApplyOperationID)
 	require.NotNil(t, storedTasks[0].ApplyOperationID, "task.apply_operation_id must be persisted")
 	assert.Equal(t, operations[0].ID, *storedTasks[0].ApplyOperationID)
+}
+
+// Grouped operation creation links each deployment's independent task copies to that deployment's operation.
+func TestApplyStore_CreateWithGroupedOperationsLinksTasksPerOperation(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+	apply := newGroupedCreateApply(now, "apply_grouped_multi")
+	groups := []*storage.ApplyOperationWithTasks{
+		newGroupedCreateGroup(now, "payments-a", "payments-a-target", "users", "orders"),
+		newGroupedCreateGroup(now, "payments-b", "payments-b-target", "users", "orders"),
+		newGroupedCreateGroup(now, "payments-c", "payments-c-target", "users", "orders"),
+	}
+
+	applyID, err := store.Applies().CreateWithGroupedOperations(ctx, apply, groups)
+	require.NoError(t, err)
+	require.NotZero(t, applyID)
+
+	storedOps, err := store.ApplyOperations().ListByApply(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, storedOps, 3)
+	for i, op := range storedOps {
+		assert.Equal(t, applyID, op.ApplyID)
+		assert.Equal(t, groups[i].Operation.Deployment, op.Deployment)
+		assert.Equal(t, groups[i].Operation.Target, op.Target)
+	}
+
+	storedTasks, err := store.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, storedTasks, 6)
+	storedTaskCountsByOp := map[int64]int{}
+	for _, task := range storedTasks {
+		require.NotNil(t, task.ApplyOperationID)
+		assert.NotZero(t, *task.ApplyOperationID)
+		storedTaskCountsByOp[*task.ApplyOperationID]++
+	}
+	for _, group := range groups {
+		require.NotZero(t, group.Operation.ID)
+		assert.Equal(t, applyID, group.Operation.ApplyID)
+		assert.Equal(t, 2, storedTaskCountsByOp[group.Operation.ID])
+		for _, task := range group.Tasks {
+			require.NotNil(t, task.ApplyOperationID)
+			assert.Equal(t, group.Operation.ID, *task.ApplyOperationID)
+			assert.Equal(t, applyID, task.ApplyID)
+		}
+	}
+}
+
+// Single-group creation produces the same operation/task ownership shape as the single-operation create path.
+func TestApplyStore_CreateWithGroupedOperationsSingleGroupMatchesSingleOperationCreate(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+	now := time.Now()
+
+	// The two applies share the same operation (deployment, target) shape but
+	// sit in different environments so the per-environment active-apply target
+	// lock does not reject the second create — both are non-terminal.
+	singleApply := newGroupedCreateApply(now, "apply_grouped_single_flat")
+	singleApply.Environment = "staging"
+	singleTask := newGroupedCreateTask(now, "payments-a", "users")
+	singleOperation := &storage.ApplyOperation{Deployment: "payments-a", Target: "payments-target", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now}
+	singleApplyID, err := store.Applies().CreateWithTasksAndOperations(ctx, singleApply, []*storage.Task{singleTask}, []*storage.ApplyOperation{singleOperation})
+	require.NoError(t, err)
+
+	groupedApply := newGroupedCreateApply(now, "apply_grouped_single_group")
+	groupedTask := newGroupedCreateTask(now, "payments-a", "users")
+	// Distinct task identifier (the column is globally unique) while keeping the
+	// table/DDL identical so the shape assertions below still hold.
+	groupedTask.TaskIdentifier = "task_grouped_payments-a_users"
+	groupedOperation := &storage.ApplyOperation{Deployment: "payments-a", Target: "payments-target", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now}
+	groupedApplyID, err := store.Applies().CreateWithGroupedOperations(ctx, groupedApply, []*storage.ApplyOperationWithTasks{{Operation: groupedOperation, Tasks: []*storage.Task{groupedTask}}})
+	require.NoError(t, err)
+
+	singleOps, err := store.ApplyOperations().ListByApply(ctx, singleApplyID)
+	require.NoError(t, err)
+	groupedOps, err := store.ApplyOperations().ListByApply(ctx, groupedApplyID)
+	require.NoError(t, err)
+	require.Len(t, singleOps, 1)
+	require.Len(t, groupedOps, 1)
+	assert.Equal(t, singleOps[0].Deployment, groupedOps[0].Deployment)
+	assert.Equal(t, singleOps[0].Target, groupedOps[0].Target)
+	assert.Equal(t, singleOps[0].State, groupedOps[0].State)
+
+	singleTasks, err := store.Tasks().GetByApplyID(ctx, singleApplyID)
+	require.NoError(t, err)
+	groupedTasks, err := store.Tasks().GetByApplyID(ctx, groupedApplyID)
+	require.NoError(t, err)
+	require.Len(t, singleTasks, 1)
+	require.Len(t, groupedTasks, 1)
+	assert.Equal(t, singleTasks[0].TableName, groupedTasks[0].TableName)
+	assert.Equal(t, singleTasks[0].DDL, groupedTasks[0].DDL)
+	require.NotNil(t, singleTasks[0].ApplyOperationID)
+	require.NotNil(t, groupedTasks[0].ApplyOperationID)
+	assert.Equal(t, singleOperation.ID, *singleTasks[0].ApplyOperationID)
+	assert.Equal(t, groupedOperation.ID, *groupedTasks[0].ApplyOperationID)
+}
+
+// Grouped operation creation rejects incomplete group definitions before any rows are committed.
+func TestApplyStore_CreateWithGroupedOperationsRejectsInvalidGroups(t *testing.T) {
+	tests := []struct {
+		name      string
+		groups    []*storage.ApplyOperationWithTasks
+		wantError string
+	}{
+		{name: "empty groups", groups: nil, wantError: "grouped operations are empty"},
+		{name: "nil group", groups: []*storage.ApplyOperationWithTasks{nil}, wantError: "grouped operation is nil"},
+		{name: "nil operation", groups: []*storage.ApplyOperationWithTasks{{Tasks: []*storage.Task{newGroupedCreateTask(time.Now(), "payments-a", "users")}}}, wantError: "grouped operation is missing its operation row"},
+		{name: "no tasks", groups: []*storage.ApplyOperationWithTasks{{Operation: &storage.ApplyOperation{Deployment: "payments-a", Target: "payments-target"}}}, wantError: "grouped operation has no tasks"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+			apply := newGroupedCreateApply(time.Now(), "apply_grouped_invalid_"+strings.ReplaceAll(tt.name, " ", "_"))
+
+			_, err := store.Applies().CreateWithGroupedOperations(ctx, apply, tt.groups)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), apply.ApplyIdentifier)
+			assert.Contains(t, err.Error(), tt.wantError)
+
+			gotApply, getErr := store.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
+			require.NoError(t, getErr)
+			assert.Nil(t, gotApply)
+		})
+	}
+}
+
+func newGroupedCreateApply(now time.Time, identifier string) *storage.Apply {
+	return &storage.Apply{
+		ApplyIdentifier: identifier,
+		PlanID:          1,
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "production",
+		Deployment:      "payments-a",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+}
+
+func newGroupedCreateGroup(now time.Time, deployment, target string, tables ...string) *storage.ApplyOperationWithTasks {
+	tasks := make([]*storage.Task, 0, len(tables))
+	for _, table := range tables {
+		tasks = append(tasks, newGroupedCreateTask(now, deployment, table))
+	}
+	return &storage.ApplyOperationWithTasks{
+		Operation: &storage.ApplyOperation{Deployment: deployment, Target: target, State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
+		Tasks:     tasks,
+	}
+}
+
+func newGroupedCreateTask(now time.Time, deployment, table string) *storage.Task {
+	return &storage.Task{
+		TaskIdentifier: "task_" + deployment + "_" + table,
+		PlanID:         1,
+		Database:       "payments",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		Repository:     "org/repo",
+		PullRequest:    123,
+		Environment:    "production",
+		State:          state.Task.Pending,
+		TableName:      table,
+		DDL:            "ALTER TABLE " + table + " ADD COLUMN email VARCHAR(255)",
+		DDLAction:      "alter",
+		Options:        []byte("{}"),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
 }
 
 // TestApplyStore_CreateWithTasksAndOperationsRollsBackOnTaskFailure pins the

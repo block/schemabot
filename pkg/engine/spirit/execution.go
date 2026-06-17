@@ -58,7 +58,7 @@ func (e *Engine) executeMigration(ctx context.Context, host, username, password,
 
 	// Completion is signalled only after every phase has run, so a poller never
 	// observes StateCompleted while a later DROP phase is still pending.
-	e.setMigrationState(engine.StateCompleted)
+	e.setMigrationCompleted()
 }
 
 // resumeMigration continues a stopped schema change to completion.
@@ -110,7 +110,7 @@ func (e *Engine) resumeMigration(ctx context.Context, host, username, password, 
 		return
 	}
 
-	e.setMigrationState(engine.StateCompleted)
+	e.setMigrationCompleted()
 }
 
 // ddlPhases groups a plan's statements into the order Spirit requires:
@@ -381,11 +381,11 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	return nil
 }
 
-func (e *Engine) setMigrationState(state engine.State) {
+func (e *Engine) setMigrationCompleted() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.runningMigration != nil {
-		e.runningMigration.state = state
+		e.runningMigration.state = engine.StateCompleted
 	}
 }
 

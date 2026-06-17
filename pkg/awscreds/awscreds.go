@@ -1,18 +1,20 @@
-// Package awscreds resolves database credentials from AWS Secrets Manager,
-// assuming a per-target IAM role first so a single data plane can read secrets
-// across many AWS accounts.
+// Package awscreds resolves database credentials from AWS Secrets Manager.
 //
-// It implements inventory.CredentialResolver: the target's AWS account comes
-// from an endpoint attribute (surfaced by endpoint resolution), the resolver
-// assumes a role in that account, reads the secret, and parses it as a JSON
-// {username, password} payload. Credential values come from Secrets Manager,
-// never from the inventory source.
+// It implements inventory.CredentialResolver. The secret name is templated over
+// the resolved target and its entity attributes, so one configuration can locate
+// per-target or per-cluster secrets. By default it reads from the caller's own
+// AWS account; when a role ARN is configured it assumes a per-target role first,
+// so a single data plane can read secrets across many AWS accounts. The fetched
+// secret is parsed as a JSON {username, password} payload, or interpreted by a
+// configured decoder (for example a PlanetScale token). Credential values come
+// from Secrets Manager, never from the inventory source.
 package awscreds
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -28,27 +30,35 @@ import (
 // account id when one is not configured.
 const defaultAccountAttribute = "aws_account_id"
 
+// secretNamePlaceholderRe matches "{name}" placeholders in a secret name
+// template. "{target}" is the request target; any other name is an entity
+// attribute resolved for the target.
+var secretNamePlaceholderRe = regexp.MustCompile(`\{([a-zA-Z0-9_]+)\}`)
+
 // Config configures a Resolver.
 type Config struct {
 	// AWSConfig is the base AWS config used to assume roles and build Secrets
 	// Manager clients.
 	AWSConfig aws.Config
-	// Region is the region for assumed-role sessions and Secrets Manager.
+	// Region is the region for Secrets Manager (and assumed-role sessions, when a
+	// role is configured).
 	Region string
-	// RoleARN is the IAM role assumed in the target account. It may contain an
-	// "{account}" placeholder, replaced with the target's AWS account id. Using a
-	// full ARN (rather than a bare role name) keeps the partition and role path
-	// explicit, so non-commercial partitions (aws-us-gov, aws-cn) work — e.g.
-	// "arn:aws:iam::{account}:role/tern-assumed".
+	// RoleARN is the IAM role assumed in the target account. When empty, secrets
+	// are read from the caller's own account without assuming a role. When set, it
+	// may contain an "{account}" placeholder, replaced with the target's AWS
+	// account id. Using a full ARN (rather than a bare role name) keeps the
+	// partition and role path explicit, so non-commercial partitions (aws-us-gov,
+	// aws-cn) work — e.g. "arn:aws:iam::{account}:role/tern-assumed".
 	RoleARN string
 	// ExternalID is an optional STS AssumeRole external id, required by some
-	// cross-account trust policies.
+	// cross-account trust policies. It is only used when RoleARN is set.
 	ExternalID string
-	// SecretName is the Secrets Manager secret id. It may contain a "{target}"
-	// placeholder, replaced with the request target for per-target secrets.
+	// SecretName is the Secrets Manager secret id. It may contain placeholders:
+	// "{target}" (the request target) and "{attribute}" (any resolved entity
+	// attribute), replaced to locate per-target or per-cluster secrets.
 	SecretName string
 	// AccountAttribute is the endpoint attribute holding the target's AWS account
-	// id. Defaults to "aws_account_id".
+	// id. Defaults to "aws_account_id". Only required when RoleARN is set.
 	AccountAttribute string
 	// Decode, when set, interprets the fetched secret into Credentials (for
 	// example a PlanetScale token). When nil the secret is parsed as a JSON
@@ -56,30 +66,30 @@ type Config struct {
 	Decode inventory.SecretDecoder
 }
 
-// Resolver resolves credentials from Secrets Manager via per-account assumed
-// roles.
+// Resolver resolves credentials from Secrets Manager, optionally via per-account
+// assumed roles.
 type Resolver struct {
-	accountAttr string
-	secretName  string
-	fetch       secretFetcher
-	decode      inventory.SecretDecoder
+	accountAttr    string
+	secretName     string
+	fetch          secretFetcher
+	decode         inventory.SecretDecoder
+	requireAccount bool
 }
 
 var _ inventory.CredentialResolver = (*Resolver)(nil)
 
-// secretFetcher reads a raw secret value for a target AWS account.
+// secretFetcher reads a raw secret value, optionally scoped to a target AWS
+// account (ignored by backends that read from the caller's own account).
 type secretFetcher interface {
 	FetchSecret(ctx context.Context, accountID, secretName string) (string, error)
 }
 
-// New builds a Resolver backed by per-account assumed-role Secrets Manager
-// clients.
+// New builds a Resolver. With a role ARN it assumes a per-account role to read
+// secrets across accounts; without one it reads from the caller's own account.
 func New(cfg Config) (*Resolver, error) {
 	switch {
 	case cfg.Region == "":
 		return nil, fmt.Errorf("region is required")
-	case cfg.RoleARN == "":
-		return nil, fmt.Errorf("role ARN is required")
 	case cfg.SecretName == "":
 		return nil, fmt.Errorf("secret name is required")
 	}
@@ -87,6 +97,17 @@ func New(cfg Config) (*Resolver, error) {
 	if accountAttr == "" {
 		accountAttr = defaultAccountAttribute
 	}
+
+	// No role: read from the caller's own account with a single client. A role
+	// switches on per-account assume-role so one data plane can read secrets
+	// across many accounts; the target account then comes from an attribute.
+	if cfg.RoleARN == "" {
+		regionalCfg := cfg.AWSConfig
+		regionalCfg.Region = cfg.Region
+		fetch := &ownAccountFetcher{client: secretsmanager.NewFromConfig(regionalCfg)}
+		return newResolver(accountAttr, cfg.SecretName, fetch, cfg.Decode, false), nil
+	}
+
 	fetch := &assumeRoleFetcher{
 		awsCfg:     cfg.AWSConfig,
 		region:     cfg.Region,
@@ -94,35 +115,53 @@ func New(cfg Config) (*Resolver, error) {
 		externalID: cfg.ExternalID,
 		clients:    make(map[string]*secretsmanager.Client),
 	}
-	return newResolver(accountAttr, cfg.SecretName, fetch, cfg.Decode), nil
+	return newResolver(accountAttr, cfg.SecretName, fetch, cfg.Decode, true), nil
 }
 
 // newResolver constructs a Resolver over a given fetcher, so tests can inject a
 // fake that does not call AWS.
-func newResolver(accountAttr, secretName string, fetch secretFetcher, decode inventory.SecretDecoder) *Resolver {
-	return &Resolver{accountAttr: accountAttr, secretName: secretName, fetch: fetch, decode: decode}
+func newResolver(accountAttr, secretName string, fetch secretFetcher, decode inventory.SecretDecoder, requireAccount bool) *Resolver {
+	return &Resolver{accountAttr: accountAttr, secretName: secretName, fetch: fetch, decode: decode, requireAccount: requireAccount}
 }
 
-// ResolveCredentials reads the target's account from attrs, fetches the secret
-// from that account, and parses it as a JSON {username, password} payload. It
-// fails closed: a missing account attribute, a fetch failure, an unparseable
-// secret, or a missing username/password are all errors.
+// SecretNameAttributes returns the entity attribute names referenced by a secret
+// name template — every "{placeholder}" except "{target}" — so callers can
+// ensure the resolver surfaces them.
+func SecretNameAttributes(template string) []string {
+	var attrs []string
+	for _, m := range secretNamePlaceholderRe.FindAllStringSubmatch(template, -1) {
+		if m[1] != "target" {
+			attrs = append(attrs, m[1])
+		}
+	}
+	return attrs
+}
+
+// ResolveCredentials fetches the secret for the target and parses it as a JSON
+// {username, password} payload (or via the configured decoder). It fails closed:
+// a missing required account attribute, an unresolved secret-name placeholder, a
+// fetch failure, an unparseable secret, or a missing username/password are all
+// errors.
 func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request, attrs map[string]string) (*inventory.Credentials, error) {
 	accountID := attrs[r.accountAttr]
-	if accountID == "" {
+	if r.requireAccount && accountID == "" {
 		return nil, fmt.Errorf("target %q has no %q attribute for assume-role credential resolution", req.Target, r.accountAttr)
 	}
 
-	secretName := strings.ReplaceAll(r.secretName, "{target}", req.Target)
+	secretName, err := r.renderSecretName(req, attrs)
+	if err != nil {
+		return nil, err
+	}
+	where := targetContext(req.Target, accountID)
 	raw, err := r.fetch.FetchSecret(ctx, accountID, secretName)
 	if err != nil {
-		return nil, fmt.Errorf("fetch secret %q for target %q in account %s: %w", secretName, req.Target, accountID, err)
+		return nil, fmt.Errorf("fetch secret %q for %s: %w", secretName, where, err)
 	}
 
 	if r.decode != nil {
 		creds, err := r.decode(raw)
 		if err != nil {
-			return nil, fmt.Errorf("decode secret %q for target %q in account %s: %w", secretName, req.Target, accountID, err)
+			return nil, fmt.Errorf("decode secret %q for %s: %w", secretName, where, err)
 		}
 		return creds, nil
 	}
@@ -132,12 +171,69 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 		Password string `json:"password"`
 	}
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		return nil, fmt.Errorf("parse secret %q for target %q as JSON {username, password}: %w", secretName, req.Target, err)
+		return nil, fmt.Errorf("parse secret %q for %s as JSON {username, password}: %w", secretName, where, err)
 	}
 	if parsed.Username == "" || parsed.Password == "" {
-		return nil, fmt.Errorf("secret %q for target %q is missing a username or password", secretName, req.Target)
+		return nil, fmt.Errorf("secret %q for %s is missing a username or password", secretName, where)
 	}
 	return &inventory.Credentials{Username: parsed.Username, Password: parsed.Password}, nil
+}
+
+// targetContext describes the target for error messages, including its AWS
+// account id when assume-role mode resolved one (own-account mode has none), so
+// cross-account failures stay diagnosable.
+func targetContext(target, accountID string) string {
+	if accountID != "" {
+		return fmt.Sprintf("target %q in account %s", target, accountID)
+	}
+	return fmt.Sprintf("target %q", target)
+}
+
+// renderSecretName replaces "{target}" with the request target and every other
+// "{attribute}" placeholder with the resolved attribute value, failing closed if
+// any referenced attribute was not resolved.
+func (r *Resolver) renderSecretName(req inventory.Request, attrs map[string]string) (string, error) {
+	var missing []string
+	rendered := secretNamePlaceholderRe.ReplaceAllStringFunc(r.secretName, func(match string) string {
+		key := match[1 : len(match)-1]
+		if key == "target" {
+			return req.Target
+		}
+		if v := attrs[key]; v != "" {
+			return v
+		}
+		missing = append(missing, key)
+		return match
+	})
+	if len(missing) > 0 {
+		return "", fmt.Errorf("secret name template %q for target %q references unresolved attribute(s): %s", r.secretName, req.Target, strings.Join(missing, ", "))
+	}
+	return rendered, nil
+}
+
+// getSecretString reads a string secret value, rejecting binary secrets.
+func getSecretString(ctx context.Context, client *secretsmanager.Client, secretName string) (string, error) {
+	resp, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(secretName),
+	})
+	if err != nil {
+		return "", fmt.Errorf("get secret value: %w", err)
+	}
+	if resp.SecretString == nil {
+		return "", fmt.Errorf("secret %q has no string value (binary secrets are not supported)", secretName)
+	}
+	return *resp.SecretString, nil
+}
+
+// ownAccountFetcher reads secrets from the caller's own account using a single
+// Secrets Manager client — no STS AssumeRole. The account id is ignored.
+type ownAccountFetcher struct {
+	client *secretsmanager.Client
+}
+
+// FetchSecret returns the raw secret string from the caller's own account.
+func (f *ownAccountFetcher) FetchSecret(ctx context.Context, _ string, secretName string) (string, error) {
+	return getSecretString(ctx, f.client, secretName)
 }
 
 // assumeRoleFetcher reads secrets via Secrets Manager using per-account
@@ -155,17 +251,7 @@ type assumeRoleFetcher struct {
 
 // FetchSecret returns the raw secret string from the target account.
 func (f *assumeRoleFetcher) FetchSecret(ctx context.Context, accountID, secretName string) (string, error) {
-	client := f.clientForAccount(accountID)
-	resp, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
-		SecretId: aws.String(secretName),
-	})
-	if err != nil {
-		return "", fmt.Errorf("get secret value: %w", err)
-	}
-	if resp.SecretString == nil {
-		return "", fmt.Errorf("secret %q has no string value (binary secrets are not supported)", secretName)
-	}
-	return *resp.SecretString, nil
+	return getSecretString(ctx, f.clientForAccount(accountID), secretName)
 }
 
 func (f *assumeRoleFetcher) clientForAccount(accountID string) *secretsmanager.Client {
