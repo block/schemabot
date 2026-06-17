@@ -9,6 +9,7 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/commands"
 )
 
@@ -60,6 +61,10 @@ func main() {
 	cli.Version = version
 	cli.Commit = commit
 	cli.Date = date
+
+	// Authenticate every API request with the resolved Bearer token. Empty when
+	// no token is configured, which is correct against a server with auth off.
+	client.SetAuthToken(client.ResolveToken(cli.Token))
 
 	err := ctx.Run(&cli.Globals)
 	if err != nil {

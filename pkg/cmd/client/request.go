@@ -14,9 +14,38 @@ import (
 	"golang.org/x/net/html"
 )
 
+// authTransport injects a Bearer token on outbound requests when one is
+// configured. It wraps the default transport so every CLI request — including
+// those built outside the doGet/doPost helpers — is authenticated uniformly.
+var authTransport = &bearerTransport{base: http.DefaultTransport}
+
 // httpClient is the shared HTTP client for all CLI requests.
 // Uses a 30s timeout to avoid hanging indefinitely on network stalls.
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+var httpClient = &http.Client{Timeout: 30 * time.Second, Transport: authTransport}
+
+// SetAuthToken configures the Bearer token attached to every CLI request. An
+// empty token leaves requests unauthenticated, which is correct against a
+// server with auth disabled. Surrounding whitespace is trimmed so a token
+// sourced from an environment variable or file does not break the header.
+func SetAuthToken(token string) {
+	authTransport.token = strings.TrimSpace(token)
+}
+
+// bearerTransport sets "Authorization: Bearer <token>" on each request when a
+// token is configured and the header is not already set.
+type bearerTransport struct {
+	base  http.RoundTripper
+	token string
+}
+
+func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.token != "" && req.Header.Get("Authorization") == "" {
+		// RoundTrip must not mutate the caller's request, so clone it.
+		req = req.Clone(req.Context())
+		req.Header.Set("Authorization", "Bearer "+t.token)
+	}
+	return t.base.RoundTrip(req)
+}
 
 // APIError represents an error response from the API.
 type APIError struct {

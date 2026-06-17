@@ -151,6 +151,18 @@ func ResolveEndpointWithProfile(endpointFlag, profileFlag string, configEndpoint
 	return "", nil
 }
 
+// ResolveToken returns the Bearer token to authenticate with, checking in order:
+// 1. Explicit --token flag
+// 2. SCHEMABOT_TOKEN environment variable
+// An empty result means no token is configured, which is correct against a
+// server with auth disabled.
+func ResolveToken(tokenFlag string) string {
+	if tokenFlag != "" {
+		return tokenFlag
+	}
+	return os.Getenv("SCHEMABOT_TOKEN")
+}
+
 func trimSlash(s string) string {
 	if len(s) > 0 && s[len(s)-1] == '/' {
 		return s[:len(s)-1]

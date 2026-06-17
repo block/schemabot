@@ -24,6 +24,7 @@ import (
 type Globals struct {
 	Endpoint string `help:"SchemaBot API endpoint (overrides profile)"`
 	Profile  string `help:"Configuration profile"`
+	Token    string `help:"Bearer token for authenticating to an auth-enabled server (or set SCHEMABOT_TOKEN)"`
 
 	// Build info (set by main.go from ldflags)
 	Version string `kong:"-"`
