@@ -18,9 +18,16 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
-// EnsureSchemaTimeout is the maximum time EnsureSchema will wait for schema changes to complete.
-// Schema changes on SchemaBot's own storage tables are small DDL on metadata tables.
-const EnsureSchemaTimeout = 1 * time.Minute
+// EnsureSchemaTimeout bounds the whole EnsureSchema operation: acquiring the
+// advisory lock, planning, and applying the storage schema change to
+// completion. SchemaBot's storage tables are small, but Spirit applies an
+// *online* DDL, and on Aurora that carries fixed overhead (binlog subscription,
+// checksum, cutover MDL, and throttler poll loops) that can exceed a minute even
+// for a tiny table. Trailing pods also wait up to this long on the advisory lock
+// while the leader applies, then see no changes. Too short a value cancels the
+// apply mid-copy ("failed to read chunk data: context canceled") and leaves
+// storage uninitialized.
+const EnsureSchemaTimeout = 5 * time.Minute
 
 // EnsureSchema applies all embedded MySQL schema files to the database using Spirit.
 // It is idempotent - no changes are made if the schema is already up-to-date.
@@ -155,6 +162,7 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 	}
 
 	// Apply all DDL via Spirit (starts async schema change)
+	applyStart := time.Now()
 	_, err = eng.Apply(ctx, &engine.ApplyRequest{
 		Database:    "schemabot",
 		Changes:     planResult.Changes,
@@ -175,11 +183,25 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 			Credentials: &engine.Credentials{DSN: dsn},
 		})
 		if err != nil {
+			// A cancelled context surfaces here as an opaque driver error
+			// ("...context canceled"); name the timeout instead so the cause
+			// is clear from the message line alone.
+			if ctx.Err() != nil {
+				return ensureSchemaTimeoutError(ctx, len(tableChanges), logger)
+			}
 			return fmt.Errorf("check progress: %w", err)
 		}
 
 		if progress.State == engine.StateFailed {
-			return fmt.Errorf("schema change failed: %s", progress.ErrorMessage)
+			// Surface the cause in an Error log here — callers typically wrap the
+			// returned error as a structured attribute, which is easy to miss in
+			// log search. Include the DDL count and the underlying message so a
+			// failed bootstrap is triageable from the message line alone.
+			logger.Error("storage schema change failed; SchemaBot storage will not initialize",
+				"ddl_count", len(tableChanges),
+				"error", progress.ErrorMessage,
+			)
+			return fmt.Errorf("storage schema change failed (%d change(s)): %s", len(tableChanges), progress.ErrorMessage)
 		}
 
 		if progress.State.IsTerminal() {
@@ -188,13 +210,30 @@ func EnsureSchema(dsn string, logger *slog.Logger) error {
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return ensureSchemaTimeoutError(ctx, len(tableChanges), logger)
 		case <-ticker.C:
 		}
 	}
 
-	logger.Info("storage schema applied successfully")
+	logger.Info("storage schema applied successfully",
+		"ddl_count", len(tableChanges),
+		"duration", time.Since(applyStart),
+	)
 	return nil
+}
+
+// ensureSchemaTimeoutError builds and logs the error returned when
+// EnsureSchemaTimeout fires before the storage schema change completes. Spirit
+// cancels the online DDL mid-apply and storage stays uninitialized, so the
+// message names the timeout and the most likely cause (a backend throttling the
+// online DDL) instead of surfacing a bare "context canceled" from the driver.
+func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Logger) error {
+	logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
+		"timeout", EnsureSchemaTimeout,
+		"ddl_count", ddlCount,
+	)
+	return fmt.Errorf("storage schema change did not complete within %s (%d change(s)); the database may be throttling the online DDL: %w",
+		EnsureSchemaTimeout, ddlCount, ctx.Err())
 }
 
 func staleSpiritTableNames(ctx context.Context, dsn string) ([]string, error) {
@@ -344,8 +383,8 @@ func acquireEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logge
 	}
 
 	// GET_LOCK returns 1 on success, 0 on timeout, NULL on error.
-	// Use the full EnsureSchemaTimeout as the lock wait — if another pod is
-	// running EnsureSchema, it should finish well within a minute.
+	// Wait up to the full timeout for the lock — a trailing pod must outwait the
+	// leader's schema change, after which it re-plans and finds no changes.
 	var result sql.NullInt64
 	err = conn.QueryRowContext(ctx,
 		"SELECT GET_LOCK(?, ?)", ensureSchemaLockName, int(EnsureSchemaTimeout.Seconds()),
