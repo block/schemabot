@@ -520,17 +520,17 @@ func TestNew_CustomConfig(t *testing.T) {
 	assert.Equal(t, 8, eng.threads)
 }
 
-func TestSetMigrationState(t *testing.T) {
+func TestSetMigrationCompleted(t *testing.T) {
 	eng := New(Config{})
 
 	// No running schema change - should not panic
-	eng.setMigrationState(engine.StateCompleted)
+	eng.setMigrationCompleted()
 
 	// With running schema change
 	eng.runningMigration = &runningMigration{
 		state: engine.StateRunning,
 	}
-	eng.setMigrationState(engine.StateCompleted)
+	eng.setMigrationCompleted()
 
 	assert.Equal(t, engine.StateCompleted, eng.runningMigration.state)
 }

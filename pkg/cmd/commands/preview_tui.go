@@ -83,7 +83,8 @@ func previewTUI(name string, live bool) error {
 		return fmt.Errorf("unknown TUI preview type: %s (available: %s)", name, strings.Join(tuiPreviewNames(), ", "))
 	}
 	if !live {
-		return previewTUIStatic(scenario)
+		previewTUIStatic(scenario)
+		return nil
 	}
 
 	var poll atomic.Int64
@@ -113,7 +114,7 @@ func previewTUI(name string, live bool) error {
 	return watchApplyProgressByApplyIDWithEnvironment(server.URL, scenario.ApplyID, "staging", true)
 }
 
-func previewTUIStatic(scenario tuiPreviewScenario) error {
+func previewTUIStatic(scenario tuiPreviewScenario) {
 	progress := scenario.Progress(1)
 	msg := parseProgressResult(&progress)
 
@@ -131,7 +132,6 @@ func previewTUIStatic(scenario tuiPreviewScenario) error {
 	model.initialized = true
 
 	fmt.Print(model.View())
-	return nil
 }
 
 func tuiPreviewNames() []string {

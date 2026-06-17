@@ -276,7 +276,7 @@ func (h *Handler) releaseRollbackLockAfterRejectedPlan(ctx context.Context, data
 // handleRollbackConfirmCommand handles the "schemabot rollback-confirm -e <env>" PR comment command.
 // It verifies the lock, loads the rollback plan pinned by the preceding rollback
 // command, and executes the apply.
-func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) {
+func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment string, installationID int64, requestedBy string, result CommandResult) {
 	ctx, cancel, client, err := h.commandBootstrap(repo, installationID)
 	if err != nil {
 		h.logger.Error("rollback-confirm: failed to bootstrap command", "error", err)

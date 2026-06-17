@@ -12,6 +12,7 @@ linters:
     - noctx           # requests without context
     - bodyclose       # unclosed HTTP response bodies
     - usetesting      # enforce t.Context() over context.Background() in tests
+    - unparam         # unused/constant function parameters and results
   settings:
     errcheck:
       exclude-functions:
@@ -19,6 +20,13 @@ linters:
     usetesting:
       context-background: true
       context-todo: true
+  exclusions:
+    rules:
+      # Test helpers intentionally keep uniform signatures and fixed arguments
+      # for readability, so unused/constant params there are not worth churn.
+      - path: _test\.go
+        linters:
+          - unparam
 formatters:
   enable:
     - gofmt

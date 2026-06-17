@@ -323,7 +323,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 	})
 
 	for _, table := range sorted {
-		renderTableProgress(sb, table, data.State)
+		renderTableProgress(sb, table)
 	}
 }
 
@@ -334,7 +334,7 @@ func tableStatePriority(tableStatus string) int {
 
 // renderTableProgress renders a single table's progress as markdown.
 // Mirrors the CLI's writeTableProgressWithState logic but outputs markdown instead of ANSI.
-func renderTableProgress(sb *strings.Builder, table TableProgressData, globalState string) {
+func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 

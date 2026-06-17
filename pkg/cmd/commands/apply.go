@@ -234,7 +234,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying changes...")
 
-	if _, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat); err != nil {
+	if err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat); err != nil {
 		return err
 	}
 

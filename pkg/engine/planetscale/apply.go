@@ -190,7 +190,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Uses MySQL to fetch the branch schema (real-time, no API staleness).
 	if existingBranch != "" {
 		keyspaces := sortedKeyspaces(req.SchemaFiles)
-		if err := e.verifyBranchMatchesMain(ctx, client, org, req.Database, branchName, main, keyspaces, req.SchemaFiles, password); err != nil {
+		if err := e.verifyBranchMatchesMain(ctx, client, org, req.Database, branchName, main, keyspaces, password); err != nil {
 			return nil, fmt.Errorf("branch %s has stale changes from a previous apply — delete the branch and retry without --branch: %w", branchName, err)
 		}
 	}

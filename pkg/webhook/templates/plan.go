@@ -97,7 +97,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	sb.WriteString("\n")
 
 	// Count changes
-	totalStatements, keyspacesWithDDL, keyspacesWithVSchema := countChanges(data.Changes)
+	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
 	// No changes — short-circuit with a single clean message
@@ -125,7 +125,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	}
 
 	// Summary and options (after DDL, matching CLI layout)
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithDDL, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
 	writeOptions(&sb, data)
 
 	// Footer
@@ -228,11 +228,10 @@ func writeOptions(sb *strings.Builder, data PlanCommentData) {
 	}
 }
 
-func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithDDL, keyspacesWithVSchema int) {
+func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithVSchema int) {
 	for _, ks := range changes {
 		if len(ks.Statements) > 0 {
 			totalStatements += len(ks.Statements)
-			keyspacesWithDDL++
 		}
 		if ks.VSchemaChanged {
 			keyspacesWithVSchema++
@@ -241,7 +240,7 @@ func countChanges(changes []KeyspaceChangeData) (totalStatements, keyspacesWithD
 	return
 }
 
-func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspacesWithDDL, keyspacesWithVSchema int) {
+func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements, keyspacesWithVSchema int) {
 	totalChanges := totalStatements + keyspacesWithVSchema
 	if totalChanges == 0 {
 		writeNoChangesDetected(sb, data)
@@ -451,7 +450,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	if !hasErrors && envsWithChanges >= 2 && allPlansIdentical(data) {
 		// Identical plans: render once with combined header
 		fmt.Fprintf(&sb, "### %s\n\n", capitalizeEnvNames(data.Environments))
-		writeEnvironmentPlanSection(&sb, data.Plans[data.Environments[0]], data.IsMySQL)
+		writeEnvironmentPlanSection(&sb, data.Plans[data.Environments[0]])
 	} else {
 		// Separate sections per environment
 		for _, env := range data.Environments {
@@ -469,7 +468,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 				continue
 			}
 
-			writeEnvironmentPlanSection(&sb, plan, data.IsMySQL)
+			writeEnvironmentPlanSection(&sb, plan)
 		}
 	}
 
@@ -481,8 +480,8 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 }
 
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.
-func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, isMySQL bool) {
-	totalStatements, keyspacesWithDDL, keyspacesWithVSchema := countChanges(plan.Changes)
+func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
+	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
 	if totalChanges == 0 {
@@ -509,7 +508,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, isM
 	}
 
 	// Summary (after DDL, matching CLI layout)
-	writePlanSummary(sb, *plan, totalStatements, keyspacesWithDDL, keyspacesWithVSchema)
+	writePlanSummary(sb, *plan, totalStatements, keyspacesWithVSchema)
 }
 
 // writeMultiEnvFooter writes the footer with apply commands and error guidance.

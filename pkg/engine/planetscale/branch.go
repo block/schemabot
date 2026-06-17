@@ -280,7 +280,7 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 // against main for the given keyspaces. Returns an error if any DDL changes
 // exist, indicating the branch has stale DDL from a previous failed apply
 // that RefreshSchema did not clean up.
-func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PSClient, org, database, branchName, mainBranch string, keyspaces []string, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword) error {
+func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PSClient, org, database, branchName, mainBranch string, keyspaces []string, password *ps.DatabaseBranchPassword) error {
 	// Fetch main schema via API (stable, not recently modified) and branch
 	// schema via MySQL (real-time, avoids API staleness after RefreshSchema).
 	mainSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, mainBranch, keyspaces)

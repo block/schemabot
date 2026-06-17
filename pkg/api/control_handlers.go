@@ -1027,11 +1027,11 @@ const (
 // handleStart handles POST /api/start requests.
 func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 	var req StartRequest
-	client, apply, applyID, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
+	client, apply, _, ok := s.decodeControlRequest(w, r, &req, &req.ApplyID, &req.Environment)
 	if !ok {
 		return
 	}
-	resp, httpStatus, err := s.executeStartForApply(r.Context(), client, apply, applyID, req.Caller)
+	resp, httpStatus, err := s.executeStartForApply(r.Context(), client, apply, req.Caller)
 	if err != nil {
 		s.writeControlError(w, "start", apply, err)
 		return
@@ -1043,11 +1043,11 @@ func (s *Service) handleStart(w http.ResponseWriter, r *http.Request) {
 // deploy. The apply owner is responsible for consuming the request from the
 // per-apply processing loop.
 func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest) (*apitypes.StartResponse, error) {
-	client, apply, ternApplyID, err := s.controlTarget(ctx, "start", req.ApplyID, req.Environment)
+	client, apply, _, err := s.controlTarget(ctx, "start", req.ApplyID, req.Environment)
 	if err != nil {
 		return nil, err
 	}
-	resp, _, err := s.executeStartForApply(ctx, client, apply, ternApplyID, req.Caller)
+	resp, _, err := s.executeStartForApply(ctx, client, apply, req.Caller)
 	return resp, err
 }
 
@@ -1055,7 +1055,7 @@ func (s *Service) ExecuteStart(ctx context.Context, req apitypes.ControlRequest)
 // HTTP status is meaningful only when err == nil; every error path returns a
 // zero status, and callers must derive the response status from the error (e.g.
 // via writeControlError).
-func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string) (*apitypes.StartResponse, int, error) {
+func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*apitypes.StartResponse, int, error) {
 	if err := validateStartRequestState(apply); err != nil {
 		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, err

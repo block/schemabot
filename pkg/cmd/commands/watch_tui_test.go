@@ -616,30 +616,30 @@ func TestWatchModel_EnterTriggersSkipRevert(t *testing.T) {
 
 func TestFormatExitContext(t *testing.T) {
 	t.Run("includes apply ID and resume command", func(t *testing.T) {
-		result := formatExitContext("apply-abc123", "", "mydb", "production")
+		result := formatExitContext("apply-abc123", "", "production")
 		assert.Contains(t, result, "apply-abc123")
 		assert.Contains(t, result, "schemabot progress apply-abc123 -e production")
 	})
 
 	t.Run("includes deploy request URL when present", func(t *testing.T) {
-		result := formatExitContext("apply-abc123", "https://app.planetscale.com/org/db/deploy-requests/42", "mydb", "production")
+		result := formatExitContext("apply-abc123", "https://app.planetscale.com/org/db/deploy-requests/42", "production")
 		assert.Contains(t, result, "apply-abc123")
 		assert.Contains(t, result, "https://app.planetscale.com/org/db/deploy-requests/42")
 		assert.Contains(t, result, "schemabot progress apply-abc123 -e production")
 	})
 
 	t.Run("omits deploy URL when empty", func(t *testing.T) {
-		result := formatExitContext("apply-abc123", "", "mydb", "staging")
+		result := formatExitContext("apply-abc123", "", "staging")
 		assert.NotContains(t, result, "Deploy Request:")
 	})
 
 	t.Run("empty apply ID returns empty string", func(t *testing.T) {
-		result := formatExitContext("", "https://example.com", "mydb", "staging")
+		result := formatExitContext("", "https://example.com", "staging")
 		assert.Empty(t, result)
 	})
 
 	t.Run("omits environment flag when empty", func(t *testing.T) {
-		result := formatExitContext("apply-abc123", "", "mydb", "")
+		result := formatExitContext("apply-abc123", "", "")
 		assert.Contains(t, result, "schemabot progress apply-abc123")
 		assert.NotContains(t, result, "-e ")
 	})

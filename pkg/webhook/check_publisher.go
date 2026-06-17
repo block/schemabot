@@ -269,7 +269,11 @@ func (h *Handler) upsertAggregateCheckRun(
 // manages. Without this, branch protection would block indefinitely waiting for a
 // check that would never come. It does not publish success over existing
 // per-database state that still needs operator attention.
-func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, title, summary string) {
+func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) {
+	const (
+		title   = "No managed schema changes"
+		summary = "This PR does not contain schema changes managed by SchemaBot."
+	)
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
 		return
 	}
