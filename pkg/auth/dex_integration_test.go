@@ -38,6 +38,10 @@ import (
 
 const dexImage = "ghcr.io/dexidp/dex:v2.41.1"
 
+// dexHTTPTimeout bounds every HTTP call in this test so a hung Dex or network
+// fails fast instead of blocking until the overall test timeout.
+const dexHTTPTimeout = 30 * time.Second
+
 // reserveHostPort grabs a free TCP port and releases it. The OIDC issuer URL
 // must be known before Dex starts (it is baked into Dex's config and must match
 // what clients discover), so we pin Dex's published port to this value.
@@ -49,9 +53,32 @@ func reserveHostPort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// startDex runs Dex pinned to hostPort and returns its issuer URL.
-func startDex(t *testing.T, hostPort int) string {
+// startDex runs Dex and returns its issuer URL. Because the issuer port must be
+// reserved before Dex binds it, there is an inherent TOCTOU window where another
+// process can claim the port first; we retry on start failure with a freshly
+// reserved port to absorb that race.
+func startDex(t *testing.T) string {
 	t.Helper()
+	const attempts = 3
+	var lastErr error
+	for i := range attempts {
+		issuer, err := tryStartDex(t)
+		if err == nil {
+			return issuer
+		}
+		lastErr = err
+		t.Logf("dex start attempt %d/%d failed, retrying with a new port: %v", i+1, attempts, err)
+	}
+	require.NoError(t, lastErr, "dex failed to start after %d attempts", attempts)
+	return ""
+}
+
+// tryStartDex reserves a port, pins Dex's published port to it, and starts the
+// container. It returns an error (rather than failing the test) so startDex can
+// retry on a port-binding race.
+func tryStartDex(t *testing.T) (string, error) {
+	t.Helper()
+	hostPort := reserveHostPort(t)
 	issuer := fmt.Sprintf("http://127.0.0.1:%d/dex", hostPort)
 
 	cfg := fmt.Sprintf(`issuer: %s
@@ -95,9 +122,13 @@ connectors:
 		ContainerRequest: req,
 		Started:          true,
 	})
-	require.NoError(t, err)
+	if err != nil {
+		return "", err
+	}
+	// t.Context() is already cancelled by the time cleanup runs; WithoutCancel
+	// detaches that cancellation so the container is reliably torn down.
 	t.Cleanup(func() { _ = ctr.Terminate(context.WithoutCancel(t.Context())) })
-	return issuer
+	return issuer, nil
 }
 
 // dexToken drives Dex's auth-code flow. The mockCallback connector
@@ -111,7 +142,8 @@ func dexToken(t *testing.T, issuer string) string {
 
 	var code string
 	hc := &http.Client{
-		Jar: jar,
+		Jar:     jar,
+		Timeout: dexHTTPTimeout,
 		CheckRedirect: func(r *http.Request, _ []*http.Request) error {
 			if r.URL.Host == "localhost" { // the client redirect_uri — flow complete
 				code = r.URL.Query().Get("code")
@@ -145,7 +177,7 @@ func dexToken(t *testing.T, issuer string) string {
 	tokReq, err := http.NewRequestWithContext(t.Context(), http.MethodPost, issuer+"/token", strings.NewReader(form.Encode()))
 	require.NoError(t, err)
 	tokReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	tokResp, err := http.DefaultClient.Do(tokReq)
+	tokResp, err := hc.Do(tokReq)
 	require.NoError(t, err)
 	defer func() { _ = tokResp.Body.Close() }()
 	require.Equal(t, http.StatusOK, tokResp.StatusCode)
@@ -159,10 +191,10 @@ func dexToken(t *testing.T, issuer string) string {
 }
 
 func TestOIDCAuthorizerDexEndToEnd(t *testing.T) {
-	port := reserveHostPort(t)
-	issuer := startDex(t, port)
+	issuer := startDex(t)
 	token := dexToken(t, issuer)
 
+	client := &http.Client{Timeout: dexHTTPTimeout}
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	serverWithAdminGroups := func(t *testing.T, adminGroups []string) *httptest.Server {
@@ -183,7 +215,7 @@ func TestOIDCAuthorizerDexEndToEnd(t *testing.T) {
 		if bearer != "" {
 			req.Header.Set("Authorization", "Bearer "+bearer)
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		require.NoError(t, err)
 		_ = resp.Body.Close()
 		return resp.StatusCode
