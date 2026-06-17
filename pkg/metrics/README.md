@@ -92,7 +92,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (GitHub API): `success`, `error`, `unknown`
 
-**reason** (operator claim failures): `storage_error`, `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `unknown`
+**reason** (operator claim failures): `storage_error`, `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `missing_operation_deployment`, `unknown`
 
 **reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
 

@@ -99,7 +99,7 @@ func TestResumeClaimedApplyRoutesRecoveredObserver(t *testing.T) {
 		State:           state.Apply.Pending,
 	}
 
-	resumed, err := svc.resumeClaimedApply(t.Context(), 1, apply, 0)
+	resumed, err := svc.resumeClaimedApply(t.Context(), 1, apply, 0, "")
 
 	require.NoError(t, err)
 	assert.True(t, resumed)

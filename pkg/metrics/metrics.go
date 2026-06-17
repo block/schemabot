@@ -665,6 +665,7 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"operation_storage_error":        true,
 	"operation_parent_claim_error":   true,
 	"operation_parent_not_claimable": true,
+	"missing_operation_deployment":   true,
 }
 
 // RecordOperatorClaimFailure increments the operator claim failure counter.
