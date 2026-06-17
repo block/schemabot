@@ -152,15 +152,16 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 	if err != nil {
 		return nil, err
 	}
+	where := targetContext(req.Target, accountID)
 	raw, err := r.fetch.FetchSecret(ctx, accountID, secretName)
 	if err != nil {
-		return nil, fmt.Errorf("fetch secret %q for target %q: %w", secretName, req.Target, err)
+		return nil, fmt.Errorf("fetch secret %q for %s: %w", secretName, where, err)
 	}
 
 	if r.decode != nil {
 		creds, err := r.decode(raw)
 		if err != nil {
-			return nil, fmt.Errorf("decode secret %q for target %q: %w", secretName, req.Target, err)
+			return nil, fmt.Errorf("decode secret %q for %s: %w", secretName, where, err)
 		}
 		return creds, nil
 	}
@@ -170,12 +171,22 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 		Password string `json:"password"`
 	}
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-		return nil, fmt.Errorf("parse secret %q for target %q as JSON {username, password}: %w", secretName, req.Target, err)
+		return nil, fmt.Errorf("parse secret %q for %s as JSON {username, password}: %w", secretName, where, err)
 	}
 	if parsed.Username == "" || parsed.Password == "" {
-		return nil, fmt.Errorf("secret %q for target %q is missing a username or password", secretName, req.Target)
+		return nil, fmt.Errorf("secret %q for %s is missing a username or password", secretName, where)
 	}
 	return &inventory.Credentials{Username: parsed.Username, Password: parsed.Password}, nil
+}
+
+// targetContext describes the target for error messages, including its AWS
+// account id when assume-role mode resolved one (own-account mode has none), so
+// cross-account failures stay diagnosable.
+func targetContext(target, accountID string) string {
+	if accountID != "" {
+		return fmt.Sprintf("target %q in account %s", target, accountID)
+	}
+	return fmt.Sprintf("target %q", target)
 }
 
 // renderSecretName replaces "{target}" with the request target and every other

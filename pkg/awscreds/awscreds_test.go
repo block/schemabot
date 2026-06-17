@@ -151,6 +151,22 @@ func TestSecretNameAttributes(t *testing.T) {
 	assert.Empty(t, SecretNameAttributes("static-secret"))
 }
 
+// Assume-role failures carry the target AWS account id so cross-account
+// problems stay diagnosable; own-account mode has no account to report.
+func TestResolverFetchErrorIncludesAccountInAssumeRoleMode(t *testing.T) {
+	assumeRole := newResolver("aws_account_id", "secret", &fakeFetcher{err: fmt.Errorf("access denied")}, nil, true)
+	_, err := assumeRole.ResolveCredentials(t.Context(),
+		inventory.Request{Target: "orders-dsid"},
+		map[string]string{"aws_account_id": "123456789012"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "123456789012")
+
+	ownAccount := newResolver("aws_account_id", "secret", &fakeFetcher{err: fmt.Errorf("access denied")}, nil, false)
+	_, err = ownAccount.ResolveCredentials(t.Context(), inventory.Request{Target: "orders-dsid"}, nil)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "in account")
+}
+
 func TestNewValidatesConfig(t *testing.T) {
 	base := Config{Region: "us-west-2", RoleARN: "arn:aws:iam::{account}:role/tern-assumed", SecretName: "secret"}
 
