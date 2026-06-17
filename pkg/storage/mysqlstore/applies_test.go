@@ -325,7 +325,7 @@ func TestApplyStore_CreateWithGroupedOperationsRejectsInvalidGroups(t *testing.T
 	}{
 		{name: "empty groups", groups: nil, wantError: "grouped operations are empty"},
 		{name: "nil group", groups: []*storage.ApplyOperationWithTasks{nil}, wantError: "grouped operation is nil"},
-		{name: "nil operation", groups: []*storage.ApplyOperationWithTasks{{Tasks: []*storage.Task{newGroupedCreateTask(time.Now(), "payments-a", "users")}}}, wantError: "grouped operation is nil"},
+		{name: "nil operation", groups: []*storage.ApplyOperationWithTasks{{Tasks: []*storage.Task{newGroupedCreateTask(time.Now(), "payments-a", "users")}}}, wantError: "grouped operation is missing its operation row"},
 		{name: "no tasks", groups: []*storage.ApplyOperationWithTasks{{Operation: &storage.ApplyOperation{Deployment: "payments-a", Target: "payments-target"}}}, wantError: "grouped operation has no tasks"},
 	}
 

@@ -21,6 +21,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -924,12 +925,24 @@ func (s *Service) createStoredApply(
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
-	targets, err := s.config.ResolveDatabaseTargets(plan.Database, req.Environment)
-	if err != nil {
-		return nil, 0, fmt.Errorf("resolve targets for %s/%s: %w", plan.Database, req.Environment, err)
-	}
-	if len(targets) == 0 {
-		return nil, 0, fmt.Errorf("resolve targets for %s/%s: no targets", plan.Database, req.Environment)
+
+	// The plan already carries the resolved primary (deployment, target) from
+	// plan time, and is authoritative for single-deployment applies and the
+	// config-light trusted control-plane enqueue path. Multi-deployment fan-out
+	// additionally needs the full ordered target set, which only the server
+	// config knows; use it only when it defines more than one deployment so
+	// single-deployment creation stays unchanged and does not depend on
+	// database config being present.
+	targets := []routing.ExecutionTarget{{
+		DatabaseType: plan.DatabaseType,
+		Deployment:   plan.Deployment,
+		Target:       plan.Target,
+	}}
+	if resolved, err := s.config.ResolveDatabaseTargets(plan.Database, req.Environment); err != nil {
+		s.logger.Debug("createStoredApply: using plan's stored target; config did not resolve database targets",
+			"database", plan.Database, "environment", req.Environment, "error", err)
+	} else if len(resolved) > 1 {
+		targets = resolved
 	}
 
 	var lockID int64
