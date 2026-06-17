@@ -303,6 +303,40 @@ func newGitHubRateLimitTransport(base http.RoundTripper) http.RoundTripper {
 	)
 }
 
+const githubUnavailableReadRetryMaxAttempts = 3
+
+var githubUnavailableReadRetryDelay = 200 * time.Millisecond
+
+func retryGitHubUnavailableRead[T any](ctx context.Context, logger *slog.Logger, operation string, logAttrs []any, read func(context.Context) (T, error)) (T, error) {
+	var zero T
+	for attempt := 1; attempt <= githubUnavailableReadRetryMaxAttempts; attempt++ {
+		result, err := read(ctx)
+		if err == nil {
+			if attempt > 1 && logger != nil {
+				logger.Info("GitHub read succeeded after retry",
+					append(logAttrs, "operation", operation, "attempt", attempt)...)
+			}
+			return result, nil
+		}
+		if !IsUnavailableError(err) || attempt == githubUnavailableReadRetryMaxAttempts || ctx.Err() != nil {
+			return zero, err
+		}
+		delay := githubUnavailableReadRetryDelay * time.Duration(attempt)
+		if logger != nil {
+			logger.Warn("retrying unavailable GitHub read",
+				append(logAttrs, "operation", operation, "attempt", attempt, "max_attempts", githubUnavailableReadRetryMaxAttempts, "delay", delay, "error", err)...)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return zero, fmt.Errorf("wait to retry GitHub read %s: %w", operation, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	return zero, fmt.Errorf("retry GitHub read %s: exhausted attempts", operation)
+}
+
 // AppSlug returns the GitHub App slug associated with this installation
 // client, when known. It is best-effort: startup can proceed before the slug
 // is fetched, so callers should tolerate an empty string.
@@ -480,9 +514,15 @@ func (ic *InstallationClient) FetchPullRequestNoCache(ctx context.Context, repo 
 
 func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string, pr int) (*PullRequestInfo, error) {
 	owner, repoName := splitRepo(repo)
-	ghPR, _, err := ic.client.PullRequests.Get(ctx, owner, repoName, pr)
+	ghPR, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch pull request", []any{"repo", repo, "pr", pr}, func(ctx context.Context) (*gh.PullRequest, error) {
+		ghPR, _, err := ic.client.PullRequests.Get(ctx, owner, repoName, pr)
+		if err != nil {
+			return nil, fmt.Errorf("fetch pull request %s#%d: %w", repo, pr, classifyGitHubAPIError(err))
+		}
+		return ghPR, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("fetch pull request %s#%d: %w", repo, pr, classifyGitHubAPIError(err))
+		return nil, err
 	}
 	return &PullRequestInfo{
 		HeadRef: ghPR.GetHead().GetRef(),
@@ -512,11 +552,26 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 	var allFiles []PRFile
 
 	for {
-		ghFiles, resp, err := ic.client.PullRequests.ListFiles(ctx, owner, repoName, pr, opts)
+		readResult, err := retryGitHubUnavailableRead(ctx, ic.logger, "list PR files", []any{"repo", repo, "pr", pr, "page", opts.Page}, func(ctx context.Context) (struct {
+			files []*gh.CommitFile
+			resp  *gh.Response
+		}, error) {
+			ghFiles, resp, err := ic.client.PullRequests.ListFiles(ctx, owner, repoName, pr, opts)
+			if err != nil {
+				return struct {
+					files []*gh.CommitFile
+					resp  *gh.Response
+				}{}, fmt.Errorf("list PR files: %w", classifyGitHubAPIError(err))
+			}
+			return struct {
+				files []*gh.CommitFile
+				resp  *gh.Response
+			}{files: ghFiles, resp: resp}, nil
+		})
 		if err != nil {
-			return nil, fmt.Errorf("list PR files: %w", classifyGitHubAPIError(err))
+			return nil, err
 		}
-		for _, f := range ghFiles {
+		for _, f := range readResult.files {
 			allFiles = append(allFiles, PRFile{
 				Filename: f.GetFilename(),
 				Status:   f.GetStatus(),
@@ -525,10 +580,10 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 		if len(allFiles) >= maxGitHubPRFiles {
 			return nil, fmt.Errorf("list PR files for %s#%d reached GitHub API limit: %w", repo, pr, ErrPRFilesIncomplete)
 		}
-		if resp.NextPage == 0 {
+		if readResult.resp.NextPage == 0 {
 			break
 		}
-		opts.Page = resp.NextPage
+		opts.Page = readResult.resp.NextPage
 	}
 
 	return allFiles, nil
@@ -986,9 +1041,15 @@ type TreeEntry struct {
 // FetchGitTree fetches the entire directory tree in one API call using recursive mode.
 func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA string) ([]TreeEntry, bool, error) {
 	owner, repoName := splitRepo(repo)
-	ghTree, _, err := ic.client.Git.GetTree(ctx, owner, repoName, treeSHA, true)
+	ghTree, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch git tree", []any{"repo", repo, "tree_sha", treeSHA}, func(ctx context.Context) (*gh.Tree, error) {
+		ghTree, _, err := ic.client.Git.GetTree(ctx, owner, repoName, treeSHA, true)
+		if err != nil {
+			return nil, fmt.Errorf("fetch git tree: %w", classifyGitHubAPIError(err))
+		}
+		return ghTree, nil
+	})
 	if err != nil {
-		return nil, false, fmt.Errorf("fetch git tree: %w", classifyGitHubAPIError(err))
+		return nil, false, err
 	}
 
 	entries := make([]TreeEntry, len(ghTree.Entries))
@@ -1007,9 +1068,15 @@ func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA st
 // FetchBlobContent fetches file content using the Git Blob API.
 func (ic *InstallationClient) FetchBlobContent(ctx context.Context, repo, blobSHA string) (string, error) {
 	owner, repoName := splitRepo(repo)
-	blob, _, err := ic.client.Git.GetBlob(ctx, owner, repoName, blobSHA)
+	blob, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch blob", []any{"repo", repo, "blob_sha", blobSHA}, func(ctx context.Context) (*gh.Blob, error) {
+		blob, _, err := ic.client.Git.GetBlob(ctx, owner, repoName, blobSHA)
+		if err != nil {
+			return nil, fmt.Errorf("fetch blob: %w", classifyGitHubAPIError(err))
+		}
+		return blob, nil
+	})
 	if err != nil {
-		return "", fmt.Errorf("fetch blob: %w", classifyGitHubAPIError(err))
+		return "", err
 	}
 
 	content := blob.GetContent()
@@ -1027,9 +1094,15 @@ func (ic *InstallationClient) FetchBlobContent(ctx context.Context, repo, blobSH
 func (ic *InstallationClient) FetchFileContent(ctx context.Context, repo, filePath, ref string) (string, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.RepositoryContentGetOptions{Ref: ref}
-	fileContent, _, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, filePath, opts)
+	fileContent, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch file content", []any{"repo", repo, "path", filePath, "ref", ref}, func(ctx context.Context) (*gh.RepositoryContent, error) {
+		fileContent, _, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, filePath, opts)
+		if err != nil {
+			return nil, fmt.Errorf("fetch file content: %w", classifyGitHubAPIError(err))
+		}
+		return fileContent, nil
+	})
 	if err != nil {
-		return "", fmt.Errorf("fetch file content: %w", classifyGitHubAPIError(err))
+		return "", err
 	}
 	if fileContent == nil {
 		return "", fmt.Errorf("file not found: %s", filePath)
@@ -1051,17 +1124,32 @@ const maxGitHubDirEntries = 1000
 func (ic *InstallationClient) fetchDirectoryContents(ctx context.Context, repo, dirPath, ref string) ([]*gh.RepositoryContent, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.RepositoryContentGetOptions{Ref: ref}
-	fileContent, directoryContent, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, dirPath, opts)
+	readResult, err := retryGitHubUnavailableRead(ctx, ic.logger, "fetch directory content", []any{"repo", repo, "path", dirPath, "ref", ref}, func(ctx context.Context) (struct {
+		fileContent      *gh.RepositoryContent
+		directoryContent []*gh.RepositoryContent
+	}, error) {
+		fileContent, directoryContent, _, err := ic.client.Repositories.GetContents(ctx, owner, repoName, dirPath, opts)
+		if err != nil {
+			return struct {
+				fileContent      *gh.RepositoryContent
+				directoryContent []*gh.RepositoryContent
+			}{}, fmt.Errorf("fetch directory content at %s: %w", dirPath, classifyGitHubAPIError(err))
+		}
+		return struct {
+			fileContent      *gh.RepositoryContent
+			directoryContent []*gh.RepositoryContent
+		}{fileContent: fileContent, directoryContent: directoryContent}, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("fetch directory content at %s: %w", dirPath, classifyGitHubAPIError(err))
+		return nil, err
 	}
-	if fileContent != nil {
+	if readResult.fileContent != nil {
 		return nil, fmt.Errorf("expected directory at %s, found file", dirPath)
 	}
-	if len(directoryContent) >= maxGitHubDirEntries {
+	if len(readResult.directoryContent) >= maxGitHubDirEntries {
 		return nil, fmt.Errorf("list schema directory %s in repo %s ref %s reached GitHub Contents API limit: %w", dirPath, repo, ref, ErrDirListingCapped)
 	}
-	return directoryContent, nil
+	return readResult.directoryContent, nil
 }
 
 // GitHubFile represents a file fetched from GitHub API.

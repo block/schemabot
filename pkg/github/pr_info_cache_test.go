@@ -105,7 +105,7 @@ func TestFetchPullRequest_ErrorsAreNotCached(t *testing.T) {
 	mux.HandleFunc("/repos/octo/repo/pulls/42", func(w http.ResponseWriter, r *http.Request) {
 		n := calls.Add(1)
 		if n < 3 {
-			http.Error(w, "boom", http.StatusInternalServerError)
+			http.Error(w, "bad credentials", http.StatusUnauthorized)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

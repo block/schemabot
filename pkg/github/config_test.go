@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
@@ -35,8 +36,12 @@ environments:
 }
 
 func TestFindAllConfigsForPRClassifiesGitHubUnavailable(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+
 	client, mux := setupConfigTestGitHubServer(t)
+	requests := 0
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		requests++
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 	})
 
@@ -44,11 +49,106 @@ func TestFindAllConfigsForPRClassifiesGitHubUnavailable(t *testing.T) {
 	_, err := ic.FindAllConfigsForPR(t.Context(), "octocat/hello-world", 1)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrGitHubUnavailable)
+	assert.Equal(t, githubUnavailableReadRetryMaxAttempts, requests)
+}
+
+func TestFindAllConfigsForPRRetriesUnavailablePullRequestRead(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+
+	client, mux := setupConfigTestGitHubServer(t)
+	requests := 0
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		if requests == 1 {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(gh.PullRequest{
+			Head: &gh.PullRequestBranch{SHA: new("abc123")},
+		}))
+	})
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("apps/widgets/schema/schemabot.yaml"),
+		Status:   new("added"),
+	}})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	configs, err := ic.FindAllConfigsForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.NoError(t, err)
+	require.Len(t, configs, 1)
+	assert.Equal(t, "widgets", configs[0].Config.Database)
+	assert.Equal(t, 2, requests)
+}
+
+func TestFindAllConfigsForPRRetriesUnavailablePRFilesRead(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	requests := 0
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		if requests == 1 {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.CommitFile{{
+			Filename: new("apps/widgets/schema/schemabot.yaml"),
+			Status:   new("added"),
+		}}))
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: mysql\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	configs, err := ic.FindAllConfigsForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.NoError(t, err)
+	require.Len(t, configs, 1)
+	assert.Equal(t, "widgets", configs[0].Config.Database)
+	assert.Equal(t, 2, requests)
+}
+
+func TestFindAllConfigsForPRRetriesUnavailableConfigContentRead(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("apps/widgets/schema/schemabot.yaml"),
+		Status:   new("added"),
+	}})
+	requests := 0
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		if requests == 1 {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Type:     new("file"),
+			Encoding: new("base64"),
+			Content:  new(base64.StdEncoding.EncodeToString([]byte("database: widgets\ntype: mysql\n"))),
+		}))
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	configs, err := ic.FindAllConfigsForPR(t.Context(), "octocat/hello-world", 1)
+
+	require.NoError(t, err)
+	require.Len(t, configs, 1)
+	assert.Equal(t, "widgets", configs[0].Config.Database)
+	assert.Equal(t, 2, requests)
 }
 
 func TestFindAllConfigsForPRDoesNotClassifyRateLimitAsGitHubUnavailable(t *testing.T) {
+	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
+
 	client, mux := setupConfigTestGitHubServer(t)
+	requests := 0
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		requests++
 		w.Header().Set("X-RateLimit-Remaining", "0")
 		w.WriteHeader(http.StatusForbidden)
 		_, err := w.Write([]byte(`{"message":"API rate limit exceeded"}`))
@@ -59,6 +159,7 @@ func TestFindAllConfigsForPRDoesNotClassifyRateLimitAsGitHubUnavailable(t *testi
 	_, err := ic.FindAllConfigsForPR(t.Context(), "octocat/hello-world", 1)
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, ErrGitHubUnavailable))
+	assert.Equal(t, 1, requests)
 }
 
 func TestFindAllConfigsForPRDoesNotClassifyMissingConfigAsGitHubUnavailable(t *testing.T) {
@@ -296,6 +397,16 @@ func setupConfigTestGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {
 	client.BaseURL = baseURL
 
 	return client, mux
+}
+
+func setGitHubUnavailableReadRetryDelay(t *testing.T, delay time.Duration) {
+	t.Helper()
+
+	originalDelay := githubUnavailableReadRetryDelay
+	githubUnavailableReadRetryDelay = delay
+	t.Cleanup(func() {
+		githubUnavailableReadRetryDelay = originalDelay
+	})
 }
 
 func registerPullRequest(t *testing.T, mux *http.ServeMux, headSHA string) {
