@@ -101,6 +101,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
+	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -171,6 +172,7 @@ type LocalClient struct {
 	spiritEngine      engine.Engine
 	planetscaleEngine engine.Engine
 	customEngine      engine.Engine
+	psClientFunc      func(tokenName, tokenValue string) (psclient.PSClient, error)
 	logger            *slog.Logger
 
 	// heartbeatInterval controls how often the apply heartbeat updates updated_at.
@@ -211,11 +213,13 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 	// that points at the API base URL from metadata (e.g., "http://localscale:8080").
 	// TargetDSN is the vtgate MySQL DSN for SHOW VITESS_MIGRATIONS.
 	var psEngine engine.Engine
+	var psClientFunc func(tokenName, tokenValue string) (psclient.PSClient, error)
 	if cfg.Type == storage.DatabaseTypeVitess {
 		apiURL := cfg.Metadata["api_url"]
-		psEngine = planetscale.NewWithClient(logger, func(tokenName, tokenValue string) (psclient.PSClient, error) {
+		psClientFunc = func(tokenName, tokenValue string) (psclient.PSClient, error) {
 			return psclient.NewPSClientWithBaseURL(tokenName, tokenValue, apiURL)
-		})
+		}
+		psEngine = planetscale.NewWithClient(logger, psClientFunc)
 	}
 
 	// For a database type without a built-in engine, build it from a registered
@@ -251,6 +255,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		}),
 		planetscaleEngine: psEngine,
 		customEngine:      customEngine,
+		psClientFunc:      psClientFunc,
 		logger:            logger,
 		heartbeatInterval: 10 * time.Second,
 	}, nil
@@ -458,8 +463,8 @@ func (c *LocalClient) Health(ctx context.Context) error {
 
 // PullSchema fetches the live schema and returns declarative schema files.
 func (c *LocalClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
-		return nil, fmt.Errorf("pull schema for database %s type %s: only %s is supported: %w", c.config.Database, c.config.Type, storage.DatabaseTypeMySQL, ErrPullSchemaUnsupportedType)
+	if c.config.Type != storage.DatabaseTypeMySQL && c.config.Type != storage.DatabaseTypeVitess {
+		return nil, fmt.Errorf("pull schema for database %s type %s: only %s and %s are supported: %w", c.config.Database, c.config.Type, storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, ErrPullSchemaUnsupportedType)
 	}
 	if req.Type != "" && req.Type != c.config.Type {
 		return nil, fmt.Errorf("pull schema for database %s: request type %q does not match client type %q: %w", c.config.Database, req.Type, c.config.Type, ErrPullSchemaInvalidRequest)
@@ -493,6 +498,10 @@ func (c *LocalClient) pullAllNamespaces(ctx context.Context, req *ternv1.PullSch
 }
 
 func (c *LocalClient) discoverPullNamespaces(ctx context.Context) ([]string, error) {
+	if c.config.Type == storage.DatabaseTypeVitess {
+		return c.discoverVitessPullKeyspaces(ctx)
+	}
+
 	if database, err := mysqlDSNDatabase(c.config.TargetDSN); err != nil {
 		return nil, fmt.Errorf("inspect MySQL target DSN for namespace discovery: %w", err)
 	} else if database != "" {
@@ -538,6 +547,10 @@ func (c *LocalClient) discoverPullNamespaces(ctx context.Context) ([]string, err
 }
 
 func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullSchemaRequest, namespace string) (*ternv1.PullSchemaResponse, error) {
+	if c.config.Type == storage.DatabaseTypeVitess {
+		return c.pullVitessSchemaNamespace(ctx, req, namespace)
+	}
+
 	targetDSN := c.config.TargetDSN
 	if c.config.Type == storage.DatabaseTypeMySQL {
 		creds, err := c.credentialsForMySQLPullNamespace(namespace)
@@ -569,7 +582,7 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 
 	pulledTables := make(map[string]string, len(tables))
 	for _, tbl := range tables {
-		content, err := pulledSchemaFileContent(namespace, tbl)
+		content, err := pulledSchemaFileContent(namespace, tbl.Name, tbl.Schema)
 		if err != nil {
 			return nil, err
 		}
@@ -599,6 +612,134 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 		},
 		TableCount: int32(len(tables)),
 	}, nil
+}
+
+func (c *LocalClient) discoverVitessPullKeyspaces(ctx context.Context) ([]string, error) {
+	client, org, branch, err := c.planetScalePullClient()
+	if err != nil {
+		return nil, err
+	}
+
+	c.logger.Info("LocalClient.PullSchema: discovering Vitess keyspaces", "database", c.config.Database, "branch", branch)
+	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
+		Organization: org,
+		Database:     c.config.Database,
+		Branch:       branch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s: %w", c.config.Database, branch, err)
+	}
+	namespaces := make([]string, 0, len(keyspaces))
+	for _, keyspace := range keyspaces {
+		if keyspace == nil {
+			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess keyspace", "database", c.config.Database, "branch", branch)
+			continue
+		}
+		if keyspace.Name == "" {
+			return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s returned a keyspace with no name", c.config.Database, branch)
+		}
+		if schema.IsReservedPullNamespace(keyspace.Name) {
+			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "branch", branch, "namespace", keyspace.Name)
+			continue
+		}
+		namespaces = append(namespaces, keyspace.Name)
+	}
+	sort.Strings(namespaces)
+	c.logger.Info("LocalClient.PullSchema: discovered Vitess keyspaces", "database", c.config.Database, "branch", branch, "namespace_count", len(namespaces))
+	return namespaces, nil
+}
+
+func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1.PullSchemaRequest, namespace string) (*ternv1.PullSchemaResponse, error) {
+	client, org, branch, err := c.planetScalePullClient()
+	if err != nil {
+		return nil, err
+	}
+
+	c.logger.Info("LocalClient.PullSchema: loading live Vitess schema", "database", c.config.Database, "branch", branch, "namespace", namespace)
+	schemaResult, err := client.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
+		Organization: org,
+		Database:     c.config.Database,
+		Branch:       branch,
+		Keyspace:     namespace,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+	}
+
+	pulledTables := make(map[string]string, len(schemaResult))
+	for _, tbl := range schemaResult {
+		if tbl == nil {
+			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess table schema", "database", c.config.Database, "branch", branch, "namespace", namespace)
+			continue
+		}
+		if tbl.Name == "" {
+			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s returned a table with no name", c.config.Database, branch, namespace)
+		}
+		content, err := pulledSchemaFileContent(c.config.Database, tbl.Name, tbl.Raw)
+		if err != nil {
+			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+		}
+		pulledTables[tbl.Name] = content
+	}
+
+	artifacts := map[string]string{}
+	vschema, err := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
+		Organization: org,
+		Database:     c.config.Database,
+		Branch:       branch,
+		Keyspace:     namespace,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fetch Vitess VSchema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+	}
+	if vschema != nil && strings.TrimSpace(vschema.Raw) != "" {
+		artifacts[vSchemaArtifactName] = strings.TrimRight(vschema.Raw, "\n") + "\n"
+	}
+
+	c.logger.Info("LocalClient.PullSchema: loaded live Vitess schema",
+		"database", c.config.Database,
+		"branch", branch,
+		"namespace", namespace,
+		"table_count", len(pulledTables),
+		"artifact_count", len(artifacts),
+	)
+
+	return &ternv1.PullSchemaResponse{
+		Database:    c.pullResponseDatabase(req),
+		Type:        c.config.Type,
+		Environment: req.Environment,
+		Namespaces: map[string]*ternv1.PulledNamespace{
+			namespace: {
+				Tables:    pulledTables,
+				Artifacts: artifacts,
+				NamespaceCatalog: &ternv1.NamespaceCatalog{
+					Name:       namespace,
+					Engine:     c.config.Type,
+					TableCount: int32(len(pulledTables)),
+				},
+			},
+		},
+		TableCount: int32(len(pulledTables)),
+	}, nil
+}
+
+func (c *LocalClient) planetScalePullClient() (psclient.PSClient, string, string, error) {
+	if c.psClientFunc == nil {
+		return nil, "", "", fmt.Errorf("PlanetScale client is not configured for database %s: %w", c.config.Database, ErrPullSchemaUnsupportedType)
+	}
+	org := c.config.Metadata["organization"]
+	if org == "" {
+		return nil, "", "", fmt.Errorf("PlanetScale organization metadata is required for database %s", c.config.Database)
+	}
+	branch := c.config.Metadata["main_branch"]
+	if branch == "" {
+		branch = "main"
+	}
+	client, err := c.psClientFunc(c.config.Metadata["token_name"], c.config.Metadata["token_value"])
+	if err != nil {
+		return nil, "", "", fmt.Errorf("create PlanetScale client for database %s: %w", c.config.Database, err)
+	}
+	return client, org, branch, nil
 }
 
 type pulledCatalog struct {
@@ -807,13 +948,13 @@ func (c *LocalClient) credentialsForMySQLPullNamespace(namespace string) (*engin
 	}, nil
 }
 
-func pulledSchemaFileContent(database string, tbl spirittable.TableSchema) (string, error) {
-	if tbl.Name == "" {
+func pulledSchemaFileContent(database string, tableName string, tableDDL string) (string, error) {
+	if tableName == "" {
 		return "", fmt.Errorf("load live schema for database %s: table with empty name", database)
 	}
-	content := strings.TrimRight(tbl.Schema, "\n") + "\n"
+	content := strings.TrimRight(tableDDL, "\n") + "\n"
 	if _, err := statement.ParseCreateTable(content); err != nil {
-		return "", fmt.Errorf("parse pulled schema for database %s table %s: %w", database, tbl.Name, err)
+		return "", fmt.Errorf("parse pulled schema for database %s table %s: %w", database, tableName, err)
 	}
 	return content, nil
 }

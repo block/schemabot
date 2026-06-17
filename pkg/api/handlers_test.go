@@ -1018,6 +1018,62 @@ func TestExecutePullSchemaRoutesConfiguredMySQLTarget(t *testing.T) {
 	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", resp.Namespaces["orders"].Tables["users"])
 }
 
+func TestExecutePullSchemaRoutesConfiguredVitessTarget(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "commerce",
+			Type:        storage.DatabaseTypeVitess,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"commerce_sharded": {
+					Tables:    map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"},
+					Artifacts: map[string]string{"vschema.json": "{\"sharded\":true}"},
+				},
+			},
+			TableCount: 1,
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"commerce": {
+				Type: storage.DatabaseTypeVitess,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "commerce-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "commerce",
+		Environment: "production",
+		Type:        storage.DatabaseTypeVitess,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, "commerce", resp.Database)
+	assert.Equal(t, storage.DatabaseTypeVitess, resp.Type)
+	assert.Equal(t, int32(1), resp.TableCount)
+	require.NotNil(t, mockClient.pullSchemaReq)
+	assert.Equal(t, "commerce-production", mockClient.pullSchemaReq.Target)
+	assert.Empty(t, mockClient.pullSchemaReq.Namespace)
+	assert.Equal(t, "production", mockClient.pullSchemaReq.Environment)
+	assert.Equal(t, storage.DatabaseTypeVitess, mockClient.pullSchemaReq.Type)
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", resp.Namespaces["commerce_sharded"].Tables["users"])
+	assert.JSONEq(t, "{\"sharded\":true}", resp.Namespaces["commerce_sharded"].Artifacts["vschema.json"])
+}
+
 func TestExecutePullSchemaPullsRequestedNamespaces(t *testing.T) {
 	mockClient := &mockTernClient{
 		pullSchemaHook: func(req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -1079,7 +1135,7 @@ func TestExecutePullSchemaRejectsUnsupportedType(t *testing.T) {
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"orders": {
-				Type: storage.DatabaseTypeVitess,
+				Type: storage.DatabaseTypeStrata,
 				Environments: map[string]EnvironmentConfig{
 					"production": {Target: "orders-production", Deployment: "primary"},
 				},
@@ -1097,12 +1153,12 @@ func TestExecutePullSchemaRejectsUnsupportedType(t *testing.T) {
 	_, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
 		Database:    "orders",
 		Environment: "production",
-		Type:        storage.DatabaseTypeVitess,
+		Type:        storage.DatabaseTypeStrata,
 	})
 
 	var unsupportedErr *unsupportedPullSchemaError
 	require.ErrorAs(t, err, &unsupportedErr)
-	assert.Equal(t, storage.DatabaseTypeVitess, unsupportedErr.DatabaseType)
+	assert.Equal(t, storage.DatabaseTypeStrata, unsupportedErr.DatabaseType)
 }
 
 func TestExecutePullSchemaRejectsMultiDeploymentEnvironment(t *testing.T) {

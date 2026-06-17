@@ -44,6 +44,41 @@ func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
 	assert.Equal(t, "CREATE TABLE `orders` (`id` bigint NOT NULL);\n", string(orders))
 }
 
+func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "commerce",
+		Type:        "vitess",
+		Environment: "production",
+		TableCount:  1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"commerce_sharded": {
+				Tables: map[string]string{
+					"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+				},
+				Artifacts: map[string]string{
+					"vschema.json": "{\"sharded\":true}",
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, plan.checkConflicts(false))
+	require.NoError(t, plan.write())
+
+	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, "database: commerce\ntype: vitess\n", string(config))
+
+	users, err := os.ReadFile(filepath.Join(root, "commerce_sharded", "users.sql"))
+	require.NoError(t, err)
+	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL);\n", string(users))
+
+	vschema, err := os.ReadFile(filepath.Join(root, "commerce_sharded", "vschema.json"))
+	require.NoError(t, err)
+	assert.JSONEq(t, "{\"sharded\":true}", string(vschema))
+}
+
 func TestOnboardPullNamespacesUseConcreteLiveNamespaces(t *testing.T) {
 	pullNamespaces, err := onboardPullNamespaces([]string{"orders_production", "orders_audit_production"})
 	require.NoError(t, err)

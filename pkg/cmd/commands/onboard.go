@@ -164,8 +164,8 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse)
 	if strings.TrimSpace(resp.Database) == "" {
 		return nil, fmt.Errorf("pull schema response database is empty")
 	}
-	if resp.Type != storage.DatabaseTypeMySQL {
-		return nil, fmt.Errorf("onboard currently supports %s databases; got %s", storage.DatabaseTypeMySQL, resp.Type)
+	if resp.Type != storage.DatabaseTypeMySQL && resp.Type != storage.DatabaseTypeVitess {
+		return nil, fmt.Errorf("onboard currently supports %s and %s databases; got %s", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, resp.Type)
 	}
 	if len(resp.Namespaces) == 0 {
 		return nil, fmt.Errorf("pull schema returned no tables for database %s environment %s", resp.Database, resp.Environment)
@@ -202,7 +202,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse)
 			}
 			files[filepath.Join(namespace, tableName+".sql")] = pulled.Tables[tableName]
 		}
-		if vschema := pulled.Artifacts["vschema"]; vschema != "" {
+		if vschema := pulled.Artifacts["vschema.json"]; vschema != "" {
 			files[filepath.Join(namespace, "vschema.json")] = vschema
 		}
 	}
