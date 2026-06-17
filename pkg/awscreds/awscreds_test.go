@@ -150,6 +150,66 @@ func TestTemplateAttributes(t *testing.T) {
 	assert.Equal(t, []string{"app"}, TemplateAttributes("{app}_ddl"))
 	assert.Empty(t, TemplateAttributes("schemabot/{target}/ddl"))
 	assert.Empty(t, TemplateAttributes("static-secret"))
+	// A length operator does not change which attribute the placeholder references.
+	assert.Equal(t, []string{"app"}, TemplateAttributes("{app:24}_ddl"))
+}
+
+// A ":N" length operator truncates the resolved value so a derived username fits
+// the database's identifier limit even when the source attribute is longer (e.g.
+// an app name longer than MySQL's 32-character cap).
+func TestResolverUsernameLengthOperatorTruncates(t *testing.T) {
+	fetch := &fakeFetcher{payload: "pw"}
+	r := newResolver("aws_account_id", "secret", "{app:24}_ddl", fetch, nil, false)
+
+	creds, err := r.ResolveCredentials(t.Context(),
+		inventory.Request{Target: "orders-dsid"},
+		map[string]string{"app": "abcdefghijklmnopqrstuvwxyz0123"}) // 30 chars
+	require.NoError(t, err)
+	assert.Equal(t, "abcdefghijklmnopqrstuvwx_ddl", creds.Username) // 24 + "_ddl"
+}
+
+// A value already within the limit is left intact by the length operator.
+func TestResolverLengthOperatorLeavesShortValueIntact(t *testing.T) {
+	fetch := &fakeFetcher{payload: "pw"}
+	r := newResolver("aws_account_id", "secret", "{app:24}_ddl", fetch, nil, false)
+
+	creds, err := r.ResolveCredentials(t.Context(),
+		inventory.Request{Target: "orders-dsid"},
+		map[string]string{"app": "orders"})
+	require.NoError(t, err)
+	assert.Equal(t, "orders_ddl", creds.Username)
+}
+
+// The length operator also applies to secret-name templates.
+func TestResolverSecretNameLengthOperatorTruncates(t *testing.T) {
+	fetch := &fakeFetcher{payload: `{"username":"u","password":"p"}`}
+	r := newResolver("aws_account_id", "schemabot/{cluster:8}/ddl", "", fetch, nil, true)
+
+	_, err := r.ResolveCredentials(t.Context(),
+		inventory.Request{Target: "orders-dsid"},
+		map[string]string{"aws_account_id": "123456789012", "cluster": "production-cluster"})
+	require.NoError(t, err)
+	assert.Equal(t, "schemabot/producti/ddl", fetch.gotSecret)
+}
+
+// A zero or unparseable length operator is a configuration error, not a silent
+// passthrough that would produce a wrong identifier.
+func TestResolverFailsOnInvalidLengthOperator(t *testing.T) {
+	r := newResolver("aws_account_id", "secret", "{app:0}_ddl", &fakeFetcher{payload: "pw"}, nil, false)
+
+	_, err := r.ResolveCredentials(t.Context(),
+		inventory.Request{Target: "orders-dsid"},
+		map[string]string{"app": "orders"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid length operator")
+}
+
+// Truncation counts characters, not bytes, so a multi-byte value is never cut
+// mid-character.
+func TestTruncateToRunesCountsCharacters(t *testing.T) {
+	assert.Equal(t, "héllo", truncateToRunes("héllo-world", 5))
+	assert.Equal(t, "abc", truncateToRunes("abc", 5))
+	assert.Equal(t, "", truncateToRunes("abc", 0))
 }
 
 // Some conventions derive the username from an entity attribute and store only

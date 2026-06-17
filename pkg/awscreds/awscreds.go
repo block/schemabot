@@ -19,8 +19,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
@@ -34,10 +36,13 @@ import (
 // account id when one is not configured.
 const defaultAccountAttribute = "aws_account_id"
 
-// templatePlaceholderRe matches "{name}" placeholders in a template. "{target}"
-// is the request target; any other name is an entity attribute resolved for the
-// target.
-var templatePlaceholderRe = regexp.MustCompile(`\{([a-zA-Z0-9_]+)\}`)
+// templatePlaceholderRe matches "{name}" placeholders in a template, with an
+// optional ":N" length operator (e.g. "{app:24}"). "{target}" is the request
+// target; any other name is an entity attribute resolved for the target. When a
+// length operator is present, the resolved value is truncated to at most N
+// characters — used to fit database identifier limits (e.g. MySQL's 32-character
+// username cap, Postgres's 63) when an attribute can exceed them.
+var templatePlaceholderRe = regexp.MustCompile(`\{([a-zA-Z0-9_]+)(?::(\d+))?\}`)
 
 // Config configures a Resolver.
 type Config struct {
@@ -59,7 +64,9 @@ type Config struct {
 	ExternalID string
 	// SecretName is the Secrets Manager secret id. It may contain placeholders:
 	// "{target}" (the request target) and "{attribute}" (any resolved entity
-	// attribute), replaced to locate per-target or per-cluster secrets.
+	// attribute), replaced to locate per-target or per-cluster secrets. A
+	// placeholder may carry a ":N" length operator (e.g. "{cluster:20}") that
+	// truncates the value to at most N characters.
 	SecretName string
 	// AccountAttribute is the endpoint attribute holding the target's AWS account
 	// id. Defaults to "aws_account_id". Only required when RoleARN is set.
@@ -68,7 +75,10 @@ type Config struct {
 	// placeholders) that renders the database username, and the fetched secret is
 	// treated as the plain-text password rather than a JSON payload. Use this for
 	// conventions that derive the username from entity attributes (e.g.
-	// "{app}_ddl") and store only the password. Mutually exclusive with Decode.
+	// "{app}_ddl") and store only the password. A placeholder may carry a ":N"
+	// length operator (e.g. "{app:24}_ddl") so the rendered username fits the
+	// database's identifier limit when an attribute can exceed it. Mutually
+	// exclusive with Decode.
 	Username string
 	// Decode, when set, interprets the fetched secret into Credentials (for
 	// example a PlanetScale token). When nil (and no Username template is set) the
@@ -235,25 +245,55 @@ func targetContext(target, accountID string) string {
 }
 
 // renderTemplate replaces "{target}" with the request target and every other
-// "{attribute}" placeholder with the resolved attribute value, failing closed if
-// any referenced attribute was not resolved. what labels the template in errors.
+// "{attribute}" placeholder with the resolved attribute value, applying an
+// optional ":N" length operator that truncates the value to at most N
+// characters. It fails closed if any referenced attribute was not resolved or a
+// length operator is invalid (zero, or too large to parse). what labels the
+// template in errors.
 func renderTemplate(what, tmpl, target string, attrs map[string]string) (string, error) {
-	var missing []string
+	var missing, invalid []string
 	rendered := templatePlaceholderRe.ReplaceAllStringFunc(tmpl, func(match string) string {
-		key := match[1 : len(match)-1]
-		if key == "target" {
-			return target
+		groups := templatePlaceholderRe.FindStringSubmatch(match)
+		key, lengthOp := groups[1], groups[2]
+
+		var value string
+		switch {
+		case key == "target":
+			value = target
+		case attrs[key] != "":
+			value = attrs[key]
+		default:
+			missing = append(missing, key)
+			return match
 		}
-		if v := attrs[key]; v != "" {
-			return v
+
+		if lengthOp == "" {
+			return value
 		}
-		missing = append(missing, key)
-		return match
+		maxLen, err := strconv.Atoi(lengthOp)
+		if err != nil || maxLen < 1 {
+			invalid = append(invalid, match)
+			return match
+		}
+		return truncateToRunes(value, maxLen)
 	})
+	if len(invalid) > 0 {
+		return "", fmt.Errorf("%s template %q for target %q has invalid length operator(s): %s", what, tmpl, target, strings.Join(invalid, ", "))
+	}
 	if len(missing) > 0 {
 		return "", fmt.Errorf("%s template %q for target %q references unresolved attribute(s): %s", what, tmpl, target, strings.Join(missing, ", "))
 	}
 	return rendered, nil
+}
+
+// truncateToRunes returns at most maxLen runes of s. Database identifier limits
+// count characters, so truncating by rune (not byte) keeps multi-byte values
+// from being cut mid-character.
+func truncateToRunes(s string, maxLen int) string {
+	if utf8.RuneCountInString(s) <= maxLen {
+		return s
+	}
+	return string([]rune(s)[:maxLen])
 }
 
 // getSecretString reads a string secret value, rejecting binary secrets.
