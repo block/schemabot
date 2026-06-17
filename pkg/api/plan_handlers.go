@@ -874,7 +874,7 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		client.SetObserver(storedApplyID, observer)
 	}
 
-	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, deployment, options, attachObserver)
+	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
 	if err != nil {
 		recordApplyError("enqueue apply", err)
 		return nil, 0, err
@@ -900,12 +900,11 @@ func (s *Service) enqueueApply(
 	ctx context.Context,
 	plan *storage.Plan,
 	req ApplyRequest,
-	deployment string,
 	options map[string]string,
 	onApplyCreated func(int64),
 ) (string, int64, error) {
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, deployment, options, applyIdentifier, "")
+	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier, "")
 	if err != nil {
 		return "", 0, err
 	}
@@ -919,7 +918,6 @@ func (s *Service) createStoredApply(
 	ctx context.Context,
 	plan *storage.Plan,
 	req ApplyRequest,
-	deployment string,
 	options map[string]string,
 	applyIdentifier string,
 	externalID string,
@@ -952,7 +950,7 @@ func (s *Service) createStoredApply(
 		Repository:      plan.Repository,
 		PullRequest:     plan.PullRequest,
 		Environment:     req.Environment,
-		Deployment:      deployment,
+		Deployment:      targets[0].Deployment,
 		Caller:          req.Caller,
 		InstallationID:  req.InstallationID,
 		ExternalID:      externalID,
@@ -962,7 +960,6 @@ func (s *Service) createStoredApply(
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
-	apply.Deployment = targets[0].Deployment
 
 	taskChanges := applyTaskChanges(plan)
 	buildTasks := func() []*storage.Task {

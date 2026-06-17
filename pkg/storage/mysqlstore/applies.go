@@ -608,7 +608,7 @@ func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, apply *storag
 			return fmt.Errorf("create apply %s deployment %s: grouped operation is nil", apply.ApplyIdentifier, deployment)
 		}
 		if group.Operation == nil {
-			return fmt.Errorf("create apply %s deployment %s: grouped operation is nil", apply.ApplyIdentifier, deployment)
+			return fmt.Errorf("create apply %s deployment %s: grouped operation is missing its operation row", apply.ApplyIdentifier, deployment)
 		}
 		if len(group.Tasks) == 0 {
 			return fmt.Errorf("create apply %s deployment %s: grouped operation has no tasks", apply.ApplyIdentifier, deployment)
@@ -619,6 +619,9 @@ func insertApplyGroupedOperations(ctx context.Context, tx *sql.Tx, apply *storag
 			return fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", group.Operation.Deployment, apply.ApplyIdentifier, err)
 		}
 		for _, task := range group.Tasks {
+			if task == nil {
+				return fmt.Errorf("create apply %s deployment %s: grouped operation has a nil task", apply.ApplyIdentifier, group.Operation.Deployment)
+			}
 			task.ApplyID = applyID
 			task.ApplyOperationID = &group.Operation.ID
 			taskID, err := insertTask(ctx, tx, task)

@@ -1701,7 +1701,7 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, DefaultDeployment, nil, "apply-fanout", "")
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout", "")
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(123), storedApplyID)
