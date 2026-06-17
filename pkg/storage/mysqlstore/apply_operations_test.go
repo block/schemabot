@@ -1597,6 +1597,348 @@ func TestApplyOperationStore_FindNextApplyOperation_BarrierHaltsOnFailedSibling(
 	assert.Nil(t, claimed, "barrier must still halt the rollout on a failed earlier deployment")
 }
 
+// --- FindNextApplyOperationCutover (OC-1): the cutover-claim predicate ---
+//
+// These tests pin the cutover gate, the counterpart to the copy gate above.
+// It claims a row parked at waiting_for_cutover and transitions it to
+// cutting_over, but only when its turn comes in deployment order. Unlike the
+// copy gate's barrier relaxation, the cutover "done" set is completed-only, so
+// the high-risk atomic swaps never overlap and run strictly in order.
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_ClaimsEarliestParked
+// verifies the happy path: a waiting_for_cutover row with no earlier sibling is
+// claimed and transitioned to cutting_over, with a fresh lease rotated onto it.
+func TestApplyOperationStore_FindNextApplyOperationCutover_ClaimsEarliestParked(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_claim", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+		State: state.ApplyOperation.WaitingForCutover,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.WaitingForCutover, claimed.State, "returned row carries its pre-claim state")
+	assert.Equal(t, "cutover-operator", claimed.LeaseOwner, "claim must record the lease owner")
+	assert.NotEmpty(t, claimed.LeaseToken, "claim must rotate a lease token onto the row")
+	require.NotNil(t, claimed.LeaseAcquiredAt, "claim must stamp lease_acquired_at")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.CuttingOver, persisted.State, "cutover claim must transition waiting_for_cutover → cutting_over")
+	assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken, "rotated lease token must be persisted")
+	assert.Equal(t, "cutover-operator", persisted.LeaseOwner)
+
+	// Now in cutting_over and fresh → not re-claimable.
+	again, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, again)
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_OrdersSiblings verifies
+// the cutover gate runs strictly in deployment order with a completed-only
+// "done" set: a later sibling is claimable only once every earlier sibling has
+// reached completed, not merely reached the cutover barrier.
+func TestApplyOperationStore_FindNextApplyOperationCutover_OrdersSiblings(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_ordered", 1)
+
+	deployments := []string{"region-a", "region-b", "region-c"}
+	ids := make([]int64, len(deployments))
+	for i, deployment := range deployments {
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: deployment, State: state.ApplyOperation.WaitingForCutover,
+		})
+		require.NoError(t, err)
+		ids[i] = id
+	}
+
+	for i, deployment := range deployments {
+		claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "cutover %q should be claimable once earlier siblings completed", deployment)
+		assert.Equal(t, ids[i], claimed.ID)
+		assert.Equal(t, deployment, claimed.Deployment)
+
+		// The claimed row is now cutting_over (not completed), so it gates its
+		// later siblings: a second claim before completion yields nothing.
+		blocked, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+		require.NoError(t, err)
+		assert.Nil(t, blocked, "later cutovers must wait while %q is still cutting over", deployment)
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, claimed.ID))
+	}
+
+	done, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, done)
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_BlocksOnSiblingInRevertWindow
+// pins the difference from the copy gate's barrier relaxation: an earlier
+// sibling that has reached its cutover barrier but is not yet completed
+// (revert_window) still blocks a later cutover. The cutover "done" set is
+// completed-only, so swaps never overlap.
+func TestApplyOperationStore_FindNextApplyOperationCutover_BlocksOnSiblingInRevertWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_revert", 1)
+
+	// region-a is in revert_window (fresh, so not stale-recoverable); region-b
+	// is parked behind it. Under the copy gate this sibling would relax the
+	// barrier — under the cutover gate it keeps blocking.
+	earlierID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.RevertWindow,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.WaitingForCutover,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a later cutover must wait while an earlier sibling is in revert_window, not yet completed")
+
+	// Sanity: once the earlier sibling completes, region-b becomes claimable —
+	// confirming the nil above was the completed-only gate, not an unrelated skip.
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, earlierID))
+	next, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, next, "region-b must be claimable once region-a completes")
+	assert.Equal(t, "region-b", next.Deployment)
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_HaltsOnFailedSibling
+// verifies the default fail-closed behaviour: a terminal-failed earlier sibling
+// blocks a later cutover.
+func TestApplyOperationStore_FindNextApplyOperationCutover_HaltsOnFailedSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_halt", 1)
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureHalt,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b",
+		State: state.ApplyOperation.WaitingForCutover, OnFailure: storage.OnFailureHalt,
+	})
+	require.NoError(t, err)
+
+	// Backdate the failed row so staleness can't be mistaken for the reason it
+	// is skipped; a failed earlier sibling must block on its state alone.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a later cutover must not run once an earlier deployment failed")
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_OnFailureContinueClaimsPastFailedSibling
+// verifies the on_failure "continue" exemption: a terminal-failed earlier
+// sibling no longer blocks the cutover, matching the copy gate.
+func TestApplyOperationStore_FindNextApplyOperationCutover_OnFailureContinueClaimsPastFailedSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_continue", 1)
+
+	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a",
+		State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b",
+		State: state.ApplyOperation.WaitingForCutover, OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+
+	// Backdate the failed row so staleness can't be the reason it is skipped.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, failedID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "on_failure continue must let the cutover proceed past a failed sibling")
+	assert.Equal(t, "region-b", claimed.Deployment)
+
+	persisted, err := store.ApplyOperations().Get(ctx, claimed.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.ApplyOperation.CuttingOver, persisted.State, "the claimed parked row is transitioned to cutting_over")
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_PendingStopBlocks
+// verifies that a pending stop control request halts remaining cutovers even
+// when the deployment-order gate is otherwise open — mirroring the copy gate's
+// pending-stop guard so `stop` arrests the rollout at the cutover barrier too.
+func TestApplyOperationStore_FindNextApplyOperationCutover_PendingStopBlocks(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_stop", 1)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.WaitingForCutover,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a pending stop request must halt the cutover")
+
+	// Sanity: clearing the stop reopens the gate, confirming the nil was the
+	// stop guard and not an unrelated skip.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_control_requests SET status = ? WHERE apply_id = ? AND operation = ?
+	`, storage.ControlRequestCompleted, apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+
+	next, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, next, "the cutover must be claimable once the stop is cleared")
+	assert.Equal(t, id, next.ID)
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_RecoversStaleInFlight
+// verifies the recovery path: a row already mid-cutover (cutting_over or
+// revert_window) whose heartbeat has gone stale is re-leased without changing
+// its state — its driver died and another worker resumes it. This path carries
+// no ordering gate, because the row already started its swap.
+func TestApplyOperationStore_FindNextApplyOperationCutover_RecoversStaleInFlight(t *testing.T) {
+	for _, inFlight := range []string{state.ApplyOperation.CuttingOver, state.ApplyOperation.RevertWindow} {
+		t.Run(inFlight, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := New(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql", "staging")
+			apply := createTestApply(t, store, lock, "apply_op_cutover_recover_"+inFlight, 1)
+
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", State: inFlight,
+			})
+			require.NoError(t, err)
+
+			// Backdate the heartbeat past the staleness window.
+			_, err = testDB.ExecContext(ctx, `
+				UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+			`, id)
+			require.NoError(t, err)
+
+			claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "recovery-operator")
+			require.NoError(t, err)
+			require.NotNil(t, claimed)
+			assert.Equal(t, id, claimed.ID)
+			assert.Equal(t, inFlight, claimed.State, "a recovered in-flight cutover keeps its state")
+			assert.Equal(t, "recovery-operator", claimed.LeaseOwner, "recovery must rotate the lease to the new owner")
+			assert.NotEmpty(t, claimed.LeaseToken)
+
+			persisted, err := store.ApplyOperations().Get(ctx, id)
+			require.NoError(t, err)
+			assert.Equal(t, inFlight, persisted.State, "state is unchanged on recovery")
+			assert.Equal(t, "recovery-operator", persisted.LeaseOwner)
+			assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat is refreshed on recovery")
+		})
+	}
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_SkipsFreshInFlight
+// verifies that a row mid-cutover whose heartbeat is fresh is not re-claimed:
+// the active driver still owns it.
+func TestApplyOperationStore_FindNextApplyOperationCutover_SkipsFreshInFlight(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_fresh", 1)
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.CuttingOver,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a fresh in-flight cutover must not be re-claimed")
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_IgnoresCopyPhaseRows
+// verifies the cutover gate only starts rows parked at waiting_for_cutover: a
+// pending or running row (the copy gate's territory) is never claimed for
+// cutover, keeping the two phases on separate claim primitives.
+func TestApplyOperationStore_FindNextApplyOperationCutover_IgnoresCopyPhaseRows(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_copyphase", 1)
+
+	for i, copyState := range []string{state.ApplyOperation.Pending, state.ApplyOperation.Running} {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: fmt.Sprintf("region-%d", i), State: copyState,
+		})
+		require.NoError(t, err)
+	}
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "the cutover gate must not claim copy-phase (pending/running) rows")
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_RequiresOwner verifies
+// the owner is required to claim a cutover.
+func TestApplyOperationStore_FindNextApplyOperationCutover_RequiresOwner(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	_, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_PendingStartRequestDoesNotBypassSiblingGate
 // verifies that a parent apply's pending start request does not let a later
 // pending deployment jump the deployment-order gate. Start requests resume

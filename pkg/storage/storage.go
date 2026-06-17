@@ -477,6 +477,25 @@ type ApplyOperationStore interface {
 	// needs work.
 	FindNextApplyOperation(ctx context.Context, owner string) (*ApplyOperation, error)
 
+	// FindNextApplyOperationCutover atomically claims the next operation parked
+	// at the cutover barrier whose turn it is, in deployment order, and rotates a
+	// fresh operation lease onto it in the same transaction. It is the cutover
+	// counterpart to FindNextApplyOperation: that primitive gates the copy phase
+	// (claims pending rows → running); this one gates the cutover phase.
+	//
+	// A waiting_for_cutover row is claimed and transitioned to cutting_over only
+	// when every earlier deployment_order sibling has reached completed (the
+	// cutover gate is completed-only, with the on_failure "continue" exemption
+	// for a terminal-failed earlier sibling) and no pending stop control request
+	// exists for the apply. Separately, a row already in cutting_over or
+	// revert_window whose heartbeat has been stale for more than one minute is
+	// re-leased without changing its state — recovering an in-flight cutover whose
+	// driver died, which carries no ordering gate.
+	//
+	// owner identifies the claiming worker and is required. Returns the claimed
+	// row, or nil if nothing is ready to cut over.
+	FindNextApplyOperationCutover(ctx context.Context, owner string) (*ApplyOperation, error)
+
 	// Heartbeat refreshes the child row's updated_at timestamp to extend the
 	// claim's lease while a worker is acting on it. Mirrors ApplyStore.Heartbeat
 	// semantics: silent no-op when the row no longer exists.

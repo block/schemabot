@@ -838,6 +838,159 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	return ad, nil
 }
 
+// FindNextApplyOperationCutover atomically claims the next operation parked at
+// the cutover barrier whose turn it is, in deployment order, and rotates a fresh
+// operation lease onto it in the same transaction. It is the cutover counterpart
+// to FindNextApplyOperation: that primitive gates the copy phase (pending →
+// running); this one gates the cutover phase (waiting_for_cutover → cutting_over).
+//
+// Two claim paths, mirroring FindNextApplyOperation:
+//
+//   - Start a parked cutover. A waiting_for_cutover row is claimed and
+//     transitioned to cutting_over only when every earlier deployment_order
+//     sibling has reached completed and no pending stop control request exists.
+//     Unlike the copy gate's barrier relaxation, the cutover gate's "done" set is
+//     completed-only, so the high-risk swaps never overlap and run strictly in
+//     order. The on_failure "continue" exemption lets a terminal-failed earlier
+//     sibling stop blocking, matching the copy gate.
+//   - Recover a stale in-flight cutover. A row already in cutting_over or
+//     revert_window whose heartbeat has gone stale is re-leased without changing
+//     its state — its driver died mid-cutover and another worker resumes it. This
+//     path carries no ordering gate: the row already started its cutover, so
+//     resuming is recovering work, not starting a new swap.
+//
+// As with FindNextApplyOperation, the returned row carries its pre-claim state:
+// a returned waiting_for_cutover row means a parked cutover was just started (the
+// row is now cutting_over), while a returned cutting_over/revert_window row means
+// an in-flight cutover was recovered. owner is required and recorded as the lease
+// owner. Returns nil when nothing is ready to cut over.
+func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("operator owner is required to claim apply_operation cutover: %w", storage.ErrApplyLeaseLost)
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin claim apply_operation cutover transaction: %w", err)
+	}
+	defer rollbackApplyTx(ctx, tx, "claim apply_operation cutover")
+
+	// Start-a-parked-cutover gate (see SQL below). A waiting_for_cutover row is
+	// claimable only when no earlier deployment_order sibling is still
+	// non-completed; the on_failure/Failed pair is the "continue" exemption (a
+	// terminal-failed earlier sibling no longer blocks later cutovers), and the
+	// pending-stop NOT EXISTS makes `stop` halt remaining cutovers even under
+	// "continue".
+	queryArgs := []any{
+		state.ApplyOperation.WaitingForCutover,
+		state.ApplyOperation.Completed,
+		storage.OnFailureContinue,
+		state.ApplyOperation.Failed,
+		storage.ControlOperationStop, storage.ControlRequestPending,
+	}
+	// Recovery clause: a row already mid-cutover whose heartbeat has gone stale is
+	// re-leased without changing state, so it carries no ordering gate.
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.CuttingOver,
+		state.ApplyOperation.RevertWindow,
+	)
+
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM apply_operations
+		WHERE (
+			(
+				state = ?
+				AND NOT EXISTS (
+					SELECT 1
+					FROM apply_operations AS earlier
+					WHERE earlier.apply_id = apply_operations.apply_id
+						AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
+						AND earlier.state <> ?
+						AND NOT (apply_operations.on_failure = ? AND earlier.state = ?)
+				)
+				AND NOT EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation = ?
+						AND cr.status = ?
+				)
+			)
+			OR (state IN (?, ?) AND updated_at < NOW() - INTERVAL %s)
+		)
+		ORDER BY created_at, id
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED
+	`, applyOperationColumns, applyOperationHeartbeatStaleness), queryArgs...)
+
+	ad, err := scanApplyOperationInto(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // nothing ready to cut over
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query next claimable apply_operation cutover: %w", err)
+	}
+
+	// Rotate a fresh operation lease onto the claimed row, mirroring
+	// FindNextApplyOperation.
+	leaseToken := uuid.NewString()
+	leaseAcquiredAt := time.Now()
+
+	if ad.State == state.ApplyOperation.WaitingForCutover {
+		// waiting_for_cutover → cutting_over: rotate the lease and refresh the
+		// heartbeat in the same write, leaving started_at untouched (it was
+		// stamped when the copy phase started). WHERE state = ? guards against a
+		// concurrent transition between the SELECT and this UPDATE; the mirrored
+		// pending-stop NOT EXISTS lets a stop committed in that window still win.
+		// RowsAffected == 0 means another writer moved the row or a stop landed,
+		// so we back off cleanly.
+		result, err := tx.ExecContext(ctx, `
+			UPDATE apply_operations
+			SET state = ?, updated_at = NOW(),
+			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+			WHERE id = ? AND state = ?
+				AND NOT EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ?
+				)
+		`, state.ApplyOperation.CuttingOver, owner, leaseToken, ad.ID, state.ApplyOperation.WaitingForCutover,
+			ad.ApplyID, storage.ControlOperationStop, storage.ControlRequestPending)
+		if err != nil {
+			return nil, fmt.Errorf("claim waiting_for_cutover apply_operation %d: %w", ad.ID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("read cutover claim rows affected for apply_operation %d: %w", ad.ID, err)
+		}
+		if rows == 0 {
+			return nil, nil
+		}
+	} else {
+		// Recovering a stale in-flight cutover (cutting_over or revert_window):
+		// keep the current state and rotate the lease onto this worker.
+		_, err = tx.ExecContext(ctx, `
+			UPDATE apply_operations
+			SET updated_at = NOW(),
+			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+			WHERE id = ?
+		`, owner, leaseToken, ad.ID)
+		if err != nil {
+			return nil, fmt.Errorf("refresh heartbeat for recovered cutover apply_operation %d: %w", ad.ID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claim apply_operation cutover %d: %w", ad.ID, err)
+	}
+
+	ad.LeaseOwner = owner
+	ad.LeaseToken = leaseToken
+	ad.LeaseAcquiredAt = &leaseAcquiredAt
+
+	return ad, nil
+}
+
 // Heartbeat refreshes updated_at to maintain the claim's lease. Should be
 // called periodically by a worker holding the lease. Silent no-op when the
 // row no longer exists (mirrors ApplyStore.Heartbeat).
