@@ -116,9 +116,15 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 	_, err := buildCredentialResolver(t.Context(), base, nil)
 	require.NoError(t, err)
 
+	// role_arn is optional: without it the backend reads from the caller's own
+	// account, so the resolver still builds.
+	ownAccount := base
+	ownAccount.RoleARN = ""
+	_, err = buildCredentialResolver(t.Context(), ownAccount, nil)
+	require.NoError(t, err)
+
 	cases := map[string]func(*api.EtreCredentialsConfig){
 		"region":      func(c *api.EtreCredentialsConfig) { c.Region = "" },
-		"role_arn":    func(c *api.EtreCredentialsConfig) { c.RoleARN = "" },
 		"secret_name": func(c *api.EtreCredentialsConfig) { c.SecretName = "" },
 	}
 	for field, mutate := range cases {
@@ -132,17 +138,34 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 
 // The assume-role backend's account attribute is surfaced to the resolver even
 // when not listed in attribute_fields, so credential resolution can read it.
-func TestCredentialAttributeFieldsIncludesAccountAttribute(t *testing.T) {
-	withDefault := api.EtreConfig{
+func TestCredentialAttributeFields(t *testing.T) {
+	// Assume-role mode (role_arn set) resolves the target account from an
+	// attribute, defaulting to aws_account_id.
+	assumeRole := api.EtreConfig{
 		AttributeFields: []string{"region"},
-		Credentials:     api.EtreCredentialsConfig{Type: "awssm"},
+		Credentials:     api.EtreCredentialsConfig{Type: "awssm", RoleARN: "arn:aws:iam::{account}:role/ddl", SecretName: "secret"},
 	}
-	assert.Equal(t, []string{"region", "aws_account_id"}, resolverAttributeFields(withDefault))
+	assert.Equal(t, []string{"region", "aws_account_id"}, resolverAttributeFields(assumeRole))
 
+	// A custom account attribute is surfaced instead of the default.
 	custom := api.EtreConfig{
-		Credentials: api.EtreCredentialsConfig{Type: "awssm", AccountAttribute: "account"},
+		Credentials: api.EtreCredentialsConfig{Type: "awssm", RoleARN: "arn:aws:iam::{account}:role/ddl", AccountAttribute: "account", SecretName: "secret"},
 	}
 	assert.Equal(t, []string{"account"}, resolverAttributeFields(custom))
+
+	// Own-account mode (no role_arn) needs no account attribute.
+	ownAccount := api.EtreConfig{
+		AttributeFields: []string{"region"},
+		Credentials:     api.EtreCredentialsConfig{Type: "awssm", SecretName: "secret"},
+	}
+	assert.Equal(t, []string{"region"}, resolverAttributeFields(ownAccount))
+
+	// A secret_name templated over entity attributes surfaces those attributes so
+	// the resolver fetches them for the credential backend.
+	templated := api.EtreConfig{
+		Credentials: api.EtreCredentialsConfig{Type: "awssm", SecretName: "{cluster}_schemabot_password"},
+	}
+	assert.Equal(t, []string{"cluster"}, resolverAttributeFields(templated))
 
 	secretRef := api.EtreConfig{
 		AttributeFields: []string{"region"},

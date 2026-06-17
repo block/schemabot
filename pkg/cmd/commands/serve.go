@@ -493,12 +493,11 @@ func buildCredentialResolver(ctx context.Context, cfg api.EtreCredentialsConfig,
 	case credentialTypeAWSSM:
 		// Validate required fields with config-path context before loading AWS
 		// config, so a misconfiguration fails fast and actionably instead of
-		// after (potentially slow) credential-chain resolution.
+		// after (potentially slow) credential-chain resolution. role_arn is
+		// optional: without it the backend reads from the caller's own account.
 		switch {
 		case cfg.Region == "":
 			return nil, fmt.Errorf("target_resolver.etre.credentials.region is required for the awssm backend")
-		case cfg.RoleARN == "":
-			return nil, fmt.Errorf("target_resolver.etre.credentials.role_arn is required for the awssm backend")
 		case cfg.SecretName == "":
 			return nil, fmt.Errorf("target_resolver.etre.credentials.secret_name is required for the awssm backend")
 		}
@@ -541,11 +540,20 @@ func resolverAttributeFields(cfg api.EtreConfig) []string {
 		fields = ensureField(fields, orgAttr)
 	}
 	if credentialType(cfg.Credentials) == credentialTypeAWSSM {
-		accountAttr := cfg.Credentials.AccountAttribute
-		if accountAttr == "" {
-			accountAttr = "aws_account_id"
+		// Assume-role mode (role_arn set) resolves the target account from an
+		// attribute; own-account mode does not need it.
+		if cfg.Credentials.RoleARN != "" {
+			accountAttr := cfg.Credentials.AccountAttribute
+			if accountAttr == "" {
+				accountAttr = "aws_account_id"
+			}
+			fields = ensureField(fields, accountAttr)
 		}
-		fields = ensureField(fields, accountAttr)
+		// The secret name may template over resolved attributes; surface those so
+		// the resolver fetches them for the credential backend.
+		for _, attr := range awscreds.SecretNameAttributes(cfg.Credentials.SecretName) {
+			fields = ensureField(fields, attr)
+		}
 	}
 	return fields
 }
