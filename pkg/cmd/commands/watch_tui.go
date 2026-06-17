@@ -405,7 +405,7 @@ func runWatchModel(model WatchModel) (err error) {
 	// Print apply context even on panic so operators never lose the apply ID.
 	defer func() {
 		if r := recover(); r != nil {
-			printExitContext(model.applyID, "", model.database, model.environment)
+			printExitContext(model.applyID, "", model.environment)
 			err = fmt.Errorf("unexpected error: %v", r)
 		}
 	}()
@@ -414,7 +414,7 @@ func runWatchModel(model WatchModel) (err error) {
 	p := tea.NewProgram(model)
 	finalModel, err := p.Run()
 	if err != nil {
-		printExitContext(model.applyID, "", model.database, model.environment)
+		printExitContext(model.applyID, "", model.environment)
 		return err
 	}
 
@@ -423,7 +423,7 @@ func runWatchModel(model WatchModel) (err error) {
 	// Completed applies render their apply ID in the success line. Other exits
 	// need explicit context so operators can resume monitoring or investigate.
 	if !state.IsState(m.state, state.Apply.Completed) {
-		printExitContext(m.applyID, m.deployRequestURL, m.database, m.environment)
+		printExitContext(m.applyID, m.deployRequestURL, m.environment)
 	}
 
 	// The TUI view already displays errors inline, so return ErrSilent
@@ -440,8 +440,8 @@ func runWatchModel(model WatchModel) (err error) {
 
 // printExitContext prints apply context on any TUI exit so operators
 // can resume monitoring or find the apply in PlanetScale.
-func printExitContext(applyID, deployRequestURL, database, environment string) {
-	msg := formatExitContext(applyID, deployRequestURL, database, environment)
+func printExitContext(applyID, deployRequestURL, environment string) {
+	msg := formatExitContext(applyID, deployRequestURL, environment)
 	if msg != "" {
 		fmt.Print(msg)
 	}
@@ -449,7 +449,7 @@ func printExitContext(applyID, deployRequestURL, database, environment string) {
 
 // formatExitContext builds the exit context message with apply ID, deploy
 // request URL, and resume command. Returns empty string if no apply ID.
-func formatExitContext(applyID, deployRequestURL, database, environment string) string {
+func formatExitContext(applyID, deployRequestURL, environment string) string {
 	if applyID == "" {
 		return ""
 	}

@@ -489,7 +489,7 @@ func TestHandleRollbackConfirmCommandBlocksUnauthorizedActor(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	h := actorAuthStorageTestHandler(cfg, &actorAuthStorage{locks: locks, plan: rollbackAuthPlan()}, installClient)
 
-	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "mona", CommandResult{Action: action.RollbackConfirm})
+	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", 12345, "mona", CommandResult{Action: action.RollbackConfirm})
 
 	body := requireComment(t, comments, "unauthorized rollback-confirm comment")
 	assert.Contains(t, body, "SchemaBot Command Not Authorized")
@@ -513,7 +513,7 @@ func TestHandleRollbackConfirmCommandAllowsAuthorizedActor(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 	h := actorAuthStorageTestHandler(cfg, &actorAuthStorage{locks: &actorAuthLockStore{}}, installClient)
 
-	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.RollbackConfirm})
+	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", 12345, "hubot", CommandResult{Action: action.RollbackConfirm})
 
 	body := requireComment(t, comments, "rollback-confirm no-lock comment")
 	assert.Contains(t, body, "No Lock Found")

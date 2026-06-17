@@ -42,21 +42,20 @@ func previewExitAll() {
 }
 
 func previewExitDetachMySQL() {
-	fmt.Print(formatExitContext("apply-8487c4ad", "", "mydb", "staging"))
+	fmt.Print(formatExitContext("apply-8487c4ad", "", "staging"))
 }
 
 func previewExitDetachVitess() {
 	fmt.Print(formatExitContext(
 		"apply-9849818a9cec4ba7",
 		"https://app.planetscale.com/square-production/inventory2/deploy-requests/109",
-		"inventory2",
 		"production",
 	))
 }
 
 func previewExitErrorMySQL() {
 	fmt.Println("Error: unexpected error: connection refused")
-	fmt.Print(formatExitContext("apply-8487c4ad", "", "mydb", "staging"))
+	fmt.Print(formatExitContext("apply-8487c4ad", "", "staging"))
 }
 
 func previewExitErrorVitess() {
@@ -64,7 +63,6 @@ func previewExitErrorVitess() {
 	fmt.Print(formatExitContext(
 		"apply-9849818a9cec4ba7",
 		"https://app.planetscale.com/square-production/inventory2/deploy-requests/109",
-		"inventory2",
 		"production",
 	))
 }

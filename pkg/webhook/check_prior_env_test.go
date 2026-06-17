@@ -224,7 +224,7 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 	}
 
 	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
-		"orders", "mysql", "production", []string{"staging", "production"}, 12345, "testuser")
+		"orders", "mysql", "production", []string{"staging", "production"}, 12345)
 	assert.True(t, blocked, "production blocks when the environment list includes staging before production")
 
 	select {
@@ -244,7 +244,7 @@ func TestCheckPriorEnvironmentsWithProductionOnlyServerConfigChecksStaging(t *te
 	assert.Equal(t, []string{"production"}, schemaResult.Environments)
 
 	blocked = h.checkPriorEnvironments(t.Context(), repo, pr,
-		"orders", "mysql", "production", schemaResult.Environments, 12345, "testuser")
+		"orders", "mysql", "production", schemaResult.Environments, 12345)
 	assert.True(t, blocked, "production blocks on staging even when this server only has a production target for the database")
 
 	select {
@@ -343,7 +343,7 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 		registerGitHubEndpoints(t, mux, comments)
 
 		blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
-			"orders", "mysql", "production", []string{"production"}, 12345, "testuser")
+			"orders", "mysql", "production", []string{"production"}, 12345)
 
 		assert.False(t, blocked, "a passing staging aggregate check from the trusted staging deployment App must allow production apply")
 		select {
@@ -360,7 +360,7 @@ func TestCheckPriorEnvironmentsCrossDeploymentAppTrust(t *testing.T) {
 		registerGitHubEndpoints(t, mux, comments)
 
 		blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
-			"orders", "mysql", "production", []string{"production"}, 12345, "testuser")
+			"orders", "mysql", "production", []string{"production"}, 12345)
 
 		assert.True(t, blocked, "a staging aggregate check from an unconfigured App must not satisfy the promotion gate")
 		select {
@@ -435,7 +435,7 @@ func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testin
 	}
 
 	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
-		"orders", "mysql", "canary", []string{"canary"}, 12345, "testuser")
+		"orders", "mysql", "canary", []string{"canary"}, 12345)
 	assert.True(t, blocked, "scoped instance must fail closed when an allowed target environment is absent from the promotion order")
 
 	select {
@@ -552,7 +552,7 @@ func TestCheckPriorEnvironmentsScopedTargetInOrderAllowsApply(t *testing.T) {
 	}
 
 	blocked := h.checkPriorEnvironments(t.Context(), repo, pr,
-		"orders", "mysql", "production", []string{"production"}, 12345, "testuser")
+		"orders", "mysql", "production", []string{"production"}, 12345)
 	assert.False(t, blocked, "in-order target with a passing prior environment check should be allowed")
 
 	select {

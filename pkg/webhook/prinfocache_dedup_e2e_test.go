@@ -153,7 +153,7 @@ func TestRollbackConfirmHandlerDoesNotFetchPRForNoLock(t *testing.T) {
 	// Call the handler entry point synchronously. No lock is acquired, so the
 	// handler must bail out without fetching the PR or discovering current schema
 	// files.
-	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "testuser", CommandResult{
+	h.handleRollbackConfirmCommand("octocat/hello-world", 1, "staging", 12345, "testuser", CommandResult{
 		Environment: "staging",
 	})
 

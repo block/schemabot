@@ -258,7 +258,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "rollback started"})
 	case action.RollbackConfirm:
 		h.goSafe(repo, pr, installationID, func() {
-			h.handleRollbackConfirmCommand(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
+			h.handleRollbackConfirmCommand(repo, pr, result.Environment, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "rollback-confirm started"})
 	case action.Stop:
@@ -308,22 +308,21 @@ func (h *Handler) postComment(repo string, pr int, installationID int64, body st
 }
 
 // postAndTrackComment creates a PR comment and stores its ID in apply_comments.
-// Returns the GitHub comment ID, or 0 if the comment failed to post.
 func (h *Handler) postAndTrackComment(
 	ctx context.Context, repo string, pr int, installationID int64,
 	applyID int64, commentState string, body string,
-) int64 {
+) {
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to create GitHub client for tracked comment", "error", err)
-		return 0
+		return
 	}
 
 	commentID, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body))
 	if err != nil {
 		h.logger.Error("failed to post tracked comment",
 			"repo", repo, "pr", pr, "commentState", commentState, "error", err)
-		return 0
+		return
 	}
 
 	comment := &storage.ApplyComment{
@@ -335,8 +334,6 @@ func (h *Handler) postAndTrackComment(
 		h.logger.Error("failed to store comment ID",
 			"applyID", applyID, "commentState", commentState, "commentID", commentID, "error", err)
 	}
-
-	return commentID
 }
 
 func (h *Handler) renderPRComment(body string) string {

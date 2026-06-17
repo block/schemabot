@@ -938,17 +938,6 @@ func TestRenderApplyBlockedByInProgressChecks_EmptyList(t *testing.T) {
 	}
 }
 
-func TestTruncateDDL(t *testing.T) {
-	assert.Equal(t, "ALTER TABLE orders ADD INDEX idx_user_id (user_id)", truncateDDL("ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", 80))
-	assert.Equal(t, "short", truncateDDL("short", 80))
-	assert.Equal(t, "", truncateDDL("", 80))
-
-	long := "ALTER TABLE `very_long_table_name` ADD INDEX `idx_very_long_column_name_that_goes_on_forever` (`very_long_column_name_that_goes_on_forever`)"
-	result := truncateDDL(long, 80)
-	assert.Len(t, result, 80)
-	assert.True(t, strings.HasSuffix(result, "..."))
-}
-
 func TestRenderApplyStatusComment_WaitingForCutover_ReadyNotReady(t *testing.T) {
 	data := ApplyStatusCommentData{
 		ApplyID:     "apply-abc123",

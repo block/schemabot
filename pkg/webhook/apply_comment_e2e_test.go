@@ -206,13 +206,14 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	h := NewHandler(svc, factory, nil, logger)
 
 	// Step 1: Post initial progress comment
-	progressCommentID := h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Progress, "Initial progress")
+	h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Progress, "Initial progress")
 
 	// Verify create was captured
+	var progressCommentID int64
 	select {
 	case created := <-capture.creates:
 		assert.Equal(t, "Initial progress", created.Body)
-		assert.Equal(t, progressCommentID, created.ID)
+		progressCommentID = created.ID
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for progress comment create")
 	}
@@ -255,12 +256,13 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	assert.Equal(t, progressCommentID, active.GitHubCommentID)
 
 	// Step 4: Post cutover comment (simulating defer_cutover)
-	cutoverCommentID := h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Cutover, "Cutover ready")
+	h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Cutover, "Cutover ready")
 
+	var cutoverCommentID int64
 	select {
 	case created := <-capture.creates:
 		assert.Equal(t, "Cutover ready", created.Body)
-		assert.Equal(t, cutoverCommentID, created.ID)
+		cutoverCommentID = created.ID
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for cutover comment create")
 	}
@@ -284,12 +286,13 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	}
 
 	// Step 7: Post summary comment (terminal state)
-	summaryCommentID := h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Summary, "Schema change completed")
+	h.postAndTrackComment(ctx, "org/repo", 42, 12345, applyID, state.Comment.Summary, "Schema change completed")
 
+	var summaryCommentID int64
 	select {
 	case created := <-capture.creates:
 		assert.Equal(t, "Schema change completed", created.Body)
-		assert.Equal(t, summaryCommentID, created.ID)
+		summaryCommentID = created.ID
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for summary comment create")
 	}
@@ -494,11 +497,13 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	h := NewHandler(svc, factory, nil, logger)
 
 	// Resume: post new progress comment (upsert should replace old ID)
-	newProgressID := h.postAndTrackComment(ctx, "org/repo-resume", 43, 12345, applyID, state.Comment.Progress, "Resumed progress")
+	h.postAndTrackComment(ctx, "org/repo-resume", 43, 12345, applyID, state.Comment.Progress, "Resumed progress")
 
+	var newProgressID int64
 	select {
 	case created := <-capture.creates:
 		assert.Equal(t, "Resumed progress", created.Body)
+		newProgressID = created.ID
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for resumed progress comment")
 	}
@@ -511,11 +516,13 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	assert.NotEqual(t, int64(111), comment.GitHubCommentID, "old comment ID should be replaced")
 
 	// Post new summary (upsert replaces old ID)
-	newSummaryID := h.postAndTrackComment(ctx, "org/repo-resume", 43, 12345, applyID, state.Comment.Summary, "Resumed summary")
+	h.postAndTrackComment(ctx, "org/repo-resume", 43, 12345, applyID, state.Comment.Summary, "Resumed summary")
 
+	var newSummaryID int64
 	select {
 	case created := <-capture.creates:
 		assert.Equal(t, "Resumed summary", created.Body)
+		newSummaryID = created.ID
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for resumed summary comment")
 	}
