@@ -1028,6 +1028,74 @@ func TestGRPCClient_ResumeApplyOperationStoresRemoteIDOnOperationForMultiOpApply
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
 }
 
+func TestGRPCClient_ResumeApplyOperationStartsQueuedRemoteWithoutWritingParent(t *testing.T) {
+	// A multi-deployment operation that was already dispatched (its remote apply
+	// id lives on the operation) and whose parent apply is still pending must
+	// start its own remote apply by the operation's id and must NOT write the
+	// parent applies row: parent state is owned by the operator's projection CAS.
+	server := &capturingTernServer{
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op-start",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:        "alter",
+		Namespace:        "default",
+		State:            state.Task.Pending,
+	}
+	taskStore := &mockTaskStore{
+		tasks:           []*storage.Task{task},
+		getByApplyIDErr: errors.New("whole-apply task load must not be used for operation-scoped resume"),
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Pending, EngineResumeContext: "remote-op-west-1"},
+		siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Pending},
+	}}
+	applyStore := &mockApplyStore{apply: apply}
+	client.storage = &mockStorage{
+		applies: applyStore,
+		tasks:   taskStore,
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-multi-op-start",
+		}},
+		operations: operationStore,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	assert.Equal(t, "remote-op-west-1", server.getStartApplyID(),
+		"the operation's own remote apply id must be started, not the parent external_id")
+	assert.Empty(t, applyStore.updates,
+		"a multi-op drive must never write the parent applies row directly; parent state is owned by the projection CAS")
+}
+
 func TestGRPCClient_ResumeApplyOperationStopsUndispatchedOperationWithoutCompletingApplyStop(t *testing.T) {
 	// A multi-deployment apply has one durable stop request shared by every
 	// deployment. Stopping a claimed-but-undispatched operation (no remote apply

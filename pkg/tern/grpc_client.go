@@ -693,7 +693,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	if err := c.syncStoredTasksFromRemoteTasks(ctx, apply, storedTasks, progress.Tables, now); err != nil {
 		return true, err
 	}
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+	if _, err := c.persistParentApply(ctx, apply, scope, "sync nonterminal gRPC stop"); err != nil {
 		return true, fmt.Errorf("sync nonterminal remote gRPC stop state for %s: %w", apply.ApplyIdentifier, err)
 	}
 	slog.Info("remote gRPC stop request accepted and remains pending for remote apply owner",
@@ -1175,10 +1175,13 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		if apply.StartedAt == nil {
 			apply.StartedAt = &now
 		}
-		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		persisted, err := c.persistParentApply(ctx, apply, scope, "start queued gRPC apply")
+		if err != nil {
 			return fmt.Errorf("update started gRPC apply %s: %w", apply.ApplyIdentifier, err)
 		}
-		c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by operator", state.Apply.Pending)
+		if persisted {
+			c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by operator", state.Apply.Pending)
+		}
 	}
 
 	// Check the real state from Tern before deciding what to do. Stored state
@@ -1285,7 +1288,8 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			remoteStartRequested = true
 		}
 
-		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		persisted, err := c.persistParentApply(ctx, apply, scope, "refresh stopped gRPC apply before start")
+		if err != nil {
 			return fmt.Errorf("update apply state: %w", err)
 		}
 		if startRequested {
@@ -1293,10 +1297,12 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 				return err
 			}
 		}
-		if remoteStartRequested {
-			c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by operator", oldState)
-		} else if oldState != apply.State {
-			c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply state refreshed before operator start: %s -> %s", oldState, apply.State), oldState)
+		if persisted {
+			if remoteStartRequested {
+				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, "Remote apply start requested by operator", oldState)
+			} else if oldState != apply.State {
+				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply state refreshed before operator start: %s -> %s", oldState, apply.State), oldState)
+			}
 		}
 	}
 
@@ -1421,13 +1427,16 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	if apply.StartedAt == nil {
 		apply.StartedAt = &now
 	}
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+	persisted, err := c.persistParentApply(ctx, apply, scope, "start gRPC deferred deploy")
+	if err != nil {
 		return fmt.Errorf("update started gRPC deferred deploy %s: %w", apply.ApplyIdentifier, err)
 	}
 	if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
 		return err
 	}
-	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote deferred deploy start requested%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), oldState)
+	if persisted {
+		c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote deferred deploy start requested%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), oldState)
+	}
 	return nil
 }
 
