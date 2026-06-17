@@ -163,7 +163,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 	// resolving their target — not just statically-configured deployments. The gRPC
 	// server below reuses the same instance.
 	var dataPlaneClient tern.Client
-	if serverConfig.TargetResolver.Etre.Configured() || serverConfig.TargetResolver.Configured() {
+	if serverConfig.TargetResolver.Enabled() {
 		dataPlaneClient, err = buildGRPCTernClient(ctx, serverConfig, storage, logger, os.Getenv("TERN_ENVIRONMENT"), svc.WakeOperator)
 		if err != nil {
 			return fmt.Errorf("build data-plane target router: %w", err)
@@ -324,7 +324,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 	if len(wakeOperator) > 0 {
 		wake = wakeOperator[0]
 	}
-	etreConfigured := config.TargetResolver.Etre.Configured()
+	etreConfigured := len(config.TargetResolver.Etre) > 0
 	staticConfigured := config.TargetResolver.Configured()
 
 	if etreConfigured && staticConfigured {
@@ -394,18 +394,11 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 }
 
 // buildTargetResolver builds the configured inventory.Resolver — the Etre
-// dynamic backend or the static inventory. The caller guarantees exactly one is
-// configured.
+// dynamic backend(s) or the static inventory. The caller guarantees exactly one
+// kind is configured.
 func buildTargetResolver(ctx context.Context, cfg api.TargetResolverConfig, logger *slog.Logger) (inventory.Resolver, error) {
-	if cfg.Etre.Configured() {
-		resolver, err := buildEtreResolver(ctx, cfg.Etre, logger)
-		if err != nil {
-			return nil, fmt.Errorf("build etre resolver: %w", err)
-		}
-		logger.Info("gRPC server routing by etre resolver",
-			"entity_type", cfg.Etre.EntityType, "target_label", cfg.Etre.TargetLabel,
-			"credentials", credentialType(cfg.Etre.Credentials))
-		return resolver, nil
+	if len(cfg.Etre) > 0 {
+		return buildEtreResolvers(ctx, cfg.Etre, logger)
 	}
 
 	resolver, err := inventory.NewStaticResolver(cfg.StaticInventory())
@@ -414,6 +407,54 @@ func buildTargetResolver(ctx context.Context, cfg api.TargetResolverConfig, logg
 	}
 	logger.Info("gRPC server routing by static target resolver", "targets", len(cfg.Targets))
 	return resolver, nil
+}
+
+// buildEtreResolvers builds the Etre-backed resolver(s). A single block resolves
+// every request directly (engine selected by its database_type). Multiple blocks
+// compose into a TypeRoutingResolver keyed by database type so one data plane
+// serves several engines at once and the request's database type selects the
+// engine. It fails closed when multiple blocks omit a database_type or collide on
+// one, so an ambiguous routing config surfaces at startup, not first request.
+func buildEtreResolvers(ctx context.Context, etres []api.EtreConfig, logger *slog.Logger) (inventory.Resolver, error) {
+	if len(etres) == 1 {
+		resolver, err := buildEtreResolver(ctx, etres[0], logger)
+		if err != nil {
+			return nil, fmt.Errorf("build etre resolver: %w", err)
+		}
+		logEtreResolver(logger, etres[0])
+		return resolver, nil
+	}
+
+	byType := make(map[string]inventory.Resolver, len(etres))
+	for _, cfg := range etres {
+		switch {
+		case cfg.DatabaseType == "":
+			return nil, fmt.Errorf("target_resolver.etre: database_type is required for each resolver when more than one is configured")
+		case byType[cfg.DatabaseType] != nil:
+			return nil, fmt.Errorf("target_resolver.etre: more than one resolver configured for database_type %q", cfg.DatabaseType)
+		}
+		resolver, err := buildEtreResolver(ctx, cfg, logger)
+		if err != nil {
+			return nil, fmt.Errorf("build etre resolver for database_type %q: %w", cfg.DatabaseType, err)
+		}
+		logEtreResolver(logger, cfg)
+		byType[cfg.DatabaseType] = resolver
+	}
+
+	router, err := inventory.NewTypeRoutingResolver(byType)
+	if err != nil {
+		return nil, fmt.Errorf("build per-type etre resolver routing: %w", err)
+	}
+	logger.Info("gRPC server routing by per-type etre resolvers", "database_types", len(byType))
+	return router, nil
+}
+
+// logEtreResolver records that an Etre resolver was built, with the identifiers
+// an operator needs to confirm routing at startup.
+func logEtreResolver(logger *slog.Logger, cfg api.EtreConfig) {
+	logger.Info("gRPC server etre resolver configured",
+		"database_type", cfg.DatabaseType, "entity_type", cfg.EntityType,
+		"target_label", cfg.TargetLabel, "credentials", credentialType(cfg.Credentials))
 }
 
 // buildEtreResolver assembles the Etre-backed resolver from config: the Etre

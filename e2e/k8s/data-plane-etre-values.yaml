@@ -21,21 +21,21 @@ config:
     dsn: "env:MYSQL_DSN"
   target_resolver:
     etre:
-      addr: "http://etre:8080"
-      database_type: mysql
-      entity_type: aurora_cluster
-      target_label: dsid
-      env_label: env
-      labels:
-        aws_region: us-east-1
-      mysql:
-        host_field: writer_endpoint
-        default_port: "3306"
-      credentials:
-        type: awssm
-        region: us-east-1
-        role_arn: "arn:aws:iam::{account}:role/tern-assumed"
-        secret_name: "{target}_ddl_password"
+      - addr: "http://etre:8080"
+        database_type: mysql
+        entity_type: aurora_cluster
+        target_label: dsid
+        env_label: env
+        labels:
+          aws_region: us-east-1
+        mysql:
+          host_field: writer_endpoint
+          default_port: "3306"
+        credentials:
+          type: awssm
+          region: us-east-1
+          role_arn: "arn:aws:iam::{account}:role/tern-assumed"
+          secret_name: "{target}_ddl_password"
 
 env:
   - name: MYSQL_DSN

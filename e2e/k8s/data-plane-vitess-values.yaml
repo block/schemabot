@@ -21,17 +21,17 @@ config:
     dsn: "env:MYSQL_DSN"
   target_resolver:
     etre:
-      addr: "http://etre:8080"
-      database_type: vitess
-      entity_type: planetscale_database
-      target_label: dsid
-      env_label: env
-      vitess:
-        organization_attribute: organization
-        api_url: "http://localscale:8080"
-      credentials:
-        type: secret_ref
-        password_ref: "env:PS_TOKEN"
+      - addr: "http://etre:8080"
+        database_type: vitess
+        entity_type: planetscale_database
+        target_label: dsid
+        env_label: env
+        vitess:
+          organization_attribute: organization
+          api_url: "http://localscale:8080"
+        credentials:
+          type: secret_ref
+          password_ref: "env:PS_TOKEN"
 
 env:
   - name: MYSQL_DSN

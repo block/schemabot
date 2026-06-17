@@ -44,14 +44,14 @@ func TestBuildGRPCTernClientRoutesViaEtreResolver(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	config := &api.ServerConfig{
 		TargetResolver: api.TargetResolverConfig{
-			Etre: api.EtreConfig{
+			Etre: []api.EtreConfig{{
 				Addr:         "https://etre.example",
 				DatabaseType: storage.DatabaseTypeMySQL,
 				EntityType:   "cluster",
 				TargetLabel:  "dsid",
 				MySQL:        api.EtreMySQLConfig{HostField: "writer_endpoint"},
 				Credentials:  api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
-			},
+			}},
 		},
 	}
 
@@ -67,7 +67,7 @@ func TestBuildGRPCTernClientRoutesViaEtreWithAWSSMCredentials(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	config := &api.ServerConfig{
 		TargetResolver: api.TargetResolverConfig{
-			Etre: api.EtreConfig{
+			Etre: []api.EtreConfig{{
 				Addr:         "https://etre.example",
 				DatabaseType: storage.DatabaseTypeMySQL,
 				EntityType:   "cluster",
@@ -79,7 +79,7 @@ func TestBuildGRPCTernClientRoutesViaEtreWithAWSSMCredentials(t *testing.T) {
 					RoleARN:    "arn:aws:iam::{account}:role/tern-assumed",
 					SecretName: "schemabot/{target}/ddl",
 				},
-			},
+			}},
 		},
 	}
 
@@ -87,6 +87,75 @@ func TestBuildGRPCTernClientRoutesViaEtreWithAWSSMCredentials(t *testing.T) {
 	require.NoError(t, err)
 	_, ok := client.(*tern.TargetRouter)
 	assert.True(t, ok, "expected a TargetRouter with awssm credentials")
+}
+
+// A data plane that serves more than one engine configures one etre block per
+// database type; they compose into a per-type router that selects the engine
+// from each request's database type.
+func TestBuildTargetResolverComposesPerTypeResolvers(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := api.TargetResolverConfig{
+		Etre: []api.EtreConfig{
+			{
+				Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeMySQL,
+				EntityType: "cluster", TargetLabel: "dsid",
+				MySQL:       api.EtreMySQLConfig{HostField: "writer_endpoint"},
+				Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+			},
+			{
+				Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeVitess,
+				EntityType: "keyspace", TargetLabel: "dsid",
+				Vitess:      api.EtreVitessConfig{OrganizationAttribute: "organization"},
+				Credentials: api.EtreCredentialsConfig{PasswordRef: "env:PS_TOKEN"},
+			},
+		},
+	}
+
+	resolver, err := buildTargetResolver(t.Context(), cfg, logger)
+	require.NoError(t, err)
+	_, ok := resolver.(*inventory.TypeRoutingResolver)
+	assert.True(t, ok, "expected a TypeRoutingResolver for multiple per-type etre blocks, got %T", resolver)
+}
+
+// With more than one resolver, each must declare a database_type so the router
+// can select among them; an omitted type is a startup configuration error.
+func TestBuildEtreResolversRejectsMissingDatabaseTypeWhenMultiple(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	etres := []api.EtreConfig{
+		{
+			Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeMySQL,
+			EntityType: "cluster", TargetLabel: "dsid",
+			MySQL:       api.EtreMySQLConfig{HostField: "writer_endpoint"},
+			Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+		},
+		{
+			Addr:       "https://etre.example", // no database_type
+			EntityType: "cluster", TargetLabel: "dsid",
+			MySQL:       api.EtreMySQLConfig{HostField: "writer_endpoint"},
+			Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+		},
+	}
+
+	_, err := buildEtreResolvers(t.Context(), etres, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database_type is required")
+}
+
+// Two resolvers claiming the same database type is ambiguous and fails closed at
+// startup rather than letting map iteration order decide which one routes.
+func TestBuildEtreResolversRejectsDuplicateDatabaseType(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	block := api.EtreConfig{
+		Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeMySQL,
+		EntityType: "cluster", TargetLabel: "dsid",
+		MySQL:       api.EtreMySQLConfig{HostField: "writer_endpoint"},
+		Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+	}
+
+	_, err := buildEtreResolvers(t.Context(), []api.EtreConfig{block, block}, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), storage.DatabaseTypeMySQL)
+	assert.Contains(t, err.Error(), "more than one resolver")
 }
 
 // An unknown credentials.type fails closed at startup.
@@ -248,10 +317,10 @@ func TestBuildGRPCTernClientErrorsWhenEtreAndStaticBothConfigured(t *testing.T) 
 			Targets: map[string]inventory.StaticTarget{
 				"dsid-orders-prod": {DatabaseType: storage.DatabaseTypeMySQL, DSN: "root@tcp(localhost:3306)/"},
 			},
-			Etre: api.EtreConfig{
+			Etre: []api.EtreConfig{{
 				Addr: "https://etre.example", EntityType: "cluster", TargetLabel: "dsid",
 				MySQL: api.EtreMySQLConfig{HostField: "writer_endpoint"}, Credentials: api.EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
-			},
+			}},
 		},
 	}
 

@@ -375,7 +375,11 @@ type DSNFromConfigPaths struct {
 // time. Each is one pluggable backend behind the same resolver interface.
 type TargetResolverConfig struct {
 	Targets map[string]inventory.StaticTarget `yaml:"targets,omitempty"`
-	Etre    EtreConfig                        `yaml:"etre,omitempty"`
+	// Etre lists one or more Etre-backed resolvers. A single entry resolves every
+	// request directly; multiple entries compose into a per-type router (keyed by
+	// each entry's database_type) so one data plane can serve several engines at
+	// once and the request's database type selects among them.
+	Etre []EtreConfig `yaml:"etre,omitempty"`
 }
 
 // Configured reports whether the data plane has any static target inventory.
@@ -386,7 +390,7 @@ func (c TargetResolverConfig) Configured() bool {
 // Enabled reports whether any target-resolver backend is configured (static
 // inventory or Etre). New backends are added here so callers stay correct.
 func (c TargetResolverConfig) Enabled() bool {
-	return c.Configured() || c.Etre.Configured()
+	return c.Configured() || len(c.Etre) > 0
 }
 
 // StaticInventory returns the static inventory config for NewStaticResolver.
@@ -479,11 +483,6 @@ type EtreCredentialsConfig struct {
 	ExternalID       string `yaml:"external_id,omitempty"`
 	SecretName       string `yaml:"secret_name,omitempty"`
 	AccountAttribute string `yaml:"account_attribute,omitempty"`
-}
-
-// Configured reports whether the data plane should resolve targets through Etre.
-func (c EtreConfig) Configured() bool {
-	return strings.TrimSpace(c.Addr) != ""
 }
 
 // DatabaseConfig holds configuration for a registered database.
