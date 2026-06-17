@@ -41,8 +41,11 @@ const defaultAccountAttribute = "aws_account_id"
 // target; any other name is an entity attribute resolved for the target. When a
 // length operator is present, the resolved value is truncated to at most N
 // characters — used to fit database identifier limits (e.g. MySQL's 32-character
-// username cap, Postgres's 63) when an attribute can exceed them.
-var templatePlaceholderRe = regexp.MustCompile(`\{([a-zA-Z0-9_]+)(?::(\d+))?\}`)
+// username cap, Postgres's 63) when an attribute can exceed them. The operator is
+// captured loosely (any text after the colon) so a malformed one like "{app:x}"
+// is still recognized as a placeholder and rejected at render, rather than
+// rendering literally.
+var templatePlaceholderRe = regexp.MustCompile(`\{([a-zA-Z0-9_]+)(:[^}]*)?\}`)
 
 // Config configures a Resolver.
 type Config struct {
@@ -270,7 +273,9 @@ func renderTemplate(what, tmpl, target string, attrs map[string]string) (string,
 		if lengthOp == "" {
 			return value
 		}
-		maxLen, err := strconv.Atoi(lengthOp)
+		// lengthOp includes the leading colon (e.g. ":24"); the spec after it must
+		// be a positive integer. Anything else (":", ":x", ":0") is a config error.
+		maxLen, err := strconv.Atoi(lengthOp[1:])
 		if err != nil || maxLen < 1 {
 			invalid = append(invalid, match)
 			return match

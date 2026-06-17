@@ -195,13 +195,18 @@ func TestResolverSecretNameLengthOperatorTruncates(t *testing.T) {
 // A zero or unparseable length operator is a configuration error, not a silent
 // passthrough that would produce a wrong identifier.
 func TestResolverFailsOnInvalidLengthOperator(t *testing.T) {
-	r := newResolver("aws_account_id", "secret", "{app:0}_ddl", &fakeFetcher{payload: "pw"}, nil, false)
+	// Zero, non-numeric, negative, and empty operators are all configuration
+	// errors. A malformed operator must still be recognized as a placeholder and
+	// rejected, never rendered literally into the username.
+	for _, tmpl := range []string{"{app:0}_ddl", "{app:nope}_ddl", "{app:-1}_ddl", "{app:}_ddl"} {
+		r := newResolver("aws_account_id", "secret", tmpl, &fakeFetcher{payload: "pw"}, nil, false)
 
-	_, err := r.ResolveCredentials(t.Context(),
-		inventory.Request{Target: "orders-dsid"},
-		map[string]string{"app": "orders"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid length operator")
+		_, err := r.ResolveCredentials(t.Context(),
+			inventory.Request{Target: "orders-dsid"},
+			map[string]string{"app": "orders"})
+		require.Error(t, err, tmpl)
+		assert.Contains(t, err.Error(), "invalid length operator", tmpl)
+	}
 }
 
 // Truncation counts characters, not bytes, so a multi-byte value is never cut
