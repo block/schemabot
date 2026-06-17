@@ -82,8 +82,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 
     files=$(git diff --name-only --diff-filter=d "$range_base" "$local_sha" -- '*.go' 2>/dev/null || true)
     if [ -n "$files" ]; then
-        changed_go_files="$changed_go_files
+        # Newline-join records so each filename stays on its own line. Append
+        # without a leading newline on the first record so no empty line is
+        # introduced.
+        if [ -z "$changed_go_files" ]; then
+            changed_go_files="$files"
+        else
+            changed_go_files="$changed_go_files
 $files"
+        fi
     fi
 done
 
