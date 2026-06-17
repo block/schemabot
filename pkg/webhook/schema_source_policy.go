@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
@@ -30,7 +31,7 @@ func newSchemaConfigOutsideAllowedDirsError(config *ghclient.SchemabotConfig, sc
 }
 
 func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, databaseName, source string) (*ghclient.SchemaRequestResult, error) {
-	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName)
+	schemaResult, err := client.CreateSchemaRequestFromPR(ctx, repo, pr, environment, databaseName, h.validateRequestedDatabaseEnvironment)
 	if err != nil {
 		return nil, err
 	}
@@ -42,6 +43,20 @@ func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *
 		}
 	}
 	return schemaResult, nil
+}
+
+func (h *Handler) validateRequestedDatabaseEnvironment(database, environment string) error {
+	if environment == "" {
+		return nil
+	}
+	environments, err := h.configuredDatabaseEnvironments(database)
+	if err != nil {
+		return fmt.Errorf("resolve configured environments for database %q: %w", database, err)
+	}
+	if slices.Contains(environments, environment) {
+		return nil
+	}
+	return fmt.Errorf("database %q environment %q is not configured on this server", database, environment)
 }
 
 func (h *Handler) configPathManagedByRepo(ctx context.Context, repo string, pr int, headSHA string, config *ghclient.SchemabotConfig, schemaPath, source string) bool {

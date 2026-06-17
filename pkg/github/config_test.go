@@ -354,6 +354,148 @@ func TestFetchSchemaFilesOptimizedWalksSchemaDirectoryOnly(t *testing.T) {
 	assert.Equal(t, "apps/widgets/schema/main/widgets.sql", files[2].Path)
 }
 
+func TestCreateSchemaRequestFromPRUsesEnvironmentSymlinkSchemaRoot(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("services/orders/schema/schemabot.yaml"),
+		Status:   new("modified"),
+	}, {
+		Filename: new("services/orders/schema/base/orders_001/orders.sql"),
+		Status:   new("added"),
+	}})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/services/orders/schema/schemabot.yaml", "database: orders\ntype: mysql\n")
+	registerSymlinkContent(t, mux, "/repos/octocat/hello-world/contents/services/orders/schema/production", "services/orders/schema/production", "base")
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/services/orders/schema/base", []*gh.RepositoryContent{
+		{Type: new("dir"), Name: new("orders_001"), Path: new("services/orders/schema/base/orders_001")},
+	})
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/services/orders/schema/base/orders_001", []*gh.RepositoryContent{
+		{Type: new("file"), Name: new("orders.sql"), Path: new("services/orders/schema/base/orders_001/orders.sql")},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/services/orders/schema/base/orders_001/orders.sql", "CREATE TABLE orders (id bigint primary key);\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "production", "", nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, "orders", result.Database)
+	assert.Equal(t, "mysql", result.Type)
+	assert.Equal(t, "services/orders/schema/base", result.SchemaPath)
+	require.Contains(t, result.SchemaFiles, "orders_001")
+	assert.Equal(t, "CREATE TABLE orders (id bigint primary key);\n", result.SchemaFiles["orders_001"].Files["orders.sql"])
+}
+
+func TestCreateSchemaRequestFromPRUsesRepoRootEnvironmentSymlinkSchemaRoot(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("schemabot.yaml"),
+		Status:   new("modified"),
+	}, {
+		Filename: new("base/orders_001/orders.sql"),
+		Status:   new("added"),
+	}})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schemabot.yaml", "database: orders\ntype: mysql\n")
+	registerSymlinkContent(t, mux, "/repos/octocat/hello-world/contents/production", "production", "base")
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/base", []*gh.RepositoryContent{
+		{Type: new("dir"), Name: new("orders_001"), Path: new("base/orders_001")},
+	})
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/base/orders_001", []*gh.RepositoryContent{
+		{Type: new("file"), Name: new("orders.sql"), Path: new("base/orders_001/orders.sql")},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/base/orders_001/orders.sql", "CREATE TABLE orders (id bigint primary key);\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "production", "", nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, "orders", result.Database)
+	assert.Equal(t, "base", result.SchemaPath)
+	require.Contains(t, result.SchemaFiles, "orders_001")
+	assert.Equal(t, "CREATE TABLE orders (id bigint primary key);\n", result.SchemaFiles["orders_001"].Files["orders.sql"])
+}
+
+func TestResolveSchemaRootForEnvironmentRejectsPathTraversal(t *testing.T) {
+	ic := &InstallationClient{}
+	for _, environment := range []string{"../other", "prod/blue", ".", "..", `prod\blue`} {
+		t.Run(environment, func(t *testing.T) {
+			_, err := ic.resolveSchemaRootForEnvironment(t.Context(), "octocat/hello-world", "abc123", "services/orders/schema", environment)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "must be a single path segment")
+		})
+	}
+}
+
+func TestCreateSchemaRequestFromPRFallsBackWhenEnvironmentSchemaRootMissing(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("apps/widgets/schema/main/widgets.sql"),
+		Status:   new("modified"),
+	}})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: vitess\n")
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema", []*gh.RepositoryContent{
+		{Type: new("dir"), Name: new("main"), Path: new("apps/widgets/schema/main")},
+	})
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/main", []*gh.RepositoryContent{
+		{Type: new("file"), Name: new("widgets.sql"), Path: new("apps/widgets/schema/main/widgets.sql")},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/main/widgets.sql", "CREATE TABLE widgets (id bigint primary key);\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "production", "", nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, "apps/widgets/schema", result.SchemaPath)
+	require.Contains(t, result.SchemaFiles, "main")
+	assert.Equal(t, "CREATE TABLE widgets (id bigint primary key);\n", result.SchemaFiles["main"].Files["widgets.sql"])
+}
+
+func TestCreateSchemaRequestFromPRValidatesEnvironmentBeforeResolvingEnvironmentSchemaRoot(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("services/orders/schema/schemabot.yaml"),
+		Status:   new("modified"),
+	}})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/services/orders/schema/schemabot.yaml", "database: orders\ntype: mysql\n")
+	environmentRootRequests := 0
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/services/orders/schema/production", func(w http.ResponseWriter, _ *http.Request) {
+		environmentRootRequests++
+		require.NoError(t, json.NewEncoder(w).Encode([]*gh.RepositoryContent{
+			{Type: new("dir"), Name: new("orders_001"), Path: new("services/orders/schema/production/orders_001")},
+		}))
+	})
+
+	validationErr := errors.New("environment rejected")
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "production", "", func(database, environment string) error {
+		assert.Equal(t, "orders", database)
+		assert.Equal(t, "production", environment)
+		return validationErr
+	})
+
+	require.ErrorIs(t, err, validationErr)
+	assert.Zero(t, environmentRootRequests)
+}
+
+func TestCreateSchemaRequestFromPRRejectsEnvironmentSymlinkOutsideSchemaDirectory(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "abc123")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("apps/widgets/schema/schemabot.yaml"),
+		Status:   new("modified"),
+	}})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/schemabot.yaml", "database: widgets\ntype: vitess\n")
+	registerSymlinkContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema/production", "apps/widgets/schema/production", "../other")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "production", "", nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "points outside schema directory")
+}
+
 // TestFindConfigForPR_AuthFailureDoesNotFallThroughToNoConfig verifies that
 // auth errors propagate instead of being swallowed as ErrNoConfig.
 func TestFindConfigForPR_AuthFailureDoesNotFallThroughToNoConfig(t *testing.T) {
@@ -435,6 +577,18 @@ func registerFileContent(t *testing.T, mux *http.ServeMux, endpointPath, content
 			Type:     new("file"),
 			Encoding: new("base64"),
 			Content:  new(base64.StdEncoding.EncodeToString([]byte(content))),
+		}))
+	})
+}
+
+func registerSymlinkContent(t *testing.T, mux *http.ServeMux, endpointPath, linkPath, target string) {
+	t.Helper()
+
+	mux.HandleFunc("GET "+endpointPath, func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Type:   new("symlink"),
+			Path:   new(linkPath),
+			Target: new(target),
 		}))
 	})
 }
