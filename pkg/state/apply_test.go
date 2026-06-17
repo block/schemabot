@@ -184,6 +184,7 @@ func TestIsTerminalApplyState(t *testing.T) {
 	nonTerminalStates := []string{
 		Apply.Pending,
 		Apply.Running,
+		Apply.RunningDegraded,
 		Apply.FailedRetryable,
 		Apply.WaitingForCutover,
 		Apply.CuttingOver,
@@ -210,6 +211,8 @@ func TestNormalizeState(t *testing.T) {
 		{"pending", Apply.Pending},
 		{"RUNNING", Apply.Running},
 		{"running", Apply.Running},
+		{"RUNNING_DEGRADED", Apply.RunningDegraded},
+		{"running_degraded", Apply.RunningDegraded},
 		{"WAITING_FOR_DEPLOY", Apply.WaitingForDeploy},
 		{"waiting_for_deploy", Apply.WaitingForDeploy},
 		{"WAITING_FOR_CUTOVER", Apply.WaitingForCutover},
@@ -369,14 +372,14 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 		want     string
 	}{
 		{
-			name:     "continue failure with pending sibling holds running",
+			name:     "continue failure with pending sibling holds running_degraded",
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Pending, true)},
-			want:     Apply.Running,
+			want:     Apply.RunningDegraded,
 		},
 		{
-			name:     "continue failure with running sibling holds running",
+			name:     "continue failure with running sibling holds running_degraded",
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Running, true)},
-			want:     Apply.Running,
+			want:     Apply.RunningDegraded,
 		},
 		{
 			name:     "continue failure with all siblings terminal settles failed",
@@ -399,9 +402,9 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 			want:     Apply.Failed,
 		},
 		{
-			name:     "continue failure with completed and pending holds running",
+			name:     "continue failure with completed and pending holds running_degraded",
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Completed, true), rc(Apply.Pending, true)},
-			want:     Apply.Running,
+			want:     Apply.RunningDegraded,
 		},
 	}
 	for _, tc := range cases {

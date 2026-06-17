@@ -1804,9 +1804,9 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 
 	// Under on_failure "continue" a terminally failed deployment does not
 	// terminalize the apply while a sibling is still pending: the apply is held
-	// running so the remaining deployment gets its turn, then settles to failed
-	// once every sibling is terminal.
-	t.Run("continue policy holds the apply active past a failed deployment", func(t *testing.T) {
+	// running_degraded so the remaining deployment gets its turn, then settles to
+	// failed once every sibling is terminal.
+	t.Run("continue policy holds the apply degraded past a failed deployment", func(t *testing.T) {
 		tasks := []*storage.Task{taskWith(state.Task.Failed)}
 		client := &LocalClient{
 			storage: &exactProgressStorage{
@@ -1823,7 +1823,7 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 
 		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
 		assert.True(t, ok, "current op row present, projection must be determined")
-		assert.Equal(t, state.Apply.Running, got, "continue policy must hold the apply active until the pending sibling settles")
+		assert.Equal(t, state.Apply.RunningDegraded, got, "continue policy must hold the apply degraded until the pending sibling settles")
 	})
 
 	// Default policy (on_failure unset) fails closed: a terminally failed

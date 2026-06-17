@@ -86,6 +86,7 @@ type txBeginner interface {
 func claimableApplyStates() []string {
 	return []string{
 		state.Apply.Running,
+		state.Apply.RunningDegraded,
 		state.Apply.WaitingForDeploy,
 		state.Apply.WaitingForCutover,
 		state.Apply.Recovering,
