@@ -521,7 +521,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, apply.ExternalID, err, failErr)
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
-			fmt.Sprintf("Remote cutover failed for apply %s%s: %v", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq)), err), "", "")
+			fmt.Sprintf("Remote cutover failed for apply %s (remote %s)%s: %v", apply.ApplyIdentifier, apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq)), err), "", "")
 		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w", apply.ApplyIdentifier, apply.ExternalID, err)
 	}
 	if resp == nil {
@@ -530,7 +530,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 			return err
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
-			fmt.Sprintf("Remote cutover returned no response for apply %s%s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+			fmt.Sprintf("Remote cutover returned no response for apply %s (remote %s)%s", apply.ApplyIdentifier, apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s", apply.ApplyIdentifier, apply.ExternalID, errorMessage)
 	}
 	if !resp.Accepted {
@@ -542,11 +542,11 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 			return err
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
-			fmt.Sprintf("Remote cutover was not accepted for apply %s%s: %s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq)), errorMessage), "", "")
+			fmt.Sprintf("Remote cutover was not accepted for apply %s (remote %s)%s: %s", apply.ApplyIdentifier, apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq)), errorMessage), "", "")
 		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s", apply.ApplyIdentifier, apply.ExternalID, errorMessage)
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
-		fmt.Sprintf("Remote cutover accepted for apply %s%s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		fmt.Sprintf("Remote cutover accepted for apply %s (remote %s)%s", apply.ApplyIdentifier, apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	if err := completePendingCutoverControlRequests(ctx, c.storage, apply); err != nil {
 		return err
 	}
