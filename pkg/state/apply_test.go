@@ -202,6 +202,28 @@ func TestIsTerminalApplyState(t *testing.T) {
 	assert.False(t, IsTerminalApplyState("STATE_RUNNING"))
 }
 
+// TestIsRunningApplyState pins the running-family set that control gates key
+// off: running and running_degraded are running-family; other non-terminal
+// states (pending, waiting_for_cutover, recovering) are not.
+func TestIsRunningApplyState(t *testing.T) {
+	for _, s := range []string{Apply.Running, Apply.RunningDegraded, "RUNNING", "STATE_RUNNING_DEGRADED", "running_degraded"} {
+		assert.Truef(t, IsRunningApplyState(s), "%s should be running-family", s)
+	}
+	for _, s := range []string{
+		Apply.Pending,
+		Apply.WaitingForDeploy,
+		Apply.WaitingForCutover,
+		Apply.Recovering,
+		Apply.CuttingOver,
+		Apply.FailedRetryable,
+		Apply.Completed,
+		Apply.Failed,
+		Apply.Stopped,
+	} {
+		assert.Falsef(t, IsRunningApplyState(s), "%s should NOT be running-family", s)
+	}
+}
+
 func TestNormalizeState(t *testing.T) {
 	testCases := []struct {
 		input    string

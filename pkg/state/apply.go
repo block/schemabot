@@ -261,6 +261,18 @@ func IsTerminalApplyState(s string) bool {
 	return ok && info.Terminal
 }
 
+// IsRunningApplyState reports whether an apply is in a running-family state:
+// running, or running_degraded (a continue rollout still in flight after a
+// sibling deployment failed). Control gates that mean "the apply is actively
+// running" — cutover readiness, start reconciliation, stop/volume eligibility —
+// must use this so a degraded rollout is not mistaken for a non-running apply.
+// This is narrower than "active" (non-terminal): pending, waiting_for_cutover,
+// recovering, and other non-terminal states are not running-family.
+// Accepts any format (proto, uppercase, or canonical lowercase).
+func IsRunningApplyState(s string) bool {
+	return IsState(s, Apply.Running, Apply.RunningDegraded)
+}
+
 // IsSetupPhase returns true if the apply state is an engine-lifecycle phase
 // that runs before per-table progress is meaningful (all tables are Queued).
 // Used by the TUI and CLI to hide the table list during setup.
