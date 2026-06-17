@@ -179,7 +179,7 @@ jobs:
           build-args: |
             VERSION=${{ github.ref_name }}
             COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at || github.run_started_at }}
 
       # LocalScale image — fake PlanetScale API for testing.
       # Published to ghcr.io/block/schemabot/localscale:<sha|latest>
