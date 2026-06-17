@@ -443,7 +443,7 @@ func (c *GRPCClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*
 	return c.client.Cutover(ctx, req)
 }
 
-func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply) error {
+func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	controlReq, err := pendingCutoverControlRequest(ctx, c.storage, apply)
 	if err != nil {
 		return err
@@ -494,7 +494,8 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 			"state", apply.State)
 		return nil
 	}
-	if apply.ExternalID == "" {
+	remoteID := scope.remoteApplyID(apply)
+	if remoteID == "" {
 		message := "remote apply id is not available"
 		if err := failPendingCutoverControlRequests(ctx, c.storage, apply, message); err != nil {
 			return err
@@ -511,7 +512,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return err
 	}
 	resp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
-		ApplyId:     apply.ExternalID,
+		ApplyId:     remoteID,
 		Environment: apply.Environment,
 	})
 	if err != nil {
@@ -605,7 +606,8 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		}
 		return true, nil
 	}
-	if apply.ExternalID == "" {
+	remoteID := scope.remoteApplyID(apply)
+	if remoteID == "" {
 		if err := c.stopUndispatchedApply(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
 			return true, err
 		}
@@ -616,40 +618,40 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	}
 
 	resp, err := c.client.Stop(ctx, &ternv1.StopRequest{
-		ApplyId:     apply.ExternalID,
+		ApplyId:     remoteID,
 		Environment: apply.Environment,
 	})
 	if err != nil {
 		if completed, completeErr := c.completeRemoteStopFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
 			return true, nil
 		} else if completeErr != nil {
-			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w; terminal progress reconciliation also failed: %w", apply.ApplyIdentifier, apply.ExternalID, err, completeErr)
+			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w; terminal progress reconciliation also failed: %w", apply.ApplyIdentifier, remoteID, err, completeErr)
 		}
-		return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, apply.ExternalID, err)
+		return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
 	if resp == nil || !resp.Accepted {
 		errorMessage := "not accepted"
 		if resp != nil && resp.ErrorMessage != "" {
 			errorMessage = resp.ErrorMessage
 		}
-		return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %s", apply.ApplyIdentifier, apply.ExternalID, errorMessage)
+		return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
-		fmt.Sprintf("Remote stop accepted for apply %s%s", apply.ExternalID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		fmt.Sprintf("Remote stop accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 
 	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     apply.ExternalID,
+		ApplyId:     remoteID,
 		Environment: apply.Environment,
 	})
 	if err != nil {
-		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, apply.ExternalID, err)
+		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
 	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
-		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: no active schema change", apply.ApplyIdentifier, apply.ExternalID)
+		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: no active schema change", apply.ApplyIdentifier, remoteID)
 	}
 	remoteState := ProtoStateToStorage(progress.State)
 	if remoteState == "" {
-		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: unmapped remote state %s", apply.ApplyIdentifier, apply.ExternalID, remoteApplyStateDescription(progress.State))
+		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: unmapped remote state %s", apply.ApplyIdentifier, remoteID, remoteApplyStateDescription(progress.State))
 	}
 	now := time.Now()
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
@@ -694,7 +696,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 
 func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope) (bool, error) {
 	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     apply.ExternalID,
+		ApplyId:     scope.remoteApplyID(apply),
 		Environment: apply.Environment,
 	})
 	if err != nil {
@@ -804,24 +806,142 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 	return err
 }
 
-// applyTaskScope selects which task rows the remote drive re-queries. The zero
-// value scopes to the whole apply (all its operations); an operation-scoped
-// value restricts the drive to a single apply_operation (one deployment), so a
-// worker can advance one deployment independently of its siblings.
+// applyTaskScope selects which task rows the remote drive re-queries and where
+// the remote Tern apply id for the drive is read and written. The zero value
+// scopes to the whole apply (all its operations) and uses the parent
+// applies.external_id, matching the single-operation behaviour. An
+// operation-scoped value restricts the drive to a single apply_operation (one
+// deployment) so a worker can advance one deployment independently of its
+// siblings; when the parent owns more than one operation it also routes the
+// remote apply id through that operation's engine_resume_context instead of the
+// shared parent external_id, so one deployment never reuses or overwrites
+// another deployment's remote apply id.
 type applyTaskScope struct {
 	applyOperationID int64
+
+	// operation is the claimed apply_operation row, loaded and validated for
+	// operation-scoped drives. nil for whole-apply drives.
+	operation *storage.ApplyOperation
+
+	// multiOperation is true only when the parent apply owns more than one
+	// operation. Deployment equality is not enough to detect this: the primary
+	// operation of a multi-op apply shares apply.Deployment, so the operation
+	// count is the authoritative signal for routing the remote apply id per op.
+	multiOperation bool
 }
 
 func wholeApplyTaskScope() applyTaskScope {
 	return applyTaskScope{}
 }
 
-func operationApplyTaskScope(applyOperationID int64) applyTaskScope {
-	return applyTaskScope{applyOperationID: applyOperationID}
-}
-
 func (s applyTaskScope) isOperationScoped() bool {
 	return s.applyOperationID > 0
+}
+
+// usesOperationRemoteResume reports whether the remote apply id for this drive
+// lives on the claimed operation's engine_resume_context rather than the parent
+// applies.external_id. Only multi-operation drives do; single-operation and
+// whole-apply drives keep using the parent external_id.
+func (s applyTaskScope) usesOperationRemoteResume() bool {
+	return s.multiOperation && s.operation != nil
+}
+
+// remoteApplyID resolves the remote Tern apply id sent on this drive's
+// Progress/Stop/Start/Cutover calls. Multi-operation drives read the claimed
+// operation's engine_resume_context (which may be empty before dispatch);
+// everything else reads the parent external_id.
+func (s applyTaskScope) remoteApplyID(apply *storage.Apply) string {
+	if s.usesOperationRemoteResume() {
+		return s.operation.EngineResumeContext
+	}
+	return apply.ExternalID
+}
+
+// dispatchState returns the state that governs the dispatch / ambiguity
+// decision. A multi-operation drive keys on the claimed operation's state: the
+// parent apply may already be running because a sibling deployment is active
+// while this operation still needs its first remote dispatch.
+func (s applyTaskScope) dispatchState(apply *storage.Apply) string {
+	if s.usesOperationRemoteResume() {
+		return s.operation.State
+	}
+	return apply.State
+}
+
+// loadOperationApplyTaskScope loads and validates the claimed apply_operation
+// row and determines whether the parent apply is multi-operation. It fails
+// closed on any mismatch so an operation-scoped drive can never act on another
+// apply's row, a sibling deployment, or a row outside the parent's operation
+// set.
+func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *storage.Apply, applyOperationID int64) (applyTaskScope, error) {
+	operation, err := c.storage.ApplyOperations().Get(ctx, applyOperationID)
+	if err != nil {
+		return applyTaskScope{}, fmt.Errorf("load apply_operation %d for apply %s: %w", applyOperationID, apply.ApplyIdentifier, err)
+	}
+	if operation.ApplyID != apply.ID {
+		return applyTaskScope{}, fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", applyOperationID, operation.ApplyID, apply.ApplyIdentifier, apply.ID)
+	}
+	if operation.Deployment == "" {
+		return applyTaskScope{}, fmt.Errorf("apply_operation %d for apply %s has no deployment", applyOperationID, apply.ApplyIdentifier)
+	}
+	if apply.Deployment != "" && apply.Deployment != operation.Deployment {
+		return applyTaskScope{}, fmt.Errorf("apply %s deployment %q does not match apply_operation %d deployment %q", apply.ApplyIdentifier, apply.Deployment, applyOperationID, operation.Deployment)
+	}
+	ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return applyTaskScope{}, fmt.Errorf("list operations for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	found := false
+	for _, op := range ops {
+		if op.ID == applyOperationID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return applyTaskScope{}, fmt.Errorf("apply_operation %d is not part of apply %s operation set", applyOperationID, apply.ApplyIdentifier)
+	}
+	return applyTaskScope{
+		applyOperationID: applyOperationID,
+		operation:        operation,
+		multiOperation:   len(ops) > 1,
+	}, nil
+}
+
+// persistRemoteApplyID stores the remote Tern apply id returned by dispatch.
+// Single-operation drives keep it on the parent applies.external_id (mutated in
+// place so the caller's Applies().Update persists it). Multi-operation drives
+// write it to the claimed operation's engine_resume_context and never touch the
+// parent external_id, refusing to overwrite a different existing id so one
+// deployment can't clobber another deployment's remote apply id.
+func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) error {
+	if remoteID == "" {
+		return fmt.Errorf("refusing to persist empty remote apply id for apply %s", apply.ApplyIdentifier)
+	}
+	if !scope.usesOperationRemoteResume() {
+		apply.ExternalID = remoteID
+		return nil
+	}
+	op := scope.operation
+	current, err := c.storage.ApplyOperations().Get(ctx, op.ID)
+	if err != nil {
+		return fmt.Errorf("reload apply_operation %d before storing remote apply id: %w", op.ID, err)
+	}
+	if current.ApplyID != apply.ID {
+		return fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", op.ID, current.ApplyID, apply.ApplyIdentifier, apply.ID)
+	}
+	if current.EngineResumeContext != "" && current.EngineResumeContext != remoteID {
+		return fmt.Errorf("apply_operation %d already has remote apply id %q; refusing to overwrite with %q", op.ID, current.EngineResumeContext, remoteID)
+	}
+	if err := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
+		ApplyOperationID: op.ID,
+		MigrationContext: remoteID,
+		Metadata:         "{}",
+	}); err != nil {
+		return fmt.Errorf("store remote apply id for apply_operation %d: %w", op.ID, err)
+	}
+	op.EngineResumeContext = remoteID
+	return nil
 }
 
 // loadApplyTasks loads the task rows the remote drive operates on, scoped either
@@ -874,7 +994,10 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 	if apply == nil {
 		return fmt.Errorf("apply is required")
 	}
-	scope := operationApplyTaskScope(applyOperationID)
+	scope, err := c.loadOperationApplyTaskScope(ctx, apply, applyOperationID)
+	if err != nil {
+		return err
+	}
 	// Fail closed before any dispatch or state mutation: an operation that
 	// resolves to no tasks is an invalid or stale claim. The shared resume path
 	// would otherwise mark the whole parent apply failed (dispatchPendingApply
@@ -906,14 +1029,14 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
 		return err
 	}
-	if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
+	if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
 		return err
 	}
 
-	if shouldDispatchQueuedRemoteApply(apply) {
+	if shouldDispatchQueuedRemoteApply(apply, scope) {
 		return c.dispatchPendingApply(ctx, apply, scope)
 	}
-	if hasAmbiguousRemoteDispatchState(apply) {
+	if hasAmbiguousRemoteDispatchState(apply, scope) {
 		errMsg := fmt.Sprintf("gRPC apply %s is %s without external_id; remote dispatch state is ambiguous", apply.ApplyIdentifier, apply.State)
 		if err := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); err != nil {
 			return fmt.Errorf("%s; persist failure state: %w", errMsg, err)
@@ -935,17 +1058,18 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
 			return err
 		}
-		if err := c.processPendingStartControlRequest(ctx, apply); err != nil {
+		if err := c.processPendingStartControlRequest(ctx, apply, scope); err != nil {
 			return err
 		}
 	}
 
-	if apply.ExternalID != "" && state.IsState(apply.State, state.Apply.Pending) && !startRequested {
+	remoteID := scope.remoteApplyID(apply)
+	if remoteID != "" && state.IsState(apply.State, state.Apply.Pending) && !startRequested {
 		if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
 			return err
 		}
 		_, err := c.client.Start(ctx, &ternv1.StartRequest{
-			ApplyId:     apply.ExternalID,
+			ApplyId:     remoteID,
 			Environment: apply.Environment,
 		})
 		if err != nil {
@@ -968,7 +1092,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		oldState := apply.State
 		remoteStartRequested := false
 		resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-			ApplyId:     apply.ExternalID,
+			ApplyId:     remoteID,
 			Environment: apply.Environment,
 		})
 		if err == nil {
@@ -1034,11 +1158,11 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 				return err
 			}
 			_, err := c.client.Start(ctx, &ternv1.StartRequest{
-				ApplyId:     apply.ExternalID,
+				ApplyId:     remoteID,
 				Environment: apply.Environment,
 			})
 			if err != nil {
-				message := fmt.Sprintf("remote start failed for remote apply %s: %v", apply.ExternalID, err)
+				message := fmt.Sprintf("remote start failed for remote apply %s: %v", remoteID, err)
 				slog.Warn("remote gRPC start failed; storing stopped state for operator retry",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
@@ -1147,7 +1271,7 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 	}
 }
 
-func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, apply *storage.Apply) error {
+func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	controlReq, err := pendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
 		return err
@@ -1171,7 +1295,8 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	if !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
 		return nil
 	}
-	if apply.ExternalID == "" {
+	remoteID := scope.remoteApplyID(apply)
+	if remoteID == "" {
 		message := fmt.Sprintf("gRPC apply %s is waiting for deploy without external_id; start dispatch state is ambiguous", apply.ApplyIdentifier)
 		if err := failPendingStartControlRequests(ctx, c.storage, apply, message); err != nil {
 			return err
@@ -1179,11 +1304,11 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 		return errors.New(message)
 	}
 	_, err = c.client.Start(ctx, &ternv1.StartRequest{
-		ApplyId:     apply.ExternalID,
+		ApplyId:     remoteID,
 		Environment: apply.Environment,
 	})
 	if err != nil {
-		message := fmt.Sprintf("remote deferred deploy start failed for remote apply %s: %v", apply.ExternalID, err)
+		message := fmt.Sprintf("remote deferred deploy start failed for remote apply %s: %v", remoteID, err)
 		slog.Warn("remote gRPC deferred deploy start failed; storing start request failure",
 			"apply_id", apply.ApplyIdentifier,
 			"external_id", apply.ExternalID,
@@ -1211,20 +1336,20 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	return nil
 }
 
-func shouldDispatchQueuedRemoteApply(apply *storage.Apply) bool {
+func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope) bool {
 	if apply == nil {
 		return false
 	}
-	return apply.ExternalID == "" && state.IsState(apply.State, state.Apply.Pending, state.Apply.FailedRetryable)
+	return scope.remoteApplyID(apply) == "" && state.IsState(scope.dispatchState(apply), state.Apply.Pending, state.Apply.FailedRetryable)
 }
 
-func hasAmbiguousRemoteDispatchState(apply *storage.Apply) bool {
+func hasAmbiguousRemoteDispatchState(apply *storage.Apply, scope applyTaskScope) bool {
 	if apply == nil {
 		return false
 	}
-	return apply.ExternalID == "" &&
-		!state.IsTerminalApplyState(apply.State) &&
-		!shouldDispatchQueuedRemoteApply(apply)
+	return scope.remoteApplyID(apply) == "" &&
+		!state.IsTerminalApplyState(scope.dispatchState(apply)) &&
+		!shouldDispatchQueuedRemoteApply(apply, scope)
 }
 
 func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
@@ -1317,7 +1442,13 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 
 	oldApplyState := apply.State
 	now := time.Now()
-	apply.ExternalID = resp.ApplyId
+	// Persist the remote apply id before the parent state update so a failure
+	// after this point can resume the exact remote operation instead of
+	// dispatching a duplicate. Multi-operation drives store it on the claimed
+	// operation row; single-operation drives mutate apply.ExternalID in place.
+	if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId); err != nil {
+		return fmt.Errorf("store remote apply id for %s: %w", apply.ApplyIdentifier, err)
+	}
 	apply.State = state.Apply.Running
 	apply.ErrorMessage = ""
 	apply.CompletedAt = nil
@@ -1326,10 +1457,10 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("store remote apply id for %s: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("update dispatched gRPC apply %s after storing remote apply id %s: %w", apply.ApplyIdentifier, resp.ApplyId, err)
 	}
 	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo,
-		fmt.Sprintf("Apply dispatched to remote Tern: target=%s deployment=%s remote_apply_id=%s", target, apply.Deployment, apply.ExternalID),
+		fmt.Sprintf("Apply dispatched to remote Tern: target=%s deployment=%s remote_apply_id=%s", target, apply.Deployment, resp.ApplyId),
 		oldApplyState)
 
 	return c.pollForCompletion(ctx, apply, false, scope)
@@ -1885,7 +2016,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			} else if handled {
 				return nil
 			}
-			if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
+			if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
 				slog.Warn("pending gRPC cutover request processing failed; current apply owner will exit for operator retry",
 					"apply_id", apply.ApplyIdentifier,
 					"external_id", apply.ExternalID,
@@ -1896,17 +2027,18 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 
 			// Poll progress from remote Tern
+			remoteID := scope.remoteApplyID(apply)
 			resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-				ApplyId:     apply.ExternalID,
+				ApplyId:     remoteID,
 				Environment: apply.Environment,
 			})
 			if err != nil {
 				if status.Code(err) == codes.NotFound {
-					message := fmt.Sprintf("remote apply %s was not found by data plane", apply.ExternalID)
+					message := fmt.Sprintf("remote apply %s was not found by data plane", remoteID)
 					return c.failMissingRemoteApply(ctx, apply, message, err, scope)
 				}
 				if isTerminalRemoteProgressError(err) {
-					message := fmt.Sprintf("remote progress failed for remote apply %s: %v", apply.ExternalID, err)
+					message := fmt.Sprintf("remote progress failed for remote apply %s: %v", remoteID, err)
 					if markErr := c.markRemoteApplyFailed(ctx, apply, nil, message, false, scope); markErr != nil {
 						return fmt.Errorf("mark remote apply %s failed after terminal progress error: %w", apply.ApplyIdentifier, markErr)
 					}

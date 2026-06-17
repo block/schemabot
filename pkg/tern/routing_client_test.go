@@ -38,6 +38,16 @@ func (l routingApplyOperationLookup) Get(_ context.Context, id int64) (*storage.
 	return l[id], nil
 }
 
+func (l routingApplyOperationLookup) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
+	var ops []*storage.ApplyOperation
+	for _, op := range l {
+		if op != nil && op.ApplyID == applyID {
+			ops = append(ops, op)
+		}
+	}
+	return ops, nil
+}
+
 type routingRecordingClient struct {
 	Client
 
@@ -568,6 +578,9 @@ func TestRoutingClientProgressRejectsRemoteApplyWithoutExternalID(t *testing.T) 
 				Environment:     "production",
 			},
 		},
+		ApplyOperationLookup: routingApplyOperationLookup{
+			1: {ID: 1, ApplyID: 42, Deployment: "west"},
+		},
 		ClientForDeployment: testDeploymentClientFunc(clients),
 	})
 
@@ -578,6 +591,43 @@ func TestRoutingClientProgressRejectsRemoteApplyWithoutExternalID(t *testing.T) 
 
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "has not been accepted by remote deployment \"west\" yet")
+	assert.Nil(t, clients["west/production"].progressReq)
+}
+
+func TestRoutingClientProgressFailsClosedForMultiOpRemoteApply(t *testing.T) {
+	// An apply-scoped control/progress call carries no operation context. For a
+	// multi-operation remote apply there is no single authoritative remote apply
+	// id (each deployment's id lives on its own operation row), so routing must
+	// fail closed rather than guess one.
+	clients := map[string]*routingRecordingClient{
+		"west/production": {isRemote: true},
+	}
+	routingClient := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver:   routingResolverFunc(func(context.Context, routing.Request) ([]routing.ExecutionTarget, error) { return nil, nil }),
+		PlanLookup: routingPlanLookup{},
+		ApplyLookup: routingApplyLookup{
+			"apply-123": {
+				ID:              42,
+				ApplyIdentifier: "apply-123",
+				ExternalID:      "remote-apply-456",
+				Deployment:      "west",
+				Environment:     "production",
+			},
+		},
+		ApplyOperationLookup: routingApplyOperationLookup{
+			1: {ID: 1, ApplyID: 42, Deployment: "west"},
+			2: {ID: 2, ApplyID: 42, Deployment: "east"},
+		},
+		ClientForDeployment: testDeploymentClientFunc(clients),
+	})
+
+	_, err := routingClient.Progress(t.Context(), &ternv1.ProgressRequest{
+		ApplyId:     "apply-123",
+		Environment: "production",
+	})
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "spans 2 operations")
 	assert.Nil(t, clients["west/production"].progressReq)
 }
 

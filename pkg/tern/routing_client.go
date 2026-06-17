@@ -28,6 +28,7 @@ type ApplyLookup interface {
 // ApplyOperationLookup loads operation-scoped routing metadata for a stored apply.
 type ApplyOperationLookup interface {
 	Get(ctx context.Context, id int64) (*storage.ApplyOperation, error)
+	ListByApply(ctx context.Context, applyID int64) ([]*storage.ApplyOperation, error)
 }
 
 // RoutingClientConfig wires a RoutingClient to routing, storage, and deployment clients.
@@ -396,7 +397,7 @@ func (c *RoutingClient) clientForApply(ctx context.Context, applyIdentifier, req
 		return nil, nil, "", err
 	}
 	c.attachObserver(client, apply.ID)
-	ternApplyID, err := ternApplyIdentifierForClient(apply, client)
+	ternApplyID, err := c.ternApplyIdentifierForClient(ctx, apply, client)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -445,7 +446,22 @@ func validateStoredApplyEnvironment(operation string, apply *storage.Apply, requ
 	return fmt.Errorf("apply %q is stored for environment %q, not %q; cannot route %s", apply.ApplyIdentifier, apply.Environment, requestEnvironment, operation)
 }
 
-func ternApplyIdentifierForClient(apply *storage.Apply, client Client) (string, error) {
+// ternApplyIdentifierForClient resolves the remote apply id for an apply-scoped
+// control/progress call (which carries no operation context). A multi-operation
+// remote apply has no single parent remote id — each deployment's id lives on
+// its own operation row — so it fails closed rather than route a stale or empty
+// parent external_id to the wrong deployment. Single-operation and local applies
+// keep using the parent external_id / apply identifier.
+func (c *RoutingClient) ternApplyIdentifierForClient(ctx context.Context, apply *storage.Apply, client Client) (string, error) {
+	if client.IsRemote() {
+		operationCount, err := c.remoteApplyOperationCount(ctx, apply)
+		if err != nil {
+			return "", err
+		}
+		if operationCount > 1 {
+			return "", fmt.Errorf("apply %q spans %d operations; apply-scoped control cannot choose a remote apply id without an operation context", apply.ApplyIdentifier, operationCount)
+		}
+	}
 	if apply.ExternalID != "" {
 		return apply.ExternalID, nil
 	}
@@ -453,6 +469,20 @@ func ternApplyIdentifierForClient(apply *storage.Apply, client Client) (string, 
 		return "", fmt.Errorf("apply %q has not been accepted by remote deployment %q yet", apply.ApplyIdentifier, apply.Deployment)
 	}
 	return apply.ApplyIdentifier, nil
+}
+
+// remoteApplyOperationCount returns how many operations the apply owns, failing
+// closed when the operation lookup is unavailable or errors so an apply-scoped
+// remote control never silently assumes a single-operation apply.
+func (c *RoutingClient) remoteApplyOperationCount(ctx context.Context, apply *storage.Apply) (int, error) {
+	if c.applyOperationLookup == nil {
+		return 0, fmt.Errorf("apply operation lookup is required to route apply %q control", apply.ApplyIdentifier)
+	}
+	ops, err := c.applyOperationLookup.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return 0, fmt.Errorf("list operations for apply %q routing: %w", apply.ApplyIdentifier, err)
+	}
+	return len(ops), nil
 }
 
 func operationScopedApply(apply *storage.Apply, operation *storage.ApplyOperation) *storage.Apply {
