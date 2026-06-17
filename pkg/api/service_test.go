@@ -224,6 +224,35 @@ func TestService_RoutingTernClientRoutesApplyThroughStoredPlanTarget(t *testing.
 	assert.Equal(t, "appdb-target", deploymentClient.applyReq.Options["target"])
 }
 
+// A configured default client (e.g. a TargetRouter) serves any deployment and
+// environment that has no static or registered client, so the operator can
+// resume dynamically-routed applies without a per-deployment registration. A
+// registered client still takes precedence, and without a default the lookup
+// fails closed.
+func TestService_TernClientFallsBackToDefaultClient(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := &mockStorageWithApplyStores{plans: &staticPlanStore{}, applies: &staticApplyStore{}}
+	svc := New(store, &ServerConfig{}, nil, logger)
+
+	// No static config and no default client → fail closed.
+	_, err := svc.TernClient("unconfigured", "staging")
+	require.Error(t, err)
+
+	// Default client serves any deployment/environment otherwise unresolved.
+	def := &mockTernClient{}
+	svc.SetDefaultTernClient(def)
+	got, err := svc.TernClient("unconfigured", "staging")
+	require.NoError(t, err)
+	assert.Same(t, def, got)
+
+	// A registered client takes precedence over the default.
+	registered := &mockTernClient{}
+	svc.RegisterTernClient("primary", "staging", registered)
+	got, err = svc.TernClient("primary", "staging")
+	require.NoError(t, err)
+	assert.Same(t, registered, got)
+}
+
 func TestTernConfig_Endpoint_EmptyEndpoint(t *testing.T) {
 	config := TernConfig{
 		"default": {

@@ -108,6 +108,7 @@ type Service struct {
 	storage           storage.Storage
 	config            *ServerConfig
 	ternClients       map[string]tern.Client // keyed by "deployment/environment", lazily created
+	defaultTernClient tern.Client            // fallback for any deployment/environment without a static or gRPC client (e.g. a TargetRouter)
 	routingTernClient *tern.RoutingClient
 	ternMu            sync.Mutex // protects tern client caches and engineFactories
 	logger            *slog.Logger
@@ -332,6 +333,17 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 		}
 	}
 
+	// A configured default client serves any deployment/environment that has no
+	// static local DSN — typically a TargetRouter that resolves the connection
+	// from the request's target. This lets the durable-apply operator resolve
+	// dynamically-routed targets without a per-request RegisterTernClient. It is
+	// shared across keys (the router resolves per request), so it is not cached
+	// under this key.
+	if s.defaultTernClient != nil {
+		s.logger.Debug("using default tern client for dynamic target resolution", "deployment", deployment, "environment", environment)
+		return s.defaultTernClient, nil
+	}
+
 	// Fall back to gRPC mode (TernDeployments)
 	address, err := s.config.TernDeployments.Endpoint(deployment, environment)
 	if err != nil {
@@ -401,6 +413,17 @@ func (s *Service) RegisterTernClient(deployment, environment string, client tern
 	s.ternMu.Lock()
 	defer s.ternMu.Unlock()
 	s.ternClients[key] = client
+}
+
+// SetDefaultTernClient sets a fallback tern client used by TernClient for any
+// deployment/environment that has no static local DSN configured. Pass a
+// TargetRouter so the durable-apply operator and routing client resolve the
+// connection from each request's target — the dynamic-resolution counterpart to
+// RegisterTernClient, without needing one registration per deployment.
+func (s *Service) SetDefaultTernClient(client tern.Client) {
+	s.ternMu.Lock()
+	defer s.ternMu.Unlock()
+	s.defaultTernClient = client
 }
 
 // malformedTokenError builds an error for a token that did not parse into a
