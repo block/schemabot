@@ -2242,6 +2242,45 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate(t *testing.T) {
 	}
 }
 
+// TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope pins the dispatch
+// gate for multi-operation drives. The operator claim transitions an operation
+// pending→running in a separate transaction before the drive runs, so a freshly
+// claimed operation reaches dispatch in running with no per-operation remote id
+// yet. That first dispatch must proceed — a running operation with an empty
+// remote id is not the ambiguous crash case the whole-apply path rejects.
+func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
+	tests := []struct {
+		name     string
+		opState  string
+		remoteID string
+		multiOp  bool
+		want     bool
+	}{
+		{name: "multi-op running without remote id dispatches", opState: state.ApplyOperation.Running, multiOp: true, want: true},
+		{name: "multi-op pending without remote id dispatches", opState: state.ApplyOperation.Pending, multiOp: true, want: true},
+		{name: "multi-op running with remote id does not dispatch", opState: state.ApplyOperation.Running, remoteID: "remote-apply-123", multiOp: true, want: false},
+		{name: "multi-op terminal without remote id does not dispatch", opState: state.ApplyOperation.Completed, multiOp: true, want: false},
+		{name: "single-op running without remote id does not dispatch", opState: state.ApplyOperation.Running, multiOp: false, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The parent apply is running because a sibling deployment is active;
+			// the per-operation remote id (not apply.ExternalID) governs dispatch.
+			apply := &storage.Apply{State: state.Apply.Running}
+			scope := applyTaskScope{
+				applyOperationID: 1,
+				operation: &storage.ApplyOperation{
+					State:               tt.opState,
+					EngineResumeContext: tt.remoteID,
+				},
+				multiOperation: tt.multiOp,
+			}
+			assert.Equal(t, tt.want, shouldDispatchQueuedRemoteApply(apply, scope))
+		})
+	}
+}
+
 func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 	// Progress returns STOPPED initially so ResumeApply checks remote state,
 	// confirms the apply is stopped, and calls Start. After Start, the mock

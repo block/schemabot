@@ -1037,7 +1037,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		return c.dispatchPendingApply(ctx, apply, scope)
 	}
 	if hasAmbiguousRemoteDispatchState(apply, scope) {
-		errMsg := fmt.Sprintf("gRPC apply %s is %s without external_id; remote dispatch state is ambiguous", apply.ApplyIdentifier, apply.State)
+		errMsg := fmt.Sprintf("gRPC apply %s is %s without a remote apply id; remote dispatch state is ambiguous", apply.ApplyIdentifier, scope.dispatchState(apply))
 		if err := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); err != nil {
 			return fmt.Errorf("%s; persist failure state: %w", errMsg, err)
 		}
@@ -1165,7 +1165,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 				message := fmt.Sprintf("remote start failed for remote apply %s: %v", remoteID, err)
 				slog.Warn("remote gRPC start failed; storing stopped state for operator retry",
 					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
+					"remote_apply_id", remoteID,
 					"database", apply.Database,
 					"environment", apply.Environment,
 					"error", err)
@@ -1297,7 +1297,7 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
-		message := fmt.Sprintf("gRPC apply %s is waiting for deploy without external_id; start dispatch state is ambiguous", apply.ApplyIdentifier)
+		message := fmt.Sprintf("gRPC apply %s is waiting for deploy without a remote apply id; start dispatch state is ambiguous", apply.ApplyIdentifier)
 		if err := failPendingStartControlRequests(ctx, c.storage, apply, message); err != nil {
 			return err
 		}
@@ -1311,7 +1311,7 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 		message := fmt.Sprintf("remote deferred deploy start failed for remote apply %s: %v", remoteID, err)
 		slog.Warn("remote gRPC deferred deploy start failed; storing start request failure",
 			"apply_id", apply.ApplyIdentifier,
-			"external_id", apply.ExternalID,
+			"remote_apply_id", remoteID,
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"error", err)
@@ -1340,7 +1340,22 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	if apply == nil {
 		return false
 	}
-	return scope.remoteApplyID(apply) == "" && state.IsState(scope.dispatchState(apply), state.Apply.Pending, state.Apply.FailedRetryable)
+	if scope.remoteApplyID(apply) != "" {
+		return false
+	}
+	dispatchState := scope.dispatchState(apply)
+	if state.IsState(dispatchState, state.Apply.Pending, state.Apply.FailedRetryable) {
+		return true
+	}
+	// An operation-scoped multi-op drive claims its operation pending→running in
+	// a separate transaction before this drive runs, so a freshly claimed
+	// operation reaches dispatch in running with no operation-scoped remote id
+	// yet. An empty per-operation remote id means nothing was durably dispatched
+	// to remote Tern, so this is the operation's first dispatch — not the
+	// ambiguous "running with no remote id" case the whole-apply path guards
+	// against, where a shared external_id could have been lost after a real
+	// dispatch.
+	return scope.usesOperationRemoteResume() && state.IsState(dispatchState, state.Apply.Running)
 }
 
 func hasAmbiguousRemoteDispatchState(apply *storage.Apply, scope applyTaskScope) bool {
