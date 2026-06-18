@@ -820,6 +820,12 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	if op == nil {
 		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrApplyOperationRowMissing)
 	}
+	// Trust-boundary guard: the operation must belong to the passed-in apply, or
+	// an operation-scoped drive could advance another apply's deployment under
+	// this apply's state. The routing and gRPC paths enforce the same invariant.
+	if op.ApplyID != apply.ID {
+		return fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", applyOperationID, op.ApplyID, apply.ApplyIdentifier, apply.ID)
+	}
 	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
 		return fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
@@ -842,6 +848,9 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 // operation, so an empty result fails closed the same way ResumeApplyOperation
 // does rather than failing the whole parent apply.
 func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	if apply == nil {
+		return fmt.Errorf("stored apply is required to drive apply_operation %d cutover", applyOperationID)
+	}
 	tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, applyOperationID)
 	if err != nil {
 		return fmt.Errorf("get tasks for apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
@@ -855,6 +864,17 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 	}
 	if op == nil {
 		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrApplyOperationRowMissing)
+	}
+	// Trust-boundary guard: the operation must belong to the passed-in apply, or
+	// the cutover drive could force another apply's deployment through its swap
+	// under this apply's state. The routing and gRPC paths enforce the same.
+	if op.ApplyID != apply.ID {
+		return fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", applyOperationID, op.ApplyID, apply.ApplyIdentifier, apply.ID)
+	}
+	// Fail closed unless the operation is actually in a cutover phase. A
+	// copy-phase or terminal operation must never be forced into a cutover drive.
+	if !isCutoverDriveState(op.State) {
+		return fmt.Errorf("apply_operation %d (apply %s) is in state %q, not parked or recovering for cutover", applyOperationID, apply.ApplyIdentifier, op.State)
 	}
 	// Force the cutover: clear DeferCutover so the drive auto-triggers the swap
 	// when the engine reaches waiting_for_cutover, and never release at the

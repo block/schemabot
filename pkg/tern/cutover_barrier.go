@@ -1,6 +1,19 @@
 package tern
 
-import "github.com/block/schemabot/pkg/storage"
+import (
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+)
+
+// isCutoverDriveState reports whether an operation is in a phase the ordered
+// cutover drive may resume: parked at the barrier (waiting_for_cutover) or
+// already mid-cutover (cutting_over / revert_window) for stale-lease recovery.
+// These are exactly the states the OC-1 cutover-claim predicate selects. A
+// copy-phase or terminal operation is rejected so a mismatched or stale claim
+// can never force an unrelated operation through the high-risk swap.
+func isCutoverDriveState(opState string) bool {
+	return state.IsState(opState, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.RevertWindow)
+}
 
 // shouldAutoDeferCutover reports whether an operation-scoped copy drive must park
 // at the cutover barrier automatically. It is true only for an operation of a

@@ -102,6 +102,30 @@ func TestGroupedApplyHonoursEffectiveOptions(t *testing.T) {
 	assert.Equal(t, "spirit_atomic_cutover", groupedApplyMode(apply, effective))
 }
 
+// The cutover drive may resume an operation parked at the barrier or already
+// mid-cutover (stale-lease recovery), but never a copy-phase or terminal one.
+func TestIsCutoverDriveState(t *testing.T) {
+	tests := []struct {
+		state string
+		want  bool
+	}{
+		{state.Apply.WaitingForCutover, true},
+		{state.Apply.CuttingOver, true},
+		{state.Apply.RevertWindow, true},
+		{state.Apply.Pending, false},
+		{state.Apply.Running, false},
+		{state.Apply.WaitingForDeploy, false},
+		{state.Apply.Completed, false},
+		{state.Apply.Failed, false},
+		{state.Apply.Stopped, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.state, func(t *testing.T) {
+			assert.Equal(t, tt.want, isCutoverDriveState(tt.state))
+		})
+	}
+}
+
 // An ordered-cutover drive (forceCutoverResume) must load the parked engine
 // checkpoint even though the barrier park deliberately leaves DeferCutover unset
 // on the shared apply, while still requiring the apply to actually be parked.
