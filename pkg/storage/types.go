@@ -405,13 +405,13 @@ type Apply struct {
 	// Once the retry budget is exhausted, the apply becomes failed.
 	Attempt int
 
-	// LeaseOwner identifies the worker that last claimed this apply. It is
+	// LeaseOwner identifies the driver that last claimed this apply. It is
 	// operator-facing context; LeaseToken is the ownership capability used for
 	// correctness.
 	LeaseOwner string
 
 	// LeaseToken is rotated on each claim. Owned writes must include the current
-	// token to avoid stale workers overwriting a newer owner.
+	// token to avoid stale drivers overwriting a newer owner.
 	LeaseToken string
 
 	// LeaseAcquiredAt records when the current lease was acquired.
@@ -513,9 +513,9 @@ type ApplyOperation struct {
 	CompletedAt *time.Time
 
 	// LeaseOwner, LeaseToken, and LeaseAcquiredAt are the operation's own claim
-	// lease, rotated when a worker claims the row via FindNextApplyOperation and
+	// lease, rotated when a driver claims the row via FindNextApplyOperation and
 	// refreshed by its heartbeat. They mirror the apply-level lease columns so a
-	// worker can guard operation-scoped writes on this row's token instead of the
+	// driver can guard operation-scoped writes on this row's token instead of the
 	// parent apply's, letting sibling deployments run independently.
 	LeaseOwner      string
 	LeaseToken      string
@@ -593,7 +593,7 @@ const (
 type ControlRequestStatus string
 
 const (
-	// ControlRequestPending means an operator worker still needs to act.
+	// ControlRequestPending means an operator driver still needs to act.
 	ControlRequestPending ControlRequestStatus = "pending"
 	// ControlRequestCompleted means the requested operation has been accepted.
 	ControlRequestCompleted ControlRequestStatus = "completed"

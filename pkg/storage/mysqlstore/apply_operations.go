@@ -532,7 +532,7 @@ func (s *applyOperationStore) GetEngineResumeState(ctx context.Context, operatio
 }
 
 // applyOperationHeartbeatStaleness is the lease window after which a claimed
-// apply_operations row may be re-claimed by another worker. Mirrors the apply
+// apply_operations row may be re-claimed by another driver. Mirrors the apply
 // heartbeat staleness in applies.go.
 const applyOperationHeartbeatStaleness = "1 MINUTE"
 
@@ -586,7 +586,7 @@ const applyOperationHeartbeatStaleness = "1 MINUTE"
 // siblings, so this gate is dormant regardless of policy.
 //
 // Mirrors ApplyStore.FindNextApply: SELECT ... FOR UPDATE SKIP LOCKED to
-// avoid worker races, READ COMMITTED isolation to prevent next-key range
+// avoid driver races, READ COMMITTED isolation to prevent next-key range
 // locks from serializing claims across otherwise independent rows.
 //
 // Caller: the operator's per-poll recovery (Service.recoverApplyOperation)
@@ -677,9 +677,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//         stale — crash recovery, with no budget gate (the attempt was already
 	//         admitted and counted when the parent was claimed).
 	//     Claiming a failed_retryable parent transitions it to running and refreshes
-	//     applies.updated_at (see persistApplyClaim), so once a worker owns the
+	//     applies.updated_at (see persistApplyClaim), so once a driver owns the
 	//     retry neither sub-condition matches and peers back off instead of
-	//     churning on a row another worker is actively driving.
+	//     churning on a row another driver is actively driving.
 	//
 	// There is intentionally no "pending + pending start request" clause to
 	// match ApplyStore.FindNextApply's pending-start clause. That apply-level
@@ -796,7 +796,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		return nil, fmt.Errorf("query next claimable apply_operation: %w", err)
 	}
 
-	// Rotate a fresh operation lease onto the claimed row so the claiming worker
+	// Rotate a fresh operation lease onto the claimed row so the claiming driver
 	// can guard operation-scoped writes on this token. Mirrors persistApplyClaim
 	// at the apply level.
 	leaseToken := uuid.NewString()
@@ -836,7 +836,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		// Re-leasing a row that already started: a stale active heartbeat, or a
 		// stopped operation whose parent apply has a pending start request. Both
 		// keep their current state and are driven by the caller, so rotate the
-		// lease onto this worker and refresh the heartbeat.
+		// lease onto this driver and refresh the heartbeat.
 		_, err = tx.ExecContext(ctx, `
 			UPDATE apply_operations
 			SET updated_at = NOW(),
@@ -876,7 +876,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 //     sibling stop blocking, matching the copy gate.
 //   - Recover a stale in-flight cutover. A row already in cutting_over or
 //     revert_window whose heartbeat has gone stale is re-leased without changing
-//     its state — its driver died mid-cutover and another worker resumes it. This
+//     its state — its driver died mid-cutover and another driver resumes it. This
 //     path carries no ordering gate: the row already started its cutover, so
 //     resuming is recovering work, not starting a new swap.
 //
@@ -989,7 +989,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 		}
 	} else {
 		// Recovering a stale in-flight cutover (cutting_over or revert_window):
-		// keep the current state and rotate the lease onto this worker.
+		// keep the current state and rotate the lease onto this driver.
 		_, err = tx.ExecContext(ctx, `
 			UPDATE apply_operations
 			SET updated_at = NOW(),
@@ -1013,7 +1013,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 }
 
 // Heartbeat refreshes updated_at to maintain the claim's lease. Should be
-// called periodically by a worker holding the lease. Silent no-op when the
+// called periodically by a driver holding the lease. Silent no-op when the
 // row no longer exists (mirrors ApplyStore.Heartbeat).
 func (s *applyOperationStore) Heartbeat(ctx context.Context, id int64) error {
 	guard, err := operationWriteGuardFromContext(ctx)
@@ -1157,7 +1157,7 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 	if rows == 0 {
 		// No pending rows changed: either there were none (lease still valid, a
 		// legitimate no-op) or the lease token no longer matches (ownership lost).
-		// Distinguish the two so a displaced worker fails closed.
+		// Distinguish the two so a displaced driver fails closed.
 		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
 			return 0, err
 		}

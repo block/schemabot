@@ -211,7 +211,7 @@ func TestControlRequestStore_LeaseGuardsPendingResolution(t *testing.T) {
 		UPDATE applies
 		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
 		WHERE id = ?
-	`, "current-worker", "current-token", applyID)
+	`, "current-driver", "current-token", applyID)
 	require.NoError(t, err)
 
 	created, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
@@ -223,7 +223,7 @@ func TestControlRequestStore_LeaseGuardsPendingResolution(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, alreadyPending)
 
-	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: applyID, Owner: "old-worker", Token: "stale-token"})
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: applyID, Owner: "old-driver", Token: "stale-token"})
 	require.ErrorIs(t, store.ControlRequests().CompletePending(staleCtx, applyID, storage.ControlOperationStart), storage.ErrApplyLeaseLost)
 	require.ErrorIs(t, store.ControlRequests().FailPending(staleCtx, applyID, storage.ControlOperationStart, "stale failure"), storage.ErrApplyLeaseLost)
 
@@ -232,7 +232,7 @@ func TestControlRequestStore_LeaseGuardsPendingResolution(t *testing.T) {
 	require.NotNil(t, pending)
 	assert.Equal(t, created.ID, pending.ID)
 
-	currentCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: applyID, Owner: "current-worker", Token: "current-token"})
+	currentCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: applyID, Owner: "current-driver", Token: "current-token"})
 	require.NoError(t, store.ControlRequests().CompletePending(currentCtx, applyID, storage.ControlOperationStart))
 	completed := getControlRequestByID(t, store, created.ID)
 	require.NotNil(t, completed)
