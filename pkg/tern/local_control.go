@@ -13,8 +13,58 @@ import (
 )
 
 // Cutover triggers the cutover phase when defer_cutover was used.
+// Cutover queues a durable cutover request. The instance that owns the schema
+// change performs the cutover when it observes the pending request through
+// shared storage, so the request is safe on any instance serving this route.
 func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
-	return c.cutover(ctx, req, "")
+	return c.requestCutover(ctx, req, "")
+}
+
+// requestCutover resolves the target apply and records a durable cutover request
+// for its owner to process. It never invokes the local engine, mirroring how
+// stop and start are routed to the apply owner.
+func (c *LocalClient) requestCutover(ctx context.Context, req *ternv1.CutoverRequest, caller string) (*ternv1.CutoverResponse, error) {
+	c.logger.Info("Cutover requested", "database", c.config.Database, "type", c.config.Type, "apply_id", req.ApplyId, "environment", req.Environment, "caller", caller)
+	apply, err := c.resolveCutoverApply(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("no active schema change")
+	}
+	return c.queueCutoverRequest(ctx, apply, caller)
+}
+
+// resolveCutoverApply finds the apply a cutover request targets, by apply
+// identifier when provided or by the database's active task otherwise.
+func (c *LocalClient) resolveCutoverApply(ctx context.Context, req *ternv1.CutoverRequest) (*storage.Apply, error) {
+	if req.ApplyId != "" {
+		apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+		if err != nil {
+			return nil, fmt.Errorf("load apply %s before cutover: %w", req.ApplyId, err)
+		}
+		if apply == nil {
+			return nil, fmt.Errorf("load apply %s before cutover: %w", req.ApplyId, storage.ErrApplyNotFound)
+		}
+		return apply, nil
+	}
+
+	task, err := c.getActiveTaskForDatabase(ctx, c.config.Database)
+	if err != nil {
+		return nil, err
+	}
+	if task == nil {
+		c.logger.Info("cutover request found no active task", "database", c.config.Database, "type", c.config.Type)
+		return nil, nil
+	}
+	apply, err := c.storage.Applies().Get(ctx, task.ApplyID)
+	if err != nil {
+		return nil, fmt.Errorf("load apply %d before cutover: %w", task.ApplyID, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("load apply %d before cutover: %w", task.ApplyID, storage.ErrApplyNotFound)
+	}
+	return apply, nil
 }
 
 func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, caller string) (*ternv1.CutoverResponse, error) {
@@ -130,6 +180,49 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 		return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: errorMessage}, nil
 	}
 
+	return &ternv1.CutoverResponse{Accepted: true}, nil
+}
+
+// queueCutoverRequest records a durable cutover control request and returns
+// once it is queued. The instance that owns the schema change observes the
+// pending request through shared storage and performs the cutover, the same way
+// stop and start are routed to the owner. A cutover RPC can land on any instance
+// sharing the route's storage, so it must never act on a local engine that may
+// not be running this schema change.
+func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.CutoverResponse, error) {
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available")
+	}
+	requestedBy := caller
+	if requestedBy == "" {
+		requestedBy = "tern-grpc"
+	}
+	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: requestedBy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if alreadyPending {
+		c.logger.Info("cutover request already pending for apply owner",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", requestedBy)
+	} else {
+		c.logger.Info("cutover request queued for apply owner",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", requestedBy)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Cutover request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
+	}
+	c.wakeOperatorForControlRequest(apply)
 	return &ternv1.CutoverResponse{Accepted: true}, nil
 }
 

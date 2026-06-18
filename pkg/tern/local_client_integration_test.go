@@ -1571,14 +1571,21 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStor
 	require.NoError(t, err)
 	assert.Equal(t, ternv1.State_STATE_RECOVERING, progressResp.State)
 
+	// A cutover request is queued for the apply owner; it is not performed while
+	// the apply is recovering, so storage stays in the recovery state until the
+	// owner reattaches and proves cutover readiness.
 	cutoverResp, err := client.Cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, cutoverResp)
-	assert.False(t, cutoverResp.Accepted)
-	assert.Contains(t, cutoverResp.ErrorMessage, "recovering")
+	assert.True(t, cutoverResp.Accepted, "cutover is queued for the owner even during recovery")
+
+	storedApply, err = stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Recovering, storedApply.State, "queuing a cutover must not perform it while recovering")
 
 	recoveryEngine.progress = &engine.ProgressResult{
 		State: engine.StateRunning,

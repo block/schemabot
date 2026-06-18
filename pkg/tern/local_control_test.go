@@ -470,9 +470,10 @@ func TestLocalClient_StopAllTasksTerminalDerivesApplyState(t *testing.T) {
 	}
 }
 
-// PlanetScale cutover must include the opaque resume state recorded for the
-// apply. If that state is missing, LocalClient returns an error before
-// invoking the engine so the storage invariant violation is visible.
+// When the apply owner performs a cutover, the request must include the opaque
+// resume state recorded for the apply. If that state is missing, the owner
+// returns an error before invoking the engine so the storage invariant
+// violation is visible.
 func TestLocalClient_CutoverRequiresEngineResumeState(t *testing.T) {
 	operationID := int64(99)
 	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-control"}
@@ -486,7 +487,7 @@ func TestLocalClient_CutoverRequiresEngineResumeState(t *testing.T) {
 	eng := &controlCaptureEngine{}
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
 
-	_, err := client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier})
+	_, err := client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.ErrorIs(t, err, storage.ErrEngineResumeStateNotFound)
 	assert.Nil(t, eng.cutoverReq, "cutover should not call the engine without resume state")
@@ -544,7 +545,7 @@ func TestLocalClient_CutoverRequiresCompleteEngineResumeState(t *testing.T) {
 			resumeState := maybeEngineResumeStateFromPlanetScaleData(operationID, tc.resumeData)
 			client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
-			_, err := client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier})
+			_, err := client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 			require.ErrorContains(t, err, "cutover control resume state is incomplete")
 			require.ErrorContains(t, err, tc.missingPart)
@@ -577,7 +578,7 @@ func TestLocalClient_CutoverPassesEngineResumeState(t *testing.T) {
 	eng := &controlCaptureEngine{}
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
 
-	resp, err := client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier})
+	resp, err := client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
 	assert.True(t, resp.Accepted)

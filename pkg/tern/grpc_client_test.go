@@ -598,6 +598,14 @@ type mockApplyStore struct {
 	updates   []*storage.Apply
 }
 
+func (m *mockApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
+	if m.apply == nil {
+		return nil, nil
+	}
+	apply := *m.apply
+	return &apply, nil
+}
+
 func (m *mockApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 	if m.apply == nil {
 		return nil, nil
