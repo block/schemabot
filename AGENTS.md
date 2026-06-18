@@ -92,6 +92,8 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 **Terminology:** NEVER use the word "migration" in code, comments, CLI output, or error messages. ALWAYS use "schema change" instead.
 
+**Driver terminology:** A *driver* is the operator worker that claims an apply via `FOR UPDATE SKIP LOCKED`, holds its lease (`LeaseOwner` / `LeaseToken`), and *drives* it to a terminal state. Use *driver* (noun) and *drive* (verb) — not *worker* — in new code, comments, logs, docs, and tests for the lease-holding goroutine and the work it performs. This is distinct from the **Go MySQL driver** (`github.com/go-sql-driver/mysql`, `database/sql/driver`): always refer to that as the "Go MySQL driver" or "SQL driver" and keep it import-qualified so the two senses never collide.
+
 **OSS-ready code:** Never reference internal company names or proprietary details in code or comments.
 
 ### PR Self-Review Bar
