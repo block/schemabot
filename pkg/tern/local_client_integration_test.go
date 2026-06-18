@@ -1613,6 +1613,10 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStor
 	require.NotNil(t, storedTask)
 	assert.Equal(t, state.Task.Recovering, storedTask.State)
 
+	// The read path never advances recovery state from the engine — surfacing
+	// cutover readiness is the apply owner's job. Even when the engine reports
+	// the schema change is waiting for cutover, progress reflects the stored
+	// recovery state until the owner persists the transition.
 	recoveryEngine.progress = &engine.ProgressResult{
 		State: engine.StateWaitingForCutover,
 		Tables: []engine.TableProgress{{
@@ -1622,6 +1626,26 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStor
 			Progress:  100,
 		}},
 	}
+	progressResp, err = client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.State_STATE_RECOVERING, progressResp.State)
+
+	// Once the owner reattach loop proves cutover readiness and persists it,
+	// progress reflects the cutover-ready state from storage on any instance.
+	storedTask, err = stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	storedTask.State = state.Task.WaitingForCutover
+	require.NoError(t, stor.Tasks().Update(ctx, storedTask))
+	storedApply, err = stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	storedApply.State = state.Apply.WaitingForCutover
+	require.NoError(t, stor.Applies().Update(ctx, storedApply))
+
 	progressResp, err = client.Progress(ctx, &ternv1.ProgressRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: localClientTestEnvironment,

@@ -534,6 +534,16 @@ type Engine struct {
 
 // Compile-time check that Engine implements the interface.
 var _ engine.Engine = (*Engine)(nil)
+var _ engine.ExternallyAuthoritativeProgress = (*Engine)(nil)
+
+// ProgressIsExternallyAuthoritative reports that PlanetScale progress is read
+// from PlanetScale's deploy-request and VITESS_MIGRATIONS state rather than
+// instance-local memory, so any instance returns the same correct result and
+// the progress read path may query the engine directly regardless of which
+// instance owns the schema change.
+func (e *Engine) ProgressIsExternallyAuthoritative() bool {
+	return true
+}
 
 // New creates a new PlanetScale engine with the given logger.
 func New(logger *slog.Logger) *Engine {

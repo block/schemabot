@@ -326,20 +326,28 @@ func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
 
 type fakeControlEngine struct {
 	engine.Engine
-	stopCount      int
-	startCount     int
-	cutoverCount   int
-	cutoverResult  *engine.ControlResult
-	cutoverErr     error
-	progressReq    *engine.ProgressRequest
-	progressResult *engine.ProgressResult
-	progressErr    error
-	planResult     *engine.PlanResult
-	applyResult    *engine.ApplyResult
-	applyErr       error
+	stopCount               int
+	startCount              int
+	cutoverCount            int
+	cutoverResult           *engine.ControlResult
+	cutoverErr              error
+	progressReq             *engine.ProgressRequest
+	progressResult          *engine.ProgressResult
+	progressErr             error
+	planResult              *engine.PlanResult
+	applyResult             *engine.ApplyResult
+	applyErr                error
+	externallyAuthoritative bool
 }
 
 func (e *fakeControlEngine) Name() string { return "fake" }
+
+// ProgressIsExternallyAuthoritative models an engine whose progress is read from
+// authoritative external state (like PlanetScale) when set, so the progress read
+// path queries it directly instead of serving from stored progress.
+func (e *fakeControlEngine) ProgressIsExternallyAuthoritative() bool {
+	return e.externallyAuthoritative
+}
 
 func (e *fakeControlEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
 	if e.planResult != nil {
@@ -629,7 +637,7 @@ func TestLocalClient_VitessProgressRequiresEngineResumeState(t *testing.T) {
 		TableName:        "users",
 		State:            state.Task.Running,
 	}
-	eng := &fakeControlEngine{}
+	eng := &fakeControlEngine{externallyAuthoritative: true}
 	client := &LocalClient{
 		config: LocalConfig{
 			Database: "testdb",
@@ -677,7 +685,7 @@ func TestLocalClient_VitessProgressPassesAndPersistsEngineResumeState(t *testing
 	}
 	updatedMetadata := `{"branch_name":"branch-123","deploy_request_id":321,"deploy_request_url":"https://example.test/deploys/321","is_instant":true}`
 	applyOperations := &exactProgressApplyOperationStore{data: storedResumeState}
-	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{
+	eng := &fakeControlEngine{externallyAuthoritative: true, progressResult: &engine.ProgressResult{
 		State: engine.StateRunning,
 		ResumeState: &engine.ResumeState{
 			MigrationContext: "ctx-123",
