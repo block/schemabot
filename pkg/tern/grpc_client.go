@@ -564,6 +564,21 @@ func (c *GRPCClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1
 	return c.client.Stop(ctx, req)
 }
 
+// logOperationDriveLeavesParentStop records that a multi-operation
+// operation-only drive observed an apply-level pending stop request and is
+// leaving it pending. Such a drive owns only its operation; the parent stop
+// request is completed by the operator once the projection CAS derives the
+// parent terminal, so completing it from the drive would resolve the
+// apply-level stop early while sibling operations are still live.
+func logOperationDriveLeavesParentStop(apply *storage.Apply, scope applyTaskScope) {
+	slog.Info("operation-only drive leaving apply-level stop request for operator projection",
+		"apply_id", apply.ApplyIdentifier,
+		"apply_operation_id", scope.applyOperationID,
+		"database", apply.Database,
+		"environment", apply.Environment,
+		"state", apply.State)
+}
+
 func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
 	controlReq, err := pendingStopControlRequest(ctx, c.storage, apply)
 	if err != nil {
@@ -572,7 +587,26 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	if controlReq == nil {
 		return false, nil
 	}
-	if completed, err := completePendingStopIfStoredApplyResolved(ctx, c.storage, apply); err != nil {
+	if scope.suppressesDirectParentApplyWrites() {
+		// An operation-only drive must not complete the apply-level stop
+		// request: the operator projection owns it and completes it once the
+		// parent apply derives terminal. If the parent is already terminal in
+		// storage the operator has resolved it, so this drive is done; if not,
+		// fall through so this drive can still stop its own operation's remote
+		// work and leave the parent stop pending for the operator.
+		storedApply, err := c.storage.Applies().Get(ctx, apply.ID)
+		if err != nil {
+			return true, fmt.Errorf("load apply %s before leaving pending stop for operator projection: %w", apply.ApplyIdentifier, err)
+		}
+		if storedApply == nil {
+			return true, fmt.Errorf("load apply %s before leaving pending stop for operator projection: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+		}
+		if state.IsTerminalApplyState(storedApply.State) {
+			*apply = *storedApply
+			logOperationDriveLeavesParentStop(apply, scope)
+			return true, nil
+		}
+	} else if completed, err := completePendingStopIfStoredApplyResolved(ctx, c.storage, apply); err != nil {
 		return true, err
 	} else if completed {
 		slog.Info("completing pending gRPC stop request for resolved apply",
@@ -592,6 +626,10 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		return true, nil
 	}
 	if state.IsTerminalApplyState(apply.State) {
+		if scope.suppressesDirectParentApplyWrites() {
+			logOperationDriveLeavesParentStop(apply, scope)
+			return true, nil
+		}
 		slog.Info("completing pending gRPC stop request for terminal apply",
 			"apply_id", apply.ApplyIdentifier,
 			"external_id", apply.ExternalID,
@@ -618,6 +656,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			if err := c.stopUndispatchedApplyOperation(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
 				return true, err
 			}
+			logOperationDriveLeavesParentStop(apply, scope)
 			return true, nil
 		}
 		if err := c.stopUndispatchedApply(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
@@ -676,16 +715,15 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 			return true, err
 		}
-		// In an operation-scoped multi-op drive the stop request is shared
-		// across sibling operations. One operation reaching terminal must not
-		// complete the apply-level stop request, or stopped siblings would stop
-		// observing it before they settle. Leave it pending for the rollout
-		// projection to complete once the aggregate settles. Restore the
-		// in-memory parent apply fields the driver does not own so this
-		// operation's terminal remote state does not leak onto the shared apply
-		// and let a later stop pass treat the parent as terminal.
-		if scope.usesOperationRemoteResume() {
+		// An operation-only drive owns only its operation: the apply-level stop
+		// request is shared across siblings and completed by the operator
+		// projection once the parent derives terminal. Leave it pending here and
+		// restore the in-memory parent apply fields the driver does not own, so
+		// this operation's terminal remote state does not leak onto the shared
+		// apply and let a later stop pass treat the parent as terminal.
+		if scope.suppressesDirectParentApplyWrites() {
 			apply.State, apply.StartedAt, apply.UpdatedAt = priorState, priorStartedAt, priorUpdatedAt
+			logOperationDriveLeavesParentStop(apply, scope)
 			return true, nil
 		}
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
@@ -759,16 +797,15 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 		return false, err
 	}
-	// In an operation-scoped multi-op drive the stop request is shared across
-	// sibling operations. One operation reconciling terminal progress must not
-	// complete the apply-level stop request, or stopped siblings would stop
-	// observing it before they settle. Leave it pending for the rollout
-	// projection to complete once the aggregate settles. Restore the in-memory
-	// parent apply fields the driver does not own so this operation's terminal
-	// remote state does not leak onto the shared apply and let a later stop pass
-	// treat the parent as terminal.
-	if scope.usesOperationRemoteResume() {
+	// An operation-only drive owns only its operation: the apply-level stop
+	// request is shared across siblings and completed by the operator projection
+	// once the parent derives terminal. Leave it pending here and restore the
+	// in-memory parent apply fields the driver does not own, so this operation's
+	// terminal remote state does not leak onto the shared apply and let a later
+	// stop pass treat the parent as terminal.
+	if scope.suppressesDirectParentApplyWrites() {
 		apply.State, apply.StartedAt, apply.UpdatedAt = priorState, priorStartedAt, priorUpdatedAt
+		logOperationDriveLeavesParentStop(apply, scope)
 		return true, nil
 	}
 	if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
@@ -1171,7 +1208,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	}
 	startRequested := startControlReq != nil
 	if startRequested {
-		if err := c.waitForPendingStopBeforeStart(ctx, apply, scope, startControlReq); err != nil {
+		if deferred, err := c.waitForPendingStopBeforeStart(ctx, apply, scope, startControlReq); err != nil || deferred {
 			return err
 		}
 	}
@@ -1278,7 +1315,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 
 		// Only call Start if Tern confirms the apply is actually stopped.
 		if state.IsState(apply.State, state.Apply.Stopped) {
-			if err := c.completePendingStopBeforeRemoteStart(ctx, apply); err != nil {
+			if deferred, err := c.completePendingStopBeforeRemoteStart(ctx, apply, scope); err != nil || deferred {
 				return err
 			}
 			_, err := c.client.Start(ctx, &ternv1.StartRequest{
@@ -1335,16 +1372,33 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	return c.pollForCompletion(ctx, apply, startRequested, scope)
 }
 
-func (c *GRPCClient) completePendingStopBeforeRemoteStart(ctx context.Context, apply *storage.Apply) error {
+// completePendingStopBeforeRemoteStart completes an apply-level stop request
+// that raced in just before a remote start. It returns deferred=true when an
+// operation-only drive observes a pending stop: that drive never completes the
+// parent stop (the operator projection owns it), so it must not start remote
+// work and leaves both the stop and start pending for the operator.
+func (c *GRPCClient) completePendingStopBeforeRemoteStart(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
 	controlReq, err := pendingStopControlRequest(ctx, c.storage, apply)
 	if err != nil {
-		return fmt.Errorf("check pending stop before starting stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("check pending stop before starting stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if controlReq == nil {
-		return nil
+		return false, nil
+	}
+	if scope.suppressesDirectParentApplyWrites() {
+		logOperationDriveLeavesParentStop(apply, scope)
+		slog.Info("operation-only drive deferring remote start until apply-level stop resolves",
+			"apply_id", apply.ApplyIdentifier,
+			"apply_operation_id", scope.applyOperationID,
+			"remote_apply_id", scope.remoteApplyID(apply),
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		return true, nil
 	}
 	if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
-		return fmt.Errorf("complete pending stop before starting stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("complete pending stop before starting stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	slog.Info("completed pending gRPC stop request before starting stopped remote apply",
 		"apply_id", apply.ApplyIdentifier,
@@ -1355,7 +1409,7 @@ func (c *GRPCClient) completePendingStopBeforeRemoteStart(ctx context.Context, a
 		"state", apply.State)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 		fmt.Sprintf("Pending remote stop request completed before start%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-	return nil
+	return false, nil
 }
 
 func hasPendingStartControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (bool, error) {
@@ -1366,15 +1420,49 @@ func hasPendingStartControlRequest(ctx context.Context, store storage.Storage, a
 	return controlReq != nil, nil
 }
 
-func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *storage.Apply, scope applyTaskScope, startControlReq *storage.ApplyControlRequest) error {
+// waitForPendingStopBeforeStart blocks a pending start until the apply-level
+// stop request resolves. It returns deferred=true when the caller must abandon
+// the start for this drive: an operation-only drive never completes the parent
+// stop (the operator projection owns it), so it stops its own operation's
+// remote work and leaves both the stop and start pending for the operator.
+func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *storage.Apply, scope applyTaskScope, startControlReq *storage.ApplyControlRequest) (bool, error) {
 	loggedWait := false
 	for {
 		stopReq, err := pendingStopControlRequest(ctx, c.storage, apply)
 		if err != nil {
-			return fmt.Errorf("check pending stop before pending gRPC start for apply %s: %w", apply.ApplyIdentifier, err)
+			return false, fmt.Errorf("check pending stop before pending gRPC start for apply %s: %w", apply.ApplyIdentifier, err)
 		}
 		if stopReq == nil {
-			return nil
+			return false, nil
+		}
+		if scope.suppressesDirectParentApplyWrites() {
+			// Stop this operation's own remote work once, then defer: the
+			// operation-only drive must not spin waiting for a parent stop it
+			// will never complete.
+			handled, err := c.processPendingStopControlRequest(ctx, apply, scope)
+			if err != nil {
+				return false, err
+			}
+			stillPending, err := pendingStopControlRequest(ctx, c.storage, apply)
+			if err != nil {
+				return false, fmt.Errorf("recheck pending stop before deferring pending gRPC start for apply %s: %w", apply.ApplyIdentifier, err)
+			}
+			if stillPending == nil {
+				return false, nil
+			}
+			if !handled {
+				logOperationDriveLeavesParentStop(apply, scope)
+			}
+			slog.Info("operation-only drive deferring pending gRPC start until apply-level stop resolves",
+				"apply_id", apply.ApplyIdentifier,
+				"apply_operation_id", scope.applyOperationID,
+				"remote_apply_id", scope.remoteApplyID(apply),
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"requested_by", controlRequestCaller(startControlReq),
+				"stop_requested_by", controlRequestCaller(stillPending),
+				"state", apply.State)
+			return true, nil
 		}
 		if !loggedWait {
 			slog.Info("pending gRPC start request is waiting for pending stop request to finish",
@@ -1388,11 +1476,11 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 			loggedWait = true
 		}
 		if _, err := c.processPendingStopControlRequest(ctx, apply, scope); err != nil {
-			return err
+			return false, err
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		case <-time.After(grpcProgressPollInterval):
 		}
 	}
@@ -1950,6 +2038,16 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 			return err
 		}
 		if storedApply != nil && state.IsTerminalApplyState(storedApply.State) {
+			if scope.suppressesDirectParentApplyWrites() {
+				controlReq, err := pendingStopControlRequest(ctx, c.storage, storedApply)
+				if err != nil {
+					return fmt.Errorf("check pending stop after terminal remote progress for apply %s: %w", storedApply.ApplyIdentifier, err)
+				}
+				if controlReq != nil {
+					logOperationDriveLeavesParentStop(storedApply, scope)
+				}
+				return nil
+			}
 			if err := completePendingStopControlRequests(ctx, c.storage, storedApply); err != nil {
 				return err
 			}
