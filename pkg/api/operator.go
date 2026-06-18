@@ -603,12 +603,19 @@ func (s *Service) recoverMultiApplyOperation(ctx context.Context, workerID int, 
 		return
 	}
 
-	if _, err := s.updateApplyStateFromOperations(operationLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen); err != nil {
+	result, err := s.updateApplyStateFromOperations(operationLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen)
+	if err != nil {
 		s.logger.Error("operator: failed to update derived apply state from apply_operations",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
 		return
 	}
+
+	// Publish the apply-level terminal summary if this drive's projection won the
+	// swap that terminalized the parent. Do this before stop-request cleanup: the
+	// summary depends only on the apply being terminal, and a later cleanup error
+	// must not suppress it.
+	s.publishTerminalSummaryIfWon(operationLeaseCtx, workerID, finalApply, result)
 
 	if err := s.completePendingStopIfApplyResolved(operationLeaseCtx, workerID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending stop request for resolved apply",
@@ -676,12 +683,18 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, workerID int, own
 		return true
 	}
 
-	if _, err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen); err != nil {
+	result, err := s.updateApplyStateFromOperations(applyLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen)
+	if err != nil {
 		s.logger.Error("operator: failed to update derived apply state during stop reconciliation",
 			"worker", workerID, "apply_id", finalApply.ApplyIdentifier,
 			"database", finalApply.Database, "environment", finalApply.Environment, "error", err)
 		return true
 	}
+
+	// A multi-operation apply that settles terminal here (stop reconciliation has
+	// no operation drive to publish on its behalf) still owes its single terminal
+	// summary; publish it if this projection won the terminal swap.
+	s.publishTerminalSummaryIfWon(applyLeaseCtx, workerID, finalApply, result)
 
 	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, workerID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending stop request after stop reconciliation",
@@ -832,12 +845,18 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, wor
 			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
 		return
 	}
-	if _, err := s.updateApplyStateFromOperations(applyCtx, workerID, apply, allowLeaseScopedFailedReopen); err != nil {
+	result, err := s.updateApplyStateFromOperations(applyCtx, workerID, apply, allowLeaseScopedFailedReopen)
+	if err != nil {
 		s.logger.Error("operator: failed to update derived apply state after failing task-less operation",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
 		return
 	}
+
+	// A task-less operation failure that terminalizes a multi-operation apply
+	// publishes the summary here; the gate on OperationCount keeps the single-op
+	// caller (which still publishes via its per-driver observer) unchanged.
+	s.publishTerminalSummaryIfWon(applyCtx, workerID, apply, result)
 }
 
 // resumeClaimedApply drives claimed work through the engine. When
@@ -1277,6 +1296,12 @@ type applyProjectionResult struct {
 	// BecameTerminal is true when this projection won the swap and moved the
 	// parent from a non-terminal previous state to a terminal derived state.
 	BecameTerminal bool
+	// OperationCount is the number of child apply_operations rows this projection
+	// derived from. Callers use it to distinguish a legacy single-operation apply
+	// (count 1, which still publishes its terminal summary via the per-driver
+	// observer) from an aggregate multi-operation apply (count > 1, whose summary
+	// is published once by the CAS winner) without re-listing operations.
+	OperationCount int
 }
 
 // updateApplyStateFromOperations re-derives applies.state from the apply's child
@@ -1356,7 +1381,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 			"worker", workerID, "apply_id", apply.ApplyIdentifier,
 			"database", apply.Database, "environment", apply.Environment,
 			"state", derived, "operation_count", len(ops))
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived}, nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops)}, nil
 	}
 
 	var completedAt *time.Time
@@ -1398,7 +1423,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 			"worker", workerID, "apply_id", apply.ApplyIdentifier,
 			"database", apply.Database, "environment", apply.Environment,
 			"expected_state", apply.State, "derived_state", derived, "operation_count", len(ops))
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived}, nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops)}, nil
 	}
 	s.logger.Info("operator: updated derived apply state from apply_operations",
 		"worker", workerID, "apply_id", apply.ApplyIdentifier,
@@ -1409,7 +1434,84 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, workerID i
 		PreviousState:  apply.State,
 		DerivedState:   derived,
 		BecameTerminal: !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived),
+		OperationCount: len(ops),
 	}, nil
+}
+
+// publishTerminalSummaryIfWon publishes the apply-level terminal summary exactly
+// once, when this drive won the aggregate non-terminal→terminal projection CAS
+// for a multi-operation apply. Single-operation applies (OperationCount <= 1)
+// publish their summary through the per-driver observer and are skipped here, so
+// this is a no-op on the legacy path. Because the parent apply is already
+// durably terminal once result.BecameTerminal is true, publishing is best
+// effort: every failure is logged with triage identifiers and counted, never
+// reverted, and left for summary reconciliation to repair.
+func (s *Service) publishTerminalSummaryIfWon(ctx context.Context, workerID int, apply *storage.Apply, result applyProjectionResult) {
+	if !result.BecameTerminal || result.OperationCount <= 1 {
+		return
+	}
+	if s.OnApplyTerminalSummary == nil {
+		s.logger.Debug("operator: aggregate terminal summary publisher not configured; skipping",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment,
+			"derived_state", result.DerivedState, "operation_count", result.OperationCount)
+		return
+	}
+
+	// Reload the parent at its terminal state: the input apply still carries the
+	// pre-CAS state, while the summary must render the terminal state, error
+	// message, and completion time the projection just stamped.
+	terminalApply, err := s.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		s.logger.Error("operator: failed to reload terminal apply for aggregate summary; summary not published",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment,
+			"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)
+		metrics.RecordOperatorTerminalSummaryFailure(ctx, "reload_apply_error")
+		return
+	}
+	if terminalApply == nil {
+		s.logger.Error("operator: terminal apply not found while publishing aggregate summary; summary not published",
+			"worker", workerID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment,
+			"derived_state", result.DerivedState, "operation_count", result.OperationCount)
+		metrics.RecordOperatorTerminalSummaryFailure(ctx, "apply_missing")
+		return
+	}
+	if !state.IsTerminalApplyState(terminalApply.State) {
+		s.logger.Error("operator: reloaded apply is no longer terminal while publishing aggregate summary; summary not published",
+			"worker", workerID, "apply_id", terminalApply.ApplyIdentifier,
+			"database", terminalApply.Database, "environment", terminalApply.Environment,
+			"reloaded_state", terminalApply.State, "derived_state", result.DerivedState,
+			"operation_count", result.OperationCount)
+		metrics.RecordOperatorTerminalSummaryFailure(ctx, "apply_not_terminal_after_cas")
+		return
+	}
+
+	// Reload every operation's tasks so the summary reflects the whole apply, not
+	// just the operation this drive owned.
+	tasks, err := s.storage.Tasks().GetByApplyID(ctx, terminalApply.ID)
+	if err != nil {
+		s.logger.Error("operator: failed to reload tasks for aggregate terminal summary; summary not published",
+			"worker", workerID, "apply_id", terminalApply.ApplyIdentifier,
+			"database", terminalApply.Database, "environment", terminalApply.Environment,
+			"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)
+		metrics.RecordOperatorTerminalSummaryFailure(ctx, "reload_tasks_error")
+		return
+	}
+
+	if err := s.OnApplyTerminalSummary(ctx, terminalApply, tasks); err != nil {
+		s.logger.Error("operator: aggregate terminal summary publish failed; parent state stays terminal, summary left for reconciliation",
+			"worker", workerID, "apply_id", terminalApply.ApplyIdentifier,
+			"database", terminalApply.Database, "environment", terminalApply.Environment,
+			"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)
+		metrics.RecordOperatorTerminalSummaryFailure(ctx, "callback_error")
+		return
+	}
+	s.logger.Info("operator: published aggregate terminal summary for multi-operation apply",
+		"worker", workerID, "apply_id", terminalApply.ApplyIdentifier,
+		"database", terminalApply.Database, "environment", terminalApply.Environment,
+		"derived_state", result.DerivedState, "operation_count", result.OperationCount)
 }
 
 func operatorLeaseOwner(workerID int) string {

@@ -169,54 +169,98 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 					SupportChannel: h.supportChannel(),
 					Logger:         logger,
 					OnTerminalHook: func(a *storage.Apply) {
-						// Drive every identifier and side effect from the apply the
-						// hook was handed so logs and check updates can never mix
-						// fields from two apply instances.
-						checkFields := func() []any {
-							return []any{
-								"apply_id", a.ApplyIdentifier,
-								"repo", a.Repository,
-								"pr", a.PullRequest,
-								"database", a.Database,
-								"environment", a.Environment,
-							}
-						}
-						updated, err := h.updateCheckRecordForApplyResult(context.Background(), a.Repository, a.PullRequest, a)
-						if err != nil {
-							logger.Error("observer: failed to update check record for recovered apply",
-								append(checkFields(), "error", err)...)
-							return
-						}
-						if !updated {
-							logger.Debug("observer: skipping aggregate check update for recovered apply, apply no longer owns check state",
-								checkFields()...)
-							return
-						}
-						ghInstClient, err := h.clientForRepo(a.Repository, a.InstallationID)
-						if err != nil {
-							logger.Warn("observer: aggregate check not refreshed for recovered apply; cannot resolve GitHub App client",
-								append(checkFields(), "error", err)...)
-							return
-						}
-						checkRecord, err := service.Storage().Checks().Get(context.Background(), a.Repository, a.PullRequest, a.Environment, a.DatabaseType, a.Database)
-						if err != nil {
-							logger.Warn("observer: aggregate check not refreshed for recovered apply; failed to load stored check state",
-								append(checkFields(), "error", err)...)
-							return
-						}
-						if checkRecord == nil {
-							logger.Debug("observer: no stored check state for recovered apply; nothing to refresh",
-								checkFields()...)
-							return
-						}
-						h.updateAggregateCheck(context.Background(), ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
+						h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
 					},
 				}))
 		}
 
+		// Register the aggregate terminal-summary callback. A multi-operation
+		// apply suppresses the per-driver observer, so its single terminal summary
+		// is published here by the operator that won the aggregate projection CAS.
+		service.OnApplyTerminalSummary = func(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
+			if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
+				logger.Debug("aggregate terminal summary skipped: apply has no GitHub destination",
+					"apply_id", apply.ApplyIdentifier,
+					"database", apply.Database,
+					"environment", apply.Environment)
+				return nil
+			}
+			factory, err := h.factoryForRepo(apply.Repository)
+			if err != nil {
+				return fmt.Errorf("resolve GitHub App client for aggregate terminal summary of apply %s repo %s pr %d: %w",
+					apply.ApplyIdentifier, apply.Repository, apply.PullRequest, err)
+			}
+			logger.Info("publishing aggregate terminal summary for multi-operation apply",
+				"apply_id", apply.ApplyIdentifier,
+				"repo", apply.Repository,
+				"pr", apply.PullRequest,
+				"state", apply.State)
+			obs := NewAggregateTerminalCommentObserver(CommentObserverConfig{
+				GHClient:       factory,
+				Storage:        service.Storage(),
+				Repo:           apply.Repository,
+				PR:             apply.PullRequest,
+				InstallationID: apply.InstallationID,
+				ApplyID:        apply.ID,
+				SupportChannel: h.supportChannel(),
+				Logger:         logger,
+				OnTerminalHook: func(a *storage.Apply) {
+					h.refreshChecksForTerminalApply(context.Background(), a, "aggregate terminal apply")
+				},
+			})
+			obs.OnTerminal(apply, tasks)
+			return nil
+		}
 	}
 
 	return h
+}
+
+// refreshChecksForTerminalApply updates the stored check record for a terminal
+// apply result and refreshes the GitHub aggregate Check Run. It drives every
+// identifier and side effect from the apply it is handed so logs and check
+// updates never mix fields from two apply instances. logCtx names the caller
+// (e.g. "recovered apply") so operators can tell which path refreshed the check.
+func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.Apply, logCtx string) {
+	checkFields := func() []any {
+		return []any{
+			"apply_id", a.ApplyIdentifier,
+			"repo", a.Repository,
+			"pr", a.PullRequest,
+			"database", a.Database,
+			"environment", a.Environment,
+			"context", logCtx,
+		}
+	}
+	updated, err := h.updateCheckRecordForApplyResult(ctx, a.Repository, a.PullRequest, a)
+	if err != nil {
+		h.logger.Error("observer: failed to update check record for terminal apply",
+			append(checkFields(), "error", err)...)
+		return
+	}
+	if !updated {
+		h.logger.Debug("observer: skipping aggregate check update for terminal apply, apply no longer owns check state",
+			checkFields()...)
+		return
+	}
+	ghInstClient, err := h.clientForRepo(a.Repository, a.InstallationID)
+	if err != nil {
+		h.logger.Warn("observer: aggregate check not refreshed for terminal apply; cannot resolve GitHub App client",
+			append(checkFields(), "error", err)...)
+		return
+	}
+	checkRecord, err := h.service.Storage().Checks().Get(ctx, a.Repository, a.PullRequest, a.Environment, a.DatabaseType, a.Database)
+	if err != nil {
+		h.logger.Warn("observer: aggregate check not refreshed for terminal apply; failed to load stored check state",
+			append(checkFields(), "error", err)...)
+		return
+	}
+	if checkRecord == nil {
+		h.logger.Debug("observer: no stored check state for terminal apply; nothing to refresh",
+			checkFields()...)
+		return
+	}
+	h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
 }
 
 // factoryForRepo returns the GitHub App client factory that owns the given

@@ -614,7 +614,7 @@ func TestUpdateApplyStateFromOperations_ReturnsProjectionResult(t *testing.T) {
 			},
 			apply:    &storage.Apply{ID: 3, ApplyIdentifier: "apply-a", State: state.Apply.Running, StartedAt: &startedAt},
 			casMatch: true,
-			want:     applyProjectionResult{Swapped: true, PreviousState: state.Apply.Running, DerivedState: state.Apply.Failed, BecameTerminal: true},
+			want:     applyProjectionResult{Swapped: true, PreviousState: state.Apply.Running, DerivedState: state.Apply.Failed, BecameTerminal: true, OperationCount: 2},
 		},
 		{
 			name: "winning non-terminal swap",
@@ -624,7 +624,7 @@ func TestUpdateApplyStateFromOperations_ReturnsProjectionResult(t *testing.T) {
 			},
 			apply:    &storage.Apply{ID: 3, ApplyIdentifier: "apply-b", State: state.Apply.Pending},
 			casMatch: true,
-			want:     applyProjectionResult{Swapped: true, PreviousState: state.Apply.Pending, DerivedState: state.Apply.Running, BecameTerminal: false},
+			want:     applyProjectionResult{Swapped: true, PreviousState: state.Apply.Pending, DerivedState: state.Apply.Running, BecameTerminal: false, OperationCount: 2},
 		},
 		{
 			name: "no-op match",
@@ -634,7 +634,7 @@ func TestUpdateApplyStateFromOperations_ReturnsProjectionResult(t *testing.T) {
 			},
 			apply:    &storage.Apply{ID: 3, ApplyIdentifier: "apply-c", State: state.Apply.Running, StartedAt: &startedAt},
 			casMatch: true,
-			want:     applyProjectionResult{Swapped: false, PreviousState: state.Apply.Running, DerivedState: state.Apply.Running, BecameTerminal: false},
+			want:     applyProjectionResult{Swapped: false, PreviousState: state.Apply.Running, DerivedState: state.Apply.Running, BecameTerminal: false, OperationCount: 2},
 		},
 		{
 			name: "lost race",
@@ -644,7 +644,7 @@ func TestUpdateApplyStateFromOperations_ReturnsProjectionResult(t *testing.T) {
 			},
 			apply:    &storage.Apply{ID: 3, ApplyIdentifier: "apply-d", State: state.Apply.Running, StartedAt: &startedAt},
 			casMatch: false,
-			want:     applyProjectionResult{Swapped: false, PreviousState: state.Apply.Running, DerivedState: state.Apply.Failed, BecameTerminal: false},
+			want:     applyProjectionResult{Swapped: false, PreviousState: state.Apply.Running, DerivedState: state.Apply.Failed, BecameTerminal: false, OperationCount: 2},
 		},
 	}
 
