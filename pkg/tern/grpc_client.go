@@ -675,6 +675,14 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 			return true, err
 		}
+		// In an operation-scoped multi-op drive the stop request is shared
+		// across sibling operations. One operation reaching terminal must not
+		// complete the apply-level stop request, or stopped siblings would stop
+		// observing it before they settle. Leave it pending for the rollout
+		// projection to complete once the aggregate settles.
+		if scope.usesOperationRemoteResume() {
+			return true, nil
+		}
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
 			return true, err
 		}
@@ -744,6 +752,14 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	apply.UpdatedAt = now
 	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 		return false, err
+	}
+	// In an operation-scoped multi-op drive the stop request is shared across
+	// sibling operations. One operation reconciling terminal progress must not
+	// complete the apply-level stop request, or stopped siblings would stop
+	// observing it before they settle. Leave it pending for the rollout
+	// projection to complete once the aggregate settles.
+	if scope.usesOperationRemoteResume() {
+		return true, nil
 	}
 	if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
 		return false, err
@@ -1293,7 +1309,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			return fmt.Errorf("update apply state: %w", err)
 		}
 		if startRequested {
-			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+			if err := c.completeApplyStartRequestForScope(ctx, apply, scope); err != nil {
 				return err
 			}
 		}
@@ -1431,7 +1447,7 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	if err != nil {
 		return fmt.Errorf("update started gRPC deferred deploy %s: %w", apply.ApplyIdentifier, err)
 	}
-	if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+	if err := c.completeApplyStartRequestForScope(ctx, apply, scope); err != nil {
 		return err
 	}
 	if persisted {
@@ -1741,6 +1757,25 @@ func logSkippedRemoteApplyTransition(operation string, remoteApply, storedApply 
 	default:
 		slog.Warn("skipping remote gRPC apply state transition", fields...)
 	}
+}
+
+// completeApplyStartRequestForScope completes the apply-level start control
+// request unless this is an operation-scoped multi-op drive. In a multi-op
+// drive the start request is shared across sibling operations; one operation
+// starting must not complete the shared start request, or stopped siblings
+// would become unclaimable before they resume. The rollout projection completes
+// it once the aggregate settles.
+func (c *GRPCClient) completeApplyStartRequestForScope(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
+	if scope.usesOperationRemoteResume() {
+		slog.Debug("skipping apply-level start request completion during multi-operation drive; shared start request is owned by the rollout projection",
+			"apply_id", apply.ApplyIdentifier,
+			"apply_db_id", apply.ID,
+			"apply_operation_id", scope.applyOperationID,
+			"deployment", scope.operation.Deployment,
+			"environment", apply.Environment)
+		return nil
+	}
+	return completePendingStartControlRequests(ctx, c.storage, apply)
 }
 
 // persistParentApply writes the parent applies row unless the drive is a

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -813,4 +814,129 @@ func TestUpdateApplyStateFromOperations_StaleWriteSkipped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, state.Apply.Pending, applyStore.expectedState, "the write must compare-and-swap on the state read before deriving")
 	assert.Nil(t, applyStore.updated, "a CAS miss must not record a persisted projection")
+}
+
+// casApplyStore models the applies row as a compare-and-swap against a single
+// durable state. Get returns the durable state so a reload observes writes made
+// by an earlier UpdateDerivedState, and UpdateDerivedState only swaps when the
+// caller's expected state matches the durable state — exactly like the SQL CAS.
+type casApplyStore struct {
+	storage.ApplyStore
+	mu       sync.Mutex
+	template storage.Apply
+	state    string
+}
+
+func (s *casApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.template
+	a.State = s.state
+	return &a, nil
+}
+
+func (s *casApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, _ string, _, _ *time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state != expectedState {
+		return false, nil
+	}
+	s.state = newState
+	return true, nil
+}
+
+func (s *casApplyStore) currentState() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state
+}
+
+// recoverOperationStore backs the single claimed operation through the recover
+// flow: Get/ListByApply return the live row and MarkFailed transitions it.
+type recoverOperationStore struct {
+	storage.ApplyOperationStore
+	mu sync.Mutex
+	op *storage.ApplyOperation
+}
+
+func (s *recoverOperationStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op := *s.op
+	return &op, nil
+}
+
+func (s *recoverOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op := *s.op
+	return []*storage.ApplyOperation{&op}, nil
+}
+
+func (s *recoverOperationStore) MarkFailed(_ context.Context, _ int64, errMsg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.op.State = state.ApplyOperation.Failed
+	s.op.ErrorMessage = errMsg
+	return nil
+}
+
+func (s *recoverOperationStore) Heartbeat(context.Context, int64) error { return nil }
+
+// recoverTestStorage wires the stores the recover flow touches, including the
+// plan lookup the routing tern client requires to build.
+type recoverTestStorage struct {
+	mockStorage
+	applies storage.ApplyStore
+	ops     storage.ApplyOperationStore
+}
+
+func (s *recoverTestStorage) Applies() storage.ApplyStore                  { return s.applies }
+func (s *recoverTestStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
+func (s *recoverTestStorage) Plans() storage.PlanStore                     { return &staticPlanStore{} }
+
+// When a multi-deployment operation has no tasks, the recover flow fails it
+// closed. By the time it fails, the pre-drive projection has already moved the
+// durable parent apply from pending to running, so the failure projection must
+// compare-and-swap against the reloaded running state — not the stale pending
+// apply it started the drive with — or the parent is stranded running.
+func TestRecoverMultiApplyOperation_FailsTaskLessOperationAgainstReloadedParent(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	applyStore := &casApplyStore{
+		template: storage.Apply{
+			ID:              7,
+			ApplyIdentifier: "apply-multi-op-recover",
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+		},
+		state: state.Apply.Pending,
+	}
+	opStore := &recoverOperationStore{op: &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.Running,
+	}}
+	deploymentClient := &mockTernClient{resumeErr: tern.ErrNoTasksForApplyOperation}
+
+	svc := New(
+		&recoverTestStorage{applies: applyStore, ops: opStore},
+		testServerConfig(),
+		map[string]tern.Client{"west/staging": deploymentClient},
+		logger,
+	)
+
+	svc.recoverMultiApplyOperation(t.Context(), 1, &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.Running,
+	}, storage.OperationLease{})
+
+	assert.Equal(t, state.Apply.Failed, applyStore.currentState(),
+		"the parent apply must be failed after the task-less operation is terminalized against the reloaded running state")
+	assert.Equal(t, state.ApplyOperation.Failed, opStore.op.State,
+		"the task-less operation row must be marked failed")
 }

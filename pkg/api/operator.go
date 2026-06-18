@@ -554,7 +554,21 @@ func (s *Service) recoverMultiApplyOperation(ctx context.Context, workerID int, 
 		// The drive failed closed: the operation has no tasks, so it can never
 		// make progress. Terminalize it now rather than leaving it to be
 		// re-leased on every poll once its heartbeat goes stale.
-		s.failOperationWithoutTasks(operationLeaseCtx, operationLeaseCtx, workerID, op, apply)
+		//
+		// Reload the parent apply first: the pre-drive projection may already
+		// have moved the durable parent from pending to running, and the
+		// failure projection CAS expects the current durable state. Failing
+		// against the stale pre-drive apply would miss the CAS and strand the
+		// parent apply running.
+		failApply := apply
+		if reloaded, reloadErr := s.storage.Applies().Get(operationLeaseCtx, apply.ID); reloadErr != nil {
+			s.logger.Error("operator: failed to reload parent apply before failing task-less operation; using pre-drive apply state",
+				"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+				"database", apply.Database, "environment", apply.Environment, "error", reloadErr)
+		} else if reloaded != nil {
+			failApply = reloaded
+		}
+		s.failOperationWithoutTasks(operationLeaseCtx, operationLeaseCtx, workerID, op, failApply)
 		return
 	}
 
