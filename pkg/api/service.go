@@ -105,6 +105,16 @@ func (c TernConfig) Endpoint(deployment, environment string) (string, error) {
 // The webhook handler uses this to start watching progress and posting PR comments.
 type RecoveryCallback func(apply *storage.Apply)
 
+// ApplyTerminalSummaryCallback is called after the operator wins the aggregate
+// non-terminal→terminal projection compare-and-swap for a multi-operation apply.
+// A multi-operation drive owns only its operation and suppresses the per-driver
+// terminal observer, so the apply-level terminal summary is published exactly
+// once, here, by the CAS winner. The apply and tasks are reloaded from storage
+// (the apply at its terminal state, the tasks across every operation) before
+// invocation. Single-operation applies keep publishing via the per-driver
+// observer and never reach this callback.
+type ApplyTerminalSummaryCallback func(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error
+
 type pendingObserverKey struct {
 	database    string
 	deployment  string
@@ -147,6 +157,12 @@ type Service struct {
 	// ResumeApply starts the engine/poller. Set by the webhook handler to attach
 	// an observer for PR comments.
 	OnApplyRecovered RecoveryCallback
+
+	// OnApplyTerminalSummary is called after a multi-operation apply is
+	// terminalized by the aggregate projection CAS. Set by the webhook handler to
+	// publish the apply-level terminal PR summary and refresh GitHub check state
+	// exactly once, since multi-operation drives suppress the per-driver observer.
+	OnApplyTerminalSummary ApplyTerminalSummaryCallback
 
 	pendingObserverMu sync.Mutex
 	pendingObservers  map[pendingObserverKey]tern.ProgressObserver
