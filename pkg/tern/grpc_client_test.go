@@ -1219,6 +1219,8 @@ func TestGRPCClient_ResumeApplyOperationStopReachingTerminalLeavesApplyStopPendi
 
 	assert.Equal(t, "remote-op-west", server.getStopApplyID(),
 		"the operation's own remote apply id must be stopped, not the parent external_id")
+	assert.Equal(t, state.Apply.Running, apply.State,
+		"one operation reaching terminal must not leak its terminal remote state onto the shared parent apply")
 
 	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)

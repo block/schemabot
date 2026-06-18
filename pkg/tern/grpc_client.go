@@ -666,6 +666,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: unmapped remote state %s", apply.ApplyIdentifier, remoteID, remoteApplyStateDescription(progress.State))
 	}
 	now := time.Now()
+	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
@@ -679,8 +680,12 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		// across sibling operations. One operation reaching terminal must not
 		// complete the apply-level stop request, or stopped siblings would stop
 		// observing it before they settle. Leave it pending for the rollout
-		// projection to complete once the aggregate settles.
+		// projection to complete once the aggregate settles. Restore the
+		// in-memory parent apply fields the driver does not own so this
+		// operation's terminal remote state does not leak onto the shared apply
+		// and let a later stop pass treat the parent as terminal.
 		if scope.usesOperationRemoteResume() {
+			apply.State, apply.StartedAt, apply.UpdatedAt = priorState, priorStartedAt, priorUpdatedAt
 			return true, nil
 		}
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
@@ -745,6 +750,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 		return false, fmt.Errorf("sync remote gRPC stop for apply %s remote %s after stop error: unmapped remote state %s", apply.ApplyIdentifier, apply.ExternalID, remoteApplyStateDescription(progress.State))
 	}
 	now := time.Now()
+	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
@@ -757,8 +763,12 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	// sibling operations. One operation reconciling terminal progress must not
 	// complete the apply-level stop request, or stopped siblings would stop
 	// observing it before they settle. Leave it pending for the rollout
-	// projection to complete once the aggregate settles.
+	// projection to complete once the aggregate settles. Restore the in-memory
+	// parent apply fields the driver does not own so this operation's terminal
+	// remote state does not leak onto the shared apply and let a later stop pass
+	// treat the parent as terminal.
 	if scope.usesOperationRemoteResume() {
+		apply.State, apply.StartedAt, apply.UpdatedAt = priorState, priorStartedAt, priorUpdatedAt
 		return true, nil
 	}
 	if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
