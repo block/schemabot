@@ -440,7 +440,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, apply *storage.Apply) (bool, error) {
 	hasPendingStart, err := hasPendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
-		return true, err
+		return true, fmt.Errorf("check pending start request after stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if hasPendingStart {
 		c.logger.Info("pending stop completed but a start is queued; continuing to resume in the same claim",

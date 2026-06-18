@@ -1428,7 +1428,7 @@ func persistApplyClaim(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *stora
 	return claimAcquired, nil
 }
 
-// claimStoppedApplyUnderTargetLock drives the full stopped→running claim while
+// claimStoppedApplyUnderTargetLock drives the full stopped→resuming claim while
 // holding the apply-target lock: re-check the one-active-apply-per-target
 // invariant, then either transition+commit or refuse+commit. It commits inside
 // the lock so a concurrent create cannot add a second active apply between the
