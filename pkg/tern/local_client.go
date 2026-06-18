@@ -1599,6 +1599,9 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				activeTask.State = taskState
 				now := time.Now()
 				activeTask.UpdatedAt = now
+				if activeTask.StartedAt == nil && !state.IsState(taskState, state.Task.Pending) {
+					activeTask.StartedAt = &now
+				}
 				if state.IsTerminalTaskState(taskState) && activeTask.CompletedAt == nil {
 					activeTask.CompletedAt = &now
 				}

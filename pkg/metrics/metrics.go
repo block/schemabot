@@ -619,8 +619,8 @@ func operatorMetricNames(suffix string) [2]string {
 }
 
 // addOperatorCounter increments an operator counter and its deprecated
-// scheduler-named alias with the same value and attributes.
-func addOperatorCounter(ctx context.Context, suffix, description, unit string, value int64, attrs ...attribute.KeyValue) {
+// scheduler-named alias by one with the same attributes.
+func addOperatorCounter(ctx context.Context, suffix, description, unit string, attrs ...attribute.KeyValue) {
 	meter := otel.Meter(meterName)
 	for _, name := range operatorMetricNames(suffix) {
 		counter, err := meter.Int64Counter(name,
@@ -631,7 +631,7 @@ func addOperatorCounter(ctx context.Context, suffix, description, unit string, v
 			slog.Warn("failed to create operator counter", "metric", name, "error", err)
 			continue
 		}
-		counter.Add(ctx, value, otelmetric.WithAttributes(attrs...))
+		counter.Add(ctx, 1, otelmetric.WithAttributes(attrs...))
 	}
 }
 
@@ -639,7 +639,7 @@ func addOperatorCounter(ctx context.Context, suffix, description, unit string, v
 // successfully claimed and resumed.
 func RecordOperatorResume(ctx context.Context, database, deployment, environment, previousState string) {
 	addOperatorCounter(ctx, "resumed_total",
-		"Total number of applies resumed by the operator", "{apply}", 1,
+		"Total number of applies resumed by the operator", "{apply}",
 		attribute.String("database", database),
 		DeploymentAttribute(deployment),
 		EnvironmentAttribute(environment),
@@ -650,7 +650,7 @@ func RecordOperatorResume(ctx context.Context, database, deployment, environment
 // RecordOperatorResumeFailure increments the operator resume failure counter.
 func RecordOperatorResumeFailure(ctx context.Context, database, deployment, environment, reason string) {
 	addOperatorCounter(ctx, "resume_failures_total",
-		"Total number of operator resume attempts that failed", "{apply}", 1,
+		"Total number of operator resume attempts that failed", "{apply}",
 		attribute.String("database", database),
 		DeploymentAttribute(deployment),
 		EnvironmentAttribute(environment),
@@ -664,6 +664,10 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"storage_error":                           true,
 	"operation_storage_error":                 true,
 	"missing_operation_lease_token":           true,
+	"operation_set_list_error":                true,
+	"operation_set_missing":                   true,
+	"operation_parent_load_error":             true,
+	"operation_parent_missing":                true,
 	"operation_parent_claim_error":            true,
 	"operation_parent_not_claimable":          true,
 	"missing_operation_deployment":            true,
@@ -677,7 +681,32 @@ func RecordOperatorClaimFailure(ctx context.Context, reason string) {
 		reason = "unknown"
 	}
 	addOperatorCounter(ctx, "claim_failures_total",
-		"Total number of operator claim attempts that failed", "{attempt}", 1,
+		"Total number of operator claim attempts that failed", "{attempt}",
+		EnvironmentAttribute(""),
+		attribute.String("reason", reason),
+	)
+}
+
+var knownOperatorTerminalSummaryFailureReasons = map[string]bool{
+	"reload_apply_error":           true,
+	"apply_missing":                true,
+	"apply_not_terminal_after_cas": true,
+	"reload_tasks_error":           true,
+	"callback_error":               true,
+}
+
+// RecordOperatorTerminalSummaryFailure increments the counter for a
+// multi-operation apply whose aggregate terminal summary failed to publish after
+// the projection CAS already terminalized the parent. A spike means terminal PR
+// summaries / check refreshes are being dropped; the parent state itself is
+// already durable, so the expected operator action is to check the GitHub
+// side-effect path (App client, check state) and rely on summary reconciliation.
+func RecordOperatorTerminalSummaryFailure(ctx context.Context, reason string) {
+	if !knownOperatorTerminalSummaryFailureReasons[reason] {
+		reason = "unknown"
+	}
+	addOperatorCounter(ctx, "terminal_summary_publish_failures_total",
+		"Total number of multi-operation aggregate terminal summary publishes that failed", "{apply}",
 		EnvironmentAttribute(""),
 		attribute.String("reason", reason),
 	)

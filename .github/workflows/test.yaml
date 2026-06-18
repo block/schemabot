@@ -25,6 +25,7 @@ jobs:
       pull-requests: read
     outputs:
       code: ${{ steps.out.outputs.code }}
+      full: ${{ steps.out.outputs.full }}
     steps:
       - name: "Detect non-docs changes"
         if: github.event_name == 'pull_request'
@@ -37,22 +38,39 @@ jobs:
               - '**'
               - '!**/*.md'
               - '!docs/**'
-      - name: "Resolve code-change flag"
+      - name: "Resolve code-change and coverage flags"
         id: out
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           FILTER_OUTCOME: ${{ steps.filter.outcome }}
           FILTER_CODE: ${{ steps.filter.outputs.code }}
+          PR_SMOKE_ENABLED: ${{ vars.PR_SMOKE_E2E_ENABLED }}
         run: |
+          set -euo pipefail
+          # code: does this change touch anything other than docs?
           if [ "$EVENT_NAME" != "pull_request" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            code=true
           elif [ "$FILTER_OUTCOME" != "success" ]; then
             echo "::warning::paths-filter failed; running CI instead of skipping"
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            code=true
           else
-            echo "code=$FILTER_CODE" >> "$GITHUB_OUTPUT"
+            code="$FILTER_CODE"
           fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          # full: run the complete e2e matrix, or a smoke subset?
+          # Always full on push/merge_group (these gate a merge). On a PR, run
+          # the smoke subset ONLY when an admin has opted in via the repo
+          # variable; any other value fails closed to full PR coverage so the
+          # gate cannot be weakened by merging this workflow before the merge
+          # queue is enabled.
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$PR_SMOKE_ENABLED" = "true" ]; then
+            full=false
+          else
+            full=true
+          fi
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT_NAME code=$code full=$full (pr_smoke_enabled=${PR_SMOKE_ENABLED:-unset})"
 
   build:
     name: "Build"
@@ -140,23 +158,49 @@ jobs:
 
   localscale-matrix:
     name: "LocalScale Matrix"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 1
     outputs:
       shards: ${{ steps.gen.outputs.shards }}
+      mode: ${{ steps.gen.outputs.mode }}
+      shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Generate shard matrix"
         id: gen
+        env:
+          FULL: ${{ needs.changes.outputs.full }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
         run: |
+          set -euo pipefail
           NUM_SHARDS=3
-          tests=$(grep -h -o 'func Test[^(]*' pkg/localscale/*_test.go | sed 's/func //' | grep -v '/' | shuf)
-          shards=$(echo "$tests" | awk -v n="$NUM_SHARDS" '
+          # Deterministic order so a test always lands in the same bucket.
+          tests=$(grep -h -o 'func Test[^(]*' pkg/localscale/*_test.go | sed 's/func //' | grep -v '/' | sort)
+          count=$(printf '%s\n' "$tests" | grep -c . || true)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no localscale tests discovered"
+            exit 1
+          fi
+          all=$(printf '%s\n' "$tests" | awk -v n="$NUM_SHARDS" '
             { bucket[NR % n] = bucket[NR % n] (bucket[NR % n] ? "|" : "") $0 }
             END { for (i=0; i<n; i++) printf "{\"shard\":\"%d\",\"run_filter\":\"%s\"}\n", i+1, bucket[i] }
           ' | jq -cs '.')
+          if [ "$FULL" = "true" ]; then
+            shards="$all"
+            mode="full"
+          else
+            # Smoke: one bucket, chosen deterministically per PR so reruns are reproducible.
+            idx=$(( PR_NUMBER % NUM_SHARDS ))
+            shards=$(printf '%s' "$all" | jq -c "[.[$idx]]")
+            mode="smoke"
+          fi
+          shard_count=$(printf '%s' "$shards" | jq 'length')
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
-          echo "Generated $NUM_SHARDS shards from $(echo "$tests" | wc -l) tests"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode shard_count=$shard_count from $count tests"
 
   localscale:
     name: "LocalScale Tests (${{ matrix.shard }})"
@@ -222,24 +266,49 @@ jobs:
 
   e2e-vitess-matrix:
     name: "E2E Vitess Matrix"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 1
     outputs:
       shards: ${{ steps.gen.outputs.shards }}
+      mode: ${{ steps.gen.outputs.mode }}
+      shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Generate shard matrix"
         id: gen
+        env:
+          FULL: ${{ needs.changes.outputs.full }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
         run: |
+          set -euo pipefail
           NUM_SHARDS=3
-          # Extract all TestVitess_ function names and split evenly across shards
-          tests=$(grep -o 'func TestVitess_[^(]*' e2e/local/vitess_test.go | sed 's/func //' | shuf)
-          shards=$(echo "$tests" | awk -v n="$NUM_SHARDS" '
+          # Deterministic order so a test always lands in the same bucket.
+          tests=$(grep -o 'func TestVitess_[^(]*' e2e/local/vitess_test.go | sed 's/func //' | sort)
+          count=$(printf '%s\n' "$tests" | grep -c . || true)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no vitess e2e tests discovered"
+            exit 1
+          fi
+          all=$(printf '%s\n' "$tests" | awk -v n="$NUM_SHARDS" '
             { bucket[NR % n] = bucket[NR % n] (bucket[NR % n] ? "|" : "") $0 }
             END { for (i=0; i<n; i++) printf "{\"shard\":\"%d\",\"run_filter\":\"%s\"}\n", i+1, bucket[i] }
           ' | jq -cs '.')
+          if [ "$FULL" = "true" ]; then
+            shards="$all"
+            mode="full"
+          else
+            # Smoke: one bucket, chosen deterministically per PR so reruns are reproducible.
+            idx=$(( PR_NUMBER % NUM_SHARDS ))
+            shards=$(printf '%s' "$all" | jq -c "[.[$idx]]")
+            mode="smoke"
+          fi
+          shard_count=$(printf '%s' "$shards" | jq 'length')
           echo "shards=$shards" >> "$GITHUB_OUTPUT"
-          echo "Generated $NUM_SHARDS shards from $(echo "$tests" | wc -l) tests"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "shard_count=$shard_count" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode shard_count=$shard_count from $count tests"
 
   e2e-vitess:
     name: "E2E Vitess Tests (${{ matrix.shard }})"
@@ -277,7 +346,7 @@ jobs:
   e2e-k8s:
     name: "E2E K8s Tests"
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -327,7 +396,7 @@ jobs:
   e2e-k8s-etre:
     name: "E2E K8s Etre Tests"
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -375,7 +444,7 @@ jobs:
   e2e-k8s-vitess:
     name: "E2E K8s Vitess Tests"
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -442,7 +511,7 @@ jobs:
   # skipped or failed upstream is treated as failure.
   e2e-rollup:
     name: "E2E Tests"
-    needs: [changes, e2e-mysql, e2e-vitess]
+    needs: [changes, e2e-vitess-matrix, e2e-mysql, e2e-vitess]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -450,6 +519,10 @@ jobs:
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          EVENT_NAME: ${{ github.event_name }}
+          FULL: ${{ needs.changes.outputs.full }}
+          VITESS_MODE: ${{ needs.e2e-vitess-matrix.outputs.mode }}
+          VITESS_SHARD_COUNT: ${{ needs.e2e-vitess-matrix.outputs.shard_count }}
           E2E_MYSQL_RESULT: ${{ needs.e2e-mysql.result }}
           E2E_VITESS_RESULT: ${{ needs.e2e-vitess.result }}
         run: |
@@ -462,6 +535,21 @@ jobs:
             echo "Docs-only PR; E2E intentionally skipped."
             exit 0
           fi
+          # Fail closed: a merge-gating event must run the full matrix, and the
+          # matrix that was actually instantiated must match the claimed mode.
+          # A passing result on a single smoke shard must never gate a merge.
+          if [ "$EVENT_NAME" != "pull_request" ] && [ "$FULL" != "true" ]; then
+            echo "::error::non-PR event ($EVENT_NAME) must run the full E2E matrix"
+            exit 1
+          fi
+          if [ "$FULL" = "true" ] && [ "$VITESS_SHARD_COUNT" != "3" ]; then
+            echo "::error::full E2E expected 3 Vitess shards, got mode=$VITESS_MODE count=$VITESS_SHARD_COUNT"
+            exit 1
+          fi
+          if [ "$FULL" != "true" ] && [ "$VITESS_SHARD_COUNT" != "1" ]; then
+            echo "::error::smoke E2E expected 1 Vitess shard, got mode=$VITESS_MODE count=$VITESS_SHARD_COUNT"
+            exit 1
+          fi
           if [ "$E2E_MYSQL_RESULT" != "success" ]; then
             echo "::error::e2e-mysql result=$E2E_MYSQL_RESULT"
             exit 1
@@ -473,7 +561,7 @@ jobs:
 
   localscale-rollup:
     name: "LocalScale Tests"
-    needs: [changes, localscale]
+    needs: [changes, localscale-matrix, localscale]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -481,6 +569,10 @@ jobs:
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
           CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          EVENT_NAME: ${{ github.event_name }}
+          FULL: ${{ needs.changes.outputs.full }}
+          LS_MODE: ${{ needs.localscale-matrix.outputs.mode }}
+          LS_SHARD_COUNT: ${{ needs.localscale-matrix.outputs.shard_count }}
           LOCALSCALE_RESULT: ${{ needs.localscale.result }}
         run: |
           set -euo pipefail
@@ -492,7 +584,62 @@ jobs:
             echo "Docs-only PR; LocalScale intentionally skipped."
             exit 0
           fi
+          # Fail closed: a merge-gating event must run the full matrix, and the
+          # matrix that was actually instantiated must match the claimed mode.
+          if [ "$EVENT_NAME" != "pull_request" ] && [ "$FULL" != "true" ]; then
+            echo "::error::non-PR event ($EVENT_NAME) must run the full LocalScale matrix"
+            exit 1
+          fi
+          if [ "$FULL" = "true" ] && [ "$LS_SHARD_COUNT" != "3" ]; then
+            echo "::error::full LocalScale expected 3 shards, got mode=$LS_MODE count=$LS_SHARD_COUNT"
+            exit 1
+          fi
+          if [ "$FULL" != "true" ] && [ "$LS_SHARD_COUNT" != "1" ]; then
+            echo "::error::smoke LocalScale expected 1 shard, got mode=$LS_MODE count=$LS_SHARD_COUNT"
+            exit 1
+          fi
           if [ "$LOCALSCALE_RESULT" != "success" ]; then
             echo "::error::localscale result=$LOCALSCALE_RESULT"
             exit 1
           fi
+
+  # Stable rollup for the k8s e2e jobs so a single check name can gate a merge.
+  # On a PR running the smoke subset these jobs are intentionally skipped and the
+  # full k8s coverage runs on push / in the merge queue; on any merge-gating
+  # event all three must succeed.
+  k8s-rollup:
+    name: "K8s E2E Tests"
+    needs: [changes, e2e-k8s, e2e-k8s-etre, e2e-k8s-vitess]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          EVENT_NAME: ${{ github.event_name }}
+          FULL: ${{ needs.changes.outputs.full }}
+          K8S_RESULT: ${{ needs.e2e-k8s.result }}
+          K8S_ETRE_RESULT: ${{ needs.e2e-k8s-etre.result }}
+          K8S_VITESS_RESULT: ${{ needs.e2e-k8s-vitess.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes job failed"
+            exit 1
+          fi
+          if [ "$CHANGES_CODE" != "true" ]; then
+            echo "Docs-only PR; K8s E2E intentionally skipped."
+            exit 0
+          fi
+          # On a PR running the smoke subset, k8s is deferred to the merge queue.
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$FULL" != "true" ]; then
+            echo "PR smoke run; full K8s E2E deferred to the merge queue."
+            exit 0
+          fi
+          for r in "$K8S_RESULT" "$K8S_ETRE_RESULT" "$K8S_VITESS_RESULT"; do
+            if [ "$r" != "success" ]; then
+              echo "::error::k8s e2e results: k8s=$K8S_RESULT etre=$K8S_ETRE_RESULT vitess=$K8S_VITESS_RESULT"
+              exit 1
+            fi
+          done

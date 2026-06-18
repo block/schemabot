@@ -44,6 +44,14 @@ type CommentObserver struct {
 	// via clock.NewFake(start).
 	clock clock.Clock
 
+	// aggregateTerminalCASWinner marks a one-shot observer used by the operator
+	// to publish a multi-operation apply's single terminal summary after it won
+	// the aggregate projection compare-and-swap. Such a worker holds the
+	// operation lease, not the parent apply lease, so the per-driver apply-lease
+	// authority does not apply; the won CAS is the authority. It bypasses the
+	// apply-lease checks and lease-scoped storage writes accordingly.
+	aggregateTerminalCASWinner bool
+
 	mu                sync.Mutex
 	lastProgressPost  time.Time
 	lastState         string
@@ -128,6 +136,17 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
 	}
+}
+
+// NewAggregateTerminalCommentObserver builds a one-shot observer for the
+// operator to publish a multi-operation apply's single terminal summary after it
+// won the aggregate projection compare-and-swap. The CAS win — not a parent
+// apply lease — is the authority, so this observer bypasses the per-driver
+// apply-lease checks. Only OnTerminal is meant to be called on it.
+func NewAggregateTerminalCommentObserver(cfg CommentObserverConfig) *CommentObserver {
+	o := NewCommentObserver(cfg)
+	o.aggregateTerminalCASWinner = true
+	return o
 }
 
 // OnProgress is called on each progress poller tick. Rate-limits updates
@@ -304,6 +323,13 @@ func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
 }
 
 func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation string) bool {
+	// The aggregate terminal observer is invoked by the operator that already won
+	// the non-terminal→terminal projection CAS. That worker holds the operation
+	// lease, not the parent apply lease, so the per-driver apply-lease authority
+	// does not apply here — the won CAS is the authority for this one publish.
+	if o.aggregateTerminalCASWinner {
+		return true
+	}
 	// PR apply observers are created before the durable apply row is claimed, so
 	// they may not have a lease at construction time. Once progress callbacks pass
 	// the claimed apply, fall back to the apply's current lease and use it as the
@@ -335,6 +361,14 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 }
 
 func (o *CommentObserver) contextWithApplyLease(ctx context.Context, apply *storage.Apply) context.Context {
+	// The aggregate terminal observer holds the operation lease, not the parent
+	// apply lease. Attaching an apply lease it does not hold would make every
+	// comment-recording write fail closed. Pass the context through unchanged so
+	// these writes take storage's no-apply-lease path; the won projection CAS,
+	// not an apply lease, authorizes this one terminal publish.
+	if o.aggregateTerminalCASWinner {
+		return ctx
+	}
 	// Storage writes that record GitHub side effects must use the same lease as
 	// the observer-side lease checks above. Attach the resolved lease even if it
 	// is invalid so storage fails closed instead of performing an unleased write.

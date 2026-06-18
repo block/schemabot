@@ -1159,6 +1159,146 @@ func TestGRPCClient_ResumeApplyOperationStopsUndispatchedOperationWithoutComplet
 	assert.NotNil(t, stopReq, "the apply-level stop request must remain pending for sibling operations")
 }
 
+func TestGRPCClient_ResumeApplyOperationStopReachingTerminalLeavesApplyStopPending(t *testing.T) {
+	// A multi-deployment apply has one durable stop request shared by every
+	// deployment. When a dispatched operation observes its own remote apply
+	// reaching a terminal state, it must NOT complete the apply-level stop
+	// request: sibling deployments still in flight need to keep observing the
+	// stop. The rollout projection completes the shared request once the
+	// aggregate settles.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_COMPLETED,
+		progressStateSet: true,
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op-stop-terminal",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		State:            state.Task.Running,
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Running, EngineResumeContext: "remote-op-west"},
+		siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Running, EngineResumeContext: "remote-east"},
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	// Keep the stored parent row a distinct copy so mutating the in-memory apply
+	// during the drive does not leak a terminal state into stored reads.
+	storedApply := *apply
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+		operations:      operationStore,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	assert.Equal(t, "remote-op-west", server.getStopApplyID(),
+		"the operation's own remote apply id must be stopped, not the parent external_id")
+	assert.Equal(t, state.Apply.Running, apply.State,
+		"one operation reaching terminal must not leak its terminal remote state onto the shared parent apply")
+
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, stopReq, "the apply-level stop request must remain pending for sibling operations after one operation terminalizes")
+}
+
+func TestGRPCClient_ResumeApplyOperationStartLeavesApplyStartPending(t *testing.T) {
+	// A multi-deployment apply has one durable start request shared by every
+	// deployment. When one operation starts its own remote apply, it must NOT
+	// complete the apply-level start request: stopped sibling deployments still
+	// need it pending so they remain claimable and can resume. The rollout
+	// projection completes the shared request once the aggregate settles.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op-start-pending",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		State:            state.Task.Stopped,
+	}
+	taskStore := &mockTaskStore{
+		tasks:           []*storage.Task{task},
+		getByApplyIDErr: errors.New("whole-apply task load must not be used for operation-scoped resume"),
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Stopped, EngineResumeContext: "remote-op-west"},
+		siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Stopped, EngineResumeContext: "remote-east"},
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           taskStore,
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+		operations:      operationStore,
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-multi-op-start-pending",
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	assert.Equal(t, "remote-op-west", server.getStartApplyID(),
+		"the operation's own remote apply id must be started, not the parent external_id")
+
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, startReq, "the apply-level start request must remain pending for sibling operations after one operation starts")
+}
+
 func TestGRPCClient_ResumeApplyOperationFailureRecordsTasksOnlyForMultiOpApply(t *testing.T) {
 	// When a multi-deployment operation's remote dispatch is rejected, the drive
 	// records the failure on that operation's own tasks and returns the error,
