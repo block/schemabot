@@ -36,6 +36,28 @@ func TestShouldAutoDeferCutover(t *testing.T) {
 	}
 }
 
+func TestShouldReleaseAtCutoverBarrier(t *testing.T) {
+	tests := []struct {
+		name           string
+		manualDefer    bool
+		multiOperation bool
+		op             *storage.ApplyOperation
+		want           bool
+	}{
+		{"multi-op barrier auto-releases", false, true, barrierOp(), true},
+		{"manual defer holds the claim", true, true, barrierOp(), false},
+		{"single-op barrier does not release", false, false, barrierOp(), false},
+		{"multi-op rolling does not release", false, true, rollingOp(), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{}
+			apply.SetOptions(storage.ApplyOptions{DeferCutover: tt.manualDefer})
+			assert.Equal(t, tt.want, shouldReleaseAtCutoverBarrier(apply, tt.multiOperation, tt.op))
+		})
+	}
+}
+
 func TestEffectiveCopyDriveOptions(t *testing.T) {
 	t.Run("multi-op barrier turns on defer cutover", func(t *testing.T) {
 		apply := &storage.Apply{}

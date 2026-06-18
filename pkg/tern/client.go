@@ -4,6 +4,7 @@ package tern
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
@@ -16,6 +17,13 @@ import (
 // clients detect this from storage before any dispatch or state mutation, so
 // callers can match it with errors.Is regardless of the transport.
 var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
+
+// ErrApplyOperationRowMissing is returned by ResumeApplyOperation when tasks
+// scope to the operation but the apply_operation row itself is absent. It is a
+// distinct, more accurate cause than the no-tasks case, but wraps
+// ErrNoTasksForApplyOperation so the same fail-closed handling (errors.Is)
+// terminalizes the stale claim rather than retrying it forever.
+var ErrApplyOperationRowMissing = fmt.Errorf("apply_operation row missing: %w", ErrNoTasksForApplyOperation)
 
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that

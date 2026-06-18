@@ -802,7 +802,7 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 		return fmt.Errorf("get apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
 	}
 	if op == nil {
-		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
+		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrApplyOperationRowMissing)
 	}
 	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
@@ -813,7 +813,7 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	// (releases) the copy drive at the barrier; the deployment-ordered cutover
 	// claim drives the swap later. Single-operation or rolling drives are
 	// unchanged.
-	releaseAtCutoverBarrier := shouldAutoDeferCutover(multiOperation, op)
+	releaseAtCutoverBarrier := shouldReleaseAtCutoverBarrier(apply, multiOperation, op)
 	options := effectiveCopyDriveOptions(apply, multiOperation, op).Map()
 	return c.resumeApplyWithTasks(ctx, apply, tasks, options, releaseAtCutoverBarrier)
 }
