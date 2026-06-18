@@ -405,7 +405,7 @@ type Apply struct {
 	// Once the retry budget is exhausted, the apply becomes failed.
 	Attempt int
 
-	// LeaseOwner identifies the worker that last claimed this apply. It is
+	// LeaseOwner identifies the driver that last claimed this apply. It is
 	// operator-facing context; LeaseToken is the ownership capability used for
 	// correctness.
 	LeaseOwner string
