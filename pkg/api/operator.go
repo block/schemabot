@@ -268,6 +268,52 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 		return
 	}
 
+	// Branch on the operation count. A single-operation apply keeps the legacy
+	// parent-lease drive byte-for-byte. A multi-operation apply drives under the
+	// operation lease only: siblings must not serialize on a shared parent lease,
+	// and the parent applies.state is moved solely by the projection CAS.
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, op.ApplyID)
+	if err != nil {
+		s.logger.Error("operator: failed to list operations for claimed apply; operation will not be driven",
+			"worker", workerID, "lease_owner", owner, "apply_operation_id", op.ID,
+			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_set_list_error")
+		return
+	}
+	if !operationSetContainsID(ops, op.ID) {
+		s.logger.Error("operator: claimed operation is not part of its apply's operation set; operation will not be driven",
+			"worker", workerID, "lease_owner", owner, "apply_operation_id", op.ID,
+			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "operation_count", len(ops))
+		metrics.RecordOperatorClaimFailure(ctx, "operation_set_missing")
+		return
+	}
+	if len(ops) > 1 {
+		s.recoverMultiApplyOperation(ctx, workerID, op, opLease)
+		return
+	}
+
+	s.recoverSingleApplyOperation(ctx, workerID, owner, op, opLease)
+}
+
+// operationSetContainsID reports whether id is one of the apply's operation
+// rows, used to confirm the claimed operation still belongs to the apply set
+// before driving it.
+func operationSetContainsID(ops []*storage.ApplyOperation, id int64) bool {
+	for _, op := range ops {
+		if op.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// recoverSingleApplyOperation drives a single-operation apply on the legacy
+// parent-lease path: it claims the parent apply lease, runs the engine under the
+// dual (apply + operation) lease so the engine writes the parent applies row
+// directly, fires the per-driver terminal observer, and re-derives the parent
+// from the operation rows afterward. This path is byte-for-byte the pre-fan-out
+// behavior.
+func (s *Service) recoverSingleApplyOperation(ctx context.Context, workerID int, owner string, op *storage.ApplyOperation, opLease storage.OperationLease) {
 	// The engine drive still writes the parent applies row (state RUNNING /
 	// COMPLETED / FAILED), and the derived-state reconcile updates
 	// applies.state, so the worker must also hold the parent apply lease — the
@@ -434,6 +480,137 @@ func (s *Service) recoverApplyOperation(ctx context.Context, workerID int, owner
 	// pending, complete it now so the request does not linger after the rollout
 	// has stopped.
 	if err := s.completePendingStopIfApplyResolved(applyLeaseCtx, workerID, finalApply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending stop request for resolved apply",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
+		return
+	}
+}
+
+// recoverMultiApplyOperation drives one operation of a multi-operation apply
+// under the operation lease only. It never claims the parent apply lease, so
+// sibling operations no longer serialize on a shared parent token. The engine
+// drive is suppressed from writing the parent applies row (the gRPC/local
+// drivers skip parent writes for operation-scoped multi-op drives), and the
+// per-driver terminal observer is disabled; the parent applies.state is moved
+// solely by the operation-authorized projection CAS. The operation row is
+// driven from its own tasks, then the parent is re-derived from the operation
+// rows.
+func (s *Service) recoverMultiApplyOperation(ctx context.Context, workerID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
+	operationLeaseCtx := storage.WithOperationLease(ctx, opLease)
+
+	apply, err := s.storage.Applies().Get(operationLeaseCtx, op.ApplyID)
+	if err != nil {
+		s.logger.Error("operator: failed to load parent apply for operation drive; operation will not be driven",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_db_id", op.ApplyID,
+			"deployment", op.Deployment, "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_load_error")
+		return
+	}
+	if apply == nil {
+		s.logger.Error("operator: parent apply not found for claimed operation; operation will not be driven",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_db_id", op.ApplyID,
+			"deployment", op.Deployment)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_missing")
+		return
+	}
+
+	// The claimed operation row's deployment is the authoritative routing key; an
+	// empty deployment is a corrupt row with no routing key, so fail closed.
+	if op.Deployment == "" {
+		s.logger.Error("operator: claimed operation is missing deployment metadata; operation will not be driven",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment)
+		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_deployment")
+		return
+	}
+
+	// Move the parent pending→running via the projection CAS before the drive.
+	// The claim already set this operation running, so the projection reflects an
+	// in-flight rollout; the driver no longer writes the parent running for
+	// multi-op, so without this the parent would linger pending during a long
+	// drive. The op lease authorizes the derived-state CAS.
+	if _, err := s.updateApplyStateFromOperations(operationLeaseCtx, workerID, apply, allowLeaseScopedFailedReopen); err != nil {
+		s.logger.Error("operator: failed to project parent running before operation drive; operation will not be driven",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment, "error", err)
+		return
+	}
+
+	// Heartbeat the operation row on the apply heartbeat cadence so a peer worker
+	// does not re-claim it during a long drive. The heartbeat writes under the
+	// operation lease, so a lost operation lease cancels the run.
+	runCtx, cancelRun := context.WithCancel(operationLeaseCtx)
+	defer cancelRun()
+	stopHeartbeat := s.startApplyOperationHeartbeat(runCtx, workerID, op, apply, cancelRun)
+	defer stopHeartbeat()
+
+	// Suppress the per-driver terminal observer: the aggregate terminal summary
+	// is published once by the projection CAS winner, not per deployment.
+	resumed, resumeErr := s.resumeClaimedApplyWithOptions(runCtx, workerID, apply, op.ID, op.Deployment,
+		resumeClaimedApplyOptions{suppressRecoveredObserver: true})
+	stopHeartbeat()
+	if !resumed && errors.Is(resumeErr, tern.ErrNoTasksForApplyOperation) {
+		// The drive failed closed: the operation has no tasks, so it can never
+		// make progress. Terminalize it now rather than leaving it to be
+		// re-leased on every poll once its heartbeat goes stale.
+		s.failOperationWithoutTasks(operationLeaseCtx, operationLeaseCtx, workerID, op, apply)
+		return
+	}
+
+	// Persist the operation row from its OWN tasks — even when the drive returned
+	// an error. Unlike the single-op path, a multi-op drive has no
+	// reconcileUnclaimableParent fallback (it never claims the parent), so a
+	// remote rejection that durably failed this operation's tasks must be
+	// promoted to the operation row here or the operation would stay running and
+	// be re-leased forever. markOperationFromOwnResult derives the operation from
+	// its tasks: a still-running task set leaves it claimable (a benign no-op),
+	// while a terminal task set terminalizes it.
+	marked, err := s.markOperationFromOwnResult(operationLeaseCtx, workerID, op)
+	if err != nil {
+		s.logger.Error("operator: failed to update apply_operation from its tasks; derived apply state not updated",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+		return
+	}
+	if !marked {
+		return
+	}
+
+	// If a stop is pending, terminalize any still-pending sibling operations to
+	// stopped before deriving the parent, so the rollout can settle. Authorized
+	// by this operation's own lease (the 6a op-lease branch).
+	if err := s.stopPendingOperationsForPendingStop(operationLeaseCtx, workerID, apply); err != nil {
+		s.logger.Error("operator: failed to stop pending sibling operations for pending stop request; derived apply state not updated",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", apply.Environment, "error", err)
+		return
+	}
+
+	// Reload the parent so the projection re-derives against the durable
+	// apply.State (its terminal-to-non-terminal guard), then move it via the CAS.
+	finalApply, err := s.storage.Applies().Get(operationLeaseCtx, apply.ID)
+	if err != nil {
+		s.logger.Error("operator: failed to reload parent apply after operation drive; derived apply state not updated",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"deployment", op.Deployment, "error", err)
+		return
+	}
+	if finalApply == nil {
+		s.logger.Error("operator: parent apply not found after operation drive; derived apply state not updated",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", apply.ApplyIdentifier,
+			"deployment", op.Deployment)
+		return
+	}
+
+	if _, err := s.updateApplyStateFromOperations(operationLeaseCtx, workerID, finalApply, allowLeaseScopedFailedReopen); err != nil {
+		s.logger.Error("operator: failed to update derived apply state from apply_operations",
+			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
+		return
+	}
+
+	if err := s.completePendingStopIfApplyResolved(operationLeaseCtx, workerID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending stop request for resolved apply",
 			"worker", workerID, "apply_operation_id", op.ID, "apply_id", finalApply.ApplyIdentifier,
 			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
@@ -675,6 +852,19 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, wor
 // operation terminal, and the returned error lets it distinguish the fail-closed
 // no-tasks case (tern.ErrNoTasksForApplyOperation) from transient failures.
 func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *storage.Apply, applyOperationID int64, operationDeployment string) (bool, error) {
+	return s.resumeClaimedApplyWithOptions(ctx, workerID, apply, applyOperationID, operationDeployment, resumeClaimedApplyOptions{})
+}
+
+// resumeClaimedApplyOptions tunes a drive for the multi-operation path.
+type resumeClaimedApplyOptions struct {
+	// suppressRecoveredObserver skips the per-driver progress/terminal observer
+	// hook. A multi-operation drive owns only its operation; the aggregate
+	// terminal summary is published once by the projection CAS winner, not per
+	// deployment, so the per-driver observer must not fire.
+	suppressRecoveredObserver bool
+}
+
+func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, workerID int, apply *storage.Apply, applyOperationID int64, operationDeployment string, opts resumeClaimedApplyOptions) (bool, error) {
 	lease := apply.Lease()
 	start := s.clock.Now()
 
@@ -731,7 +921,7 @@ func (s *Service) resumeClaimedApply(ctx context.Context, workerID int, apply *s
 		return false, err
 	}
 
-	if s.OnApplyRecovered != nil {
+	if s.OnApplyRecovered != nil && !opts.suppressRecoveredObserver {
 		s.OnApplyRecovered(apply)
 	}
 
