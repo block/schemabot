@@ -574,6 +574,7 @@ func logOperationDriveLeavesParentStop(apply *storage.Apply, scope applyTaskScop
 	slog.Info("operation-only drive leaving apply-level stop request for operator projection",
 		"apply_id", apply.ApplyIdentifier,
 		"apply_operation_id", scope.applyOperationID,
+		"remote_apply_id", scope.remoteApplyID(apply),
 		"database", apply.Database,
 		"environment", apply.Environment,
 		"state", apply.State)
@@ -591,7 +592,8 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		// An operation-only drive must not complete the apply-level stop
 		// request: the operator projection owns it and completes it once the
 		// parent apply derives terminal. If the parent is already terminal in
-		// storage the operator has resolved it, so this drive is done; if not,
+		// storage there is no more remote work for this drive to do, so leave
+		// the stop pending for the operator projection to resolve; otherwise
 		// fall through so this drive can still stop its own operation's remote
 		// work and leave the parent stop pending for the operator.
 		storedApply, err := c.storage.Applies().Get(ctx, apply.ID)
