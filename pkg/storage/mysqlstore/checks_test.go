@@ -1066,7 +1066,7 @@ func TestCheckStore_CompleteForApplyLeaseGuard(t *testing.T) {
 		UPDATE applies
 		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
 		WHERE id = ?
-	`, "current-worker", "current-token", apply.ID)
+	`, "current-driver", "current-token", apply.ID)
 	require.NoError(t, err)
 
 	check := &storage.Check{
@@ -1086,7 +1086,7 @@ func TestCheckStore_CompleteForApplyLeaseGuard(t *testing.T) {
 	check.Conclusion = "success"
 	check.HasChanges = false
 	staleApply := *apply
-	staleApply.LeaseOwner = "old-worker"
+	staleApply.LeaseOwner = "old-driver"
 	staleApply.LeaseToken = "stale-token"
 	updated, err := store.Checks().CompleteForApply(ctx, check, &staleApply)
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
@@ -1100,7 +1100,7 @@ func TestCheckStore_CompleteForApplyLeaseGuard(t *testing.T) {
 	assert.Equal(t, apply.ID, retrieved.ApplyID)
 
 	currentApply := *apply
-	currentApply.LeaseOwner = "current-worker"
+	currentApply.LeaseOwner = "current-driver"
 	currentApply.LeaseToken = "current-token"
 	updated, err = store.Checks().CompleteForApply(ctx, check, &currentApply)
 	require.NoError(t, err)
@@ -1261,7 +1261,7 @@ func TestCheckStore_MarkActionRequiredForApplyLeaseGuard(t *testing.T) {
 		UPDATE applies
 		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
 		WHERE id = ?
-	`, "current-worker", "current-token", apply.ID)
+	`, "current-driver", "current-token", apply.ID)
 	require.NoError(t, err)
 
 	check := &storage.Check{
@@ -1281,7 +1281,7 @@ func TestCheckStore_MarkActionRequiredForApplyLeaseGuard(t *testing.T) {
 	check.HasChanges = true
 	check.Conclusion = "action_required"
 	staleApply := *apply
-	staleApply.LeaseOwner = "old-worker"
+	staleApply.LeaseOwner = "old-driver"
 	staleApply.LeaseToken = "stale-token"
 	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, &staleApply)
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
@@ -1296,7 +1296,7 @@ func TestCheckStore_MarkActionRequiredForApplyLeaseGuard(t *testing.T) {
 	assert.Equal(t, apply.ID, retrieved.ApplyID)
 
 	currentApply := *apply
-	currentApply.LeaseOwner = "current-worker"
+	currentApply.LeaseOwner = "current-driver"
 	currentApply.LeaseToken = "current-token"
 	updated, err = store.Checks().MarkActionRequiredForApply(ctx, check, &currentApply)
 	require.NoError(t, err)

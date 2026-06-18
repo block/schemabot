@@ -99,10 +99,10 @@ available, such as `repository`, `github_app`, and `installation_id`.
 ### Check Ownership Misses
 
 `schemabot.check_ownership_misses_total` should normally be near zero. A spike
-means an apply or rollback worker reached a terminal path after the stored check
+means an apply or rollback driver reached a terminal path after the stored check
 state had already moved to a different owner, usually because a new commit,
-newer apply, rollback, pod restart, or recovery path raced with the older worker.
-The guarded update prevented the stale worker from overwriting current merge-gate
+newer apply, rollback, pod restart, or recovery path raced with the older driver.
+The guarded update prevented the stale driver from overwriting current merge-gate
 state, so the metric is a near-miss signal rather than proof that check state was
 corrupted.
 
@@ -110,13 +110,13 @@ Operation values:
 
 | Operation | Meaning |
 |---|---|
-| `apply_finished` | A worker tried to record a terminal apply result, but the stored check state no longer belonged to that apply. |
-| `rollback_finished` | A rollback worker tried to mark the check `action_required`, but the stored check state no longer belonged to that rollback apply. |
+| `apply_finished` | A driver tried to record a terminal apply result, but the stored check state no longer belonged to that apply. |
+| `rollback_finished` | A rollback driver tried to mark the check `action_required`, but the stored check state no longer belonged to that rollback apply. |
 
 A spike is still dangerous because the live database can keep changing after the
 PR's desired schema has moved on. For example, an apply can start for commit A,
 an agent can push commit B that removes the schema change, and commit A's apply
-can still reach the database. The guard prevents the old apply worker from
+can still reach the database. The guard prevents the old apply driver from
 marking the current check successful, but it does not undo live-schema drift.
 
 Operator response:
@@ -127,7 +127,7 @@ Operator response:
    apply was running, then compare the latest commit on the PR branch, stored
    check state, and active apply state before allowing merge.
 3. For a global spike, check recent deploys, pod restarts, recovery activity, and
-   webhook redeliveries. A broad spike can indicate duplicate workers or a
+   webhook redeliveries. A broad spike can indicate duplicate drivers or a
    service-level race, not just user commit churn.
 4. If the live schema may now differ from the PR's current declarative schema,
    re-plan the current head and decide whether to apply again, roll back, or
@@ -166,7 +166,7 @@ Operation values:
 | `rollback_finished` | SchemaBot marked stored check state `action_required` after a rollback succeeded because the PR's desired schema is no longer present in that environment. |
 | `aggregate_check_sync` | SchemaBot tried to make the visible aggregate GitHub Check Run match stored per-database check state. The status label says whether it created/updated, skipped, blocked, or failed. |
 | `stale_check_cleanup` | SchemaBot handled stored check state for a database that is no longer touched by the latest commit on the PR branch. Plan-only state can be cleared; apply-owned state stays blocked. |
-| `stale_check_reconciliation` | SchemaBot repaired stale `in_progress` stored check state by comparing it with authoritative apply state after a worker restart, crash, or race. |
+| `stale_check_reconciliation` | SchemaBot repaired stale `in_progress` stored check state by comparing it with authoritative apply state after a driver restart, crash, or race. |
 | `schema_config_discovery` | SchemaBot discovered managed schema configs for the PR before deciding what to plan or which aggregate checks to publish. |
 | `schema_config_source_policy` | SchemaBot evaluated whether a discovered `schemabot.yaml` path is inside this repository's server-owned `allowed_dirs` boundary. `status="skipped"` means the config is outside the managed paths and was ignored; `status="error"` means the config is in a managed path but cannot be routed safely. |
 | `schema_config_environment_validation` | SchemaBot found schema changes but none of the database's server-configured environments are allowed for this deployment, so it failed the aggregate check closed. |

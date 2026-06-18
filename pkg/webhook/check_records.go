@@ -171,7 +171,7 @@ func isApplyNewer(candidate, existing *storage.Apply) bool {
 
 // reconcileStaleChecks repairs stored check state from authoritative apply
 // state. The visible GitHub Check Run is the PR merge gate, but the apply row is
-// the source of truth for whether a schema change is still running. If a worker
+// the source of truth for whether a schema change is still running. If a driver
 // dies after the apply reaches a terminal state but before it updates stored
 // check state, the PR can be left with an in_progress aggregate forever.
 // Reconciliation runs before plan and apply commands so normal user activity can

@@ -219,7 +219,7 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	}, logger)
 	require.NoError(t, svc.SetOperatorPollInterval(100*time.Millisecond))
 	// Webhook E2E helpers use the real service lifecycle. Local applies are
-	// durably queued by ExecuteApply, then dispatched by operator workers.
+	// durably queued by ExecuteApply, then dispatched by operator drivers.
 	svc.StartOperator(ctx)
 	t.Cleanup(func() { _ = svc.Close() })
 
@@ -3365,7 +3365,7 @@ func TestE2EReconcileStaleInProgressCheckFailure(t *testing.T) {
 	svc := setupE2EService(t, dbName)
 	ctx := t.Context()
 
-	// Seed the terminal apply. This models a worker that reached a failed apply
+	// Seed the terminal apply. This models a driver that reached a failed apply
 	// state, then crashed before it updated GitHub check state.
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-stale-failed",
@@ -4106,7 +4106,7 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 }
 
 // TestE2EAggregateUpdateSkipsStaleHeadSHA verifies that aggregate updates are
-// gated by the current PR commit SHA. A stale worker must not publish a check
+// gated by the current PR commit SHA. A stale driver must not publish a check
 // run for an older commit after the PR branch has moved.
 func TestE2EAggregateUpdateSkipsStaleHeadSHA(t *testing.T) {
 	dbName := "webhook_stale_sha_guard"

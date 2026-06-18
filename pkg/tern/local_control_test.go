@@ -376,7 +376,7 @@ func TestLocalClient_StopSnapshotsProgressWithStoppedTaskNamespace(t *testing.T)
 	assert.Equal(t, "root@tcp(localhost:3306)/live_schema", eng.progressReq.Credentials.DSN)
 }
 
-// A stop request can race with a worker that finalized all task rows but
+// A stop request can race with a driver that finalized all task rows but
 // exited before finalizing the apply row. When every targeted task is already
 // terminal, stop derives the apply's final state from its tasks: an apply
 // whose tasks failed must finish as failed, never as completed, so the

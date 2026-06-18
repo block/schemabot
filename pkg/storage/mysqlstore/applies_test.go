@@ -133,7 +133,7 @@ func TestApplyStore_CreateWithTasksCommitsQueueAtomically(t *testing.T) {
 	assert.Equal(t, applyID, tasks[1].ApplyID)
 
 	// A pending apply created with its full task set is immediately ready for
-	// operator dispatch; workers never see a partially populated task list.
+	// operator dispatch; drivers never see a partially populated task list.
 	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
@@ -1276,7 +1276,7 @@ func TestApplyStore_UpdateDerivedStateLeaseGuard(t *testing.T) {
 	require.NoError(t, err)
 	task.ID = taskID
 
-	claimed, err := store.Applies().FindNextApply(ctx, "worker-a")
+	claimed, err := store.Applies().FindNextApply(ctx, "driver-a")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 
@@ -1287,7 +1287,7 @@ func TestApplyStore_UpdateDerivedStateLeaseGuard(t *testing.T) {
 	expectedState := leased.State
 
 	// A stale lease cannot write, even when the expected state matches.
-	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "worker-old", Token: "stale-token"})
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-old", Token: "stale-token"})
 	_, err = store.Applies().UpdateDerivedState(staleCtx, apply.ID, expectedState, state.Apply.Failed, "stale", nil, nil)
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
 
@@ -1319,7 +1319,7 @@ func TestApplyStore_UpdateDerivedStateOperationLeaseGuard(t *testing.T) {
 
 	opLeaseCtx := func(applyID, opID int64, token string) context.Context {
 		return storage.WithOperationLease(ctx, storage.OperationLease{
-			ApplyID: applyID, OperationID: opID, Owner: "worker", Token: token,
+			ApplyID: applyID, OperationID: opID, Owner: "driver", Token: token,
 		})
 	}
 
@@ -1333,7 +1333,7 @@ func TestApplyStore_UpdateDerivedStateOperationLeaseGuard(t *testing.T) {
 	// A current operation lease authorizes the projection swap.
 	apply := runningApply("apply_op_cas_ok", "staging-ok", 900)
 	opID := createApplyOperationForLeaseTest(t, store, apply.ID, "primary")
-	stampOperationLease(t, opID, "worker", "op-token")
+	stampOperationLease(t, opID, "driver", "op-token")
 	swapped, err := store.Applies().UpdateDerivedState(opLeaseCtx(apply.ID, opID, "op-token"), apply.ID, state.Apply.Running, state.Apply.Failed, "op failure", nil, nil)
 	require.NoError(t, err)
 	require.True(t, swapped, "a current operation lease must authorize the projection swap")
@@ -1344,7 +1344,7 @@ func TestApplyStore_UpdateDerivedStateOperationLeaseGuard(t *testing.T) {
 	// A stale operation token fails closed even when the expected state matches.
 	staleApply := runningApply("apply_op_cas_stale", "staging-stale", 901)
 	staleOpID := createApplyOperationForLeaseTest(t, store, staleApply.ID, "primary")
-	stampOperationLease(t, staleOpID, "worker", "op-token")
+	stampOperationLease(t, staleOpID, "driver", "op-token")
 	_, err = store.Applies().UpdateDerivedState(opLeaseCtx(staleApply.ID, staleOpID, "stale-op-token"), staleApply.ID, state.Apply.Running, state.Apply.Failed, "stale", nil, nil)
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
 	persisted, err := store.Applies().Get(ctx, staleApply.ID)
@@ -1359,11 +1359,11 @@ func TestApplyStore_UpdateDerivedStateOperationLeaseGuard(t *testing.T) {
 	// with a current apply lease also on the context.
 	precApply := runningApply("apply_op_cas_prec", "staging-prec", 903)
 	precOpID := createApplyOperationForLeaseTest(t, store, precApply.ID, "primary")
-	stampOperationLease(t, precOpID, "worker", "op-token")
-	_, err = testDB.ExecContext(ctx, `UPDATE applies SET lease_owner=?, lease_token=?, lease_acquired_at=NOW() WHERE id=?`, "current-worker", "apply-token", precApply.ID)
+	stampOperationLease(t, precOpID, "driver", "op-token")
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET lease_owner=?, lease_token=?, lease_acquired_at=NOW() WHERE id=?`, "current-driver", "apply-token", precApply.ID)
 	require.NoError(t, err)
 	bothCtx := storage.WithApplyLease(opLeaseCtx(precApply.ID, precOpID, "stale-op-token"), storage.ApplyLease{
-		ApplyID: precApply.ID, Owner: "current-worker", Token: "apply-token",
+		ApplyID: precApply.ID, Owner: "current-driver", Token: "apply-token",
 	})
 	_, err = store.Applies().UpdateDerivedState(bothCtx, precApply.ID, state.Apply.Running, state.Apply.Failed, "prec", nil, nil)
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
@@ -1376,7 +1376,7 @@ func TestApplyStore_UpdateDerivedStateOperationLeaseGuard(t *testing.T) {
 	// reconciled on the next poll rather than mistaken for a lost lease.
 	missApply := runningApply("apply_op_cas_miss", "staging-miss", 904)
 	missOpID := createApplyOperationForLeaseTest(t, store, missApply.ID, "primary")
-	stampOperationLease(t, missOpID, "worker", "op-token")
+	stampOperationLease(t, missOpID, "driver", "op-token")
 	swapped, err = store.Applies().UpdateDerivedState(opLeaseCtx(missApply.ID, missOpID, "op-token"), missApply.ID, state.Apply.Pending, state.Apply.Failed, "stale projection", nil, nil)
 	require.NoError(t, err, "a state mismatch under a current operation lease must not be reported as a lost lease")
 	assert.False(t, swapped, "the expected state no longer matches, so the swap must miss")
@@ -1434,10 +1434,10 @@ func TestApplyStore_UpdateRejectsOperationLeaseOnlyContext(t *testing.T) {
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_update_oplease", 906, state.Apply.Running, "staging")
 	opID := createApplyOperationForLeaseTest(t, store, apply.ID, "primary")
-	stampOperationLease(t, opID, "worker", "op-token")
+	stampOperationLease(t, opID, "driver", "op-token")
 
 	opOnlyCtx := storage.WithOperationLease(ctx, storage.OperationLease{
-		ApplyID: apply.ID, OperationID: opID, Owner: "worker", Token: "op-token",
+		ApplyID: apply.ID, OperationID: opID, Owner: "driver", Token: "op-token",
 	})
 
 	apply.State = state.Apply.Failed
@@ -1450,9 +1450,9 @@ func TestApplyStore_UpdateRejectsOperationLeaseOnlyContext(t *testing.T) {
 
 	// A single-operation drive carries both leases, so the direct write lands on
 	// the parent-lease path.
-	_, err = testDB.ExecContext(ctx, `UPDATE applies SET lease_owner=?, lease_token=?, lease_acquired_at=NOW() WHERE id=?`, "current-worker", "apply-token", apply.ID)
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET lease_owner=?, lease_token=?, lease_acquired_at=NOW() WHERE id=?`, "current-driver", "apply-token", apply.ID)
 	require.NoError(t, err)
-	dualCtx := storage.WithApplyLease(opOnlyCtx, storage.ApplyLease{ApplyID: apply.ID, Owner: "current-worker", Token: "apply-token"})
+	dualCtx := storage.WithApplyLease(opOnlyCtx, storage.ApplyLease{ApplyID: apply.ID, Owner: "current-driver", Token: "apply-token"})
 	require.NoError(t, store.Applies().Update(dualCtx, apply))
 	written, err := store.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -1472,7 +1472,7 @@ func TestApplyStore_HeartbeatRejectsOperationLeaseOnlyContext(t *testing.T) {
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_heartbeat_oplease", 907, state.Apply.Running, "staging")
 	opID := createApplyOperationForLeaseTest(t, store, apply.ID, "primary")
-	stampOperationLease(t, opID, "worker", "op-token")
+	stampOperationLease(t, opID, "driver", "op-token")
 
 	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 5 MINUTE WHERE id = ?`, apply.ID)
 	require.NoError(t, err)
@@ -1480,7 +1480,7 @@ func TestApplyStore_HeartbeatRejectsOperationLeaseOnlyContext(t *testing.T) {
 	require.NoError(t, err)
 
 	opOnlyCtx := storage.WithOperationLease(ctx, storage.OperationLease{
-		ApplyID: apply.ID, OperationID: opID, Owner: "worker", Token: "op-token",
+		ApplyID: apply.ID, OperationID: opID, Owner: "driver", Token: "op-token",
 	})
 	require.ErrorIs(t, store.Applies().Heartbeat(opOnlyCtx, apply.ID), storage.ErrApplyLeaseLost,
 		"an operation-lease-only context must not heartbeat the parent apply")
@@ -1489,9 +1489,9 @@ func TestApplyStore_HeartbeatRejectsOperationLeaseOnlyContext(t *testing.T) {
 	assert.Equal(t, before.UpdatedAt, unchanged.UpdatedAt, "the parent row must be untouched")
 
 	// A single-operation drive carries both leases, so the heartbeat lands.
-	_, err = testDB.ExecContext(ctx, `UPDATE applies SET lease_owner=?, lease_token=?, lease_acquired_at=NOW() WHERE id=?`, "current-worker", "apply-token", apply.ID)
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET lease_owner=?, lease_token=?, lease_acquired_at=NOW() WHERE id=?`, "current-driver", "apply-token", apply.ID)
 	require.NoError(t, err)
-	dualCtx := storage.WithApplyLease(opOnlyCtx, storage.ApplyLease{ApplyID: apply.ID, Owner: "current-worker", Token: "apply-token"})
+	dualCtx := storage.WithApplyLease(opOnlyCtx, storage.ApplyLease{ApplyID: apply.ID, Owner: "current-driver", Token: "apply-token"})
 	require.NoError(t, store.Applies().Heartbeat(dualCtx, apply.ID))
 	after, err := store.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -1591,10 +1591,10 @@ func TestApplyStore_ClaimApplyByIDClaimsPendingWithTasks(t *testing.T) {
 
 	again, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
 	require.NoError(t, err)
-	assert.Nil(t, again, "a freshly claimed apply is owned by its current worker")
+	assert.Nil(t, again, "a freshly claimed apply is owned by its current driver")
 }
 
-// ClaimApplyByID must not steal a fresh lease from a healthy apply-level worker,
+// ClaimApplyByID must not steal a fresh lease from a healthy apply-level driver,
 // so a running apply with a fresh heartbeat is not claimable; it only becomes
 // claimable once its heartbeat goes stale, matching FindNextApply recovery.
 func TestApplyStore_ClaimApplyByIDSkipsFreshRunningUntilStale(t *testing.T) {
@@ -1607,7 +1607,7 @@ func TestApplyStore_ClaimApplyByIDSkipsFreshRunningUntilStale(t *testing.T) {
 
 	fresh, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
 	require.NoError(t, err)
-	assert.Nil(t, fresh, "a fresh running apply is owned by its active worker")
+	assert.Nil(t, fresh, "a fresh running apply is owned by its active driver")
 
 	_, err = testDB.ExecContext(ctx, `
 		UPDATE applies
@@ -1645,10 +1645,10 @@ func TestApplyStore_ClaimApplyByIDReturnsNilForTerminalAndMissing(t *testing.T) 
 
 // A PlanetScale apply transitions through engine setup-phase states
 // (preparing_branch through validating_deploy_request) before per-table work
-// begins. If the worker driving setup crashes, the apply is left in one of
-// those states; a fresh worker must reclaim it once the heartbeat goes stale so
+// begins. If the driver driving setup crashes, the apply is left in one of
+// those states; a fresh driver must reclaim it once the heartbeat goes stale so
 // setup resumes from persisted branch/deploy metadata. While the original
-// worker is still alive its heartbeat stays fresh, so the apply is not claimed
+// driver is still alive its heartbeat stays fresh, so the apply is not claimed
 // out from under it.
 func TestApplyStore_FindNextApplyClaimsStaleSetupPhase(t *testing.T) {
 	for _, setupState := range []string{
@@ -1669,7 +1669,7 @@ func TestApplyStore_FindNextApplyClaimsStaleSetupPhase(t *testing.T) {
 
 			fresh, err := store.Applies().FindNextApply(ctx, "operator-a")
 			require.NoError(t, err)
-			assert.Nil(t, fresh, "a setup-phase apply with a fresh heartbeat is owned by its active worker")
+			assert.Nil(t, fresh, "a setup-phase apply with a fresh heartbeat is owned by its active driver")
 
 			_, err = testDB.ExecContext(ctx, `
 				UPDATE applies
@@ -1691,7 +1691,7 @@ func TestApplyStore_FindNextApplyClaimsStaleSetupPhase(t *testing.T) {
 }
 
 // ClaimApplyByID is how the operation-level claim loop acquires the parent apply
-// lease after leasing a stale operation row. When a PlanetScale worker crashes
+// lease after leasing a stale operation row. When a PlanetScale driver crashes
 // mid-setup the operation row stays running (stale) while the parent apply sits
 // in a setup-phase state, so ClaimApplyByID must reclaim that stale parent for
 // recovery while still refusing one whose heartbeat is fresh.
@@ -1706,7 +1706,7 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleSetupPhase(t *testing.T) {
 
 	fresh, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
 	require.NoError(t, err)
-	assert.Nil(t, fresh, "a fresh setup-phase apply is owned by its active worker")
+	assert.Nil(t, fresh, "a fresh setup-phase apply is owned by its active driver")
 
 	_, err = testDB.ExecContext(ctx, `
 		UPDATE applies
@@ -1785,16 +1785,16 @@ func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
 	require.NoError(t, err)
 	task.ID = taskID
 
-	claimed, err := store.Applies().FindNextApply(ctx, "worker-a")
+	claimed, err := store.Applies().FindNextApply(ctx, "driver-a")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
-	require.Equal(t, "worker-a", claimed.LeaseOwner)
+	require.Equal(t, "driver-a", claimed.LeaseOwner)
 	require.NotEmpty(t, claimed.LeaseToken)
 	require.NotNil(t, claimed.LeaseAcquiredAt)
 
-	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "worker-old", Token: "stale-token"})
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-old", Token: "stale-token"})
 	claimed.State = state.Apply.Failed
-	claimed.ErrorMessage = "stale worker failure"
+	claimed.ErrorMessage = "stale driver failure"
 	require.ErrorIs(t, store.Applies().Update(staleCtx, claimed), storage.ErrApplyLeaseLost)
 	require.ErrorIs(t, store.Applies().Heartbeat(staleCtx, apply.ID), storage.ErrApplyLeaseLost)
 
@@ -1805,7 +1805,7 @@ func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
 		Level:     storage.LogLevelInfo,
 		EventType: storage.LogEventStateTransition,
 		Source:    storage.LogSourceSchemaBot,
-		Message:   "stale worker log",
+		Message:   "stale driver log",
 	}), storage.ErrApplyLeaseLost)
 
 	persistedApply, err := store.Applies().Get(ctx, apply.ID)
@@ -1834,7 +1834,7 @@ func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
 		Level:     storage.LogLevelInfo,
 		EventType: storage.LogEventStateTransition,
 		Source:    storage.LogSourceSchemaBot,
-		Message:   "owned worker log",
+		Message:   "owned driver log",
 	}))
 }
 
@@ -1943,7 +1943,7 @@ func TestApplyStore_FindNextApplyClaimsPendingControlRequestWithoutTasks(t *test
 
 	claimedAgain, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
-	assert.Nil(t, claimedAgain, "claim heartbeat should prevent another worker from immediately taking the same start request")
+	assert.Nil(t, claimedAgain, "claim heartbeat should prevent another driver from immediately taking the same start request")
 }
 
 func TestApplyStore_FindNextApplyClaimsStoppedStartControlRequest(t *testing.T) {
@@ -1975,7 +1975,7 @@ func TestApplyStore_FindNextApplyClaimsStoppedStartControlRequest(t *testing.T) 
 
 	claimedAgain, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
-	assert.Nil(t, claimedAgain, "claim transition should prevent another worker from taking the same stopped start request")
+	assert.Nil(t, claimedAgain, "claim transition should prevent another driver from taking the same stopped start request")
 }
 
 func TestApplyStore_FindNextApplyClaimsWaitingForDeployStartControlRequest(t *testing.T) {
@@ -2016,7 +2016,7 @@ func TestApplyStore_FindNextApplyClaimsWaitingForDeployStartControlRequest(t *te
 
 	claimedAgain, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
-	assert.Nil(t, claimedAgain, "fresh processing lease should prevent another worker from taking the same deferred deploy start request")
+	assert.Nil(t, claimedAgain, "fresh processing lease should prevent another driver from taking the same deferred deploy start request")
 
 	_, err = testDB.ExecContext(ctx, `
 		UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
@@ -2140,7 +2140,7 @@ func TestApplyStore_FindNextApplyClaimsStaleWaitingForCutoverControlRequest(t *t
 
 	freshClaim, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
-	assert.Nil(t, freshClaim, "fresh waiting-for-cutover applies are owned by their active worker")
+	assert.Nil(t, freshClaim, "fresh waiting-for-cutover applies are owned by their active driver")
 
 	_, err = testDB.ExecContext(ctx, `
 		UPDATE applies
@@ -2162,7 +2162,7 @@ func TestApplyStore_FindNextApplyClaimsStaleWaitingForCutoverControlRequest(t *t
 
 	claimedAgain, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
-	assert.Nil(t, claimedAgain, "claim heartbeat should prevent another worker from immediately taking the same stale cutover request")
+	assert.Nil(t, claimedAgain, "claim heartbeat should prevent another driver from immediately taking the same stale cutover request")
 }
 
 func TestApplyStore_FindNextApplySkipsFailedStoppedStartControlRequest(t *testing.T) {
@@ -2222,7 +2222,7 @@ func TestApplyStore_FindNextApplyDoesNotClaimFreshRunningStopControlRequest(t *t
 
 	claimed, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
-	assert.Nil(t, claimed, "fresh running applies are owned by their active worker; pending stop must not create a second owner")
+	assert.Nil(t, claimed, "fresh running applies are owned by their active driver; pending stop must not create a second owner")
 }
 
 func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
@@ -2268,9 +2268,9 @@ func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 	require.NoError(t, err)
 	apply.ID = applyID
 
-	const workers = 16
-	stores := make([]*Storage, workers)
-	for i := range workers {
+	const drivers = 16
+	stores := make([]*Storage, drivers)
+	for i := range drivers {
 		db, openErr := sql.Open("mysql", testDSNChangedRows)
 		require.NoError(t, openErr)
 		db.SetMaxOpenConns(1)
@@ -2287,11 +2287,11 @@ func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 	var claimed []*storage.Apply
 	var claimErrors []error
 
-	for i := range workers {
-		workerStore := stores[i]
+	for i := range drivers {
+		driverStore := stores[i]
 		wg.Go(func() {
 			<-start
-			got, claimErr := workerStore.Applies().FindNextApply(ctx, "test-owner")
+			got, claimErr := driverStore.Applies().FindNextApply(ctx, "test-owner")
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -2309,7 +2309,7 @@ func TestApplyStore_FindNextApplyConcurrentPendingClaims(t *testing.T) {
 	wg.Wait()
 
 	require.Empty(t, claimErrors)
-	require.Len(t, claimed, 1, "only one operator worker should claim a pending apply")
+	require.Len(t, claimed, 1, "only one operator driver should claim a pending apply")
 	assert.Equal(t, apply.ApplyIdentifier, claimed[0].ApplyIdentifier)
 	assert.Equal(t, state.Apply.Pending, claimed[0].State)
 

@@ -46,7 +46,7 @@ type CommentObserver struct {
 
 	// aggregateTerminalCASWinner marks a one-shot observer used by the operator
 	// to publish a multi-operation apply's single terminal summary after it won
-	// the aggregate projection compare-and-swap. Such a worker holds the
+	// the aggregate projection compare-and-swap. Such a driver holds the
 	// operation lease, not the parent apply lease, so the per-driver apply-lease
 	// authority does not apply; the won CAS is the authority. It bypasses the
 	// apply-lease checks and lease-scoped storage writes accordingly.
@@ -324,7 +324,7 @@ func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
 
 func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation string) bool {
 	// The aggregate terminal observer is invoked by the operator that already won
-	// the non-terminal→terminal projection CAS. That worker holds the operation
+	// the non-terminal→terminal projection CAS. That driver holds the operation
 	// lease, not the parent apply lease, so the per-driver apply-lease authority
 	// does not apply here — the won CAS is the authority for this one publish.
 	if o.aggregateTerminalCASWinner {
@@ -346,7 +346,7 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 
 	// GitHub comments and check updates are side effects outside MySQL's
 	// transaction boundary. Re-check the apply lease immediately before each
-	// side effect so a stale worker cannot publish progress, terminal comments,
+	// side effect so a stale driver cannot publish progress, terminal comments,
 	// or check updates after a newer operator owner has claimed the apply.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

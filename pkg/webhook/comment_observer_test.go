@@ -215,7 +215,7 @@ func TestCommentObserverErrorLogsWithoutApplyRecord(t *testing.T) {
 
 // The aggregate terminal observer is invoked by the operator that already won
 // the non-terminal→terminal projection CAS for a multi-operation apply. That
-// worker holds the operation lease, not the parent apply lease, so the one-shot
+// driver holds the operation lease, not the parent apply lease, so the one-shot
 // observer must publish without an apply lease — unlike the normal per-driver
 // observer, which fails closed when it cannot prove apply-lease ownership.
 func TestAggregateTerminalObserverBypassesApplyLeaseCheck(t *testing.T) {
@@ -232,7 +232,7 @@ func TestAggregateTerminalObserverBypassesApplyLeaseCheck(t *testing.T) {
 		"the aggregate terminal observer is authorized by the won CAS, not an apply lease")
 
 	// The lease-scoped storage write helper must likewise not attach a lease the
-	// aggregate worker does not hold, so comment-recording writes take storage's
+	// aggregate driver does not hold, so comment-recording writes take storage's
 	// no-apply-lease path instead of failing closed.
 	ctx := aggregate.contextWithApplyLease(t.Context(), unleasedApply)
 	_, hasLease := storage.ApplyLeaseFromContext(ctx)

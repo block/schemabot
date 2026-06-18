@@ -886,7 +886,7 @@ func TestGRPCClient_ResumeApplyDispatchesQueuedRemoteApply(t *testing.T) {
 }
 
 func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
-	// An operator worker resumes a single apply_operation over the remote path.
+	// An operator driver resumes a single apply_operation over the remote path.
 	// The drive loads tasks scoped to that operation (GetByApplyOperationID) and
 	// dispatches only those, never widening to the whole apply's tasks.
 	server := &capturingTernServer{
@@ -1996,7 +1996,7 @@ func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *te
 	// A freshly dispatched remote apply can report pending before the remote
 	// engine starts copying rows. SchemaBot has already claimed the queued apply
 	// locally, so progress polling must not write pending back to the stored
-	// apply row and make it claimable by another operator worker.
+	// apply row and make it claimable by another operator driver.
 	server := &capturingTernServer{
 		remoteApplyID: "remote-pending-first",
 		progressStates: []ternv1.State{
@@ -2550,7 +2550,7 @@ func hasLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 func TestGRPCClient_PollReturnsTerminalStorageUpdateError(t *testing.T) {
 	// A terminal remote state is not enough by itself; the control plane must
-	// persist that terminal state to storage before the operator worker exits.
+	// persist that terminal state to storage before the operator driver exits.
 	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
 		progressState:    ternv1.State_STATE_COMPLETED,
 		progressStateSet: true,
@@ -2622,8 +2622,8 @@ func TestGRPCClient_PollKeepsApplyActiveWhenTerminalTaskLoadFails(t *testing.T) 
 }
 
 func TestGRPCClient_PollSkipsTaskFinalizationWhenStoredApplyAlreadyTerminal(t *testing.T) {
-	// A stale worker can receive a terminal remote state after another worker
-	// has already terminalized the stored apply row. In that case the worker must
+	// A stale driver can receive a terminal remote state after another driver
+	// has already terminalized the stored apply row. In that case the driver must
 	// not rewrite tasks from its stale in-memory apply state.
 	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
 		progressState:    ternv1.State_STATE_COMPLETED,
@@ -2696,7 +2696,7 @@ func TestGRPCClient_MarkRemoteApplyFailedReturnsTaskLoadError(t *testing.T) {
 
 func TestGRPCClient_ResumeApplyRejectsAmbiguousRemoteDispatchState(t *testing.T) {
 	// A stale active gRPC apply without an external_id is ambiguous: the prior
-	// worker may have sent the remote Apply RPC and crashed before persisting the
+	// driver may have sent the remote Apply RPC and crashed before persisting the
 	// returned data-plane ID. Fail closed instead of dispatching a duplicate
 	// remote schema change.
 	server := &capturingTernServer{remoteApplyID: "remote-duplicate"}
@@ -2988,8 +2988,8 @@ func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 }
 
 func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
-	// An operator claim can move the apply row before the worker calls remote
-	// Start. The durable control request lets a later worker recover that
+	// An operator claim can move the apply row before the driver calls remote
+	// Start. The durable control request lets a later driver recover that
 	// intent and validate the remote stopped state.
 	server := &capturingTernServer{
 		progressState:    ternv1.State_STATE_STOPPED,
@@ -3252,8 +3252,8 @@ func TestGRPCClient_ResumeApplyStartErrorLeavesApplyStopped(t *testing.T) {
 }
 
 func TestGRPCClient_ResumeApplyProcessesQueuedStop(t *testing.T) {
-	// A pending durable stop is processed by the operator-owned worker before
-	// resume/start work. The worker mirrors remote stopped progress to storage
+	// A pending durable stop is processed by the operator-owned driver before
+	// resume/start work. The driver mirrors remote stopped progress to storage
 	// before completing the durable request.
 	server := &capturingTernServer{
 		progressState:    ternv1.State_STATE_STOPPED,
@@ -3311,7 +3311,7 @@ func TestGRPCClient_ResumeApplyProcessesQueuedStop(t *testing.T) {
 }
 
 func TestGRPCClient_ResumeApplyProcessesQueuedCutover(t *testing.T) {
-	// A pending durable cutover is processed by the operator-owned worker using
+	// A pending durable cutover is processed by the operator-owned driver using
 	// the remote apply ID, then completed once remote Tern accepts the request.
 	server := &capturingTernServer{
 		cutoverAccepted:  true,
@@ -3576,7 +3576,7 @@ func TestGRPCClient_ResumeApplyCompletesQueuedStartWhenRemoteAlreadyActive(t *te
 }
 
 func TestGRPCClient_ReconcileStoppedRemoteProgressKeepsQueuedStartPending(t *testing.T) {
-	// A Start request can be accepted while an older worker is still recording
+	// A Start request can be accepted while an older driver is still recording
 	// the remote stop. The stop sync must not consume the pending Start intent;
 	// the operator needs that durable request to claim and resume the apply.
 	now := time.Now()
@@ -3825,7 +3825,7 @@ func TestGRPCClient_ResumeApplyFailsWhenStoppedRemoteIsNotFound(t *testing.T) {
 func TestGRPCClient_PollFailsWhenRemoteApplyIsNotFound(t *testing.T) {
 	// A known remote apply ID returning NotFound means the data plane can no
 	// longer report progress for work the control plane believes exists. The
-	// stored apply fails so workers do not keep polling a stale remote ID.
+	// stored apply fails so drivers do not keep polling a stale remote ID.
 	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{
 		progressErr: status.Error(codes.NotFound, "apply not found"),
 	})

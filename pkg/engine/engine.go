@@ -248,7 +248,7 @@ type ApplyRequest struct {
 
 	// OnStateChange is called by the engine to persist ResumeState at key milestones
 	// during Apply (e.g., after branch creation, after deploy request creation).
-	// This enables crash recovery: if the worker dies mid-Apply, the tern layer can
+	// This enables crash recovery: if the driver dies mid-Apply, the tern layer can
 	// resume from the last persisted state instead of starting over.
 	// Nil means no persistence (state is only returned at the end of Apply).
 	OnStateChange func(state *ResumeState)
@@ -414,11 +414,11 @@ type ControlResult struct {
 // The same volume number has different effects per engine:
 //   - Spirit: controls thread count (1-16+) and chunk timing. Higher volume =
 //     more parallel copy threads = faster but more load. State is in-process
-//     and lost on worker crash (restarts with defaults).
+//     and lost on driver crash (restarts with defaults).
 //   - PlanetScale/Vitess: controls a server-side rejection throttle ratio
 //     (0.0-0.95). Online DDL runs on a single thread per shard; the throttle
 //     ratio determines what fraction of write requests are rejected to limit
-//     replication lag impact. State is server-side and survives worker crashes.
+//     replication lag impact. State is server-side and survives driver crashes.
 //
 // The scale provides a consistent user interface across engines, but the
 // underlying mechanisms are fundamentally different (concurrency control

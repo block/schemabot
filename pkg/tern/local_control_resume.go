@@ -454,8 +454,8 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 
 // prepareStoppedTasksForResume turns an operator-claimed start request back into
 // runnable task work. The start intent stays pending until stopped task rows are
-// requeued and the apply is ready for execution, so a worker crash can still be
-// recovered by another operator worker.
+// requeued and the apply is ready for execution, so a driver crash can still be
+// recovered by another operator driver.
 func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) {
 	if !startRequested {
 		return
@@ -523,7 +523,7 @@ func (c *LocalClient) markApplyRecovering(ctx context.Context, apply *storage.Ap
 
 // launchAtomicResume sends all DDLs to the engine in one call, marks tasks and
 // apply as RUNNING, logs the provided message, and then polls for completion.
-// Operator-owned calls block so the worker owns the apply until terminal or
+// Operator-owned calls block so the driver owns the apply until terminal or
 // retry-waiting state; user start calls poll in the background and returns
 // after the engine accepts the resume.
 func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.Apply,
@@ -783,7 +783,7 @@ func (c *LocalClient) notifyTerminalObserver(apply *storage.Apply, tasks []*stor
 	}
 }
 
-// ResumeApply starts or resumes an apply claimed by an operator worker.
+// ResumeApply starts or resumes an apply claimed by an operator driver.
 // Pending applies are dispatched for the first time; stale applies use the
 // engine's resume metadata to continue after a missed heartbeat.
 func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
@@ -799,7 +799,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 // ResumeApplyOperation starts or resumes a single apply_operation (one
 // deployment of a multi-deployment apply), driving only that operation's tasks.
 // The drive logic is identical to ResumeApply; the only difference is that tasks
-// are loaded scoped to the operation rather than the whole apply, so a worker
+// are loaded scoped to the operation rather than the whole apply, so a driver
 // can advance one deployment independently of its siblings.
 func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
 	tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, applyOperationID)

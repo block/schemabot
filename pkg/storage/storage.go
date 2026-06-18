@@ -107,14 +107,14 @@ type CheckStore interface {
 
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
-	// same PR/environment/database. Returns false when another worker changed
+	// same PR/environment/database. Returns false when another driver changed
 	// the stored state first.
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// MarkActionRequiredForApply marks stored check state action_required after
 	// a rollback only if it still belongs to that rollback apply and no newer
 	// apply exists for the same PR/environment/database. Returns false when
-	// another worker changed the stored state first.
+	// another driver changed the stored state first.
 	MarkActionRequiredForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.
@@ -278,7 +278,7 @@ type ApplyStore interface {
 	// successful claim it rotates the lease (owner, token, acquired_at) and
 	// refreshes the heartbeat so operator-owned writes can fail closed after
 	// ownership changes. Returns the claimed apply, or nil if the apply does not
-	// exist or is not currently claimable (e.g. another worker holds a fresh
+	// exist or is not currently claimable (e.g. another driver holds a fresh
 	// lease or the apply is terminal). Used by the operation-level claim loop to
 	// acquire the parent apply lease after claiming an apply_operations row.
 	ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*Apply, error)
@@ -302,7 +302,7 @@ type ApplyStore interface {
 
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 	// Should be called every 10 seconds while working on an apply.
-	// If not called for > 1 minute, another worker can claim the apply.
+	// If not called for > 1 minute, another driver can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
 
 	// CheckLease verifies that an operator apply lease is still current without
@@ -472,7 +472,7 @@ type ApplyOperationStore interface {
 	// minute are re-leased without changing their state. Terminal rows
 	// (completed/failed/cancelled/stopped/reverted) are never claimed.
 	//
-	// owner identifies the claiming worker and is required; it is recorded as
+	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing
 	// needs work.
 	FindNextApplyOperation(ctx context.Context, owner string) (*ApplyOperation, error)
@@ -492,12 +492,12 @@ type ApplyOperationStore interface {
 	// re-leased without changing its state — recovering an in-flight cutover whose
 	// driver died, which carries no ordering gate.
 	//
-	// owner identifies the claiming worker and is required. Returns the claimed
+	// owner identifies the claiming driver and is required. Returns the claimed
 	// row, or nil if nothing is ready to cut over.
 	FindNextApplyOperationCutover(ctx context.Context, owner string) (*ApplyOperation, error)
 
 	// Heartbeat refreshes the child row's updated_at timestamp to extend the
-	// claim's lease while a worker is acting on it. Mirrors ApplyStore.Heartbeat
+	// claim's lease while a driver is acting on it. Mirrors ApplyStore.Heartbeat
 	// semantics: silent no-op when the row no longer exists.
 	Heartbeat(ctx context.Context, id int64) error
 
@@ -539,7 +539,7 @@ type ApplyLogStore interface {
 }
 
 // ControlRequestStore manages durable user control requests.
-// A control request is behavioral state, not just audit: operator workers use
+// A control request is behavioral state, not just audit: operator drivers use
 // pending rows to recover accepted operations after process restarts.
 type ControlRequestStore interface {
 	// RequestPending records a pending request for an apply operation. If the

@@ -80,7 +80,7 @@ stateDiagram-v2
 - `recovering`: Temporary restart recovery. Current MySQL/Spirit deferred-cutover recovery enters this state only after durable storage had already reached `waiting_for_cutover`. That stored cutover-ready state is authoritative: recovery must not move durable storage backward to `running` if Spirit reports row-copy progress after reattaching. Row-copy counters can still be displayed while storage remains `recovering`. Recovery exits to `waiting_for_cutover` only after cutover readiness is proven again, or to `completed` when live-schema reconciliation proves the data plane already reached the desired schema. Control operations that require a later phase are blocked while recovery is active.
 - `revert_window`: Only with `--enable-revert`. Spirit auto-advances through it; PlanetScale holds until expiry or user action. Maps from PlanetScale's `complete_pending_revert` deploy state
 - `stopped`: Spirit only — resumable via `schemabot start`. Spirit checkpoints progress for resume.
-- `failed_retryable`: transient engine failure. Scheduler workers retry while the retry budget remains, then move the apply to `failed`.
+- `failed_retryable`: transient engine failure. Scheduler drivers retry while the retry budget remains, then move the apply to `failed`.
 - `cancelled`: PlanetScale only — permanent. Cancels the deploy request; the underlying Vitess migrations are cancelled. Not resumable — start a new apply instead.
 
 ## Task states

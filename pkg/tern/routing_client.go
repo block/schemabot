@@ -288,7 +288,7 @@ func (c *RoutingClient) Health(ctx context.Context) error {
 	return fmt.Errorf("routing client health requires a deployment-scoped client")
 }
 
-// ResumeApply starts or resumes work claimed by an operator worker.
+// ResumeApply starts or resumes work claimed by an operator driver.
 func (c *RoutingClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
 	client, err := c.clientForStoredApply(ctx, apply)
 	if err != nil {

@@ -14,12 +14,12 @@ func TestOperationLease_Valid(t *testing.T) {
 	}{
 		{
 			name:  "fully populated",
-			lease: OperationLease{ApplyID: 1, OperationID: 2, Owner: "worker-0", Token: "tok"},
+			lease: OperationLease{ApplyID: 1, OperationID: 2, Owner: "driver-0", Token: "tok"},
 			want:  true,
 		},
 		{
 			name:  "missing token",
-			lease: OperationLease{ApplyID: 1, OperationID: 2, Owner: "worker-0"},
+			lease: OperationLease{ApplyID: 1, OperationID: 2, Owner: "driver-0"},
 			want:  false,
 		},
 		{
@@ -60,7 +60,7 @@ func TestOperationLeaseFromContext_Absent(t *testing.T) {
 }
 
 // An operation lease must not be readable as an apply lease and vice versa:
-// the two capabilities use distinct context keys so a worker can carry both at
+// the two capabilities use distinct context keys so a driver can carry both at
 // once without one masquerading as the other.
 func TestOperationAndApplyLeasesAreDistinct(t *testing.T) {
 	ctx := WithOperationLease(t.Context(), OperationLease{ApplyID: 1, OperationID: 2, Token: "op"})

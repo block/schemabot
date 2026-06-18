@@ -1095,7 +1095,7 @@ func TestLocalClient_GroupedApplyKeepsClaimLeaseRunning(t *testing.T) {
 	assert.Equal(t, state.Apply.Completed, completed.State)
 }
 
-// An operator worker resumes a single apply_operation — one deployment of an
+// An operator driver resumes a single apply_operation — one deployment of an
 // apply — rather than the whole apply. ResumeApplyOperation loads only that
 // operation's tasks (via the operation-scoped read primitive) and drives them
 // to completion through the same engine path as ResumeApply.
@@ -2415,7 +2415,7 @@ func TestLocalClient_ResumeApplyGroupedStartRequestFailsWhenEngineRejects(t *tes
 }
 
 // This scenario covers restart recovery of a grouped Vitess apply whose opaque
-// engine resume state was persisted before the worker died. Recovery must hand
+// engine resume state was persisted before the driver died. Recovery must hand
 // that state back to the engine in exactly one grouped apply — even without
 // defer-cutover — so the engine reattaches to the in-flight deploy request
 // instead of opening a duplicate one. The rebuilt changes must keep the tasks'
@@ -3562,7 +3562,7 @@ func TestLocalClient_AtomicRetryableFailureQueuesOperatorRetry(t *testing.T) {
 	}
 
 	// The engine reports a failed result with Retryable=true. The local Tern
-	// worker should stop this attempt, keep the apply non-terminal, and leave
+	// driver should stop this attempt, keep the apply non-terminal, and leave
 	// already-completed task work untouched for the operator retry.
 	client.pollForCompletionAtomic(ctx, apply, tasks, &engine.Credentials{DSN: dsn}, nil, apply.GetOptions().Map(), false)
 

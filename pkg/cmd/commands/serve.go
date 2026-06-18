@@ -171,7 +171,7 @@ func (cmd *ServeCmd) Run(g *Globals) error {
 		svc.SetDefaultTernClient(dataPlaneClient)
 	}
 
-	// Start the operator worker pool after webhook callbacks are registered.
+	// Start the operator driver pool after webhook callbacks are registered.
 	// This polls for apply work every 10 seconds:
 	// - Runs immediately on startup
 	// - Dispatches queued local applies

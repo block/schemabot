@@ -958,7 +958,7 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 // scopes to the whole apply (all its operations) and uses the parent
 // applies.external_id, matching the single-operation behaviour. An
 // operation-scoped value restricts the drive to a single apply_operation (one
-// deployment) so a worker can advance one deployment independently of its
+// deployment) so a driver can advance one deployment independently of its
 // siblings; when the parent owns more than one operation it also routes the
 // remote apply id through that operation's engine_resume_context instead of the
 // shared parent external_id, so one deployment never reuses or overwrites
@@ -1143,7 +1143,7 @@ func (c *GRPCClient) ResumeApply(ctx context.Context, apply *storage.Apply) erro
 // deployment of a multi-deployment apply) over the remote (gRPC) path. The drive
 // logic is identical to ResumeApply; the operation scope only narrows the task
 // re-query sites (dispatch, progress poll, terminal reconcile, failure, stop) so
-// a worker advances one deployment independently of its siblings.
+// a driver advances one deployment independently of its siblings.
 func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
 	if applyOperationID <= 0 {
 		return fmt.Errorf("apply operation id is required")
@@ -1809,7 +1809,7 @@ func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
 	return changes
 }
 
-// storedApplyTransitionStatus describes whether a worker may copy a remote
+// storedApplyTransitionStatus describes whether a driver may copy a remote
 // failure or terminal result into the stored apply row after reloading storage.
 // Only the ready status may mutate storage; every other status explains why the
 // write must be skipped or retried.
@@ -1837,7 +1837,7 @@ func (c *GRPCClient) reloadStoredApplyForRemoteTransition(ctx context.Context, r
 	return storedApply, storedApplyTransitionReady, nil
 }
 
-// A terminal stored apply is usually authoritative: a stale worker must not
+// A terminal stored apply is usually authoritative: a stale driver must not
 // overwrite a newer completed/failed/reverted result. Stopped is the one
 // terminal state that may still be superseded when the caller is reconciling an
 // exact remote apply ID that is missing or no longer active.
@@ -2074,7 +2074,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	}
 
 	// Keep the stored apply active until stored task rows are written. If task
-	// storage is unavailable, the operator can retry this worker instead of
+	// storage is unavailable, the operator can retry this driver instead of
 	// treating a terminal apply as fully reconciled.
 	storedTasks, err := c.loadApplyTasks(ctx, storedApply, scope)
 	if err != nil {
@@ -2124,7 +2124,7 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 		return err
 	}
 	// Stopped is a terminal apply state, but it is not completion of a pending
-	// Start request. A start can be queued while the previous worker is still
+	// Start request. A start can be queued while the previous driver is still
 	// recording the stop; leave that request pending so the operator can claim
 	// the stopped row and perform the resume.
 	if !state.IsState(storedApply.State, state.Apply.Stopped) {

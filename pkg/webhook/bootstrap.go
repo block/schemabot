@@ -11,7 +11,7 @@ import (
 // commandTimeout is the default deadline for processing a single PR command.
 // Command handlers run as fire-and-forget goroutines after the webhook delivery
 // has been acknowledged; the timeout bounds their lifetime so an unresponsive
-// downstream (GitHub API, MySQL, Spirit) cannot leak a worker indefinitely.
+// downstream (GitHub API, MySQL, Spirit) cannot leak a driver indefinitely.
 const commandTimeout = 2 * time.Minute
 
 // commandBootstrap sets up the standard per-command context with a deadline

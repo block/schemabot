@@ -251,7 +251,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 			case <-ticker.C:
 				if err := c.storage.Applies().Heartbeat(hbCtx, apply.ID); err != nil {
 					if errors.Is(err, storage.ErrApplyLeaseLost) {
-						c.logger.Warn("heartbeat failed because apply lease was lost; local worker will stop executing and writing apply state",
+						c.logger.Warn("heartbeat failed because apply lease was lost; local driver will stop executing and writing apply state",
 							"apply_id", apply.ApplyIdentifier,
 							"database", apply.Database,
 							"environment", apply.Environment,

@@ -51,7 +51,7 @@ var TerminalTaskStates = []string{
 // IsTerminalTaskState returns true if the state is a terminal task state
 // where no further processing will occur.
 // Stopped is NOT terminal — a stopped task can be resumed via Start.
-// FailedRetryable is NOT terminal — operator workers may retry the task.
+// FailedRetryable is NOT terminal — operator drivers may retry the task.
 func IsTerminalTaskState(s string) bool {
 	switch s {
 	case Task.Completed, Task.Failed, Task.Reverted, Task.Cancelled:

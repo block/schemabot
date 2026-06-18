@@ -28,7 +28,7 @@ comment workflows.
 
 The gRPC path has two state sources:
 
-- **Remote Tern state** — what the remote data-plane worker reports through
+- **Remote Tern state** — what the remote data-plane driver reports through
   `Progress`, and what it accepts through `Stop`, `Start`, or `Cutover` RPCs.
 - **Stored SchemaBot state** — apply state, durable control requests, apply logs,
   and user-facing progress shown by CLI watch, PR comments, and check runs.
@@ -65,7 +65,7 @@ request against remote Tern, and records the result back in SchemaBot storage.
 ```text
 ╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭─────────────╮
 │ Operator /  │   │ SchemaBot   │   │ SchemaBot   │   │ Scheduler   │   │ Remote Tern │
-│ automation  │──▶│ API         │──▶│ storage     │──▶│ worker      │──▶│ data plane  │
+│ automation  │──▶│ API         │──▶│ storage     │──▶│ driver      │──▶│ data plane  │
 ╰─────────────╯   ╰─────────────╯   ╰─────────────╯   ╰─────────────╯   ╰─────────────╯
      request        validate +       durable intent     claim +          Stop / Start /
                     accept           caller metadata    execute          Cutover RPC
@@ -81,7 +81,7 @@ state; they do not infer state directly from remote Tern.
 ```text
 ╭─────────────╮   ╭─────────────╮   ╭─────────────╮   ╭────────────────╮
 │ Scheduler   │   │ Remote Tern │   │ SchemaBot   │   │ User-visible   │
-│ worker      │──▶│ data plane  │──▶│ storage     │──▶│ observers      │
+│ driver      │──▶│ data plane  │──▶│ storage     │──▶│ observers      │
 ╰─────────────╯   ╰─────────────╯   ╰─────────────╯   ╰────────────────╯
      poll           progress         reconciled        CLI watch,
                     sample           state, errors,    PR comments,

@@ -83,7 +83,7 @@ type Client interface {
 	// Health checks the service health.
 	Health(ctx context.Context) error
 
-	// ResumeApply starts or resumes work claimed by an operator worker.
+	// ResumeApply starts or resumes work claimed by an operator driver.
 	// Fresh pending applies are dispatched for the first time; stale applies
 	// use checkpoint/resume capabilities of the underlying engine.
 	ResumeApply(ctx context.Context, apply *storage.Apply) error
@@ -91,7 +91,7 @@ type Client interface {
 	// ResumeApplyOperation starts or resumes a single apply_operation (one
 	// deployment of a multi-deployment apply), driving only that operation's
 	// tasks. The drive logic is identical to ResumeApply; the operation scope
-	// only narrows which tasks are loaded/re-queried so a worker can advance one
+	// only narrows which tasks are loaded/re-queried so a driver can advance one
 	// deployment independently of its siblings. Fails closed when no tasks match
 	// the operation rather than touching the rest of the apply.
 	ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error

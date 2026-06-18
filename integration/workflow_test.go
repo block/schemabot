@@ -1398,7 +1398,7 @@ CREATE TABLE ccc_cancelled (
 
 	// Step 3: Poll progress until the retryable failure is durable in storage.
 	// The request that observes the engine failure can briefly return failed
-	// before the background worker persists failed_retryable.
+	// before the background driver persists failed_retryable.
 	var lastState string
 	var errorMessage string
 	var finalTables []any

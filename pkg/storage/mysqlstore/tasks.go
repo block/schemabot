@@ -178,7 +178,7 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 // GetByApplyOperationID returns the tasks for a single apply_operation (one
 // deployment of a multi-deployment apply). While the config layer hard-blocks
 // more than one deployment per environment this returns the same rows as
-// GetByApplyID for the apply's single operation; it lets a worker drive and
+// GetByApplyID for the apply's single operation; it lets a driver drive and
 // reconcile one deployment independently once an apply fans out across several.
 func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `

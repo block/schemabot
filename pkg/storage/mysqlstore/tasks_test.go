@@ -32,14 +32,14 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 		UPDATE applies
 		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
 		WHERE id = ?
-	`, "current-worker", "apply-token", apply.ID)
+	`, "current-driver", "apply-token", apply.ID)
 	require.NoError(t, err)
 
 	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
 	})
 	require.NoError(t, err)
-	stampOperationLease(t, opID, "worker", "op-token")
+	stampOperationLease(t, opID, "driver", "op-token")
 
 	now := time.Now()
 	taskID, err := store.Tasks().Create(ctx, &storage.Task{
@@ -68,7 +68,7 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 
 	opCtx := func(token string) context.Context {
 		return storage.WithOperationLease(ctx, storage.OperationLease{
-			ApplyID: apply.ID, OperationID: opID, Owner: "worker", Token: token,
+			ApplyID: apply.ID, OperationID: opID, Owner: "driver", Token: token,
 		})
 	}
 
@@ -87,7 +87,7 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 	// when a current apply lease is also on the context.
 	task.State = state.Task.Failed
 	bothCtx := storage.WithApplyLease(opCtx("stale-op-token"), storage.ApplyLease{
-		ApplyID: apply.ID, Owner: "current-worker", Token: "apply-token",
+		ApplyID: apply.ID, Owner: "current-driver", Token: "apply-token",
 	})
 	require.ErrorIs(t, store.Tasks().Update(bothCtx, task), storage.ErrApplyLeaseLost)
 	reloaded, err = store.Tasks().Get(ctx, "task_oplease_users")
@@ -98,7 +98,7 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 // TestTaskStore_GetByApplyOperationID verifies that tasks can be loaded for a
 // single apply_operation (one deployment) independently of its sibling
 // deployments under the same apply. This is the read primitive an operator
-// worker uses to drive only the deployment it has claimed.
+// driver uses to drive only the deployment it has claimed.
 func TestTaskStore_GetByApplyOperationID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

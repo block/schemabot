@@ -867,7 +867,7 @@ func ensureApplyFailureMessage(apply *storage.Apply, tasks []*storage.Task) {
 // handleStopAllTasksTerminal handles the edge case where stop is requested but
 // every targeted task is already in a terminal state (completed, failed,
 // cancelled, or reverted). The apply row may still be non-terminal — e.g., a
-// worker exited after finalizing task rows but before the apply row — so the
+// driver exited after finalizing task rows but before the apply row — so the
 // apply's final state is derived from its task states rather than assumed.
 // A failed task must surface as a failed apply, never as a completed one, and
 // its failure reason is propagated so operators can triage from the apply
