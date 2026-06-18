@@ -1281,7 +1281,11 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 				return fmt.Errorf("start gRPC apply %s: %w", apply.ApplyIdentifier, err)
 			}
 			now := time.Now()
-			apply.State = state.Apply.Running
+			// The data plane accepted the start but may still report stopped for
+			// a short window. Publish resuming, not running, so /api/status and
+			// /api/progress/apply/{id} stay consistent until pollForCompletion
+			// observes the data plane actually leave stopped.
+			apply.State = state.Apply.Resuming
 			if apply.StartedAt == nil {
 				apply.StartedAt = &now
 			}

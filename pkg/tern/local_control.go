@@ -431,6 +431,28 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	}, nil
 }
 
+// stopHandledUnlessStartPending reports a completed stop as handled unless a
+// start request is also pending, in which case it returns not-handled so the
+// caller resumes the apply from the queued start in the same claim. Without
+// this, a stop and a start that race into the same claim would consume only the
+// stop, leaving the apply stopped with a pending start that the claim
+// lease-freshness gate cannot re-claim until the lease goes stale.
+func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, apply *storage.Apply) (bool, error) {
+	hasPendingStart, err := hasPendingStartControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return true, err
+	}
+	if hasPendingStart {
+		c.logger.Info("pending stop completed but a start is queued; continuing to resume in the same claim",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"state", apply.State)
+		return false, nil
+	}
+	return true, nil
+}
+
 func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
 	controlReq, err := pendingStopControlRequest(ctx, c.storage, apply)
 	if err != nil {
@@ -448,7 +470,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		return true, nil
+		return c.stopHandledUnlessStartPending(ctx, apply)
 	}
 	if state.IsTerminalApplyState(apply.State) {
 		c.logger.Info("completing pending stop request for terminal apply",
@@ -460,7 +482,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		if err := completePendingStopControlRequests(ctx, c.storage, apply); err != nil {
 			return true, err
 		}
-		return true, nil
+		return c.stopHandledUnlessStartPending(ctx, apply)
 	}
 
 	// A revert-window apply has already cut over. Stop is a permanent rejection,

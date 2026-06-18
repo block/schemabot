@@ -393,7 +393,7 @@ func TestApplyStore_CreateWithGroupedOperationsBlocksOverlapOnSecondaryDeploymen
 }
 
 // TestApplyStore_ClaimStoppedFanOutRefusedWhenSecondaryDeploymentActive proves
-// the stopped→running claim re-check covers every deployment a fan-out apply
+// the stopped-claim re-check covers every deployment a fan-out apply
 // owns. A stopped apply spanning [region-a, region-b] must not restart while a
 // different active apply already owns region-b, even though the stopped apply's
 // primary deployment (region-a) is free.
@@ -1971,7 +1971,7 @@ func TestApplyStore_FindNextApplyClaimsStoppedStartControlRequest(t *testing.T) 
 	persisted, err := store.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
-	assert.Equal(t, state.Apply.Running, persisted.State)
+	assert.Equal(t, state.Apply.Resuming, persisted.State, "claiming a stopped apply with a pending start moves it into resuming until the data plane leaves stopped")
 
 	claimedAgain, err := store.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
@@ -2030,7 +2030,7 @@ func TestApplyStore_FindNextApplyClaimsWaitingForDeployStartControlRequest(t *te
 }
 
 // TestApplyStore_ClaimStoppedStartRefusedWhenTargetActive verifies the
-// one-active-apply-per-target invariant survives a stopped→running claim. A
+// one-active-apply-per-target invariant survives a stopped-apply claim. A
 // stopped apply is not "active", so a newer apply can become active for the same
 // target while it sits stopped. Claiming the stopped apply must re-check the
 // target under the apply-target lock: when another active apply owns the target
@@ -2081,9 +2081,9 @@ func TestApplyStore_ClaimStoppedStartRefusedWhenTargetActive(t *testing.T) {
 }
 
 // TestApplyStore_ClaimStoppedStartSucceedsWhenTargetClear verifies the happy
-// path of the stopped→running claim re-check: with no other active apply on the
+// path of the stopped→resuming claim re-check: with no other active apply on the
 // target, claiming a stopped apply that carries a pending start control request
-// transitions it to running and leaves exactly one running apply for the target.
+// transitions it to resuming and leaves exactly one active apply for the target.
 func TestApplyStore_ClaimStoppedStartSucceedsWhenTargetClear(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -2110,15 +2110,16 @@ func TestApplyStore_ClaimStoppedStartSucceedsWhenTargetClear(t *testing.T) {
 	persisted, err := store.Applies().Get(ctx, stopped.ID)
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
-	assert.Equal(t, state.Apply.Running, persisted.State, "claim must transition stopped → running")
+	assert.Equal(t, state.Apply.Resuming, persisted.State, "claim must transition stopped → resuming")
 
 	// The resume path (operator) completes the start request after a successful
-	// claim; the storage claim's job is only to safely make the apply running.
+	// claim; the storage claim's job is only to safely move the apply into the
+	// transient resuming state.
 	stillPending, err := store.ControlRequests().GetPending(ctx, stopped.ID, storage.ControlOperationStart)
 	require.NoError(t, err)
 	assert.NotNil(t, stillPending, "a successful claim leaves the start request pending for the resume path to complete")
 
-	assertExactlyOneRunningApply(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	assertExactlyOneActiveApply(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 }
 
 func TestApplyStore_FindNextApplyClaimsStaleWaitingForCutoverControlRequest(t *testing.T) {
@@ -2832,6 +2833,22 @@ func assertExactlyOneRunningApply(t *testing.T, store *Storage, database, dbType
 		}
 	}
 	assert.Equal(t, 1, running, "exactly one running apply must exist for %s/%s/%s", database, dbType, environment)
+}
+
+// assertExactlyOneActiveApply fails unless exactly one non-terminal apply exists
+// for the target, guarding the one-active-apply-per-target invariant for
+// transient active states such as resuming that are not running-family.
+func assertExactlyOneActiveApply(t *testing.T, store *Storage, database, dbType, environment string) {
+	t.Helper()
+	applies, err := store.Applies().GetByDatabase(t.Context(), database, dbType, environment)
+	require.NoError(t, err)
+	active := 0
+	for _, a := range applies {
+		if !state.IsTerminalApplyState(a.State) {
+			active++
+		}
+	}
+	assert.Equal(t, 1, active, "exactly one active apply must exist for %s/%s/%s", database, dbType, environment)
 }
 
 func createTestApply(t *testing.T, store *Storage, lock *storage.Lock, applyID string, planID int64) *storage.Apply {

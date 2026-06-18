@@ -56,9 +56,14 @@ func deriveErrorCode(applyState, errorMessage string) string {
 }
 
 // shouldServeProgressFromStorage returns true when storage has the authoritative
-// progress state and there is no active Tern work to poll.
+// progress state and there is no active Tern work to poll. Resuming is included
+// because the apply has been stopped and a start has been requested but the data
+// plane has not yet left the stopped state; serving live remote progress in that
+// window would surface the stopped state to operators who already asked to start.
 func shouldServeProgressFromStorage(applyState string) bool {
-	return state.IsTerminalApplyState(applyState) || state.IsState(applyState, state.Apply.FailedRetryable)
+	return state.IsTerminalApplyState(applyState) ||
+		state.IsState(applyState, state.Apply.FailedRetryable) ||
+		state.IsState(applyState, state.Apply.Resuming)
 }
 
 // A remote apply may be accepted into control-plane storage before an operator

@@ -1045,6 +1045,73 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
 }
 
+func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *testing.T) {
+	// A stop and a start can race into the same operator claim: the apply is
+	// already stopped while a stop request is still pending, and a start request
+	// arrives alongside it. Completing the stop must report not-handled so the
+	// resume continues to the queued start in the same claim, instead of leaving
+	// the apply stopped with a pending start the claim lease-freshness gate
+	// cannot re-claim until the lease goes stale.
+	apply := &storage.Apply{
+		ID:              789,
+		ApplyIdentifier: "apply-stop-then-start",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+	}
+	task := &storage.Task{
+		ID:             987,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-then-start",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Stopped,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:stopper",
+		},
+		{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStart,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:starter",
+		},
+	}}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.False(t, handled, "a queued start must keep the claim resuming instead of exiting after the stop")
+
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, stopReq, "the resolved stop request must be completed")
+
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, startReq, "the start request must remain pending for the resume drive to complete")
+}
+
 func TestLocalClient_ProcessPendingStartControlRequestWaitsForPendingStop(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              123,

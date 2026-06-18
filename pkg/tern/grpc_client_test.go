@@ -2720,6 +2720,73 @@ func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
 	assert.Nil(t, controlReq)
 }
 
+func TestGRPCClient_ResumeApplyPublishesResumingUntilDataPlaneLeavesStopped(t *testing.T) {
+	// A start accepted by the data plane may still report stopped for a short
+	// window. The control plane must publish resuming, not running, during that
+	// window so /api/status and /api/progress/apply/{id} stay consistent until
+	// the data plane actually leaves stopped, then transition to running.
+	server := &capturingTernServer{
+		progressStates: []ternv1.State{
+			ternv1.State_STATE_STOPPED,   // pre-start stopped-state check
+			ternv1.State_STATE_STOPPED,   // first poll: still stopped (grace window)
+			ternv1.State_STATE_RUNNING,   // data plane leaves stopped
+			ternv1.State_STATE_COMPLETED, // terminal
+		},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-resuming-window",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-resuming-window",
+		State:           state.Apply.Stopped,
+	}
+	storedApply := *apply
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.NoError(t, err)
+
+	persistedStates := make([]string, 0, len(applyStore.updates))
+	for _, u := range applyStore.updates {
+		persistedStates = append(persistedStates, u.State)
+	}
+	require.Contains(t, persistedStates, state.Apply.Resuming,
+		"the resume must publish resuming before running while the data plane is still stopped")
+
+	resumingIdx := -1
+	runningIdx := -1
+	for i, s := range persistedStates {
+		if resumingIdx == -1 && state.IsState(s, state.Apply.Resuming) {
+			resumingIdx = i
+		}
+		if runningIdx == -1 && state.IsState(s, state.Apply.Running) {
+			runningIdx = i
+		}
+	}
+	require.NotEqual(t, -1, runningIdx, "the resume must eventually publish running")
+	assert.Less(t, resumingIdx, runningIdx, "resuming must be published before running")
+
+	assert.Equal(t, "remote-resuming-window", server.getStartApplyID())
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, startReq, "the start control request must be completed once the resume is driven")
+}
+
 func TestGRPCClient_ResumeApplyCompletesQueuedStopBeforeQueuedStart(t *testing.T) {
 	// Start can arrive immediately after stop progress is visible. The operator
 	// should consume the resolved stop request and continue with the queued start
