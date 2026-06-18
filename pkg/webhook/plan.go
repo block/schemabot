@@ -75,7 +75,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Build PlanRequest in the format expected by the API service
 	prNumber := int32(pr)
 	deployment := ""
-	if resolvedTarget, err := h.service.Config().ResolveDatabaseTarget(schemaResult.Database, environment); err != nil {
+	if resolvedTarget, err := h.service.Config().ResolvePrimaryDatabaseTarget(schemaResult.Database, environment); err != nil {
 		h.logger.Warn("plan metric deployment is unknown because target resolution failed",
 			"repo", repo,
 			"pr", pr,

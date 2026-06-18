@@ -1300,6 +1300,24 @@ func TestServerConfig_ResolveDatabaseTargets(t *testing.T) {
 		assert.Equal(t, "tenant-a", got.Deployment)
 		assert.Equal(t, "cluster-production-001", got.Target)
 	})
+
+	t.Run("ResolvePrimaryDatabaseTarget returns the lead deployment for multi-deployment", func(t *testing.T) {
+		got, err := cfg.ResolvePrimaryDatabaseTarget("multidb", "production")
+		require.NoError(t, err)
+		assert.Equal(t, routing.ExecutionTarget{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments"}, got)
+	})
+
+	t.Run("ResolvePrimaryDatabaseTarget returns the single target for scalar remote", func(t *testing.T) {
+		got, err := cfg.ResolvePrimaryDatabaseTarget("scalardb", "production")
+		require.NoError(t, err)
+		assert.Equal(t, routing.ExecutionTarget{DatabaseType: "vitess", Deployment: "tenant-a", Target: "cluster-production-001"}, got)
+	})
+
+	t.Run("ResolvePrimaryDatabaseTarget errors on unknown database", func(t *testing.T) {
+		_, err := cfg.ResolvePrimaryDatabaseTarget("missing", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not configured")
+	})
 }
 
 // TestServerConfig_ResolveDatabaseTargets_BypassValidate covers the cases
@@ -1389,6 +1407,24 @@ func TestServerConfig_ResolveDatabaseTargets_DeploymentOrder(t *testing.T) {
 		got, err := cfg.ResolveDatabaseTargets("payments", "production")
 		require.NoError(t, err)
 		assert.Equal(t, []string{"payments-a", "payments-b", "payments-c"}, resolvedOrder(t, got))
+	})
+
+	t.Run("primary target is the first deployment in explicit rollout order", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{
+			Deployments:     deployments,
+			DeploymentOrder: []string{"payments-c", "payments-a", "payments-b"},
+		})
+		got, err := cfg.ResolvePrimaryDatabaseTarget("payments", "production")
+		require.NoError(t, err)
+		assert.Equal(t, "payments-c", got.Deployment)
+		assert.Equal(t, "payments", got.Target)
+	})
+
+	t.Run("primary target falls back to alphabetical first when order unset", func(t *testing.T) {
+		cfg := makeCfg(EnvironmentConfig{Deployments: deployments})
+		got, err := cfg.ResolvePrimaryDatabaseTarget("payments", "production")
+		require.NoError(t, err)
+		assert.Equal(t, "payments-a", got.Deployment)
 	})
 
 	t.Run("deployment_order missing a deployment errors", func(t *testing.T) {
