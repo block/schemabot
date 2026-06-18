@@ -80,7 +80,7 @@ request bodies that try to send database or deployment fields.
 
 ## Scheduler
 
-On startup, the service launches a background scheduler (`StartScheduler`) that claims apply work from storage. A claim means selecting one apply that needs work and refreshing its heartbeat in the same transaction so the driver has a lease while it starts or resumes the apply.
+On startup, the service launches a background scheduler (`StartOperator`) that claims apply work from storage. A claim means selecting one apply that needs work and refreshing its heartbeat in the same transaction so the driver has a lease while it starts or resumes the apply.
 
 1. Runs immediately, then polls every 10 seconds per configured driver
 2. Finds fresh queued applies or applies with stale heartbeats (no update for 1+ minute)

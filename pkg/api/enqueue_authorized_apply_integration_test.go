@@ -27,7 +27,7 @@ import (
 // A data-plane host queues control-plane-authorized dispatches through
 // EnqueueAuthorizedApply against real storage. The queued apply must be durable (apply,
 // task, and operation rows committed in one transaction), claimable by an
-// operator worker, and covered by the one-active-apply-per-target invariant —
+// operator driver, and covered by the one-active-apply-per-target invariant —
 // while the gated ExecuteApply path on the same service keeps failing closed
 // because the deployment has no database config to evaluate source policy
 // against.
@@ -148,8 +148,8 @@ func TestEnqueueAuthorizedApplyQueuesDurableApplyAgainstStorage(t *testing.T) {
 	require.ErrorIs(t, err, storage.ErrActiveApplyExists)
 
 	// The committed apply and task rows make the queued apply claimable by an
-	// operator worker.
-	claimed, err := stor.Applies().FindNextApply(ctx, "worker-test")
+	// operator driver.
+	claimed, err := stor.Applies().FindNextApply(ctx, "driver-test")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "queued apply must be operator-claimable")
 	assert.Equal(t, applyID, claimed.ID)

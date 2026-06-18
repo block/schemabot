@@ -1526,8 +1526,8 @@ func TestEnqueueAuthorizedApplyRejectsInvalidStoredPlan(t *testing.T) {
 }
 
 // A queued trusted dispatch follows the same durable operator path as gated
-// applies: EnqueueAuthorizedApply stores the pending apply, wakes a worker, and the
-// worker claims and resumes it.
+// applies: EnqueueAuthorizedApply stores the pending apply, wakes a driver, and the
+// driver claims and resumes it.
 func TestEnqueueAuthorizedApplyWakesOperatorForQueuedApply(t *testing.T) {
 	applies := &capturingApplyStore{findCh: make(chan struct{}, 1)}
 	mock := &mockTernClient{resumeCh: make(chan *storage.Apply, 1)}

@@ -280,7 +280,7 @@ func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory
 
 // SetClock overrides the time source used by orchestration loops (currently
 // the operator claim-duration measurement). Must be called before
-// StartOperator — once operator workers are running they read s.clock
+// StartOperator — once operator drivers are running they read s.clock
 // concurrently, so swapping the field is rejected to avoid a data race.
 // Production callers should leave the default clock.Real{} in place; tests
 // use clock.NewFake to make timing observable. A nil or typed-nil c is
@@ -295,10 +295,10 @@ func (s *Service) SetClock(c clock.Clock) error {
 	return nil
 }
 
-// SetOperatorPollInterval sets the operator worker poll interval.
+// SetOperatorPollInterval sets the operator driver poll interval.
 // Most deployments should use the default interval; this is a low-level
 // embedding hook for callers that need to tune the operator loop directly.
-// Call before StartOperator so workers create their tickers with the intended
+// Call before StartOperator so drivers create their tickers with the intended
 // interval.
 func (s *Service) SetOperatorPollInterval(interval time.Duration) error {
 	if interval <= 0 {
@@ -721,7 +721,7 @@ func (s *Service) Storage() storage.Storage {
 
 // Close closes the service and releases resources.
 func (s *Service) Close() error {
-	// Stop background workers first.
+	// Stop background drivers first.
 	s.StopOperator()
 	s.StopRemoteDeploymentHealthMonitor()
 

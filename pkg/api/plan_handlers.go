@@ -676,7 +676,7 @@ func applyMetricStatusForError(err error) string {
 }
 
 // ExecuteApply queues an apply request in storage and returns once the work is
-// durable. Operator workers own dispatching queued work through the Tern
+// durable. Operator drivers own dispatching queued work through the Tern
 // client so request cancellation cannot orphan in-memory execution.
 //
 // Flow:
@@ -684,7 +684,7 @@ func applyMetricStatusForError(err error) string {
 //  2. Resolve the Tern client to validate the deployment/environment.
 //  3. Create a pending Apply record and pending Task records from the plan.
 //  4. Attach any pending observer to the stored apply before dispatch can start.
-//  5. Wake an operator worker so fresh applies usually start immediately.
+//  5. Wake an operator driver so fresh applies usually start immediately.
 //  6. Return the SchemaBot apply_identifier to the HTTP caller.
 //
 // Returns the API response, the stored apply ID (0 if not stored), and any error.
@@ -833,7 +833,7 @@ func (s *Service) authorizeStoredPlanSource(ctx context.Context, span trace.Span
 }
 
 // queueValidatedApply stores the pending apply and tasks for a validated plan
-// and wakes an operator worker. Callers must have run loadPlanForApply first;
+// and wakes an operator driver. Callers must have run loadPlanForApply first;
 // gated entry points also run authorizeStoredPlanSource before queueing.
 func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan *storage.Plan, req ApplyRequest) (*apitypes.ApplyResponse, int64, error) {
 	deployment := plan.Deployment
