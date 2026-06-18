@@ -315,6 +315,24 @@ func (c *RoutingClient) ResumeApplyOperation(ctx context.Context, apply *storage
 	return client.ResumeApplyOperation(ctx, operationScopedApply(apply, operation), applyOperationID)
 }
 
+// ResumeApplyOperationCutover drives one parked operation through its cutover
+// phase, routing to the deployment's client just like ResumeApplyOperation.
+func (c *RoutingClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	if apply == nil {
+		return fmt.Errorf("stored apply is required for routing")
+	}
+	operation, err := c.loadApplyOperation(ctx, apply, applyOperationID)
+	if err != nil {
+		return err
+	}
+	client, err := c.clientForDeployment(ctx, operation.Deployment, apply.Environment)
+	if err != nil {
+		return fmt.Errorf("get client for apply %q operation %d deployment %q environment %q: %w", apply.ApplyIdentifier, applyOperationID, operation.Deployment, apply.Environment, err)
+	}
+	c.attachObserver(client, apply.ID)
+	return client.ResumeApplyOperationCutover(ctx, operationScopedApply(apply, operation), applyOperationID)
+}
+
 // Endpoint returns a descriptive endpoint for the routing wrapper.
 func (c *RoutingClient) Endpoint() string { return "routing" }
 

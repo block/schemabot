@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -99,4 +100,31 @@ func TestGroupedApplyHonoursEffectiveOptions(t *testing.T) {
 	effective := effectiveCopyDriveOptions(apply, true, barrierOp()).Map()
 	assert.True(t, c.usesGroupedApply(apply, effective))
 	assert.Equal(t, "spirit_atomic_cutover", groupedApplyMode(apply, effective))
+}
+
+// An ordered-cutover drive (forceCutoverResume) must load the parked engine
+// checkpoint even though the barrier park deliberately leaves DeferCutover unset
+// on the shared apply, while still requiring the apply to actually be parked.
+func TestShouldInspectCutoverSignalForResume(t *testing.T) {
+	parked := func(opts storage.ApplyOptions) *storage.Apply {
+		return &storage.Apply{State: state.Apply.WaitingForCutover, Options: storage.MarshalApplyOptions(opts)}
+	}
+
+	tests := []struct {
+		name               string
+		apply              *storage.Apply
+		forceCutoverResume bool
+		want               bool
+	}{
+		{"manual defer recovery inspects without force", parked(storage.ApplyOptions{DeferCutover: true}), false, true},
+		{"barrier park needs force to inspect", parked(storage.ApplyOptions{}), false, false},
+		{"forced cutover drive inspects parked op", parked(storage.ApplyOptions{}), true, true},
+		{"force ignored when not parked", &storage.Apply{State: state.Apply.Running}, true, false},
+		{"nil apply never inspects", nil, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, shouldInspectCutoverSignalForResume(tt.apply, tt.forceCutoverResume))
+		})
+	}
 }

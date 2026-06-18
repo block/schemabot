@@ -310,6 +310,17 @@ func (r *TargetRouter) ResumeApplyOperation(ctx context.Context, apply *storage.
 	return client.ResumeApplyOperation(ctx, apply, applyOperationID)
 }
 
+// ResumeApplyOperationCutover drives one parked apply operation through its
+// cutover phase by routing through its stored target.
+func (r *TargetRouter) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	client, err := r.clientForStoredApply(ctx, apply)
+	if err != nil {
+		return err
+	}
+	r.attachObserver(client, apply.ID)
+	return client.ResumeApplyOperationCutover(ctx, apply, applyOperationID)
+}
+
 // Endpoint returns a descriptive endpoint for the router.
 func (r *TargetRouter) Endpoint() string { return "target-router" }
 

@@ -1362,6 +1362,18 @@ func TestGRPCClient_ResumeApplyOperationFailureRecordsTasksOnlyForMultiOpApply(t
 	assert.Empty(t, applyStore.updates, "a multi-op failure must not write the parent applies row directly")
 }
 
+// The remote (gRPC) transport does not park an operation at the cutover barrier,
+// so there is no parked checkpoint for a cutover drive to resume. The operator
+// must fail closed on the sentinel rather than silently dropping the claim.
+func TestGRPCClient_ResumeApplyOperationCutoverFailsClosedUnsupported(t *testing.T) {
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
+	defer cleanup()
+
+	err := client.ResumeApplyOperationCutover(t.Context(), &storage.Apply{ApplyIdentifier: "apply-x"}, 7)
+	require.ErrorIs(t, err, ErrOperationCutoverUnsupportedRemote)
+	assert.Contains(t, err.Error(), "apply-x")
+}
+
 func TestGRPCClient_ResumeApplyOperationRejectsMissingOperationID(t *testing.T) {
 	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
 	defer cleanup()

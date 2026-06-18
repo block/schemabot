@@ -18,6 +18,14 @@ import (
 // callers can match it with errors.Is regardless of the transport.
 var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
 
+// ErrOperationCutoverUnsupportedRemote is returned by
+// GRPCClient.ResumeApplyOperationCutover. The remote (gRPC) drive does not yet
+// park an operation at the cutover barrier, so there is no parked checkpoint for
+// it to resume and drive through cutover; the remote park/drive is a deliberate
+// follow-up. Returning a sentinel keeps the operator fail-closed for the remote
+// transport rather than silently dropping the claim.
+var ErrOperationCutoverUnsupportedRemote = errors.New("operation cutover drive is not supported for remote (gRPC) applies")
+
 // ErrApplyOperationRowMissing is returned by ResumeApplyOperation when tasks
 // scope to the operation but the apply_operation row itself is absent. It is a
 // distinct, more accurate cause than the no-tasks case, but wraps
@@ -87,6 +95,17 @@ type Client interface {
 	// deployment independently of its siblings. Fails closed when no tasks match
 	// the operation rather than touching the rest of the apply.
 	ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error
+
+	// ResumeApplyOperationCutover drives a single apply_operation that is parked
+	// at the cutover barrier (waiting_for_cutover) through its cutover phase:
+	// waiting_for_cutover → cutting_over → revert_window → completed. It is the
+	// deployment-ordered counterpart to ResumeApplyOperation's copy drive — the
+	// operator claims a parked operation whose turn it is (via the cutover-claim
+	// predicate) and calls this to perform the high-risk swap, while siblings
+	// stay parked. Unlike ResumeApplyOperation it never re-parks: it resumes the
+	// operation's engine checkpoint and forces the cutover. Fails closed when no
+	// tasks match the operation, like ResumeApplyOperation.
+	ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error
 
 	// Endpoint returns the address this client connects to.
 	// For GRPCClient, this is the dial address (e.g., "tern-staging:9090").

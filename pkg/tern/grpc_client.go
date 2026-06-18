@@ -1135,6 +1135,18 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 	return c.resumeApply(ctx, apply, scope)
 }
 
+// ResumeApplyOperationCutover is not supported on the remote (gRPC) path. The
+// remote drive does not park an operation at the cutover barrier, so there is no
+// parked checkpoint to resume and drive through cutover. Fail closed with a
+// sentinel rather than attempting a drive that cannot exist yet; the operator
+// reserves the parked operation for a future remote cutover drive.
+func (c *GRPCClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	if apply == nil {
+		return fmt.Errorf("apply is required")
+	}
+	return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrOperationCutoverUnsupportedRemote)
+}
+
 // resumeApply runs work claimed by the operator. Fresh queued applies have no
 // external_id yet, so this first dispatches them to remote Tern and stores the
 // returned ID. The call then polls until the apply reaches a stored terminal

@@ -520,48 +520,49 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
-	healthErr         error
-	planResp          *ternv1.PlanResponse
-	planErr           error
-	planReq           *ternv1.PlanRequest
-	pullSchemaResp    *ternv1.PullSchemaResponse
-	pullSchemaErr     error
-	pullSchemaReq     *ternv1.PullSchemaRequest
-	pullSchemaReqs    []*ternv1.PullSchemaRequest
-	pullSchemaHook    func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
-	applyResp         *ternv1.ApplyResponse
-	applyErr          error
-	applyReq          *ternv1.ApplyRequest
-	progressResp      *ternv1.ProgressResponse
-	progressErr       error
-	progressReq       *ternv1.ProgressRequest
-	volumeResp        *ternv1.VolumeResponse
-	volumeErr         error
-	volumeReq         *ternv1.VolumeRequest // captured request
-	stopResp          *ternv1.StopResponse
-	stopErr           error
-	stopReq           *ternv1.StopRequest // captured request
-	stopHook          func()
-	startResp         *ternv1.StartResponse
-	startErr          error
-	startReq          *ternv1.StartRequest // captured request
-	cutoverResp       *ternv1.CutoverResponse
-	cutoverErr        error
-	cutoverReq        *ternv1.CutoverRequest // captured request
-	revertResp        *ternv1.RevertResponse
-	revertErr         error
-	revertReq         *ternv1.RevertRequest // captured request
-	skipRevertResp    *ternv1.SkipRevertResponse
-	skipRevertErr     error
-	skipRevertReq     *ternv1.SkipRevertRequest // captured request
-	resumeMu          sync.Mutex
-	resumeErr         error
-	resumeApply       *storage.Apply
-	resumeOperationID int64
-	resumeCh          chan *storage.Apply
-	observerApplyID   int64
-	observer          tern.ProgressObserver
-	isRemote          bool
+	healthErr                error
+	planResp                 *ternv1.PlanResponse
+	planErr                  error
+	planReq                  *ternv1.PlanRequest
+	pullSchemaResp           *ternv1.PullSchemaResponse
+	pullSchemaErr            error
+	pullSchemaReq            *ternv1.PullSchemaRequest
+	pullSchemaReqs           []*ternv1.PullSchemaRequest
+	pullSchemaHook           func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
+	applyResp                *ternv1.ApplyResponse
+	applyErr                 error
+	applyReq                 *ternv1.ApplyRequest
+	progressResp             *ternv1.ProgressResponse
+	progressErr              error
+	progressReq              *ternv1.ProgressRequest
+	volumeResp               *ternv1.VolumeResponse
+	volumeErr                error
+	volumeReq                *ternv1.VolumeRequest // captured request
+	stopResp                 *ternv1.StopResponse
+	stopErr                  error
+	stopReq                  *ternv1.StopRequest // captured request
+	stopHook                 func()
+	startResp                *ternv1.StartResponse
+	startErr                 error
+	startReq                 *ternv1.StartRequest // captured request
+	cutoverResp              *ternv1.CutoverResponse
+	cutoverErr               error
+	cutoverReq               *ternv1.CutoverRequest // captured request
+	revertResp               *ternv1.RevertResponse
+	revertErr                error
+	revertReq                *ternv1.RevertRequest // captured request
+	skipRevertResp           *ternv1.SkipRevertResponse
+	skipRevertErr            error
+	skipRevertReq            *ternv1.SkipRevertRequest // captured request
+	resumeMu                 sync.Mutex
+	resumeErr                error
+	resumeApply              *storage.Apply
+	resumeOperationID        int64
+	resumeCutoverOperationID int64
+	resumeCh                 chan *storage.Apply
+	observerApplyID          int64
+	observer                 tern.ProgressObserver
+	isRemote                 bool
 }
 
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
@@ -661,6 +662,22 @@ func (m *mockTernClient) ResumeApplyOperation(ctx context.Context, apply *storag
 	m.resumeMu.Lock()
 	m.resumeApply = apply
 	m.resumeOperationID = applyOperationID
+	resumeCh := m.resumeCh
+	resumeErr := m.resumeErr
+	m.resumeMu.Unlock()
+
+	if resumeCh != nil {
+		select {
+		case resumeCh <- apply:
+		default:
+		}
+	}
+	return resumeErr
+}
+func (m *mockTernClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	m.resumeMu.Lock()
+	m.resumeApply = apply
+	m.resumeCutoverOperationID = applyOperationID
 	resumeCh := m.resumeCh
 	resumeErr := m.resumeErr
 	m.resumeMu.Unlock()

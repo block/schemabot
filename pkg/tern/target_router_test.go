@@ -143,6 +143,11 @@ func (c *targetRouterRecordingClient) ResumeApplyOperation(_ context.Context, ap
 	return nil
 }
 
+func (c *targetRouterRecordingClient) ResumeApplyOperationCutover(_ context.Context, apply *storage.Apply, _ int64) error {
+	c.resumeApply = apply
+	return nil
+}
+
 func (c *targetRouterRecordingClient) Endpoint() string { return "recording" }
 
 func (c *targetRouterRecordingClient) IsRemote() bool { return false }
