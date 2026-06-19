@@ -308,7 +308,7 @@ func getSecretValue(ctx context.Context, client *secretsmanager.Client, secretNa
 		SecretId: aws.String(secretName),
 	})
 	if err != nil {
-		return "", fmt.Errorf("get secret value: %w", err)
+		return "", fmt.Errorf("get secret value %q: %w", secretName, err)
 	}
 	return secrets.ValueFromGetSecretOutput(resp, secretName)
 }

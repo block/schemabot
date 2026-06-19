@@ -81,6 +81,11 @@ func TestValueFromGetSecretOutput(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "binary-pw", got)
 
+	// An empty-but-present binary value round-trips as "" rather than erroring.
+	got, err = ValueFromGetSecretOutput(&secretsmanager.GetSecretValueOutput{SecretBinary: []byte{}}, "secret")
+	require.NoError(t, err)
+	assert.Empty(t, got)
+
 	// Neither form set is an error naming the secret.
 	_, err = ValueFromGetSecretOutput(&secretsmanager.GetSecretValueOutput{}, "secret")
 	require.Error(t, err)
