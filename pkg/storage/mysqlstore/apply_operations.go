@@ -865,6 +865,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 // to FindNextApplyOperation: that primitive gates the copy phase (pending →
 // running); this one gates the cutover phase (waiting_for_cutover → cutting_over).
 //
+// Both claim paths are bound by a shared eligibility gate — barrier policy, a
+// multi-operation apply, and a parent apply not started with manual
+// --defer-cutover — so the worker only ever drives the operations OC-2
+// parks-and-releases for it (see the gate comment in the body and
+// shouldReleaseAtCutoverBarrier in pkg/tern/cutover_barrier.go). Anything else
+// (single-op, rolling, or manual-defer) stays on the copy/manual cutover path.
+//
 // Two claim paths, mirroring FindNextApplyOperation:
 //
 //   - Start a parked cutover. A waiting_for_cutover row is claimed and
@@ -895,21 +902,42 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	}
 	defer rollbackApplyTx(ctx, tx, "claim apply_operation cutover")
 
+	// Eligibility gate (the three leading conditions in the SQL below). The
+	// cutover worker may only claim operations it is actually responsible for
+	// driving — exactly the population OC-2 parks-and-releases. This mirrors
+	// shouldReleaseAtCutoverBarrier in pkg/tern/cutover_barrier.go:
+	//
+	//   1. cutover_policy = barrier — rolling rows are never deployment-ordered
+	//      at the cutover phase.
+	//   2. multi-operation apply (EXISTS sibling) — a single-op apply has no
+	//      siblings to order, so it never auto-defers; its cutover stays on the
+	//      copy/manual path. Mirrors shouldAutoDeferCutover's multiOperation arg.
+	//   3. parent apply NOT started with manual --defer-cutover — that contract
+	//      keeps the operator holding the claim and polling for a manual cutover,
+	//      so the cutover worker must not steal it. defer_cutover lives in the
+	//      applies.options JSON (boolean, omitted when false), not a column; the
+	//      null-safe <=> CAST('true' AS JSON) means "exactly JSON true".
+	//
+	// The gate wraps BOTH claim branches (start and stale recovery): a stale
+	// cutting_over/revert_window row outside this population reached that state
+	// via the copy/manual path, so recovering it here would steal legitimate work.
+	queryArgs := []any{storage.CutoverPolicyBarrier}
 	// Start-a-parked-cutover gate (see SQL below). A waiting_for_cutover row is
 	// claimable only when no earlier deployment_order sibling is still
 	// non-completed; the on_failure/Failed pair is the "continue" exemption (a
 	// terminal-failed earlier sibling no longer blocks later cutovers), and the
 	// pending-stop NOT EXISTS makes `stop` halt remaining cutovers even under
 	// "continue".
-	queryArgs := []any{
+	queryArgs = append(queryArgs,
 		state.ApplyOperation.WaitingForCutover,
 		state.ApplyOperation.Completed,
 		storage.OnFailureContinue,
 		state.ApplyOperation.Failed,
 		storage.ControlOperationStop, storage.ControlRequestPending,
-	}
+	)
 	// Recovery clause: a row already mid-cutover whose heartbeat has gone stale is
-	// re-leased without changing state, so it carries no ordering gate.
+	// re-leased without changing state, so it carries no ordering gate (but is
+	// still bound by the eligibility gate above).
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.CuttingOver,
 		state.ApplyOperation.RevertWindow,
@@ -918,7 +946,20 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
-		WHERE (
+		WHERE apply_operations.cutover_policy = ?
+		AND EXISTS (
+			SELECT 1
+			FROM apply_operations AS sibling
+			WHERE sibling.apply_id = apply_operations.apply_id
+				AND sibling.id <> apply_operations.id
+		)
+		AND EXISTS (
+			SELECT 1
+			FROM applies AS a
+			WHERE a.id = apply_operations.apply_id
+				AND NOT (JSON_EXTRACT(a.options, '$.defer_cutover') <=> CAST('true' AS JSON))
+		)
+		AND (
 			(
 				state = ?
 				AND NOT EXISTS (

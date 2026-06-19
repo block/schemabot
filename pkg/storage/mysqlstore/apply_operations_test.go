@@ -1705,6 +1705,35 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsStaleMultiOpRollingPar
 // copy gate's barrier relaxation, the cutover "done" set is completed-only, so
 // the high-risk atomic swaps never overlap and run strictly in order.
 
+// The cutover claim only drives the population OC-2 parks-and-releases for it:
+// barrier policy, a multi-operation apply, and a parent apply not started with
+// manual --defer-cutover (see shouldReleaseAtCutoverBarrier). These helpers seed
+// that eligible shape so the behavioral tests below fail for the reason under
+// test, not the eligibility gate.
+
+// setTestApplyOptions overwrites an apply's stored options, e.g. to set
+// defer_cutover=true for the manual-defer exclusion.
+func setTestApplyOptions(t *testing.T, applyID int64, opts storage.ApplyOptions) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(), `
+		UPDATE applies SET options = ? WHERE id = ?
+	`, string(storage.MarshalApplyOptions(opts)), applyID)
+	require.NoError(t, err)
+}
+
+// insertCompletedBarrierSibling adds a terminal (completed) barrier sibling so a
+// single-candidate cutover test satisfies the multi-operation eligibility gate.
+// A completed sibling is never itself claimable and, being terminal, never
+// blocks an earlier-deployment ordering check.
+func insertCompletedBarrierSibling(t *testing.T, store *Storage, applyID int64, deployment string) {
+	t.Helper()
+	_, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+		ApplyID: applyID, Deployment: deployment,
+		State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+}
+
 // TestApplyOperationStore_FindNextApplyOperationCutover_ClaimsEarliestParked
 // verifies the happy path: a waiting_for_cutover row with no earlier sibling is
 // claimed and transitioned to cutting_over, with a fresh lease rotated onto it.
@@ -1718,9 +1747,10 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_ClaimsEarliestParked(
 
 	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
-		State: state.ApplyOperation.WaitingForCutover,
+		State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
 	require.NoError(t, err)
+	insertCompletedBarrierSibling(t, store, apply.ID, "region-z")
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
 	require.NoError(t, err)
@@ -1761,6 +1791,7 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_OrdersSiblings(t *tes
 	for i, deployment := range deployments {
 		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 			ApplyID: apply.ID, Deployment: deployment, State: state.ApplyOperation.WaitingForCutover,
+			CutoverPolicy: storage.CutoverPolicyBarrier,
 		})
 		require.NoError(t, err)
 		ids[i] = id
@@ -1805,10 +1836,12 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_BlocksOnSiblingInReve
 	// barrier — under the cutover gate it keeps blocking.
 	earlierID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.RevertWindow,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
 	require.NoError(t, err)
 	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.WaitingForCutover,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
 	require.NoError(t, err)
 
@@ -1839,11 +1872,13 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_HaltsOnFailedSibling(
 	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a",
 		State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureHalt,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
 	require.NoError(t, err)
 	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-b",
 		State: state.ApplyOperation.WaitingForCutover, OnFailure: storage.OnFailureHalt,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
 	require.NoError(t, err)
 
@@ -1873,11 +1908,13 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_OnFailureContinueClai
 	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a",
 		State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
 	require.NoError(t, err)
 	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-b",
 		State: state.ApplyOperation.WaitingForCutover, OnFailure: storage.OnFailureContinue,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
 	require.NoError(t, err)
 
@@ -1911,8 +1948,10 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_PendingStopBlocks(t *
 
 	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.WaitingForCutover,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
 	require.NoError(t, err)
+	insertCompletedBarrierSibling(t, store, apply.ID, "region-z")
 
 	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
@@ -1956,8 +1995,10 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_RecoversStaleInFlight
 
 			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 				ApplyID: apply.ID, Deployment: "region-a", State: inFlight,
+				CutoverPolicy: storage.CutoverPolicyBarrier,
 			})
 			require.NoError(t, err)
+			insertCompletedBarrierSibling(t, store, apply.ID, "region-z")
 
 			// Backdate the heartbeat past the staleness window.
 			_, err = testDB.ExecContext(ctx, `
@@ -1995,8 +2036,10 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_SkipsFreshInFlight(t 
 
 	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.CuttingOver,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
 	require.NoError(t, err)
+	insertCompletedBarrierSibling(t, store, apply.ID, "region-z")
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
 	require.NoError(t, err)
@@ -2018,6 +2061,7 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_IgnoresCopyPhaseRows(
 	for i, copyState := range []string{state.ApplyOperation.Pending, state.ApplyOperation.Running} {
 		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 			ApplyID: apply.ID, Deployment: fmt.Sprintf("region-%d", i), State: copyState,
+			CutoverPolicy: storage.CutoverPolicyBarrier,
 		})
 		require.NoError(t, err)
 	}
@@ -2037,6 +2081,111 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_RequiresOwner(t *test
 	_, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_SkipsRollingPolicy
+// verifies the eligibility gate's policy term: a multi-op apply parked at the
+// cutover barrier under the rolling policy is never deployment-ordered at the
+// cutover phase, so the cutover worker must not claim it.
+func TestApplyOperationStore_FindNextApplyOperationCutover_SkipsRollingPolicy(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_rolling", 1)
+
+	for _, deployment := range []string{"region-a", "region-b"} {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: deployment, State: state.ApplyOperation.WaitingForCutover,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+		})
+		require.NoError(t, err)
+	}
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "the cutover worker must not claim rolling-policy operations")
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_SkipsSingleOpBarrier
+// verifies the eligibility gate's multi-op term: a single-operation barrier
+// apply has no siblings to order, so it never auto-defers — its cutover stays on
+// the copy/manual path and the cutover worker must not claim it.
+func TestApplyOperationStore_FindNextApplyOperationCutover_SkipsSingleOpBarrier(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_singleop", 1)
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.WaitingForCutover,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "the cutover worker must not claim a single-operation barrier apply")
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_SkipsManualDeferCutover
+// verifies the eligibility gate's manual-defer term: when the parent apply was
+// started with --defer-cutover, the operator holds the claim and polls for a
+// manual cutover, so the cutover worker must not steal the parked row.
+func TestApplyOperationStore_FindNextApplyOperationCutover_SkipsManualDeferCutover(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_manualdefer", 1)
+	setTestApplyOptions(t, apply.ID, storage.ApplyOptions{DeferCutover: true})
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.WaitingForCutover,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	insertCompletedBarrierSibling(t, store, apply.ID, "region-z")
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "the cutover worker must not claim a manually deferred apply")
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_SkipsManualDeferRecovery
+// verifies the eligibility gate also binds the stale-recovery branch: a stale
+// in-flight cutover whose parent apply is manually deferred reached cutting_over
+// via the manual path, so the cutover worker must not recover it.
+func TestApplyOperationStore_FindNextApplyOperationCutover_SkipsManualDeferRecovery(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_manualdefer_recover", 1)
+	setTestApplyOptions(t, apply.ID, storage.ApplyOptions{DeferCutover: true})
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.CuttingOver,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	insertCompletedBarrierSibling(t, store, apply.ID, "region-z")
+
+	// Backdate the heartbeat past the staleness window so only the eligibility
+	// gate — not freshness — can be the reason it is skipped.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "recovery-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "the cutover worker must not recover a manually deferred in-flight cutover")
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_PendingStartRequestDoesNotBypassSiblingGate
