@@ -27,7 +27,7 @@ import (
 )
 
 // TestOperatorMultiOperationMatrix proves the DORMANT multi-deployment fan-out
-// path before the config flip (fan-out PR 11). Config.Validate() still rejects
+// path before the config flip enables it. Config.Validate() still rejects
 // >1 deployment, so a real apply never owns more than one operation today; this
 // matrix reaches the multi-op path the only way production cannot — by seeding
 // an apply with N apply_operations via CreateWithGroupedOperations (the exact
@@ -259,7 +259,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		// the operation leases do not serialize on a shared parent lease. Each
 		// drive also probes that a direct parent write fails closed under the
 		// operation-only lease.
-		gate := newDriveGate(2)
+		gate := newDriveGate(t, 2)
 		svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
 			"region-a": {taskState: state.Task.Completed, gate: gate, probeParentWrite: true},
 			"region-b": {taskState: state.Task.Completed, gate: gate, probeParentWrite: true},
@@ -357,6 +357,7 @@ func (s seededMultiOpApply) opID(deployment string) int64 { return s.ops[deploym
 
 func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, spec multiOpSeed) seededMultiOpApply {
 	t.Helper()
+	require.NotEmpty(t, spec.deployments, "seedGroupedApply requires at least one deployment")
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: spec.applyIdentifier,
@@ -488,7 +489,7 @@ func driveOneOperation(t *testing.T, ctx context.Context, svc *matrixService, re
 }
 
 // matrixClients builds one deterministic tern.Client per deployment, keyed by
-// the "deployment/environment" form the service uses to route.
+// the "deployment/environment" format the service uses to route.
 func matrixClients(stor storage.Storage, rec *driveRecorder, outcomes map[string]matrixOutcome) map[string]tern.Client {
 	clients := make(map[string]tern.Client, len(outcomes))
 	for dep, outcome := range outcomes {
@@ -547,7 +548,7 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 		if state.IsState(m.outcome.taskState, state.Task.Failed) {
 			task.ErrorMessage = m.outcome.errMsg
 		}
-		if state.IsTerminalApplyState(m.outcome.taskState) {
+		if state.IsTerminalTaskState(m.outcome.taskState) {
 			now := time.Now()
 			task.CompletedAt = &now
 		}
@@ -637,13 +638,14 @@ func (r *matrixSummaryRecorder) lastTasks() []*storage.Task {
 // driveGate releases all participants only once the expected number have arrived,
 // proving the operation drives run concurrently rather than serializing.
 type driveGate struct {
+	t        *testing.T
 	wg       sync.WaitGroup
 	released chan struct{}
 	once     sync.Once
 }
 
-func newDriveGate(participants int) *driveGate {
-	g := &driveGate{released: make(chan struct{})}
+func newDriveGate(t *testing.T, participants int) *driveGate {
+	g := &driveGate{t: t, released: make(chan struct{})}
 	g.wg.Add(participants)
 	return g
 }
@@ -659,9 +661,11 @@ func (g *driveGate) arriveAndWait() {
 	select {
 	case <-g.released:
 	case <-time.After(20 * time.Second):
-		// A participant never arrived: the drives serialized instead of running
-		// concurrently. Unblock so the test fails on the assertions rather than
-		// hanging.
+		// A participant never arrived within the deadline: the drives serialized
+		// instead of running concurrently, which defeats the invariant this gate
+		// enforces. Fail the test, then unblock so it reports the failure rather
+		// than hanging.
+		g.t.Errorf("drive gate timed out: drives serialized instead of running concurrently")
 	}
 }
 
