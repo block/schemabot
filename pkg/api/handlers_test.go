@@ -1532,7 +1532,7 @@ func TestEnqueueAuthorizedApplyWakesOperatorForQueuedApply(t *testing.T) {
 	applies := &capturingApplyStore{findCh: make(chan struct{}, 1)}
 	mock := &mockTernClient{resumeCh: make(chan *storage.Apply, 1)}
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), mock, applies)
-	svc.config.OperatorWorkers = 1
+	svc.config.Drivers = 1
 	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
 	svc.StartOperator(t.Context())
 	t.Cleanup(svc.StopOperator)
@@ -2113,7 +2113,7 @@ func TestExecuteApplyWakesOperatorForQueuedLocalApply(t *testing.T) {
 	applies := &capturingApplyStore{findCh: make(chan struct{}, 1)}
 	mock := &mockTernClient{resumeCh: make(chan *storage.Apply, 1)}
 	svc, _ := newExecuteApplyTestService(mock, applies)
-	svc.config.OperatorWorkers = 1
+	svc.config.Drivers = 1
 	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
 	svc.StartOperator(t.Context())
 	t.Cleanup(svc.StopOperator)

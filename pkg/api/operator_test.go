@@ -16,28 +16,35 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-func TestOperatorWorkersConfig(t *testing.T) {
-	t.Run("default workers", func(t *testing.T) {
+func TestDriversConfig(t *testing.T) {
+	t.Run("default drivers", func(t *testing.T) {
 		config := &ServerConfig{}
+		assert.Equal(t, 0, config.Drivers)
+		assert.Equal(t, 4, DefaultDrivers)
+	})
+
+	t.Run("configured drivers", func(t *testing.T) {
+		config := &ServerConfig{Drivers: 3}
+		assert.Equal(t, 3, config.Drivers)
+	})
+
+	t.Run("deprecated operator_workers folds into drivers", func(t *testing.T) {
+		config := &ServerConfig{OperatorWorkers: 2}
+		require.NoError(t, config.resolveDeprecatedDrivers())
+		assert.Equal(t, 2, config.Drivers)
 		assert.Equal(t, 0, config.OperatorWorkers)
-		assert.Equal(t, 4, DefaultOperatorWorkers)
 	})
 
-	t.Run("configured workers", func(t *testing.T) {
-		config := &ServerConfig{OperatorWorkers: 3}
-		assert.Equal(t, 3, config.OperatorWorkers)
-	})
-
-	t.Run("deprecated scheduler_workers folds into operator_workers", func(t *testing.T) {
+	t.Run("deprecated scheduler_workers folds into drivers", func(t *testing.T) {
 		config := &ServerConfig{SchedulerWorkers: 2}
-		require.NoError(t, config.resolveDeprecatedOperatorWorkers())
-		assert.Equal(t, 2, config.OperatorWorkers)
+		require.NoError(t, config.resolveDeprecatedDrivers())
+		assert.Equal(t, 2, config.Drivers)
 		assert.Equal(t, 0, config.SchedulerWorkers)
 	})
 
-	t.Run("setting both keys is rejected", func(t *testing.T) {
-		config := &ServerConfig{OperatorWorkers: 4, SchedulerWorkers: 2}
-		assert.Error(t, config.resolveDeprecatedOperatorWorkers())
+	t.Run("setting multiple keys is rejected", func(t *testing.T) {
+		config := &ServerConfig{Drivers: 4, OperatorWorkers: 2}
+		assert.Error(t, config.resolveDeprecatedDrivers())
 	})
 }
 

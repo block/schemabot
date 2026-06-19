@@ -11,7 +11,7 @@
   - [Deployment Order](#deployment-order)
 - [Environment Order](#environment-order)
 - [Hybrid Mode](#hybrid-mode)
-- [Operator Workers](#operator-workers)
+- [Drivers](#drivers)
 - [Pending Drops](#pending-drops)
 - [Support Channel](#support-channel)
 - [Repository Allowlist](#repository-allowlist)
@@ -258,19 +258,19 @@ tern_deployments:
 
 Routing is always server-side. A database environment with `dsn` uses local mode. A database environment with `target` and `deployment` uses gRPC mode through the matching `tern_deployments` endpoint. A database that is not listed in `databases` is not routable.
 
-## Operator Workers
+## Drivers
 
-SchemaBot runs a background operator for apply work that needs server-side coordination. By default, four workers poll for claimable work so a server can make progress across independent databases and environments concurrently.
+SchemaBot runs a background operator for apply work that needs server-side coordination. By default, four drivers poll for claimable work so a server can make progress across independent databases and environments concurrently.
 
 ```yaml
-operator_workers: 4
+drivers: 4
 ```
 
-Increase `operator_workers` when one SchemaBot server should make operator progress across independent databases or environments concurrently. More workers help high-scale installations with many schema changes because each worker can claim and resume a different target during the same operator tick. The operator still excludes overlapping work for the same database and environment, so this improves concurrency across independent targets, not parallel execution against one target.
+Increase `drivers` when one SchemaBot server should make operator progress across independent databases or environments concurrently. More drivers help high-scale installations with many schema changes because each driver can claim and resume a different target during the same operator tick. The operator still excludes overlapping work for the same database and environment, so this improves concurrency across independent targets, not parallel execution against one target.
 
-An operator claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the worker's lease while it reloads state and resumes the apply.
+A driver claim means selecting one stale apply and refreshing its heartbeat in the same storage transaction. That heartbeat refresh is the driver's lease while it reloads state and drives the apply to a terminal state.
 
-> **Deprecated:** the previous `scheduler_workers` key still works as an alias for `operator_workers` and is honored with a deprecation warning. Set only one of the two. The alias will be removed one release after the operator rename has soaked.
+> **Deprecated:** the previous `operator_workers` and `scheduler_workers` keys still work as aliases for `drivers` and are honored with a deprecation warning. Set only one of the three. The aliases will be removed one release after the driver rename has soaked.
 
 ## Pending Drops
 

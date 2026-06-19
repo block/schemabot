@@ -622,7 +622,7 @@ The operator is part of Tern orchestration. The API service starts it on server 
 
 Each operator driver runs immediately on startup, then polls every 10 seconds. The driver claims at most one apply per tick and resumes it through the Tern client for that apply's deployment and environment. Fresh applies also send a best-effort wake signal after their apply and task rows are committed, so a driver can claim them immediately instead of waiting for the next poll tick.
 
-`operator_workers` controls operator concurrency (the deprecated `operator_workers` alias is still accepted for one release). The default is four drivers, so an untuned server can still make progress across independent databases and environments concurrently. More drivers help larger installations with many independent schema changes because each driver can claim and resume a different target during the same operator tick.
+`drivers` controls operator concurrency (the deprecated `operator_workers` and `scheduler_workers` aliases are still accepted for one release). The default is four drivers, so an untuned server can still make progress across independent databases and environments concurrently. More drivers help larger installations with many independent schema changes because each driver can claim and resume a different target during the same operator tick.
 
 In a multi-pod deployment, every SchemaBot pod runs its own operator. Each operator has its own configurable driver pool, and every driver coordinates through shared storage before resuming an apply. When a recovered apply came from a PR comment, the driver attaches a reconstructed `ProgressObserver` before calling `ResumeApply()` so the resumed progress poller can keep updating PR comments.
 

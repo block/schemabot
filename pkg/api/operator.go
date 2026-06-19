@@ -31,9 +31,9 @@ const (
 	// min(operatorPollInterval, ApplyOperationHeartbeatInterval).
 	ApplyOperationHeartbeatInterval = 10 * time.Second
 
-	// DefaultOperatorWorkers is the number of concurrent operator drivers
-	// when not configured via operator_workers in the server config.
-	DefaultOperatorWorkers = 4
+	// DefaultDrivers is the number of concurrent operator drivers
+	// when not configured via drivers in the server config.
+	DefaultDrivers = 4
 
 	// ApplyClaimLogTimeout bounds the best-effort apply-log append recording an
 	// operator claim, so a slow or hung storage layer cannot delay the resume
@@ -48,7 +48,7 @@ const (
 // includes queued applies, crash recovery for applies with stale heartbeats,
 // and retry recovery for transient engine failures.
 //
-// Launches N concurrent drivers (configured via operator_workers in config).
+// Launches N concurrent drivers (configured via drivers in config).
 // Each driver independently claims applies using FOR UPDATE SKIP LOCKED.
 // Call StopOperator to gracefully stop.
 func (s *Service) StartOperator(ctx context.Context) {
@@ -59,9 +59,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 		return
 	}
 
-	driverCount := s.config.OperatorWorkers
+	driverCount := s.config.Drivers
 	if driverCount <= 0 {
-		driverCount = DefaultOperatorWorkers
+		driverCount = DefaultDrivers
 	}
 
 	stop := make(chan struct{})

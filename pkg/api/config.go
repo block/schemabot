@@ -96,19 +96,25 @@ type ServerConfig struct {
 	// staging before production.
 	EnvironmentOrder []string `yaml:"environment_order"`
 
-	// OperatorWorkers is the number of concurrent operator workers that claim
-	// and resume applies. Each worker independently polls FindNextApply with
-	// FOR UPDATE SKIP LOCKED to prevent races. Defaults to DefaultOperatorWorkers.
-	OperatorWorkers int `yaml:"operator_workers"`
+	// Drivers is the number of concurrent operator drivers that claim and drive
+	// applies. Each driver independently polls FindNextApply with FOR UPDATE
+	// SKIP LOCKED to prevent races. Defaults to DefaultDrivers.
+	Drivers int `yaml:"drivers"`
 
-	// SchedulerWorkers is the deprecated alias for OperatorWorkers. It is kept
-	// so existing config files that still set scheduler_workers continue to
-	// load (the YAML decoder runs with KnownFields(true) and would otherwise
-	// reject the unknown key). Validate() copies it into OperatorWorkers when
-	// the new key is unset and logs a deprecation warning. Remove one release
-	// after the operator rename has soaked.
+	// OperatorWorkers is the deprecated alias for Drivers. It is kept so existing
+	// config files that still set operator_workers continue to load (the YAML
+	// decoder runs with KnownFields(true) and would otherwise reject the unknown
+	// key). Validate() folds it into Drivers when the new key is unset and logs a
+	// deprecation warning. Remove one release after the driver rename has soaked.
 	//
-	// Deprecated: use operator_workers.
+	// Deprecated: use drivers.
+	OperatorWorkers int `yaml:"operator_workers,omitempty"`
+
+	// SchedulerWorkers is the original deprecated alias for Drivers, predating
+	// operator_workers. It is kept for the same KnownFields(true) reason and is
+	// folded into Drivers by Validate() with a deprecation warning.
+	//
+	// Deprecated: use drivers.
 	SchedulerWorkers int `yaml:"scheduler_workers,omitempty"`
 
 	// OperatorClaimOperations switches scheduler workers to claim work at the
@@ -706,26 +712,41 @@ func LoadServerConfigFromFile(path string) (*ServerConfig, error) {
 	return &config, nil
 }
 
-// resolveDeprecatedOperatorWorkers folds the deprecated scheduler_workers key
-// into operator_workers. When only the deprecated key is set it is honored and
-// a deprecation warning is logged; setting both keys is rejected so the
-// effective value is never ambiguous.
-func (c *ServerConfig) resolveDeprecatedOperatorWorkers() error {
-	if c.SchedulerWorkers == 0 {
-		return nil
+// resolveDeprecatedDrivers folds the deprecated operator_workers and
+// scheduler_workers keys into drivers. When only a deprecated key is set it is
+// honored and a deprecation warning is logged; setting more than one of the
+// three keys is rejected so the effective value is never ambiguous.
+func (c *ServerConfig) resolveDeprecatedDrivers() error {
+	set := 0
+	if c.Drivers != 0 {
+		set++
 	}
 	if c.OperatorWorkers != 0 {
-		return fmt.Errorf("set only one of operator_workers or scheduler_workers (scheduler_workers is deprecated)")
+		set++
 	}
-	slog.Warn("scheduler_workers is deprecated; use operator_workers", "scheduler_workers", c.SchedulerWorkers)
-	c.OperatorWorkers = c.SchedulerWorkers
-	c.SchedulerWorkers = 0
+	if c.SchedulerWorkers != 0 {
+		set++
+	}
+	if set > 1 {
+		return fmt.Errorf("set only one of drivers, operator_workers, or scheduler_workers (operator_workers and scheduler_workers are deprecated)")
+	}
+
+	if c.OperatorWorkers != 0 {
+		slog.Warn("operator_workers is deprecated; use drivers", "operator_workers", c.OperatorWorkers)
+		c.Drivers = c.OperatorWorkers
+		c.OperatorWorkers = 0
+	}
+	if c.SchedulerWorkers != 0 {
+		slog.Warn("scheduler_workers is deprecated; use drivers", "scheduler_workers", c.SchedulerWorkers)
+		c.Drivers = c.SchedulerWorkers
+		c.SchedulerWorkers = 0
+	}
 	return nil
 }
 
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
-	if err := c.resolveDeprecatedOperatorWorkers(); err != nil {
+	if err := c.resolveDeprecatedDrivers(); err != nil {
 		return err
 	}
 
