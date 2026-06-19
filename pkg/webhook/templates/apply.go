@@ -522,8 +522,10 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 	}
 }
 
-// writeApplyFooter writes state-specific footer with next actions.
-// All actionable states follow the same pattern: --- separator + "To <verb>:" + command.
+// writeApplyFooter writes a state-specific footer with the next operator action.
+// Most actionable states render a "<label>:" line plus a command. Terminal states
+// with no recovery command (a cancelled change cannot be resumed) instead render
+// explanatory guidance pointing at the right next step.
 func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
 	case state.Apply.WaitingForDeploy:
@@ -579,6 +581,8 @@ func RenderApplySummaryComment(data ApplyStatusCommentData) string {
 		writeSummaryFailed(&sb, data, completedCount, failedCount, totalTables)
 	case state.Apply.Stopped:
 		writeSummaryStopped(&sb, data, completedCount, totalTables)
+	case state.Apply.Cancelled:
+		writeSummaryCancelled(&sb, data, completedCount, totalTables)
 	default:
 		fmt.Fprintf(&sb, "## Schema Change \u2014 %s\n\n", humanizeState(data.State))
 		writeSummaryMetadata(&sb, data)
@@ -656,7 +660,24 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 	}
 
 	writeSummaryTableList(sb, data)
-	writeFooterAction(sb, "To resume:", fmt.Sprintf("schemabot start %s", data.ApplyID))
+	writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s", data.ApplyID))
+}
+
+// writeSummaryCancelled renders the terminal summary for a cancelled schema
+// change. Unlike a stopped change, a cancelled one is permanent (e.g. a
+// PlanetScale deploy request that was cancelled), so the summary offers no resume
+// command and directs the operator to open a new schema change.
+func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, completedCount int, totalTables int) {
+	writeApplyHeader(sb, data)
+	writeSummaryMetadata(sb, data)
+
+	if completedCount > 0 {
+		fmt.Fprintf(sb, "\n%d of %d %s completed before cancellation.\n", completedCount, totalTables, pluralize("table", totalTables))
+	}
+
+	writeSummaryTableList(sb, data)
+	sb.WriteString("\n---\n\n")
+	sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 }
 
 func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {

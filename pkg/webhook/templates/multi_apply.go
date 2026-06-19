@@ -171,7 +171,7 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 			fmt.Sprintf("To cut over `%s`:", na.Deployment),
 			fmt.Sprintf("schemabot cutover %s", data.ApplyID))
 	case presentation.NextActionResume:
-		writeFooterAction(sb, "To resume:", fmt.Sprintf("schemabot start %s", data.ApplyID))
+		writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s", data.ApplyID))
 	case presentation.NextActionReviewFailure:
 		// revert applies only to a deployment still in its post-cutover revert
 		// window, not to a failure; the recovery path for a failed apply is a
