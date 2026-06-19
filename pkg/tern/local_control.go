@@ -463,7 +463,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".
 	terminalState := state.Task.Stopped
 	var engineTableProgress map[string]*engine.TableProgress
-	if c.config.Type == storage.DatabaseTypeVitess {
+	if stopTerminatesChange(c.config.Type) {
 		terminalState = state.Task.Cancelled
 	} else {
 		// Snapshot progress AFTER Spirit has fully stopped to preserve row copy progress.

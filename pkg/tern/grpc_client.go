@@ -822,7 +822,7 @@ func (c *GRPCClient) stopUndispatchedApply(ctx context.Context, apply *storage.A
 	now := time.Now()
 	taskState := state.Task.Stopped
 	applyState := state.Apply.Stopped
-	if apply.DatabaseType == storage.DatabaseTypeVitess {
+	if stopTerminatesChange(apply.DatabaseType) {
 		taskState = state.Task.Cancelled
 		applyState = state.Apply.Cancelled
 	}
@@ -876,7 +876,7 @@ func (c *GRPCClient) stopUndispatchedApplyOperation(ctx context.Context, apply *
 	now := time.Now()
 	taskState := state.Task.Stopped
 	operationState := state.ApplyOperation.Stopped
-	if apply.DatabaseType == storage.DatabaseTypeVitess {
+	if stopTerminatesChange(apply.DatabaseType) {
 		taskState = state.Task.Cancelled
 		operationState = state.ApplyOperation.Cancelled
 	}
