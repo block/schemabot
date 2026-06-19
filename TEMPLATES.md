@@ -1776,7 +1776,7 @@ Rows: 156,342 / 397,453
 
 ---
 
-To resume:
+Paused — to resume from where it stopped:
 ```
 schemabot start apply-a1b2c3d4e5f6
 ```
@@ -2161,7 +2161,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 ---
 
-To resume:
+Paused — to resume from where it stopped:
 ```
 schemabot start apply-a1b2c3d4e5f6
 ```

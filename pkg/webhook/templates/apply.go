@@ -118,7 +118,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Reverted:
 		sb.WriteString("## ↩️ Schema Change Reverted\n\n")
 	case state.Apply.Cancelled:
-		sb.WriteString("## Schema Change Cancelled\n\n")
+		sb.WriteString("## 🚫 Schema Change Cancelled\n\n")
 	case state.Apply.PreparingBranch:
 		sb.WriteString("## Schema Change — Preparing Branch\n\n")
 	case state.Apply.ApplyingBranchChanges:
@@ -545,7 +545,10 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.FailedRetryable:
 		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", fmt.Sprintf("schemabot stop %s", data.ApplyID))
 	case state.Apply.Stopped:
-		writeFooterAction(sb, "To resume:", fmt.Sprintf("schemabot start %s", data.ApplyID))
+		writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s", data.ApplyID))
+	case state.Apply.Cancelled:
+		sb.WriteString("\n---\n\n")
+		sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	case state.Apply.Failed:
 		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
 	case state.Apply.RevertWindow:

@@ -1502,7 +1502,7 @@ func startNotAllowedForState(apply *storage.Apply) error {
 	case state.IsState(apply.State, state.Apply.Completed):
 		return controlConflictf("schema change already completed and cannot be started")
 	case state.IsState(apply.State, state.Apply.Cancelled):
-		return controlConflictf("schema change was cancelled and cannot be started")
+		return controlConflictf("schema change was cancelled and cannot be started; open a new schema change to apply it again")
 	case state.IsState(apply.State, state.Apply.Reverted):
 		return controlConflictf("schema change was reverted and cannot be started")
 	case state.IsState(apply.State,
