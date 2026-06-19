@@ -1276,6 +1276,236 @@ func TestLocalClient_ResumeApplyOperationFailsClosedOnNoTasks(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, after.State, "a task-less operation must not mutate the parent apply state")
 }
 
+// The ordered-cutover drive is operation-scoped like the copy drive: a claim for
+// an operation that resolves to no tasks is invalid or stale and must fail
+// closed with ErrNoTasksForApplyOperation without mutating the parked parent
+// apply, so the operator can terminalize just that operation.
+func TestLocalClient_ResumeApplyOperationCutoverFailsClosedOnNoTasks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-op-cutover-notasks-%d", time.Now().UnixNano()),
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.WaitingForCutover,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	// Insert an operation parked at the barrier but deliberately no tasks.
+	operationID, err := stor.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: "testdb",
+		Target:     "testdb",
+		State:      state.ApplyOperation.WaitingForCutover,
+	})
+	require.NoError(t, err)
+
+	err = client.ResumeApplyOperationCutover(ctx, apply, operationID)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrNoTasksForApplyOperation, "the empty-operation fail-closed signal must be matchable with errors.Is")
+
+	after, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, state.Apply.WaitingForCutover, after.State, "a task-less cutover claim must not mutate the parked parent apply state")
+}
+
+// The cutover drive is operation-scoped and must fail closed when the operation
+// does not belong to the passed-in apply, so a mismatched (apply, operation)
+// pair can never force another apply's deployment through cutover.
+func TestLocalClient_ResumeApplyOperationCutoverFailsClosedOnApplyMismatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	ownerApplyID, operationID := seedCutoverOperationWithTask(ctx, t, stor, state.ApplyOperation.WaitingForCutover)
+
+	// A different apply that does not own the operation.
+	now := time.Now()
+	otherApply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-cutover-other-%d", time.Now().UnixNano()),
+		Database:        "otherdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "otherdb",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.WaitingForCutover,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	otherApplyID, err := stor.Applies().Create(ctx, otherApply)
+	require.NoError(t, err)
+	otherApply.ID = otherApplyID
+
+	err = client.ResumeApplyOperationCutover(ctx, otherApply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "belongs to apply")
+
+	owner, err := stor.Applies().Get(ctx, ownerApplyID)
+	require.NoError(t, err)
+	require.NotNil(t, owner)
+	assert.Equal(t, state.Apply.WaitingForCutover, owner.State, "a mismatched cutover claim must not touch the operation's real parent apply")
+}
+
+// A copy-phase or terminal operation must never be forced into a cutover drive;
+// only operations parked at or recovering through the cutover barrier are
+// eligible. Here the operation is still running its copy phase.
+func TestLocalClient_ResumeApplyOperationCutoverFailsClosedOnWrongState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	applyID, operationID := seedCutoverOperationWithTask(ctx, t, stor, state.ApplyOperation.Running)
+
+	apply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+
+	err = client.ResumeApplyOperationCutover(ctx, apply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not parked or recovering for cutover")
+
+	after, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, state.Apply.Running, after.State, "a copy-phase operation must not be driven through cutover")
+}
+
+// seedCutoverOperationWithTask creates a plan, apply (in opState's apply-level
+// equivalent), one operation in opState, and a single task scoped to it. It
+// returns the apply ID and operation ID so cutover trust-boundary tests have a
+// real (apply, operation, task) trio to exercise the guards against.
+func seedCutoverOperationWithTask(ctx context.Context, t *testing.T, stor storage.Storage, opState string) (int64, int64) {
+	t.Helper()
+	ddl := "ALTER TABLE `users` ADD COLUMN cutover_note VARCHAR(255)"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-cutover-guard-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {Tables: []storage.TableChange{{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"}}},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-cutover-guard-%d", time.Now().UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           opState,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{}),
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	operationID, err := stor.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: "testdb",
+		Target:     "testdb",
+		State:      opState,
+	})
+	require.NoError(t, err)
+
+	_, err = stor.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier:   fmt.Sprintf("task-cutover-guard-%d", time.Now().UnixNano()),
+		ApplyID:          applyID,
+		ApplyOperationID: &operationID,
+		PlanID:           planID,
+		Database:         "testdb",
+		DatabaseType:     storage.DatabaseTypeMySQL,
+		Engine:           storage.EngineSpirit,
+		State:            state.Task.WaitingForCutover,
+		TableName:        "users",
+		Namespace:        "testdb",
+		DDL:              ddl,
+		DDLAction:        "alter",
+		Options:          storage.MarshalApplyOptions(storage.ApplyOptions{}),
+		Environment:      localClientTestEnvironment,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	})
+	require.NoError(t, err)
+
+	return applyID, operationID
+}
+
 // This scenario covers an operator-owned grouped start where the target schema
 // advances between the recovery re-plan and the final pre-dispatch schema check.
 // The operator should complete durable state without reissuing engine apply work.
@@ -1571,14 +1801,21 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStor
 	require.NoError(t, err)
 	assert.Equal(t, ternv1.State_STATE_RECOVERING, progressResp.State)
 
+	// A cutover request is queued for the apply owner; it is not performed while
+	// the apply is recovering, so storage stays in the recovery state until the
+	// owner reattaches and proves cutover readiness.
 	cutoverResp, err := client.Cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, cutoverResp)
-	assert.False(t, cutoverResp.Accepted)
-	assert.Contains(t, cutoverResp.ErrorMessage, "recovering")
+	assert.True(t, cutoverResp.Accepted, "cutover is queued for the owner even during recovery")
+
+	storedApply, err = stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Recovering, storedApply.State, "queuing a cutover must not perform it while recovering")
 
 	recoveryEngine.progress = &engine.ProgressResult{
 		State: engine.StateRunning,
@@ -1606,6 +1843,10 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStor
 	require.NotNil(t, storedTask)
 	assert.Equal(t, state.Task.Recovering, storedTask.State)
 
+	// The read path never advances recovery state from the engine — surfacing
+	// cutover readiness is the apply owner's job. Even when the engine reports
+	// the schema change is waiting for cutover, progress reflects the stored
+	// recovery state until the owner persists the transition.
 	recoveryEngine.progress = &engine.ProgressResult{
 		State: engine.StateWaitingForCutover,
 		Tables: []engine.TableProgress{{
@@ -1615,6 +1856,26 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStor
 			Progress:  100,
 		}},
 	}
+	progressResp, err = client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.State_STATE_RECOVERING, progressResp.State)
+
+	// Once the owner reattach loop proves cutover readiness and persists it,
+	// progress reflects the cutover-ready state from storage on any instance.
+	storedTask, err = stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	storedTask.State = state.Task.WaitingForCutover
+	require.NoError(t, stor.Tasks().Update(ctx, storedTask))
+	storedApply, err = stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	storedApply.State = state.Apply.WaitingForCutover
+	require.NoError(t, stor.Applies().Update(ctx, storedApply))
+
 	progressResp, err = client.Progress(ctx, &ternv1.ProgressRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: localClientTestEnvironment,

@@ -84,6 +84,30 @@ type DeferredCutoverSignalChecker interface {
 	DeferredCutoverSignalExists(ctx context.Context, req *DeferredCutoverSignalRequest) (bool, error)
 }
 
+// ExternallyAuthoritativeProgress is an optional interface for engines whose
+// Progress result reflects authoritative external state (for example a remote
+// online-DDL service) rather than instance-local in-memory state.
+//
+// This distinction matters when one logical data-plane route is served by
+// multiple instances that share storage. A progress request can be balanced
+// onto any instance. An engine that reads progress from instance-local memory
+// only knows about the schema change that instance is running, so a request
+// served by another instance would observe unrelated or stale state — its
+// progress must instead come from shared storage, which the instance driving
+// the schema change keeps current. An engine that reads progress from external
+// authoritative state returns the same correct answer on every instance, so it
+// may be queried directly regardless of which instance answers.
+//
+// Engines that do not implement this interface are treated as instance-local:
+// their progress is served from shared storage. This fails closed — a new
+// engine is never trusted cross-instance unless it explicitly declares its
+// progress authoritative.
+type ExternallyAuthoritativeProgress interface {
+	// ProgressIsExternallyAuthoritative reports whether this engine's Progress
+	// result is correct regardless of which instance answers.
+	ProgressIsExternallyAuthoritative() bool
+}
+
 // DeferredCutoverSignalRequest identifies the target database whose deferred
 // cutover signal should be inspected.
 type DeferredCutoverSignalRequest struct {

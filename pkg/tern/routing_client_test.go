@@ -51,17 +51,18 @@ func (l routingApplyOperationLookup) ListByApply(_ context.Context, applyID int6
 type routingRecordingClient struct {
 	Client
 
-	pullSchemaReq      *ternv1.PullSchemaRequest
-	planReq            *ternv1.PlanRequest
-	applyReq           *ternv1.ApplyRequest
-	applyErr           error
-	progressReq        *ternv1.ProgressRequest
-	resumeApply        *storage.Apply
-	resumeOperationID  int64
-	pendingObserverSet bool
-	pendingObserver    ProgressObserver
-	observerApplyID    int64
-	isRemote           bool
+	pullSchemaReq            *ternv1.PullSchemaRequest
+	planReq                  *ternv1.PlanRequest
+	applyReq                 *ternv1.ApplyRequest
+	applyErr                 error
+	progressReq              *ternv1.ProgressRequest
+	resumeApply              *storage.Apply
+	resumeOperationID        int64
+	resumeCutoverOperationID int64
+	pendingObserverSet       bool
+	pendingObserver          ProgressObserver
+	observerApplyID          int64
+	isRemote                 bool
 }
 
 func (c *routingRecordingClient) PullSchema(_ context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -95,6 +96,12 @@ func (c *routingRecordingClient) ResumeApply(_ context.Context, apply *storage.A
 func (c *routingRecordingClient) ResumeApplyOperation(_ context.Context, apply *storage.Apply, applyOperationID int64) error {
 	c.resumeApply = apply
 	c.resumeOperationID = applyOperationID
+	return nil
+}
+
+func (c *routingRecordingClient) ResumeApplyOperationCutover(_ context.Context, apply *storage.Apply, applyOperationID int64) error {
+	c.resumeApply = apply
+	c.resumeCutoverOperationID = applyOperationID
 	return nil
 }
 
@@ -695,6 +702,45 @@ func TestRoutingClientResumeApplyOperationRoutesByStoredOperation(t *testing.T) 
 	assert.Equal(t, "east", apply.Deployment)
 	assert.Equal(t, "target-east", apply.GetOptions().Target)
 	assert.Equal(t, int64(7), clients["west/staging"].resumeOperationID)
+	assert.Equal(t, int64(42), clients["west/staging"].observerApplyID)
+}
+
+func TestRoutingClientResumeApplyOperationCutoverRoutesByStoredOperation(t *testing.T) {
+	clients := map[string]*routingRecordingClient{
+		"east/staging": {},
+		"west/staging": {},
+	}
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-123",
+		Deployment:      "east",
+		Environment:     "staging",
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "target-east"})
+	routingClient := newTestRoutingClient(t, RoutingClientConfig{
+		Resolver:    routingResolverFunc(func(context.Context, routing.Request) ([]routing.ExecutionTarget, error) { return nil, nil }),
+		PlanLookup:  routingPlanLookup{},
+		ApplyLookup: routingApplyLookup{},
+		ApplyOperationLookup: routingApplyOperationLookup{
+			7: {
+				ID:         7,
+				ApplyID:    42,
+				Deployment: "west",
+				Target:     "target-west",
+			},
+		},
+		ClientForDeployment: testDeploymentClientFunc(clients),
+	})
+	routingClient.SetObserver(42, routingNoopObserver{})
+
+	err := routingClient.ResumeApplyOperationCutover(t.Context(), apply, 7)
+
+	require.NoError(t, err)
+	assert.Nil(t, clients["east/staging"].resumeApply)
+	require.NotNil(t, clients["west/staging"].resumeApply)
+	assert.Equal(t, "west", clients["west/staging"].resumeApply.Deployment)
+	assert.Equal(t, "target-west", clients["west/staging"].resumeApply.GetOptions().Target)
+	assert.Equal(t, int64(7), clients["west/staging"].resumeCutoverOperationID)
 	assert.Equal(t, int64(42), clients["west/staging"].observerApplyID)
 }
 

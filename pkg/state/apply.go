@@ -16,6 +16,7 @@ var Apply = struct {
 	Pending           string
 	Running           string
 	RunningDegraded   string
+	Resuming          string
 	WaitingForDeploy  string
 	WaitingForCutover string
 	Recovering        string
@@ -40,6 +41,7 @@ var Apply = struct {
 	Pending:           "pending",
 	Running:           "running",
 	RunningDegraded:   "running_degraded",
+	Resuming:          "resuming",
 	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
 	Recovering:        "recovering",

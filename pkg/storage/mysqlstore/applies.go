@@ -83,10 +83,16 @@ type txBeginner interface {
 // healthy worker mid-setup keeps its heartbeat fresh, so it is never claimed out
 // from under itself. Leaving these states out would strand a crashed setup-phase
 // apply non-terminal and unclaimable, so no operator could ever recover it.
+//
+// Resuming is included for the same reason: it is a transient state a driver
+// holds while waiting for the data plane to leave stopped after a start. A
+// stale heartbeat there means the driver died mid-resume, and recovery must be
+// able to reclaim and finish driving it to a terminal state.
 func claimableApplyStates() []string {
 	return []string{
 		state.Apply.Running,
 		state.Apply.RunningDegraded,
+		state.Apply.Resuming,
 		state.Apply.WaitingForDeploy,
 		state.Apply.WaitingForCutover,
 		state.Apply.Recovering,
@@ -1401,7 +1407,7 @@ func persistApplyClaim(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *stora
 	}
 
 	if isStartingClaim(apply.State) {
-		claimed, err := transitionClaimToRunning(ctx, tx, apply, owner, leaseToken)
+		claimed, err := transitionClaimToState(ctx, tx, apply, state.Apply.Running, owner, leaseToken)
 		if err != nil {
 			return claimLostRace, err
 		}
@@ -1422,7 +1428,7 @@ func persistApplyClaim(ctx context.Context, db *sql.DB, tx *sql.Tx, apply *stora
 	return claimAcquired, nil
 }
 
-// claimStoppedApplyUnderTargetLock drives the full stopped→running claim while
+// claimStoppedApplyUnderTargetLock drives the full stopped→resuming claim while
 // holding the apply-target lock: re-check the one-active-apply-per-target
 // invariant, then either transition+commit or refuse+commit. It commits inside
 // the lock so a concurrent create cannot add a second active apply between the
@@ -1454,7 +1460,7 @@ func claimStoppedApplyUnderTargetLock(ctx context.Context, db *sql.DB, tx *sql.T
 		return refuseStoppedClaimForActiveTarget(ctx, tx, apply, owner, database, dbType, environment)
 	}
 
-	claimed, err := transitionClaimToRunning(ctx, tx, apply, owner, leaseToken)
+	claimed, err := transitionClaimToState(ctx, tx, apply, state.Apply.Resuming, owner, leaseToken)
 	if err != nil {
 		return claimLostRace, err
 	}
@@ -1474,12 +1480,15 @@ func isStartingClaim(applyState string) bool {
 	return state.IsState(applyState, state.Apply.Pending, state.Apply.Stopped, state.Apply.FailedRetryable)
 }
 
-// transitionClaimToRunning performs the guarded stopped/pending/retryable →
-// running transition that rotates the lease. WHERE state = ? guards against a
-// concurrent transition landing between the SELECT and this UPDATE; a zero
-// rows-affected result means another worker already moved the row, so the
-// caller backs off cleanly. Reports false on that lost race.
-func transitionClaimToRunning(ctx context.Context, tx *sql.Tx, apply *storage.Apply, owner, leaseToken string) (bool, error) {
+// transitionClaimToState performs the guarded claim transition that rotates the
+// lease and moves the apply into targetState. A pending or failed_retryable
+// claim transitions to running; a stopped claim transitions to resuming, the
+// transient state held while the driver waits for the data plane to leave
+// stopped after a start. WHERE state = ? guards against a concurrent transition
+// landing between the SELECT and this UPDATE; a zero rows-affected result means
+// another worker already moved the row, so the caller backs off cleanly. Reports
+// false on that lost race.
+func transitionClaimToState(ctx context.Context, tx *sql.Tx, apply *storage.Apply, targetState, owner, leaseToken string) (bool, error) {
 	result, err := tx.ExecContext(ctx, `
 		UPDATE applies
 		SET state = ?, updated_at = NOW(),
@@ -1488,7 +1497,7 @@ func transitionClaimToRunning(ctx context.Context, tx *sql.Tx, apply *storage.Ap
 		    completed_at = NULL,
 		    error_message = CASE WHEN ? = ? THEN '' ELSE error_message END
 		WHERE id = ? AND state = ?
-	`, state.Apply.Running, owner, leaseToken, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.ID, apply.State)
+	`, targetState, owner, leaseToken, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.ID, apply.State)
 	if err != nil {
 		return false, fmt.Errorf("claim apply %d (%s) in state %s: %w", apply.ID, apply.ApplyIdentifier, apply.State, err)
 	}

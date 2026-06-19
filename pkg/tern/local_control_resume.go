@@ -476,6 +476,22 @@ func shouldInspectDeferredCutoverSignal(apply *storage.Apply) bool {
 		state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.Recovering)
 }
 
+// shouldInspectCutoverSignalForResume reports whether the resume path must load
+// the engine's cutover checkpoint before driving. It is true for the normal
+// deferred-cutover recovery (shouldInspectDeferredCutoverSignal) and, in
+// addition, for an ordered-cutover drive (forceCutoverResume) of a parked
+// operation. The barrier park deliberately does not persist DeferCutover onto
+// the shared apply (it is an execution-time, per-operation decision), so the
+// stored-options check alone would miss a parked operation; the force flag
+// covers that case while still requiring the apply to actually be parked.
+func shouldInspectCutoverSignalForResume(apply *storage.Apply, forceCutoverResume bool) bool {
+	if shouldInspectDeferredCutoverSignal(apply) {
+		return true
+	}
+	return forceCutoverResume && apply != nil &&
+		state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.Recovering)
+}
+
 func (c *LocalClient) markApplyRecovering(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	c.logger.Info("entering recovery state for deferred cutover checkpoint",
 		"apply_id", apply.ApplyIdentifier,
@@ -777,7 +793,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	}
 	// Whole-apply scope has no single operation to order, so the stored apply
 	// options govern the drive directly (no automatic barrier park).
-	return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false)
+	return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false, false)
 }
 
 // ResumeApplyOperation starts or resumes a single apply_operation (one
@@ -804,6 +820,12 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	if op == nil {
 		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrApplyOperationRowMissing)
 	}
+	// Trust-boundary guard: the operation must belong to the passed-in apply, or
+	// an operation-scoped drive could advance another apply's deployment under
+	// this apply's state. The routing and gRPC paths enforce the same invariant.
+	if op.ApplyID != apply.ID {
+		return fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", applyOperationID, op.ApplyID, apply.ApplyIdentifier, apply.ID)
+	}
 	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
 		return fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
@@ -815,13 +837,60 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	// unchanged.
 	releaseAtCutoverBarrier := shouldReleaseAtCutoverBarrier(apply, multiOperation, op)
 	options := effectiveCopyDriveOptions(apply, multiOperation, op).Map()
-	return c.resumeApplyWithTasks(ctx, apply, tasks, options, releaseAtCutoverBarrier)
+	return c.resumeApplyWithTasks(ctx, apply, tasks, options, releaseAtCutoverBarrier, false)
+}
+
+// ResumeApplyOperationCutover drives a single apply_operation parked at the
+// cutover barrier (waiting_for_cutover) through its cutover phase. It is the
+// deployment-ordered counterpart to ResumeApplyOperation's copy drive: the
+// operator claims the parked operation whose turn it is and calls this to force
+// the high-risk swap, while siblings stay parked. Tasks are scoped to the
+// operation, so an empty result fails closed the same way ResumeApplyOperation
+// does rather than failing the whole parent apply.
+func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	if apply == nil {
+		return fmt.Errorf("stored apply is required to drive apply_operation %d cutover", applyOperationID)
+	}
+	tasks, err := c.storage.Tasks().GetByApplyOperationID(ctx, applyOperationID)
+	if err != nil {
+		return fmt.Errorf("get tasks for apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
+	}
+	if len(tasks) == 0 {
+		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
+	}
+	op, err := c.storage.ApplyOperations().Get(ctx, applyOperationID)
+	if err != nil {
+		return fmt.Errorf("get apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
+	}
+	if op == nil {
+		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrApplyOperationRowMissing)
+	}
+	// Trust-boundary guard: the operation must belong to the passed-in apply, or
+	// the cutover drive could force another apply's deployment through its swap
+	// under this apply's state. The routing and gRPC paths enforce the same.
+	if op.ApplyID != apply.ID {
+		return fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", applyOperationID, op.ApplyID, apply.ApplyIdentifier, apply.ID)
+	}
+	// Fail closed unless the operation is actually in a cutover phase. A
+	// copy-phase or terminal operation must never be forced into a cutover drive.
+	if !isCutoverDriveState(op.State) {
+		return fmt.Errorf("apply_operation %d (apply %s) is in state %q, not parked or recovering for cutover", applyOperationID, apply.ApplyIdentifier, op.State)
+	}
+	// Force the cutover: clear DeferCutover so the drive auto-triggers the swap
+	// when the engine reaches waiting_for_cutover, and never release at the
+	// barrier (this drive *is* the ordered-cutover claim, not the copy park).
+	// The barrier park deliberately does not persist DeferCutover onto the
+	// shared apply, so forceCutoverResume tells the resume path to still load
+	// the parked engine checkpoint before driving.
+	opts := apply.GetOptions()
+	opts.DeferCutover = false
+	return c.resumeApplyWithTasks(ctx, apply, tasks, opts.Map(), false, true)
 }
 
 // resumeApplyWithTasks drives an apply (or one of its operations) from the set
 // of tasks the caller has loaded. Callers choose whether tasks are scoped to the
 // whole apply or to a single operation.
-func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool) error {
+func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool, forceCutoverResume bool) error {
 	if len(tasks) == 0 {
 		c.logger.Warn("no tasks found for apply, marking as failed",
 			"apply_id", apply.ApplyIdentifier)
@@ -873,7 +942,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		fmt.Sprintf("Recovering apply (heartbeat expired, was in %s state)", apply.State), "", "")
 
 	deferredCutoverSignalAbsent := false
-	if shouldInspectDeferredCutoverSignal(apply) {
+	if shouldInspectCutoverSignalForResume(apply, forceCutoverResume) {
 		signalExists, signalSupported, err := c.deferredCutoverSignalExists(ctx, apply)
 		if err != nil {
 			c.logger.Warn("deferred cutover recovery could not verify engine cutover signal; operator will retry",

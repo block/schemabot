@@ -326,20 +326,28 @@ func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
 
 type fakeControlEngine struct {
 	engine.Engine
-	stopCount      int
-	startCount     int
-	cutoverCount   int
-	cutoverResult  *engine.ControlResult
-	cutoverErr     error
-	progressReq    *engine.ProgressRequest
-	progressResult *engine.ProgressResult
-	progressErr    error
-	planResult     *engine.PlanResult
-	applyResult    *engine.ApplyResult
-	applyErr       error
+	stopCount               int
+	startCount              int
+	cutoverCount            int
+	cutoverResult           *engine.ControlResult
+	cutoverErr              error
+	progressReq             *engine.ProgressRequest
+	progressResult          *engine.ProgressResult
+	progressErr             error
+	planResult              *engine.PlanResult
+	applyResult             *engine.ApplyResult
+	applyErr                error
+	externallyAuthoritative bool
 }
 
 func (e *fakeControlEngine) Name() string { return "fake" }
+
+// ProgressIsExternallyAuthoritative models an engine whose progress is read from
+// authoritative external state (like PlanetScale) when set, so the progress read
+// path queries it directly instead of serving from stored progress.
+func (e *fakeControlEngine) ProgressIsExternallyAuthoritative() bool {
+	return e.externallyAuthoritative
+}
 
 func (e *fakeControlEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
 	if e.planResult != nil {
@@ -629,7 +637,7 @@ func TestLocalClient_VitessProgressRequiresEngineResumeState(t *testing.T) {
 		TableName:        "users",
 		State:            state.Task.Running,
 	}
-	eng := &fakeControlEngine{}
+	eng := &fakeControlEngine{externallyAuthoritative: true}
 	client := &LocalClient{
 		config: LocalConfig{
 			Database: "testdb",
@@ -677,7 +685,7 @@ func TestLocalClient_VitessProgressPassesAndPersistsEngineResumeState(t *testing
 	}
 	updatedMetadata := `{"branch_name":"branch-123","deploy_request_id":321,"deploy_request_url":"https://example.test/deploys/321","is_instant":true}`
 	applyOperations := &exactProgressApplyOperationStore{data: storedResumeState}
-	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{
+	eng := &fakeControlEngine{externallyAuthoritative: true, progressResult: &engine.ProgressResult{
 		State: engine.StateRunning,
 		ResumeState: &engine.ResumeState{
 			MigrationContext: "ctx-123",
@@ -1043,6 +1051,73 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
+}
+
+func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *testing.T) {
+	// A stop and a start can race into the same operator claim: the apply is
+	// already stopped while a stop request is still pending, and a start request
+	// arrives alongside it. Completing the stop must report not-handled so the
+	// resume continues to the queued start in the same claim, instead of leaving
+	// the apply stopped with a pending start the claim lease-freshness gate
+	// cannot re-claim until the lease goes stale.
+	apply := &storage.Apply{
+		ID:              789,
+		ApplyIdentifier: "apply-stop-then-start",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+	}
+	task := &storage.Task{
+		ID:             987,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-then-start",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Stopped,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:stopper",
+		},
+		{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStart,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:starter",
+		},
+	}}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.False(t, handled, "a queued start must keep the claim resuming instead of exiting after the stop")
+
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, stopReq, "the resolved stop request must be completed")
+
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, startReq, "the start request must remain pending for the resume drive to complete")
 }
 
 func TestLocalClient_ProcessPendingStartControlRequestWaitsForPendingStop(t *testing.T) {

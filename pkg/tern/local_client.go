@@ -1419,6 +1419,26 @@ func (c *LocalClient) getEngine() engine.Engine {
 	}
 }
 
+// engineProgressIsExternallyAuthoritative reports whether the progress read path
+// may query the engine directly for live progress, or must serve progress from
+// shared storage instead.
+//
+// One logical data-plane route can be served by multiple instances that share
+// storage. A progress request can be balanced onto any instance. An engine
+// whose progress comes from instance-local memory only knows the schema change
+// that instance is running, so an instance that is not driving the queried
+// schema change would observe unrelated or stale state — its progress must come
+// from storage, which the driving instance keeps current. An engine whose
+// progress comes from authoritative external state returns the same correct
+// result on every instance and may be queried directly.
+//
+// This fails closed: an engine that does not declare its progress authoritative
+// is served from storage.
+func engineProgressIsExternallyAuthoritative(eng engine.Engine) bool {
+	source, ok := eng.(engine.ExternallyAuthoritativeProgress)
+	return ok && source.ProgressIsExternallyAuthoritative()
+}
+
 // Progress returns detailed progress for an active schema change.
 // Returns ALL tasks for the current apply: completed, running, and pending.
 // req.ApplyId is required so progress is always scoped to a single apply.
@@ -1545,7 +1565,17 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	if queryDuringPending && activeTask.State == state.Task.Pending {
 		queryLiveProgress = true
 	}
-	if eng != nil && queryLiveProgress {
+	// Live engine progress is read only when the engine's progress is
+	// authoritative on any instance. Instance-local engines (Spirit) are served
+	// from stored progress, which the instance driving the schema change keeps
+	// current, so a progress request balanced onto a non-driving instance cannot
+	// observe unrelated or stale engine state.
+	serveEngineProgress := eng != nil && queryLiveProgress && engineProgressIsExternallyAuthoritative(eng)
+	if eng != nil && queryLiveProgress && !serveEngineProgress {
+		c.logger.Debug("Progress: serving stored progress; engine progress is instance-local",
+			"apply_id", apply.ApplyIdentifier, "task_id", activeTask.TaskIdentifier, "database", c.config.Database)
+	}
+	if serveEngineProgress {
 		progressReq := &engine.ProgressRequest{
 			Database:    c.config.Database,
 			Credentials: creds,

@@ -598,6 +598,14 @@ type mockApplyStore struct {
 	updates   []*storage.Apply
 }
 
+func (m *mockApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
+	if m.apply == nil {
+		return nil, nil
+	}
+	apply := *m.apply
+	return &apply, nil
+}
+
 func (m *mockApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 	if m.apply == nil {
 		return nil, nil
@@ -1299,6 +1307,154 @@ func TestGRPCClient_ResumeApplyOperationStartLeavesApplyStartPending(t *testing.
 	assert.NotNil(t, startReq, "the apply-level start request must remain pending for sibling operations after one operation starts")
 }
 
+func TestGRPCClient_ResumeApplyOperationDispatchedStopLeavesApplyStopPending(t *testing.T) {
+	// A multi-deployment operation that already dispatched (its remote apply id
+	// lives on the operation) stops its own remote work when it sees the shared
+	// stop request, but must NOT complete the apply-level stop request even when
+	// its own remote reaches a terminal state: sibling deployments may still be
+	// live, so the operator's projection owns parent stop completion.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Stopped,
+			PercentComplete: 50,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op-dispatched-stop",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		Namespace:        "default",
+		State:            state.Task.Running,
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Running, EngineResumeContext: "remote-op-west-1"},
+		siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Running, EngineResumeContext: "remote-op-east-1"},
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	applyStore := &mockApplyStore{apply: apply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+		operations:      operationStore,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	assert.Equal(t, "remote-op-west-1", server.getStopApplyID(),
+		"the operation's own remote apply id must be stopped, not the parent external_id")
+	assert.Empty(t, applyStore.updates,
+		"a multi-op drive must never write the parent applies row; parent state is owned by the projection CAS")
+
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, stopReq, "the apply-level stop request must remain pending for the operator to complete")
+}
+
+func TestGRPCClient_ResumeApplyOperationDefersStartWhileApplyStopPending(t *testing.T) {
+	// A multi-deployment operation with both a pending start and a pending stop
+	// must not start its remote work or complete the parent stop: it stops its
+	// own remote work and leaves both requests pending for the operator. It must
+	// return promptly rather than spin waiting for a parent stop it never owns.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_RUNNING,
+		progressStateSet: true,
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-multi-op-defer-start",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		Namespace:        "default",
+		State:            state.Task.Running,
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Running, EngineResumeContext: "remote-op-west-1"},
+		siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Running, EngineResumeContext: "remote-op-east-1"},
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:alice",
+		},
+		{
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStart,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:bob",
+		},
+	}}
+	applyStore := &mockApplyStore{apply: apply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+		operations:      operationStore,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	assert.Empty(t, server.getStartApplyID(),
+		"a multi-op drive must not start remote work while the apply-level stop is pending")
+	assert.Empty(t, applyStore.updates,
+		"a multi-op drive must never write the parent applies row; parent state is owned by the projection CAS")
+
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, stopReq, "the apply-level stop request must remain pending for the operator to complete")
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, startReq, "the apply-level start request must remain pending until the stop resolves")
+}
+
 func TestGRPCClient_ResumeApplyOperationFailureRecordsTasksOnlyForMultiOpApply(t *testing.T) {
 	// When a multi-deployment operation's remote dispatch is rejected, the drive
 	// records the failure on that operation's own tasks and returns the error,
@@ -1360,6 +1516,18 @@ func TestGRPCClient_ResumeApplyOperationFailureRecordsTasksOnlyForMultiOpApply(t
 	assert.True(t, state.IsState(task.State, state.Task.Failed, state.Task.FailedRetryable),
 		"the operation's own task must be recorded as failed; got %q", task.State)
 	assert.Empty(t, applyStore.updates, "a multi-op failure must not write the parent applies row directly")
+}
+
+// The remote (gRPC) transport does not park an operation at the cutover barrier,
+// so there is no parked checkpoint for a cutover drive to resume. The operator
+// must fail closed on the sentinel rather than silently dropping the claim.
+func TestGRPCClient_ResumeApplyOperationCutoverFailsClosedUnsupported(t *testing.T) {
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
+	defer cleanup()
+
+	err := client.ResumeApplyOperationCutover(t.Context(), &storage.Apply{ApplyIdentifier: "apply-x"}, 7)
+	require.ErrorIs(t, err, ErrOperationCutoverUnsupportedRemote)
+	assert.Contains(t, err.Error(), "apply-x")
 }
 
 func TestGRPCClient_ResumeApplyOperationRejectsMissingOperationID(t *testing.T) {
@@ -2858,6 +3026,73 @@ func TestGRPCClient_ResumeApplyStartsQueuedStartAfterClaim(t *testing.T) {
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
+}
+
+func TestGRPCClient_ResumeApplyPublishesResumingUntilDataPlaneLeavesStopped(t *testing.T) {
+	// A start accepted by the data plane may still report stopped for a short
+	// window. The control plane must publish resuming, not running, during that
+	// window so /api/status and /api/progress/apply/{id} stay consistent until
+	// the data plane actually leaves stopped, then transition to running.
+	server := &capturingTernServer{
+		progressStates: []ternv1.State{
+			ternv1.State_STATE_STOPPED,   // pre-start stopped-state check
+			ternv1.State_STATE_STOPPED,   // first poll: still stopped (grace window)
+			ternv1.State_STATE_RUNNING,   // data plane leaves stopped
+			ternv1.State_STATE_COMPLETED, // terminal
+		},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-resuming-window",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-resuming-window",
+		State:           state.Apply.Stopped,
+	}
+	storedApply := *apply
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.NoError(t, err)
+
+	persistedStates := make([]string, 0, len(applyStore.updates))
+	for _, u := range applyStore.updates {
+		persistedStates = append(persistedStates, u.State)
+	}
+	require.Contains(t, persistedStates, state.Apply.Resuming,
+		"the resume must publish resuming before running while the data plane is still stopped")
+
+	resumingIdx := -1
+	runningIdx := -1
+	for i, s := range persistedStates {
+		if resumingIdx == -1 && state.IsState(s, state.Apply.Resuming) {
+			resumingIdx = i
+		}
+		if runningIdx == -1 && state.IsState(s, state.Apply.Running) {
+			runningIdx = i
+		}
+	}
+	require.NotEqual(t, -1, runningIdx, "the resume must eventually publish running")
+	assert.Less(t, resumingIdx, runningIdx, "resuming must be published before running")
+
+	assert.Equal(t, "remote-resuming-window", server.getStartApplyID())
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, startReq, "the start control request must be completed once the resume is driven")
 }
 
 func TestGRPCClient_ResumeApplyCompletesQueuedStopBeforeQueuedStart(t *testing.T) {
