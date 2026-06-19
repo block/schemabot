@@ -117,7 +117,7 @@ type ServerConfig struct {
 	// Deprecated: use drivers.
 	SchedulerWorkers int `yaml:"scheduler_workers,omitempty"`
 
-	// OperatorClaimOperations switches scheduler workers to claim work at the
+	// OperatorClaimOperations switches drivers to claim work at the
 	// apply_operations (per-deployment) level via FindNextApplyOperation instead
 	// of the apply level via FindNextApply. While the apply-create dual-write
 	// produces exactly one operation per apply, the two paths are equivalent;
