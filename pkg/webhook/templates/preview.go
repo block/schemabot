@@ -858,6 +858,19 @@ func PreviewCommentApplyResuming() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Resuming, tables))
 }
 
+// PreviewCommentApplyCancelled renders a sample apply-cancelled comment. A
+// cancelled change is permanent (e.g. a PlanetScale deploy request cancellation)
+// and cannot be resumed — the operator must open a new schema change.
+func PreviewCommentApplyCancelled() string {
+	tables := sampleApplyTables()[:2]
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Cancelled
+	tables[1].RowsCopied = 1055687
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 72
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Cancelled, tables))
+}
+
 // PreviewCommentApplyWaitingForCutover renders a sample waiting-for-cutover comment.
 func PreviewCommentApplyWaitingForCutover() string {
 	tables := sampleApplyTables()
@@ -1192,6 +1205,18 @@ func PreviewCommentSummaryStopped() string {
 	tables[1].RowsTotal = 1466232
 	tables[1].PercentComplete = 72
 	return RenderApplySummaryComment(sampleSummaryDataWithDuration(state.Apply.Stopped, tables, 45*time.Minute))
+}
+
+// PreviewCommentSummaryCancelled renders a sample cancelled summary comment. A
+// cancelled change is permanent and cannot be resumed.
+func PreviewCommentSummaryCancelled() string {
+	tables := sampleApplyTables()[:2]
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Cancelled
+	tables[1].RowsCopied = 1055687
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 72
+	return RenderApplySummaryComment(sampleSummaryDataWithDuration(state.Apply.Cancelled, tables, 45*time.Minute))
 }
 
 // PreviewCommentSummaryCompletedLarge renders a completed summary with 8 tables (rollup format).

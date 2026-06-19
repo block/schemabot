@@ -750,6 +750,14 @@ func TestPreviewCommentApplyResuming(t *testing.T) {
 	assert.NotContains(t, result, "72%")
 }
 
+func TestPreviewCommentApplyCancelled(t *testing.T) {
+	result := PreviewCommentApplyCancelled()
+
+	assert.Contains(t, result, "🚫 Schema Change Cancelled")
+	assert.Contains(t, result, "cannot be resumed")
+	assert.NotContains(t, result, "schemabot start", "a cancelled change is permanent — no resume affordance")
+}
+
 func TestPreviewCommentApplyWaitingForCutover(t *testing.T) {
 	result := PreviewCommentApplyWaitingForCutover()
 
@@ -799,6 +807,15 @@ func TestPreviewCommentSummaryStopped(t *testing.T) {
 	assert.Contains(t, result, "**`orders`**")
 	// A stopped change is resumable.
 	assert.Contains(t, result, "schemabot start")
+}
+
+func TestPreviewCommentSummaryCancelled(t *testing.T) {
+	result := PreviewCommentSummaryCancelled()
+
+	assert.Contains(t, result, "🚫 Schema Change Cancelled")
+	assert.Contains(t, result, "cannot be resumed")
+	// A cancelled change is permanent — no resume affordance.
+	assert.NotContains(t, result, "schemabot start")
 }
 
 // The terminal summary for a cancelled (permanent) change must not offer resume
