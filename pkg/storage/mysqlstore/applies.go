@@ -72,15 +72,15 @@ type txBeginner interface {
 
 // claimableApplyStates returns active apply states where operator recovery can
 // safely resume work after the heartbeat becomes stale. Pending has a separate
-// queue path and does not need to be stale before a worker claims it. Terminal
+// queue path and does not need to be stale before a driver claims it. Terminal
 // states are already done, failed_retryable has its own retry path, and stopped
 // requires an explicit user start.
 //
 // The PlanetScale setup-phase states (preparing_branch through
 // validating_deploy_request) are included: a stale heartbeat in any of them
-// unambiguously means the worker driving engine setup died, and the persisted
+// unambiguously means the driver driving engine setup died, and the persisted
 // branch/deploy metadata lets recovery resume the apply from stored state. A
-// healthy worker mid-setup keeps its heartbeat fresh, so it is never claimed out
+// healthy driver mid-setup keeps its heartbeat fresh, so it is never claimed out
 // from under itself. Leaving these states out would strand a crashed setup-phase
 // apply non-terminal and unclaimable, so no operator could ever recover it.
 //
@@ -1056,13 +1056,13 @@ func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentApplies
 // applies where heartbeat expired > 1 minute, and recently failed_retryable
 // applies that still have retry budget.
 // Apply creation/update enforces one active apply per database/type/environment,
-// so claims only need to lease one row and avoid worker races on that row.
+// so claims only need to lease one row and avoid driver races on that row.
 func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.Apply, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply: %w", storage.ErrApplyLeaseLost)
 	}
 	// Read committed keeps concurrent SKIP LOCKED claims from taking next-key
-	// range locks that can serialize workers across otherwise independent targets.
+	// range locks that can serialize drivers across otherwise independent targets.
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply transaction: %w", err)
@@ -1086,7 +1086,7 @@ func (s *applyStore) FindNextApply(ctx context.Context, owner string) (*storage.
 
 	// Apply creation/update enforces at most one active apply per
 	// database/type/environment. The claim query only needs to find stale work;
-	// FOR UPDATE SKIP LOCKED prevents concurrent workers from claiming the same row.
+	// FOR UPDATE SKIP LOCKED prevents concurrent drivers from claiming the same row.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
@@ -1383,7 +1383,7 @@ func (o claimOutcome) claimedAndComplete() bool {
 // persistApplyClaim rotates the lease (owner, token, acquired_at) onto apply in
 // memory and persists it inside tx, refreshing the heartbeat in the same write.
 // Pending, stopped-start, and retryable applies move into running as part of the
-// claim so another worker cannot immediately re-claim the same durable request
+// claim so another driver cannot immediately re-claim the same durable request
 // after the transaction releases its row lock; active applies just refresh the
 // heartbeat.
 //
@@ -1486,7 +1486,7 @@ func isStartingClaim(applyState string) bool {
 // transient state held while the driver waits for the data plane to leave
 // stopped after a start. WHERE state = ? guards against a concurrent transition
 // landing between the SELECT and this UPDATE; a zero rows-affected result means
-// another worker already moved the row, so the caller backs off cleanly. Reports
+// another driver already moved the row, so the caller backs off cleanly. Reports
 // false on that lost race.
 func transitionClaimToState(ctx context.Context, tx *sql.Tx, apply *storage.Apply, targetState, owner, leaseToken string) (bool, error) {
 	result, err := tx.ExecContext(ctx, `
@@ -1557,7 +1557,7 @@ func failPendingStartControlRequestTx(ctx context.Context, tx *sql.Tx, applyID i
 
 // Heartbeat updates the apply's updated_at timestamp to maintain the lease.
 // Should be called every 10 seconds while working on an apply.
-// If not called for > 1 minute, another worker can claim the apply via FindNextApply.
+// If not called for > 1 minute, another driver can claim the apply via FindNextApply.
 // When ctx has an apply lease, a stale token returns ErrApplyLeaseLost so the
 // old operator owner stops before writing state or external side effects.
 func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {

@@ -111,7 +111,7 @@ func (c *pendingPollClient) GetDeployRequest(_ context.Context, req *ps.GetDeplo
 }
 
 // When PlanetScale returns a transient error while a deploy request is still
-// computing its schema diff, the apply worker surfaces a wrapped error
+// computing its schema diff, the apply driver surfaces a wrapped error
 // identifying the deploy request rather than panicking on a nil response.
 func TestWaitForDeployRequestPending_PollErrorIsWrapped(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
@@ -128,7 +128,7 @@ func TestWaitForDeployRequestPending_PollErrorIsWrapped(t *testing.T) {
 }
 
 // A deploy request that never leaves the pending state must not block the apply
-// worker forever — cancelling the context stops the poll and returns a wrapped
+// driver forever — cancelling the context stops the poll and returns a wrapped
 // error naming the deploy request.
 func TestWaitForDeployRequestPending_HonorsContextCancellation(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
@@ -237,7 +237,7 @@ func captureStateChanges(req *engine.ApplyRequest) *[]*engine.ResumeState {
 }
 
 // deployRequestNeedsResumeDeploy gates the resume path that starts a deploy the
-// crashed worker never began. It must fire only for a non-deferred deploy
+// crashed driver never began. It must fire only for a non-deferred deploy
 // request that finished validation ("ready") and was never deployed.
 func TestDeployRequestNeedsResumeDeploy(t *testing.T) {
 	deployedAt := time.Now()
@@ -286,7 +286,7 @@ func TestDeployRequestNeedsResumeDeploy(t *testing.T) {
 	}
 }
 
-// A worker that crashed between creating a non-deferred deploy request and
+// A driver that crashed between creating a non-deferred deploy request and
 // starting it leaves the request stuck in "ready", which Progress reports as
 // pending forever. Resuming must start the deploy so the schema change actually
 // runs, carrying the instant DDL flag from the recovered metadata.
@@ -312,7 +312,7 @@ func TestResumeExistingDeployRequest_DeploysReadyNeverStarted(t *testing.T) {
 	assert.Contains(t, result.Message, "Resumed and deployed request #42")
 }
 
-// A deploy request that is already in flight when the worker resumes must not be
+// A deploy request that is already in flight when the driver resumes must not be
 // re-deployed; resume simply reattaches and preserves the stored progress state.
 func TestResumeExistingDeployRequest_InFlightIsNotRedeployed(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))

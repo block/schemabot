@@ -544,25 +544,25 @@ schemabot plan                    # Re-plan all configured environments
 schemabot apply -e <environment>  # Re-run apply gating and create a new apply plan
 ```
 
-A stored check ownership miss means a worker tried to update a stored check row,
-but the row no longer represents the apply that worker is completing. This is
+A stored check ownership miss means a driver tried to update a stored check row,
+but the row no longer represents the apply that driver is completing. This is
 usually healthy race protection: a newer plan, apply, rollback, or stale-check
 reconciliation pass has become the source of truth for that PR/environment/
-database, so the older worker must not overwrite it.
+database, so the older driver must not overwrite it.
 
 Common fail-closed scenarios:
 
 | Scenario | Why SchemaBot blocks | Operator action |
 | --- | --- | --- |
 | PR branch moved while SchemaBot was processing | The work was based on an older commit SHA. Publishing that result on the current PR could be misleading. | Usually wait for the `synchronize` webhook to auto-plan the latest commit. If the required check stays missing or stale, comment `schemabot plan -e <environment>` on the PR, or `schemabot plan` for all configured environments. |
-| Aggregate update skipped for a stale SHA | A background worker tried to publish status for a commit that is no longer the PR head. | Confirm the latest commit has a SchemaBot aggregate check. If it does not, comment `schemabot plan -e <environment>` or `schemabot plan`. |
+| Aggregate update skipped for a stale SHA | A background driver tried to publish status for a commit that is no longer the PR head. | Confirm the latest commit has a SchemaBot aggregate check. If it does not, comment `schemabot plan -e <environment>` or `schemabot plan`. |
 | GitHub unavailable during config discovery | SchemaBot cannot safely read PR metadata or repository contents. | Wait for GitHub API recovery, then comment `schemabot plan -e <environment>` or `schemabot plan`. CLI operations can still manage live schema changes while GitHub is down, but they do not make branch protection pass. |
 | Config discovery failed for a non-GitHub reason | SchemaBot could read GitHub, but could not determine the managed schema config or schema files. | Fix `schemabot.yaml`, the schema file layout, or the invalid SQL/config state. Push the fix, or comment `schemabot plan -e <environment>` after fixing the PR. Use logs with `blocking_reason=schema_config_discovery_failed` for the underlying read or parse failure. |
 | Schema changes found but no configured environments are allowed | The database is configured only for environments this deployment is not allowed to process. Publishing success would hide a deployment/config mismatch. | Align the server database environment config with this deployment's `allowed_environments`, then push the config fix or comment `schemabot plan -e <environment>`. |
 | Accepted apply cannot be tracked | The engine accepted work, but SchemaBot could not store or reload the apply ID needed for progress and check ownership. | Treat this as a storage or apply-tracking incident. Inspect engine state and the `applies` table before retrying; do not rely on branch protection until a new plan reflects the live schema. |
 | Accepted apply could not update required check state | The apply may be running, but SchemaBot could not mark the stored check row `in_progress` with the accepted `apply_id`. | Inspect the accepted apply, storage health, and aggregate check. Retry only after confirming the live schema state and stored check state agree. |
 | Prior-environment check state could not be read | SchemaBot cannot prove that an earlier environment is clean. | Treat this as a SchemaBot storage health issue. Restore storage access, then repeat the blocked command, for example `schemabot apply -e production`. Do not bypass the promotion gate unless this is an explicit breakglass decision. |
-| Stored check ownership miss | A newer plan or apply owns the stored check state for the same PR, environment, and database. Letting the older worker write would overwrite newer safety state. | Inspect the newest apply for that repo/PR/environment/database with the CLI, for example `schemabot status -d <database> -e <environment>` or `schemabot progress <apply-id>`. Let the newest apply finish, or reconcile it with operator commands before retrying PR comments. |
+| Stored check ownership miss | A newer plan or apply owns the stored check state for the same PR, environment, and database. Letting the older driver write would overwrite newer safety state. | Inspect the newest apply for that repo/PR/environment/database with the CLI, for example `schemabot status -d <database> -e <environment>` or `schemabot progress <apply-id>`. Let the newest apply finish, or reconcile it with operator commands before retrying PR comments. |
 | Schema changes were removed while an apply may still be running | The live database may still change even though the current PR no longer represents that change. | Inspect the in-flight apply in Tern or with the CLI. If the change reached the live database, either put the schema change back in the PR and comment `schemabot plan -e <environment>` before applying again, or roll back/reconcile the live schema first. |
 | Stale in-progress row after a pod crash | Stored check state says an apply is running, but the watcher may have died before publishing the terminal result. | Comment `schemabot plan -e <environment>` or `schemabot apply -e <environment>` to trigger stale-check reconciliation. If reconciliation fails, inspect SchemaBot storage and the latest apply for that database. |
 

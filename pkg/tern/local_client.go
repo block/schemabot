@@ -1381,7 +1381,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	// Direct client calls can still register a pending observer before starting
 	// the engine. API-created applies use the service-level observer registry
-	// because operator workers dispatch them asynchronously.
+	// because operator drivers dispatch them asynchronously.
 	if obs := c.consumePendingObserver(); obs != nil {
 		// Set the apply ID on the observer if it supports it (e.g., CommentObserver
 		// needs the ID to look up tracked comments for editing).

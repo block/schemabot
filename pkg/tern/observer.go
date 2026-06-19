@@ -52,7 +52,7 @@ func (c *LocalClient) SetObserver(applyID int64, observer ProgressObserver) {
 
 // SetPendingObserver sets an observer that will be consumed by the next direct
 // client Apply() call. The API service uses its own pending-observer registry
-// because operator workers dispatch API-created applies asynchronously.
+// because operator drivers dispatch API-created applies asynchronously.
 func (c *LocalClient) SetPendingObserver(observer ProgressObserver) {
 	c.observerMu.Lock()
 	defer c.observerMu.Unlock()

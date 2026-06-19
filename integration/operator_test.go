@@ -26,9 +26,9 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// These tests exercise operator behavior at two levels: the full worker loop
+// These tests exercise operator behavior at two levels: the full driver loop
 // in the resume tests, and the atomic claim query through FindNextApply.
-// Operator workers use FindNextApply before calling ResumeApply, so direct
+// Operator drivers use FindNextApply before calling ResumeApply, so direct
 // calls keep claim policy tests focused without waiting for ticks.
 
 type operatorClaimFixture struct {
@@ -82,7 +82,7 @@ func (c *blockingResumeClient) waitForResume(t *testing.T, timeout time.Duration
 
 // newOperatorClaimFixture creates a real target database plus a clean SchemaBot
 // metadata store. The claim-policy tests write apply rows directly into storage
-// so they can test operator decisions without depending on worker timing.
+// so they can test operator decisions without depending on driver timing.
 func newOperatorClaimFixture(t *testing.T, appDBPrefix string) *operatorClaimFixture {
 	t.Helper()
 
@@ -148,7 +148,7 @@ func TestOperator_BasicClaimAndResume(t *testing.T) {
 	require.NoError(t, err)
 
 	// Seed storage with a stale running apply and running tasks, matching the
-	// state left behind when a worker stops heartbeating before completing.
+	// state left behind when a driver stops heartbeating before completing.
 	now := time.Now()
 	staleApply := &storage.Apply{
 		ApplyIdentifier: fmt.Sprintf("apply-stale-%d", now.UnixNano()%100000),
@@ -868,7 +868,7 @@ func TestOperator_ClaimRefreshesHeartbeat(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, beforeClaim)
 
-	// Claiming is also the operator's lease renewal; it keeps another worker from immediately reclaiming the same apply.
+	// Claiming is also the operator's lease renewal; it keeps another driver from immediately reclaiming the same apply.
 	claimed, err := stor.Applies().FindNextApply(ctx, "test-owner")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
@@ -988,8 +988,8 @@ func TestOperator_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 	}
 
 	// The first client blocks after the operator claims its apply. That keeps
-	// one worker occupied across the next poll, so completion of the second
-	// apply proves another worker can claim independent work.
+	// one driver occupied across the next poll, so completion of the second
+	// apply proves another driver can claim independent work.
 	blockingClient1 := newBlockingResumeClient(client1, blockedResume)
 
 	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{
@@ -1024,9 +1024,9 @@ func TestOperator_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 
 	blockingClient1.waitForResume(t, 5*time.Second)
 
-	// A worker can miss work on the startup claim and pick it up on the next
+	// A driver can miss work on the startup claim and pick it up on the next
 	// poll. The important behavior is that the second apply completes while the
-	// first worker is still blocked.
+	// first driver is still blocked.
 	waitForOperatorAppliesCompleted(t, stor, []int64{apply2ID}, operatorPollInterval+5*time.Second)
 
 	blockedApply, err := stor.Applies().Get(ctx, apply1ID)
@@ -1080,7 +1080,7 @@ func seedStaleOperatorApply(
 
 	now := time.Now()
 	applyID, err := stor.Applies().Create(t.Context(), &storage.Apply{
-		ApplyIdentifier: fmt.Sprintf("apply-multi-worker-%s", dbName),
+		ApplyIdentifier: fmt.Sprintf("apply-multi-driver-%s", dbName),
 		PlanID:          plan.ID,
 		Database:        dbName,
 		DatabaseType:    storage.DatabaseTypeMySQL,
@@ -1095,7 +1095,7 @@ func seedStaleOperatorApply(
 
 	for _, tc := range plan.FlatDDLChanges() {
 		_, err := stor.Tasks().Create(t.Context(), &storage.Task{
-			TaskIdentifier: fmt.Sprintf("task-multi-worker-%s-%s", dbName, tc.Table),
+			TaskIdentifier: fmt.Sprintf("task-multi-driver-%s-%s", dbName, tc.Table),
 			ApplyID:        applyID,
 			PlanID:         plan.ID,
 			Database:       dbName,

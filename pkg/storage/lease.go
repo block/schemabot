@@ -36,7 +36,7 @@ type operationLeaseContextKey struct{}
 // It is distinct from ApplyLease: it identifies the operation row and carries
 // the operation's own token, so storage writes can guard on the operation's
 // claim instead of the parent apply's. Keeping the two leases separate lets a
-// worker hold both at once during the migration to operation-scoped writes
+// driver hold both at once during the migration to operation-scoped writes
 // without conflating an operation token with the parent apply token.
 type OperationLease struct {
 	ApplyID     int64

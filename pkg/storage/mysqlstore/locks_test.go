@@ -100,9 +100,9 @@ func TestLockStore_Acquire_SameOwnerConcurrent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 
-	const workers = 16
-	stores := make([]*Storage, workers)
-	for i := range workers {
+	const drivers = 16
+	stores := make([]*Storage, drivers)
+	for i := range drivers {
 		db, openErr := sql.Open("mysql", testDSNChangedRows)
 		require.NoError(t, openErr)
 		db.SetMaxOpenConns(1)
@@ -118,12 +118,12 @@ func TestLockStore_Acquire_SameOwnerConcurrent(t *testing.T) {
 	var mu sync.Mutex
 	var errs []error
 
-	for i := range workers {
-		workerStore := stores[i]
+	for i := range drivers {
+		driverStore := stores[i]
 		planID := fmt.Sprintf("plan-%d", i)
 		wg.Go(func() {
 			<-start
-			err := workerStore.Locks().Acquire(ctx, &storage.Lock{
+			err := driverStore.Locks().Acquire(ctx, &storage.Lock{
 				DatabaseName:  "testdb",
 				DatabaseType:  "vitess",
 				Repository:    "org/repo",

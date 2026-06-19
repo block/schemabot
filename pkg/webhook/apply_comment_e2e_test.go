@@ -161,7 +161,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	applyID, err := st.Applies().Create(ctx, apply)
 	require.NoError(t, err)
 	apply.ID = applyID
-	apply.LeaseOwner = "comment-test-worker"
+	apply.LeaseOwner = "comment-test-driver"
 	apply.LeaseToken = "comment-test-token"
 	leaseAcquiredAt := time.Now()
 	apply.LeaseAcquiredAt = &leaseAcquiredAt
@@ -538,7 +538,7 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	assert.Len(t, allComments, 2, "upsert should not create duplicate entries")
 }
 
-// This scenario covers a recovered PR observer whose operator worker has lost
+// This scenario covers a recovered PR observer whose operator driver has lost
 // ownership before it reaches terminal notification. The stale observer must not
 // edit progress, post a summary, mark summary state, or run terminal hooks.
 func TestE2ECommentObserverSkipsTerminalSideEffectsAfterLeaseLoss(t *testing.T) {
@@ -619,7 +619,7 @@ func TestE2ECommentObserverSkipsTerminalSideEffectsAfterLeaseLoss(t *testing.T) 
 		UPDATE applies
 		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
 		WHERE id = ?
-	`, "current-worker", "current-token", applyID)
+	`, "current-driver", "current-token", applyID)
 	require.NoError(t, err)
 
 	progressCommentID := int64(4242)
@@ -642,7 +642,7 @@ func TestE2ECommentObserverSkipsTerminalSideEffectsAfterLeaseLoss(t *testing.T) 
 		ApplyID:        applyID,
 		ApplyLease: storage.ApplyLease{
 			ApplyID: applyID,
-			Owner:   "stale-worker",
+			Owner:   "stale-driver",
 			Token:   "stale-token",
 		},
 		Logger: logger,
@@ -653,7 +653,7 @@ func TestE2ECommentObserverSkipsTerminalSideEffectsAfterLeaseLoss(t *testing.T) 
 
 	terminalApply := *apply
 	terminalApply.State = state.Apply.Failed
-	terminalApply.ErrorMessage = "stale worker terminal state"
+	terminalApply.ErrorMessage = "stale driver terminal state"
 	terminalApply.CompletedAt = &now
 	observer.OnTerminal(&terminalApply, []*storage.Task{task})
 

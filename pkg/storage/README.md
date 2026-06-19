@@ -28,7 +28,7 @@ type Storage interface {
 | `ApplyStore` | Schema change execution state, heartbeat-based leasing |
 | `TaskStore` | Individual DDL tasks within an apply, progress tracking |
 | `ApplyLogStore` | Audit trail (state transitions, errors, progress events) |
-| `ControlRequestStore` | Durable user control intent that can be recovered by workers |
+| `ControlRequestStore` | Durable user control intent that can be recovered by drivers |
 | `CheckStore` | GitHub status check state |
 | `SettingsStore` | Admin-level key-value settings |
 
@@ -52,9 +52,9 @@ See [`pkg/state`](../state/) for the full state hierarchy (apply states, task st
 
 The apply store supports crash recovery through heartbeat-based leasing:
 
-- **Heartbeat**: Workers call `Heartbeat(applyID)` every 10 seconds to signal they're alive
+- **Heartbeat**: Drivers call `Heartbeat(applyID)` every 10 seconds to signal they're alive
 - **FindNextApply**: Claims one apply with a stale heartbeat (>1 minute since last update) by selecting it and refreshing its heartbeat in one transaction
-- If a worker crashes, its apply becomes claimable after the heartbeat times out
+- If a driver crashes, its apply becomes claimable after the heartbeat times out
 
 ## Key Types
 

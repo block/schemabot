@@ -73,7 +73,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 	// persistState persists apply metadata to storage via OnStateChange for crash recovery.
 	// On first apply, migCtx is empty until the tern layer assigns one via ResumeState.
-	// persistState is a no-op in this window — if the worker crashes before Apply returns,
+	// persistState is a no-op in this window — if the driver crashes before Apply returns,
 	// there's no ResumeState to recover from. The tern layer handles this by retrying
 	// the full Apply on the next heartbeat recovery cycle.
 	persistState := func(meta *psMetadata) {
@@ -696,12 +696,12 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		"deploy_request", meta.DeployRequestID,
 	)
 
-	// If we have a deploy request ID, the worker crashed after creating it.
+	// If we have a deploy request ID, the driver crashed after creating it.
 	if meta.DeployRequestID != 0 {
 		return e.resumeExistingDeployRequest(ctx, client, org, req, meta)
 	}
 
-	// No deploy request yet — worker crashed after branch creation but before
+	// No deploy request yet — driver crashed after branch creation but before
 	// the deploy request was created. Diff the branch against desired schema
 	// to find DDL that wasn't applied before the crash, then apply only the
 	// missing changes.
@@ -845,7 +845,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 
 // resumeExistingDeployRequest resumes an apply whose deploy request was already
 // created before the crash. It reattaches to the recovered deploy request,
-// deploys it when the worker crashed after creation but before the deploy was
+// deploys it when the driver crashed after creation but before the deploy was
 // started, and rediscovers the Vitess migration_context so per-shard progress
 // keeps working for the rest of the apply.
 func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata) (*engine.ApplyResult, error) {
@@ -968,7 +968,7 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 // deployRequestNeedsResumeDeploy reports whether a recovered deploy request must
 // be deployed during resume. This is the case only for a non-deferred deploy
 // request that finished PlanetScale's diff ("ready") but was never started —
-// the worker crashed between creating the deploy request and deploying it. A
+// the driver crashed between creating the deploy request and deploying it. A
 // deferred deploy is left for the operator-triggered deploy, and a request that
 // already has a DeployedAt timestamp is in flight and must not be re-deployed.
 func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata) bool {

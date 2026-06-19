@@ -1226,7 +1226,7 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 }
 
 // queueStoppedApplyForOperator makes a user start request claimable by a
-// operator worker. Resuming stopped table work can outlive the HTTP request,
+// operator driver. Resuming stopped table work can outlive the HTTP request,
 // so the handler records intent, normalizes a lagging stored apply row to
 // stopped, and wakes the operator.
 func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.StartResponse, string, error) {

@@ -301,7 +301,7 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
    `IsComplete`.
 
 4. **Crash recovery loses up to 500ms of progress.** The pollers write to storage every 500ms.
-   On crash, the last persisted snapshot may be up to 500ms stale. Scheduler workers find
+   On crash, the last persisted snapshot may be up to 500ms stale. Scheduler drivers find
    applies with stale heartbeats and call `Tern.ResumeApply()`, which re-plans against the
    actual DB state to determine what still needs to be done.
 

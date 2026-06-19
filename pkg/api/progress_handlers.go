@@ -67,7 +67,7 @@ func shouldServeProgressFromStorage(applyState string) bool {
 }
 
 // A remote apply may be accepted into control-plane storage before an operator
-// worker dispatches it and stores the data-plane ID. During that handoff window,
+// driver dispatches it and stores the data-plane ID. During that handoff window,
 // progress must use local storage instead of asking the data plane about a
 // control-plane apply identifier it cannot know.
 func shouldServeRemoteProgressFromStorage(apply *storage.Apply, client tern.Client) bool {
@@ -81,7 +81,7 @@ func shouldServeRemoteProgressFromStorage(apply *storage.Apply, client tern.Clie
 }
 
 // queuedRemoteProgressApply returns the user-visible apply state while a gRPC
-// apply is claimed by an operator worker but has not been accepted by the
+// apply is claimed by an operator driver but has not been accepted by the
 // remote data plane yet. The storage row is already running for recovery
 // purposes, but operators should still see pending until external_id exists.
 func queuedRemoteProgressApply(apply *storage.Apply) *storage.Apply {

@@ -219,7 +219,7 @@ func TestApplyCommentStore_LeaseGuardsWrites(t *testing.T) {
 		UPDATE applies
 		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
 		WHERE id = ?
-	`, "current-worker", "current-token", apply.ID)
+	`, "current-driver", "current-token", apply.ID)
 	require.NoError(t, err)
 
 	comment := &storage.ApplyComment{
@@ -227,14 +227,14 @@ func TestApplyCommentStore_LeaseGuardsWrites(t *testing.T) {
 		CommentState:    state.Comment.Progress,
 		GitHubCommentID: 100,
 	}
-	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "old-worker", Token: "stale-token"})
+	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "old-driver", Token: "stale-token"})
 	require.ErrorIs(t, store.ApplyComments().Upsert(staleCtx, comment), storage.ErrApplyLeaseLost)
 
 	missing, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
 	require.NoError(t, err)
 	assert.Nil(t, missing)
 
-	currentCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "current-worker", Token: "current-token"})
+	currentCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "current-driver", Token: "current-token"})
 	require.NoError(t, store.ApplyComments().Upsert(currentCtx, comment))
 	require.ErrorIs(t, store.ApplyComments().IncrementEditCount(staleCtx, apply.ID, state.Comment.Progress), storage.ErrApplyLeaseLost)
 
