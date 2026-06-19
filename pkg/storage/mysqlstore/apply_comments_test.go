@@ -171,6 +171,38 @@ func TestApplyCommentStore_DeleteByApply(t *testing.T) {
 	require.NoError(t, store.ApplyComments().DeleteByApply(ctx, 99999))
 }
 
+func TestApplyCommentStore_Delete(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_del_one", 1)
+
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 100,
+	}))
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 101,
+	}))
+
+	// Delete only the summary marker; the progress comment must remain tracked.
+	require.NoError(t, store.ApplyComments().Delete(ctx, apply.ID, state.Comment.Summary))
+
+	summary, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	assert.Nil(t, summary)
+
+	progress, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, progress)
+	assert.Equal(t, int64(100), progress.GitHubCommentID)
+
+	// Deleting a comment state that does not exist is a no-op, not an error.
+	require.NoError(t, store.ApplyComments().Delete(ctx, apply.ID, state.Comment.Summary))
+	require.NoError(t, store.ApplyComments().Delete(ctx, 99999, state.Comment.Progress))
+}
+
 func TestApplyCommentStore_UniqueConstraint(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

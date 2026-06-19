@@ -23,6 +23,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/clock"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -309,6 +310,168 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	assert.Equal(t, progressCommentID, commentStates[state.Comment.Progress])
 	assert.Equal(t, cutoverCommentID, commentStates[state.Comment.Cutover])
 	assert.Equal(t, summaryCommentID, commentStates[state.Comment.Summary])
+}
+
+// When a stopped apply resumes, the observer posts a fresh progress comment and
+// tracks that as the live one, rather than re-editing the comment frozen at
+// "Stopped". The prior progress comment is left in place as the record of where
+// the apply paused, the stopped summary marker is consumed, and later progress
+// edits land on the new comment.
+func TestE2EResumeRotatesProgressComment(t *testing.T) {
+	ctx := t.Context()
+
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+
+	st := mysqlstore.New(schemabotDB)
+
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM apply_comments")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM tasks WHERE repository = 'org/repo-rotate'")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'org/repo-rotate'")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'org/repo-rotate'")
+
+	lock := &storage.Lock{
+		DatabaseName: "e2e_rotate_db",
+		DatabaseType: "mysql",
+		Repository:   "org/repo-rotate",
+		PullRequest:  142,
+		Owner:        "org/repo-rotate#142",
+	}
+	require.NoError(t, st.Locks().Acquire(ctx, lock))
+	lock, err = st.Locks().Get(ctx, "e2e_rotate_db", "mysql")
+	require.NoError(t, err)
+
+	// The apply has resumed: it is active again (Running) after an operator start.
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply_e2e_rotate_%d", time.Now().UnixNano()),
+		LockID:          lock.ID,
+		PlanID:          1,
+		Database:        "e2e_rotate_db",
+		DatabaseType:    "mysql",
+		Repository:      "org/repo-rotate",
+		PullRequest:     142,
+		Environment:     "staging",
+		InstallationID:  12345,
+		Engine:          "spirit",
+		State:           state.Apply.Running,
+	}
+	applyID, err := st.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+	apply.LeaseOwner = "resume-test-driver"
+	apply.LeaseToken = "resume-test-token"
+	leaseAcquiredAt := time.Now()
+	apply.LeaseAcquiredAt = &leaseAcquiredAt
+	_, err = schemabotDB.ExecContext(ctx, `
+		UPDATE applies
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = ?, state = ?
+		WHERE id = ?
+	`, apply.LeaseOwner, apply.LeaseToken, leaseAcquiredAt, state.Apply.Running, applyID)
+	require.NoError(t, err)
+
+	// The task is copying again after resume.
+	now := time.Now()
+	task := &storage.Task{
+		TaskIdentifier:  fmt.Sprintf("task_e2e_rotate_%d", now.UnixNano()),
+		ApplyID:         applyID,
+		PlanID:          1,
+		Database:        "e2e_rotate_db",
+		DatabaseType:    "mysql",
+		Engine:          "spirit",
+		Repository:      "org/repo-rotate",
+		PullRequest:     142,
+		Environment:     "staging",
+		State:           state.Task.Running,
+		TableName:       "users",
+		DDL:             "ALTER TABLE users ADD INDEX idx_email (email)",
+		DDLAction:       "alter",
+		RowsCopied:      500,
+		RowsTotal:       1000,
+		ProgressPercent: 50,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	_, err = st.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+
+	installClient, capture := setupFakeGitHubForComments(t)
+	factory := &fakeClientFactory{client: installClient}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	serverConfig := &api.ServerConfig{}
+	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
+	t.Cleanup(func() { _ = svc.Close() })
+	h := NewHandler(svc, factory, nil, logger)
+
+	// Seed the pre-resume comments left by the stop: the progress comment frozen at
+	// "Stopped" and the stopped summary marker that signals a resume is in progress.
+	h.postAndTrackComment(ctx, "org/repo-rotate", 142, 12345, applyID, state.Comment.Progress, "Stopped at 21%")
+	stoppedProgressID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-rotate", 142, 12345, applyID, state.Comment.Summary, "Schema Change Stopped")
+	requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(now)
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        st,
+		Repo:           "org/repo-rotate",
+		PR:             142,
+		InstallationID: 12345,
+		ApplyID:        applyID,
+		Logger:         logger,
+		Clock:          fake,
+	})
+
+	// First progress tick after resume rotates the progress comment.
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var newProgressID int64
+	select {
+	case created := <-capture.creates:
+		newProgressID = created.ID
+		assert.Contains(t, created.Body, "Schema Change In Progress")
+		assert.NotContains(t, created.Body, "Stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a new progress comment to be posted on resume")
+	}
+	assert.NotEqual(t, stoppedProgressID, newProgressID, "resume must post a new comment, not reuse the stopped one")
+
+	// The progress row now tracks the new comment; the summary marker is consumed.
+	prog, err := st.ApplyComments().Get(ctx, applyID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, newProgressID, prog.GitHubCommentID)
+	summary, err := st.ApplyComments().Get(ctx, applyID, state.Comment.Summary)
+	require.NoError(t, err)
+	assert.Nil(t, summary, "stopped summary marker should be consumed after rotation")
+
+	// A later tick edits the new comment in place — it does not rotate again.
+	fake.Advance(activeInterval + time.Second)
+	task.RowsCopied = 700
+	task.ProgressPercent = 70
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the new comment")
+	case created := <-capture.creates:
+		t.Fatalf("resume must rotate exactly once; got another new comment %d", created.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected an in-place edit of the new progress comment on the next tick")
+	}
+}
+
+// requireCommentCreate returns the next captured comment-create id, failing if
+// none arrives.
+func requireCommentCreate(t *testing.T, capture *commentCapture) int64 {
+	t.Helper()
+	select {
+	case created := <-capture.creates:
+		return created.ID
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for comment create")
+		return 0
+	}
 }
 
 func TestE2EReconcileMissingSummaryCommentsPostsSummary(t *testing.T) {

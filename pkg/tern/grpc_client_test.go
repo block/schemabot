@@ -3095,6 +3095,42 @@ func TestGRPCClient_ResumeApplyPublishesResumingUntilDataPlaneLeavesStopped(t *t
 	assert.Nil(t, startReq, "the start control request must be completed once the resume is driven")
 }
 
+func TestGRPCClient_RequeueStoppedTasksForRemoteStart(t *testing.T) {
+	// When the data plane accepts a start, the gRPC drive must requeue the apply's
+	// stopped task rows to pending. Otherwise taskStateWithNoBackwardProgress pins
+	// them at stopped on every later progress poll (stopped blocks active engine
+	// progress), so the resumed row copy never surfaces and the PR comment keeps
+	// rendering "Stopped" while the data plane copies. Tasks in other states are
+	// left untouched.
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
+	defer cleanup()
+
+	completedAt := time.Now()
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-requeue-stopped",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Resuming,
+	}
+	taskStore := &mockTaskStore{tasks: []*storage.Task{
+		{TaskIdentifier: "t-stopped", ApplyID: 1, State: state.Task.Stopped, TableName: "users", CompletedAt: &completedAt},
+		{TaskIdentifier: "t-completed", ApplyID: 1, State: state.Task.Completed, TableName: "orders"},
+	}}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   taskStore,
+		logs:    &mockApplyLogStore{},
+	}
+
+	err := client.requeueStoppedTasksForRemoteStart(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Task.Pending, taskStore.tasks[0].State, "stopped task must be requeued to pending on resume")
+	assert.Nil(t, taskStore.tasks[0].CompletedAt, "requeued task must clear its completed timestamp")
+	assert.Equal(t, state.Task.Completed, taskStore.tasks[1].State, "non-stopped task must be left untouched")
+}
+
 func TestGRPCClient_ResumeApplyCompletesQueuedStopBeforeQueuedStart(t *testing.T) {
 	// Start can arrive immediately after stop progress is visible. The operator
 	// should consume the resolved stop request and continue with the queued start

@@ -1367,6 +1367,9 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 				apply.StartedAt = &now
 			}
 			remoteStartRequested = true
+			if err := c.requeueStoppedTasksForRemoteStart(ctx, apply, scope); err != nil {
+				return err
+			}
 		}
 
 		persisted, err := c.persistParentApply(ctx, apply, scope, "refresh stopped gRPC apply before start")
@@ -1778,6 +1781,35 @@ func isTerminalRemoteProgressError(err error) bool {
 	default:
 		return false
 	}
+}
+
+// requeueStoppedTasksForRemoteStart requeues an apply's stopped task rows once the
+// data plane accepts a start. The gRPC drive delegates the engine to remote Tern,
+// so it must mirror LocalClient.prepareStoppedTasksForResume: a task left at
+// "stopped" is pinned there by taskStateWithNoBackwardProgress on every later
+// progress poll (a stopped task blocks active engine progress), so the resumed row
+// copy would never surface in stored task state and the PR progress comment would
+// keep rendering "Stopped" while the data plane is actively copying. Requeuing to
+// pending lets the next progress sync advance the task to running.
+func (c *GRPCClient) requeueStoppedTasksForRemoteStart(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
+	tasks, err := c.loadApplyTasks(ctx, apply, scope)
+	if err != nil {
+		return fmt.Errorf("load tasks to requeue stopped gRPC apply %s for start: %w", apply.ApplyIdentifier, err)
+	}
+	for _, task := range tasks {
+		if !state.IsState(task.State, state.Task.Stopped) {
+			continue
+		}
+		oldState := task.State
+		task.State = state.Task.Pending
+		task.CompletedAt = nil
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			return fmt.Errorf("requeue stopped task %s for gRPC apply %s start: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
+		c.logTaskStateTransition(ctx, apply.ID, task,
+			fmt.Sprintf("Task %s requeued for start", task.TableName), oldState)
+	}
+	return nil
 }
 
 func (c *GRPCClient) prepareDispatchTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {

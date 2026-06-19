@@ -192,6 +192,18 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		return
 	}
 
+	// A summary comment present while the apply is active again means the apply
+	// was stopped and has resumed — stopped is the only terminal state that
+	// returns to active. Post a fresh progress comment to track the resumed row
+	// copy and leave the prior comment frozen at "Stopped" as the record of where
+	// the apply paused.
+	if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForResume(apply, tasks) {
+		o.lastState = currentState
+		o.lastProgressPost = now
+		o.stagnantTicks = 0
+		return
+	}
+
 	// Adaptive rate limiting — ported from watchApplyProgress.
 	// Edit every 5s when progress is moving, slow to 30s when stagnant.
 	var totalRows int64
@@ -423,6 +435,43 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 	if err := o.stor.ApplyComments().IncrementEditCount(o.contextWithApplyLease(ctx, apply), o.applyID, commentState); err != nil {
 		o.logError(apply, "observer: failed to increment edit count", "error", err, "comment_state", commentState)
 	}
+}
+
+// rotateProgressCommentForResume posts a fresh progress comment when a resumed
+// apply is detected, so the resumed row copy is tracked in a new comment instead
+// of re-editing the comment frozen at "Stopped". The signal is durable and
+// cross-pod safe: OnTerminal writes a summary comment when an apply stops, so an
+// active apply with a summary comment present has resumed. On rotation it posts a
+// new progress comment — postAndTrackComment overwrites the tracked progress
+// comment id, so later progress edits land on the new comment while the prior one
+// stays frozen as the record — and consumes the summary marker so it rotates
+// exactly once and the eventual terminal summary is posted fresh. Returns true
+// when it rotated.
+func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, tasks []*storage.Task) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	summary, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Summary)
+	if err != nil {
+		o.logError(apply, "observer: failed to check for summary comment before resume rotation", "error", err)
+		return false
+	}
+	if summary == nil {
+		// No summary comment — the apply has not been stopped, so there is nothing
+		// to rotate. This is the common path on every progress tick.
+		return false
+	}
+
+	body := o.formatStatusComment(apply, tasks)
+	o.postAndTrackComment(apply, state.Comment.Progress, body)
+
+	if err := o.stor.ApplyComments().Delete(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Summary); err != nil {
+		o.logError(apply, "observer: failed to consume summary marker after resume rotation", "error", err)
+		return true
+	}
+	o.logger.Info("observer: posted fresh progress comment for resumed apply",
+		"apply_id", o.applyID, "repo", o.repo, "pr", o.pr, "state", apply.State)
+	return true
 }
 
 // postAndTrackComment creates a comment and stores its ID.

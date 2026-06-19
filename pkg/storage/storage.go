@@ -412,6 +412,12 @@ type ApplyCommentStore interface {
 
 	// DeleteByApply removes all comment records for an apply.
 	DeleteByApply(ctx context.Context, applyID int64) error
+
+	// Delete removes the tracked comment record for a single
+	// (apply_id, comment_state). The GitHub comment itself is left in place; only
+	// SchemaBot's tracking of it is dropped, so it is no longer edited. A missing
+	// row is not an error.
+	Delete(ctx context.Context, applyID int64, commentState string) error
 }
 
 // ApplyOperationStore manages per-(apply, deployment) child rows for

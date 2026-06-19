@@ -129,6 +129,40 @@ func (s *applyCommentStore) DeleteByApply(ctx context.Context, applyID int64) er
 	return err
 }
 
+// Delete removes the tracked comment record for a single (apply_id, comment_state).
+// It stops SchemaBot editing that GitHub comment again; the comment itself is left
+// in place on the PR as a historical record. A missing row is not an error.
+func (s *applyCommentStore) Delete(ctx context.Context, applyID int64, commentState string) error {
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return err
+	}
+	if !hasLease {
+		_, err := s.db.ExecContext(ctx, `
+			DELETE FROM apply_comments WHERE apply_id = ? AND comment_state = ?
+		`, applyID, commentState)
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `
+		DELETE c FROM apply_comments c
+		JOIN applies a ON a.id = c.apply_id
+		WHERE c.apply_id = ? AND c.comment_state = ? AND a.lease_token = ?
+	`, applyID, commentState, lease.Token)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read apply comment delete rows affected for apply %d state %s: %w", applyID, commentState, err)
+	}
+	if rows == 0 {
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // scanApplyComment scans a single apply comment row, returning nil if not found.
 func scanApplyComment(row *sql.Row) (*storage.ApplyComment, error) {
 	comment, err := scanApplyCommentInto(row)
