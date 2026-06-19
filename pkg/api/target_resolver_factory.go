@@ -17,19 +17,28 @@ import (
 )
 
 // BuildResolver builds the configured inventory.Resolver — the Etre dynamic
-// backend(s) or the static inventory. The caller guarantees exactly one kind is
-// configured.
+// backend(s) or the static inventory. It fails closed on an ambiguous config
+// (both backends configured) and on an empty one (neither configured), so an
+// embedder calling this directly gets the same guarantees the server enforces
+// rather than a silent backend preference.
 func (c TargetResolverConfig) BuildResolver(ctx context.Context, logger *slog.Logger) (inventory.Resolver, error) {
-	if len(c.Etre) > 0 {
+	etreConfigured := len(c.Etre) > 0
+	staticConfigured := c.Configured()
+	switch {
+	case etreConfigured && staticConfigured:
+		return nil, fmt.Errorf("target_resolver configures both etre and static targets; per-target overrides are not yet supported — use one")
+	case etreConfigured:
 		return buildEtreResolvers(ctx, c.Etre, logger)
+	case staticConfigured:
+		resolver, err := inventory.NewStaticResolver(c.StaticInventory())
+		if err != nil {
+			return nil, fmt.Errorf("build static target resolver: %w", err)
+		}
+		logger.Info("gRPC server routing by static target resolver", "targets", len(c.Targets))
+		return resolver, nil
+	default:
+		return nil, fmt.Errorf("target_resolver configures neither etre nor static targets")
 	}
-
-	resolver, err := inventory.NewStaticResolver(c.StaticInventory())
-	if err != nil {
-		return nil, fmt.Errorf("build static target resolver: %w", err)
-	}
-	logger.Info("gRPC server routing by static target resolver", "targets", len(c.Targets))
-	return resolver, nil
 }
 
 // buildEtreResolvers builds the Etre-backed resolver(s). A single block resolves

@@ -318,14 +318,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 	if len(wakeOperator) > 0 {
 		wake = wakeOperator[0]
 	}
-	etreConfigured := len(config.TargetResolver.Etre) > 0
-	staticConfigured := config.TargetResolver.Configured()
-
-	if etreConfigured && staticConfigured {
-		return nil, fmt.Errorf("target_resolver configures both etre and static targets; per-target overrides are not yet supported — use one")
-	}
-
-	if etreConfigured || staticConfigured {
+	if config.TargetResolver.Enabled() {
 		resolver, err := config.TargetResolver.BuildResolver(ctx, logger)
 		if err != nil {
 			return nil, err

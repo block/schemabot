@@ -267,3 +267,29 @@ func TestBuildEtreResolverValidatesConfig(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "addr resolved to an empty value")
 }
+
+// BuildResolver fails closed on an ambiguous config: configuring both the Etre
+// and static backends is rejected rather than silently preferring one, so an
+// embedder gets the same guarantee the server enforces.
+func TestBuildResolverRejectsBothEtreAndStatic(t *testing.T) {
+	cfg := TargetResolverConfig{
+		Targets: map[string]inventory.StaticTarget{"db": {}},
+		Etre: []EtreConfig{{
+			Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeMySQL,
+			EntityType: "cluster", TargetLabel: "dsid",
+			MySQL:       EtreMySQLConfig{HostField: "writer_endpoint"},
+			Credentials: EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+		}},
+	}
+	_, err := cfg.BuildResolver(t.Context(), slog.New(slog.DiscardHandler))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "both etre and static targets")
+}
+
+// BuildResolver fails closed on an empty config: configuring neither backend is
+// an error rather than a degenerate empty resolver.
+func TestBuildResolverRejectsNeitherConfigured(t *testing.T) {
+	_, err := TargetResolverConfig{}.BuildResolver(t.Context(), slog.New(slog.DiscardHandler))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "neither etre nor static")
+}
