@@ -103,6 +103,8 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("## Schema Change — Waiting for Cutover\n\n")
 	case state.Apply.Recovering:
 		sb.WriteString("## Schema Change — Recovering\n\n")
+	case state.Apply.Resuming:
+		sb.WriteString("## Schema Change — Resuming\n\n")
 	case state.Apply.CuttingOver:
 		sb.WriteString("## Schema Change — Cutting Over\n\n")
 	case state.Apply.RevertWindow:
@@ -313,7 +315,13 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 // writeTableProgressSection writes the per-table progress breakdown.
 // Tables are sorted: active/running first, then pending, then completed/terminal last.
 func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData) {
-	writeProgressSummary(sb, data.Tables)
+	// During the resume window the per-table percents are indeterminate (the data
+	// plane has not reported continuation vs fresh copy yet), so the aggregate
+	// running-percent summary would surface stale pre-stop numbers. The per-table
+	// "Resuming…" lines below convey state without it.
+	if data.State != state.Apply.Resuming {
+		writeProgressSummary(sb, data.Tables)
+	}
 	sb.WriteString("\n### Table Progress\n\n")
 
 	sorted := make([]TableProgressData, len(data.Tables))
@@ -323,8 +331,24 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 	})
 
 	for _, table := range sorted {
+		// While the apply is resuming, the data plane has not yet reported whether
+		// the schema change continues from its checkpoint or restarts from scratch,
+		// so the row-copy percent is indeterminate. Render state-only until the
+		// apply transitions to running and real progress is known.
+		if data.State == state.Apply.Resuming && !state.IsTerminalTaskState(state.NormalizeTaskStatus(table.Status)) {
+			renderResumingTable(sb, table)
+			continue
+		}
 		renderTableProgress(sb, table)
 	}
+}
+
+// renderResumingTable renders a table while the apply is resuming, before the
+// data plane reports whether the change continues from its checkpoint or restarts
+// from scratch. The percent is intentionally omitted during this window.
+func renderResumingTable(sb *strings.Builder, table TableProgressData) {
+	fmt.Fprintf(sb, "**`%s`**: \U0001f504 Resuming…\n", table.TableName)
+	writeDDLLine(sb, table.DDL)
 }
 
 // tableStatePriority returns a sort key: lower = rendered first (active on top, completed on bottom).

@@ -342,7 +342,9 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	lock, err = st.Locks().Get(ctx, "e2e_rotate_db", "mysql")
 	require.NoError(t, err)
 
-	// The apply has resumed: it is active again (Running) after an operator start.
+	// The apply has just been started again after a stop: the data plane accepted
+	// the start, so the apply is in the Resuming window (it may still report stopped
+	// briefly) before it transitions to Running.
 	apply := &storage.Apply{
 		ApplyIdentifier: fmt.Sprintf("apply_e2e_rotate_%d", time.Now().UnixNano()),
 		LockID:          lock.ID,
@@ -354,7 +356,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 		Environment:     "staging",
 		InstallationID:  12345,
 		Engine:          "spirit",
-		State:           state.Apply.Running,
+		State:           state.Apply.Resuming,
 	}
 	applyID, err := st.Applies().Create(ctx, apply)
 	require.NoError(t, err)
@@ -367,7 +369,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 		UPDATE applies
 		SET lease_owner = ?, lease_token = ?, lease_acquired_at = ?, state = ?
 		WHERE id = ?
-	`, apply.LeaseOwner, apply.LeaseToken, leaseAcquiredAt, state.Apply.Running, applyID)
+	`, apply.LeaseOwner, apply.LeaseToken, leaseAcquiredAt, state.Apply.Resuming, applyID)
 	require.NoError(t, err)
 
 	// The task is copying again after resume.
@@ -422,15 +424,19 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 		Clock:          fake,
 	})
 
-	// First progress tick after resume rotates the progress comment.
+	// First progress tick after resume rotates the progress comment. While the
+	// apply is in the Resuming window the comment renders state-only: the row-copy
+	// percent is indeterminate (continuation vs fresh copy), so no bar is shown.
 	obs.OnProgress(apply, []*storage.Task{task})
 
 	var newProgressID int64
 	select {
 	case created := <-capture.creates:
 		newProgressID = created.ID
-		assert.Contains(t, created.Body, "Schema Change In Progress")
+		assert.Contains(t, created.Body, "Schema Change — Resuming")
+		assert.Contains(t, created.Body, "Resuming…")
 		assert.NotContains(t, created.Body, "Stopped")
+		assert.NotContains(t, created.Body, "50%", "the indeterminate resume window must not show a stale percent")
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected a new progress comment to be posted on resume")
 	}
@@ -445,7 +451,9 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, summary, "stopped summary marker should be consumed after rotation")
 
-	// A later tick edits the new comment in place — it does not rotate again.
+	// Once the data plane leaves stopped the apply is Running: a later tick edits
+	// the new comment in place (it does not rotate again) and now shows the bar.
+	apply.State = state.Apply.Running
 	fake.Advance(activeInterval + time.Second)
 	task.RowsCopied = 700
 	task.ProgressPercent = 70
@@ -454,6 +462,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the new comment")
+		assert.Contains(t, edited.Body, "70%", "once running, the new comment shows real row-copy progress")
 	case created := <-capture.creates:
 		t.Fatalf("resume must rotate exactly once; got another new comment %d", created.ID)
 	case <-time.After(5 * time.Second):
