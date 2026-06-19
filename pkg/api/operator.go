@@ -688,19 +688,15 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	// start to resume. applyOperationID 0 selects the whole-apply drive: this path
 	// holds the apply lease, not an operation lease, because no single operation
 	// is carrying the stop.
-	resumed, err := s.resumeClaimedApply(applyLeaseCtx, driverID, apply, 0, "")
-	if err != nil {
+	// resumeClaimedApply returns (true, nil) on success and (false, err) on every
+	// failure, so the error is the only signal we need here.
+	if _, err := s.resumeClaimedApply(applyLeaseCtx, driverID, apply, 0, ""); err != nil {
 		// Fail closed: leave the pending stop and pending operation rows untouched
 		// so the next tick reclaims this apply and retries the data-plane stop.
 		s.logger.Error("operator: failed to drive data-plane stop during stop reconciliation",
 			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment, "error", err)
-		return true
-	}
-	if !resumed {
-		s.logger.Warn("operator: data-plane stop drive did not run during stop reconciliation; leaving stop for retry",
-			"driver", driverID, "apply_id", apply.ApplyIdentifier,
-			"database", apply.Database, "environment", apply.Environment)
+			"database", apply.Database, "deployment", apply.Deployment,
+			"environment", apply.Environment, "error", err)
 		return true
 	}
 
