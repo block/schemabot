@@ -2137,6 +2137,35 @@ schemabot start apply-a1b2c3d4e5f6
 </details>
 
 <details>
+<summary><a name="resuming"></a><strong>Resuming</strong></summary>
+
+
+## Schema Change — Resuming
+
+**Database**: `testapp` | **Environment**: `staging` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Elapsed**: 8m
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+### Table Progress
+
+**`users`**: 🔄 Resuming…
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="waiting-for-cutover"></a><strong>Waiting For Cutover</strong></summary>
 
 

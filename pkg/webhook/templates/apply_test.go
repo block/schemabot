@@ -621,6 +621,15 @@ func TestPreviewCommentApplyStopped(t *testing.T) {
 	assert.Contains(t, result, "schemabot start")
 }
 
+func TestPreviewCommentApplyResuming(t *testing.T) {
+	result := PreviewCommentApplyResuming()
+
+	assert.Contains(t, result, "Schema Change — Resuming")
+	assert.Contains(t, result, "🔄 Resuming…")
+	// The indeterminate resume window hides the stale pre-stop percent.
+	assert.NotContains(t, result, "72%")
+}
+
 func TestPreviewCommentApplyWaitingForCutover(t *testing.T) {
 	result := PreviewCommentApplyWaitingForCutover()
 

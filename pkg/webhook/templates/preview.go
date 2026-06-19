@@ -813,6 +813,22 @@ func PreviewCommentApplyStopped() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Stopped, tables))
 }
 
+// PreviewCommentApplyResuming renders a sample comment for an apply that has just
+// been started again after a stop. During the resuming window the data plane has
+// not yet reported whether the change continues from its checkpoint or restarts
+// from scratch, so the row-copy percent is indeterminate: non-terminal tables
+// render state-only ("Resuming…") despite carrying their pre-stop counters, while
+// already-completed tables keep their final state.
+func PreviewCommentApplyResuming() string {
+	tables := sampleApplyTables()[:2]
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Running
+	tables[1].RowsCopied = 1055687
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 72
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Resuming, tables))
+}
+
 // PreviewCommentApplyWaitingForCutover renders a sample waiting-for-cutover comment.
 func PreviewCommentApplyWaitingForCutover() string {
 	tables := sampleApplyTables()
