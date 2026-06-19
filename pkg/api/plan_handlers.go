@@ -432,7 +432,7 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	planStart := time.Now()
 	deployment := ""
 
-	resolvedTarget, err := s.config.ResolveDatabaseTarget(req.Database, req.Environment)
+	resolvedTarget, err := s.config.ResolvePrimaryDatabaseTarget(req.Database, req.Environment)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "resolve target")

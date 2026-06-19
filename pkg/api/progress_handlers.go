@@ -130,7 +130,7 @@ func (s *Service) deploymentForDatabaseEnvironment(database, deployment, environ
 	if deployment != "" {
 		return deployment, nil
 	}
-	resolved, err := s.config.ResolveDatabaseTarget(database, environment)
+	resolved, err := s.config.ResolvePrimaryDatabaseTarget(database, environment)
 	if err != nil {
 		return "", err
 	}

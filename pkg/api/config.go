@@ -1230,6 +1230,31 @@ func (c *ServerConfig) ResolveDatabaseTarget(database, environment string) (rout
 	return targets[0], nil
 }
 
+// ResolvePrimaryDatabaseTarget returns the primary deployment for a configured
+// database/environment: the first entry in rollout order (explicit
+// deployment_order when set, otherwise alphabetical). For single-deployment
+// environments this is the only target; for multi-deployment environments it is
+// the lead deployment the rollout starts from.
+//
+// Use this where a single representative route is needed but a multi-deployment
+// environment must not be rejected — planning a schema diff, routing a progress
+// poll, or labelling a metric. The deployment chosen here matches the apply
+// row's own stored deployment (createStoredApply uses the same primary), while
+// the apply itself fans out across the full target set at create time.
+// Callers that require exactly one configured deployment use
+// ResolveDatabaseTarget; callers that act on every deployment use
+// ResolveDatabaseTargets.
+func (c *ServerConfig) ResolvePrimaryDatabaseTarget(database, environment string) (routing.ExecutionTarget, error) {
+	targets, err := c.ResolveDatabaseTargets(database, environment)
+	if err != nil {
+		return routing.ExecutionTarget{}, err
+	}
+	if len(targets) == 0 {
+		return routing.ExecutionTarget{}, fmt.Errorf("database %q environment %q resolved no deployments", database, environment)
+	}
+	return targets[0], nil
+}
+
 // orderedDeploymentKeys returns the keys of a deployments map in rollout order:
 // the explicit deployment_order when set, otherwise alphabetical for
 // deterministic resolution. When an order is given it is validated to be a
