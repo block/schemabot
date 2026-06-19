@@ -190,7 +190,7 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 
 	owner := driverLeaseOwner(driverID)
 
-	if s.config.OperatorClaimOperations {
+	if s.config.ShouldClaimOperations() {
 		// Service a pending stop with no claimable operation to carry it before
 		// claiming new operation work, so a queued stop wins over starting more
 		// deployments. When nothing needs stop reconciliation this is a cheap

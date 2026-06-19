@@ -96,7 +96,7 @@ func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operator
 	require.NoError(t, err, "create local client")
 
 	serverConfig := &schemabotapi.ServerConfig{
-		OperatorClaimOperations: operatorClaimOperations,
+		OperatorClaimOperations: &operatorClaimOperations,
 		Databases: map[string]schemabotapi.DatabaseConfig{
 			appDBName: {
 				Type: "mysql",

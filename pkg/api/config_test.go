@@ -2408,6 +2408,69 @@ require_passing_checks: false
 	})
 }
 
+func TestServerConfig_ShouldClaimOperations(t *testing.T) {
+	t.Run("nil receiver defaults to true", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.True(t, cfg.ShouldClaimOperations())
+	})
+
+	t.Run("nil field defaults to true", func(t *testing.T) {
+		cfg := &ServerConfig{}
+		assert.True(t, cfg.ShouldClaimOperations())
+	})
+
+	t.Run("explicitly true", func(t *testing.T) {
+		cfg := &ServerConfig{OperatorClaimOperations: new(true)}
+		assert.True(t, cfg.ShouldClaimOperations())
+	})
+
+	t.Run("explicitly false falls back to apply-level claiming", func(t *testing.T) {
+		cfg := &ServerConfig{OperatorClaimOperations: new(false)}
+		assert.False(t, cfg.ShouldClaimOperations())
+	})
+
+	t.Run("YAML omits the key and defaults to true", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "config.yaml")
+		content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/testapp"
+`
+		err := os.WriteFile(configPath, []byte(content), 0644)
+		require.NoError(t, err)
+
+		cfg, err := LoadServerConfigFromFile(configPath)
+		require.NoError(t, err)
+
+		assert.True(t, cfg.ShouldClaimOperations())
+	})
+
+	t.Run("YAML can opt back into apply-level claiming", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "config.yaml")
+		content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/testapp"
+operator_claim_operations: false
+`
+		err := os.WriteFile(configPath, []byte(content), 0644)
+		require.NoError(t, err)
+
+		cfg, err := LoadServerConfigFromFile(configPath)
+		require.NoError(t, err)
+
+		assert.False(t, cfg.ShouldClaimOperations())
+	})
+}
+
 func TestServerConfig_ReviewPolicy(t *testing.T) {
 	t.Run("nil receiver defaults to false", func(t *testing.T) {
 		var cfg *ServerConfig

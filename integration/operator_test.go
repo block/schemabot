@@ -1100,6 +1100,10 @@ func TestOperator_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 
 	svc := schemabotapi.New(stor, &schemabotapi.ServerConfig{
 		Drivers: 2,
+		// This scenario seeds stale applies with tasks (no apply_operations
+		// rows), so it exercises apply-level claiming. The operation-level
+		// claim path has its own dedicated coverage.
+		OperatorClaimOperations: new(false),
 		Databases: map[string]schemabotapi.DatabaseConfig{
 			db1Name: {
 				Type: "mysql",
