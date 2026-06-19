@@ -55,6 +55,20 @@ func markApplyHeartbeatStale(t *testing.T, dsn, applyID, storageName string) {
 	rowsAffected, err := result.RowsAffected()
 	require.NoError(t, err)
 	require.Equal(t, int64(1), rowsAffected, "expected to mark one %s apply heartbeat stale", storageName)
+
+	// With operation-level claiming, a running apply is reclaimed via
+	// FindNextApplyOperation's stale-heartbeat clause, which keys off
+	// apply_operations.updated_at (not applies.updated_at). Age the apply's
+	// operation rows too so the operator can re-lease without waiting out the
+	// production staleness window. Operation rows are optional here (e.g. the
+	// data-plane apply has none), so we don't assert a row count.
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations ao
+			JOIN applies a ON ao.apply_id = a.id
+			SET ao.updated_at = NOW() - INTERVAL 2 MINUTE
+			WHERE a.apply_identifier = ?`,
+		applyID)
+	require.NoError(t, err)
 }
 
 func markDataPlaneHeartbeatStale(t *testing.T, applyID string) {
