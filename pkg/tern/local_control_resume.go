@@ -492,6 +492,24 @@ func shouldInspectCutoverSignalForResume(apply *storage.Apply, forceCutoverResum
 		state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.Recovering)
 }
 
+// suppressParentApplyWrites reports whether the current drive runs under an
+// operation lease only (no parent apply lease). That is the multi-operation
+// fan-out case: the parent applies row is owned solely by the operator's
+// rollout-projection CAS, so the drive must not write it directly — storage
+// fails such writes closed with ErrApplyLeaseLost, and the cutover drive's
+// recovering/running writes would otherwise abort the whole drive. A
+// single-operation or whole-apply drive carries the parent apply lease and
+// writes (and heartbeats) the parent directly, so this returns false for them.
+// The operator advances the parent via updateApplyStateFromOperations after the
+// drive returns.
+func suppressParentApplyWrites(ctx context.Context) bool {
+	if _, ok := storage.ApplyLeaseFromContext(ctx); ok {
+		return false
+	}
+	opLease, ok := storage.OperationLeaseFromContext(ctx)
+	return ok && opLease.Valid()
+}
+
 func (c *LocalClient) markApplyRecovering(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	c.logger.Info("entering recovery state for deferred cutover checkpoint",
 		"apply_id", apply.ApplyIdentifier,
@@ -513,6 +531,12 @@ func (c *LocalClient) markApplyRecovering(ctx context.Context, apply *storage.Ap
 	apply.State = state.Apply.Recovering
 	apply.CompletedAt = nil
 	apply.UpdatedAt = time.Now()
+	// A multi-operation drive owns only its operation: the parent recovering
+	// write is the operator's projection to make, and a direct write here fails
+	// closed under the operation-only lease. Tasks are already recovering above.
+	if suppressParentApplyWrites(ctx) {
+		return nil
+	}
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("mark apply %s recovering after restart: %w", apply.ApplyIdentifier, err)
 	}
@@ -530,6 +554,13 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	tasks []*storage.Task, plan *storage.Plan, options map[string]string, logMessage string, block bool, startRequested bool, releaseAtCutoverBarrier bool) error {
 
 	allTasks := tasks
+	// A multi-operation drive (operation lease only) owns its operation, not the
+	// parent applies row: it must not write the parent state, complete parent
+	// stop/start requests, adjust the apply-level active metric, fire the parent
+	// terminal observer, or heartbeat the parent. The operator advances the
+	// parent via the projection CAS after the drive returns; the operation row is
+	// heartbeated by the operator. Task and engine state are still persisted.
+	suppressParent := suppressParentApplyWrites(ctx)
 	eng := c.getEngine()
 	if eng == nil {
 		return fmt.Errorf("no engine available for grouped resume apply %s", apply.ApplyIdentifier)
@@ -559,6 +590,12 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		apply.State = state.Apply.Completed
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
+		// The drive's tasks are already terminal, so the operator derives this
+		// operation completed and projects the parent; skip the parent writes and
+		// side-effects a multi-operation drive does not own.
+		if suppressParent {
+			return nil
+		}
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", state.Apply.Completed, "error", err)
 			return fmt.Errorf("mark grouped resume apply %s completed after final schema check: %w", apply.ApplyIdentifier, err)
@@ -649,36 +686,55 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		apply.State = state.Apply.Recovering
 	}
 	apply.UpdatedAt = now
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
-		return fmt.Errorf("mark grouped resume apply %s %s: %w", apply.ApplyIdentifier, apply.State, err)
-	}
-	if startRequested {
-		if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
-			return err
+	// A multi-operation drive does not write the parent running state or complete
+	// parent start requests; the operator projected the parent running before the
+	// drive. Tasks are already running/recovering above.
+	if !suppressParent {
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			c.logger.Error("failed to update apply state", "apply_id", apply.ApplyIdentifier, "state", apply.State, "error", err)
+			return fmt.Errorf("mark grouped resume apply %s %s: %w", apply.ApplyIdentifier, apply.State, err)
 		}
+		if startRequested {
+			if err := completePendingStartControlRequests(ctx, c.storage, apply); err != nil {
+				return err
+			}
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			logMessage, oldApplyState, apply.State)
 	}
-
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-		logMessage, oldApplyState, apply.State)
 
 	if block {
 		pollCtx, cancelPoll := context.WithCancel(ctx)
 		defer cancelPoll()
-		stopHeartbeat := c.startApplyHeartbeat(pollCtx, apply, cancelPoll)
+		// Heartbeat the parent apply only when this drive owns it; a
+		// multi-operation drive's parent heartbeat fails closed under the
+		// operation-only lease and would cancel the run, so the operator
+		// heartbeats the operation row instead.
+		stopHeartbeat := c.startParentApplyHeartbeat(pollCtx, apply, suppressParent, cancelPoll)
 		defer stopHeartbeat()
 		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 		return nil
 	}
 
 	resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
-	stopHeartbeat := c.startApplyHeartbeat(resumeCtx, apply, cancelResume)
+	stopHeartbeat := c.startParentApplyHeartbeat(resumeCtx, apply, suppressParent, cancelResume)
 	go func() {
 		defer cancelResume()
 		defer stopHeartbeat()
 		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 	}()
 	return nil
+}
+
+// startParentApplyHeartbeat starts the parent apply heartbeat when this drive
+// owns the parent apply lease. A multi-operation drive (operation lease only)
+// does not own the parent row — its heartbeat fails closed and would cancel the
+// run — so this returns a no-op and the operator heartbeats the operation row.
+func (c *LocalClient) startParentApplyHeartbeat(ctx context.Context, apply *storage.Apply, suppressParent bool, cancelApply ...context.CancelFunc) context.CancelFunc {
+	if suppressParent {
+		return func() {}
+	}
+	return c.startApplyHeartbeat(ctx, apply, cancelApply...)
 }
 
 // errGroupedResumeStateUnavailable marks a resume attempt whose persisted engine

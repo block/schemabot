@@ -735,6 +735,29 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
+	// A multi-operation drive (operation lease only) owns its operation, not the
+	// parent applies row: it has synced its tasks and run the engine's auto
+	// actions above, but the parent state, terminal side-effects, and the
+	// terminal summary are the operator's projection to make after the drive
+	// returns. Stop polling once this operation's own tasks settle (or park at
+	// the cutover barrier); the operator persists the operation row and projects
+	// the parent. Without this, a drive that won the terminal projection CAS here
+	// would suppress the operator's once-only terminal summary.
+	if suppressParentApplyWrites(ctx) {
+		opState := state.DeriveApplyState(taskStates(tasks))
+		if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
+			c.logger.Info("operation parked at cutover barrier; exiting copy drive",
+				"mode", groupedApplyMode(apply, options), "apply_id", apply.ApplyIdentifier, "operation_state", opState)
+			return true
+		}
+		if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
+			c.logger.Info("operation settled; exiting operation drive for operator projection",
+				"mode", groupedApplyMode(apply, options), "apply_id", apply.ApplyIdentifier, "operation_state", opState)
+			return true
+		}
+		return false
+	}
+
 	// Update apply state from persisted task state so recovery guards can keep
 	// storage ahead of stale engine progress until Spirit reaches the cutover wait again.
 	if derived, ok := c.deriveAggregateApplyState(ctx, apply, tasks); ok {

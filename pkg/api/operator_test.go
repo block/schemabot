@@ -940,3 +940,157 @@ func TestRecoverMultiApplyOperation_FailsTaskLessOperationAgainstReloadedParent(
 	assert.Equal(t, state.ApplyOperation.Failed, opStore.op.State,
 		"the task-less operation row must be marked failed")
 }
+
+// cutoverOpStore backs the cutover claim path: FindNextApplyOperationCutover
+// hands back the barrier-parked operation whose turn it is, ListByApply reports a
+// genuine multi-operation set (so the operation-lease-only drive is valid), and
+// MarkFailed terminalizes the claimed row.
+type cutoverOpStore struct {
+	storage.ApplyOperationStore
+	mu      sync.Mutex
+	op      *storage.ApplyOperation
+	sibling *storage.ApplyOperation
+	claimed bool
+}
+
+func (s *cutoverOpStore) FindNextApplyOperationCutover(context.Context, string) (*storage.ApplyOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.claimed = true
+	op := *s.op
+	return &op, nil
+}
+
+func (s *cutoverOpStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op := *s.op
+	return &op, nil
+}
+
+func (s *cutoverOpStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op := *s.op
+	sibling := *s.sibling
+	return []*storage.ApplyOperation{&op, &sibling}, nil
+}
+
+func (s *cutoverOpStore) MarkFailed(_ context.Context, _ int64, errMsg string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.op.State = state.ApplyOperation.Failed
+	s.op.ErrorMessage = errMsg
+	return nil
+}
+
+func (s *cutoverOpStore) Heartbeat(context.Context, int64) error { return nil }
+
+// The cutover claim path drives a barrier-parked operation through its swap via
+// ResumeApplyOperationCutover, not the copy-phase ResumeApplyOperation, and only
+// when the claimed operation belongs to a genuine multi-operation apply so the
+// operation-lease-only drive (with parent-write suppression) is valid.
+func TestRecoverApplyOperationCutover_RoutesThroughCutoverDrive(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	applyStore := &casApplyStore{
+		template: storage.Apply{
+			ID:              7,
+			ApplyIdentifier: "apply-cutover",
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+		},
+		state: state.Apply.Running,
+	}
+	opStore := &cutoverOpStore{
+		op: &storage.ApplyOperation{
+			ID:         42,
+			ApplyID:    7,
+			Deployment: "west",
+			State:      state.ApplyOperation.CuttingOver,
+			LeaseOwner: "driver-1",
+			LeaseToken: "token-1",
+		},
+		sibling: &storage.ApplyOperation{
+			ID:         41,
+			ApplyID:    7,
+			Deployment: "east",
+			State:      state.ApplyOperation.Completed,
+		},
+	}
+	// Fail closed on no tasks so the drive short-circuits to the task-less
+	// terminalization; the routing assertion only needs the cutover entrypoint to
+	// have been called.
+	deploymentClient := &mockTernClient{resumeErr: tern.ErrNoTasksForApplyOperation}
+
+	svc := New(
+		&recoverTestStorage{applies: applyStore, ops: opStore},
+		testServerConfig(),
+		map[string]tern.Client{"west/staging": deploymentClient},
+		logger,
+	)
+
+	consumed := svc.recoverApplyOperationCutover(t.Context(), 1, "driver-1")
+
+	assert.True(t, consumed, "claiming a parked cutover must consume the tick")
+	assert.True(t, opStore.claimed, "the cutover claim predicate must be queried")
+	deploymentClient.resumeMu.Lock()
+	cutoverID := deploymentClient.resumeCutoverOperationID
+	copyID := deploymentClient.resumeOperationID
+	deploymentClient.resumeMu.Unlock()
+	assert.Equal(t, int64(42), cutoverID, "the operation must be driven through the cutover entrypoint")
+	assert.Equal(t, int64(0), copyID, "the cutover claim must not route through the copy-phase entrypoint")
+	assert.Equal(t, state.ApplyOperation.Failed, opStore.op.State,
+		"the task-less cutover operation must be terminalized failed")
+}
+
+// A claimed cutover operation that is not part of a multi-operation apply must
+// not be driven: the operation-lease-only path (and its parent-write
+// suppression) is only correct for a genuine fan-out, so a single-operation set
+// fails closed without calling any resume entrypoint.
+func TestRecoverApplyOperationCutover_RejectsSingleOperationSet(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	applyStore := &casApplyStore{
+		template: storage.Apply{ID: 7, ApplyIdentifier: "apply-cutover-single", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"},
+		state:    state.Apply.Running,
+	}
+	opStore := &recoverOperationStore{op: &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.CuttingOver,
+		LeaseOwner: "driver-1",
+		LeaseToken: "token-1",
+	}}
+	deploymentClient := &mockTernClient{}
+
+	svc := New(
+		&recoverTestStorage{applies: applyStore, ops: &singleCutoverOpStore{recoverOperationStore: opStore}},
+		testServerConfig(),
+		map[string]tern.Client{"west/staging": deploymentClient},
+		logger,
+	)
+
+	consumed := svc.recoverApplyOperationCutover(t.Context(), 1, "driver-1")
+
+	assert.True(t, consumed, "claiming any operation consumes the tick even when it is rejected")
+	deploymentClient.resumeMu.Lock()
+	cutoverID := deploymentClient.resumeCutoverOperationID
+	copyID := deploymentClient.resumeOperationID
+	deploymentClient.resumeMu.Unlock()
+	assert.Equal(t, int64(0), cutoverID, "a single-operation set must not be driven through cutover")
+	assert.Equal(t, int64(0), copyID, "a single-operation set must not be driven through copy")
+}
+
+// singleCutoverOpStore exposes a recoverOperationStore (single-operation
+// ListByApply) through the cutover claim predicate.
+type singleCutoverOpStore struct {
+	*recoverOperationStore
+}
+
+func (s *singleCutoverOpStore) FindNextApplyOperationCutover(context.Context, string) (*storage.ApplyOperation, error) {
+	op := *s.op
+	return &op, nil
+}

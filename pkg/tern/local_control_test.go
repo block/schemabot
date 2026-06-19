@@ -795,3 +795,32 @@ func TestLocalClient_StopRejectsRevertWindow(t *testing.T) {
 	assert.Equal(t, state.Task.RevertWindow, task.State, "revert-window task must not be marked cancelled by stop")
 	assert.Equal(t, state.Apply.RevertWindow, apply.State, "revert-window apply must not be marked cancelled by stop")
 }
+
+// suppressParentApplyWrites engages only for an operation-lease-only drive (a
+// multi-operation fan-out): the parent applies row is owned by the operator's
+// projection CAS, so the drive must not write it. A drive carrying the parent
+// apply lease (single-operation or whole-apply) writes the parent directly.
+func TestSuppressParentApplyWrites(t *testing.T) {
+	applyLease := storage.ApplyLease{ApplyID: 1, Owner: "d", Token: "t"}
+	opLease := storage.OperationLease{ApplyID: 1, OperationID: 2, Owner: "d", Token: "t"}
+
+	t.Run("operation lease only suppresses", func(t *testing.T) {
+		ctx := storage.WithOperationLease(t.Context(), opLease)
+		assert.True(t, suppressParentApplyWrites(ctx))
+	})
+	t.Run("apply lease writes the parent directly", func(t *testing.T) {
+		ctx := storage.WithApplyLease(t.Context(), applyLease)
+		assert.False(t, suppressParentApplyWrites(ctx))
+	})
+	t.Run("dual lease writes the parent directly", func(t *testing.T) {
+		ctx := storage.WithOperationLease(storage.WithApplyLease(t.Context(), applyLease), opLease)
+		assert.False(t, suppressParentApplyWrites(ctx))
+	})
+	t.Run("no lease does not suppress", func(t *testing.T) {
+		assert.False(t, suppressParentApplyWrites(t.Context()))
+	})
+	t.Run("invalid operation lease does not suppress", func(t *testing.T) {
+		ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{})
+		assert.False(t, suppressParentApplyWrites(ctx))
+	})
+}

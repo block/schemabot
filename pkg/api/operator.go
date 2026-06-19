@@ -198,6 +198,13 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 		if s.recoverApplyPendingStop(ctx, driverID, owner) {
 			return
 		}
+		// Drive a barrier-parked cutover whose deployment-ordered turn it is
+		// before claiming new copy work, so the high-risk ordered swaps make
+		// progress ahead of starting more copy phases. Dormant until the
+		// multi-deployment fan-out lands (nothing parks at the barrier today).
+		if s.recoverApplyOperationCutover(ctx, driverID, owner) {
+			return
+		}
 		s.recoverApplyOperation(ctx, driverID, owner)
 		return
 	}
@@ -497,6 +504,17 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 // driven from its own tasks, then the parent is re-derived from the operation
 // rows.
 func (s *Service) recoverMultiApplyOperation(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
+	s.driveClaimedMultiOperation(ctx, driverID, op, opLease, false)
+}
+
+// driveClaimedMultiOperation drives one claimed operation of a multi-operation
+// apply under the operation lease only and settles the parent via the projection
+// CAS. cutover selects the drive phase: false runs the operation's copy phase
+// (ResumeApplyOperation), true forces a barrier-parked operation through its swap
+// (ResumeApplyOperationCutover). The parent applies row is never written by the
+// drive — the driver owns only its operation row and tasks; the parent state and
+// the once-only terminal summary are this method's projection responsibility.
+func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease, cutover bool) {
 	operationLeaseCtx := storage.WithOperationLease(ctx, opLease)
 
 	apply, err := s.storage.Applies().Get(operationLeaseCtx, op.ApplyID)
@@ -548,7 +566,7 @@ func (s *Service) recoverMultiApplyOperation(ctx context.Context, driverID int, 
 	// Suppress the per-driver terminal observer: the aggregate terminal summary
 	// is published once by the projection CAS winner, not per deployment.
 	resumed, resumeErr := s.resumeClaimedApplyWithOptions(runCtx, driverID, apply, op.ID, op.Deployment,
-		resumeClaimedApplyOptions{suppressRecoveredObserver: true})
+		resumeClaimedApplyOptions{suppressRecoveredObserver: true, cutover: cutover})
 	stopHeartbeat()
 	if !resumed && errors.Is(resumeErr, tern.ErrNoTasksForApplyOperation) {
 		// The drive failed closed: the operation has no tasks, so it can never
@@ -637,6 +655,66 @@ func (s *Service) recoverMultiApplyOperation(ctx context.Context, driverID int, 
 			"deployment", op.Deployment, "environment", finalApply.Environment, "error", err)
 		return
 	}
+}
+
+// recoverApplyOperationCutover claims the next barrier-parked operation whose
+// deployment-ordered turn it is to cut over and drives it through its swap. It is
+// the cutover counterpart to recoverApplyOperation's copy claim: the storage
+// predicate (FindNextApplyOperationCutover) only returns operations of a
+// multi-operation barrier apply, so the drive always runs under the operation
+// lease only and the parent applies row is settled by the projection CAS. With
+// one operation per apply today nothing parks at the barrier, so this is dormant
+// until the multi-deployment fan-out lands.
+//
+// Returns true when this tick is consumed by a cutover claim — an operation was
+// claimed (whether or not the drive that followed succeeded) or the claim itself
+// errored — so the caller does not also run the normal copy-operation claim this
+// tick. Returns false only when nothing is ready to cut over.
+func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int, owner string) bool {
+	op, err := s.storage.ApplyOperations().FindNextApplyOperationCutover(ctx, owner)
+	if err != nil {
+		s.logger.Error("operator: failed to claim apply_operation cutover", "driver", driverID, "lease_owner", owner, "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_cutover_storage_error")
+		return true
+	}
+	if op == nil {
+		s.logger.Debug("operator: no apply_operation to cut over", "driver", driverID)
+		return false
+	}
+
+	// The claim rotated a fresh operation lease onto the row; it is the
+	// capability that guards this operation's writes, so fail closed if missing.
+	opLease := op.Lease()
+	if !opLease.Valid() {
+		s.logger.Error("operator: claimed apply_operation cutover without a valid operation lease token; operation will not be driven",
+			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
+			"apply_db_id", op.ApplyID, "deployment", op.Deployment)
+		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_cutover_lease_token")
+		return true
+	}
+
+	// The cutover predicate already gates to multi-operation barrier applies, but
+	// the operation-lease-only drive (and its parent-write suppression) is only
+	// correct for a genuine multi-operation apply, so verify the set before
+	// driving rather than trusting the claim alone.
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, op.ApplyID)
+	if err != nil {
+		s.logger.Error("operator: failed to list operations for claimed cutover; operation will not be driven",
+			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
+			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_cutover_set_list_error")
+		return true
+	}
+	if len(ops) <= 1 || !operationSetContainsID(ops, op.ID) {
+		s.logger.Error("operator: claimed cutover operation is not part of a multi-operation apply set; operation will not be driven",
+			"driver", driverID, "lease_owner", owner, "apply_operation_id", op.ID,
+			"apply_db_id", op.ApplyID, "deployment", op.Deployment, "operation_count", len(ops))
+		metrics.RecordOperatorClaimFailure(ctx, "operation_cutover_set_invalid")
+		return true
+	}
+
+	s.driveClaimedMultiOperation(ctx, driverID, op, opLease, true)
+	return true
 }
 
 // recoverApplyPendingStop drives stop reconciliation for an apply that has a
@@ -895,6 +973,11 @@ type resumeClaimedApplyOptions struct {
 	// terminal summary is published once by the projection CAS winner, not per
 	// deployment, so the per-driver observer must not fire.
 	suppressRecoveredObserver bool
+	// cutover routes the operation through ResumeApplyOperationCutover instead of
+	// ResumeApplyOperation: it drives a single operation parked at the cutover
+	// barrier through its high-risk swap (the deployment-ordered cutover claim)
+	// rather than running its copy phase.
+	cutover bool
 }
 
 func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID int, apply *storage.Apply, applyOperationID int64, operationDeployment string, opts resumeClaimedApplyOptions) (bool, error) {
@@ -964,11 +1047,15 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	}
 	// The operation-claim path scopes the drive to the single deployment it
 	// leased so sibling deployments are unaffected; ResumeApplyOperation fails
-	// closed when no tasks scope to the operation. The legacy whole-apply path
-	// (applyOperationID == 0) drives every task of the apply.
-	if applyOperationID > 0 {
+	// closed when no tasks scope to the operation. The cutover variant drives a
+	// barrier-parked operation through its swap instead of its copy phase. The
+	// legacy whole-apply path (applyOperationID == 0) drives every task.
+	switch {
+	case applyOperationID > 0 && opts.cutover:
+		err = client.ResumeApplyOperationCutover(ctx, apply, applyOperationID)
+	case applyOperationID > 0:
 		err = client.ResumeApplyOperation(ctx, apply, applyOperationID)
-	} else {
+	default:
 		err = client.ResumeApply(ctx, apply)
 	}
 	if err != nil {
