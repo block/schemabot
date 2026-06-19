@@ -640,13 +640,16 @@ func (s *Service) recoverMultiApplyOperation(ctx context.Context, driverID int, 
 }
 
 // recoverApplyPendingStop drives stop reconciliation for an apply that has a
-// pending stop request but no claimable operation to carry it. Under on_failure
-// "continue" a failed earlier sibling can leave an apply with only terminal and
-// pending operations; the claim gate keeps the pending ones from starting, so
-// the normal operation-claim path never visits the apply and its stop would
-// strand forever. This path claims such an apply directly, stops its pending
-// siblings, re-derives the parent, and completes the stop once the apply is
-// terminal.
+// pending stop request but no claimable operation to carry it. Two cases reach
+// here: an apply whose operation row is still pending while its task is already
+// running (a direct data-plane apply marks the task running before the operator
+// claims the operation), and an on_failure "continue" rollout where a failed
+// earlier sibling left only terminal and pending operations that the claim gate
+// keeps from starting. In both cases the normal operation-claim path never
+// drives the apply, so its stop would strand forever. This path claims the apply
+// directly, drives the data-plane stop so the engine halts and the tasks settle
+// to stopped, terminalizes the pending operation rows, re-derives the parent,
+// and completes the stop once the apply is terminal.
 //
 // Returns true when this tick is consumed by stop reconciliation — an apply was
 // claimed (whether the reconciliation that followed succeeded or hit an error)
@@ -676,7 +679,39 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	}
 	applyLeaseCtx := storage.WithApplyLease(ctx, lease)
 
-	if err := s.stopPendingOperationsForPendingStop(applyLeaseCtx, driverID, apply); err != nil {
+	// Drive the pending stop through the data plane before terminalizing any
+	// rows. The data-plane drive (ResumeApply -> processPendingStopControlRequest
+	// -> stopOwnedApply) halts live engine work and sets the apply's tasks to
+	// stopped. Without it, an apply whose operation row is still pending while its
+	// task is already running would have its operation and apply rows marked
+	// stopped while the task keeps running, leaving no stopped task for a later
+	// start to resume. applyOperationID 0 selects the whole-apply drive: this path
+	// holds the apply lease, not an operation lease, because no single operation
+	// is carrying the stop.
+	resumed, err := s.resumeClaimedApply(applyLeaseCtx, driverID, apply, 0, "")
+	if err != nil {
+		// Fail closed: leave the pending stop and pending operation rows untouched
+		// so the next tick reclaims this apply and retries the data-plane stop.
+		s.logger.Error("operator: failed to drive data-plane stop during stop reconciliation",
+			"driver", driverID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment, "error", err)
+		return true
+	}
+	if !resumed {
+		s.logger.Warn("operator: data-plane stop drive did not run during stop reconciliation; leaving stop for retry",
+			"driver", driverID, "apply_id", apply.ApplyIdentifier,
+			"database", apply.Database, "environment", apply.Environment)
+		return true
+	}
+
+	// The data-plane drive stopped the tasks and completed the stop control
+	// request, but it does not touch apply_operations rows. Terminalize the
+	// still-pending operations so the derived parent state below stays stopped and
+	// the operation rows match the now-stopped tasks. The stop request is already
+	// completed, so this goes through the unguarded helper rather than
+	// stopPendingOperationsForPendingStop (which would no-op without a pending
+	// stop).
+	if err := s.markPendingOperationsStopped(applyLeaseCtx, driverID, apply); err != nil {
 		s.logger.Error("operator: failed to stop pending sibling operations during stop reconciliation",
 			"driver", driverID, "apply_id", apply.ApplyIdentifier,
 			"database", apply.Database, "environment", apply.Environment, "error", err)
@@ -731,7 +766,16 @@ func (s *Service) stopPendingOperationsForPendingStop(ctx context.Context, drive
 	if controlReq == nil {
 		return nil
 	}
+	return s.markPendingOperationsStopped(ctx, driverID, apply)
+}
 
+// markPendingOperationsStopped terminalizes every still-pending operation of the
+// apply to stopped. Callers must have already established the stop intent — a
+// pending stop request, or a completed data-plane stop drive — because this does
+// not re-check the control request. That lets it run after the data-plane drive
+// has already completed the stop request, where the pending-stop guard in
+// stopPendingOperationsForPendingStop would otherwise short-circuit to a no-op.
+func (s *Service) markPendingOperationsStopped(ctx context.Context, driverID int, apply *storage.Apply) error {
 	stopped, err := s.storage.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
 	if err != nil {
 		return fmt.Errorf("stop pending apply_operations for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)

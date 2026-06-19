@@ -350,6 +350,112 @@ func TestOperator_OperatorReconcilesOperationWhenParentTerminal(t *testing.T) {
 	assert.Equal(t, derived, parent.State, "parent apply state is derived from its child operations")
 }
 
+// TestOperator_StopReconciliationDrivesTaskStop covers the operation-claim stop
+// path for an apply whose operation row is still pending when a stop is
+// requested — the window before the operator claims and drives the operation.
+// Stop reconciliation must drive the data-plane stop so the task settles to
+// stopped, not only flip the operation and apply rows. Otherwise the apply reads
+// stopped while its task stays non-terminal, and a later start finds no stopped
+// task to resume.
+func TestOperator_StopReconciliationDrivesTaskStop(t *testing.T) {
+	ctx := t.Context()
+	appDBName, appDSN := createTestDB(t, "stop_reconcile_drive_")
+	ts := startTestServerOperator(t, appDBName, appDSN)
+
+	now := time.Now()
+	applyID, err := ts.Storage.Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply-stop-reconcile-drive",
+		Database:        appDBName,
+		DatabaseType:    "mysql",
+		Deployment:      appDBName,
+		Engine:          "spirit",
+		State:           state.Apply.Pending,
+		Options:         []byte("{}"),
+		Environment:     "staging",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	require.NoError(t, err)
+
+	opID, err := ts.Storage.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    applyID,
+		Deployment: appDBName,
+		Target:     appDBName,
+		State:      state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+
+	const taskIdentifier = "task-stop-reconcile-drive"
+	_, err = ts.Storage.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier:   taskIdentifier,
+		ApplyID:          applyID,
+		ApplyOperationID: &opID,
+		Database:         appDBName,
+		DatabaseType:     "mysql",
+		Engine:           "spirit",
+		Environment:      "staging",
+		State:            state.Task.Pending,
+		TableName:        "users",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	})
+	require.NoError(t, err)
+
+	_, _, err = ts.Storage.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "test",
+	})
+	require.NoError(t, err)
+
+	// The operator drives the data-plane stop, settling the task to stopped
+	// before terminalizing the operation and apply rows. Wait for the full
+	// settled state in one condition: the operation and apply rows are
+	// terminalized after the task stop, so polling them independently would
+	// race that window. The load-bearing assertion is task == stopped: without
+	// the fix the operator flips the operation/apply rows but never drives the
+	// task, so this condition never holds and the test fails.
+	require.Eventually(t, func() bool {
+		task, err := ts.Storage.Tasks().Get(ctx, taskIdentifier)
+		if err != nil || task == nil || !state.IsState(task.State, state.Task.Stopped) {
+			return false
+		}
+		op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+		if err != nil || op == nil || !state.IsState(op.State, state.ApplyOperation.Stopped) {
+			return false
+		}
+		apply, err := ts.Storage.Applies().Get(ctx, applyID)
+		if err != nil || apply == nil || !state.IsState(apply.State, state.Apply.Stopped) {
+			return false
+		}
+		return true
+	}, 10*time.Second, 100*time.Millisecond,
+		"stop reconciliation must drive the task to stopped and terminalize the operation and apply rows")
+
+	task, err := ts.Storage.Tasks().Get(ctx, taskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	assert.Equal(t, state.Task.Stopped, task.State, "task settles to stopped via the data-plane drive")
+
+	op, err := ts.Storage.ApplyOperations().Get(ctx, opID)
+	require.NoError(t, err)
+	require.NotNil(t, op)
+	assert.Equal(t, state.ApplyOperation.Stopped, op.State, "operation row is terminalized to stopped")
+
+	apply, err := ts.Storage.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.Equal(t, state.Apply.Stopped, apply.State, "apply settles to stopped")
+
+	// The stop request is completed once the apply has stopped.
+	require.Eventually(t, func() bool {
+		req, err := ts.Storage.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStop)
+		return err == nil && req == nil
+	}, 5*time.Second, 100*time.Millisecond,
+		"pending stop request is completed after the apply stops")
+}
+
 // TestOperator_OperationDeploymentDrivesByOperationDeployment proves the
 // operation-claim path routes the drive by the claimed apply_operations row's
 // own deployment, not the parent apply's stored deployment. The parent apply's
