@@ -30,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/block/schemabot/pkg/inventory"
+	"github.com/block/schemabot/pkg/secrets"
 )
 
 // defaultAccountAttribute is the endpoint attribute holding the target's AWS
@@ -301,18 +302,15 @@ func truncateToRunes(s string, maxLen int) string {
 	return string([]rune(s)[:maxLen])
 }
 
-// getSecretString reads a string secret value, rejecting binary secrets.
-func getSecretString(ctx context.Context, client *secretsmanager.Client, secretName string) (string, error) {
+// getSecretValue reads a secret's value from Secrets Manager (string or binary).
+func getSecretValue(ctx context.Context, client *secretsmanager.Client, secretName string) (string, error) {
 	resp, err := client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
 		SecretId: aws.String(secretName),
 	})
 	if err != nil {
 		return "", fmt.Errorf("get secret value: %w", err)
 	}
-	if resp.SecretString == nil {
-		return "", fmt.Errorf("secret %q has no string value (binary secrets are not supported)", secretName)
-	}
-	return *resp.SecretString, nil
+	return secrets.ValueFromGetSecretOutput(resp, secretName)
 }
 
 // ownAccountFetcher reads secrets from the caller's own account using a single
@@ -323,7 +321,7 @@ type ownAccountFetcher struct {
 
 // FetchSecret returns the raw secret string from the caller's own account.
 func (f *ownAccountFetcher) FetchSecret(ctx context.Context, _ string, secretName string) (string, error) {
-	return getSecretString(ctx, f.client, secretName)
+	return getSecretValue(ctx, f.client, secretName)
 }
 
 // assumeRoleFetcher reads secrets via Secrets Manager using per-account
@@ -341,7 +339,7 @@ type assumeRoleFetcher struct {
 
 // FetchSecret returns the raw secret string from the target account.
 func (f *assumeRoleFetcher) FetchSecret(ctx context.Context, accountID, secretName string) (string, error) {
-	return getSecretString(ctx, f.clientForAccount(accountID), secretName)
+	return getSecretValue(ctx, f.clientForAccount(accountID), secretName)
 }
 
 func (f *assumeRoleFetcher) clientForAccount(accountID string) *secretsmanager.Client {

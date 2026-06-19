@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -67,3 +69,20 @@ func TestResolve_LiteralWithColon(t *testing.T) {
 
 // Note: secretsmanager: tests would require mocking AWS SDK or integration tests
 // The AWS functionality is tested via integration tests with LocalStack
+
+func TestValueFromGetSecretOutput(t *testing.T) {
+	// The string form is used when present.
+	got, err := ValueFromGetSecretOutput(&secretsmanager.GetSecretValueOutput{SecretString: aws.String("pw")}, "secret")
+	require.NoError(t, err)
+	assert.Equal(t, "pw", got)
+
+	// A binary-only secret falls back to its bytes rather than being rejected.
+	got, err = ValueFromGetSecretOutput(&secretsmanager.GetSecretValueOutput{SecretBinary: []byte("binary-pw")}, "secret")
+	require.NoError(t, err)
+	assert.Equal(t, "binary-pw", got)
+
+	// Neither form set is an error naming the secret.
+	_, err = ValueFromGetSecretOutput(&secretsmanager.GetSecretValueOutput{}, "secret")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has no value")
+}

@@ -146,11 +146,9 @@ func resolveSecretsManager(ref string) (string, error) {
 		return "", fmt.Errorf("get secret %q: %w", secretName, err)
 	}
 
-	secretValue := ""
-	if result.SecretString != nil {
-		secretValue = *result.SecretString
-	} else {
-		return "", fmt.Errorf("secret %q has no string value (binary secrets not supported)", secretName)
+	secretValue, err := ValueFromGetSecretOutput(result, secretName)
+	if err != nil {
+		return "", err
 	}
 
 	// If no JSON key specified, return the whole secret
@@ -176,4 +174,19 @@ func resolveSecretsManager(ref string) (string, error) {
 	default:
 		return fmt.Sprintf("%v", v), nil
 	}
+}
+
+// ValueFromGetSecretOutput returns a secret's value, preferring the string form
+// and falling back to the binary form. Secrets Manager stores a value as exactly
+// one of the two; some secrets (for example a password written via the binary
+// API) only have the binary form, so decode those bytes as a string rather than
+// rejecting them. aws-sdk-go-v2 has already base64-decoded SecretBinary.
+func ValueFromGetSecretOutput(resp *secretsmanager.GetSecretValueOutput, secretName string) (string, error) {
+	if resp.SecretString != nil {
+		return *resp.SecretString, nil
+	}
+	if len(resp.SecretBinary) > 0 {
+		return string(resp.SecretBinary), nil
+	}
+	return "", fmt.Errorf("secret %q has no value", secretName)
 }
