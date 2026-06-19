@@ -349,6 +349,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 func renderResumingTable(sb *strings.Builder, table TableProgressData) {
 	fmt.Fprintf(sb, "**`%s`**: \U0001f504 Resuming…\n", table.TableName)
 	writeDDLLine(sb, table.DDL)
+	sb.WriteString("\n")
 }
 
 // tableStatePriority returns a sort key: lower = rendered first (active on top, completed on bottom).

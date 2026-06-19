@@ -326,10 +326,15 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 
 	st := mysqlstore.New(schemabotDB)
 
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM apply_comments")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM tasks WHERE repository = 'org/repo-rotate'")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'org/repo-rotate'")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'org/repo-rotate'")
+	for _, stmt := range []string{
+		"DELETE FROM apply_comments",
+		"DELETE FROM tasks WHERE repository = 'org/repo-rotate'",
+		"DELETE FROM applies WHERE repository = 'org/repo-rotate'",
+		"DELETE FROM locks WHERE repository = 'org/repo-rotate'",
+	} {
+		_, err = schemabotDB.ExecContext(ctx, stmt)
+		require.NoError(t, err)
+	}
 
 	lock := &storage.Lock{
 		DatabaseName: "e2e_rotate_db",

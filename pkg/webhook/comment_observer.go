@@ -58,6 +58,7 @@ type CommentObserver struct {
 	lastRowsCopied    int64
 	stagnantTicks     int
 	hasCutoverComment bool
+	resumeRotated     bool
 }
 
 const (
@@ -448,6 +449,15 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 // exactly once and the eventual terminal summary is posted fresh. Returns true
 // when it rotated.
 func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, tasks []*storage.Task) bool {
+	if o.resumeRotated {
+		// This observer already rotated for the current resume. Guard against
+		// re-rotating (and posting duplicate fresh comments) on later ticks if the
+		// summary-marker delete below failed to land. A fresh observer on a later
+		// drive claim starts with this unset and rotates once more, bounding any
+		// duplicate to one per drive rather than one per tick.
+		return false
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -464,6 +474,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 
 	body := o.formatStatusComment(apply, tasks)
 	o.postAndTrackComment(apply, state.Comment.Progress, body)
+	o.resumeRotated = true
 
 	if err := o.stor.ApplyComments().Delete(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Summary); err != nil {
 		o.logError(apply, "observer: failed to consume summary marker after resume rotation", "error", err)
