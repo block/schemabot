@@ -808,6 +808,12 @@ type ApplyComment struct {
 	// LastEditedAt is when the comment was last edited via the GitHub API.
 	LastEditedAt *time.Time
 
+	// SupersededAt is set when this comment has been retired by a newer one
+	// (e.g. a stopped-summary marker consumed when the apply resumes). The row and
+	// the GitHub comment are kept; SchemaBot just no longer treats it as the active
+	// comment for its state. Nil means active.
+	SupersededAt *time.Time
+
 	// CreatedAt is when the comment was first posted.
 	CreatedAt time.Time
 

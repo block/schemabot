@@ -447,14 +447,17 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	}
 	assert.NotEqual(t, stoppedProgressID, newProgressID, "resume must post a new comment, not reuse the stopped one")
 
-	// The progress row now tracks the new comment; the summary marker is consumed.
+	// The progress row now tracks the new comment; the stopped-summary marker is
+	// consumed by being superseded — the row and its GitHub comment are kept, not
+	// deleted.
 	prog, err := st.ApplyComments().Get(ctx, applyID, state.Comment.Progress)
 	require.NoError(t, err)
 	require.NotNil(t, prog)
 	assert.Equal(t, newProgressID, prog.GitHubCommentID)
 	summary, err := st.ApplyComments().Get(ctx, applyID, state.Comment.Summary)
 	require.NoError(t, err)
-	assert.Nil(t, summary, "stopped summary marker should be consumed after rotation")
+	require.NotNil(t, summary, "the stopped-summary row is retired, not deleted")
+	assert.NotNil(t, summary.SupersededAt, "the stopped-summary marker is superseded after rotation")
 
 	// Once the data plane leaves stopped the apply is Running: a later tick edits
 	// the new comment in place (it does not rotate again) and now shows the bar.

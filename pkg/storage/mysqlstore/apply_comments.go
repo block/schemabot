@@ -13,7 +13,7 @@ import (
 )
 
 // applyCommentColumns lists all columns for SELECT queries.
-const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, edit_count, last_edited_at, created_at, updated_at`
+const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, edit_count, last_edited_at, superseded_at, created_at, updated_at`
 
 // applyCommentStore implements storage.ApplyCommentStore using MySQL.
 type applyCommentStore struct {
@@ -32,7 +32,8 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 			INSERT INTO apply_comments (apply_id, comment_state, github_comment_id)
 			VALUES (?, ?, ?)
 			ON DUPLICATE KEY UPDATE
-				github_comment_id = VALUES(github_comment_id)
+				github_comment_id = VALUES(github_comment_id),
+				superseded_at = NULL
 		`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID)
 		return err
 	}
@@ -42,7 +43,8 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 		SELECT ?, ?, ? FROM applies a
 		WHERE a.id = ? AND a.lease_token = ?
 		ON DUPLICATE KEY UPDATE
-			github_comment_id = VALUES(github_comment_id)
+			github_comment_id = VALUES(github_comment_id),
+			superseded_at = NULL
 	`, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
@@ -129,33 +131,40 @@ func (s *applyCommentStore) DeleteByApply(ctx context.Context, applyID int64) er
 	return err
 }
 
-// Delete removes the tracked comment record for a single (apply_id, comment_state).
-// It stops SchemaBot editing that GitHub comment again; the comment itself is left
-// in place on the PR as a historical record. A missing row is not an error.
-func (s *applyCommentStore) Delete(ctx context.Context, applyID int64, commentState string) error {
+// Supersede retires the tracked comment for a single (apply_id, comment_state) by
+// stamping superseded_at, without deleting the row or the GitHub comment. The
+// comment stays on the PR as a record; SchemaBot just no longer treats it as the
+// active comment for its state (so it is not edited again and does not re-trigger
+// resume detection). A missing or already-superseded row is not an error. A later
+// Upsert for the same state clears superseded_at, making the row active again.
+func (s *applyCommentStore) Supersede(ctx context.Context, applyID int64, commentState string) error {
 	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
 	if err != nil {
 		return err
 	}
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, `
-			DELETE FROM apply_comments WHERE apply_id = ? AND comment_state = ?
+			UPDATE apply_comments SET superseded_at = NOW()
+			WHERE apply_id = ? AND comment_state = ? AND superseded_at IS NULL
 		`, applyID, commentState)
 		return err
 	}
 	result, err := s.db.ExecContext(ctx, `
-		DELETE c FROM apply_comments c
+		UPDATE apply_comments c
 		JOIN applies a ON a.id = c.apply_id
-		WHERE c.apply_id = ? AND c.comment_state = ? AND a.lease_token = ?
+		SET c.superseded_at = NOW()
+		WHERE c.apply_id = ? AND c.comment_state = ? AND c.superseded_at IS NULL AND a.lease_token = ?
 	`, applyID, commentState, lease.Token)
 	if err != nil {
 		return err
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("read apply comment delete rows affected for apply %d state %s: %w", applyID, commentState, err)
+		return fmt.Errorf("read apply comment supersede rows affected for apply %d state %s: %w", applyID, commentState, err)
 	}
 	if rows == 0 {
+		// Zero rows can mean the row was missing, already superseded, or the lease
+		// was lost. The first two are benign; surface only a lost lease.
 		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
 			return err
 		}
@@ -191,7 +200,7 @@ func scanApplyCommentInto(s scanner) (*storage.ApplyComment, error) {
 	err := s.Scan(
 		&comment.ID, &comment.ApplyID, &comment.CommentState,
 		&comment.GitHubCommentID, &comment.EditCount, &comment.LastEditedAt,
-		&comment.CreatedAt, &comment.UpdatedAt,
+		&comment.SupersededAt, &comment.CreatedAt, &comment.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err

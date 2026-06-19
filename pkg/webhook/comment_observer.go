@@ -466,9 +466,10 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 		o.logError(apply, "observer: failed to check for summary comment before resume rotation", "error", err)
 		return false
 	}
-	if summary == nil {
-		// No summary comment — the apply has not been stopped, so there is nothing
-		// to rotate. This is the common path on every progress tick.
+	if summary == nil || summary.SupersededAt != nil {
+		// No active summary comment — either the apply has not been stopped, or a
+		// prior resume already consumed the marker. Nothing to rotate. This is the
+		// common path on every progress tick.
 		return false
 	}
 
@@ -476,7 +477,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	o.postAndTrackComment(apply, state.Comment.Progress, body)
 	o.resumeRotated = true
 
-	if err := o.stor.ApplyComments().Delete(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Summary); err != nil {
+	if err := o.stor.ApplyComments().Supersede(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Summary); err != nil {
 		o.logError(apply, "observer: failed to consume summary marker after resume rotation", "error", err)
 		return true
 	}

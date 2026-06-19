@@ -5,6 +5,7 @@ CREATE TABLE `apply_comments` (
   `github_comment_id` bigint NOT NULL,
   `edit_count` int NOT NULL DEFAULT '0',
   `last_edited_at` datetime DEFAULT NULL,
+  `superseded_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),

@@ -171,13 +171,13 @@ func TestApplyCommentStore_DeleteByApply(t *testing.T) {
 	require.NoError(t, store.ApplyComments().DeleteByApply(ctx, 99999))
 }
 
-func TestApplyCommentStore_Delete(t *testing.T) {
+func TestApplyCommentStore_Supersede(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := New(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
-	apply := createTestApply(t, store, lock, "apply_comment_del_one", 1)
+	apply := createTestApply(t, store, lock, "apply_comment_supersede", 1)
 
 	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
 		ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 100,
@@ -186,21 +186,35 @@ func TestApplyCommentStore_Delete(t *testing.T) {
 		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 101,
 	}))
 
-	// Delete only the summary marker; the progress comment must remain tracked.
-	require.NoError(t, store.ApplyComments().Delete(ctx, apply.ID, state.Comment.Summary))
+	// Supersede the summary marker. The row is retired in place, not deleted, and
+	// the progress comment is untouched.
+	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
 
 	summary, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	require.NoError(t, err)
-	assert.Nil(t, summary)
+	require.NotNil(t, summary, "the superseded row is kept, not deleted")
+	assert.NotNil(t, summary.SupersededAt, "the row is marked superseded")
+	assert.Equal(t, int64(101), summary.GitHubCommentID, "the GitHub comment id is preserved")
 
 	progress, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
 	require.NoError(t, err)
 	require.NotNil(t, progress)
+	assert.Nil(t, progress.SupersededAt)
 	assert.Equal(t, int64(100), progress.GitHubCommentID)
 
-	// Deleting a comment state that does not exist is a no-op, not an error.
-	require.NoError(t, store.ApplyComments().Delete(ctx, apply.ID, state.Comment.Summary))
-	require.NoError(t, store.ApplyComments().Delete(ctx, 99999, state.Comment.Progress))
+	// Re-posting a summary (e.g. on a later stop) reactivates the row.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 102,
+	}))
+	summary, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Nil(t, summary.SupersededAt, "a re-posted summary is active again")
+	assert.Equal(t, int64(102), summary.GitHubCommentID)
+
+	// Superseding a missing or already-superseded state is a no-op, not an error.
+	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Cutover))
+	require.NoError(t, store.ApplyComments().Supersede(ctx, 99999, state.Comment.Progress))
 }
 
 func TestApplyCommentStore_UniqueConstraint(t *testing.T) {
