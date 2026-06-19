@@ -648,8 +648,16 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	// Deferred-deploy start gate keys on the PARENT apply state, not the
+	// operation state: the operation row stays active (running) while the apply
+	// parks at waiting_for_deploy, because the copy phase finished and only the
+	// deploy is deferred. The operation row is never persisted to
+	// waiting_for_deploy, so an operation-state predicate would never match.
+	// Gating on the parent's waiting_for_deploy state mirrors
+	// ApplyStore.FindNextApply's deferred-deploy clause.
+	queryArgs = append(queryArgs, stringArgs(activeStates)...)
+	queryArgs = append(queryArgs, state.Apply.WaitingForDeploy)
 	queryArgs = append(queryArgs,
-		state.ApplyOperation.WaitingForDeploy,
 		storage.ControlOperationStart, storage.ControlRequestPending)
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
@@ -662,8 +670,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//   - A stopped operation whose parent apply has a pending start request is
 	//     reclaimable so the operator can resume it.
 	//
-	//   - A waiting-for-deploy operation whose parent apply has a pending start
-	//     request is reclaimable so the operator can trigger the deferred deploy.
+	//   - An active operation whose PARENT apply is waiting_for_deploy and has a
+	//     pending start request is reclaimable so the operator can trigger the
+	//     deferred deploy. The operation row stays running while the apply parks
+	//     at waiting_for_deploy (only the deploy is deferred), so this gate keys
+	//     on the parent apply state, mirroring ApplyStore.FindNextApply.
 	//
 	//   - A failed_retryable operation is reclaimable only while its PARENT apply
 	//     is itself claimable for that operation's recovery. The operator claim
@@ -749,7 +760,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				)
 			)
 			OR (
-				state = ?
+				state IN (%s)
+				AND EXISTS (
+					SELECT 1
+					FROM applies a
+					WHERE a.id = apply_operations.apply_id
+						AND a.state = ?
+				)
 				AND EXISTS (
 					SELECT 1
 					FROM apply_control_requests cr
@@ -786,7 +803,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, activeStatePlaceholders, applyOperationHeartbeatStaleness, activeStatePlaceholders, applyOperationHeartbeatStaleness), queryArgs...)
+	`, applyOperationColumns, activeStatePlaceholders, applyOperationHeartbeatStaleness, activeStatePlaceholders, activeStatePlaceholders, applyOperationHeartbeatStaleness), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

@@ -890,6 +890,97 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsWaitingForDeployWithPe
 	assert.Equal(t, id, reclaimed.ID)
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_ClaimsRunningOpWhenParentWaitingForDeploy
+// covers the real deferred-deploy shape: while the apply parks at
+// waiting_for_deploy, the operation row stays running (the copy phase finished,
+// only the deploy is deferred). A pending start request must re-claim that
+// running operation so the operator can trigger the deferred deploy — the gate
+// keys on the parent apply's waiting_for_deploy state, not the operation state.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsRunningOpWhenParentWaitingForDeploy(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_running_parent_waiting", 1, state.Apply.WaitingForDeploy, "staging")
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Running,
+	})
+	require.NoError(t, err)
+	// The operation holds a fresh heartbeat (updated_at = NOW()) from its own
+	// in-flight copy drive, but its lease was acquired before the start request,
+	// so the lease-age gate admits the claim.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET lease_owner = 'copy-owner', lease_token = 'copy-token', lease_acquired_at = NOW() - INTERVAL 2 MINUTE, updated_at = NOW()
+		WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "running operation under a waiting-for-deploy parent with a pending start request must be reclaimable")
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Running, claimed.State, "re-claim must keep the running state for the resume drive to trigger the deploy")
+	assert.Equal(t, "test-operator", claimed.LeaseOwner)
+	assert.NotEmpty(t, claimed.LeaseToken)
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.Running, persisted.State)
+	assert.Equal(t, "test-operator", persisted.LeaseOwner)
+	assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SkipsRunningOpStartBeforeWaitingForDeploy
+// verifies the deferred-deploy gate does not steal a healthy operation lease
+// when a start request lands before the apply has reached waiting_for_deploy. A
+// running operation whose parent is still validating the deploy request must not
+// be re-claimed by the start request — that protects the "start too early" path.
+func TestApplyOperationStore_FindNextApplyOperation_SkipsRunningOpStartBeforeWaitingForDeploy(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_running_parent_running", 1, state.Apply.Running, "staging")
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Running,
+	})
+	require.NoError(t, err)
+	// Fresh lease and heartbeat: the operation is actively being driven, so no
+	// staleness clause applies either.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET lease_owner = 'copy-owner', lease_token = 'copy-token', lease_acquired_at = NOW(), updated_at = NOW()
+		WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a running operation must not be re-claimed by a start request before its parent reaches waiting_for_deploy")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_SkipsStoppedWithCompletedStart
 // verifies the claim predicate filters on a *pending* start request: once the
 // start request is no longer pending, the stopped operation is terminal again
