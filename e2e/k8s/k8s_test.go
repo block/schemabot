@@ -418,8 +418,26 @@ func createStoredK8sApplyWithTask(t *testing.T, dsn string, apply *storage.Apply
 		task.CompletedAt = &now
 	}
 
+	// Dual-write the apply_operations row alongside the apply, mirroring the
+	// production apply-create path. Every apply owns exactly one operation
+	// whose state tracks the parent, so the operator's operation-claim loop can
+	// claim and drive this apply; CreateWithTasksAndOperations links the task to
+	// the operation via apply_operation_id.
+	operation := &storage.ApplyOperation{
+		Deployment: apply.Deployment,
+		State:      apply.State,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if !state.IsState(apply.State, state.Apply.Pending) {
+		operation.StartedAt = &now
+	}
+	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
+		operation.CompletedAt = &now
+	}
+
 	store := mysqlstore.New(db)
-	_, err = store.Applies().CreateWithTasks(t.Context(), apply, []*storage.Task{task})
+	_, err = store.Applies().CreateWithTasksAndOperations(t.Context(), apply, []*storage.Task{task}, []*storage.ApplyOperation{operation})
 	require.NoError(t, err)
 	return apply.ApplyIdentifier
 }
