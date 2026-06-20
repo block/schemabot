@@ -45,9 +45,14 @@ type options struct {
 	date    string
 }
 
-// WithLogger sets the logger Run uses. When unset, Run uses slog.Default().
+// WithLogger sets the logger Run uses. A nil logger is ignored so Run keeps
+// slog.Default(); when unset, Run uses slog.Default().
 func WithLogger(logger *slog.Logger) Option {
-	return func(o *options) { o.logger = logger }
+	return func(o *options) {
+		if logger != nil {
+			o.logger = logger
+		}
+	}
 }
 
 // WithBuildInfo sets the build identifiers logged on startup.
@@ -118,7 +123,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
-		pingCtx, pingCancel := context.WithTimeout(context.Background(), pingTimeout)
+		pingCtx, pingCancel := context.WithTimeout(ctx, pingTimeout)
 		pingErr := db.PingContext(pingCtx)
 		pingCancel()
 		if pingErr != nil {
@@ -159,8 +164,6 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	svc := api.New(storage, cfg, nil, logger)
 	defer utils.CloseAndLog(svc)
 
-	srvCtx := context.Background()
-
 	// Build the webhook runtime before recovery starts so recovered applies can
 	// attach PR comment observers. If GitHub is not configured, the runtime
 	// serves a disabled webhook endpoint and skips comment reconciliation.
@@ -172,7 +175,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	// On startup, find applies that have a progress comment but no summary
 	// comment. This means terminal comment handling was interrupted; reconcile
 	// in the background so GitHub repair does not block server startup.
-	webhookRuntime.StartMissingSummaryReconciliation(srvCtx, logger)
+	webhookRuntime.StartMissingSummaryReconciliation(ctx, logger)
 
 	// When a dynamic target resolver is configured, build the data-plane client (a
 	// TargetRouter that resolves each request's target to a connection) and set it
@@ -181,7 +184,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	// server below reuses the same instance.
 	var dataPlaneClient tern.Client
 	if cfg.TargetResolver.Enabled() {
-		dataPlaneClient, err = buildGRPCTernClient(srvCtx, cfg, storage, logger, os.Getenv("TERN_ENVIRONMENT"), svc.WakeOperator)
+		dataPlaneClient, err = buildGRPCTernClient(ctx, cfg, storage, logger, os.Getenv("TERN_ENVIRONMENT"), svc.WakeOperator)
 		if err != nil {
 			return fmt.Errorf("build data-plane target router: %w", err)
 		}
@@ -194,13 +197,13 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	// - Dispatches queued local applies
 	// - Recovers applies with stale heartbeats (> 1 minute) using FOR UPDATE SKIP LOCKED
 	// - STOPPED applies are NOT auto-resumed (user must call `schemabot start`)
-	svc.StartOperator(srvCtx)
+	svc.StartOperator(ctx)
 
 	// Optionally start gRPC server for Tern proto (used by docker-compose.grpc.yml)
 	var grpcServer *grpc.Server
 	grpcPort := os.Getenv("GRPC_PORT")
 	if grpcPort != "" {
-		grpcServer, err = startGRPCServer(srvCtx, cfg, storage, logger, grpcPort, dataPlaneClient, svc.WakeOperator)
+		grpcServer, err = startGRPCServer(ctx, cfg, storage, logger, grpcPort, dataPlaneClient, svc.WakeOperator)
 		if err != nil {
 			return fmt.Errorf("start grpc server: %w", err)
 		}
@@ -223,12 +226,12 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	// Emit steady-state availability metrics for every configured remote Tern
 	// deployment so dashboards can show deployment-specific health even when no
 	// schema changes are running.
-	svc.StartRemoteDeploymentHealthMonitor(srvCtx)
+	svc.StartRemoteDeploymentHealthMonitor(ctx)
 	defer svc.StopRemoteDeploymentHealthMonitor()
 
 	// Permanently drop expired quarantined tables from local-mode MySQL
 	// databases once their pending drops retention period has passed.
-	svc.StartPendingDropsCleaner(srvCtx)
+	svc.StartPendingDropsCleaner(ctx)
 	defer svc.StopPendingDropsCleaner()
 
 	// Configure routes
@@ -242,7 +245,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	// allow-all NoneAuthorizer that lets every request through (attaching an
 	// anonymous user); with "oidc" it validates Bearer JWTs and bypasses
 	// non-API paths (/webhook, /metrics, health) itself.
-	authz, err := buildAuthorizer(srvCtx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, logger)
+	authz, err := buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, logger)
 	if err != nil {
 		return fmt.Errorf("setup auth: %w", err)
 	}
@@ -276,13 +279,17 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 		close(errCh)
 	}()
 
-	// Wait for shutdown signal
+	// Wait for a shutdown signal, context cancellation (embedded callers), or a
+	// fatal server error.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	select {
 	case sig := <-sigCh:
 		logger.Info("received shutdown signal", "signal", sig)
+	case <-ctx.Done():
+		logger.Info("context canceled, shutting down", "error", ctx.Err())
 	case err := <-errCh:
 		return err
 	}
@@ -322,7 +329,9 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 
 	go func() {
 		logger.Info("starting gRPC server", "port", port)
-		if err := grpcSrv.Serve(listener); err != nil {
+		// Serve returns ErrServerStopped on GracefulStop/Stop during normal
+		// shutdown; that is expected, not an error worth alerting on.
+		if err := grpcSrv.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			logger.Error("gRPC server error", "error", err)
 		}
 	}()
