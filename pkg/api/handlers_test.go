@@ -2023,9 +2023,9 @@ func TestProgressByApplyIDResolvesExternalIDForRemoteApply(t *testing.T) {
 
 // The progress endpoint's headline state is always the stored apply state —
 // the single source of truth shared with the PR comment observer. Even when the
-// live engine reports a more advanced phase, the response reflects stored state
-// so the CLI status and the PR comment never disagree. Live engine progress
-// still drives per-table detail, just not the headline state.
+// live engine reports a different phase, the response reflects stored state so
+// the CLI status and the PR comment never disagree. Live engine progress still
+// drives per-table detail, just not the headline state.
 func TestProgressByApplyIDDisplaysStoredStateNotLiveProto(t *testing.T) {
 	mock := &mockTernClient{
 		isRemote: true,
