@@ -2021,6 +2021,37 @@ func TestProgressByApplyIDResolvesExternalIDForRemoteApply(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, resp.State)
 }
 
+// The progress endpoint's headline state is always the stored apply state —
+// the single source of truth shared with the PR comment observer. Even when the
+// live engine reports a more advanced phase, the response reflects stored state
+// so the CLI status and the PR comment never disagree. Live engine progress
+// still drives per-table detail, just not the headline state.
+func TestProgressByApplyIDDisplaysStoredStateNotLiveProto(t *testing.T) {
+	mock := &mockTernClient{
+		isRemote: true,
+		progressResp: &ternv1.ProgressResponse{
+			ApplyId: "remote-apply-ps",
+			State:   ternv1.State_STATE_RUNNING,
+		},
+	}
+	apply := activeTestApply("apply-stored-state")
+	apply.ExternalID = "remote-apply-ps"
+	apply.State = state.Apply.WaitingForCutover
+	svc := newControlTestService(mock, apply)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-stored-state", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, state.Apply.WaitingForCutover, resp.State,
+		"displayed state must come from the stored apply state, not the live engine proto")
+}
+
 func TestProgressByApplyIDOnlySendsApplyIDAndEnvironment(t *testing.T) {
 	// Remote progress lookups use the apply ID as the stable routing key. The
 	// data plane should not need database routing hints to interpret that ID.

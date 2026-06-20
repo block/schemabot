@@ -290,3 +290,20 @@ func IsSetupPhase(s string) bool {
 func IsPlanetScaleEngine(engine string) bool {
 	return strings.EqualFold(engine, "planetscale") || strings.EqualFold(engine, "ENGINE_PLANETSCALE")
 }
+
+// InitialActiveApplyState returns the state an apply enters the moment its work
+// is dispatched to the engine. Spirit begins copying rows immediately, so its
+// first active phase is Running. PlanetScale begins by preparing a branch and
+// staging a deploy request, so its first active phase is PreparingBranch.
+//
+// Dispatch must use this instead of hardcoding Running: stamping Running on a
+// PlanetScale apply that is only preparing its branch misrepresents the engine
+// lifecycle and outranks the real deploy-request phases the engine later
+// reports, pinning the stored state — and every surface that renders it — at a
+// row-copy phase that has not begun.
+func InitialActiveApplyState(engine string) string {
+	if IsPlanetScaleEngine(engine) {
+		return Apply.PreparingBranch
+	}
+	return Apply.Running
+}

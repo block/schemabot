@@ -335,6 +335,12 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	if freshApply, err := s.storage.Applies().GetByApplyIdentifier(r.Context(), applyID); err == nil && freshApply != nil {
 		apply = freshApply
 	}
+	// The displayed apply state is always the stored apply state — the single
+	// source of truth shared with the PR comment observer and the status list.
+	// The live engine progress (resp) drives per-table detail and percentages,
+	// but never the headline state: sourcing state from the engine here would
+	// let this endpoint disagree with the comment, which renders stored state.
+	httpResp.State = apply.State
 	if apply.StartedAt != nil {
 		httpResp.StartedAt = apply.StartedAt.Format(time.RFC3339)
 	}

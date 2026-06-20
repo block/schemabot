@@ -1248,7 +1248,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			return fmt.Errorf("start queued gRPC apply %s: %w", apply.ApplyIdentifier, err)
 		}
 		now := time.Now()
-		apply.State = state.Apply.Running
+		apply.State = state.InitialActiveApplyState(apply.Engine)
 		if apply.StartedAt == nil {
 			apply.StartedAt = &now
 		}
@@ -1558,7 +1558,7 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	}
 	now := time.Now()
 	oldState := apply.State
-	apply.State = state.Apply.Running
+	apply.State = state.InitialActiveApplyState(apply.Engine)
 	if apply.StartedAt == nil {
 		apply.StartedAt = &now
 	}
@@ -1703,7 +1703,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId); err != nil {
 		return fmt.Errorf("store remote apply id for %s: %w", apply.ApplyIdentifier, err)
 	}
-	apply.State = state.Apply.Running
+	apply.State = state.InitialActiveApplyState(apply.Engine)
 	apply.ErrorMessage = ""
 	apply.CompletedAt = nil
 	if apply.StartedAt == nil {
