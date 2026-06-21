@@ -371,6 +371,17 @@ type TaskStore interface {
 	// Returns ErrTaskNotFound if the task does not exist.
 	Update(ctx context.Context, task *Task) error
 
+	// UpsertShardProgress creates or updates the per-shard task row for
+	// (apply_operation_id, namespace, table_name, shard). It is the operator's
+	// write-through for reflected per-shard progress (e.g. PlanetScale shards
+	// discovered via SHOW VITESS_MIGRATIONS). It requires the operation lease on
+	// the context: the single lease-holding operator is the only writer of an
+	// operation's per-shard rows, so the lookup-then-write is serialized by that
+	// lease and needs no unique constraint. A displaced operator (lost lease)
+	// fails closed with ErrApplyLeaseLost. On conflict only the progress fields
+	// change; identity and DDL are preserved.
+	UpsertShardProgress(ctx context.Context, task *Task) error
+
 	// GetByApplyID returns all tasks for an apply.
 	// Used for aggregating task states to derive Apply state.
 	GetByApplyID(ctx context.Context, applyID int64) ([]*Task, error)

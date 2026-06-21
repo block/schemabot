@@ -956,6 +956,144 @@ func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
 }
 
+func TestGRPCClient_ResumeApplyOperationDispatchParksBarrierCutoverRemotely(t *testing.T) {
+	// On a multi-deployment apply under the barrier cutover policy, the remote
+	// copy drive must instruct Tern to park at the cutover barrier (defer_cutover)
+	// so the deployment-ordered cutover claim can drive each operation's swap in
+	// turn. The apply itself was not started with manual --defer-cutover, so the
+	// instruction is the per-operation automatic barrier decision, derived at
+	// dispatch and never persisted onto the shared apply.
+	server := &capturingTernServer{
+		remoteApplyID: "remote-op-barrier-1",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-barrier",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:        "alter",
+		Namespace:        "default",
+		State:            state.Task.Pending,
+	}
+	taskStore := &mockTaskStore{
+		tasks:           []*storage.Task{task},
+		getByApplyIDErr: errors.New("whole-apply task load must not be used for operation-scoped resume"),
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   taskStore,
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-barrier",
+		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyBarrier},
+			siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyBarrier},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.NoError(t, err)
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected barrier operation to be dispatched to remote Tern")
+	assert.Equal(t, "true", req.Options["defer_cutover"],
+		"a multi-op barrier operation must dispatch with defer_cutover so the remote engine parks at the cutover barrier")
+	assert.False(t, apply.GetOptions().DeferCutover,
+		"the automatic barrier decision must not be persisted onto the shared apply options")
+}
+
+func TestGRPCClient_ResumeApplyOperationDispatchDoesNotDeferRollingCutover(t *testing.T) {
+	// A multi-deployment apply under the default rolling policy serializes copy
+	// and cutover per deployment, so its copy drive must NOT defer cutover — the
+	// barrier park is specific to the barrier policy.
+	server := &capturingTernServer{
+		remoteApplyID: "remote-op-rolling-1",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-rolling",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:        "alter",
+		Namespace:        "default",
+		State:            state.Task.Pending,
+	}
+	taskStore := &mockTaskStore{
+		tasks:           []*storage.Task{task},
+		getByApplyIDErr: errors.New("whole-apply task load must not be used for operation-scoped resume"),
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   taskStore,
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-rolling",
+		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling},
+			siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req)
+	assert.NotEqual(t, "true", req.Options["defer_cutover"],
+		"a rolling-policy operation must not defer cutover at dispatch")
+}
+
 func TestGRPCClient_ResumeApplyOperationStoresRemoteIDOnOperationForMultiOpApply(t *testing.T) {
 	// On a multi-deployment apply, each deployment gets its own remote Tern apply
 	// id. Dispatching one operation must store its remote id on that operation's

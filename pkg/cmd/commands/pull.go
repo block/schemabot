@@ -14,7 +14,7 @@ import (
 type PullCmd struct {
 	Database      string   `short:"d" required:"" help:"Database name from SchemaBot server config"`
 	Environment   string   `short:"e" required:"" help:"Source environment to pull from"`
-	Type          string   `help:"Database type" default:"mysql" enum:"mysql"`
+	Type          string   `help:"Database type override; resolved from the server's registered config when omitted"`
 	Namespaces    []string `name:"namespace" help:"Concrete live namespace to pull. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
 	CatalogDetail string   `help:"Structured catalog detail to include" default:"basic" enum:"basic,detailed"`
 }

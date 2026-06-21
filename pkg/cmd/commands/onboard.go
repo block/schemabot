@@ -19,7 +19,7 @@ type OnboardCmd struct {
 	Database          string   `short:"d" required:"" help:"Database name from SchemaBot server config"`
 	Environment       string   `short:"e" required:"" help:"Source environment to pull from"`
 	SchemaDir         string   `short:"s" required:"" help:"Schema root to write schemabot.yaml and namespace directories" name:"schema_dir"`
-	Type              string   `help:"Database type" default:"mysql" enum:"mysql"`
+	Type              string   `help:"Database type override; resolved from the server's registered config when omitted"`
 	Namespaces        []string `name:"namespace" help:"Concrete live namespace to onboard. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
 	TemplateEnvSuffix bool     `help:"Write namespaces ending in _<environment> as _$ENV directories" name:"template-env-suffix"`
 	DryRun            bool     `help:"Preview files without writing them" name:"dry-run"`

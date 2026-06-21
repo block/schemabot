@@ -33,7 +33,7 @@ func TestEnsureSchema(t *testing.T) {
 	require.NoError(t, EnsureSchema(dsn, logger), "First EnsureSchema failed")
 
 	// Verify tables exist
-	tables := []string{"tasks", "plans", "locks", "checks", "settings", "apply_operations", "vitess_apply_data", "vitess_tasks"}
+	tables := []string{"tasks", "plans", "locks", "checks", "settings", "apply_operations", "vitess_apply_data"}
 	for _, table := range tables {
 		assert.True(t, testutil.TableExists(t, db, "schemabot", table), "Table %s not found", table)
 	}
@@ -230,4 +230,33 @@ func startEnsureSchemaContainer(t *testing.T, ctx context.Context) (testcontaine
 	}, 30*time.Second, time.Second, "MySQL did not become ready")
 
 	return container, dsn, db
+}
+
+// A deployment that predates this change still has a live vitess_tasks table.
+// Now that the embedded schema no longer declares it, EnsureSchema must
+// reconcile the obsolete table away cleanly — succeeding, removing it, and
+// staying idempotent on the next run.
+func TestEnsureSchema_RemovesObsoleteVitessTasks(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	container, dsn, db := startEnsureSchemaContainer(t, ctx)
+	// Cleanup runs after the test, when t.Context() is already cancelled.
+	defer func() { _ = container.Terminate(t.Context()) }()
+	defer utils.CloseAndLog(db)
+
+	// Bring the schema up to date, then simulate a pre-existing deployment by
+	// recreating the obsolete table the embedded schema no longer declares.
+	require.NoError(t, EnsureSchema(dsn, logger))
+	_, err := db.ExecContext(ctx,
+		"CREATE TABLE `vitess_tasks` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	require.True(t, testutil.TableExists(t, db, "schemabot", "vitess_tasks"))
+
+	// EnsureSchema reconciles the obsolete table away without error...
+	require.NoError(t, EnsureSchema(dsn, logger), "EnsureSchema with an obsolete vitess_tasks table failed")
+	assert.False(t, testutil.TableExists(t, db, "schemabot", "vitess_tasks"), "obsolete vitess_tasks should be removed")
+
+	// ...and the next run is a clean no-op.
+	require.NoError(t, EnsureSchema(dsn, logger), "second EnsureSchema not idempotent")
 }

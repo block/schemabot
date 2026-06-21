@@ -324,23 +324,14 @@
 //
 // # VSchema Tasks
 //
-// VSchema updates and routing rule changes are tracked as Vitess-specific tasks
-// in the vitess_tasks table (one row per keyspace with changes). This is needed
-// because:
-//   - A deploy request can be VSchema-only (zero DDLs). Without vitess_tasks,
-//     the apply would have zero tasks and DeriveApplyState() would have nothing
-//     to aggregate.
-//   - The progress view surfaces when VSchema updates are happening during
-//     a deploy (the in_progress_vschema deploy state).
-//   - VSchema tasks don't fit the DDL task schema (no table_name, no DDL string,
-//     no rows_copied, no engine_migration_id).
-//
-// VSchema task state follows the deploy request: when the deploy hits
-// in_progress_vschema, VSchema tasks transition to running; when it passes,
-// they complete. They don't appear in SHOW VITESS_MIGRATIONS.
-//
-// DeriveApplyState() aggregates both DDL tasks (from the tasks table) and
-// VSchema tasks (from vitess_tasks) to compute the overall apply state.
+// VSchema updates are tracked as VSchema tasks in the regular tasks table, not a
+// separate table. They are marked by a synthetic table_name (e.g.
+// "VSchema: <keyspace>") rather than a real table and never appear in
+// SHOW VITESS_MIGRATIONS. Their state follows the deploy request: they transition
+// to running when the deploy reaches in_progress_vschema and complete when it
+// passes, and the overall apply state aggregates them alongside the DDL tasks.
+// This lets a VSchema-only deploy (zero DDLs) still have a task to aggregate and
+// surfaces the in_progress_vschema phase in the progress view.
 //
 // # Storage Tables
 //
@@ -350,13 +341,6 @@
 //   - deploy_request_id:  PlanetScale deploy request number
 //   - migration_context:  groups all SHOW VITESS_MIGRATIONS rows for this deploy
 //   - deploy_request_url: link to the deploy request in PlanetScale console
-//
-// vitess_tasks — per-keyspace non-DDL tasks. One row per keyspace with changes:
-//   - apply_id:   links to the apply
-//   - keyspace:   which keyspace this task covers
-//   - task_type:  "vschema" or "routing_rules"
-//   - state:      task state (pending, running, completed, failed)
-//   - payload:    JSON (e.g. the new VSchema or routing rules)
 //
 // DDL tasks use the regular tasks table. Per-task Vitess data is minimal:
 // just the engine_migration_id (Vitess migration UUID) on the task record.

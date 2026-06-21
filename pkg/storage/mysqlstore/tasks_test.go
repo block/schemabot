@@ -282,3 +282,122 @@ func TestTaskStore_UnshardedTaskHasEmptyShard(t *testing.T) {
 	assert.Equal(t, "", got.Shard, "unsharded tasks default to the empty-string shard")
 	assert.Equal(t, 0, got.CutoverAttempts)
 }
+
+// UpsertShardProgress is the operator's lease-held write-through for reflected
+// per-shard progress (e.g. PlanetScale shards from SHOW VITESS_MIGRATIONS). The
+// single lease-holding operator inserts a new per-shard task and updates it in
+// place on later passes (no duplicate row); a caller without the operation lease
+// is refused, and a displaced operator that lost the lease fails closed without
+// writing — on both the insert and update paths.
+func TestTaskStore_UpsertShardProgress(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "resolute", "vitess", "staging")
+	apply := createTestApply(t, store, lock, "apply_upsert_shard", 1)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "resolute",
+	})
+	require.NoError(t, err)
+	stampOperationLease(t, opID, "driver", "op-token")
+
+	opCtx := func(token string) context.Context {
+		return storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: "driver", Token: token,
+		})
+	}
+
+	now := time.Now()
+	shardTask := func(shard string) *storage.Task {
+		return &storage.Task{
+			TaskIdentifier:   "task-" + shard,
+			ApplyID:          apply.ID,
+			ApplyOperationID: &opID,
+			PlanID:           apply.PlanID,
+			Database:         apply.Database,
+			DatabaseType:     apply.DatabaseType,
+			Engine:           storage.EnginePlanetScale,
+			Environment:      apply.Environment,
+			State:            state.Task.Running,
+			Namespace:        "resolute",
+			TableName:        "users",
+			Shard:            shard,
+			DDL:              "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			DDLAction:        "ALTER",
+			RowsCopied:       100000,
+			RowsTotal:        500000,
+			ProgressPercent:  20,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+	}
+
+	// Without an operation lease on the context the write is refused outright.
+	require.ErrorContains(t, store.Tasks().UpsertShardProgress(ctx, shardTask("-80")),
+		"requires an operation lease")
+
+	// A displaced operator (stale token) fails closed on the insert path: nothing written.
+	require.ErrorIs(t, store.Tasks().UpsertShardProgress(opCtx("stale"), shardTask("-80")), storage.ErrApplyLeaseLost)
+	got, err := store.Tasks().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	assert.Empty(t, got, "a lost lease must not insert a shard task")
+
+	// The lease holder inserts the shard row.
+	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), shardTask("-80")))
+	got, err = store.Tasks().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "-80", got[0].Shard)
+	assert.Equal(t, 20, got[0].ProgressPercent)
+
+	// Re-upserting the same shard with advanced progress updates in place — no duplicate row.
+	advanced := shardTask("-80")
+	advanced.State = state.Task.Completed
+	advanced.ProgressPercent = 100
+	advanced.RowsCopied = 500000
+	advanced.ReadyToComplete = true
+	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), advanced))
+	got, err = store.Tasks().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	require.Len(t, got, 1, "re-upserting the same shard must update in place, not insert a duplicate")
+	assert.Equal(t, state.Task.Completed, got[0].State)
+	assert.Equal(t, 100, got[0].ProgressPercent)
+	assert.True(t, got[0].ReadyToComplete)
+
+	// A stale operator must not overwrite an existing shard row (update path fails closed).
+	stale := shardTask("-80")
+	stale.State = state.Task.Failed
+	stale.ProgressPercent = 5
+	require.ErrorIs(t, store.Tasks().UpsertShardProgress(opCtx("stale"), stale), storage.ErrApplyLeaseLost)
+	got, err = store.Tasks().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, state.Task.Completed, got[0].State, "a lost lease must not overwrite the shard row")
+	assert.Equal(t, 100, got[0].ProgressPercent)
+
+	// A different shard under the same operation is a separate row.
+	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), shardTask("80-")))
+	got, err = store.Tasks().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	assert.Len(t, got, 2, "a different shard is its own per-shard task row")
+
+	// A row targeting a different operation than the held lease is refused, so
+	// the lease cannot gate a write that points at another operation.
+	mismatched := shardTask("c0-")
+	otherOp := opID + 1000
+	mismatched.ApplyOperationID = &otherOp
+	require.Error(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), mismatched))
+
+	// A per-shard row must identify its table and shard.
+	noTable := shardTask("e0-")
+	noTable.TableName = ""
+	require.ErrorContains(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), noTable), "requires a table name")
+	noShard := shardTask("")
+	require.ErrorContains(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), noShard), "requires a non-empty shard")
+
+	// None of the refused writes created rows.
+	got, err = store.Tasks().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	assert.Len(t, got, 2, "refused writes must not create rows")
+}
