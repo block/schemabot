@@ -159,6 +159,116 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	return nil
 }
 
+// UpsertShardProgress creates or updates the per-shard task row for
+// (apply_operation_id, namespace, table_name, shard). It is the operator's
+// write-through for reflected per-shard progress (e.g. PlanetScale shards from
+// SHOW VITESS_MIGRATIONS).
+//
+// It requires the operation lease on the context: the single lease-holding
+// operator is the only writer of an operation's per-shard rows, so the
+// lookup-then-write is serialized by that lease without a database-level unique
+// constraint. The insert is gated on the lease so a displaced operator that lost
+// the lease fails closed (ErrApplyLeaseLost) instead of writing stale rows, and
+// the update path reuses the lease-guarded Update. On conflict only the progress
+// fields change; identity and DDL are preserved.
+func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task) error {
+	opLease, ok := storage.OperationLeaseFromContext(ctx)
+	if !ok {
+		return fmt.Errorf("upsert shard progress for %s.%s shard %q requires an operation lease", task.Namespace, task.TableName, task.Shard)
+	}
+	if !opLease.Valid() {
+		return fmt.Errorf("invalid operation lease for shard progress %s.%s shard %q: %w", task.Namespace, task.TableName, task.Shard, storage.ErrApplyLeaseLost)
+	}
+	if task.ApplyOperationID == nil {
+		return fmt.Errorf("upsert shard progress for %s.%s shard %q requires apply_operation_id", task.Namespace, task.TableName, task.Shard)
+	}
+	// Fail closed if the row targets a different operation than the held lease:
+	// the insert is gated on the leased operation, so without this a caller could
+	// write a row pointing at another apply_operation under this lease.
+	if *task.ApplyOperationID != opLease.OperationID {
+		return fmt.Errorf("upsert shard progress targets operation %d but the held lease is for operation %d", *task.ApplyOperationID, opLease.OperationID)
+	}
+	// A per-shard row must identify its table and shard. An empty table_name
+	// would store NULL and never match the lookup (re-inserting every pass), and
+	// an empty shard would collide with the unsharded single-shard sentinel.
+	if task.TableName == "" {
+		return fmt.Errorf("upsert shard progress for operation %d shard %q requires a table name", *task.ApplyOperationID, task.Shard)
+	}
+	if task.Shard == "" {
+		return fmt.Errorf("upsert shard progress for operation %d table %q requires a non-empty shard", *task.ApplyOperationID, task.TableName)
+	}
+
+	// Find the existing per-shard row under this operation. The lookup-then-write
+	// is safe without a unique constraint because the operation lease makes the
+	// caller the single writer of this operation's rows.
+	var id int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id FROM tasks
+		WHERE apply_operation_id = ? AND namespace = ? AND table_name = ? AND shard = ?
+	`, *task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
+	switch {
+	case err == nil:
+		// Existing shard row: update its progress fields under the lease guard.
+		task.ID = id
+		return s.Update(ctx, task)
+	case errors.Is(err, sql.ErrNoRows):
+		// New shard row: insert gated on the lease so a lost lease fails closed.
+		return s.insertShardTaskGuarded(ctx, task, opLease)
+	default:
+		return fmt.Errorf("look up shard task for operation %d %s.%s shard %q: %w",
+			*task.ApplyOperationID, task.Namespace, task.TableName, task.Shard, err)
+	}
+}
+
+// insertShardTaskGuarded inserts a new per-shard task row only while the
+// operation lease is still current. The INSERT ... SELECT ... WHERE the
+// operation's lease_token matches means a displaced operator inserts zero rows
+// and fails closed rather than writing a stale shard row.
+func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Task, opLease storage.OperationLease) error {
+	options := task.Options
+	if len(options) == 0 {
+		options = []byte("{}")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO tasks (
+			task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
+			namespace, table_name, shard, ddl, ddl_action,
+			engine, repository, pull_request, environment, state, error_message, options, attempt,
+			rows_copied, rows_total, progress_percent, eta_seconds, cutover_attempts,
+			is_instant, ready_to_complete, engine_migration_id,
+			started_at, completed_at, created_at, updated_at
+		)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		FROM apply_operations ao
+		WHERE ao.id = ? AND ao.lease_token = ?
+	`,
+		task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
+		task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
+		task.Engine, task.Repository, task.PullRequest, task.Environment,
+		task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
+		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.CutoverAttempts,
+		task.IsInstant, task.ReadyToComplete, nullString(task.EngineMigrationID),
+		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
+		opLease.OperationID, opLease.Token,
+	)
+	if err != nil {
+		return fmt.Errorf("insert shard task for operation %d %s.%s shard %q: %w",
+			opLease.OperationID, task.Namespace, task.TableName, task.Shard, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read shard task insert rows affected for operation %d: %w", opLease.OperationID, err)
+	}
+	if rows == 0 {
+		// Zero rows inserted means the operation lease is no longer current.
+		return ensureOperationLeaseStillOwned(ctx, s.db, opLease)
+	}
+	if newID, err := result.LastInsertId(); err == nil {
+		task.ID = newID
+	}
+	return nil
+}
+
 // GetByApplyID returns all tasks for an apply.
 func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
