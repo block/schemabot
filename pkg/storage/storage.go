@@ -42,6 +42,9 @@ type Storage interface {
 	// VitessApplyData returns the Vitess apply data store.
 	VitessApplyData() VitessApplyDataStore
 
+	// ShardProgress returns the per-shard progress read-model store.
+	ShardProgress() ShardProgressStore
+
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -529,6 +532,21 @@ type VitessApplyDataStore interface {
 
 	// GetByApplyID returns the Vitess apply data for the given apply ID.
 	GetByApplyID(ctx context.Context, applyID int64) (*VitessApplyData, error)
+}
+
+// ShardProgressStore manages the per-shard progress read-model. The operator's
+// reconciler upserts one row per shard of a sharded change; the renderer reads
+// them back per operation. Rows are keyed by (apply_operation_id, namespace,
+// table_name, shard), so the deployment dimension is inherited from the operation
+// and multi-region shards never collide.
+type ShardProgressStore interface {
+	// Upsert inserts or updates one shard's progress, keyed by
+	// (apply_operation_id, namespace, table_name, shard).
+	Upsert(ctx context.Context, sp *ShardProgress) error
+
+	// GetByApplyOperationID returns all shard-progress rows for an operation,
+	// ordered by namespace, table_name, shard.
+	GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*ShardProgress, error)
 }
 
 // ApplyLogStore manages apply log entries for debugging and audit.

@@ -41,6 +41,7 @@ func (m *mockStorage) ControlRequests() storage.ControlRequestStore  { return ni
 func (m *mockStorage) ApplyComments() storage.ApplyCommentStore      { return nil }
 func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore  { return nil }
 func (m *mockStorage) VitessApplyData() storage.VitessApplyDataStore { return nil }
+func (m *mockStorage) ShardProgress() storage.ShardProgressStore     { return nil }
 func (m *mockStorage) Checks() storage.CheckStore                    { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore               { return nil }
 func (m *mockStorage) Ping(ctx context.Context) error                { return m.pingErr }

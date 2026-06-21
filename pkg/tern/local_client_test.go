@@ -425,6 +425,10 @@ func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
 func (s *exactProgressStorage) VitessApplyData() storage.VitessApplyDataStore {
 	return s.vitessApplyData
 }
+
+func (s *exactProgressStorage) ShardProgress() storage.ShardProgressStore {
+	return nil
+}
 func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 	return s.applyOperations
 }

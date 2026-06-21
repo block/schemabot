@@ -114,6 +114,10 @@ func (s *controlTestStorage) VitessApplyData() storage.VitessApplyDataStore {
 	return nil
 }
 
+func (s *controlTestStorage) ShardProgress() storage.ShardProgressStore {
+	return nil
+}
+
 func (s *controlTestStorage) ApplyOperations() storage.ApplyOperationStore {
 	return s.applyOperations
 }

@@ -895,6 +895,26 @@ type ApplyLogFilter struct {
 	Limit     int    // Optional: limit results (default 100)
 }
 
+// ShardProgress is the per-shard display read-model for a sharded schema change,
+// one row per (apply_operation, namespace, table, shard) in the shard_progress
+// table. It is the persisted projection the operator's reconciler writes and the
+// renderer reads, so per-shard progress survives worker restarts and is consistent
+// across instances. It carries only display fields — execution state lives on the
+// operation row.
+type ShardProgress struct {
+	ApplyOperationID int64
+	Namespace        string
+	TableName        string
+	Shard            string
+	State            string
+	ProgressPercent  int
+	RowsCopied       int64
+	RowsTotal        int64
+	ETASeconds       int64
+	CutoverAttempts  int
+	ReadyToComplete  bool
+}
+
 // VitessApplyData holds Vitess-specific data for deploy request tracking.
 // Stored in vitess_apply_data table, one row per apply when database_type = 'vitess'.
 type VitessApplyData struct {
