@@ -3,6 +3,7 @@
 package mysqlstore
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -89,10 +90,13 @@ func TestShardProgressStore_OrderedAndIsolatedByOperation(t *testing.T) {
 	const opA = int64(1001)
 	const opB = int64(1002)
 
-	// Insert opA's shards out of order; reads come back ordered (namespace, table, shard).
+	// Insert opA's shards out of order — across two namespaces, and two tables
+	// within the `resolute` namespace — so the read exercises the full
+	// (namespace, table_name, shard) ordering, including table_name within a namespace.
 	for _, sp := range []*storage.ShardProgress{
 		{ApplyOperationID: opA, Namespace: "resolute", TableName: "users", Shard: "80-", State: "running"},
 		{ApplyOperationID: opA, Namespace: "resolute", TableName: "users", Shard: "-80", State: "running"},
+		{ApplyOperationID: opA, Namespace: "resolute", TableName: "orders", Shard: "-80", State: "running"},
 		{ApplyOperationID: opA, Namespace: "reporting", TableName: "events", Shard: "-", State: "running"},
 	} {
 		require.NoError(t, store.ShardProgress().Upsert(ctx, sp))
@@ -104,11 +108,17 @@ func TestShardProgressStore_OrderedAndIsolatedByOperation(t *testing.T) {
 
 	got, err := store.ShardProgress().GetByApplyOperationID(ctx, opA)
 	require.NoError(t, err)
-	require.Len(t, got, 3, "only opA's shards")
-	assert.Equal(t, []string{"reporting", "resolute", "resolute"},
-		[]string{got[0].Namespace, got[1].Namespace, got[2].Namespace}, "ordered by namespace")
-	assert.Equal(t, []string{"-", "-80", "80-"},
-		[]string{got[0].Shard, got[1].Shard, got[2].Shard}, "then by table_name, shard")
+	require.Len(t, got, 4, "only opA's shards")
+	gotKeys := make([][3]string, len(got))
+	for i, sp := range got {
+		gotKeys[i] = [3]string{sp.Namespace, sp.TableName, sp.Shard}
+	}
+	assert.Equal(t, [][3]string{
+		{"reporting", "events", "-"},  // namespace first
+		{"resolute", "orders", "-80"}, // then table_name within the namespace (orders < users)
+		{"resolute", "users", "-80"},  // then shard within the table
+		{"resolute", "users", "80-"},
+	}, gotKeys, "ordered by (namespace, table_name, shard)")
 
 	gotB, err := store.ShardProgress().GetByApplyOperationID(ctx, opB)
 	require.NoError(t, err)
@@ -117,4 +127,54 @@ func TestShardProgressStore_OrderedAndIsolatedByOperation(t *testing.T) {
 	gotEmpty, err := store.ShardProgress().GetByApplyOperationID(ctx, int64(9999))
 	require.NoError(t, err)
 	assert.Empty(t, gotEmpty, "an operation with no shards returns no rows and no error")
+}
+
+// When the caller holds an operation lease, Upsert is scoped to it so a displaced
+// driver that lost the lease fails closed instead of overwriting the read-model
+// with stale progress — the same guard tasks.Update enforces.
+func TestShardProgressStore_OperationLeaseGuardsUpsert(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_sp_oplease", 1)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	stampOperationLease(t, opID, "driver", "op-token")
+
+	opCtx := func(token string) context.Context {
+		return storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: "driver", Token: token,
+		})
+	}
+
+	sp := &storage.ShardProgress{
+		ApplyOperationID: opID, Namespace: "resolute", TableName: "users", Shard: "-80",
+		State: "running", ProgressPercent: 30,
+	}
+
+	// A displaced driver (stale operation token) fails closed and writes nothing.
+	require.ErrorIs(t, store.ShardProgress().Upsert(opCtx("stale-op-token"), sp), storage.ErrApplyLeaseLost)
+	got, err := store.ShardProgress().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	assert.Empty(t, got, "a lost lease must not write shard progress")
+
+	// The lease holder writes successfully.
+	require.NoError(t, store.ShardProgress().Upsert(opCtx("op-token"), sp))
+	got, err = store.ShardProgress().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "running", got[0].State)
+	assert.Equal(t, 30, got[0].ProgressPercent)
+
+	// A later stale write must not overwrite the lease holder's row.
+	sp.State = "failed"
+	require.ErrorIs(t, store.ShardProgress().Upsert(opCtx("stale-op-token"), sp), storage.ErrApplyLeaseLost)
+	got, err = store.ShardProgress().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "running", got[0].State, "stale driver must not overwrite the read-model")
 }
