@@ -1555,6 +1555,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// For Vitess, load opaque ResumeState so the engine can poll the deploy
 	// request and query SHOW VITESS_MIGRATIONS.
 	var engineResult *engine.ProgressResult
+	var engineMetadata map[string]string
 	var vitessApplyIsInstant bool
 	// Query engine for live progress. For Vitess, also query during pending state
 	// to surface PlanetScale states (preparing branch, deploy request, etc.).
@@ -1587,19 +1588,15 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				return nil, fmt.Errorf("load Vitess engine resume state for progress task %s: %w", activeTask.TaskIdentifier, resumeErr)
 			}
 			progressReq.ResumeState = resumeState
-			vad, vadErr := c.storage.VitessApplyData().GetByApplyID(ctx, activeTask.ApplyID)
-			switch {
-			case vadErr != nil:
-				c.logger.Error("failed to load VitessApplyData for progress", "apply_id", activeTask.ApplyID, "error", vadErr)
-			case vad == nil:
-				c.logger.Warn("VitessApplyData not found for progress — apply may still be initializing", "apply_id", activeTask.ApplyID)
-			default:
-				vitessApplyIsInstant = vad.IsInstant
-			}
 		}
 		result, err := eng.Progress(ctx, progressReq)
 		if err == nil {
 			engineResult = result
+			// The engine surfaces display fields (branch, deploy-request URL,
+			// is_instant, deferred) on the result; the renderer reads them from
+			// here instead of the vitess_apply_data side table.
+			engineMetadata = result.Metadata
+			vitessApplyIsInstant = result.Metadata["is_instant"] == "true"
 			if c.config.Type == storage.DatabaseTypeVitess && result.ResumeState != nil {
 				operationID, operationErr := applyOperationIDForTask(activeTask)
 				if operationErr != nil {
@@ -1856,6 +1853,16 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		Tables:       tables,
 		Summary:      summary,
 		ErrorMessage: errorMessage,
+	}
+
+	// Surface the engine's display metadata (e.g. PlanetScale branch_name,
+	// deploy_request_url, is_instant) on the response so the renderer reads it
+	// from the progress projection rather than an engine-specific side table.
+	for k, v := range engineMetadata {
+		if resp.Metadata == nil {
+			resp.Metadata = make(map[string]string, len(engineMetadata))
+		}
+		resp.Metadata[k] = v
 	}
 
 	// Populate apply_id, engine, and volume from the apply record.

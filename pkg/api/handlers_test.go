@@ -2191,6 +2191,24 @@ func TestProgressResponseFromProtoPreservesVSchemaChangeType(t *testing.T) {
 	assert.Equal(t, "vschema_update", resp.Tables[0].ChangeType)
 }
 
+// The engine's display metadata on the progress response (branch, deploy-request
+// URL, instant) is carried through to the API response, so the renderer no longer
+// needs the vitess_apply_data side-table overlay for it.
+func TestProgressResponseFromProtoCopiesMetadata(t *testing.T) {
+	resp := progressResponseFromProto(&ternv1.ProgressResponse{
+		State: ternv1.State_STATE_RUNNING,
+		Metadata: map[string]string{
+			"branch_name":        "branch-x",
+			"deploy_request_url": "https://app.example/deploy/7",
+			"is_instant":         "true",
+		},
+	})
+
+	assert.Equal(t, "branch-x", resp.Metadata["branch_name"])
+	assert.Equal(t, "https://app.example/deploy/7", resp.Metadata["deploy_request_url"])
+	assert.Equal(t, "true", resp.Metadata["is_instant"])
+}
+
 func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *testing.T) {
 	startedAt := time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC)
 	completedAt := startedAt.Add(5 * time.Minute)

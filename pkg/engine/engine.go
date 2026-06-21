@@ -314,6 +314,12 @@ type ProgressResult struct {
 	Retryable    bool   // True when a failed progress result can be retried
 	Tables       []TableProgress
 	ResumeState  *ResumeState // Updated resume state (engines may update MigrationContext/Metadata during polling)
+
+	// Metadata carries engine-specific display fields for the progress response
+	// (e.g. PlanetScale branch_name, deploy_request_url, is_instant). It lets the
+	// engine surface structured status to the renderer without core decoding the
+	// opaque ResumeState.Metadata or reading an engine-specific side table.
+	Metadata map[string]string
 }
 
 // TableProgress tracks progress for a single table.

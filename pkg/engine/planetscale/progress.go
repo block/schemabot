@@ -37,8 +37,9 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	if meta.DeployRequestID == 0 {
 		return &engine.ProgressResult{
-			State:   engine.StatePending,
-			Message: fmt.Sprintf("Setting up branch %s", meta.BranchName),
+			State:    engine.StatePending,
+			Message:  fmt.Sprintf("Setting up branch %s", meta.BranchName),
+			Metadata: psDisplayMetadata(meta),
 		}, nil
 	}
 
@@ -96,6 +97,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		State:       engineState,
 		Message:     deployStateToMessage(dr.DeploymentState),
 		ResumeState: req.ResumeState,
+		Metadata:    psDisplayMetadata(meta),
 	}
 
 	// Enrich with per-shard progress from SHOW VITESS_MIGRATIONS.
@@ -465,6 +467,38 @@ func validateMigrationContext(s string) error {
 		return fmt.Errorf("invalid context: contains unsafe characters")
 	}
 	return nil
+}
+
+// psDisplayMetadata projects the engine's deploy metadata into the progress
+// result's display fields, so the renderer gets branch / deploy-request URL /
+// instant / deferred status straight from the progress result — no core decoding
+// of the opaque resume state and no engine-specific side table.
+func psDisplayMetadata(meta *psMetadata) map[string]string {
+	if meta == nil {
+		return nil
+	}
+	// Allocate lazily: most polls set at least one field, but a bare metadata
+	// blob should return nil without allocating on the hot progress path.
+	var m map[string]string
+	set := func(k, v string) {
+		if m == nil {
+			m = make(map[string]string, 4)
+		}
+		m[k] = v
+	}
+	if meta.BranchName != "" {
+		set("branch_name", meta.BranchName)
+	}
+	if meta.DeployRequestURL != "" {
+		set("deploy_request_url", meta.DeployRequestURL)
+	}
+	if meta.IsInstant {
+		set("is_instant", "true")
+	}
+	if meta.DeferredDeploy {
+		set("deferred_deploy", "true")
+	}
+	return m
 }
 
 // parseProgressPercent parses the Vitess schema_migrations.progress column,

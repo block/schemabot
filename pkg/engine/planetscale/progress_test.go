@@ -287,3 +287,32 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 		assert.Equal(t, []string{"singularity:new-change"}, candidates)
 	})
 }
+
+// The engine surfaces its deploy display fields on the progress result so the
+// renderer reads them from the progress projection rather than a side table.
+func TestPSDisplayMetadata(t *testing.T) {
+	t.Run("populates the set fields", func(t *testing.T) {
+		m := psDisplayMetadata(&psMetadata{
+			BranchName:       "branch-x",
+			DeployRequestURL: "https://app.example/deploy/7",
+			IsInstant:        true,
+			DeferredDeploy:   true,
+		})
+		assert.Equal(t, "branch-x", m["branch_name"])
+		assert.Equal(t, "https://app.example/deploy/7", m["deploy_request_url"])
+		assert.Equal(t, "true", m["is_instant"])
+		assert.Equal(t, "true", m["deferred_deploy"])
+	})
+	t.Run("omits empty and false fields", func(t *testing.T) {
+		m := psDisplayMetadata(&psMetadata{BranchName: "b"})
+		assert.Equal(t, "b", m["branch_name"])
+		_, hasURL := m["deploy_request_url"]
+		assert.False(t, hasURL)
+		_, hasInstant := m["is_instant"]
+		assert.False(t, hasInstant)
+	})
+	t.Run("nil when nothing is set", func(t *testing.T) {
+		assert.Nil(t, psDisplayMetadata(&psMetadata{}))
+		assert.Nil(t, psDisplayMetadata(nil))
+	})
+}
