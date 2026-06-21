@@ -795,7 +795,7 @@ Task 3 → engine.Apply(DDL 3)        → waits for cutover
 
 Each DDL becomes a separate Vitess migration with its own `migration_uuid`, visible in `SHOW VITESS_MIGRATIONS`. DDL tasks in SchemaBot map 1:1 with migration UUIDs — one task per DDL. DDLs run sequentially, but within a single DDL, all shards run in parallel. Per-shard progress is surfaced in the Progress API but not stored — only aggregated per-task progress is persisted.
 
-VSchema updates are tracked as separate tasks in the `vitess_tasks` table (one per keyspace). A deploy can be DDL-only, VSchema-only, or both.
+VSchema updates are tracked as VSchema task rows in the regular `tasks` table (one per changed keyspace), not a separate table. A deploy can be DDL-only, VSchema-only, or both.
 
 | Flags | Behavior |
 |---|---|

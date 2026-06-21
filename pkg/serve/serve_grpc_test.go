@@ -30,7 +30,7 @@ func TestBuildGRPCTernClientRoutesWhenTargetResolverConfigured(t *testing.T) {
 		},
 	}
 
-	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "production")
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "production", nil)
 	require.NoError(t, err)
 	require.NotNil(t, client)
 	_, ok := client.(*tern.TargetRouter)
@@ -55,7 +55,7 @@ func TestBuildGRPCTernClientRoutesViaEtreResolver(t *testing.T) {
 		},
 	}
 
-	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "")
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "", nil)
 	require.NoError(t, err)
 	_, ok := client.(*tern.TargetRouter)
 	assert.True(t, ok, "expected a TargetRouter when target_resolver.etre is configured")
@@ -83,7 +83,7 @@ func TestBuildGRPCTernClientRoutesViaEtreWithAWSSMCredentials(t *testing.T) {
 		},
 	}
 
-	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "")
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "", nil)
 	require.NoError(t, err)
 	_, ok := client.(*tern.TargetRouter)
 	assert.True(t, ok, "expected a TargetRouter with awssm credentials")
@@ -106,7 +106,7 @@ func TestBuildGRPCTernClientErrorsWhenEtreAndStaticBothConfigured(t *testing.T) 
 		},
 	}
 
-	_, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "")
+	_, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "both etre and static")
 }
@@ -127,7 +127,7 @@ func TestBuildGRPCTernClientFallsBackToSingleDatabase(t *testing.T) {
 		},
 	}
 
-	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "production")
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "production", nil)
 	require.NoError(t, err)
 	require.NotNil(t, client)
 	_, ok := client.(*tern.LocalClient)
@@ -149,7 +149,7 @@ func TestBuildGRPCTernClientRoutesWithoutEnvironment(t *testing.T) {
 		},
 	}
 
-	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "")
+	client, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "", nil)
 	require.NoError(t, err)
 	_, ok := client.(*tern.TargetRouter)
 	assert.True(t, ok, "resolver mode should not require an environment")
@@ -167,7 +167,7 @@ func TestBuildGRPCTernClientErrorsWhenEnvMissingInFallback(t *testing.T) {
 		},
 	}
 
-	_, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "")
+	_, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "TERN_ENVIRONMENT")
 }
@@ -190,7 +190,7 @@ func TestBuildGRPCTernClientErrorsOnAmbiguousFallback(t *testing.T) {
 		},
 	}
 
-	_, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "production")
+	_, err := buildGRPCTernClient(t.Context(), config, mysqlstore.New(nil), logger, "production", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "orders")
 	assert.Contains(t, err.Error(), "payments")
@@ -201,7 +201,7 @@ func TestBuildGRPCTernClientErrorsOnAmbiguousFallback(t *testing.T) {
 func TestBuildGRPCTernClientErrorsWhenNothingConfigured(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 
-	_, err := buildGRPCTernClient(t.Context(), &api.ServerConfig{}, mysqlstore.New(nil), logger, "production")
+	_, err := buildGRPCTernClient(t.Context(), &api.ServerConfig{}, mysqlstore.New(nil), logger, "production", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "production")
 }
