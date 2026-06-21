@@ -173,3 +173,112 @@ func TestTaskStore_GetByApplyOperationID(t *testing.T) {
 	require.NotNil(t, tasksEmpty)
 	assert.Empty(t, tasksEmpty)
 }
+
+// A task is the per-(table, shard) execution record for a sharded engine: the
+// shard and its cutover attempts round-trip through create/get, two shards of
+// one table coexist under a single operation, cutover_attempts is updatable, and
+// the shard is fixed at creation (Update never rewrites it).
+func TestTaskStore_PerShardTaskRoundTrip(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "resolute", "vitess", "staging")
+	apply := createTestApply(t, store, lock, "apply_shard_tasks", 1)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "resolute",
+	})
+	require.NoError(t, err)
+
+	now := time.Now()
+	createShardTask := func(identifier, shard string, cutoverAttempts int) {
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier:   identifier,
+			ApplyID:          apply.ID,
+			ApplyOperationID: &opID,
+			PlanID:           apply.PlanID,
+			Database:         apply.Database,
+			DatabaseType:     apply.DatabaseType,
+			Engine:           storage.EngineStrata,
+			Environment:      apply.Environment,
+			State:            state.Task.Running,
+			Namespace:        "resolute",
+			TableName:        "users",
+			Shard:            shard,
+			CutoverAttempts:  cutoverAttempts,
+			DDL:              "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			DDLAction:        "ALTER",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		})
+		require.NoError(t, err)
+	}
+
+	createShardTask("task_users_-80", "-80", 1)
+	createShardTask("task_users_80-", "80-", 0)
+
+	// Round-trip: shard and cutover_attempts persist on the per-shard row.
+	got, err := store.Tasks().Get(ctx, "task_users_-80")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "resolute", got.Namespace)
+	assert.Equal(t, "users", got.TableName)
+	assert.Equal(t, "-80", got.Shard)
+	assert.Equal(t, 1, got.CutoverAttempts)
+
+	// Both shards of the same table coexist under one operation.
+	tasks, err := store.Tasks().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	shardAttempts := map[string]int{}
+	for _, task := range tasks {
+		assert.Equal(t, "users", task.TableName)
+		shardAttempts[task.Shard] = task.CutoverAttempts
+	}
+	assert.Equal(t, map[string]int{"-80": 1, "80-": 0}, shardAttempts)
+
+	// cutover_attempts is updatable (incremented across cutover retries); the
+	// shard is set at creation and Update must not rewrite it.
+	got.CutoverAttempts = 2
+	got.Shard = "ignored-on-update"
+	require.NoError(t, store.Tasks().Update(ctx, got))
+	reloaded, err := store.Tasks().Get(ctx, "task_users_-80")
+	require.NoError(t, err)
+	assert.Equal(t, 2, reloaded.CutoverAttempts, "cutover_attempts is updatable")
+	assert.Equal(t, "-80", reloaded.Shard, "shard is fixed at creation, not changed by Update")
+}
+
+// An unsharded engine (MySQL/Spirit) uses the empty-string shard sentinel, which
+// preserves today's one-task-per-table behavior.
+func TestTaskStore_UnshardedTaskHasEmptyShard(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_unsharded", 1)
+
+	now := time.Now()
+	_, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_unsharded_users",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Pending,
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN email VARCHAR(255)",
+		DDLAction:      "ALTER",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	got, err := store.Tasks().Get(ctx, "task_unsharded_users")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "", got.Shard, "unsharded tasks default to the empty-string shard")
+	assert.Equal(t, 0, got.CutoverAttempts)
+}
