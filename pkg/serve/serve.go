@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -43,6 +44,7 @@ type options struct {
 	version string
 	commit  string
 	date    string
+	engines map[string]tern.EngineFactory
 }
 
 // WithLogger sets the logger Run uses. A nil logger is ignored so Run keeps
@@ -52,6 +54,22 @@ func WithLogger(logger *slog.Logger) Option {
 		if logger != nil {
 			o.logger = logger
 		}
+	}
+}
+
+// WithEngine registers an Engine factory for a database type this build does not
+// provide natively, so an embedder (e.g. a data plane that consumes SchemaBot as
+// a module) can supply an engine without the core depending on its package. Run
+// registers it on the service (so the operator's in-process clients use it) and
+// threads it into the data-plane client factory (so the gRPC/router path uses it
+// too). Inputs are validated when Run registers them, failing startup on a bad
+// type or nil factory. Registering the same type twice keeps the last factory.
+func WithEngine(databaseType string, factory tern.EngineFactory) Option {
+	return func(o *options) {
+		if o.engines == nil {
+			o.engines = make(map[string]tern.EngineFactory)
+		}
+		o.engines[databaseType] = factory
 	}
 }
 
@@ -164,6 +182,20 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	svc := api.New(storage, cfg, nil, logger)
 	defer utils.CloseAndLog(svc)
 
+	// Register embedder-supplied engines before any client is built or the
+	// operator starts, so both the operator's in-process clients (via the
+	// service) and the data-plane gRPC/router clients (via the factory below)
+	// can resolve custom database types. Validation lives in RegisterEngine, so
+	// a bad type or nil factory fails startup here.
+	for databaseType, factory := range o.engines {
+		// RegisterEngine's error already names the operation and the database
+		// type, so return it as-is rather than double-prefixing.
+		if err := svc.RegisterEngine(databaseType, factory); err != nil {
+			return err
+		}
+		logger.Info("registered engine", "database_type", databaseType)
+	}
+
 	// Build the webhook runtime before recovery starts so recovered applies can
 	// attach PR comment observers. If GitHub is not configured, the runtime
 	// serves a disabled webhook endpoint and skips comment reconciliation.
@@ -184,7 +216,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	// server below reuses the same instance.
 	var dataPlaneClient tern.Client
 	if cfg.TargetResolver.Enabled() {
-		dataPlaneClient, err = buildGRPCTernClient(ctx, cfg, storage, logger, os.Getenv("TERN_ENVIRONMENT"), svc.WakeOperator)
+		dataPlaneClient, err = buildGRPCTernClient(ctx, cfg, storage, logger, os.Getenv("TERN_ENVIRONMENT"), o.engines, svc.WakeOperator)
 		if err != nil {
 			return fmt.Errorf("build data-plane target router: %w", err)
 		}
@@ -203,7 +235,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	var grpcServer *grpc.Server
 	grpcPort := os.Getenv("GRPC_PORT")
 	if grpcPort != "" {
-		grpcServer, err = startGRPCServer(ctx, cfg, storage, logger, grpcPort, dataPlaneClient, svc.WakeOperator)
+		grpcServer, err = startGRPCServer(ctx, cfg, storage, logger, grpcPort, dataPlaneClient, o.engines, svc.WakeOperator)
 		if err != nil {
 			return fmt.Errorf("start grpc server: %w", err)
 		}
@@ -306,12 +338,12 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 // plane is configured with a target resolver, requests are routed by opaque
 // execution target through a TargetRouter; otherwise it falls back to a single
 // LocalClient bound to the one database configured for TERN_ENVIRONMENT.
-func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, port string, client tern.Client, wakeOperator func(applyIdentifier, database, environment string)) (*grpc.Server, error) {
+func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, port string, client tern.Client, engineFactories map[string]tern.EngineFactory, wakeOperator func(applyIdentifier, database, environment string)) (*grpc.Server, error) {
 	// client is prebuilt and shared with the operator when a dynamic target
 	// resolver is configured; otherwise build the single-database client here.
 	if client == nil {
 		var err error
-		client, err = buildGRPCTernClient(ctx, config, st, logger, os.Getenv("TERN_ENVIRONMENT"), wakeOperator)
+		client, err = buildGRPCTernClient(ctx, config, st, logger, os.Getenv("TERN_ENVIRONMENT"), engineFactories, wakeOperator)
 		if err != nil {
 			return nil, err
 		}
@@ -345,7 +377,7 @@ func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlsto
 // environment is unused in this mode because each request carries its own.
 // Otherwise it falls back to a single LocalClient bound to the one database
 // configured for env.
-func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string, wakeOperator ...func(applyIdentifier, database, environment string)) (tern.Client, error) {
+func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string, engineFactories map[string]tern.EngineFactory, wakeOperator ...func(applyIdentifier, database, environment string)) (tern.Client, error) {
 	var wake func(applyIdentifier, database, environment string)
 	if len(wakeOperator) > 0 {
 		wake = wakeOperator[0]
@@ -359,7 +391,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 			Resolver:           resolver,
 			Storage:            st,
 			Logger:             logger,
-			LocalClientFactory: grpcLocalClientFactory(config, wake),
+			LocalClientFactory: grpcLocalClientFactory(config, wake, engineFactories),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("build target router: %w", err)
@@ -400,7 +432,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 	}
-	client, err := grpcLocalClientFactory(config, wake)(tern.LocalConfig{
+	client, err := grpcLocalClientFactory(config, wake, engineFactories)(tern.LocalConfig{
 		Database:  dbName,
 		Type:      dbConfig.Type,
 		TargetDSN: targetDSN,
@@ -413,9 +445,10 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysq
 }
 
 // grpcLocalClientFactory returns a LocalClientFactory that applies server-level
-// policy (pending drops) to every LocalClient the data plane builds, so the
-// router and single-database paths share identical execution semantics.
-func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIdentifier, database, environment string)) tern.LocalClientFactory {
+// policy (pending drops) and the embedder-supplied engine factories to every
+// LocalClient the data plane builds, so the router and single-database paths
+// share identical execution semantics and can resolve custom database types.
+func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIdentifier, database, environment string), engineFactories map[string]tern.EngineFactory) tern.LocalClientFactory {
 	pendingDropsDisabled := !config.PendingDropsEnabled()
 	return func(cfg tern.LocalConfig, st storage.Storage, logger *slog.Logger) (tern.Client, error) {
 		if pendingDropsDisabled {
@@ -426,6 +459,16 @@ func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIde
 		}
 		if cfg.WakeOperator == nil {
 			cfg.WakeOperator = wakeOperator
+		}
+		// Merge the embedder registry into this config so custom types always
+		// resolve, regardless of whether the resolved config already carries
+		// factories. Build a fresh map so the caller's is never mutated, and let
+		// any per-config entry win over the server-level registration.
+		if len(engineFactories) > 0 {
+			merged := make(map[string]tern.EngineFactory, len(engineFactories)+len(cfg.EngineFactories))
+			maps.Copy(merged, engineFactories)
+			maps.Copy(merged, cfg.EngineFactories)
+			cfg.EngineFactories = merged
 		}
 		return tern.NewLocalClient(cfg, st, logger)
 	}
