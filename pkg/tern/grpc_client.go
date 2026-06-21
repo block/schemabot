@@ -1640,7 +1640,14 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		return err
 	}
 
-	options := apply.GetOptions().Map()
+	// Use the per-operation copy-drive options so a multi-operation barrier
+	// deployment parks the remote engine at the cutover barrier instead of
+	// running straight through the swap. effectiveCopyDriveOptions OR's
+	// DeferCutover on only for an operation that must auto-defer; whole-apply
+	// and single-operation drives get the apply's stored options unchanged, so
+	// the deployment-ordered cutover claim (OC-3) can later drive each parked
+	// operation through its swap in turn.
+	options := effectiveCopyDriveOptions(apply, scope.multiOperation, scope.operation).Map()
 	target := options["target"]
 	if target == "" {
 		target = apply.Database
