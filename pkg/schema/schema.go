@@ -9,7 +9,6 @@
 //   - tasks: Schema change tasks
 //   - apply_operations: Per-(apply, deployment) child rows for multi-deployment applies
 //   - vitess_apply_data: Vitess-specific per-apply deploy metadata
-//   - vitess_tasks: Vitess-specific non-DDL tasks (VSchema, routing rules)
 package schema
 
 import "embed"
