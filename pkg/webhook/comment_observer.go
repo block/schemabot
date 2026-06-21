@@ -276,42 +276,40 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		activeCommentState = state.Comment.Cutover
 	}
 
-	// A multi-operation (fan-out) apply publishes its single apply-level terminal
-	// summary through the operator's aggregate CAS-winner observer (see
-	// publishTerminalSummaryIfWon / NewAggregateTerminalCommentObserver), which
-	// re-derives the parent from all apply_operations and renders the full task
-	// set. A per-driver observer here holds only one operation's task slice, so
-	// it must not publish the summary for a multi-operation apply — doing so
-	// would post a duplicate, partial summary. Single-operation applies are
-	// unaffected and keep publishing through this path.
-	publishSummary := o.shouldPublishTerminalSummary(apply)
+	// Load the operation rows once and reuse them for the ownership decision and
+	// both comment renders below, so the terminal path reads apply_operations a
+	// single time per callback.
+	ops, opsErr := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
 
 	if activeCommentState == state.Comment.Cutover {
-		// Cutover comment gets the summary format — Apply ID, DDL, success message.
-		// No separate summary needed since the cutover comment IS the completion
-		// comment, so editing it to the summary format is itself the summary
-		// publish. Defer to the aggregate publisher for multi-operation applies.
-		if publishSummary {
-			finalBody := o.formatTerminalSummaryComment(apply, tasks)
-			o.editTrackedComment(apply, activeCommentState, finalBody)
-
-			// Upsert a summary marker so FindMissingSummaryComment (outbox query)
-			// doesn't false-positive on restart for cutover applies.
-			o.markSummaryPosted(apply, activeCommentState)
-		}
+		// The cutover comment IS the completion comment, so editing it to the
+		// summary format is the terminal publish — there is no separate summary
+		// comment to duplicate. Always edit it to its terminal rendering so it
+		// never stays frozen at "cutting over"; for a multi-operation apply the
+		// aggregate CAS-winner observer re-edits it with the full task set. The
+		// summary marker is always upserted so FindMissingSummaryComment (outbox
+		// query) doesn't false-positive on restart for cutover applies.
+		finalBody := o.summaryCommentFromOps(apply, ops, opsErr, tasks)
+		o.editTrackedComment(apply, activeCommentState, finalBody)
+		o.markSummaryPosted(apply, activeCommentState)
 	} else {
 		// Edit the progress comment to its final state (completed bars / error).
 		// This is the per-operation status freeze, not the apply-level summary, so
 		// it always runs; the aggregate publisher re-edits it with the full task
 		// set for multi-operation applies.
-		finalBody := o.formatStatusComment(apply, tasks)
+		finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 
 		// Post a separate summary comment. A new comment is more reliable than
 		// an edit — GitHub renders edits with a delay, but new comments appear
-		// immediately and trigger notifications for PR subscribers.
-		if publishSummary {
-			summaryBody := o.formatTerminalSummaryComment(apply, tasks)
+		// immediately and trigger notifications for PR subscribers. A
+		// multi-operation (fan-out) apply publishes its single apply-level
+		// summary through the operator's aggregate CAS-winner observer instead
+		// (see publishTerminalSummaryIfWon / NewAggregateTerminalCommentObserver),
+		// so a per-driver observer holding one operation's task slice must defer
+		// to it rather than post a duplicate, partial summary.
+		if o.shouldPublishSeparateSummary(apply, ops, opsErr) {
+			summaryBody := o.summaryCommentFromOps(apply, ops, opsErr, tasks)
 			o.postAndTrackComment(apply, state.Comment.Summary, summaryBody)
 		}
 	}
@@ -325,27 +323,25 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 	}
 }
 
-// shouldPublishTerminalSummary reports whether this observer owns the apply-level
-// terminal summary. The aggregate CAS-winner observer (built by
+// shouldPublishSeparateSummary reports whether this observer owns the separate
+// apply-level terminal summary comment for a non-cutover apply, given the apply's
+// already-loaded operation rows. The aggregate CAS-winner observer (built by
 // NewAggregateTerminalCommentObserver after winning the non-terminal→terminal
 // projection CAS) always owns it. A per-driver observer owns it only for a
 // single-operation apply: a multi-operation apply has its summary published once
 // by the aggregate observer, which re-derives the parent from every
 // apply_operation and renders the full task set, so a per-driver observer here —
-// holding one operation's task slice — must defer to it. On a lookup failure it
-// returns false so no partial or duplicate summary is posted; startup
-// reconciliation (FindMissingSummaryComment) repairs a genuinely missing one.
-func (o *CommentObserver) shouldPublishTerminalSummary(apply *storage.Apply) bool {
+// holding one operation's task slice — must defer to it rather than post a
+// duplicate, partial summary. On a load failure it returns false so no partial
+// or duplicate summary is posted; startup reconciliation
+// (FindMissingSummaryComment) repairs a genuinely missing one.
+func (o *CommentObserver) shouldPublishSeparateSummary(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error) bool {
 	if o.aggregateTerminalCASWinner {
 		return true
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
-	if err != nil {
+	if opsErr != nil {
 		o.logError(apply, "observer: failed to load apply operations for terminal summary ownership; leaving summary to reconciliation",
-			"error", err)
+			"error", opsErr)
 		return false
 	}
 	if len(ops) > 1 {
@@ -368,9 +364,17 @@ func (o *CommentObserver) formatStatusComment(apply *storage.Apply, tasks []*sto
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
-	if err != nil {
+	return o.statusCommentFromOps(apply, ops, err, tasks)
+}
+
+// statusCommentFromOps renders the status comment from already-loaded operation
+// rows, applying the same single-deployment fallback as formatStatusComment when
+// the load failed. Callers that already hold the operation set (e.g. OnTerminal)
+// use this to avoid re-reading apply_operations.
+func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task) string {
+	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for comment dispatch; rendering single-deployment layout",
-			"apply_id", o.applyID, "error", err)
+			"apply_id", o.applyID, "error", opsErr)
 		return formatProgressComment(apply, tasks)
 	}
 	return formatApplyStatusComment(apply, ops, tasks)
@@ -388,9 +392,18 @@ func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply, tas
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
-	if err != nil {
+	return o.summaryCommentFromOps(apply, ops, err, tasks)
+}
+
+// summaryCommentFromOps renders the terminal summary from already-loaded
+// operation rows, applying the same single-deployment fallback as
+// formatTerminalSummaryComment when the load failed. Callers that already hold
+// the operation set (e.g. OnTerminal) use this to avoid re-reading
+// apply_operations.
+func (o *CommentObserver) summaryCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task) string {
+	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
-			"apply_id", o.applyID, "error", err)
+			"apply_id", o.applyID, "error", opsErr)
 		return formatSummaryComment(apply, tasks)
 	}
 	return formatApplySummaryComment(apply, ops, tasks)
