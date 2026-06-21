@@ -2107,6 +2107,30 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 			remoteState: state.Apply.WaitingForCutover,
 			expected:    state.Apply.WaitingForCutover,
 		},
+		{
+			name:        "deploy-request phase advances from the dispatched preparing-branch state",
+			storedState: state.Apply.PreparingBranch,
+			remoteState: state.Apply.ValidatingDeployRequest,
+			expected:    state.Apply.ValidatingDeployRequest,
+		},
+		{
+			name:        "deploy-request apply advances into the row-copy running phase",
+			storedState: state.Apply.ValidatingDeployRequest,
+			remoteState: state.Apply.Running,
+			expected:    state.Apply.Running,
+		},
+		{
+			name:        "stale pending remote state does not reopen a preparing-branch apply",
+			storedState: state.Apply.PreparingBranch,
+			remoteState: state.Apply.Pending,
+			expected:    state.Apply.PreparingBranch,
+		},
+		{
+			name:        "a lagging deploy-request poll does not rewind a running apply",
+			storedState: state.Apply.Running,
+			remoteState: state.Apply.PreparingBranch,
+			expected:    state.Apply.Running,
+		},
 	}
 
 	for _, tc := range tests {

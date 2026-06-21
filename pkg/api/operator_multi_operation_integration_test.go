@@ -226,7 +226,17 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		requestPendingStop(t, ctx, stor, seed.applyID)
 
 		rec := &driveRecorder{}
-		svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{}))
+		// Stop reconciliation drives the data-plane stop through the apply's
+		// deployment client before terminalizing the pending siblings, so every
+		// deployment must resolve to a client — as it always does in production,
+		// where Config.Validate ties each deployment to a configured tern
+		// deployment. No operation is driven under a pending stop (the claim gate
+		// blocks the pending sibling and the stop path uses the whole-apply drive),
+		// so these outcomes are never reached via ResumeApplyOperation.
+		svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Failed},
+			"region-b": {taskState: state.Task.Pending},
+		}))
 
 		svc.recoverApplies(ctx, 1)
 

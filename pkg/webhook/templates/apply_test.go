@@ -175,6 +175,27 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "Queued")
 }
 
+// A PlanetScale apply in a deploy-request phase renders its first-class phase
+// header (not a generic "In Progress") and still offers the operator a stop
+// action — the change is active, stoppable work before cutover.
+func TestRenderApplyStatusComment_ValidatingDeployRequest(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "boardgames",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		ApplyID:     "apply-7aa13cf03496454b",
+		State:       state.Apply.ValidatingDeployRequest,
+		Engine:      "PlanetScale",
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## Schema Change — Validating Deploy Request")
+	assert.NotContains(t, result, "## Schema Change In Progress")
+	assert.Contains(t, result, "To stop this schema change:")
+	assert.Contains(t, result, "schemabot stop apply-7aa13cf03496454b")
+}
+
 func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",

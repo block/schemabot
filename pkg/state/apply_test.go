@@ -331,6 +331,21 @@ func TestNormalizeApplyState_NewStates(t *testing.T) {
 	assert.Equal(t, Apply.ValidatingDeployRequest, normalizeApplyState("VALIDATING_DEPLOY_REQUEST"))
 }
 
+func TestInitialActiveApplyState(t *testing.T) {
+	// Spirit begins copying rows immediately, so its first active phase is Running.
+	for _, engine := range []string{"spirit", "Spirit", "strata", "", "unknown"} {
+		assert.Equal(t, Apply.Running, InitialActiveApplyState(engine),
+			"non-PlanetScale engine %q should dispatch into Running", engine)
+	}
+
+	// PlanetScale begins by preparing a branch, so its first active phase is
+	// PreparingBranch — not the row-copy Running phase.
+	for _, engine := range []string{"planetscale", "PlanetScale", "ENGINE_PLANETSCALE"} {
+		assert.Equal(t, Apply.PreparingBranch, InitialActiveApplyState(engine),
+			"PlanetScale engine %q should dispatch into PreparingBranch", engine)
+	}
+}
+
 // rc builds a RolloutChild from a state and its continuation policy so the
 // truth-table cases below read like the rollout scenario they describe.
 func rc(state string, continueOnFailure bool) RolloutChild {

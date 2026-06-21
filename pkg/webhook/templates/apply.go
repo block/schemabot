@@ -544,6 +544,15 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
 	case state.Apply.Running:
 		writeFooterAction(sb, "To stop this schema change:", fmt.Sprintf("schemabot stop %s", data.ApplyID))
+	case state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest:
+		// PlanetScale's branch and deploy-request phases are active, stoppable
+		// work — the operator can halt the change before cutover just as during
+		// row copy.
+		writeFooterAction(sb, "To stop this schema change:", fmt.Sprintf("schemabot stop %s", data.ApplyID))
 	case state.Apply.FailedRetryable:
 		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", fmt.Sprintf("schemabot stop %s", data.ApplyID))
 	case state.Apply.Stopped:

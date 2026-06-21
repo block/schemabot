@@ -1,4 +1,4 @@
-package commands
+package serve
 
 import (
 	"log/slog"
