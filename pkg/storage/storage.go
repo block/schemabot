@@ -474,10 +474,13 @@ type ApplyOperationStore interface {
 	// attention and rotates a fresh operation lease (owner + token) onto it in
 	// the same transaction, returning the row populated with that lease.
 	//
-	// Pending rows are transitioned to running and stamped with started_at;
-	// already-active rows whose heartbeat has been stale for more than one
-	// minute are re-leased without changing their state. Terminal rows
-	// (completed/failed/cancelled/stopped/reverted) are never claimed.
+	// Pending rows are transitioned to running and stamped with started_at; a
+	// stopped row whose parent apply has a pending start request is resumable
+	// and is transitioned to resuming (so the request-gated stopped predicate
+	// stops matching once the row is claimed); already-active rows whose
+	// heartbeat has been stale for more than one minute are re-leased without
+	// changing their state. Other terminal rows
+	// (completed/failed/cancelled/reverted) are never claimed.
 	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing

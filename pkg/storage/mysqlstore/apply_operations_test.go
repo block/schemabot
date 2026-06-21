@@ -819,13 +819,92 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingStar
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "stopped operation with a pending start request must be reclaimable")
 	assert.Equal(t, id, claimed.ID)
-	assert.Equal(t, state.ApplyOperation.Stopped, claimed.State, "re-claim must keep the stopped state for the resume drive to transition")
+	assert.Equal(t, state.ApplyOperation.Stopped, claimed.State, "caller sees the pre-claim state")
 
 	persisted, err := store.ApplyOperations().Get(ctx, id)
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
-	assert.Equal(t, state.ApplyOperation.Stopped, persisted.State)
+	assert.Equal(t, state.ApplyOperation.Resuming, persisted.State, "claim transitions the stopped operation to resuming so the row stops matching the stopped-row clause and a peer cannot re-claim it mid-drive")
 	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaimsStoppedWithPendingStart
+// pins the exclusivity of resuming a stopped operation: when several drivers
+// race to claim the same stopped operation that has a pending start request,
+// exactly one wins. The claim transitions the row out of stopped (to resuming)
+// under a state guard, so the row stops matching the stopped-row clause and a
+// peer cannot re-claim it mid-drive and rotate the lease out from under the
+// active driver.
+func TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaimsStoppedWithPendingStart(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_concurrent_stopped", 1, state.Apply.Stopped, "staging")
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Stopped,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	const drivers = 16
+	stores := make([]*Storage, drivers)
+	for i := range drivers {
+		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		require.NoError(t, openErr)
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		t.Cleanup(func() {
+			require.NoError(t, db.Close())
+		})
+		stores[i] = New(db)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var claimed []*storage.ApplyOperation
+	var claimErrors []error
+
+	for i := range drivers {
+		driverStore := stores[i]
+		driverOwner := fmt.Sprintf("operator-%d", i)
+		wg.Go(func() {
+			<-start
+			got, claimErr := driverStore.ApplyOperations().FindNextApplyOperation(ctx, driverOwner)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if claimErr != nil {
+				claimErrors = append(claimErrors, claimErr)
+				return
+			}
+			if got != nil {
+				claimed = append(claimed, got)
+			}
+		})
+	}
+
+	close(start)
+	wg.Wait()
+
+	require.Empty(t, claimErrors)
+	require.Len(t, claimed, 1, "only one driver should claim a stopped apply_operation with a pending start request")
+	assert.Equal(t, id, claimed[0].ID)
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.Resuming, persisted.State)
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_ClaimsWaitingForDeployWithPendingStart

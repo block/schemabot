@@ -819,7 +819,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	leaseToken := uuid.NewString()
 	leaseAcquiredAt := time.Now()
 
-	if ad.State == state.ApplyOperation.Pending {
+	switch ad.State {
+	case state.ApplyOperation.Pending:
 		// Pending → running: stamp started_at, rotate the lease, and update the
 		// heartbeat in the same write. WHERE state = ? guards against a concurrent
 		// transition landing between the SELECT and this UPDATE; RowsAffected == 0
@@ -849,11 +850,38 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		if rows == 0 {
 			return nil, nil
 		}
-	} else {
-		// Re-leasing a row that already started: a stale active heartbeat, or a
-		// stopped operation whose parent apply has a pending start request. Both
-		// keep their current state and are driven by the caller, so rotate the
-		// lease onto this driver and refresh the heartbeat.
+	case state.ApplyOperation.Stopped:
+		// Stopped → resuming: a stopped operation whose parent apply has a
+		// pending start request is a resumable claim, mirroring the apply-level
+		// stopped claim (transitionClaimToState). The claim must move the row out
+		// of stopped atomically with the lease rotation because the stopped-row
+		// predicate is request-gated, not heartbeat-gated: while the row stays
+		// stopped it keeps matching that predicate and a peer could re-lease it
+		// mid-drive. As resuming (an active state) it is re-leasable only by the
+		// heartbeat-guarded stale-active clause, which recovers a crashed drive.
+		// WHERE state = ? guards a concurrent transition landing between the
+		// SELECT and this UPDATE; RowsAffected == 0 means another writer moved it.
+		result, err := tx.ExecContext(ctx, `
+			UPDATE apply_operations
+			SET state = ?, updated_at = NOW(),
+			    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+			WHERE id = ? AND state = ?
+		`, state.ApplyOperation.Resuming, owner, leaseToken, ad.ID, state.ApplyOperation.Stopped)
+		if err != nil {
+			return nil, fmt.Errorf("claim stopped apply_operation %d: %w", ad.ID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("read claim rows affected for stopped apply_operation %d: %w", ad.ID, err)
+		}
+		if rows == 0 {
+			return nil, nil
+		}
+	default:
+		// Re-leasing a row that already started with a stale active heartbeat:
+		// crash recovery. The row keeps its current (active) state and is driven
+		// by the caller, so rotate the lease onto this driver and refresh the
+		// heartbeat.
 		_, err = tx.ExecContext(ctx, `
 			UPDATE apply_operations
 			SET updated_at = NOW(),
