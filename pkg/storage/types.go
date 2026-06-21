@@ -756,6 +756,12 @@ type Task struct {
 	// TableName is the table being modified (empty for multi-table atomic).
 	TableName string
 
+	// Shard is the shard this task tracks for sharded engines (e.g. "-80",
+	// "80-"). Empty for unsharded engines (MySQL), which have a single shard.
+	// A task is the per-(table, shard) execution record; the per-table headline
+	// is aggregated across a table's shard rows at read time, never stored.
+	Shard string
+
 	// DDL is the full DDL statement.
 	DDL string
 
@@ -767,6 +773,7 @@ type Task struct {
 	RowsTotal       int64 // Total rows to copy
 	ProgressPercent int   // 0-100
 	ETASeconds      int   // Estimated seconds remaining
+	CutoverAttempts int   // Number of cutover attempts for this shard
 
 	// Execution flags
 	IsInstant         bool   // True if INSTANT DDL (no copy needed)
