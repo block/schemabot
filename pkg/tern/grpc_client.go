@@ -1174,16 +1174,144 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 	return c.resumeApply(ctx, apply, scope)
 }
 
-// ResumeApplyOperationCutover is not supported on the remote (gRPC) path. The
-// remote drive does not park an operation at the cutover barrier, so there is no
-// parked checkpoint to resume and drive through cutover. Fail closed with a
-// sentinel rather than attempting a drive that cannot exist yet; the operator
-// reserves the parked operation for a future remote cutover drive.
+// ResumeApplyOperationCutover drives a single barrier-parked apply_operation
+// through its cutover phase over the remote (gRPC) path. It is the
+// deployment-ordered counterpart to ResumeApplyOperation's copy drive: the
+// operator claims the parked operation whose turn it is and calls this to force
+// the remote swap, while siblings stay parked. The operation's per-operation
+// remote apply id is authoritative — the drive never falls back to the parent
+// apply's external id and never writes the parent applies row directly, since
+// the operator projection CAS owns parent state for multi-operation applies.
 func (c *GRPCClient) ResumeApplyOperationCutover(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	if applyOperationID <= 0 {
+		return fmt.Errorf("apply operation id is required")
+	}
+	if c.storage == nil {
+		return fmt.Errorf("storage not configured for GRPCClient")
+	}
 	if apply == nil {
 		return fmt.Errorf("apply is required")
 	}
-	return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrOperationCutoverUnsupportedRemote)
+	scope, err := c.loadOperationApplyTaskScope(ctx, apply, applyOperationID)
+	if err != nil {
+		return err
+	}
+	// Ordered cutover is a per-operation remote drive: the swap must target the
+	// operation's own remote apply id, never the parent apply external id. Fail
+	// closed if this resolved to a whole-apply scope.
+	if !scope.usesOperationRemoteResume() {
+		return fmt.Errorf("apply_operation %d (apply %s): remote cutover drive requires a per-operation remote resume scope", applyOperationID, apply.ApplyIdentifier)
+	}
+	// Fail closed before any dispatch or state mutation: an operation that
+	// resolves to no tasks is an invalid or stale claim. Mirrors
+	// ResumeApplyOperation so an empty lookup never fails the whole parent apply.
+	tasks, err := c.loadApplyTasks(ctx, apply, scope)
+	if err != nil {
+		return err
+	}
+	if len(tasks) == 0 {
+		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
+	}
+	// Fail closed unless the operation is actually parked or recovering for
+	// cutover. A copy-phase or terminal operation must never be forced into a
+	// cutover drive.
+	if !isCutoverDriveState(scope.operation.State) {
+		return fmt.Errorf("apply_operation %d (apply %s) is in state %q, not parked or recovering for cutover", applyOperationID, apply.ApplyIdentifier, scope.operation.State)
+	}
+	remoteID := scope.remoteApplyID(apply)
+	if remoteID == "" {
+		return fmt.Errorf("apply_operation %d (apply %s): no remote apply id for cutover drive", applyOperationID, apply.ApplyIdentifier)
+	}
+	// Honor a stop that raced in after the cutover claim before forcing the swap.
+	if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+		return err
+	}
+	poll, err := c.triggerRemoteOperationCutover(ctx, apply, scope, remoteID)
+	if err != nil {
+		return err
+	}
+	if !poll {
+		return nil
+	}
+	return c.pollForCompletion(ctx, apply, false, scope)
+}
+
+// triggerRemoteOperationCutover preflights the exact remote state for an ordered
+// cutover drive and, only when the operation is still parked at the barrier,
+// issues the remote Cutover RPC. The claim moves the operation row to
+// cutting_over, so the stored row alone cannot distinguish a fresh claim (cutover
+// not sent yet) from a stale recovery (a prior driver already sent it); the
+// preflight resolves that from the data plane. It returns poll=true when the
+// caller should drive the swap to terminal via pollForCompletion, and poll=false
+// when the remote was already terminal (reconciled here) or a raced stop took
+// ownership. It never writes the parent applies row directly.
+func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) (poll bool, err error) {
+	resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     remoteID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			message := fmt.Sprintf("remote apply %s was not found by data plane during cutover preflight", remoteID)
+			return false, c.failMissingRemoteApply(ctx, apply, message, err, scope)
+		}
+		return false, fmt.Errorf("preflight remote cutover for apply_operation %d (apply %s) remote %s: %w", scope.applyOperationID, apply.ApplyIdentifier, remoteID, err)
+	}
+	if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
+		message := fmt.Sprintf("remote apply %s returned no active schema change during cutover preflight", remoteID)
+		return false, c.failMissingRemoteApply(ctx, apply, message, nil, scope)
+	}
+	remoteState := ProtoStateToStorage(resp.State)
+	if remoteState == "" {
+		return false, fmt.Errorf("preflight remote cutover for apply_operation %d (apply %s): unmapped remote state %s", scope.applyOperationID, apply.ApplyIdentifier, remoteApplyStateDescription(resp.State))
+	}
+	// Remote already terminal: reconcile from this poll and stop. Do not re-send
+	// Cutover.
+	if isTerminalProtoState(resp.State) {
+		now := time.Now()
+		apply.State = remoteState
+		apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
+		if apply.StartedAt == nil {
+			apply.StartedAt = &now
+		}
+		return false, c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope)
+	}
+	switch {
+	case state.IsState(remoteState, state.Apply.CuttingOver), state.IsState(remoteState, state.Apply.RevertWindow):
+		// A prior driver already started the swap, or the engine is in the
+		// post-cutover revert window. Do not re-send Cutover; poll to terminal.
+		apply.State = remoteState
+		return true, nil
+	case state.IsState(remoteState, state.Apply.WaitingForCutover):
+		// Parked at the barrier: this drive forces the swap below.
+	default:
+		// running / recovering / pending / stopped: not yet ready for cutover.
+		// Return a retryable error so the operator retries once the remote copy
+		// reaches the barrier.
+		return false, fmt.Errorf("preflight remote cutover for apply_operation %d (apply %s): remote is %s, not parked at the cutover barrier", scope.applyOperationID, apply.ApplyIdentifier, remoteState)
+	}
+	// Re-check a raced stop immediately before forcing the swap.
+	if handled, err := c.processPendingStopControlRequest(ctx, apply, scope); handled || err != nil {
+		return false, err
+	}
+	cutoverResp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
+		ApplyId:     remoteID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %w", scope.applyOperationID, apply.ApplyIdentifier, remoteID, err)
+	}
+	if cutoverResp == nil || !cutoverResp.Accepted {
+		message := "not accepted"
+		if cutoverResp != nil && cutoverResp.ErrorMessage != "" {
+			message = cutoverResp.ErrorMessage
+		}
+		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %s", scope.applyOperationID, apply.ApplyIdentifier, remoteID, message)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
+		fmt.Sprintf("Remote ordered cutover accepted for apply %s operation %d (remote %s)", apply.ApplyIdentifier, scope.applyOperationID, remoteID), "", "")
+	apply.State = state.Apply.CuttingOver
+	return true, nil
 }
 
 // resumeApply runs work claimed by the operator. Fresh queued applies have no
