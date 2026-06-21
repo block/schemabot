@@ -238,3 +238,50 @@ func TestAggregateTerminalObserverBypassesApplyLeaseCheck(t *testing.T) {
 	_, hasLease := storage.ApplyLeaseFromContext(ctx)
 	assert.False(t, hasLease, "aggregate terminal observer must not attach an apply lease to storage writes")
 }
+
+// A per-driver observer for a multi-operation apply must not publish the
+// apply-level terminal summary: it holds only one operation's task slice, so
+// publishing here would post a duplicate, partial summary. The aggregate
+// CAS-winner observer owns that summary instead.
+func TestShouldPublishTerminalSummaryDefersForMultiOperationApply(t *testing.T) {
+	o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
+		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed},
+	}})
+
+	assert.False(t, o.shouldPublishTerminalSummary(completedApply()))
+}
+
+// A per-driver observer for a single-operation apply (every apply today, until
+// fan-out lands) owns and publishes the terminal summary unchanged.
+func TestShouldPublishTerminalSummaryPublishesForSingleOperationApply(t *testing.T) {
+	o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
+	}})
+
+	assert.True(t, o.shouldPublishTerminalSummary(completedApply()))
+}
+
+// On an operation-load failure the per-driver observer must not publish: a
+// partial or duplicate summary is worse than none, and startup reconciliation
+// repairs a genuinely missing summary.
+func TestShouldPublishTerminalSummaryDefersOnLoadError(t *testing.T) {
+	o := newDispatchTestObserver(&stubApplyOperationStore{err: errors.New("db unavailable")})
+
+	assert.False(t, o.shouldPublishTerminalSummary(completedApply()))
+}
+
+// The aggregate CAS-winner observer always owns the terminal summary — its
+// authority is the won non-terminal→terminal projection CAS, so it publishes
+// without consulting the operation set.
+func TestShouldPublishTerminalSummaryAlwaysTrueForAggregateWinner(t *testing.T) {
+	cfg := CommentObserverConfig{
+		Repo:    "org/repo",
+		PR:      42,
+		ApplyID: 7,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	aggregate := NewAggregateTerminalCommentObserver(cfg)
+
+	assert.True(t, aggregate.shouldPublishTerminalSummary(completedApply()))
+}

@@ -120,6 +120,21 @@ func (o *CommentObserver) logError(apply *storage.Apply, msg string, args ...any
 	o.logger.Error(msg, append(fields, args...)...)
 }
 
+func (o *CommentObserver) logInfo(apply *storage.Apply, msg string, args ...any) {
+	fields := []any{
+		"repo", o.repo,
+		"pr", o.pr,
+	}
+	if apply != nil {
+		fields = append(fields,
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+		)
+	}
+	o.logger.Info(msg, append(fields, args...)...)
+}
+
 // NewCommentObserver creates a new CommentObserver for posting PR comments.
 func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 	clk := clock.Default(cfg.Clock)
@@ -261,25 +276,44 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		activeCommentState = state.Comment.Cutover
 	}
 
+	// A multi-operation (fan-out) apply publishes its single apply-level terminal
+	// summary through the operator's aggregate CAS-winner observer (see
+	// publishTerminalSummaryIfWon / NewAggregateTerminalCommentObserver), which
+	// re-derives the parent from all apply_operations and renders the full task
+	// set. A per-driver observer here holds only one operation's task slice, so
+	// it must not publish the summary for a multi-operation apply — doing so
+	// would post a duplicate, partial summary. Single-operation applies are
+	// unaffected and keep publishing through this path.
+	publishSummary := o.shouldPublishTerminalSummary(apply)
+
 	if activeCommentState == state.Comment.Cutover {
 		// Cutover comment gets the summary format — Apply ID, DDL, success message.
-		// No separate summary needed since the cutover comment IS the completion comment.
-		finalBody := o.formatTerminalSummaryComment(apply, tasks)
-		o.editTrackedComment(apply, activeCommentState, finalBody)
+		// No separate summary needed since the cutover comment IS the completion
+		// comment, so editing it to the summary format is itself the summary
+		// publish. Defer to the aggregate publisher for multi-operation applies.
+		if publishSummary {
+			finalBody := o.formatTerminalSummaryComment(apply, tasks)
+			o.editTrackedComment(apply, activeCommentState, finalBody)
 
-		// Upsert a summary marker so FindMissingSummaryComment (outbox query)
-		// doesn't false-positive on restart for cutover applies.
-		o.markSummaryPosted(apply, activeCommentState)
+			// Upsert a summary marker so FindMissingSummaryComment (outbox query)
+			// doesn't false-positive on restart for cutover applies.
+			o.markSummaryPosted(apply, activeCommentState)
+		}
 	} else {
 		// Edit the progress comment to its final state (completed bars / error).
+		// This is the per-operation status freeze, not the apply-level summary, so
+		// it always runs; the aggregate publisher re-edits it with the full task
+		// set for multi-operation applies.
 		finalBody := o.formatStatusComment(apply, tasks)
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 
 		// Post a separate summary comment. A new comment is more reliable than
 		// an edit — GitHub renders edits with a delay, but new comments appear
 		// immediately and trigger notifications for PR subscribers.
-		summaryBody := o.formatTerminalSummaryComment(apply, tasks)
-		o.postAndTrackComment(apply, state.Comment.Summary, summaryBody)
+		if publishSummary {
+			summaryBody := o.formatTerminalSummaryComment(apply, tasks)
+			o.postAndTrackComment(apply, state.Comment.Summary, summaryBody)
+		}
 	}
 
 	// Run terminal hook (e.g., update check runs)
@@ -289,6 +323,37 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 	if o.OnTerminalHook != nil {
 		o.OnTerminalHook(apply)
 	}
+}
+
+// shouldPublishTerminalSummary reports whether this observer owns the apply-level
+// terminal summary. The aggregate CAS-winner observer (built by
+// NewAggregateTerminalCommentObserver after winning the non-terminal→terminal
+// projection CAS) always owns it. A per-driver observer owns it only for a
+// single-operation apply: a multi-operation apply has its summary published once
+// by the aggregate observer, which re-derives the parent from every
+// apply_operation and renders the full task set, so a per-driver observer here —
+// holding one operation's task slice — must defer to it. On a lookup failure it
+// returns false so no partial or duplicate summary is posted; startup
+// reconciliation (FindMissingSummaryComment) repairs a genuinely missing one.
+func (o *CommentObserver) shouldPublishTerminalSummary(apply *storage.Apply) bool {
+	if o.aggregateTerminalCASWinner {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
+	if err != nil {
+		o.logError(apply, "observer: failed to load apply operations for terminal summary ownership; leaving summary to reconciliation",
+			"error", err)
+		return false
+	}
+	if len(ops) > 1 {
+		o.logInfo(apply, "observer: deferring terminal summary to aggregate publisher for multi-operation apply",
+			"operation_count", len(ops))
+		return false
+	}
+	return true
 }
 
 // formatStatusComment renders the apply's progress/cutover status comment,
