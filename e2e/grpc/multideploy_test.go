@@ -6,8 +6,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"maps"
 	"net/http"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -114,22 +116,31 @@ func multiDeployCreateTestTable(t *testing.T, deployment, tableName, ddl string)
 	dsn := multiDeployTernMySQLDSN(t, deployment)
 	db, err := sql.Open("mysql", dsn)
 	require.NoErrorf(t, err, "open tern mysql (%s)", deployment)
+	// Defer close immediately so the handle is reclaimed even if the create
+	// below fails a require.* assertion, and so close errors are logged.
+	defer utils.CloseAndLog(db)
 	_, err = db.ExecContext(t.Context(), ddl)
 	require.NoErrorf(t, err, "create table %s on %s", tableName, deployment)
-	_ = db.Close()
 
 	t.Cleanup(func() {
 		db2, err := sql.Open("mysql", dsn)
 		if err != nil {
+			t.Logf("cleanup: open tern mysql (%s): %v", deployment, err)
 			return
 		}
 		defer utils.CloseAndLog(db2)
+		// t.Context() is cancelled once the test finishes, so derive a
+		// cancellation-immune context with a bounded timeout for cleanup DDL.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
 		for _, suffix := range []string{"_new", "_old", "_chkpnt", ""} {
 			name := tableName
 			if suffix != "" {
 				name = "_" + tableName + suffix
 			}
-			_, _ = db2.ExecContext(context.Background(), "DROP TABLE IF EXISTS `"+name+"`") //nolint:usetesting // cleanup
+			if _, err := db2.ExecContext(ctx, "DROP TABLE IF EXISTS `"+name+"`"); err != nil {
+				t.Logf("cleanup: drop table %s on %s: %v", name, deployment, err)
+			}
 		}
 	})
 }
@@ -172,6 +183,23 @@ func multiDeployOperationStates(t *testing.T, applyID string) map[string]grpcOpe
 		byDeployment[op.Deployment] = op
 	}
 	return byDeployment
+}
+
+// multiDeployOps fetches per-deployment operation states and fails fast if
+// either expected deployment is missing. An apply commits all of its
+// apply_operations rows in one transaction, so once the apply is accepted a
+// missing row is a real defect — not a transient — and the test should fail
+// immediately with a clear message rather than poll for minutes against empty
+// state strings.
+func multiDeployOps(t *testing.T, applyID string, deployments ...string) map[string]grpcOperationProgress {
+	t.Helper()
+	ops := multiDeployOperationStates(t, applyID)
+	for _, d := range deployments {
+		_, ok := ops[d]
+		require.Truef(t, ok, "progress missing operation for deployment %q; present: %v",
+			d, slices.Sorted(maps.Keys(ops)))
+	}
+	return ops
 }
 
 // failedApplyState reports whether a state is a failed terminal apply state.
@@ -230,7 +258,7 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 	)
 	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
 		func() bool {
-			ops := multiDeployOperationStates(t, apply.ApplyID)
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
 			firstOp, secondOp := ops[first], ops[second]
 
 			// Happy path: neither deployment should fail.
@@ -331,7 +359,7 @@ func TestGRPCMultiDeploy_FailureHaltsRollout(t *testing.T) {
 	// from cutting over once a sibling has failed.
 	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
 		func() bool {
-			ops := multiDeployOperationStates(t, apply.ApplyID)
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
 			require.Falsef(t, state.IsState(ops[second].State, state.Apply.Completed),
 				"halt violated: %s completed despite %s failing (state %q)", second, first, ops[first].State)
 			return failedApplyState(ops[first].State)
