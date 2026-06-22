@@ -21,6 +21,14 @@ func barrier(dep, st string) Operation {
 	return Operation{Deployment: dep, State: st, Barrier: true, HaltOnFailure: true}
 }
 
+// continuing builds a rolling, on_failure=continue operation. HaltOnFailure and
+// ContinueOnFailure are exact complements at the real boundary mappers (both
+// derive from the same on_failure value), so a continue operation sets
+// HaltOnFailure false and ContinueOnFailure true together.
+func continuing(dep, st string) Operation {
+	return Operation{Deployment: dep, State: st, HaltOnFailure: false, ContinueOnFailure: true}
+}
+
 // TestDerive_Empty: an apply with no operations rolls up to pending with no
 // deployments and is not treated as multi-deployment.
 func TestDerive_Empty(t *testing.T) {
@@ -128,15 +136,15 @@ func TestDerivePending_Ordering(t *testing.T) {
 		{
 			name: "no-halt: earlier failed no longer blocks",
 			ops: []Operation{
-				{Deployment: "eu", State: so.Failed, HaltOnFailure: false},
-				{Deployment: "us", State: so.Pending, HaltOnFailure: false},
+				continuing("eu", so.Failed),
+				continuing("us", so.Pending),
 			},
 			want:  StateQueuedNext,
 			label: "queued — next in order",
 		},
 		{
 			name:  "cancelled earlier halts regardless of halt flag",
-			ops:   []Operation{{Deployment: "eu", State: so.Cancelled, HaltOnFailure: false}, {Deployment: "us", State: so.Pending, HaltOnFailure: false}},
+			ops:   []Operation{continuing("eu", so.Cancelled), continuing("us", so.Pending)},
 			want:  StateHalted,
 			label: "halted — eu cancelled",
 		},
@@ -188,8 +196,8 @@ func TestDeriveWaitingForCutover_Ordering(t *testing.T) {
 		{
 			name: "no-halt: earlier failed does not block cutover (rollout continues past it)",
 			ops: []Operation{
-				{Deployment: "eu", State: so.Failed, HaltOnFailure: false},
-				{Deployment: "us", State: so.WaitingForCutover, HaltOnFailure: false},
+				continuing("eu", so.Failed),
+				continuing("us", so.WaitingForCutover),
 			},
 			want:  StateReadyForCutoverNext,
 			label: "ready for cutover — next in order",
@@ -258,15 +266,16 @@ func TestDerive_AggregateFailedHaltExample(t *testing.T) {
 	assert.Equal(t, StateHalted, got.Deployments[3].Presentation)
 }
 
-// TestDerive_CompletedWithOneFailedDeployment: under halt_on_failure=false the
-// rollout continues, so other deployments complete, but the aggregate stays
-// failed (the G3 render-half decision).
+// TestDerive_CompletedWithOneFailedDeployment: under on_failure continue the
+// rollout runs every sibling to a terminal state, but the verdict still
+// reflects the failure — once all siblings are terminal the aggregate settles
+// to failed, not running_degraded.
 func TestDerive_CompletedWithOneFailedDeployment(t *testing.T) {
 	got := Derive([]Operation{
-		{Deployment: "eu", State: so.Completed, HaltOnFailure: false},
-		{Deployment: "us", State: so.Completed, HaltOnFailure: false},
-		{Deployment: "au", State: so.Failed, HaltOnFailure: false},
-		{Deployment: "ca", State: so.Completed, HaltOnFailure: false},
+		continuing("eu", so.Completed),
+		continuing("us", so.Completed),
+		continuing("au", so.Failed),
+		continuing("ca", so.Completed),
 	})
 
 	assert.Equal(t, state.Apply.Failed, got.State)
@@ -314,9 +323,9 @@ func TestDerive_FirstFailureNoneWhenHealthy(t *testing.T) {
 // ErrorMessage is stamped from.
 func TestDerive_FirstFailurePicksEarliestInOrder(t *testing.T) {
 	got := Derive([]Operation{
-		{Deployment: "eu", State: so.Completed, HaltOnFailure: false},
-		{Deployment: "us", State: so.Failed, HaltOnFailure: false, Error: "first boom"},
-		{Deployment: "au", State: so.Failed, HaltOnFailure: false, Error: "second boom"},
+		continuing("eu", so.Completed),
+		{Deployment: "us", State: so.Failed, HaltOnFailure: false, ContinueOnFailure: true, Error: "first boom"},
+		{Deployment: "au", State: so.Failed, HaltOnFailure: false, ContinueOnFailure: true, Error: "second boom"},
 	})
 	require.NotNil(t, got.FirstFailure)
 	assert.Equal(t, "us", got.FirstFailure.Deployment)
@@ -325,18 +334,32 @@ func TestDerive_FirstFailurePicksEarliestInOrder(t *testing.T) {
 
 // TestDerive_FirstFailureWhileSiblingStillRunning: under on_failure continue an
 // earlier deployment can be failed while a later one is still copying. The
-// aggregate is fail-closed to failed, but the in-progress comment still has a
-// running deployment, so surfacing the first failure here lifts the reason onto
-// the status comment rather than waiting for the terminal summary.
+// rollout is held running_degraded so the live sibling runs to completion, and
+// the first failure is surfaced eagerly onto the in-progress comment rather than
+// waiting for the terminal summary.
 func TestDerive_FirstFailureWhileSiblingStillRunning(t *testing.T) {
 	got := Derive([]Operation{
-		{Deployment: "eu", State: so.Failed, HaltOnFailure: false, Error: "boom"},
-		{Deployment: "us", State: so.Running, HaltOnFailure: false},
+		{Deployment: "eu", State: so.Failed, HaltOnFailure: false, ContinueOnFailure: true, Error: "boom"},
+		continuing("us", so.Running),
 	})
-	assert.Equal(t, state.Apply.Failed, got.State)
+	assert.Equal(t, state.Apply.RunningDegraded, got.State)
+	assert.Equal(t, "running (degraded)", got.Label)
+	assert.Equal(t, NextAction{Kind: NextActionNone}, got.NextAction)
 	assert.Equal(t, StateRunningCopy, got.Deployments[1].Presentation)
 	require.NotNil(t, got.FirstFailure)
 	assert.Equal(t, "eu", got.FirstFailure.Deployment)
+}
+
+// TestDerive_HaltFailureWithRunningSiblingStaysFailed: a halt-policy failure is
+// fail-closed even while a sibling is still running — only on_failure continue
+// holds the rollout running_degraded.
+func TestDerive_HaltFailureWithRunningSiblingStaysFailed(t *testing.T) {
+	got := Derive([]Operation{
+		rolling("eu", so.Failed),
+		rolling("us", so.Running),
+	})
+	assert.Equal(t, state.Apply.Failed, got.State)
+	assert.Equal(t, "failed", got.Label)
 }
 
 // TestDerive_FirstFailureExcludesRetrying: a failed_retryable deployment is

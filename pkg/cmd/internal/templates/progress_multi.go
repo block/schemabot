@@ -29,11 +29,12 @@ func progressOperationsForPresentation(ops []ProgressOperation) []presentation.O
 	presentationOps := make([]presentation.Operation, 0, len(ops))
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
-			Deployment:    op.Deployment,
-			State:         op.State,
-			Barrier:       op.CutoverPolicy == storage.CutoverPolicyBarrier,
-			HaltOnFailure: op.OnFailure != storage.OnFailureContinue,
-			Error:         op.ErrorMessage,
+			Deployment:        op.Deployment,
+			State:             op.State,
+			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
+			HaltOnFailure:     op.OnFailure != storage.OnFailureContinue,
+			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
+			Error:             op.ErrorMessage,
 		})
 	}
 	return presentationOps

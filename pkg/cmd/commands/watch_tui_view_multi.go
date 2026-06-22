@@ -30,18 +30,19 @@ func tuiOperationsForPresentation(ops []templates.ProgressOperation) []presentat
 	presentationOps := make([]presentation.Operation, 0, len(ops))
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
-			Deployment:    op.Deployment,
-			State:         op.State,
-			Barrier:       op.CutoverPolicy == storage.CutoverPolicyBarrier,
-			HaltOnFailure: op.OnFailure != storage.OnFailureContinue,
-			Error:         op.ErrorMessage,
+			Deployment:        op.Deployment,
+			State:             op.State,
+			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
+			HaltOnFailure:     op.OnFailure != storage.OnFailureContinue,
+			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
+			Error:             op.ErrorMessage,
 		})
 	}
 	return presentationOps
 }
 
 func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply) {
-	if state.IsState(model.State, state.Apply.Running, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering) {
+	if state.IsState(model.State, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering) {
 		b.WriteString(m.spinner.View() + model.Label + m.elapsed() + "\n")
 	} else {
 		b.WriteString(model.Label + "\n")

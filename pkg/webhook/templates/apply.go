@@ -90,7 +90,10 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
 	case state.Apply.Pending:
 		sb.WriteString("## Schema Change Starting\n\n")
-	case state.Apply.Running:
+	case state.Apply.Running, state.Apply.RunningDegraded:
+		// running_degraded is a continue rollout still in flight past a failed
+		// sibling: the change is still in progress, and the failed deployment is
+		// surfaced in the per-deployment breakdown, not the headline.
 		sb.WriteString("## Schema Change In Progress\n\n")
 	case state.Apply.FailedRetryable:
 		// Operator recovery retries the apply automatically, so it is still
@@ -542,7 +545,7 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.CuttingOver:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
-	case state.Apply.Running:
+	case state.Apply.Running, state.Apply.RunningDegraded:
 		writeFooterAction(sb, "To stop this schema change:", fmt.Sprintf("schemabot stop %s", data.ApplyID))
 	case state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,

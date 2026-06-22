@@ -31,6 +31,7 @@ func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
 	assert.Contains(t, FormatProgressState(state.Apply.Cancelled), "Cancelled")
 	assert.Contains(t, FormatProgressState(state.Apply.FailedRetryable), "Retrying")
 	assert.Contains(t, FormatProgressState(state.Apply.Recovering), "Recovering")
+	assert.Contains(t, FormatProgressState(state.Apply.RunningDegraded), "Running (degraded)")
 }
 
 func TestWriteStatusListHasMoreFooter(t *testing.T) {
@@ -361,6 +362,7 @@ func TestStateColorFunc_PlanetScalePhases(t *testing.T) {
 		state.Apply.ValidatingDeployRequest,
 		state.Apply.Recovering,
 		state.Apply.Cancelled,
+		state.Apply.RunningDegraded,
 	} {
 		fn := stateColorFunc(s)
 		assert.NotNil(t, fn, "expected color function for state %q", s)

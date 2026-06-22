@@ -298,6 +298,28 @@ func TestWatchModel_MultiDeploymentView(t *testing.T) {
 	assert.Contains(t, view, "Failed")
 }
 
+// Under on_failure continue a failed deployment with a still-running sibling
+// holds the rollout running_degraded: the multi-deployment TUI header shows
+// "running (degraded)" with a spinner, the running-sibling count, and the first
+// failure, rather than a premature terminal "failed" header.
+func TestWatchModel_MultiDeploymentViewRunningDegraded(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "orders", "production", false)
+	m.applyID = "apply-degraded"
+	m.state = state.Apply.RunningDegraded
+	m.initialized = true
+	m.operations = []templates.ProgressOperation{
+		{Deployment: "eu", Target: "orders-eu", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue, ErrorMessage: "duplicate column"},
+		{Deployment: "us", Target: "orders-us", State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue},
+	}
+
+	view := m.View()
+
+	assert.Contains(t, view, "running (degraded)")
+	assert.Contains(t, view, "1 running · 1 failed")
+	assert.Contains(t, view, "⚠ First failure: eu — duplicate column")
+	assert.Contains(t, view, "🔄 us — running table copy")
+}
+
 func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "orders", "production", false)
 	m.applyID = "apply-single-test"

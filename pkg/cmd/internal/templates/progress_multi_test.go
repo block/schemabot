@@ -47,6 +47,34 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 	assert.Contains(t, output, "users_c")
 }
 
+// Under on_failure continue a failed deployment with a still-running sibling
+// holds the rollout running_degraded: the aggregate shows "running (degraded)"
+// rather than a premature "failed", surfaces the first failure, and offers no
+// review-failure next action while the rollout is still in flight.
+func TestWriteProgressMultiDeploymentContinueFailureShowsRunningDegraded(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-degraded",
+			Environment: "production",
+			State:       state.Apply.RunningDegraded,
+			Operations: []ProgressOperation{
+				{Deployment: "region-a", Target: "orders-a", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureContinue, ErrorMessage: "duplicate column name 'region'"},
+				{Deployment: "region-b", Target: "orders-b", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureContinue},
+			},
+			Tables: []TableProgress{
+				{Deployment: "region-a", TableName: "users_a", ChangeType: "alter", DDL: "ALTER TABLE `users_a` ADD COLUMN `region` varchar(20)", Status: state.Task.Failed},
+				{Deployment: "region-b", TableName: "users_b", ChangeType: "alter", DDL: "ALTER TABLE `users_b` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "State:")
+	assert.Contains(t, output, "running (degraded)")
+	assert.Contains(t, output, "1 running · 1 failed")
+	assert.Contains(t, output, "First failure: region-a — duplicate column name 'region'")
+	assert.NotContains(t, output, "Next: review failure")
+}
+
 func TestWriteProgressSingleDeploymentDoesNotRenderMultiDeploymentAggregate(t *testing.T) {
 	data := ProgressData{
 		ApplyID:     "apply-single",

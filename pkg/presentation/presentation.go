@@ -44,6 +44,12 @@ type Operation struct {
 	// terminal-failed earlier sibling no longer blocks later deployments.
 	HaltOnFailure bool
 
+	// ContinueOnFailure is true only when the operation's on_failure policy is
+	// exactly "continue". The aggregate projection uses it to hold a rollout
+	// running_degraded past a continuable sibling failure; halt, pause, empty,
+	// and any unrecognized value must be false so the projection fails closed.
+	ContinueOnFailure bool
+
 	// Error is the operation's error detail, set when State is failed.
 	Error string
 }
@@ -138,7 +144,9 @@ type StateCount struct {
 // Apply is the surface-agnostic rollup for one logical apply.
 type Apply struct {
 	// State is the aggregate apply state derived from the child operation states
-	// via state.DeriveApplyState — the same projection that backs applies.state.
+	// via state.DeriveRolloutApplyState — the same policy-aware projection that
+	// backs applies.state, so a continue rollout still in flight past a failed
+	// sibling shows running_degraded here too rather than a premature failed.
 	State string
 
 	// Label is the operator-facing aggregate status (e.g. "waiting for cutover").
@@ -179,9 +187,12 @@ func (a Apply) MultiDeployment() bool {
 // must be in resolved deployment order (as returned by ListByApply); earlier
 // siblings are those before a given index.
 func Derive(ops []Operation) Apply {
-	rawStates := make([]string, len(ops))
+	children := make([]state.RolloutChild, len(ops))
 	for i, op := range ops {
-		rawStates[i] = op.State
+		children[i] = state.RolloutChild{
+			State:             op.State,
+			ContinueOnFailure: op.ContinueOnFailure,
+		}
 	}
 
 	deployments := make([]Deployment, len(ops))
@@ -189,7 +200,7 @@ func Derive(ops []Operation) Apply {
 		deployments[i] = deriveDeployment(ops, i)
 	}
 
-	aggState := state.DeriveApplyState(rawStates)
+	aggState := state.DeriveRolloutApplyState(children)
 	return Apply{
 		State:        aggState,
 		Label:        aggregateLabel(aggState),
@@ -379,6 +390,8 @@ func aggregateLabel(s string) string {
 		return "queued"
 	case state.Apply.Running:
 		return "running"
+	case state.Apply.RunningDegraded:
+		return "running (degraded)"
 	case state.Apply.WaitingForDeploy:
 		return "waiting for deploy"
 	case state.Apply.WaitingForCutover:

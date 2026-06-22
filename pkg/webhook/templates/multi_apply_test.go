@@ -19,6 +19,10 @@ func rollingOp(dep, st string) presentation.Operation {
 	return presentation.Operation{Deployment: dep, State: st, HaltOnFailure: true}
 }
 
+func continuingOp(dep, st string) presentation.Operation {
+	return presentation.Operation{Deployment: dep, State: st, HaltOnFailure: false, ContinueOnFailure: true}
+}
+
 // A barrier rollout mid-flight (one deployment parked ready for cutover, one
 // copying, two queued behind it) renders an aggregate header with the running
 // title, a per-status count line, a single cutover next-action, an at-a-glance
@@ -131,18 +135,19 @@ func TestRenderMultiDeploymentApplyComment_UsesOneRenderTimestamp(t *testing.T) 
 // firstFailingOp builds a rolling, continue-policy operation carrying an error,
 // so a fan-out can fail one deployment and keep going.
 func firstFailingOp(dep, st, errMsg string) presentation.Operation {
-	return presentation.Operation{Deployment: dep, State: st, HaltOnFailure: false, Error: errMsg}
+	return presentation.Operation{Deployment: dep, State: st, HaltOnFailure: false, ContinueOnFailure: true, Error: errMsg}
 }
 
 // A failed deployment's reason is lifted to the aggregate header so an operator
 // sees what failed without expanding that deployment's section. Under on_failure
-// continue a later deployment is still copying, so the reason surfaces on the
-// in-progress status comment, and only the first failure in resolved order shows.
+// continue a later deployment is still copying, so the rollout is running_degraded
+// (still in progress) and the reason surfaces on the in-progress status comment,
+// with only the first failure in resolved order shown.
 func TestRenderMultiDeploymentApplyComment_FirstFailureSurfacesError(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
 		firstFailingOp("us", so.Failed, "Error 1061: Duplicate key name idx"),
 		firstFailingOp("eu", so.Failed, "second failure"),
-		{Deployment: "au", State: so.Running, HaltOnFailure: false},
+		continuingOp("au", so.Running),
 	})
 	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model:       model,
@@ -150,7 +155,10 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureSurfacesError(t *testing.
 		Environment: "production",
 	})
 
-	// A later deployment is still running even though the aggregate is fail-closed.
+	// The rollout is still in progress (running_degraded), not headlined as failed.
+	assert.Contains(t, out, "## Schema Change In Progress")
+	assert.NotContains(t, out, "Schema Change Failed")
+	// A later deployment is still running while siblings have failed.
 	assert.Contains(t, out, "- 🔄 au — running table copy")
 	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — Error 1061: Duplicate key name idx\n")
 	// Only the earliest failure is lifted to the header.
