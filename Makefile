@@ -21,7 +21,7 @@ endif
 E2E_TEST_TIMEOUT ?= 10m
 E2E_TEST_FLAGS ?=
 
-.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -400,6 +400,56 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 	TEST_EXIT_CODE=$$?; \
 	echo "Tearing down gRPC e2e environment..."; \
 	$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
+	exit $$TEST_EXIT_CODE
+
+# Run the multi-deployment fan-out gRPC e2e fixture (E2E-1).
+# One environment (testapp/production) fans out to two deployments (eu, us),
+# each backed by its own remote Tern + MySQL.
+# NOT part of `make test-e2e`: the stack cannot boot until the >1-deployments
+# config hard-block is lifted (MD-9b-ii). Run manually once that lands.
+# Ports: SchemaBot=15370, SchemaBot-MySQL=15371, EU-MySQL=15372, US-MySQL=15373
+#        EU-HTTP=15380, EU-gRPC=15390, US-HTTP=15382, US-gRPC=15392
+E2E_GRPC_MD_ENV := SCHEMABOT_PORT=15370 \
+	SCHEMABOT_MYSQL_PORT=15371 \
+	TERN_EU_MYSQL_PORT=15372 \
+	TERN_US_MYSQL_PORT=15373 \
+	TERN_EU_PORT=15380 \
+	TERN_EU_GRPC_PORT=15390 \
+	TERN_US_PORT=15382 \
+	TERN_US_GRPC_PORT=15392
+
+test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixture (E2E-1; blocked on MD-9b-ii)
+	@echo "Starting isolated multi-deployment gRPC e2e environment..."
+	CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd
+	cp bin/schemabot-linux deploy/local/schemabot-dev
+	@$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v 2>/dev/null || true
+	@$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml up --build -d
+	@rm -f deploy/local/schemabot-dev
+	@echo "Waiting for multi-deployment SchemaBot gRPC e2e environment to be healthy..."
+	@for i in $$(seq 1 90); do \
+		if curl -sf http://localhost:15370/health > /dev/null 2>&1; then \
+			echo "Multi-deployment SchemaBot gRPC e2e environment is healthy"; \
+			break; \
+		fi; \
+		if [ $$i -eq 90 ]; then \
+			echo "Timeout waiting for multi-deployment SchemaBot gRPC e2e environment"; \
+			echo "(expected until MD-9b-ii lifts the >1-deployments config hard-block)"; \
+			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs; \
+			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
+	@echo "Running multi-deployment gRPC e2e tests..."
+	@E2E_MULTIDEPLOY=1 \
+	E2E_SCHEMABOT_URL=http://localhost:15370 \
+	E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:15371)/schemabot" \
+	E2E_TERN_EU_MYSQL_DSN="root:testpassword@tcp(localhost:15372)/testapp" \
+	E2E_TERN_US_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
+	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m -run TestGRPCMultiDeploy ./e2e/grpc/... ; \
+	TEST_EXIT_CODE=$$?; \
+	echo "Tearing down multi-deployment gRPC e2e environment..."; \
+	$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v; \
 	exit $$TEST_EXIT_CODE
 
 # Run k8s e2e tests on minikube. Starts minikube if needed.

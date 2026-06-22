@@ -1,0 +1,43 @@
+# SchemaBot Configuration (gRPC Mode - multi-deployment fan-out)
+#
+# E2E-1 fixture: a single (database, environment) — testapp/production — fans
+# out to TWO deployments (eu, us), each backed by its own remote Tern service
+# and MySQL. This is the shape exercised by the multi-deployment ordered-cutover
+# acceptance test (E2E-2).
+#
+# Contrast with grpc-schemabot.yaml, which wires two Terns as two *environments*
+# (staging/production) of a single "default" deployment.
+#
+# NOTE: This config sets a deployments map with >1 entry. SchemaBot's config
+# validation currently rejects that with:
+#   "multi-deployment (>1 entries) is not yet supported by this server"
+# so a stack booted from this file will NOT come up until the MD-9b-ii hard-block
+# lift lands (gated behind MD-9b-i / block/schemabot#431). The fixture is
+# committed now so the harness is ready the moment that block is removed.
+
+# SchemaBot's own storage database
+storage:
+  dsn: "env:MYSQL_DSN"
+
+# gRPC mode: one environment (production) fanning out to two deployments.
+databases:
+  testapp:
+    type: mysql
+    environments:
+      production:
+        cutover_policy: barrier
+        deployment_order:
+          - eu
+          - us
+        deployments:
+          eu:
+            target: testapp
+          us:
+            target: testapp
+
+# Per-deployment Tern gRPC endpoints.
+tern_deployments:
+  eu:
+    production: "tern-eu:9090"
+  us:
+    production: "tern-us:9090"
