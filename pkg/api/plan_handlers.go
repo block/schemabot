@@ -145,11 +145,12 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	)
 	defer span.End()
 
-	// Pull the live schema from the primary deployment (first in
-	// deployment_order, otherwise the only deployment). For a multi-deployment
-	// environment the primary is the canonical source for the schema diff; the
-	// apply itself fans out across every deployment. This matches the route
-	// ExecutePlan resolves and the deployment createStoredApply records.
+	// Pull the live schema from the primary deployment (first in rollout order:
+	// explicit deployment_order when set, otherwise alphabetical). For a
+	// multi-deployment environment the primary is the canonical source for the
+	// schema diff; the apply itself fans out across every deployment. This
+	// matches the route ExecutePlan resolves and the deployment
+	// createStoredApply records.
 	resolvedTarget, err := s.config.ResolvePrimaryDatabaseTarget(req.Database, req.Environment)
 	if err != nil {
 		span.RecordError(err)
