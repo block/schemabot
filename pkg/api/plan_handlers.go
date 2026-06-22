@@ -56,16 +56,6 @@ func (e *unsupportedPullSchemaError) Error() string {
 	return fmt.Sprintf("pull schema supports %s and %s databases; got %s", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, e.DatabaseType)
 }
 
-type ambiguousPullSchemaTargetError struct {
-	Database    string
-	Environment string
-	Count       int
-}
-
-func (e *ambiguousPullSchemaTargetError) Error() string {
-	return fmt.Sprintf("pull schema for database %q environment %q resolves to %d deployments; pull schema currently requires an environment with exactly one deployment", e.Database, e.Environment, e.Count)
-}
-
 // RemoteDeploymentUnavailableError carries routing metadata for remote
 // schema change service availability failures so callers can render actionable
 // operator-facing errors without parsing strings.
@@ -125,12 +115,6 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotImplemented, err.Error())
 			return
 		}
-		var ambiguousErr *ambiguousPullSchemaTargetError
-		if errors.As(err, &ambiguousErr) {
-			s.logger.Warn("pull schema rejected for multi-deployment environment", "database", ambiguousErr.Database, "environment", ambiguousErr.Environment, "deployment_count", ambiguousErr.Count)
-			s.writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
 		var unavailableErr *RemoteDeploymentUnavailableError
 		if errors.As(err, &unavailableErr) {
 			s.logger.Error("pull schema failed because remote deployment is unavailable",
@@ -161,19 +145,17 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	)
 	defer span.End()
 
-	resolvedTargets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
+	// Pull the live schema from the primary deployment (first in
+	// deployment_order, otherwise the only deployment). For a multi-deployment
+	// environment the primary is the canonical source for the schema diff; the
+	// apply itself fans out across every deployment. This matches the route
+	// ExecutePlan resolves and the deployment createStoredApply records.
+	resolvedTarget, err := s.config.ResolvePrimaryDatabaseTarget(req.Database, req.Environment)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "resolve target")
 		return nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
 	}
-	if len(resolvedTargets) != 1 {
-		ambiguousErr := &ambiguousPullSchemaTargetError{Database: req.Database, Environment: req.Environment, Count: len(resolvedTargets)}
-		span.RecordError(ambiguousErr)
-		span.SetStatus(otelcodes.Error, "ambiguous target")
-		return nil, ambiguousErr
-	}
-	resolvedTarget := resolvedTargets[0]
 	if req.Type != "" && req.Type != resolvedTarget.DatabaseType {
 		typeErr := fmt.Errorf("database %q type %q does not match server config type %q", req.Database, req.Type, resolvedTarget.DatabaseType)
 		span.RecordError(typeErr)
@@ -199,15 +181,15 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		return nil, err
 	}
 
-	client, err := s.RoutingTernClient()
+	client, err := s.TernClient(resolvedTarget.Deployment, req.Environment)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "tern client")
 		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
-	isRemoteTarget := s.executionTargetUsesRemoteClient(resolvedTarget.Deployment, req.Environment)
-	s.logger.Info("ExecutePullSchema: calling routing client PullSchema",
+	isRemoteTarget := client.IsRemote()
+	s.logger.Info("ExecutePullSchema: calling PullSchema",
 		"database", req.Database,
 		"type", resolvedTarget.DatabaseType,
 		"deployment", resolvedTarget.Deployment,
@@ -228,6 +210,7 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		resp, pullErr := client.PullSchema(ctx, &ternv1.PullSchemaRequest{
 			Database:      req.Database,
 			Type:          resolvedTarget.DatabaseType,
+			Target:        resolvedTarget.Target,
 			Environment:   req.Environment,
 			Namespace:     namespace,
 			CatalogDetail: catalogDetail,
@@ -341,16 +324,6 @@ func mergePullSchemaResponse(merged, resp *ternv1.PullSchemaResponse, requestedN
 	}
 	merged.TableCount += resp.TableCount
 	return nil
-}
-
-func (s *Service) executionTargetUsesRemoteClient(deployment, environment string) bool {
-	if dbConfig := s.config.Database(deployment); dbConfig != nil {
-		if envConfig, ok := dbConfig.Environments[environment]; ok && envConfig.HasLocalDSN() {
-			return false
-		}
-	}
-	_, err := s.config.TernDeployments.Endpoint(deployment, environment)
-	return err == nil
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.

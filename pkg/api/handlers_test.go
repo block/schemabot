@@ -1178,64 +1178,103 @@ func TestExecutePullSchemaRejectsUnsupportedType(t *testing.T) {
 	assert.Equal(t, storage.DatabaseTypeStrata, unsupportedErr.DatabaseType)
 }
 
-func TestExecutePullSchemaRejectsMultiDeploymentEnvironment(t *testing.T) {
+// A multi-deployment environment pulls its live schema from the primary
+// deployment (first in deployment_order); the apply itself fans out across
+// every deployment.
+func TestExecutePullSchemaRoutesPrimaryDeployment(t *testing.T) {
+	euClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	usClient := &mockTernClient{}
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"orders": {
 				Type: storage.DatabaseTypeMySQL,
 				Environments: map[string]EnvironmentConfig{
 					"production": {
+						DeploymentOrder: []string{"eu", "us"},
 						Deployments: map[string]DeploymentTarget{
-							"primary":   {Target: "orders-primary"},
-							"secondary": {Target: "orders-secondary"},
+							"eu": {Target: "orders-eu"},
+							"us": {Target: "orders-us"},
 						},
 					},
 				},
 			},
 		},
 		TernDeployments: TernConfig{
-			"primary":   {"production": "primary.example.com:80"},
-			"secondary": {"production": "secondary.example.com:80"},
+			"eu": {"production": "eu.example.com:80"},
+			"us": {"production": "us.example.com:80"},
 		},
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := New(&mockStorage{}, cfg, map[string]tern.Client{}, logger)
+	svc := New(&mockStorage{}, cfg, map[string]tern.Client{
+		"eu/production": euClient,
+		"us/production": usClient,
+	}, logger)
 
-	_, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
 		Database:    "orders",
 		Environment: "production",
 		Type:        storage.DatabaseTypeMySQL,
 	})
 
-	var ambiguousErr *ambiguousPullSchemaTargetError
-	require.ErrorAs(t, err, &ambiguousErr)
-	assert.Equal(t, "orders", ambiguousErr.Database)
-	assert.Equal(t, "production", ambiguousErr.Environment)
-	assert.Equal(t, 2, ambiguousErr.Count)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, int32(1), resp.TableCount)
+	require.NotNil(t, euClient.pullSchemaReq, "primary deployment should be pulled")
+	assert.Equal(t, "orders-eu", euClient.pullSchemaReq.Target)
+	assert.Equal(t, storage.DatabaseTypeMySQL, euClient.pullSchemaReq.Type)
+	assert.Nil(t, usClient.pullSchemaReq, "non-primary deployment must not be pulled")
 }
 
-func TestPullSchemaHandlerRejectsMultiDeploymentEnvironment(t *testing.T) {
+// The /api/pull handler succeeds for a multi-deployment environment, returning
+// the live schema pulled from the primary deployment.
+func TestPullSchemaHandlerRoutesPrimaryDeployment(t *testing.T) {
+	euClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	usClient := &mockTernClient{}
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"orders": {
 				Type: storage.DatabaseTypeMySQL,
 				Environments: map[string]EnvironmentConfig{
 					"production": {
+						DeploymentOrder: []string{"eu", "us"},
 						Deployments: map[string]DeploymentTarget{
-							"primary":   {Target: "orders-primary"},
-							"secondary": {Target: "orders-secondary"},
+							"eu": {Target: "orders-eu"},
+							"us": {Target: "orders-us"},
 						},
 					},
 				},
 			},
 		},
 		TernDeployments: TernConfig{
-			"primary":   {"production": "primary.example.com:80"},
-			"secondary": {"production": "secondary.example.com:80"},
+			"eu": {"production": "eu.example.com:80"},
+			"us": {"production": "us.example.com:80"},
 		},
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := New(&mockStorage{}, cfg, map[string]tern.Client{}, logger)
+	svc := New(&mockStorage{}, cfg, map[string]tern.Client{
+		"eu/production": euClient,
+		"us/production": usClient,
+	}, logger)
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 
@@ -1245,8 +1284,10 @@ func TestPullSchemaHandlerRejectsMultiDeploymentEnvironment(t *testing.T) {
 
 	mux.ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-	assert.Contains(t, w.Body.String(), "resolves to 2 deployments")
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, euClient.pullSchemaReq, "primary deployment should be pulled")
+	assert.Equal(t, "orders-eu", euClient.pullSchemaReq.Target)
+	assert.Nil(t, usClient.pullSchemaReq, "non-primary deployment must not be pulled")
 }
 
 func TestExecuteApplySourcePolicyAllowsDirectPlan(t *testing.T) {
