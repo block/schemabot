@@ -87,3 +87,33 @@ jobs:
       - name: webhookheaders analyzer
         if: matrix.name == 'default'
         run: make check-webhookheaders
+
+  # Stable rollup for the lint matrix so a single check name can gate a merge,
+  # mirroring the E2E/LocalScale/K8s rollups in test.yaml. The golangci matrix
+  # check names (`lint (default)`, `lint (integration, …)`, `lint (e2e, …)`)
+  # change with the matrix, so require this `Lint` check instead.
+  lint-rollup:
+    name: "Lint"
+    needs: [changes, golangci]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          GOLANGCI_RESULT: ${{ needs.golangci.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes job failed"
+            exit 1
+          fi
+          if [ "$CHANGES_CODE" != "true" ]; then
+            echo "Docs-only PR; lint intentionally skipped."
+            exit 0
+          fi
+          if [ "$GOLANGCI_RESULT" != "success" ]; then
+            echo "::error::golangci result=$GOLANGCI_RESULT"
+            exit 1
+          fi
