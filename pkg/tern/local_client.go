@@ -1791,10 +1791,22 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			}
 		}
 
-		// Render the per-shard breakdown from the persisted rows the operator's
-		// drive maintains — stored is the single read surface, never the live
-		// engine result.
-		tp.Shards = shardProgressProto(storedShards[progressTableKey(t.Namespace, t.TableName)])
+		// When per-shard rows are persisted, the table headline (rows, percent,
+		// ETA) is the aggregate of those rows — computed at read time so a reader
+		// that does not poll the engine is correct, overriding the live or
+		// stored-task figures above.
+		storedForTable := storedShards[progressTableKey(t.Namespace, t.TableName)]
+		if len(storedForTable) > 0 {
+			rowsCopied, rowsTotal, etaSeconds, percent := aggregateStoredShards(storedForTable)
+			tp.RowsCopied = rowsCopied
+			tp.RowsTotal = rowsTotal
+			tp.EtaSeconds = etaSeconds
+			tp.PercentComplete = percent
+		}
+
+		// Render the per-shard breakdown from those persisted rows — stored is the
+		// single read surface, never the live engine result.
+		tp.Shards = shardProgressProto(storedForTable)
 
 		tables = append(tables, tp)
 	}
@@ -1969,6 +1981,31 @@ func (c *LocalClient) loadStoredShardsByTable(ctx context.Context, apply *storag
 		}
 	}
 	return byTable
+}
+
+// aggregateStoredShards computes a table's headline figures from its persisted
+// per-shard rows — the per-table number is computed at read time, never stored.
+// Rows are summed (a completed shard's copied count is clamped up to its total,
+// since row counts can lag concurrent inserts), ETA is the slowest shard, and
+// percent is derived from the summed rows. Mirrors the live shard-to-table
+// aggregation so the headline does not jump when it switches from the live
+// engine result to stored rows.
+func aggregateStoredShards(shards []*storage.Task) (rowsCopied, rowsTotal, etaSeconds int64, percent int32) {
+	for _, sh := range shards {
+		rowsTotal += sh.RowsTotal
+		copied := sh.RowsCopied
+		if state.IsState(sh.State, state.Task.Completed) && sh.RowsTotal > 0 && copied < sh.RowsTotal {
+			copied = sh.RowsTotal
+		}
+		rowsCopied += copied
+		if int64(sh.ETASeconds) > etaSeconds {
+			etaSeconds = int64(sh.ETASeconds)
+		}
+	}
+	if rowsTotal > 0 {
+		percent = int32(min(rowsCopied*100/rowsTotal, 100))
+	}
+	return rowsCopied, rowsTotal, etaSeconds, percent
 }
 
 // shardProgressProto renders a table's per-shard breakdown from the persisted

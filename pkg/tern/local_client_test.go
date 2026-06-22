@@ -2791,3 +2791,36 @@ func TestLocalClient_VitessProgressRendersShardsFromStored(t *testing.T) {
 		assert.NotEqual(t, "live-only", sh.Shard, "stored rows are preferred over the live engine result")
 	}
 }
+
+// aggregateStoredShards computes the table headline from persisted shard rows:
+// rows summed (completed shards clamped to their total), ETA the slowest shard,
+// percent derived from the summed rows.
+func TestAggregateStoredShards(t *testing.T) {
+	shards := []*storage.Task{
+		{Shard: "-80", State: state.Task.Running, RowsCopied: 30, RowsTotal: 100, ETASeconds: 5},
+		{Shard: "80-", State: state.Task.Running, RowsCopied: 50, RowsTotal: 100, ETASeconds: 10},
+	}
+	rowsCopied, rowsTotal, eta, pct := aggregateStoredShards(shards)
+	assert.Equal(t, int64(80), rowsCopied)
+	assert.Equal(t, int64(200), rowsTotal)
+	assert.Equal(t, int64(10), eta, "table ETA is the slowest shard")
+	assert.Equal(t, int32(40), pct)
+
+	// A completed shard's copied count is clamped up to its total (row counts
+	// can lag concurrent inserts).
+	completed := []*storage.Task{
+		{Shard: "-80", State: state.Task.Completed, RowsCopied: 90, RowsTotal: 100},
+		{Shard: "80-", State: state.Task.Completed, RowsCopied: 100, RowsTotal: 100},
+	}
+	rowsCopied, rowsTotal, _, pct = aggregateStoredShards(completed)
+	assert.Equal(t, int64(200), rowsCopied, "completed shard clamps copied up to total")
+	assert.Equal(t, int64(200), rowsTotal)
+	assert.Equal(t, int32(100), pct)
+
+	// No shards: zero, no divide-by-zero.
+	rowsCopied, rowsTotal, eta, pct = aggregateStoredShards(nil)
+	assert.Zero(t, rowsCopied)
+	assert.Zero(t, rowsTotal)
+	assert.Zero(t, eta)
+	assert.Zero(t, pct)
+}
