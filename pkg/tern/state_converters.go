@@ -150,6 +150,25 @@ func ddlActionToProtoChangeType(action string) ternv1.ChangeType {
 	}
 }
 
+// protoChangeTypeToDDLAction converts a proto ChangeType back to the lowercase
+// DDLAction string used in storage. It is the inverse of
+// ddlActionToProtoChangeType and is used to rebuild a plan's table changes from
+// a dispatch request on a deployment that did not plan locally.
+func protoChangeTypeToDDLAction(ct ternv1.ChangeType) string {
+	switch ct {
+	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
+		return "vschema_update"
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
+		return ddl.StatementTypeToOp(statement.StatementCreateTable)
+	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
+		return ddl.StatementTypeToOp(statement.StatementAlterTable)
+	case ternv1.ChangeType_CHANGE_TYPE_DROP:
+		return ddl.StatementTypeToOp(statement.StatementDropTable)
+	default:
+		return "unknown"
+	}
+}
+
 // filterTasksByApply returns only tasks belonging to the specified apply, sorted by ID (execution order).
 func filterTasksByApply(tasks []*storage.Task, applyID int64) []*storage.Task {
 	var filtered []*storage.Task

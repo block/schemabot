@@ -1211,6 +1211,121 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 	return result, nil
 }
 
+// planForApplyRequest resolves the plan for an apply. It prefers a plan row in
+// this deployment's own storage (the single-deployment path, and the primary
+// deployment of a multi-deployment apply). When no local plan exists, a
+// non-primary deployment's Tern never planned locally — the plan was created on
+// the primary deployment's Tern — but the dispatch request carries the
+// authoritative DDL changes and schema files, so the plan is materialized from
+// them. A request with neither (a stale apply, or a local-mode apply for a plan
+// that does not exist here) has nothing to materialize and resolves to no plan.
+func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.ApplyRequest) (*storage.Plan, error) {
+	plan, err := c.storage.Plans().Get(ctx, req.PlanId)
+	if err != nil {
+		return nil, fmt.Errorf("get plan %s: %w", req.PlanId, err)
+	}
+	if plan != nil {
+		return plan, nil
+	}
+	if len(req.DdlChanges) == 0 && len(req.SchemaFiles) == 0 {
+		return nil, nil
+	}
+	return c.materializeApplyRequestPlan(ctx, req)
+}
+
+// materializeApplyRequestPlan persists a local plan row from a dispatch
+// request's authoritative DDL changes and schema files so a non-primary
+// deployment applies exactly what the primary deployment planned.
+func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *ternv1.ApplyRequest) (*storage.Plan, error) {
+	schemaFiles := protoToSchemaFiles(req.SchemaFiles)
+	namespaces := namespacesFromApplyRequest(req.DdlChanges, schemaFiles, c.config.Database)
+	if len(namespaces) == 0 {
+		return nil, fmt.Errorf("materialize plan %s: apply request carried no DDL changes or schema files", req.PlanId)
+	}
+
+	target := req.Target
+	if target == "" {
+		target = c.config.Database
+	}
+	plan := &storage.Plan{
+		PlanIdentifier: req.PlanId,
+		Database:       c.config.Database,
+		DatabaseType:   c.config.Type,
+		Deployment:     c.config.Database,
+		Target:         target,
+		Environment:    req.Environment,
+		SchemaFiles:    schemaFiles,
+		Namespaces:     namespaces,
+		CreatedAt:      time.Now(),
+	}
+	c.logger.Info("Apply: materializing plan from dispatch request",
+		"plan_id", req.PlanId,
+		"database", c.config.Database,
+		"namespace_count", len(namespaces),
+	)
+
+	planID, err := c.storage.Plans().Create(ctx, plan)
+	if err != nil {
+		// A concurrent drive of the same operation may have materialized the
+		// plan first; reload and use the existing row rather than failing.
+		existing, getErr := c.storage.Plans().Get(ctx, req.PlanId)
+		if getErr == nil && existing != nil {
+			return existing, nil
+		}
+		return nil, fmt.Errorf("create materialized plan %s: %w", req.PlanId, err)
+	}
+	plan.ID = planID
+	return plan, nil
+}
+
+// namespacesFromApplyRequest rebuilds per-namespace plan data from a dispatch
+// request. Table changes are grouped by namespace; vschema changes are omitted
+// because the apply path re-derives the vschema task from the namespace's
+// vschema.json artifact, which is recovered from the declarative schema files.
+func namespacesFromApplyRequest(changes []*ternv1.TableChange, schemaFiles schema.SchemaFiles, fallbackNamespace string) map[string]*storage.NamespacePlanData {
+	namespaces := map[string]*storage.NamespacePlanData{}
+	ensure := func(ns string) *storage.NamespacePlanData {
+		if ns == "" {
+			ns = fallbackNamespace
+		}
+		if namespaces[ns] == nil {
+			namespaces[ns] = &storage.NamespacePlanData{}
+		}
+		return namespaces[ns]
+	}
+
+	for _, ch := range changes {
+		if ch == nil {
+			continue
+		}
+		if ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
+			continue
+		}
+		nsData := ensure(ch.Namespace)
+		nsData.Tables = append(nsData.Tables, storage.TableChange{
+			Namespace: ch.Namespace,
+			Table:     ch.TableName,
+			DDL:       ch.Ddl,
+			Operation: protoChangeTypeToDDLAction(ch.ChangeType),
+		})
+	}
+
+	for ns, nsFiles := range schemaFiles {
+		if nsFiles == nil {
+			continue
+		}
+		if vs, ok := nsFiles.Files[vSchemaArtifactName]; ok && vs != "" {
+			nsData := ensure(ns)
+			if nsData.Artifacts == nil {
+				nsData.Artifacts = map[string]string{}
+			}
+			nsData.Artifacts[vSchemaArtifactName] = vs
+		}
+	}
+
+	return namespaces
+}
+
 // Apply executes a previously generated plan.
 // In local mode, Apply has additional conflict checking and polls for completion.
 //
@@ -1225,10 +1340,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		return nil, fmt.Errorf("environment is required")
 	}
 
-	// Look up the plan
-	plan, err := c.storage.Plans().Get(ctx, req.PlanId)
+	// Look up the plan, materializing it from the dispatch request when this
+	// deployment did not plan locally (a non-primary deployment of a
+	// multi-deployment apply).
+	plan, err := c.planForApplyRequest(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("get plan: %w", err)
+		return nil, fmt.Errorf("resolve plan %s for apply: %w", req.PlanId, err)
 	}
 	if plan == nil {
 		return &ternv1.ApplyResponse{
