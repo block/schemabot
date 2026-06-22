@@ -65,18 +65,6 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	}
 	changes := planNamespacesToChanges(plan.Namespaces)
 
-	// For Vitess: initialize the VitessApplyData row before the engine starts.
-	// State transitions (preparing_branch, applying_branch_changes, etc.) are
-	// handled by the engine via ApplyEvent.NewState in the OnEvent callback.
-	if c.config.Type == storage.DatabaseTypeVitess {
-		if err := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
-			ApplyID:          apply.ID,
-			MigrationContext: apply.ApplyIdentifier,
-		}); err != nil {
-			c.logger.Error("failed to save vitess apply data", "apply_id", apply.ID, "error", err)
-		}
-	}
-
 	// Mark the apply as started before calling the engine. The engine may run
 	// for a long time (branch creation, DDL application, deploy request) and
 	// started_at should reflect when work actually began, not when it finished.
@@ -121,27 +109,6 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			}
 			if saveErr := c.saveEngineResumeState(ctx, tasks, rs); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist opaque resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
-				return
-			}
-			meta, err := decodePSMetadataForStorage(rs.Metadata)
-			if err != nil {
-				c.logger.Warn("OnStateChange: failed to decode metadata", "apply_id", apply.ApplyIdentifier, "error", err)
-				return
-			}
-			if meta == nil {
-				c.logger.Warn("OnStateChange: no PS metadata in resume state", "apply_id", apply.ApplyIdentifier)
-				return
-			}
-			if saveErr := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
-				ApplyID:          apply.ID,
-				BranchName:       meta.BranchName,
-				DeployRequestID:  meta.DeployRequestID,
-				MigrationContext: rs.MigrationContext,
-				DeployRequestURL: meta.DeployRequestURL,
-				IsInstant:        meta.IsInstant,
-				DeferredDeploy:   meta.DeferredDeploy,
-			}); saveErr != nil {
-				c.logger.Warn("OnStateChange: failed to persist resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
 		},
 	})
@@ -175,9 +142,10 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		return
 	}
 
-	// Save vitess_apply_data and set IsInstant on tasks BEFORE marking running.
-	// The progress handler reads both vitess_apply_data.is_instant and task.is_instant
-	// to determine the instant label — both must be committed before the first poll.
+	// Persist the engine resume state and set IsInstant on tasks before marking
+	// running. The progress handler reads task.is_instant and the engine resume
+	// state to render the instant label and deploy display fields, so both must
+	// be committed before the first poll.
 	var resumeState *engine.ResumeState
 	if result.ResumeState != nil {
 		resumeState = result.ResumeState
@@ -186,25 +154,6 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 				c.logger.Error("failed to save opaque engine resume state", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 				c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
 				return
-			}
-		}
-		if meta, err := decodePSMetadataForStorage(resumeState.Metadata); meta != nil && err == nil {
-			c.logger.Info("saving VitessApplyData from apply result",
-				"apply_id", apply.ApplyIdentifier,
-				"is_instant", meta.IsInstant,
-				"deploy_request_id", meta.DeployRequestID,
-				"raw_metadata", resumeState.Metadata[:min(len(resumeState.Metadata), 200)],
-			)
-			if saveErr := c.storage.VitessApplyData().Save(ctx, &storage.VitessApplyData{
-				ApplyID:          apply.ID,
-				BranchName:       meta.BranchName,
-				DeployRequestID:  meta.DeployRequestID,
-				MigrationContext: resumeState.MigrationContext,
-				DeployRequestURL: meta.DeployRequestURL,
-				IsInstant:        meta.IsInstant,
-				DeferredDeploy:   meta.DeferredDeploy,
-			}); saveErr != nil {
-				c.logger.Warn("failed to save vitess apply data", "apply_id", apply.ApplyIdentifier, "error", saveErr)
 			}
 		}
 	}
