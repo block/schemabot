@@ -382,3 +382,76 @@ func TestGRPCMultiDeploy_FailureHaltsRollout(t *testing.T) {
 
 	grpcEnsureNoActiveChange(t, database, env)
 }
+
+// TestGRPCMultiDeploy_OnFailureContinue verifies that `on_failure: continue`
+// lets a barrier-policy fan-out finish healthy deployments despite a sibling
+// failure.
+//
+// Scenario: testapp/production-continue fans out to [eu, us] with
+// deployment_order [eu, us], cutover_policy: barrier, and on_failure: continue.
+// The earlier deployment (eu) is seeded with duplicate data so adding a UNIQUE
+// key fails its copy; the later deployment (us) is healthy. Because the policy
+// is continue, eu's failure is treated as settled rather than halting the
+// rollout: us still cuts over and reaches completed. The apply itself settles
+// to failed — continue governs rollout continuation, not the pass/fail verdict.
+func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
+	requireMultiDeploy(t)
+
+	const (
+		database = "testapp"
+		env      = "production-continue"
+	)
+	// Matches deployment_order in grpc-schemabot-multideploy.yaml.
+	first, second := "eu", "us"
+
+	tableName := uniqueGRPCTableName("md_continue")
+	createDDL := fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)", tableName)
+	for _, d := range []string{first, second} {
+		multiDeployCreateTestTable(t, d, tableName, createDDL)
+	}
+	// The earlier deployment gets identical names so adding UNIQUE(name) fails
+	// during its copy; the later deployment gets unique names so it completes.
+	multiDeploySeedRows(t, first, tableName, "name, data", "'dup', REPEAT('x', 200)", 10000)
+	multiDeploySeedRows(t, second, tableName, "name, data", "CONCAT('user_', seq), REPEAT('x', 200)", 10000)
+
+	grpcEnsureNoActiveChange(t, database, env)
+
+	plan := grpcPlan(t, database, env, map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT, UNIQUE KEY uniq_name (name));", tableName),
+	})
+	require.Empty(t, plan.Errors, "plan errors: %v", plan.Errors)
+	require.NotEmpty(t, plan.PlanID, "plan_id")
+
+	apply := grpcApply(t, plan.PlanID, env, nil)
+	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
+
+	// Wait until both deployments are terminal: the earlier failed, the later
+	// completed. Under continue, the later sibling must not be blocked by the
+	// earlier failure.
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOperationStates(t, apply.ApplyID)
+			return failedApplyState(ops[first].State) &&
+				state.IsState(ops[second].State, state.Apply.Completed)
+		},
+		func() string {
+			ops := multiDeployOperationStates(t, apply.ApplyID)
+			return fmt.Sprintf("waiting for %s failed + %s completed; %s=%q %s=%q",
+				first, second, first, ops[first].State, second, ops[second].State)
+		},
+	)
+
+	final := multiDeployOperationStates(t, apply.ApplyID)
+	assert.Truef(t, failedApplyState(final[first].State), "%s should be failed, was %q", first, final[first].State)
+	assert.Truef(t, state.IsState(final[second].State, state.Apply.Completed),
+		"%s should complete under on_failure: continue, was %q", second, final[second].State)
+
+	// The apply settles to failed even though a sibling completed — continue
+	// governs rollout continuation, not the verdict.
+	prog := grpcProgressByApplyID(t, apply.ApplyID)
+	assert.Truef(t, failedApplyState(prog.State), "aggregate apply state should be failed, was %q", prog.State)
+
+	grpcEnsureNoActiveChange(t, database, env)
+}
