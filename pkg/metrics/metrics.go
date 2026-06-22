@@ -66,6 +66,32 @@ func RecordPlan(ctx context.Context, repo, database, deployment, environment, st
 	)
 }
 
+// RecordShardProgressShadowCompare records whether the persisted per-shard
+// progress matched the live engine result for an apply during a progress poll.
+// It is the rollout signal for switching the read path to render shards from
+// stored: result "match" means stored == live; "divergent" means they differed
+// (different shard set or per-shard state). A nonzero divergent rate means the
+// persisted shard read-model is not yet trustworthy enough to render from —
+// investigate before flipping the read path off the live query.
+func RecordShardProgressShadowCompare(ctx context.Context, database, environment, result string) {
+	meter := otel.Meter(meterName)
+	counter, err := meter.Int64Counter("schemabot.shard_progress.shadow_compare.total",
+		otelmetric.WithDescription("Per-poll comparison of persisted per-shard progress against the live engine result"),
+		otelmetric.WithUnit("{comparison}"),
+	)
+	if err != nil {
+		slog.Warn("failed to create shard progress shadow compare counter", "error", err)
+		return
+	}
+	counter.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("database", database),
+			EnvironmentAttribute(environment),
+			attribute.String("result", result),
+		),
+	)
+}
+
 // RecordPlanDuration records the duration of a plan operation.
 func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
 	meter := otel.Meter(meterName)

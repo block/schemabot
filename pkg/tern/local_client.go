@@ -107,6 +107,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
@@ -1807,6 +1808,11 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tables = append(tables, tp)
 	}
 
+	// Shadow-compare the persisted per-shard rows against the live engine result
+	// (render still uses live above). The divergence metric validates whether the
+	// read path can be switched to render shards from stored.
+	c.shadowCompareShardProgress(ctx, apply, currentApplyTasks, engineTableProgress)
+
 	// Derive overall state from ALL tasks in this apply.
 	// If tasks are all pending, check the apply record for a more specific state
 	// (e.g., preparing_branch, creating_deploy_request during PlanetScale setup).
@@ -1935,6 +1941,79 @@ func engineTableProgressOmittedRowTotals(task *storage.Task, progress *engine.Ta
 		return false
 	}
 	return task.RowsTotal > 0 && progress.RowsTotal <= 0
+}
+
+// shadowCompareShardProgress compares the persisted per-shard task rows against
+// the live engine result and emits a divergence metric per poll. The read path
+// still renders shards from the live result; this only validates that the
+// persisted read-model matches, so the read path can later be switched to render
+// shards from storage once divergence is ~0. It is a no-op for non-Vitess applies
+// and when the live result has no shards to compare against.
+func (c *LocalClient) shadowCompareShardProgress(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, live map[string]*engine.TableProgress) {
+	if c.config.Type != storage.DatabaseTypeVitess || len(live) == 0 {
+		return
+	}
+
+	// Load the persisted shard rows for the apply's operations, grouped by table.
+	storedByTable := map[string][]*storage.Task{}
+	seenOps := map[int64]bool{}
+	for _, t := range tasks {
+		if t.ApplyOperationID == nil || seenOps[*t.ApplyOperationID] {
+			continue
+		}
+		seenOps[*t.ApplyOperationID] = true
+		shardTasks, err := c.storage.Tasks().GetShardProgressByApplyOperationID(ctx, *t.ApplyOperationID)
+		if err != nil {
+			c.logger.Warn("shard progress shadow-compare skipped: failed to load shard rows",
+				"apply_id", apply.ApplyIdentifier, "apply_operation_id", *t.ApplyOperationID, "error", err)
+			return
+		}
+		for _, st := range shardTasks {
+			key := progressTableKey(st.Namespace, st.TableName)
+			storedByTable[key] = append(storedByTable[key], st)
+		}
+	}
+
+	compared, diverged := false, false
+	for key, tp := range live {
+		if len(tp.Shards) == 0 {
+			continue
+		}
+		compared = true
+		if shardProgressDiverges(tp.Shards, storedByTable[key]) {
+			diverged = true
+			break
+		}
+	}
+	if !compared {
+		return
+	}
+	result := "match"
+	if diverged {
+		result = "divergent"
+	}
+	metrics.RecordShardProgressShadowCompare(ctx, apply.Database, apply.Environment, result)
+}
+
+// shardProgressDiverges reports whether the live engine shards differ from the
+// persisted shard rows for a table — a different shard set, or any shard whose
+// persisted state does not match the live state. Progress counts are allowed to
+// lag between polls, so only the shard set and normalized state are compared.
+func shardProgressDiverges(live []engine.ShardProgress, stored []*storage.Task) bool {
+	if len(live) != len(stored) {
+		return true
+	}
+	storedState := make(map[string]string, len(stored))
+	for _, s := range stored {
+		storedState[s.Shard] = state.NormalizeTaskStatus(s.State)
+	}
+	for _, l := range live {
+		st, ok := storedState[l.Shard]
+		if !ok || st != state.NormalizeShardStatus(l.State) {
+			return true
+		}
+	}
+	return false
 }
 
 func progressTableStatus(storedTaskState, engineTableState string) string {

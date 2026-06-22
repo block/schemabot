@@ -324,6 +324,13 @@ func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
 	return s.err
 }
 
+// GetShardProgressByApplyOperationID returns no persisted shard rows; the
+// shadow-compare in Progress() invokes it but these tests assert on the rendered
+// response, not the shadow metric.
+func (s *exactProgressTaskStore) GetShardProgressByApplyOperationID(context.Context, int64) ([]*storage.Task, error) {
+	return nil, s.err
+}
+
 type fakeControlEngine struct {
 	engine.Engine
 	stopCount               int
@@ -2700,4 +2707,33 @@ func TestLocalClientProtoEngineReflectsRegisteredEngine(t *testing.T) {
 	}, nil, slog.Default())
 	require.NoError(t, err)
 	assert.Equal(t, ternv1.Engine_ENGINE_STRATA, c.protoEngine())
+}
+
+// shardProgressDiverges is the shadow-compare check: the persisted per-shard rows
+// match the live engine result only when the shard set and each shard's
+// normalized state agree. Progress counts may lag, so they are not compared.
+func TestShardProgressDiverges(t *testing.T) {
+	live := []engine.ShardProgress{
+		{Shard: "-80", State: "running"},
+		{Shard: "80-", State: "running"},
+	}
+
+	assert.False(t, shardProgressDiverges(live, []*storage.Task{
+		{Shard: "-80", State: state.Task.Running},
+		{Shard: "80-", State: state.Task.Running},
+	}), "same shard set and states must not diverge")
+
+	assert.True(t, shardProgressDiverges(live, []*storage.Task{
+		{Shard: "-80", State: state.Task.Running},
+	}), "a different shard count diverges")
+
+	assert.True(t, shardProgressDiverges(live, []*storage.Task{
+		{Shard: "-80", State: state.Task.Running},
+		{Shard: "80-", State: state.Task.Completed},
+	}), "a per-shard state mismatch diverges")
+
+	assert.True(t, shardProgressDiverges(live, []*storage.Task{
+		{Shard: "-80", State: state.Task.Running},
+		{Shard: "c0-", State: state.Task.Running},
+	}), "a different shard name diverges")
 }
