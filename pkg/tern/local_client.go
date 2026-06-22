@@ -1735,6 +1735,10 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		errorMessage = engineResult.ErrorMessage
 	}
 
+	// The per-shard breakdown is rendered from the persisted shard rows the
+	// operator drive writes; loaded once here, grouped by table.
+	storedShards := c.loadStoredShardsByTable(ctx, apply, currentApplyTasks)
+
 	for _, t := range currentApplyTasks {
 		tp := &ternv1.TableProgress{
 			TableName:  t.TableName,
@@ -1767,20 +1771,6 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 						"error", err)
 				}
 			}
-
-			// Build shards if available
-			shards := make([]*ternv1.ShardProgress, len(et.Shards))
-			for j, sh := range et.Shards {
-				shards[j] = &ternv1.ShardProgress{
-					Shard:           sh.Shard,
-					Status:          state.NormalizeShardStatus(sh.State),
-					RowsCopied:      sh.RowsCopied,
-					RowsTotal:       sh.RowsTotal,
-					EtaSeconds:      sh.ETASeconds,
-					CutoverAttempts: int32(sh.CutoverAttempts),
-				}
-			}
-			tp.Shards = shards
 		} else {
 			// No live engine data — use stored progress from the task.
 			// This covers stopped tasks (progress saved at stop time) and
@@ -1800,6 +1790,11 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				tp.PercentComplete = 100
 			}
 		}
+
+		// Render the per-shard breakdown from the persisted rows the operator's
+		// drive maintains — stored is the single read surface, never the live
+		// engine result.
+		tp.Shards = shardProgressProto(storedShards[progressTableKey(t.Namespace, t.TableName)])
 
 		tables = append(tables, tp)
 	}
@@ -1942,6 +1937,62 @@ func engineTableProgressOmittedRowTotals(task *storage.Task, progress *engine.Ta
 		return false
 	}
 	return task.RowsTotal > 0 && progress.RowsTotal <= 0
+}
+
+// loadStoredShardsByTable loads the persisted per-shard rows for an apply's
+// operations, grouped by (namespace, table), so the progress response renders
+// the per-shard breakdown from storage. It is Vitess-only (other engines have no
+// shard rows). A load error for one operation is logged and skipped, keeping the
+// rows already loaded for other operations; tables whose rows could not be
+// loaded render an empty breakdown until the next successful load rather than
+// failing the whole response.
+func (c *LocalClient) loadStoredShardsByTable(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) map[string][]*storage.Task {
+	if c.config.Type != storage.DatabaseTypeVitess {
+		return nil
+	}
+	byTable := map[string][]*storage.Task{}
+	seenOps := map[int64]bool{}
+	for _, t := range tasks {
+		if t.ApplyOperationID == nil || seenOps[*t.ApplyOperationID] {
+			continue
+		}
+		seenOps[*t.ApplyOperationID] = true
+		shardTasks, err := c.storage.Tasks().GetShardProgressByApplyOperationID(ctx, *t.ApplyOperationID)
+		if err != nil {
+			c.logger.Warn("rendering this operation's shards from the live engine result: failed to load its persisted shard rows",
+				"apply_id", apply.ApplyIdentifier, "apply_operation_id", *t.ApplyOperationID, "error", err)
+			continue
+		}
+		for _, st := range shardTasks {
+			key := progressTableKey(st.Namespace, st.TableName)
+			byTable[key] = append(byTable[key], st)
+		}
+	}
+	return byTable
+}
+
+// shardProgressProto renders a table's per-shard breakdown from the persisted
+// shard rows — the durable read-model the operator's lease-held drive maintains.
+// Stored state is the single read surface: the breakdown is never read from the
+// live engine result. Before the drive's first write-through (or while a load
+// failed) there are no rows yet and the breakdown is empty until the drive
+// catches up.
+func shardProgressProto(stored []*storage.Task) []*ternv1.ShardProgress {
+	if len(stored) == 0 {
+		return nil
+	}
+	out := make([]*ternv1.ShardProgress, len(stored))
+	for i, s := range stored {
+		out[i] = &ternv1.ShardProgress{
+			Shard:           s.Shard,
+			Status:          state.NormalizeShardStatus(s.State),
+			RowsCopied:      s.RowsCopied,
+			RowsTotal:       s.RowsTotal,
+			EtaSeconds:      int64(s.ETASeconds),
+			CutoverAttempts: int32(s.CutoverAttempts),
+		}
+	}
+	return out
 }
 
 func progressTableStatus(storedTaskState, engineTableState string) string {

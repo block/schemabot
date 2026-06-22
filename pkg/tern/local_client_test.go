@@ -296,8 +296,9 @@ func (s *snapshotApplyStore) UpdateDerivedState(_ context.Context, _ int64, expe
 
 type exactProgressTaskStore struct {
 	storage.TaskStore
-	tasks []*storage.Task
-	err   error
+	tasks     []*storage.Task
+	shardRows []*storage.Task
+	err       error
 }
 
 func (s *exactProgressTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
@@ -322,6 +323,22 @@ func (s *exactProgressTaskStore) GetByDatabase(context.Context, string) ([]*stor
 
 func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
 	return s.err
+}
+
+// GetShardProgressByApplyOperationID returns the seeded per-shard rows for the
+// operation. With none seeded the read path falls back to the live engine
+// result, which most progress tests assert on.
+func (s *exactProgressTaskStore) GetShardProgressByApplyOperationID(_ context.Context, operationID int64) ([]*storage.Task, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	var rows []*storage.Task
+	for _, r := range s.shardRows {
+		if r.ApplyOperationID != nil && *r.ApplyOperationID == operationID {
+			rows = append(rows, r)
+		}
+	}
+	return rows, nil
 }
 
 type fakeControlEngine struct {
@@ -2700,4 +2717,77 @@ func TestLocalClientProtoEngineReflectsRegisteredEngine(t *testing.T) {
 	}, nil, slog.Default())
 	require.NoError(t, err)
 	assert.Equal(t, ternv1.Engine_ENGINE_STRATA, c.protoEngine())
+}
+
+// shardProgressProto renders the per-shard breakdown from the persisted rows when
+// present, and falls back to the live engine result only until the operator drive
+// has written them.
+func TestShardProgressProto(t *testing.T) {
+	// The breakdown renders from the persisted rows — the single read surface.
+	stored := []*storage.Task{
+		{Shard: "-80", State: state.Task.Completed, RowsCopied: 100, RowsTotal: 100, ETASeconds: 5, CutoverAttempts: 1},
+		{Shard: "80-", State: state.Task.Running, RowsCopied: 20, RowsTotal: 100},
+	}
+	out := shardProgressProto(stored)
+	require.Len(t, out, 2)
+	assert.Equal(t, "-80", out[0].Shard)
+	assert.Equal(t, int64(100), out[0].RowsCopied)
+	assert.Equal(t, int64(5), out[0].EtaSeconds)
+	assert.Equal(t, int32(1), out[0].CutoverAttempts)
+	assert.Equal(t, "80-", out[1].Shard)
+
+	// No persisted rows: empty breakdown (no live fallback).
+	assert.Nil(t, shardProgressProto(nil))
+}
+
+// Progress renders each table's per-shard breakdown only from the persisted
+// shard rows the operator drive wrote, grouped by (namespace, table). The live
+// engine result is never the read surface, so a live-only shard the engine
+// reports is ignored.
+func TestLocalClient_VitessProgressRendersShardsFromStored(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-stored-shards", DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale}
+	perTableTask := &storage.Task{
+		ID: 7, ApplyID: apply.ID, ApplyOperationID: &operationID,
+		TaskIdentifier: "task-users", Database: "testdb", DatabaseType: storage.DatabaseTypeVitess,
+		Engine: storage.EnginePlanetScale, Namespace: "commerce", TableName: "users",
+		State: state.Task.Running, DDLAction: "alter",
+	}
+	// Persisted per-shard rows (shard != "") for the operation.
+	shardRows := []*storage.Task{
+		{ApplyID: apply.ID, ApplyOperationID: &operationID, Namespace: "commerce", TableName: "users", Shard: "-80", State: state.Task.Running, RowsCopied: 40, RowsTotal: 100, ETASeconds: 7},
+		{ApplyID: apply.ID, ApplyOperationID: &operationID, Namespace: "commerce", TableName: "users", Shard: "80-", State: state.Task.Running, RowsCopied: 60, RowsTotal: 100, ETASeconds: 3},
+	}
+	// The live engine result reports a single, different shard; stored must win.
+	eng := &fakeControlEngine{externallyAuthoritative: true, progressResult: &engine.ProgressResult{
+		State:       engine.StateRunning,
+		ResumeState: &engine.ResumeState{MigrationContext: "ctx", Metadata: `{}`},
+		Tables: []engine.TableProgress{{
+			Namespace: "commerce", Table: "users", State: state.Task.Running, Progress: 99,
+			Shards: []engine.ShardProgress{{Shard: "live-only", State: state.Task.Running, RowsCopied: 1, RowsTotal: 100}},
+		}},
+	}}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{perTableTask}, shardRows: shardRows},
+			applyOperations: &exactProgressApplyOperationStore{data: &storage.EngineResumeState{ApplyOperationID: operationID, MigrationContext: "ctx", Metadata: `{}`}},
+		},
+		planetscaleEngine: eng,
+		logger:            slog.Default(),
+	}
+
+	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "staging"})
+	require.NoError(t, err)
+	require.Len(t, progress.Tables, 1)
+
+	shards := progress.Tables[0].Shards
+	require.Len(t, shards, 2, "renders the two persisted shards, not the single live one")
+	assert.Equal(t, "-80", shards[0].Shard)
+	assert.Equal(t, "80-", shards[1].Shard)
+	assert.Equal(t, int64(40), shards[0].RowsCopied)
+	for _, sh := range shards {
+		assert.NotEqual(t, "live-only", sh.Shard, "stored rows are preferred over the live engine result")
+	}
 }
