@@ -113,9 +113,14 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 	// Under the lease, both shards are persisted as per-shard tasks.
 	client.writeShardProgress(leaseCtx, perTable, tp, now)
 
-	got, err := stor.Tasks().GetByApplyOperationID(ctx, opID)
+	got, err := stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	require.Len(t, got, 2, "both shards persisted as per-shard tasks")
+	// The per-table loader must not surface shard rows, so the operator drive
+	// never re-processes them as per-table tasks on the next reload.
+	perTableRows, err := stor.Tasks().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	assert.Empty(t, perTableRows, "per-shard rows must not leak into the per-table loader")
 	byShard := map[string]*storage.Task{}
 	for _, task := range got {
 		assert.Equal(t, "resolute", task.Namespace)
@@ -135,7 +140,7 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 	tp.Shards[0].Progress = 100
 	tp.Shards[0].RowsCopied = 500000
 	client.writeShardProgress(leaseCtx, perTable, tp, time.Now())
-	got, err = stor.Tasks().GetByApplyOperationID(ctx, opID)
+	got, err = stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	require.Len(t, got, 2, "re-running the drive updates shards in place, no duplicates")
 	for _, task := range got {
@@ -147,7 +152,7 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 	// A read-path caller (no operation lease) must not write.
 	cleanupTasks(t, dsn)
 	client.writeShardProgress(ctx, perTable, tp, time.Now())
-	got, err = stor.Tasks().GetByApplyOperationID(ctx, opID)
+	got, err = stor.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	assert.Empty(t, got, "without an operation lease the drive write-through is a no-op")
 }
