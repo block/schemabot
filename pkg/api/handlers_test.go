@@ -869,6 +869,18 @@ func newControlTestServiceWithTasks(client tern.Client, apply *storage.Apply, ta
 	}, logger)
 }
 
+func newControlTestServiceWithOperations(client tern.Client, apply *storage.Apply, tasks []*storage.Task, operations []*storage.ApplyOperation) *Service {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		tasks:      &capturingTaskStore{tasks: tasks},
+		controls:   &memoryControlRequestStore{},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": client,
+	}, logger)
+}
+
 func newTestService() *Service {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	return New(&mockStorage{}, testServerConfig(), nil, logger)
@@ -2381,8 +2393,8 @@ func newActiveProgressServiceWithOperations(client tern.Client, apply *storage.A
 }
 
 func TestProgressByApplyIDActivePathIncludesOperations(t *testing.T) {
-	// The active (proto Progress RPC) path enriches the response with the
-	// apply's per-deployment operation rows from control-plane storage.
+	// A single-operation active apply reaches the proto Progress RPC path and
+	// enriches the response with its operation row from control-plane storage.
 	mock := &mockTernClient{
 		isRemote:     true,
 		progressResp: &ternv1.ProgressResponse{State: ternv1.State_STATE_RUNNING},
@@ -2391,7 +2403,6 @@ func TestProgressByApplyIDActivePathIncludesOperations(t *testing.T) {
 	apply.ExternalID = "remote-active-ops"
 	operations := &staticApplyOperationStore{operations: []*storage.ApplyOperation{
 		{ID: 1, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.Running},
-		{ID: 2, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.Failed, ErrorMessage: "engine failed"},
 	}}
 	svc := newActiveProgressServiceWithOperations(mock, apply, operations)
 	mux := http.NewServeMux()
@@ -2402,10 +2413,43 @@ func TestProgressByApplyIDActivePathIncludesOperations(t *testing.T) {
 	mux.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	require.NotNil(t, mock.progressReq, "active apply must reach the proto Progress RPC path")
+	require.NotNil(t, mock.progressReq, "single-operation active apply must reach the proto Progress RPC path")
 
 	var resp apitypes.ProgressResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Operations, 1)
+	assert.Equal(t, "deploy-a", resp.Operations[0].Deployment)
+	assert.Equal(t, state.ApplyOperation.Running, resp.Operations[0].State)
+}
+
+func TestProgressByApplyIDMultiOperationServedFromStorage(t *testing.T) {
+	// A multi-operation apply has no single data-plane apply id, so its progress
+	// is served from storage: the proto Progress RPC is not called, the headline
+	// state is the stored aggregate, and every operation row is included.
+	mock := &mockTernClient{
+		isRemote:     true,
+		progressResp: &ternv1.ProgressResponse{State: ternv1.State_STATE_RUNNING},
+	}
+	apply := activeTestApply("apply-multi-ops")
+	apply.ExternalID = "remote-multi-ops"
+	operations := &staticApplyOperationStore{operations: []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.Running},
+		{ID: 2, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.Failed, ErrorMessage: "engine failed"},
+	}}
+	svc := newActiveProgressServiceWithOperations(mock, apply, operations)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-multi-ops", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Nil(t, mock.progressReq, "multi-operation apply must not call the single-deployment proto Progress RPC")
+
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, state.Apply.Running, resp.State)
 	require.Len(t, resp.Operations, 2)
 	assert.Equal(t, "deploy-a", resp.Operations[0].Deployment)
 	assert.Equal(t, state.ApplyOperation.Running, resp.Operations[0].State)
@@ -3552,6 +3596,36 @@ func TestStopHandler(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, w.Code)
 		assert.Contains(t, w.Body.String(), "environment is required")
 	})
+
+	t.Run("multi-operation apply queues durable stop without an immediate single-deployment stop", func(t *testing.T) {
+		// A multi-operation apply has no single data-plane apply id, so the
+		// immediate stop is skipped: the durable request is queued for the
+		// operator to fan out per operation, and the single-deployment remote
+		// Stop RPC is never called.
+		mock := &mockTernClient{isRemote: true, stopResp: &ternv1.StopResponse{Accepted: true}}
+		apply := activeTestApply("apply-multi-stop")
+		tasks := []*storage.Task{
+			{ID: 30, TaskIdentifier: "task-multi-stop", ApplyID: apply.ID, State: state.Task.Running},
+		}
+		svc := newControlTestServiceWithOperations(mock, apply, tasks, []*storage.ApplyOperation{
+			{ID: 1, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.Running},
+			{ID: 2, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.Running},
+		})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-multi-stop"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		assert.Nil(t, mock.stopReq, "multi-operation apply must not issue a single-deployment immediate stop")
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		require.NotNil(t, controlReq, "durable stop request must be queued for the operator")
+	})
 }
 
 func TestStartHandler(t *testing.T) {
@@ -4326,6 +4400,37 @@ func TestCutoverHandler(t *testing.T) {
 
 		assert.Equal(t, http.StatusBadRequest, w.Code)
 		assert.Contains(t, w.Body.String(), "environment is required")
+	})
+
+	t.Run("multi-operation apply derives cutover readiness from storage, not a single remote probe", func(t *testing.T) {
+		// A multi-operation apply has no single remote data-plane apply id, so
+		// readiness is derived from the stored task rows that span every
+		// operation — the single-deployment remote progress probe is not called —
+		// and the durable cutover request is queued for the operator.
+		mock := &mockTernClient{isRemote: true}
+		apply := activeTestApply("apply-multi-cutover")
+		tasks := []*storage.Task{
+			{ID: 40, TaskIdentifier: "task-multi-cutover", ApplyID: apply.ID, State: state.Task.WaitingForCutover},
+		}
+		svc := newControlTestServiceWithOperations(mock, apply, tasks, []*storage.ApplyOperation{
+			{ID: 1, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.WaitingForCutover},
+			{ID: 2, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.WaitingForCutover},
+		})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-multi-cutover", "caller": "cli:cutter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		assert.Nil(t, mock.progressReq, "multi-operation apply must not probe a single-deployment remote for cutover readiness")
+		assert.Nil(t, mock.cutoverReq, "request path should queue operator work without calling Tern cutover")
+		controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, controlReq, "durable cutover request must be queued for the operator")
 	})
 }
 

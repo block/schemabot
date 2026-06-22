@@ -532,7 +532,13 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
 	}
-	readiness, err := s.cutoverRequestReadiness(ctx, client, apply, ternApplyID)
+	multiOp, err := s.applyHasMultipleOperations(ctx, apply)
+	if err != nil {
+		err := fmt.Errorf("check operation count for apply %s before cutover: %w", apply.ApplyIdentifier, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return nil, 0, err
+	}
+	readiness, err := s.cutoverRequestReadiness(ctx, client, apply, ternApplyID, multiOp)
 	if err != nil {
 		err := fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
@@ -607,7 +613,7 @@ const (
 	cutoverRequestRecovering
 )
 
-func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID string) (cutoverRequestReadiness, error) {
+func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID string, multiOp bool) (cutoverRequestReadiness, error) {
 	if state.IsState(apply.State, state.Apply.WaitingForCutover) {
 		return cutoverRequestReady, nil
 	}
@@ -617,7 +623,12 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 	if state.IsState(apply.State, state.Apply.Recovering) {
 		return cutoverRequestRecovering, nil
 	}
-	if client != nil && client.IsRemote() && ternApplyID != "" {
+	// A multi-operation apply has no single remote data-plane apply id, so a
+	// remote probe keyed on one ternApplyID would report at most one operation's
+	// readiness. Derive readiness from the stored task rows below, which span
+	// every operation of the apply, and let the operator drive cutover per
+	// operation.
+	if !multiOp && client != nil && client.IsRemote() && ternApplyID != "" {
 		progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
 			ApplyId:     ternApplyID,
 			Environment: apply.Environment,
@@ -752,6 +763,22 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 }
 
 func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) {
+	// A multi-operation apply has no single data-plane apply id: each operation
+	// drives against its own deployment with its own remote apply. An apply-scoped
+	// immediate stop keyed on a single ternApplyID would stop at most one operation
+	// and leave its siblings running. Skip the immediate attempt and let the
+	// operator fan the durable stop request out to every operation and reconcile
+	// the aggregate. The durable stop request is already queued at this point.
+	if multiOp, err := s.applyHasMultipleOperations(ctx, apply); err != nil {
+		s.logger.Warn("could not determine apply operation count; attempting single-deployment immediate stop",
+			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment, "error", err)
+	} else if multiOp {
+		s.logger.Info("immediate stop skipped for multi-operation apply; operator will fan out the durable stop request per operation",
+			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment, "requested_by", caller)
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
+			"Stop queued; operator will stop each deployment of this multi-deployment apply")
+		return
+	}
 	if client == nil {
 		s.logger.Warn("immediate stop not attempted because Tern client is unavailable; durable stop request remains pending for apply owner retry",
 			"apply_id", apply.ApplyIdentifier,

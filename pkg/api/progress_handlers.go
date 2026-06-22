@@ -115,6 +115,22 @@ func progressTableKey(namespace, table string) string {
 	return namespace + progressTableKeySep + table
 }
 
+// applyHasMultipleOperations reports whether an apply fanned out to more than
+// one deployment operation. A multi-operation apply has no single data-plane
+// apply id — each operation carries its own — and its aggregate state is
+// derived by the operator from the operation rows, so apply-scoped routing to a
+// single primary remote id (progress, immediate control) must be avoided.
+func (s *Service) applyHasMultipleOperations(ctx context.Context, apply *storage.Apply) (bool, error) {
+	if apply == nil {
+		return false, fmt.Errorf("apply is required")
+	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("list apply operations for apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
+	}
+	return len(ops) > 1, nil
+}
+
 func storedDeploymentForApply(apply *storage.Apply) (string, error) {
 	if apply == nil {
 		return "", fmt.Errorf("apply is required")
@@ -280,6 +296,28 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
 			s.logger.Error("failed to read apply progress from storage", "apply_id", applyID, "state", apply.State, "error", err)
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
+			return
+		}
+		s.writeJSON(w, http.StatusOK, httpResp)
+		return
+	}
+
+	// A multi-operation apply has no single remote data-plane id — each
+	// operation carries its own — and its aggregate state is derived by the
+	// operator from the operation rows. Serve it from storage so operators see
+	// the real aggregate state and the per-deployment breakdown, not a
+	// single-deployment remote view keyed on a parent id that does not exist
+	// (which would also rewrite a running aggregate to pending). On a storage
+	// error, fall back to the single-deployment path: every apply created today
+	// has one operation, so this only degrades the dormant multi-op case.
+	if multiOp, err := s.applyHasMultipleOperations(r.Context(), apply); err != nil {
+		s.logger.Warn("could not determine apply operation count; serving progress via the single-deployment path",
+			"apply_id", applyID, "database", apply.Database, "environment", apply.Environment, "error", err)
+	} else if multiOp {
+		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
+		if err != nil {
+			s.logger.Error("failed to read multi-operation apply progress from storage", "apply_id", applyID, "state", apply.State, "error", err)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
