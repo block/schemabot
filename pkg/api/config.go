@@ -864,14 +864,6 @@ func (c *ServerConfig) Validate() error {
 						return err
 					}
 				}
-				// The multi-deployment apply path (plan, progress, webhook)
-				// is not yet wired to ResolveDatabaseTargets, so accepting a
-				// >1-entry deployments map here would silently break every
-				// plan/apply with a confusing internal resolver error. Gate
-				// it at config load until the orchestration path lands.
-				if len(envConfig.Deployments) > 1 {
-					return fmt.Errorf("database %q environment %q multi-deployment (>1 entries) is not yet supported by this server; got %d deployments", name, env, len(envConfig.Deployments))
-				}
 				for deployment, dt := range envConfig.Deployments {
 					if deployment == "" {
 						return fmt.Errorf("database %q environment %q has a deployments map entry with an empty key", name, env)

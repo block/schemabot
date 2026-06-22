@@ -1238,10 +1238,9 @@ func TestServerConfig_ResolveDatabaseTargets(t *testing.T) {
 			"payments-c": {"production": "tern-c:9090"},
 		},
 	}
-	// This test exercises the resolver directly on a hand-built config so
-	// it can cover multi-deployment resolution; the Validate() gate on
-	// multi-deployment maps is covered separately by
-	// TestServerConfig_DeploymentsMapValidation.
+	// This test exercises the resolver directly on a hand-built config so it can
+	// cover multi-deployment resolution; deployments-map validation is covered
+	// separately by TestServerConfig_DeploymentsMapValidation.
 
 	t.Run("local DSN returns single element", func(t *testing.T) {
 		got, err := cfg.ResolveDatabaseTargets("localdb", "staging")
@@ -1364,9 +1363,8 @@ func TestServerConfig_ResolveDatabaseTargets_BypassValidate(t *testing.T) {
 }
 
 // TestServerConfig_ResolveDatabaseTargets_DeploymentOrder exercises the
-// resolver directly on hand-built multi-deployment configs (bypassing the
-// Validate() >1-entry gate) so it can cover deployment_order ordering and the
-// permutation checks the resolver enforces.
+// resolver directly on hand-built multi-deployment configs so it can cover
+// deployment_order ordering and the permutation checks the resolver enforces.
 func TestServerConfig_ResolveDatabaseTargets_DeploymentOrder(t *testing.T) {
 	makeCfg := func(env EnvironmentConfig) *ServerConfig {
 		return &ServerConfig{
@@ -1523,15 +1521,26 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			tern: baseTern,
 		},
 		{
-			name: "multi-entry deployments map is rejected until orchestration is wired",
+			name: "multi-entry deployments map is accepted",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
 					"payments-a": {Target: "payments"},
 					"payments-b": {Target: "payments"},
 				},
 			},
-			tern:       baseTern,
-			wantErrSub: "multi-deployment (>1 entries) is not yet supported",
+			tern: baseTern,
+		},
+		{
+			name: "multi-entry deployments map with deployment_order and barrier cutover is accepted",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments"},
+					"payments-b": {Target: "payments"},
+				},
+				DeploymentOrder: []string{"payments-a", "payments-b"},
+				CutoverPolicy:   storage.CutoverPolicyBarrier,
+			},
+			tern: baseTern,
 		},
 		{
 			name: "mixing scalar and map is rejected",
