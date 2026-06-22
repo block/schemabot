@@ -104,30 +104,140 @@ func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, l
 // gracefully. The storage DSN is resolved from cfg (falling back to MYSQL_DSN);
 // PORT and GRPC_PORT are read from the environment.
 func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
+	port := getEnv("PORT", "8080")
+	grpcPort := os.Getenv("GRPC_PORT")
+
+	srv, err := Build(ctx, cfg, opts...)
+	if err != nil {
+		return err
+	}
+	defer utils.CloseAndLog(srv)
+
+	// A configured GRPC_PORT means this process serves the data plane over its
+	// inline LocalClient drive, which does not maintain apply_operations state —
+	// so default operator claiming to the apply level (unless config set it
+	// explicitly). This is a Run convenience, not a server mode: an embedder
+	// sets ServerConfig.OperatorClaimOperations directly. Applied before Start
+	// (which launches the operator) so the operator reads the resolved value.
+	if applyDataPlaneClaimDefault(cfg, grpcPort != "") {
+		srv.logger.Info("data-plane gRPC mode: defaulting operator claiming to the apply level", "grpc_port", grpcPort)
+	} else if grpcPort != "" && cfg.ShouldClaimOperations() {
+		srv.logger.Warn("data-plane gRPC mode has operation-level operator claiming enabled; the inline LocalClient drive does not maintain apply_operations state, so stop/start resume will not recover", "grpc_port", grpcPort)
+	}
+
+	// Optionally start a gRPC server for the Tern proto (used by
+	// docker-compose.grpc.yml). Embedders attach to their own server instead.
+	if grpcPort != "" {
+		grpcServer := grpc.NewServer()
+		if err := srv.RegisterGRPC(ctx, grpcServer); err != nil {
+			return fmt.Errorf("register grpc tern service: %w", err)
+		}
+		var lc net.ListenConfig
+		listener, err := lc.Listen(ctx, "tcp", ":"+grpcPort)
+		if err != nil {
+			return fmt.Errorf("listen on port %s: %w", grpcPort, err)
+		}
+		go func() {
+			srv.logger.Info("starting gRPC server", "port", grpcPort)
+			// Serve returns ErrServerStopped on GracefulStop during normal
+			// shutdown; that is expected, not an error worth alerting on.
+			if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+				srv.logger.Error("gRPC server error", "error", err)
+			}
+		}()
+		defer grpcServer.GracefulStop()
+	}
+
+	// Start background loops (operator, health monitor, pending-drops cleaner,
+	// missing-summary reconciliation). Server.Close stops them.
+	srv.Start(ctx)
+
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      srv.Handler(),
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		srv.logger.Info("starting http server", "port", port)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+		close(errCh)
+	}()
+
+	// Wait for a shutdown signal, context cancellation (embedded callers), or a
+	// fatal server error.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	select {
+	case sig := <-sigCh:
+		srv.logger.Info("received shutdown signal", "signal", sig)
+	case <-ctx.Done():
+		srv.logger.Info("context canceled, shutting down", "error", ctx.Err())
+	case err := <-errCh:
+		return err
+	}
+
+	// Graceful shutdown of the HTTP server; Server.Close (deferred) releases the
+	// rest.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	srv.logger.Info("shutting down server")
+	return server.Shutdown(shutdownCtx)
+}
+
+// Server is a built but not-yet-listening SchemaBot server. Build constructs it
+// from a ServerConfig; an embedder attaches it to its own gRPC server and HTTP
+// mux (RegisterGRPC, Handler), starts its background loops (Start), and releases
+// its resources (Close). Run wires the same Server to its own listeners. This is
+// the embedding seam: a data plane consuming SchemaBot as a module configures it
+// entirely through ServerConfig rather than reimplementing this wiring.
+type Server struct {
+	cfg             *api.ServerConfig
+	svc             *api.Service
+	storage         *mysqlstore.Storage
+	logger          *slog.Logger
+	dataPlaneClient tern.Client
+	// grpcClient is the single-database client RegisterGRPC builds when no
+	// target resolver is configured. It is owned here (not by the service) so
+	// Close releases it; the resolver-backed dataPlaneClient is the service's
+	// default client and is closed by svc.Close.
+	grpcClient tern.Client
+	webhook    webhookRuntime
+	telemetry  *api.Telemetry
+	authz      auth.Authorizer
+	engines    map[string]tern.EngineFactory
+}
+
+// Build constructs a SchemaBot server from cfg without opening any listener. It
+// resolves and migrates storage, constructs the service, registers
+// embedder-supplied engines, builds the webhook runtime and (when a target
+// resolver is configured) the shared data-plane client, sets up authentication
+// and telemetry, and returns a Server. The caller wires it to a transport
+// (RegisterGRPC / Handler), starts background work (Start), and releases
+// resources (Close). Run is Build plus SchemaBot's own gRPC/HTTP listeners.
+func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server, error) {
 	o := options{logger: slog.Default()}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	logger := o.logger
+	logger.Info("building server", "version", o.version, "commit", o.commit, "built", o.date)
 
 	// Get storage DSN from config (with fallback to MYSQL_DSN env var)
 	dsn, err := cfg.StorageDSN()
 	if err != nil {
-		return fmt.Errorf("resolve storage DSN: %w", err)
+		return nil, fmt.Errorf("resolve storage DSN: %w", err)
 	}
 	if dsn == "" {
-		return fmt.Errorf("storage DSN not configured (set storage.dsn in config or MYSQL_DSN env var)")
-	}
-
-	port := getEnv("PORT", "8080")
-	grpcPort := os.Getenv("GRPC_PORT")
-
-	if applyDataPlaneClaimDefault(cfg, grpcPort != "") {
-		logger.Info("data-plane gRPC mode: defaulting operator claiming to the apply level",
-			"grpc_port", grpcPort)
-	} else if grpcPort != "" && cfg.ShouldClaimOperations() {
-		logger.Warn("data-plane gRPC mode has operation-level operator claiming enabled; the inline LocalClient drive does not maintain apply_operations state, so stop/start resume will not recover",
-			"grpc_port", grpcPort)
+		return nil, fmt.Errorf("storage DSN not configured (set storage.dsn in config or MYSQL_DSN env var)")
 	}
 
 	// Apply storage schema with retries for transient failures (e.g., DNS
@@ -143,12 +253,12 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 				time.Sleep(2 * time.Second)
 				continue
 			}
-			return fmt.Errorf("ensure schema after %d attempts: %w", maxRetries, err)
+			return nil, fmt.Errorf("ensure schema after %d attempts: %w", maxRetries, err)
 		}
 
 		db, err = mysqlconn.Open(dsn)
 		if err != nil {
-			return fmt.Errorf("open database: %w", err)
+			return nil, fmt.Errorf("open database: %w", err)
 		}
 		pingCtx, pingCancel := context.WithTimeout(ctx, pingTimeout)
 		pingErr := db.PingContext(pingCtx)
@@ -160,10 +270,19 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 				time.Sleep(2 * time.Second)
 				continue
 			}
-			return fmt.Errorf("ping database after %d attempts: %w", maxRetries, pingErr)
+			return nil, fmt.Errorf("ping database after %d attempts: %w", maxRetries, pingErr)
 		}
 		break
 	}
+
+	// On any error past this point, close the resources Build has opened so a
+	// failed Build leaks neither the pool nor the service.
+	success := false
+	defer func() {
+		if !success {
+			utils.CloseAndLog(db)
+		}
+	}()
 
 	// Proactively discard idle connections before MySQL's wait_timeout (default 28800s)
 	// to avoid "invalid connection" errors when the pool hands out stale connections.
@@ -178,108 +297,58 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 		"allowed_environments", cfg.AllowedEnvironments,
 		"respond_to_unscoped", cfg.ShouldRespondToUnscoped(),
 	)
-	for name, db := range cfg.Databases {
-		envs := make([]string, 0, len(db.Environments))
-		for env := range db.Environments {
+	for name, dbCfg := range cfg.Databases {
+		envs := make([]string, 0, len(dbCfg.Environments))
+		for env := range dbCfg.Environments {
 			envs = append(envs, env)
 		}
-		logger.Info("registered database", "name", name, "type", db.Type, "environments", envs)
+		logger.Info("registered database", "name", name, "type", dbCfg.Type, "environments", envs)
 	}
 
 	// Create service with dependencies
 	storage := mysqlstore.New(db)
 	svc := api.New(storage, cfg, nil, logger)
-	defer utils.CloseAndLog(svc)
+	defer func() {
+		if !success {
+			utils.CloseAndLog(svc)
+		}
+	}()
 
 	// Register embedder-supplied engines before any client is built or the
 	// operator starts, so both the operator's in-process clients (via the
-	// service) and the data-plane gRPC/router clients (via the factory below)
-	// can resolve custom database types. Validation lives in RegisterEngine, so
-	// a bad type or nil factory fails startup here.
+	// service) and the data-plane gRPC/router clients can resolve custom
+	// database types. Validation lives in RegisterEngine, so a bad type or nil
+	// factory fails startup here.
 	for databaseType, factory := range o.engines {
 		// RegisterEngine's error already names the operation and the database
 		// type, so return it as-is rather than double-prefixing.
 		if err := svc.RegisterEngine(databaseType, factory); err != nil {
-			return err
+			return nil, err
 		}
 		logger.Info("registered engine", "database_type", databaseType)
 	}
 
-	// Build the webhook runtime before recovery starts so recovered applies can
-	// attach PR comment observers. If GitHub is not configured, the runtime
+	// Build the webhook runtime before the operator starts so recovered applies
+	// can attach PR comment observers. If GitHub is not configured, the runtime
 	// serves a disabled webhook endpoint and skips comment reconciliation.
 	webhookRuntime, err := buildWebhookRuntime(cfg, svc, logger)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	// On startup, find applies that have a progress comment but no summary
-	// comment. This means terminal comment handling was interrupted; reconcile
-	// in the background so GitHub repair does not block server startup.
-	webhookRuntime.StartMissingSummaryReconciliation(ctx, logger)
 
 	// When a dynamic target resolver is configured, build the data-plane client (a
 	// TargetRouter that resolves each request's target to a connection) and set it
 	// as the operator's default client, so the operator resumes durable applies by
-	// resolving their target — not just statically-configured deployments. The gRPC
-	// server below reuses the same instance.
+	// resolving their target — not just statically-configured deployments. The
+	// gRPC transport reuses the same instance.
 	var dataPlaneClient tern.Client
 	if cfg.TargetResolver.Enabled() {
 		dataPlaneClient, err = buildGRPCTernClient(ctx, cfg, storage, logger, os.Getenv("TERN_ENVIRONMENT"), o.engines, svc.WakeOperator)
 		if err != nil {
-			return fmt.Errorf("build data-plane target router: %w", err)
+			return nil, fmt.Errorf("build data-plane target router: %w", err)
 		}
 		svc.SetDefaultTernClient(dataPlaneClient)
 	}
-
-	// Start the operator driver pool after webhook callbacks are registered.
-	// This polls for apply work every 10 seconds:
-	// - Runs immediately on startup
-	// - Dispatches queued local applies
-	// - Recovers applies with stale heartbeats (> 1 minute) using FOR UPDATE SKIP LOCKED
-	// - STOPPED applies are NOT auto-resumed (user must call `schemabot start`)
-	svc.StartOperator(ctx)
-
-	// Optionally start gRPC server for Tern proto (used by docker-compose.grpc.yml)
-	var grpcServer *grpc.Server
-	if grpcPort != "" {
-		grpcServer, err = startGRPCServer(ctx, cfg, storage, logger, grpcPort, dataPlaneClient, o.engines, svc.WakeOperator)
-		if err != nil {
-			return fmt.Errorf("start grpc server: %w", err)
-		}
-		defer grpcServer.GracefulStop()
-	}
-
-	// Initialize telemetry (OTel metrics via Prometheus /metrics endpoint)
-	telemetry, err := api.SetupTelemetry(logger)
-	if err != nil {
-		return fmt.Errorf("setup telemetry: %w", err)
-	}
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := telemetry.Shutdown(shutdownCtx); err != nil {
-			logger.Error("telemetry shutdown failed", "error", err)
-		}
-	}()
-
-	// Emit steady-state availability metrics for every configured remote Tern
-	// deployment so dashboards can show deployment-specific health even when no
-	// schema changes are running.
-	svc.StartRemoteDeploymentHealthMonitor(ctx)
-	defer svc.StopRemoteDeploymentHealthMonitor()
-
-	// Permanently drop expired quarantined tables from local-mode MySQL
-	// databases once their pending drops retention period has passed.
-	svc.StartPendingDropsCleaner(ctx)
-	defer svc.StopPendingDropsCleaner()
-
-	// Configure routes
-	mux := http.NewServeMux()
-	svc.ConfigureRoutes(mux)
-	mux.Handle("GET /metrics", telemetry.MetricsHandler)
-
-	mux.Handle("POST /webhook", webhookRuntime.handler)
 
 	// Authentication middleware. With the default (none) auth this is an
 	// allow-all NoneAuthorizer that lets every request through (attaching an
@@ -287,9 +356,63 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	// non-API paths (/webhook, /metrics, health) itself.
 	authz, err := buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, logger)
 	if err != nil {
-		return fmt.Errorf("setup auth: %w", err)
+		return nil, fmt.Errorf("setup auth: %w", err)
 	}
-	authedHandler := authz.Middleware(mux)
+
+	// Initialize telemetry (OTel metrics via Prometheus /metrics endpoint).
+	telemetry, err := api.SetupTelemetry(logger)
+	if err != nil {
+		return nil, fmt.Errorf("setup telemetry: %w", err)
+	}
+
+	success = true
+	return &Server{
+		cfg:             cfg,
+		svc:             svc,
+		storage:         storage,
+		logger:          logger,
+		dataPlaneClient: dataPlaneClient,
+		webhook:         webhookRuntime,
+		telemetry:       telemetry,
+		authz:           authz,
+		engines:         o.engines,
+	}, nil
+}
+
+// Service returns the underlying API service for embedders that need direct
+// access (for example to register additional routes or inspect state).
+func (s *Server) Service() *api.Service { return s.svc }
+
+// RegisterGRPC registers the Tern gRPC service on the embedder's server. Call it
+// before the server starts serving. When a target resolver is configured the
+// shared data-plane client is reused; otherwise a single-database client bound
+// to TERN_ENVIRONMENT is built.
+func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
+	client := s.dataPlaneClient
+	if client == nil {
+		built, err := buildGRPCTernClient(ctx, s.cfg, s.storage, s.logger, os.Getenv("TERN_ENVIRONMENT"), s.engines, s.svc.WakeOperator)
+		if err != nil {
+			return fmt.Errorf("build grpc tern client: %w", err)
+		}
+		// Owned by the Server (not the service's default client), so Close
+		// releases it.
+		s.grpcClient = built
+		client = built
+	}
+	tern.NewServer(client).Register(gs)
+	return nil
+}
+
+// Handler returns the SchemaBot HTTP handler: API routes, /metrics, the webhook
+// endpoint, the auth middleware, and OTel instrumentation. An embedder mounts it
+// on its own server; Run serves it directly.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	s.svc.ConfigureRoutes(mux)
+	mux.Handle("GET /metrics", s.telemetry.MetricsHandler)
+	mux.Handle("POST /webhook", s.webhook.handler)
+
+	authedHandler := s.authz.Middleware(mux)
 
 	// Wrap with OTel HTTP instrumentation for automatic request duration,
 	// request body size, and response body size metrics.
@@ -298,85 +421,51 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 		labeler.Add(metrics.EnvironmentAttribute(""))
 		authedHandler.ServeHTTP(w, r)
 	})
-	handler := otelhttp.NewHandler(metricHandler, "schemabot")
-
-	// Create server
-	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	// Start server in goroutine
-	errCh := make(chan error, 1)
-	go func() {
-		logger.Info("starting server", "port", port, "version", o.version, "commit", o.commit, "built", o.date)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-		close(errCh)
-	}()
-
-	// Wait for a shutdown signal, context cancellation (embedded callers), or a
-	// fatal server error.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
-	select {
-	case sig := <-sigCh:
-		logger.Info("received shutdown signal", "signal", sig)
-	case <-ctx.Done():
-		logger.Info("context canceled, shutting down", "error", ctx.Err())
-	case err := <-errCh:
-		return err
-	}
-
-	// Graceful shutdown
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	logger.Info("shutting down server")
-	return server.Shutdown(shutdownCtx)
+	return otelhttp.NewHandler(metricHandler, "schemabot")
 }
 
-// startGRPCServer starts a gRPC server serving the Tern proto. When the data
-// plane is configured with a target resolver, requests are routed by opaque
-// execution target through a TargetRouter; otherwise it falls back to a single
-// LocalClient bound to the one database configured for TERN_ENVIRONMENT.
-func startGRPCServer(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, port string, client tern.Client, engineFactories map[string]tern.EngineFactory, wakeOperator func(applyIdentifier, database, environment string)) (*grpc.Server, error) {
-	// client is prebuilt and shared with the operator when a dynamic target
-	// resolver is configured; otherwise build the single-database client here.
-	if client == nil {
-		var err error
-		client, err = buildGRPCTernClient(ctx, config, st, logger, os.Getenv("TERN_ENVIRONMENT"), engineFactories, wakeOperator)
-		if err != nil {
-			return nil, err
+// Start launches the server's background work: the operator driver pool
+// (dispatches queued applies and recovers stale ones), the remote-deployment
+// health monitor, and the pending-drops cleaner — all of which run until ctx is
+// canceled or Close is called. It also kicks off a one-shot missing-summary
+// reconciliation that, once started, runs to completion independently of ctx (it
+// repairs interrupted terminal comments and must not be cut short by a request
+// context); it runs before the operator so recovered applies attach observers
+// first.
+func (s *Server) Start(ctx context.Context) {
+	s.webhook.StartMissingSummaryReconciliation(ctx, s.logger)
+	s.svc.StartOperator(ctx)
+	s.svc.StartRemoteDeploymentHealthMonitor(ctx)
+	s.svc.StartPendingDropsCleaner(ctx)
+}
+
+// Close releases the resources the Server owns and returns the first cleanup
+// error encountered. svc.Close stops the operator and health monitor and closes
+// the service's clients and storage (the database pool), so Close only stops the
+// pending-drops cleaner, shuts down telemetry, closes the service, and closes the
+// gRPC fallback client it built itself. It does not stop any gRPC server the
+// embedder owns. Safe to call once after Start.
+func (s *Server) Close() error {
+	s.svc.StopPendingDropsCleaner()
+
+	var errs []error
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.telemetry.Shutdown(shutdownCtx); err != nil {
+		errs = append(errs, fmt.Errorf("telemetry shutdown: %w", err))
+	}
+	if s.grpcClient != nil {
+		if err := s.grpcClient.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close grpc client: %w", err))
 		}
 	}
-
-	grpcSrv := grpc.NewServer()
-	ternServer := tern.NewServer(client)
-	ternServer.Register(grpcSrv)
-
-	var lc net.ListenConfig
-	listener, err := lc.Listen(ctx, "tcp", ":"+port)
-	if err != nil {
-		return nil, fmt.Errorf("listen on port %s: %w", port, err)
+	if err := s.svc.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close service: %w", err))
 	}
-
-	go func() {
-		logger.Info("starting gRPC server", "port", port)
-		// Serve returns ErrServerStopped on GracefulStop/Stop during normal
-		// shutdown; that is expected, not an error worth alerting on.
-		if err := grpcSrv.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-			logger.Error("gRPC server error", "error", err)
-		}
-	}()
-
-	return grpcSrv, nil
+	if len(errs) > 0 {
+		return fmt.Errorf("close server: %w", errors.Join(errs...))
+	}
+	return nil
 }
 
 // buildGRPCTernClient builds the tern.Client backing the data-plane gRPC server.
