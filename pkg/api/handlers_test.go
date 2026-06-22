@@ -88,13 +88,21 @@ func (m *mockStorageWithPlanLookup) Plans() storage.PlanStore { return m.plans }
 
 type mockStorageWithApplyStores struct {
 	mockStorage
-	plans      storage.PlanStore
-	applies    storage.ApplyStore
-	tasks      storage.TaskStore
-	locks      storage.LockStore
-	applyLogs  storage.ApplyLogStore
-	controls   storage.ControlRequestStore
-	operations storage.ApplyOperationStore
+	plans           storage.PlanStore
+	applies         storage.ApplyStore
+	tasks           storage.TaskStore
+	locks           storage.LockStore
+	applyLogs       storage.ApplyLogStore
+	controls        storage.ControlRequestStore
+	operations      storage.ApplyOperationStore
+	vitessApplyData storage.VitessApplyDataStore
+}
+
+func (m *mockStorageWithApplyStores) VitessApplyData() storage.VitessApplyDataStore {
+	if m.vitessApplyData == nil {
+		return &staticVitessApplyDataStore{}
+	}
+	return m.vitessApplyData
 }
 
 func (m *mockStorageWithApplyStores) Plans() storage.PlanStore         { return m.plans }
@@ -114,8 +122,10 @@ func (m *mockStorageWithApplyStores) ApplyOperations() storage.ApplyOperationSto
 
 type staticApplyOperationStore struct {
 	storage.ApplyOperationStore
-	operations []*storage.ApplyOperation
-	err        error
+	operations      []*storage.ApplyOperation
+	err             error
+	resumeStateByOp map[int64]*storage.EngineResumeState
+	resumeStateErr  error
 }
 
 func (s *staticApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
@@ -129,6 +139,32 @@ func (s *staticApplyOperationStore) ListByApply(_ context.Context, applyID int64
 		}
 	}
 	return operations, nil
+}
+
+func (s *staticApplyOperationStore) GetEngineResumeState(_ context.Context, operationID int64) (*storage.EngineResumeState, error) {
+	if s.resumeStateErr != nil {
+		return nil, s.resumeStateErr
+	}
+	if rs, ok := s.resumeStateByOp[operationID]; ok {
+		return rs, nil
+	}
+	return nil, storage.ErrEngineResumeStateNotFound
+}
+
+type staticVitessApplyDataStore struct {
+	storage.VitessApplyDataStore
+	data map[int64]*storage.VitessApplyData
+	err  error
+}
+
+func (s *staticVitessApplyDataStore) GetByApplyID(_ context.Context, applyID int64) (*storage.VitessApplyData, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if d, ok := s.data[applyID]; ok {
+		return d, nil
+	}
+	return nil, storage.ErrVitessApplyDataNotFound
 }
 
 type staticPlanStore struct {
@@ -2370,6 +2406,78 @@ func TestProgressFromLocalStorageSingleDeploymentOmitsOperationFields(t *testing
 	assert.Empty(t, resp.Operations)
 	require.Len(t, resp.Tables, 1)
 	assert.Empty(t, resp.Tables[0].Deployment)
+}
+
+// A completed PlanetScale apply served from storage still surfaces the deploy
+// display fields (branch, deploy-request URL, instant/deferred flags). The
+// engine is not polled on the storage path, so these are read from the durable
+// engine resume state persisted on the apply's operation — the "let me look at
+// what happened" case must not lose the deploy-request link.
+func TestProgressFromLocalStorageOverlaysDisplayMetadataFromResumeState(t *testing.T) {
+	opID := int64(77)
+	apply := &storage.Apply{
+		ID:              30,
+		ApplyIdentifier: "apply_ps_completed",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		Engine:          storage.EnginePlanetScale,
+		State:           state.Apply.Completed,
+	}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{ApplyID: apply.ID, ApplyOperationID: &opID, TaskIdentifier: "task_users", TableName: "users", Namespace: "testdb", DDLAction: "alter", DDL: "ALTER TABLE users ADD COLUMN email varchar(255)", State: state.Task.Completed, Database: "testdb", DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale, Environment: "staging"},
+		}},
+		operations: &staticApplyOperationStore{
+			operations: []*storage.ApplyOperation{
+				{ID: opID, ApplyID: apply.ID, Deployment: "testdb", Target: "testdb", State: state.ApplyOperation.Completed},
+			},
+			resumeStateByOp: map[int64]*storage.EngineResumeState{
+				opID: {ApplyOperationID: opID, Metadata: `{"branch_name":"schemabot-testdb-123","deploy_request_url":"https://app.planetscale.com/org/testdb/deploy-requests/42","is_instant":true,"deferred_deploy":true}`},
+			},
+		},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+	require.NoError(t, err)
+	require.NotNil(t, resp.Metadata)
+	assert.Equal(t, "schemabot-testdb-123", resp.Metadata["branch_name"])
+	assert.Equal(t, "https://app.planetscale.com/org/testdb/deploy-requests/42", resp.Metadata["deploy_request_url"])
+	assert.Equal(t, "true", resp.Metadata["is_instant"])
+	assert.Equal(t, "true", resp.Metadata["deferred_deploy"])
+}
+
+// An apply with no engine resume state (e.g. one that predates resume-state
+// persistence) is served from storage without the deploy display fields and
+// without error — the overlay is best-effort enrichment, never a gate.
+func TestProgressFromLocalStorageWithoutResumeStateOmitsDisplayMetadata(t *testing.T) {
+	opID := int64(88)
+	apply := &storage.Apply{
+		ID:              31,
+		ApplyIdentifier: "apply_ps_no_resume",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		Engine:          storage.EnginePlanetScale,
+		State:           state.Apply.Completed,
+	}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{ApplyID: apply.ID, ApplyOperationID: &opID, TaskIdentifier: "task_users", TableName: "users", Namespace: "testdb", DDLAction: "alter", DDL: "ALTER TABLE users ADD COLUMN email varchar(255)", State: state.Task.Completed, Database: "testdb", DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale, Environment: "staging"},
+		}},
+		operations: &staticApplyOperationStore{
+			operations: []*storage.ApplyOperation{
+				{ID: opID, ApplyID: apply.ID, Deployment: "testdb", Target: "testdb", State: state.ApplyOperation.Completed},
+			},
+		},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.Empty(t, resp.Metadata["branch_name"])
+	assert.Empty(t, resp.Metadata["deploy_request_url"])
 }
 
 func TestValidateRollbackSourceApplyAcceptsLatestCompletedApplyWithOriginalFiles(t *testing.T) {

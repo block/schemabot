@@ -28,3 +28,29 @@ func TestProtoToSchemaFiles_NilNamespaceValue(t *testing.T) {
 		"users.sql": "CREATE TABLE users (id bigint primary key)",
 	}, result["payments"].Files)
 }
+
+func TestPSDisplayMetadata(t *testing.T) {
+	// A populated resume-state blob projects every display field the renderer
+	// surfaces for a PlanetScale apply.
+	m, err := PSDisplayMetadata(`{"branch_name":"schemabot-db-1","deploy_request_url":"https://app/deploy/9","is_instant":true,"deferred_deploy":true}`)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	assert.Equal(t, "schemabot-db-1", m["branch_name"])
+	assert.Equal(t, "https://app/deploy/9", m["deploy_request_url"])
+	assert.Equal(t, "true", m["is_instant"])
+	assert.Equal(t, "true", m["deferred_deploy"])
+
+	// An empty blob yields no fields and no error.
+	m, err = PSDisplayMetadata("")
+	require.NoError(t, err)
+	assert.Nil(t, m)
+
+	// A blob with no display fields set yields a nil map, never an empty alloc.
+	m, err = PSDisplayMetadata(`{"deploy_request_id":42}`)
+	require.NoError(t, err)
+	assert.Nil(t, m)
+
+	// Malformed JSON surfaces an error rather than silently dropping fields.
+	_, err = PSDisplayMetadata(`{not json`)
+	require.Error(t, err)
+}

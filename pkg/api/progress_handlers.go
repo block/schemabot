@@ -426,6 +426,60 @@ func (s *Service) overlayVitessMetadata(ctx context.Context, resp *apitypes.Prog
 	}
 }
 
+// overlayStoredDisplayMetadata populates the PlanetScale display fields
+// (branch_name, deploy_request_url, is_instant, deferred_deploy) on a progress
+// response served from storage. On the live path these arrive from the engine's
+// progress projection; terminal, stopped, and resuming applies are served from
+// storage without polling the engine, so they are read from the durable engine
+// resume state persisted on the apply's operation. Best-effort: a value already
+// set by the caller is never overwritten, and applies that predate resume-state
+// persistence simply render without these fields.
+func (s *Service) overlayStoredDisplayMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, operationIDs map[int64]string) {
+	if apply == nil || apply.Engine != storage.EnginePlanetScale {
+		return
+	}
+	for opID := range operationIDs {
+		rs, err := s.storage.ApplyOperations().GetEngineResumeState(ctx, opID)
+		if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
+			// Expected for operations that have not persisted engine state yet
+			// (or predate resume-state persistence) — nothing to overlay.
+			slog.Debug("progress response has no engine resume state to overlay",
+				"apply_id", apply.ApplyIdentifier, "apply_operation_id", opID)
+			continue
+		}
+		if err != nil {
+			slog.Warn("progress response will omit engine display fields: failed to load engine resume state",
+				"apply_id", apply.ApplyIdentifier,
+				"apply_operation_id", opID,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"error", err)
+			continue
+		}
+		display, err := tern.PSDisplayMetadata(rs.Metadata)
+		if err != nil {
+			slog.Warn("progress response will omit engine display fields: failed to decode engine resume state",
+				"apply_id", apply.ApplyIdentifier,
+				"apply_operation_id", opID,
+				"database", apply.Database,
+				"environment", apply.Environment,
+				"error", err)
+			continue
+		}
+		if len(display) == 0 {
+			continue
+		}
+		if resp.Metadata == nil {
+			resp.Metadata = make(map[string]string, len(display))
+		}
+		for k, v := range display {
+			if resp.Metadata[k] == "" {
+				resp.Metadata[k] = v
+			}
+		}
+	}
+}
+
 // handleDatabaseHistory handles GET /api/history/{database} requests.
 // Returns all applies for a database, sorted by created_at desc.
 func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) {
@@ -813,6 +867,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	s.overlayVitessMetadata(ctx, httpResp, apply)
 	operations, deploymentByOperationID := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = operations
+	s.overlayStoredDisplayMetadata(ctx, httpResp, apply, deploymentByOperationID)
 
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{

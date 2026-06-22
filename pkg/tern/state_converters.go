@@ -2,6 +2,7 @@ package tern
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 	"sort"
 	"time"
@@ -275,4 +276,41 @@ func decodePSMetadataForStorage(s string) (*psMetadataForStorage, error) {
 		return nil, err
 	}
 	return &m, nil
+}
+
+// PSDisplayMetadata decodes a PlanetScale engine resume-state blob into the
+// display fields surfaced on the progress response (branch_name,
+// deploy_request_url, is_instant, deferred_deploy). It is the projection a
+// progress response served from storage uses when the engine was not polled,
+// mirroring the live-path projection in the PlanetScale engine. It returns a nil
+// map when the blob is empty or carries no display fields, so callers render
+// without these fields rather than failing.
+func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
+	meta, err := decodePSMetadataForStorage(resumeStateMetadata)
+	if err != nil {
+		return nil, fmt.Errorf("decode planetscale resume metadata for display: %w", err)
+	}
+	if meta == nil {
+		return nil, nil
+	}
+	var m map[string]string
+	set := func(k, v string) {
+		if m == nil {
+			m = make(map[string]string, 4)
+		}
+		m[k] = v
+	}
+	if meta.BranchName != "" {
+		set("branch_name", meta.BranchName)
+	}
+	if meta.DeployRequestURL != "" {
+		set("deploy_request_url", meta.DeployRequestURL)
+	}
+	if meta.IsInstant {
+		set("is_instant", "true")
+	}
+	if meta.DeferredDeploy {
+		set("deferred_deploy", "true")
+	}
+	return m, nil
 }
