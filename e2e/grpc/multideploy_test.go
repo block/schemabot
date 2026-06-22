@@ -174,6 +174,11 @@ func multiDeployOperationStates(t *testing.T, applyID string) map[string]grpcOpe
 	return byDeployment
 }
 
+// failedApplyState reports whether a state is a failed terminal apply state.
+func failedApplyState(s string) bool {
+	return state.IsState(s, state.Apply.Failed) || state.IsState(s, state.Apply.FailedRetryable)
+}
+
 // TestGRPCMultiDeploy_OrderedCutover verifies that a single fan-out apply over
 // two deployments honours barrier-policy ordered cutover.
 //
@@ -219,8 +224,6 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 	apply := grpcApply(t, plan.PlanID, env, nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
-	failed := []string{state.Apply.Failed, state.Apply.FailedRetryable}
-
 	var (
 		sawSecondParked      bool // second deployment reached waiting_for_cutover
 		secondParkedPreFirst bool // second parked while first had not yet completed
@@ -231,8 +234,8 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 			firstOp, secondOp := ops[first], ops[second]
 
 			// Happy path: neither deployment should fail.
-			require.NotContainsf(t, failed, firstOp.State, "%s operation failed: %s", first, firstOp.ErrorMessage)
-			require.NotContainsf(t, failed, secondOp.State, "%s operation failed: %s", second, secondOp.ErrorMessage)
+			require.Falsef(t, failedApplyState(firstOp.State), "%s operation failed: %s", first, firstOp.ErrorMessage)
+			require.Falsef(t, failedApplyState(secondOp.State), "%s operation failed: %s", second, secondOp.ErrorMessage)
 
 			if state.IsState(secondOp.State, state.Apply.WaitingForCutover) {
 				sawSecondParked = true
@@ -274,6 +277,80 @@ func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
 	assert.Falsef(t, secondDone.Before(firstDone),
 		"expected %s (completed %s) to cut over no earlier than %s (completed %s)",
 		second, final[second].CompletedAt, first, final[first].CompletedAt)
+
+	grpcEnsureNoActiveChange(t, database, env)
+}
+
+// TestGRPCMultiDeploy_FailureHaltsRollout verifies that a deployment failure
+// halts a barrier-policy fan-out rollout.
+//
+// Scenario: testapp/production fans out to [eu, us] with deployment_order
+// [eu, us] and cutover_policy: barrier. The earlier deployment (eu) is seeded
+// with duplicate values so adding a UNIQUE key fails during its copy; the later
+// deployment (us) has unique values and would succeed on its own. Because eu —
+// first in the cutover order — fails, the rollout halts: us must never cut over
+// to completed, and the apply settles to a failed terminal state.
+func TestGRPCMultiDeploy_FailureHaltsRollout(t *testing.T) {
+	requireMultiDeploy(t)
+
+	const (
+		database = "testapp"
+		env      = "production"
+	)
+	// Matches deployment_order in grpc-schemabot-multideploy.yaml.
+	first, second := "eu", "us"
+
+	tableName := uniqueGRPCTableName("md_halt")
+	createDDL := fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)", tableName)
+	for _, d := range []string{first, second} {
+		multiDeployCreateTestTable(t, d, tableName, createDDL)
+	}
+	// The earlier deployment gets identical names so adding UNIQUE(name) fails
+	// during its copy; the later deployment gets unique names so it would
+	// succeed if the rollout were allowed to proceed past the failure.
+	multiDeploySeedRows(t, first, tableName, "name, data", "'dup', REPEAT('x', 200)", 10000)
+	multiDeploySeedRows(t, second, tableName, "name, data", "CONCAT('user_', seq), REPEAT('x', 200)", 10000)
+
+	grpcEnsureNoActiveChange(t, database, env)
+
+	// Add a UNIQUE index on name; the earlier deployment's duplicate data makes
+	// its copy fail.
+	plan := grpcPlan(t, database, env, map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT, UNIQUE KEY uniq_name (name));", tableName),
+	})
+	require.Empty(t, plan.Errors, "plan errors: %v", plan.Errors)
+	require.NotEmpty(t, plan.PlanID, "plan_id")
+
+	apply := grpcApply(t, plan.PlanID, env, nil)
+	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
+
+	// Wait for the earlier deployment to fail, asserting throughout that the
+	// later deployment never reaches completed — the halt policy must keep it
+	// from cutting over once a sibling has failed.
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOperationStates(t, apply.ApplyID)
+			require.Falsef(t, state.IsState(ops[second].State, state.Apply.Completed),
+				"halt violated: %s completed despite %s failing (state %q)", second, first, ops[first].State)
+			return failedApplyState(ops[first].State)
+		},
+		func() string {
+			ops := multiDeployOperationStates(t, apply.ApplyID)
+			return fmt.Sprintf("waiting for %s to fail; %s=%q %s=%q",
+				first, first, ops[first].State, second, ops[second].State)
+		},
+	)
+
+	// The earlier deployment failed; the rollout must have halted — the later
+	// deployment is not completed and the apply itself is failed.
+	final := multiDeployOperationStates(t, apply.ApplyID)
+	assert.Truef(t, failedApplyState(final[first].State), "%s should be failed, was %q", first, final[first].State)
+	assert.Falsef(t, state.IsState(final[second].State, state.Apply.Completed),
+		"%s must not complete after %s failed, was %q", second, first, final[second].State)
+	prog := grpcProgressByApplyID(t, apply.ApplyID)
+	assert.Truef(t, failedApplyState(prog.State), "aggregate apply state should be failed, was %q", prog.State)
 
 	grpcEnsureNoActiveChange(t, database, env)
 }
