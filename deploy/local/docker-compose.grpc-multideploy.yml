@@ -1,17 +1,20 @@
 # gRPC mode: SchemaBot + two Tern deployments (eu, us) of ONE environment.
 #
-# E2E-1 fixture for the multi-deployment ordered-cutover acceptance test.
+# Fixture for the multi-deployment ordered-cutover acceptance test.
 # A single (database, environment) — testapp/production — fans out to two
 # deployments, each backed by its own remote Tern service and isolated MySQL.
 #
 # This differs from docker-compose.grpc.yml, which wires two Terns as two
 # *environments* (staging/production) of a single "default" deployment.
 #
-# NOTE: SchemaBot will NOT boot from this stack until the >1-deployments config
-# hard-block is lifted (MD-9b-ii, gated behind MD-9b-i / block/schemabot#431).
-# Until then, the schemabot container exits at startup with:
+# NOTE: SchemaBot will NOT boot from this stack until the server supports
+# deployments maps with more than one entry. Until then, the schemabot service
+# exits at startup with:
 #   "multi-deployment (>1 entries) is not yet supported by this server"
-# The fixture is committed now so the harness is ready when that block lands.
+# The fixture is committed now so the harness is ready when that support lands.
+#
+# Container names are intentionally omitted so Docker Compose project scoping
+# (-p) keeps this fixture isolated from other local stacks.
 #
 # Usage (default ports):
 #   docker-compose -f docker-compose.grpc-multideploy.yml up
@@ -30,7 +33,6 @@ services:
   # =============================================================================
   tern-eu-mysql:
     image: mysql:8.0
-    container_name: tern-eu-mysql
     environment:
       MYSQL_ROOT_PASSWORD: testpassword
       MYSQL_DATABASE: tern
@@ -51,7 +53,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dev
-    container_name: tern-eu
     environment:
       MYSQL_DSN: "root:testpassword@tcp(tern-eu-mysql:3306)/tern?parseTime=true&multiStatements=true"
       TERN_TARGET_DSN: "root:testpassword@tcp(tern-eu-mysql:3306)/testapp?parseTime=true&multiStatements=true"
@@ -79,7 +80,6 @@ services:
   # =============================================================================
   tern-us-mysql:
     image: mysql:8.0
-    container_name: tern-us-mysql
     environment:
       MYSQL_ROOT_PASSWORD: testpassword
       MYSQL_DATABASE: tern
@@ -100,7 +100,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dev
-    container_name: tern-us
     environment:
       MYSQL_DSN: "root:testpassword@tcp(tern-us-mysql:3306)/tern?parseTime=true&multiStatements=true"
       TERN_TARGET_DSN: "root:testpassword@tcp(tern-us-mysql:3306)/testapp?parseTime=true&multiStatements=true"
@@ -130,7 +129,6 @@ services:
   # Note: Schema is applied by SchemaBot on startup (dogfooding)
   schemabot-mysql:
     image: mysql:8.0
-    container_name: schemabot-mysql
     environment:
       MYSQL_ROOT_PASSWORD: testpassword
       MYSQL_DATABASE: schemabot
@@ -150,7 +148,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dev
-    container_name: schemabot
     environment:
       MYSQL_DSN: "root:testpassword@tcp(schemabot-mysql:3306)/schemabot?parseTime=true&multiStatements=true"
       SCHEMABOT_CONFIG_FILE: "/config/grpc-schemabot-multideploy.yaml"

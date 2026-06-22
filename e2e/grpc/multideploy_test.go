@@ -12,27 +12,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Multi-deployment fan-out fixture (E2E-1).
+// Multi-deployment fan-out fixture.
 //
 // Scenario: a single (database, environment) — testapp/production — fans out to
 // two deployments (eu, us), each backed by its own remote Tern over gRPC, with
 // deployment_order [eu, us] and cutover_policy: barrier (see
 // deploy/local/docker-compose.grpc-multideploy.yml and
-// config/grpc-schemabot-multideploy.yaml).
+// deploy/local/config/grpc-schemabot-multideploy.yaml).
 //
 // This file only verifies that the multi-deployment stack boots and that
 // SchemaBot resolves both remote deployments — the foundation the ordered
-// cutover acceptance test (E2E-2) builds on.
+// cutover acceptance test builds on.
 //
-// The fixture cannot boot until the >1-deployments config hard-block is lifted
-// (MD-9b-ii), so these tests are gated behind E2E_MULTIDEPLOY=1 and are skipped
-// in the standard gRPC e2e run. The make target test-e2e-grpc-multideploy sets
-// the flag and stands up the multi-deployment stack.
+// The fixture cannot boot until the server supports deployments maps with more
+// than one entry, so these tests are gated behind E2E_MULTIDEPLOY=1 and are
+// skipped in the standard gRPC e2e run. The make target
+// test-e2e-grpc-multideploy sets the flag and stands up the multi-deployment
+// stack.
 
 func requireMultiDeploy(t *testing.T) {
 	t.Helper()
 	if os.Getenv("E2E_MULTIDEPLOY") != "1" {
-		t.Skip("multi-deployment fixture gated behind E2E_MULTIDEPLOY=1 (blocked on MD-9b-ii: >1-deployments config hard-block)")
+		t.Skip("multi-deployment fixture gated behind E2E_MULTIDEPLOY=1 (requires server support for deployments maps with >1 entry)")
 	}
 }
 

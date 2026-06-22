@@ -402,11 +402,11 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 	$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
 	exit $$TEST_EXIT_CODE
 
-# Run the multi-deployment fan-out gRPC e2e fixture (E2E-1).
+# Run the multi-deployment fan-out gRPC e2e fixture.
 # One environment (testapp/production) fans out to two deployments (eu, us),
 # each backed by its own remote Tern + MySQL.
-# NOT part of `make test-e2e`: the stack cannot boot until the >1-deployments
-# config hard-block is lifted (MD-9b-ii). Run manually once that lands.
+# NOT part of `make test-e2e`: the stack cannot boot until the server supports
+# deployments maps with more than one entry. Run manually once that lands.
 # Ports: SchemaBot=15370, SchemaBot-MySQL=15371, EU-MySQL=15372, US-MySQL=15373
 #        EU-HTTP=15380, EU-gRPC=15390, US-HTTP=15382, US-gRPC=15392
 E2E_GRPC_MD_ENV := SCHEMABOT_PORT=15370 \
@@ -418,7 +418,7 @@ E2E_GRPC_MD_ENV := SCHEMABOT_PORT=15370 \
 	TERN_US_PORT=15382 \
 	TERN_US_GRPC_PORT=15392
 
-test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixture (E2E-1; blocked on MD-9b-ii)
+test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixture (needs server support for >1-entry deployments maps)
 	@echo "Starting isolated multi-deployment gRPC e2e environment..."
 	CGO_ENABLED=0 GOOS=linux go build -ldflags "$(LDFLAGS)" -o bin/schemabot-linux ./pkg/cmd
 	cp bin/schemabot-linux deploy/local/schemabot-dev
@@ -433,7 +433,7 @@ test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixtur
 		fi; \
 		if [ $$i -eq 90 ]; then \
 			echo "Timeout waiting for multi-deployment SchemaBot gRPC e2e environment"; \
-			echo "(expected until MD-9b-ii lifts the >1-deployments config hard-block)"; \
+			echo "(expected until the server supports deployments maps with more than one entry)"; \
 			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs; \
 			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v; \
 			exit 1; \
