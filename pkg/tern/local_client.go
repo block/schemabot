@@ -1693,204 +1693,30 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// Get ALL tasks for this apply (completed + running + pending)
 	currentApplyTasks := filterTasksByApply(tasks, activeTask.ApplyID)
 
-	// Scope to the active task's apply operation before deriving the aggregate
-	// apply state. currentApplyTasks is scoped by apply, so once an apply fans
-	// out to multiple operations it is a mixed set; deriving the aggregate from
-	// that mix would bypass the sibling operation rows and the on_failure policy.
-	// currentApplyTasks is still used below for the response table list and the
-	// all-terminal gate. With one operation per apply the two slices are equal,
-	// so this is a no-op until the multi-deployment fan-out lands.
-	opScopedTasks := currentApplyTasks
-	if activeTask.ApplyOperationID != nil {
-		opScopedTasks = tasksForOperation(currentApplyTasks, *activeTask.ApplyOperationID)
-	}
-
-	creds := c.credentials()
-	eng := c.getEngine()
-
-	// Get live progress from engine for the currently running task.
-	// For Vitess, load opaque ResumeState so the engine can poll the deploy
-	// request and query SHOW VITESS_MIGRATIONS.
-	var engineResult *engine.ProgressResult
+	// Progress renders entirely from stored state. The operator's lease-held
+	// drive (pollForCompletionAtomic) is the sole engine poller: it advances task
+	// and apply state, terminalizes the apply, and persists per-shard rows and
+	// engine resume state every tick. Readers never poll the engine — an
+	// instance-local engine has no live result to read, and for an externally-
+	// authoritative engine the drive keeps stored current.
 	var engineMetadata map[string]string
 	var vitessApplyIsInstant bool
-	// Query engine for live progress. For Vitess, also query during pending state
-	// to surface PlanetScale states (preparing branch, deploy request, etc.).
-	queryDuringPending := c.config.Type == storage.DatabaseTypeVitess
-	// A stopped task is SchemaBot-owned state. Do not let a stale engine poll
-	// report an older active state such as waiting_for_cutover and overwrite it.
-	queryLiveProgress := activeTask.State != state.Task.Pending && activeTask.State != state.Task.Stopped
-	if queryDuringPending && activeTask.State == state.Task.Pending {
-		queryLiveProgress = true
-	}
-	// Live engine progress is read only when the engine's progress is
-	// authoritative on any instance. Instance-local engines (Spirit) are served
-	// from stored progress, which the instance driving the schema change keeps
-	// current, so a progress request balanced onto a non-driving instance cannot
-	// observe unrelated or stale engine state.
-	serveEngineProgress := eng != nil && queryLiveProgress && engineProgressIsExternallyAuthoritative(eng)
-	if eng != nil && queryLiveProgress && !serveEngineProgress {
-		c.logger.Debug("Progress: serving stored progress; engine progress is instance-local",
-			"apply_id", apply.ApplyIdentifier, "task_id", activeTask.TaskIdentifier, "database", c.config.Database)
-	}
-	if serveEngineProgress {
-		progressReq := &engine.ProgressRequest{
-			Database:    c.config.Database,
-			Credentials: creds,
-		}
-		if c.config.Type == storage.DatabaseTypeVitess {
-			resumeState, resumeErr := c.loadEngineResumeState(ctx, activeTask)
-			if resumeErr != nil {
-				c.logger.Error("failed to load Vitess engine resume state for progress", "apply_id", activeTask.ApplyID, "task_id", activeTask.TaskIdentifier, "error", resumeErr)
-				return nil, fmt.Errorf("load Vitess engine resume state for progress task %s: %w", activeTask.TaskIdentifier, resumeErr)
-			}
-			progressReq.ResumeState = resumeState
-		}
-		result, err := eng.Progress(ctx, progressReq)
-		if err == nil {
-			engineResult = result
-			// The engine surfaces display fields (branch, deploy-request URL,
-			// is_instant, deferred) on the result; the renderer reads them from
-			// here instead of the vitess_apply_data side table.
-			engineMetadata = result.Metadata
-			vitessApplyIsInstant = result.Metadata["is_instant"] == "true"
-			if c.config.Type == storage.DatabaseTypeVitess && result.ResumeState != nil {
-				operationID, operationErr := applyOperationIDForTask(activeTask)
-				if operationErr != nil {
-					c.logger.Error("failed to resolve apply operation for Vitess engine resume state from progress", "apply_id", apply.ApplyIdentifier, "task_id", activeTask.TaskIdentifier, "error", operationErr)
-					return nil, fmt.Errorf("resolve apply operation for Vitess engine resume state from progress task %s: %w", activeTask.TaskIdentifier, operationErr)
-				}
-				if saveErr := c.saveEngineResumeStateForOperation(ctx, operationID, result.ResumeState); saveErr != nil {
-					c.logger.Error("failed to save Vitess engine resume state from progress", "apply_id", apply.ApplyIdentifier, "error", saveErr)
-					return nil, fmt.Errorf("save Vitess engine resume state from progress apply %s: %w", apply.ApplyIdentifier, saveErr)
-				}
-			}
-			c.logger.Info("Progress: engine returned", "engine_state", result.State, "message", result.Message, "task_id", activeTask.TaskIdentifier, "storage_state", activeTask.State)
-			engineTaskState := taskStateFromProgressResult(result)
-			taskState := taskStateWithNoBackwardProgress(activeTask.State, engineTaskState)
-			if !state.IsState(taskState, engineTaskState) {
-				c.logger.Warn("keeping stored task state because engine progress reported earlier state",
-					"task_id", activeTask.TaskIdentifier,
-					"stored_state", activeTask.State,
-					"engine_task_state", engineTaskState)
-			}
-
-			// Engine state is translated to task state first. Stored task state
-			// can stay ahead of a stale engine poll; apply state is derived after
-			// task rows are coherent.
-			if !state.IsTerminalTaskState(activeTask.State) {
-				oldTaskState := activeTask.State
-				activeTask.State = taskState
-				now := time.Now()
-				activeTask.UpdatedAt = now
-				if activeTask.StartedAt == nil && !state.IsState(taskState, state.Task.Pending) {
-					activeTask.StartedAt = &now
-				}
-				if state.IsTerminalTaskState(taskState) && activeTask.CompletedAt == nil {
-					activeTask.CompletedAt = &now
-				}
-				if result.State == engine.StateFailed && activeTask.ErrorMessage == "" {
-					activeTask.ErrorMessage = progressFailureMessage(result)
-				}
-				if err := c.storage.Tasks().Update(ctx, activeTask); err != nil {
-					c.logger.Warn("failed to update task state from progress poll", "task_id", activeTask.TaskIdentifier, "state", activeTask.State, "error", err)
-				}
-				if !state.IsState(oldTaskState, taskState) && !state.IsTerminalTaskState(taskState) {
-					if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err != nil {
-						c.logger.Warn("failed to load apply after progress task state update", "apply_id", activeTask.ApplyID, "error", err)
-					} else if apply != nil && !state.IsTerminalApplyState(apply.State) {
-						if derived, ok := c.deriveAggregateApplyState(ctx, apply, opScopedTasks); ok {
-							// Compare-and-swap on the just-read state so a stale
-							// projection cannot clobber a newer state a sibling
-							// drive already wrote.
-							swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
-							if err != nil {
-								c.logger.Warn("failed to update apply after progress task state update", "apply_id", apply.ApplyIdentifier, "state", derived, "error", err)
-							} else if !swapped {
-								c.logger.Debug("apply progress projection write lost a race; next poll reconciles", "apply_id", apply.ApplyIdentifier, "expected_state", apply.State, "derived_state", derived)
-							}
-						}
-					}
-				}
-			}
-
-			// Also update the apply record if the engine reports a terminal state
-			// but the apply hasn't been updated yet. Only do this when ALL tasks
-			// for this apply are terminal — in sequential mode, the engine reports
-			// "completed" per-task, but the apply isn't done until all tasks finish.
-			if result.State.IsTerminal() {
-				retryableFailure := state.IsState(taskState, state.Task.FailedRetryable)
-				allTerminal := !retryableFailure
-				for _, t := range currentApplyTasks {
-					if !state.IsTerminalTaskState(t.State) {
-						allTerminal = false
-						break
-					}
-				}
-				if retryableFailure || allTerminal {
-					apply, _ := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
-					if apply != nil && !state.IsTerminalApplyState(apply.State) {
-						// Terminalize the parent apply on the rollout projection
-						// over all sibling operations, not this operation's tasks
-						// alone: under on_failure=continue a failed operation must
-						// hold the apply running while siblings are in flight. With
-						// one operation per apply the projection equals this
-						// operation's derived state, so this is a no-op until the
-						// multi-deployment fan-out lands.
-						expectedState := apply.State
-						derived, ok := c.deriveAggregateApplyState(ctx, apply, opScopedTasks)
-						quiesce, _, stampCompletedAt := applyQuiesceDecision(derived)
-						if ok && quiesce {
-							now := time.Now()
-							apply.State = derived
-							if stampCompletedAt {
-								apply.CompletedAt = &now
-							} else {
-								apply.CompletedAt = nil
-							}
-							// Prefer this operation's engine failure message; fall back
-							// to the failed task rows when the rollout projection resolves
-							// the apply to a failure due to a sibling operation that this
-							// engine result doesn't reflect.
-							if result.State == engine.StateFailed {
-								if msg := progressFailureMessage(result); msg != "" {
-									apply.ErrorMessage = msg
-								}
-							}
-							ensureApplyFailureMessage(apply, opScopedTasks)
-							apply.UpdatedAt = now
-							// Compare-and-swap on the just-read state so a stale
-							// projection cannot clobber a newer state a sibling
-							// drive already wrote.
-							swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
-							switch {
-							case err != nil:
-								c.logger.Warn("failed to update apply from progress poll", "apply_id", apply.ApplyIdentifier, "state", apply.State, "apply_db_id", apply.ID, "error", err)
-							case !swapped:
-								c.logger.Debug("apply terminal projection write lost a race; next poll reconciles", "apply_id", apply.ApplyIdentifier, "expected_state", expectedState, "derived_state", derived)
-							default:
-								c.logger.Info("apply state updated from progress polling", "apply_id", apply.ApplyIdentifier, "state", apply.State)
-							}
-						}
-					}
-				}
-			}
-		}
+	if c.config.Type == storage.DatabaseTypeVitess {
+		engineMetadata = c.loadStoredDisplayMetadata(ctx, activeTask)
+		vitessApplyIsInstant = engineMetadata["is_instant"] == "true"
 	}
 
 	// Build tables array with ALL tasks for this apply
 	tables := make([]*ternv1.TableProgress, 0, len(currentApplyTasks))
-	var summary string
 
-	// Build a map of engine table progress by namespace/table for fast lookup.
-	// Vitess commonly has the same table name in multiple keyspaces.
-	var engineTableProgress map[string]*engine.TableProgress
+	// summary has no stored source on the read path; errorMessage falls back to
+	// the failed task rows below.
+	var summary string
 	var errorMessage string
-	if engineResult != nil {
-		engineTableProgress = indexEngineTableProgress(engineResult.Tables)
-		summary = engineResult.Message
-		errorMessage = engineResult.ErrorMessage
-	}
+
+	// The per-shard rows the operator's drive persists, grouped by table — the
+	// single read surface for sharded progress.
+	storedShards := c.loadStoredShardsByTable(ctx, apply, currentApplyTasks)
 
 	for _, t := range currentApplyTasks {
 		tp := &ternv1.TableProgress{
@@ -1903,60 +1729,37 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			ChangeType: ddlActionToProtoChangeType(t.DDLAction),
 		}
 
-		// Look up engine progress for this table
-		if et, ok := engineProgressForTask(engineTableProgress, t); ok {
-			tp.Status = progressTableStatus(t.State, et.State)
-			tp.PercentComplete = int32(et.Progress)
-			tp.RowsCopied = et.RowsCopied
-			tp.RowsTotal = et.RowsTotal
-			tp.EtaSeconds = et.ETASeconds
-			tp.IsInstant = et.IsInstant
-			tp.ProgressDetail = et.ProgressDetail
-
-			if syncStoredTaskProgressFromEngineTable(t, et, time.Now()) {
-				if err := c.storage.Tasks().Update(ctx, t); err != nil {
-					c.logger.Error("failed to update task progress from engine",
-						"task_id", t.TaskIdentifier,
-						"table", t.TableName,
-						"rows_copied", t.RowsCopied,
-						"rows_total", t.RowsTotal,
-						"progress_percent", t.ProgressPercent,
-						"error", err)
-				}
-			}
-
-			// Build shards if available
-			shards := make([]*ternv1.ShardProgress, len(et.Shards))
-			for j, sh := range et.Shards {
-				shards[j] = &ternv1.ShardProgress{
-					Shard:           sh.Shard,
-					Status:          state.NormalizeShardStatus(sh.State),
-					RowsCopied:      sh.RowsCopied,
-					RowsTotal:       sh.RowsTotal,
-					EtaSeconds:      sh.ETASeconds,
-					CutoverAttempts: int32(sh.CutoverAttempts),
-				}
-			}
-			tp.Shards = shards
-		} else {
-			// No live engine data — use stored progress from the task.
-			// This covers stopped tasks (progress saved at stop time) and
-			// completed tasks that finished before the engine was shut down.
-			tp.PercentComplete = int32(t.ProgressPercent)
-			tp.RowsCopied = t.RowsCopied
-			tp.RowsTotal = t.RowsTotal
-			// Clamp to 100% only for successfully completed tasks — Vitess row
-			// counts can lag slightly due to concurrent inserts during copy.
-			if state.IsState(t.State, state.Task.Completed) && t.RowsTotal > 0 {
-				tp.PercentComplete = 100
-				if tp.RowsCopied < tp.RowsTotal {
-					tp.RowsCopied = tp.RowsTotal
-				}
-			}
-			if vitessApplyIsInstant && state.IsState(t.State, state.Task.Completed) {
-				tp.PercentComplete = 100
+		// Table figures come from the stored task row the drive maintains.
+		tp.PercentComplete = int32(t.ProgressPercent)
+		tp.RowsCopied = t.RowsCopied
+		tp.RowsTotal = t.RowsTotal
+		// Clamp to 100% only for successfully completed tasks — Vitess row
+		// counts can lag slightly due to concurrent inserts during copy.
+		if state.IsState(t.State, state.Task.Completed) && t.RowsTotal > 0 {
+			tp.PercentComplete = 100
+			if tp.RowsCopied < tp.RowsTotal {
+				tp.RowsCopied = tp.RowsTotal
 			}
 		}
+		if vitessApplyIsInstant && state.IsState(t.State, state.Task.Completed) {
+			tp.PercentComplete = 100
+		}
+
+		// When per-shard rows are persisted, the table headline (rows, percent,
+		// ETA) is the aggregate of those rows — computed at read time so a reader
+		// that does not poll the engine is correct.
+		storedForTable := storedShards[progressTableKey(t.Namespace, t.TableName)]
+		if len(storedForTable) > 0 {
+			rowsCopied, rowsTotal, etaSeconds, percent := aggregateStoredShards(storedForTable)
+			tp.RowsCopied = rowsCopied
+			tp.RowsTotal = rowsTotal
+			tp.EtaSeconds = etaSeconds
+			tp.PercentComplete = percent
+		}
+
+		// The per-shard breakdown renders from those persisted rows — stored is
+		// the single read surface, never the live engine result.
+		tp.Shards = shardProgressProto(storedForTable)
 
 		tables = append(tables, tp)
 	}
@@ -2052,57 +1855,110 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	return resp, nil
 }
 
-func syncStoredTaskProgressFromEngineTable(task *storage.Task, progress *engine.TableProgress, now time.Time) bool {
-	if task == nil || progress == nil {
-		return false
+// loadStoredShardsByTable loads the persisted per-shard rows for an apply's
+// operations, grouped by (namespace, table), so the progress response renders
+// the per-shard breakdown from storage. It is Vitess-only (other engines have no
+// shard rows). A load error for one operation is logged and skipped, keeping the
+// rows already loaded for other operations; tables whose rows could not be
+// loaded render an empty breakdown until the next successful load rather than
+// failing the whole response.
+func (c *LocalClient) loadStoredShardsByTable(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) map[string][]*storage.Task {
+	if c.config.Type != storage.DatabaseTypeVitess {
+		return nil
 	}
-
-	changed := false
-	if !engineTableProgressOmittedRowTotals(task, progress) {
-		if task.RowsCopied != progress.RowsCopied {
-			task.RowsCopied = progress.RowsCopied
-			changed = true
+	byTable := map[string][]*storage.Task{}
+	seenOps := map[int64]bool{}
+	for _, t := range tasks {
+		if t.ApplyOperationID == nil || seenOps[*t.ApplyOperationID] {
+			continue
 		}
-		if task.RowsTotal != progress.RowsTotal {
-			task.RowsTotal = progress.RowsTotal
-			changed = true
+		seenOps[*t.ApplyOperationID] = true
+		shardTasks, err := c.storage.Tasks().GetShardProgressByApplyOperationID(ctx, *t.ApplyOperationID)
+		if err != nil {
+			c.logger.Warn("operation's per-shard breakdown will be empty this poll: failed to load its persisted shard rows",
+				"apply_id", apply.ApplyIdentifier, "apply_operation_id", *t.ApplyOperationID, "error", err)
+			continue
 		}
-		if task.ProgressPercent != progress.Progress {
-			task.ProgressPercent = progress.Progress
-			changed = true
-		}
-		if task.ETASeconds != int(progress.ETASeconds) {
-			task.ETASeconds = int(progress.ETASeconds)
-			changed = true
+		for _, st := range shardTasks {
+			key := progressTableKey(st.Namespace, st.TableName)
+			byTable[key] = append(byTable[key], st)
 		}
 	}
-	if task.IsInstant != progress.IsInstant {
-		task.IsInstant = progress.IsInstant
-		changed = true
-	}
-	if progress.StartedAt != nil && task.StartedAt == nil {
-		task.StartedAt = progress.StartedAt
-		changed = true
-	}
-	if progress.CompletedAt != nil && task.CompletedAt == nil {
-		task.CompletedAt = progress.CompletedAt
-		changed = true
-	}
-	if changed {
-		task.UpdatedAt = now
-	}
-	return changed
+	return byTable
 }
 
-func engineTableProgressOmittedRowTotals(task *storage.Task, progress *engine.TableProgress) bool {
-	if task == nil || progress == nil {
-		return false
+// loadStoredDisplayMetadata reads a Vitess apply's deploy display fields
+// (branch_name, deploy_request_url, is_instant, deferred_deploy) from the
+// operation's persisted engine resume state — the drive's write-through is the
+// source, the read path never polls the engine. Returns nil before the first
+// write-through or on a decode/load error, so the response simply omits the
+// display fields until the drive catches up.
+func (c *LocalClient) loadStoredDisplayMetadata(ctx context.Context, task *storage.Task) map[string]string {
+	operationID, err := applyOperationIDForTask(task)
+	if err != nil {
+		c.logger.Debug("progress: no apply operation for display metadata", "task_id", task.TaskIdentifier, "error", err)
+		return nil
 	}
-	return task.RowsTotal > 0 && progress.RowsTotal <= 0
+	rs, err := c.storage.ApplyOperations().GetEngineResumeState(ctx, operationID)
+	if err != nil {
+		// Not-found is expected before the drive's first write-through.
+		c.logger.Debug("progress: no engine resume state for display metadata", "task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
+		return nil
+	}
+	display, err := PSDisplayMetadata(rs.Metadata)
+	if err != nil {
+		c.logger.Warn("progress response will omit engine display fields: failed to decode engine resume state",
+			"task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
+		return nil
+	}
+	return display
 }
 
-func progressTableStatus(storedTaskState, engineTableState string) string {
-	return taskStateWithNoBackwardProgress(storedTaskState, state.NormalizeTaskStatus(engineTableState))
+// aggregateStoredShards computes a table's headline figures from its persisted
+// per-shard rows — the per-table number is computed at read time, never stored.
+// Rows are summed (a completed shard's copied count is clamped up to its total,
+// since row counts can lag concurrent inserts), ETA is the slowest shard, and
+// percent is derived from the summed rows.
+func aggregateStoredShards(shards []*storage.Task) (rowsCopied, rowsTotal, etaSeconds int64, percent int32) {
+	for _, sh := range shards {
+		rowsTotal += sh.RowsTotal
+		copied := sh.RowsCopied
+		if state.IsState(sh.State, state.Task.Completed) && sh.RowsTotal > 0 && copied < sh.RowsTotal {
+			copied = sh.RowsTotal
+		}
+		rowsCopied += copied
+		if int64(sh.ETASeconds) > etaSeconds {
+			etaSeconds = int64(sh.ETASeconds)
+		}
+	}
+	if rowsTotal > 0 {
+		percent = int32(min(rowsCopied*100/rowsTotal, 100))
+	}
+	return rowsCopied, rowsTotal, etaSeconds, percent
+}
+
+// shardProgressProto renders a table's per-shard breakdown from the persisted
+// shard rows — the durable read-model the operator's lease-held drive maintains.
+// Stored state is the single read surface: the breakdown is never read from the
+// live engine result. Before the drive's first write-through (or while a load
+// failed) there are no rows yet and the breakdown is empty until the drive
+// catches up.
+func shardProgressProto(stored []*storage.Task) []*ternv1.ShardProgress {
+	if len(stored) == 0 {
+		return nil
+	}
+	out := make([]*ternv1.ShardProgress, len(stored))
+	for i, s := range stored {
+		out[i] = &ternv1.ShardProgress{
+			Shard:           s.Shard,
+			Status:          state.NormalizeShardStatus(s.State),
+			RowsCopied:      s.RowsCopied,
+			RowsTotal:       s.RowsTotal,
+			EtaSeconds:      int64(s.ETASeconds),
+			CutoverAttempts: int32(s.CutoverAttempts),
+		}
+	}
+	return out
 }
 
 // taskStateWithNoBackwardProgress applies the engine -> task -> apply ordering:
