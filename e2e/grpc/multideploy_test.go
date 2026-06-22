@@ -3,10 +3,16 @@
 package grpc
 
 import (
+	"context"
+	"database/sql"
+	"fmt"
 	"net/http"
 	"os"
 	"testing"
+	"time"
 
+	"github.com/block/schemabot/e2e/testutil"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -75,4 +81,199 @@ func TestGRPCMultiDeploy_Plan_FansOut(t *testing.T) {
 	})
 	require.Empty(t, plan.Errors, "plan errors")
 	require.NotEmpty(t, plan.PlanID, "plan_id")
+}
+
+// orderedCutoverDeadline bounds the full multi-deployment ordered-cutover
+// sequence: two concurrent full copy-swaps followed by two cutovers driven
+// strictly in deployment_order. This exceeds the shared PollDeadline because it
+// observes several phases across two remote deployments end to end.
+const orderedCutoverDeadline = 5 * time.Minute
+
+// multiDeployTernMySQLDSN returns the MySQL DSN for a deployment's remote Tern
+// target database (the testapp schema each deployment fans out to).
+func multiDeployTernMySQLDSN(t *testing.T, deployment string) string {
+	t.Helper()
+	var key string
+	switch deployment {
+	case "eu":
+		key = "E2E_TERN_EU_MYSQL_DSN"
+	case "us":
+		key = "E2E_TERN_US_MYSQL_DSN"
+	default:
+		require.Failf(t, "unknown deployment", "%s", deployment)
+	}
+	dsn := os.Getenv(key)
+	require.NotEmptyf(t, dsn, "%s environment variable not set", key)
+	return dsn
+}
+
+// multiDeployCreateTestTable creates a table on one deployment's target MySQL
+// and registers cleanup of the table and any Spirit shadow/checkpoint tables.
+func multiDeployCreateTestTable(t *testing.T, deployment, tableName, ddl string) {
+	t.Helper()
+	dsn := multiDeployTernMySQLDSN(t, deployment)
+	db, err := sql.Open("mysql", dsn)
+	require.NoErrorf(t, err, "open tern mysql (%s)", deployment)
+	_, err = db.ExecContext(t.Context(), ddl)
+	require.NoErrorf(t, err, "create table %s on %s", tableName, deployment)
+	_ = db.Close()
+
+	t.Cleanup(func() {
+		db2, err := sql.Open("mysql", dsn)
+		if err != nil {
+			return
+		}
+		defer utils.CloseAndLog(db2)
+		for _, suffix := range []string{"_new", "_old", "_chkpnt", ""} {
+			name := tableName
+			if suffix != "" {
+				name = "_" + tableName + suffix
+			}
+			_, _ = db2.ExecContext(context.Background(), "DROP TABLE IF EXISTS `"+name+"`") //nolint:usetesting // cleanup
+		}
+	})
+}
+
+// multiDeploySeedRows inserts rows into a table on one deployment's target MySQL
+// using an efficient SQL cross-join, mirroring grpcSeedRows.
+func multiDeploySeedRows(t *testing.T, deployment, tableName, columns, valueTemplate string, rowCount int) {
+	t.Helper()
+	dsn := multiDeployTernMySQLDSN(t, deployment)
+	db, err := sql.Open("mysql", dsn)
+	require.NoErrorf(t, err, "open tern mysql (%s)", deployment)
+	defer utils.CloseAndLog(db)
+
+	seqGen := `(SELECT @row := @row + 1 as seq FROM
+		(SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a`
+	if rowCount >= 100 {
+		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b`
+	}
+	if rowCount >= 1000 {
+		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c`
+	}
+	if rowCount >= 10000 {
+		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) d`
+	}
+	seqGen += `, (SELECT @row := 0) r) nums`
+
+	query := fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM %s LIMIT %d`,
+		tableName, columns, valueTemplate, seqGen, rowCount)
+	_, err = db.ExecContext(t.Context(), query)
+	require.NoErrorf(t, err, "seed %s on %s", tableName, deployment)
+}
+
+// multiDeployOperationStates returns the per-deployment operation rows of a
+// fan-out apply, keyed by deployment name.
+func multiDeployOperationStates(t *testing.T, applyID string) map[string]grpcOperationProgress {
+	t.Helper()
+	prog := grpcProgressByApplyID(t, applyID)
+	byDeployment := make(map[string]grpcOperationProgress, len(prog.Operations))
+	for _, op := range prog.Operations {
+		byDeployment[op.Deployment] = op
+	}
+	return byDeployment
+}
+
+// TestGRPCMultiDeploy_OrderedCutover verifies that a single fan-out apply over
+// two deployments honours barrier-policy ordered cutover.
+//
+// Scenario: testapp/production fans out to deployments [eu, us] with
+// deployment_order [eu, us] and cutover_policy: barrier. Both deployments copy
+// concurrently and park at the cutover barrier; the operator then drives cutover
+// strictly in order — eu cuts over and completes before us is allowed to cut
+// over. The later deployment must never reach a terminal completed state ahead
+// of the earlier one, and the whole apply settles to completed.
+func TestGRPCMultiDeploy_OrderedCutover(t *testing.T) {
+	requireMultiDeploy(t)
+
+	const (
+		database = "testapp"
+		env      = "production"
+	)
+	// Matches deployment_order in grpc-schemabot-multideploy.yaml.
+	first, second := "eu", "us"
+
+	tableName := uniqueGRPCTableName("md_ordered")
+	createDDL := fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)", tableName)
+
+	// Seed both deployments so each runs a full copy-swap (not instant DDL),
+	// giving the barrier a real window in which the later deployment parks.
+	for _, d := range []string{first, second} {
+		multiDeployCreateTestTable(t, d, tableName, createDDL)
+		multiDeploySeedRows(t, d, tableName, "name, data",
+			"CONCAT('user_', seq), REPEAT('x', 200)", 10000)
+	}
+
+	grpcEnsureNoActiveChange(t, database, env)
+
+	// Widen the primary key from INT to BIGINT to force a full table copy on
+	// every deployment.
+	plan := grpcPlan(t, database, env, map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			"CREATE TABLE %s (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT);", tableName),
+	})
+	require.Empty(t, plan.Errors, "plan errors: %v", plan.Errors)
+	require.NotEmpty(t, plan.PlanID, "plan_id")
+
+	apply := grpcApply(t, plan.PlanID, env, nil)
+	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
+
+	failed := []string{state.Apply.Failed, state.Apply.FailedRetryable}
+
+	var (
+		sawSecondParked      bool // second deployment reached waiting_for_cutover
+		secondParkedPreFirst bool // second parked while first had not yet completed
+	)
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOperationStates(t, apply.ApplyID)
+			firstOp, secondOp := ops[first], ops[second]
+
+			// Happy path: neither deployment should fail.
+			require.NotContainsf(t, failed, firstOp.State, "%s operation failed: %s", first, firstOp.ErrorMessage)
+			require.NotContainsf(t, failed, secondOp.State, "%s operation failed: %s", second, secondOp.ErrorMessage)
+
+			if state.IsState(secondOp.State, state.Apply.WaitingForCutover) {
+				sawSecondParked = true
+				if !state.IsState(firstOp.State, state.Apply.Completed) {
+					secondParkedPreFirst = true
+				}
+			}
+
+			// Barrier ordering invariant: the later deployment must never
+			// complete before the earlier one.
+			if state.IsState(secondOp.State, state.Apply.Completed) {
+				require.Truef(t, state.IsState(firstOp.State, state.Apply.Completed),
+					"barrier violated: %s completed while %s was %q", second, first, firstOp.State)
+			}
+
+			return state.IsState(firstOp.State, state.Apply.Completed) &&
+				state.IsState(secondOp.State, state.Apply.Completed)
+		},
+		func() string {
+			ops := multiDeployOperationStates(t, apply.ApplyID)
+			return fmt.Sprintf("waiting for both deployments completed; %s=%q %s=%q",
+				first, ops[first].State, second, ops[second].State)
+		},
+	)
+
+	// Barrier engaged: the later deployment parked at the cutover barrier, and
+	// did so before the earlier deployment completed (ordered cutover).
+	require.Truef(t, sawSecondParked,
+		"expected %s to park at waiting_for_cutover under barrier policy", second)
+	assert.Truef(t, secondParkedPreFirst,
+		"expected %s to be parked at the barrier before %s completed", second, first)
+
+	// Completion timestamps confirm the earlier deployment cut over first.
+	final := multiDeployOperationStates(t, apply.ApplyID)
+	firstDone, err := time.Parse(time.RFC3339, final[first].CompletedAt)
+	require.NoErrorf(t, err, "parse %s completed_at %q", first, final[first].CompletedAt)
+	secondDone, err := time.Parse(time.RFC3339, final[second].CompletedAt)
+	require.NoErrorf(t, err, "parse %s completed_at %q", second, final[second].CompletedAt)
+	assert.Falsef(t, secondDone.Before(firstDone),
+		"expected %s (completed %s) to cut over no earlier than %s (completed %s)",
+		second, final[second].CompletedAt, first, final[first].CompletedAt)
+
+	grpcEnsureNoActiveChange(t, database, env)
 }

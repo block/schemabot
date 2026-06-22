@@ -146,12 +146,26 @@ type grpcApplyResponse struct {
 }
 
 type grpcProgressResponse struct {
-	State        string              `json:"state"`
-	Engine       string              `json:"engine"`
-	ApplyID      string              `json:"apply_id,omitempty"`
-	Tables       []grpcTableProgress `json:"tables"`
-	ErrorMessage string              `json:"error_message,omitempty"`
-	Summary      string              `json:"summary,omitempty"`
+	State        string                  `json:"state"`
+	Engine       string                  `json:"engine"`
+	ApplyID      string                  `json:"apply_id,omitempty"`
+	Operations   []grpcOperationProgress `json:"operations,omitempty"`
+	Tables       []grpcTableProgress     `json:"tables"`
+	ErrorMessage string                  `json:"error_message,omitempty"`
+	Summary      string                  `json:"summary,omitempty"`
+}
+
+// grpcOperationProgress is one per-deployment operation row in a fan-out
+// (multi-deployment) apply's progress response. Empty for single-deployment
+// applies.
+type grpcOperationProgress struct {
+	Deployment   string `json:"deployment"`
+	Target       string `json:"target,omitempty"`
+	State        string `json:"state"`
+	ErrorCode    string `json:"error_code,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	StartedAt    string `json:"started_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
 }
 
 type grpcTableProgress struct {
