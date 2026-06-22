@@ -686,6 +686,38 @@ schemabot apply -e staging --allow-unsafe
 </details>
 
 <details>
+<summary><a name="drop-index-blocked"></a><strong>Drop Index Blocked</strong></summary>
+
+
+## MySQL Schema Change Plan
+
+**Database**: `testapp` | **Schema Name**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
+```
+
+📋 **Plan**: **1** table to alter
+
+---
+
+**⛔ Unsafe Changes Detected:**
+- `customers`: Unsafe operation detected: DROP INDEX `idx_customers_email`
+
+**Destructive drop guidance:**
+
+Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
+
+**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+```
+schemabot apply -e staging --allow-unsafe
+```
+
+</details>
+
+<details>
 <summary><a name="help-comment"></a><strong>Help Comment</strong></summary>
 
 

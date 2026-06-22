@@ -144,7 +144,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := unsafeDropUsageTarget(tt.changes)
+			got, ok := unsafeDropApplicationUsageTarget(tt.changes)
 
 			assert.Equal(t, tt.wantOK, ok)
 			assert.Equal(t, tt.want, got)
@@ -176,6 +176,138 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 	assert.Contains(t, result, "🔍 Checksumming to verify data (21%)")
 	assert.Contains(t, result, "Rows verified: 321,450 / 1,466,232")
 	assert.Contains(t, result, "1 checksumming")
+}
+
+func TestUnsafeDropIndexUsageTargets(t *testing.T) {
+	tests := []struct {
+		name                string
+		changes             []UnsafeChangeData
+		wantActionTarget    string
+		wantInvisibleTarget string
+		wantQueryTarget     string
+		wantOK              bool
+	}{
+		{
+			name: "drop index",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+			},
+			wantActionTarget:    "an index",
+			wantInvisibleTarget: "the dropped index",
+			wantQueryTarget:     "it",
+			wantOK:              true,
+		},
+		{
+			name: "multiple drop indexes",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`; Unsafe operation detected: DROP INDEX `idx_customers_phone`"},
+			},
+			wantActionTarget:    "indexes",
+			wantInvisibleTarget: "any dropped indexes",
+			wantQueryTarget:     "them",
+			wantOK:              true,
+		},
+		{
+			name: "drop index with drop column",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+			},
+			wantActionTarget:    "an index",
+			wantInvisibleTarget: "the dropped index",
+			wantQueryTarget:     "it",
+			wantOK:              true,
+		},
+		{
+			name: "other unsafe change",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "Unsafe operation detected: MODIFY COLUMN"},
+			},
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotActionTarget, gotInvisibleTarget, gotQueryTarget, ok := unsafeDropIndexUsageTargets(tt.changes)
+
+			assert.Equal(t, tt.wantOK, ok)
+			assert.Equal(t, tt.wantActionTarget, gotActionTarget)
+			assert.Equal(t, tt.wantInvisibleTarget, gotInvisibleTarget)
+			assert.Equal(t, tt.wantQueryTarget, gotQueryTarget)
+		})
+	}
+}
+
+func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
+	rendered := RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `customers` DROP COLUMN `nickname`, DROP INDEX `idx_customers_email`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+		},
+	})
+
+	assert.Contains(t, rendered, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.")
+	assert.Contains(t, rendered, "Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.")
+	assert.NotContains(t, rendered, "reads from or writes to the dropped index")
+}
+
+func TestRenderUnsafeChangesBlockedUsesPluralMySQLDropIndexGuidance(t *testing.T) {
+	rendered := RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `customers` DROP INDEX `idx_customers_email`, DROP INDEX `idx_customers_phone`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`; Unsafe operation detected: DROP INDEX `idx_customers_phone`"},
+		},
+	})
+
+	assert.Contains(t, rendered, "Before dropping indexes in MySQL, first make any dropped indexes invisible and verify application queries no longer rely on them for safe performance.")
+	assert.NotContains(t, rendered, "Before dropping an index in MySQL, first make any dropped indexes invisible")
+}
+
+func TestRenderUnsafeChangesBlockedDoesNotMentionInvisibleIndexesForVitess(t *testing.T) {
+	rendered := RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		IsMySQL:     false,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `customers` DROP INDEX `idx_customers_email`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+		},
+	})
+
+	assert.Contains(t, rendered, "Before allowing a destructive drop, verify application queries no longer rely on the dropped index for safe performance.")
+	assert.NotContains(t, rendered, "invisible")
 }
 
 func TestRenderApplyStatusComment_Running(t *testing.T) {
