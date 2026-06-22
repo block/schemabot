@@ -120,6 +120,15 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	}
 
 	port := getEnv("PORT", "8080")
+	grpcPort := os.Getenv("GRPC_PORT")
+
+	if applyDataPlaneClaimDefault(cfg, grpcPort != "") {
+		logger.Info("data-plane gRPC mode: defaulting operator claiming to the apply level",
+			"grpc_port", grpcPort)
+	} else if grpcPort != "" && cfg.ShouldClaimOperations() {
+		logger.Warn("data-plane gRPC mode has operation-level operator claiming enabled; the inline LocalClient drive does not maintain apply_operations state, so stop/start resume will not recover",
+			"grpc_port", grpcPort)
+	}
 
 	// Apply storage schema with retries for transient failures (e.g., DNS
 	// not yet available when the container starts in Kubernetes).
@@ -233,7 +242,6 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 
 	// Optionally start gRPC server for Tern proto (used by docker-compose.grpc.yml)
 	var grpcServer *grpc.Server
-	grpcPort := os.Getenv("GRPC_PORT")
 	if grpcPort != "" {
 		grpcServer, err = startGRPCServer(ctx, cfg, storage, logger, grpcPort, dataPlaneClient, o.engines, svc.WakeOperator)
 		if err != nil {
@@ -595,6 +603,23 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// applyDataPlaneClaimDefault sets the operator claim mode for a data-plane tern
+// process. A process serving the Tern proto over gRPC drives applies inline via
+// LocalClient and does not own the apply_operations lifecycle, so its operator
+// must recover work at the apply level via FindNextApply; operation-level
+// claiming reads a vestigial operation row that never tracks the apply and so
+// cannot resume it. When the mode is unset, default it to apply-level claiming
+// for this process; an operator can still opt in explicitly. Operation-level
+// claiming is a control-plane concept. Reports whether the default was applied.
+func applyDataPlaneClaimDefault(cfg *api.ServerConfig, isDataPlane bool) bool {
+	if !isDataPlane || cfg.OperatorClaimOperations != nil {
+		return false
+	}
+	applyLevel := false
+	cfg.OperatorClaimOperations = &applyLevel
+	return true
 }
 
 // buildAuthorizer selects the API authorizer from config. The default

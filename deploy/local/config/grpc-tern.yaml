@@ -18,3 +18,8 @@ databases:
         dsn: "env:TERN_TARGET_DSN"
       production:
         dsn: "env:TERN_TARGET_DSN"
+
+# Data-plane terns drive applies inline via LocalClient and do not maintain
+# apply_operations rows, so operator recovery claims at the apply level. The
+# server enforces this default in gRPC mode; set here as well for clarity.
+operator_claim_operations: false
