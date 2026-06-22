@@ -15,9 +15,25 @@ import (
 )
 
 const (
-	multiDeploymentSchemaBotConfig = "../../deploy/local/config/grpc-multideployment-schemabot.yaml"
-	multiDeploymentComposeFile     = "../../deploy/local/docker-compose.grpc-multideployment.yml"
+	multiDeploymentSchemaBotConfig = "../../deploy/local/config/grpc-schemabot-multideploy.yaml"
+	multiDeploymentComposeFile     = "../../deploy/local/docker-compose.grpc-multideploy.yml"
 )
+
+// loadMultiDeployFixtureConfig decodes the multi-deployment gRPC fixture config
+// the way LoadServerConfigFromFile does — with KnownFields(true) — so an unknown
+// or misspelled key in the fixture fails the test instead of being silently
+// dropped.
+func loadMultiDeployFixtureConfig(t *testing.T) ServerConfig {
+	t.Helper()
+	data, err := os.ReadFile(multiDeploymentSchemaBotConfig)
+	require.NoError(t, err)
+
+	var cfg ServerConfig
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	require.NoError(t, dec.Decode(&cfg))
+	return cfg
+}
 
 // TestLocalGRPCMultiDeploymentFixtureTopology pins the shape of the
 // multi-deployment gRPC e2e fixture: one (database, environment) fans out to two
@@ -28,23 +44,17 @@ const (
 // The fixture is asserted statically rather than booted: the server enforces a
 // >1-deployment guard until the multi-deployment orchestration path is enabled,
 // so LoadServerConfigFromFile (which calls Validate) would reject this config
-// today. The test decodes with KnownFields(true) to mirror the loader and catch
-// typos, then exercises the resolver directly.
+// today. The decode mirrors the loader with KnownFields(true) to catch typos,
+// then exercises the resolver directly.
 func TestLocalGRPCMultiDeploymentFixtureTopology(t *testing.T) {
-	data, err := os.ReadFile(multiDeploymentSchemaBotConfig)
-	require.NoError(t, err)
-
-	var cfg ServerConfig
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
-	require.NoError(t, dec.Decode(&cfg))
+	cfg := loadMultiDeployFixtureConfig(t)
 
 	db, ok := cfg.Databases["testapp"]
 	require.True(t, ok, "fixture must configure the testapp database")
 	require.Equal(t, storage.DatabaseTypeMySQL, db.Type)
 
-	env, ok := db.Environments["staging"]
-	require.True(t, ok, "fixture must configure the staging environment")
+	env, ok := db.Environments["production"]
+	require.True(t, ok, "fixture must configure the production environment")
 
 	// Two deployments of ONE environment — not two environments.
 	require.Len(t, env.Deployments, 2)
@@ -54,12 +64,12 @@ func TestLocalGRPCMultiDeploymentFixtureTopology(t *testing.T) {
 	assert.Equal(t, storage.CutoverPolicyBarrier, env.CutoverPolicy)
 
 	// Every deployment key must resolve to a non-empty per-environment endpoint.
-	assert.Equal(t, "tern-eu:9090", cfg.TernDeployments["eu"]["staging"])
-	assert.Equal(t, "tern-us:9090", cfg.TernDeployments["us"]["staging"])
+	assert.Equal(t, "tern-eu:9090", cfg.TernDeployments["eu"]["production"])
+	assert.Equal(t, "tern-us:9090", cfg.TernDeployments["us"]["production"])
 
 	// The resolver returns the deployments in deployment_order, each carrying its
 	// own deployment key against the shared target.
-	targets, err := cfg.ResolveDatabaseTargets("testapp", "staging")
+	targets, err := cfg.ResolveDatabaseTargets("testapp", "production")
 	require.NoError(t, err)
 	assert.Equal(t, []routing.ExecutionTarget{
 		{DatabaseType: storage.DatabaseTypeMySQL, Deployment: "eu", Target: "testapp"},
@@ -67,7 +77,7 @@ func TestLocalGRPCMultiDeploymentFixtureTopology(t *testing.T) {
 	}, targets)
 
 	// The lead deployment (first in deployment_order) is the planning primary.
-	primary, err := cfg.ResolvePrimaryDatabaseTarget("testapp", "staging")
+	primary, err := cfg.ResolvePrimaryDatabaseTarget("testapp", "production")
 	require.NoError(t, err)
 	assert.Equal(t, "eu", primary.Deployment)
 }
@@ -77,24 +87,25 @@ func TestLocalGRPCMultiDeploymentFixtureTopology(t *testing.T) {
 // Tern deployment endpoint in the config must map to a compose service of the
 // same name, and the SchemaBot service must load the multi-deployment config.
 func TestLocalGRPCMultiDeploymentFixtureComposeConsistency(t *testing.T) {
-	cfgData, err := os.ReadFile(multiDeploymentSchemaBotConfig)
-	require.NoError(t, err)
-	var cfg ServerConfig
-	require.NoError(t, yaml.Unmarshal(cfgData, &cfg))
+	cfg := loadMultiDeployFixtureConfig(t)
 
 	composeData, err := os.ReadFile(multiDeploymentComposeFile)
 	require.NoError(t, err)
-	compose := string(composeData)
 
-	assert.Contains(t, compose, "grpc-multideployment-schemabot.yaml",
+	var compose struct {
+		Services map[string]yaml.Node `yaml:"services"`
+	}
+	require.NoError(t, yaml.Unmarshal(composeData, &compose))
+
+	assert.Contains(t, string(composeData), "grpc-schemabot-multideploy.yaml",
 		"SchemaBot service must load the multi-deployment config")
 
 	for deployment, endpoints := range cfg.TernDeployments {
-		endpoint := endpoints["staging"]
-		require.NotEmpty(t, endpoint, "deployment %q must have a staging endpoint", deployment)
+		endpoint := endpoints["production"]
+		require.NotEmpty(t, endpoint, "deployment %q must have a production endpoint", deployment)
 		host, _, found := strings.Cut(endpoint, ":")
 		require.True(t, found, "endpoint %q must be host:port", endpoint)
-		assert.Contains(t, compose, host+":",
+		assert.Contains(t, compose.Services, host,
 			"compose must define a service for deployment endpoint host %q", host)
 	}
 }
