@@ -226,10 +226,15 @@ func TestTaskStore_PerShardTaskRoundTrip(t *testing.T) {
 	assert.Equal(t, "-80", got.Shard)
 	assert.Equal(t, 1, got.CutoverAttempts)
 
-	// Both shards of the same table coexist under one operation.
-	tasks, err := store.Tasks().GetByApplyOperationID(ctx, opID)
+	// Both shards of the same table coexist under one operation. They are read
+	// via the per-shard reader; the per-table GetByApplyOperationID excludes them
+	// so they never re-enter the per-table pipeline on reload.
+	tasks, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	require.Len(t, tasks, 2)
+	perTable, err := store.Tasks().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	assert.Empty(t, perTable, "per-shard rows must not leak into the per-table loader")
 	shardAttempts := map[string]int{}
 	for _, task := range tasks {
 		assert.Equal(t, "users", task.TableName)
@@ -339,13 +344,13 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 
 	// A displaced operator (stale token) fails closed on the insert path: nothing written.
 	require.ErrorIs(t, store.Tasks().UpsertShardProgress(opCtx("stale"), shardTask("-80")), storage.ErrApplyLeaseLost)
-	got, err := store.Tasks().GetByApplyOperationID(ctx, opID)
+	got, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	assert.Empty(t, got, "a lost lease must not insert a shard task")
 
 	// The lease holder inserts the shard row.
 	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), shardTask("-80")))
-	got, err = store.Tasks().GetByApplyOperationID(ctx, opID)
+	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, "-80", got[0].Shard)
@@ -358,7 +363,7 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	advanced.RowsCopied = 500000
 	advanced.ReadyToComplete = true
 	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), advanced))
-	got, err = store.Tasks().GetByApplyOperationID(ctx, opID)
+	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	require.Len(t, got, 1, "re-upserting the same shard must update in place, not insert a duplicate")
 	assert.Equal(t, state.Task.Completed, got[0].State)
@@ -370,7 +375,7 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	stale.State = state.Task.Failed
 	stale.ProgressPercent = 5
 	require.ErrorIs(t, store.Tasks().UpsertShardProgress(opCtx("stale"), stale), storage.ErrApplyLeaseLost)
-	got, err = store.Tasks().GetByApplyOperationID(ctx, opID)
+	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, state.Task.Completed, got[0].State, "a lost lease must not overwrite the shard row")
@@ -378,7 +383,7 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 
 	// A different shard under the same operation is a separate row.
 	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), shardTask("80-")))
-	got, err = store.Tasks().GetByApplyOperationID(ctx, opID)
+	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	assert.Len(t, got, 2, "a different shard is its own per-shard task row")
 
@@ -397,7 +402,7 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	require.ErrorContains(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), noShard), "requires a non-empty shard")
 
 	// None of the refused writes created rows.
-	got, err = store.Tasks().GetByApplyOperationID(ctx, opID)
+	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	assert.Len(t, got, 2, "refused writes must not create rows")
 }

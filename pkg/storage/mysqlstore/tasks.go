@@ -269,12 +269,15 @@ func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Ta
 	return nil
 }
 
-// GetByApplyID returns all tasks for an apply.
+// GetByApplyID returns the per-table tasks for an apply. Per-shard detail rows
+// (shard != "") are excluded: they are a reflected read-model written by the
+// operator and must not re-enter the per-table drive/gating/progress pipeline on
+// reload. Read those via GetShardProgressByApplyOperationID.
 func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+taskColumns+`
 		FROM tasks
-		WHERE apply_id = ?
+		WHERE apply_id = ? AND shard = ''
 		ORDER BY created_at DESC
 	`, applyID)
 	if err != nil {
@@ -285,16 +288,17 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 	return scanTasks(rows)
 }
 
-// GetByApplyOperationID returns the tasks for a single apply_operation (one
-// deployment of a multi-deployment apply). While the config layer hard-blocks
-// more than one deployment per environment this returns the same rows as
-// GetByApplyID for the apply's single operation; it lets a driver drive and
+// GetByApplyOperationID returns the per-table tasks for a single apply_operation
+// (one deployment of a multi-deployment apply). It lets a driver drive and
 // reconcile one deployment independently once an apply fans out across several.
+// Per-shard detail rows (shard != "") are excluded for the same reason as
+// GetByApplyID: they must stay write-only relative to the per-table pipeline and
+// are read via GetShardProgressByApplyOperationID.
 func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*storage.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+taskColumns+`
 		FROM tasks
-		WHERE apply_operation_id = ?
+		WHERE apply_operation_id = ? AND shard = ''
 		ORDER BY created_at DESC, id DESC
 	`, applyOperationID)
 	if err != nil {
@@ -312,6 +316,26 @@ func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID 
 		return []*storage.Task{}, nil
 	}
 	return tasks, nil
+}
+
+// GetShardProgressByApplyOperationID returns the per-shard task rows
+// (shard != "") for an operation, ordered by namespace, table_name, shard. It is
+// the read companion to UpsertShardProgress: the per-table loaders exclude these
+// rows, so this is how the renderer (and tests) read the per-shard breakdown
+// without the rows re-entering the per-table pipeline.
+func (s *taskStore) GetShardProgressByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*storage.Task, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+taskColumns+`
+		FROM tasks
+		WHERE apply_operation_id = ? AND shard != ''
+		ORDER BY namespace, table_name, shard
+	`, applyOperationID)
+	if err != nil {
+		return nil, fmt.Errorf("query shard progress tasks for apply_operation %d: %w", applyOperationID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanTasks(rows)
 }
 
 // GetByDatabase returns all tasks for a database.

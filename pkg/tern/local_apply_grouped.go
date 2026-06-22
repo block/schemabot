@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
@@ -1030,6 +1032,10 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 			if tp.CompletedAt != nil && !retryableFailure && task.CompletedAt == nil {
 				task.CompletedAt = tp.CompletedAt
 			}
+			// Persist the per-shard breakdown as per-shard tasks so the renderer
+			// can show per-shard state from storage. No-op outside the lease-held
+			// operator drive (read-path callers carry no operation lease).
+			c.writeShardProgress(ctx, task, tp, now)
 		} else if instantFromMetadata {
 			task.IsInstant = true
 			if result.State.IsTerminal() && !retryableFailure {
@@ -1051,6 +1057,71 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, tasks []*stora
 			task.ProgressPercent = 100
 		}
 		c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, newState), "")
+	}
+}
+
+// writeShardProgress persists a table's per-shard breakdown as per-shard tasks
+// (shard != ""), so the renderer can show per-shard state from storage instead
+// of a live re-query. It runs only inside the operator's lease-held drive:
+// UpsertShardProgress requires the operation lease, and read-path callers (which
+// carry no operation lease) skip it so a plain progress read never writes. A
+// failed shard write is logged, not fatal — the next reconcile re-applies it.
+func (c *LocalClient) writeShardProgress(ctx context.Context, table *storage.Task, tp *engine.TableProgress, now time.Time) {
+	if len(tp.Shards) == 0 {
+		return
+	}
+	if _, ok := storage.OperationLeaseFromContext(ctx); !ok {
+		return
+	}
+	var operationID int64
+	if table.ApplyOperationID != nil {
+		operationID = *table.ApplyOperationID
+	}
+	for _, sh := range tp.Shards {
+		shardTask := &storage.Task{
+			TaskIdentifier:   "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
+			ApplyID:          table.ApplyID,
+			ApplyOperationID: table.ApplyOperationID,
+			PlanID:           table.PlanID,
+			Database:         table.Database,
+			DatabaseType:     table.DatabaseType,
+			Engine:           table.Engine,
+			Repository:       table.Repository,
+			PullRequest:      table.PullRequest,
+			Environment:      table.Environment,
+			Namespace:        table.Namespace,
+			TableName:        table.TableName,
+			Shard:            sh.Shard,
+			DDL:              table.DDL,
+			DDLAction:        table.DDLAction,
+			State:            state.NormalizeShardStatus(sh.State),
+			RowsCopied:       sh.RowsCopied,
+			RowsTotal:        sh.RowsTotal,
+			ProgressPercent:  sh.Progress,
+			ETASeconds:       int(sh.ETASeconds),
+			CutoverAttempts:  sh.CutoverAttempts,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		err := c.storage.Tasks().UpsertShardProgress(ctx, shardTask)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, storage.ErrApplyLeaseLost) {
+			// A peer claimed the operation; this driver is displaced and the new
+			// owner reconciles the remaining shards. Stop write-through — every
+			// further shard would fail the same way. Expected during failover.
+			c.logger.Debug("operator: stopping shard progress write-through, operation lease lost",
+				"apply_id", table.ApplyID, "apply_operation_id", operationID,
+				"database", table.Database, "environment", table.Environment,
+				"namespace", table.Namespace, "table", table.TableName, "shard", sh.Shard)
+			return
+		}
+		c.logger.Error("operator: failed to persist shard progress",
+			"apply_id", table.ApplyID, "apply_operation_id", operationID,
+			"database", table.Database, "environment", table.Environment,
+			"namespace", table.Namespace, "table", table.TableName, "shard", sh.Shard,
+			"error", err)
 	}
 }
 

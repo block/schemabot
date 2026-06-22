@@ -386,10 +386,18 @@ type TaskStore interface {
 	// Used for aggregating task states to derive Apply state.
 	GetByApplyID(ctx context.Context, applyID int64) ([]*Task, error)
 
-	// GetByApplyOperationID returns the tasks for a single apply_operation
-	// (one deployment of a multi-deployment apply). Used to drive and
-	// reconcile one operation independently of its sibling deployments.
+	// GetByApplyOperationID returns the per-table tasks for a single
+	// apply_operation (one deployment of a multi-deployment apply). Used to drive
+	// and reconcile one operation independently of its sibling deployments.
+	// Per-shard detail rows are excluded — read them via
+	// GetShardProgressByApplyOperationID.
 	GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*Task, error)
+
+	// GetShardProgressByApplyOperationID returns the per-shard detail task rows
+	// (shard != "") for an operation. These are a reflected read-model the
+	// per-table loaders exclude, so they never re-enter the per-table pipeline;
+	// the renderer reads the per-shard breakdown through this method.
+	GetShardProgressByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*Task, error)
 
 	// GetByDatabase returns all tasks for a database.
 	GetByDatabase(ctx context.Context, database string) ([]*Task, error)
