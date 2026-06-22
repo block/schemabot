@@ -359,7 +359,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 
 	overlayApplyOptions(httpResp, apply)
 
-	s.overlayVitessMetadata(r.Context(), httpResp, apply)
+	setRevertSkippedMetadata(httpResp, apply)
 
 	// Overlay per-table timestamps from task records. The proto response
 	// doesn't carry task timestamps, but storage has them from engine
@@ -385,45 +385,18 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	s.writeJSON(w, http.StatusOK, httpResp)
 }
 
-// overlayVitessMetadata merges the skip-revert status into the response. The
-// engine's display fields (branch_name, deploy_request_url, is_instant,
-// deferred_deploy) now arrive on the response via the engine's progress
-// projection, so only revert_skipped — core control state, not engine data — is
-// read from storage here. (That field moves off vitess_apply_data in a later
-// change; this overlay disappears with it.)
-func (s *Service) overlayVitessMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply) {
-	if apply == nil {
-		slog.Warn("progress response will omit revert status: no apply record",
-			"apply_id", resp.ApplyID,
-			"database", resp.Database,
-			"environment", resp.Environment)
+// setRevertSkippedMetadata surfaces the skip-revert flag from the apply's stored
+// revert_skipped_at, so progress consumers can show that revert was skipped and
+// finalization is in progress. It reads apply state — no engine-specific side
+// table — and is a no-op until skip-revert has been dispatched.
+func setRevertSkippedMetadata(resp *apitypes.ProgressResponse, apply *storage.Apply) {
+	if apply == nil || apply.RevertSkippedAt == nil {
 		return
 	}
-	if apply.Engine != storage.EnginePlanetScale {
-		return
+	if resp.Metadata == nil {
+		resp.Metadata = make(map[string]string)
 	}
-	// Best-effort enrichment — the progress response is still served without the
-	// revert status, so log at Warn rather than Error.
-	vad, err := s.storage.VitessApplyData().GetByApplyID(ctx, apply.ID)
-	if errors.Is(err, storage.ErrVitessApplyDataNotFound) {
-		// No row yet is expected when skip-revert has not been requested; there
-		// is simply no revert status to overlay. Not an error worth logging.
-		return
-	}
-	if err != nil {
-		slog.Warn("progress response will omit revert status: failed to load vitess apply data",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"error", err)
-		return
-	}
-	if vad.RevertSkippedAt != nil {
-		if resp.Metadata == nil {
-			resp.Metadata = make(map[string]string)
-		}
-		resp.Metadata["revert_skipped"] = "true"
-	}
+	resp.Metadata["revert_skipped"] = "true"
 }
 
 // overlayStoredDisplayMetadata populates the PlanetScale display fields
@@ -864,7 +837,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 		httpResp.ErrorMessage = apply.ErrorMessage
 	}
 	overlayApplyOptions(httpResp, apply)
-	s.overlayVitessMetadata(ctx, httpResp, apply)
+	setRevertSkippedMetadata(httpResp, apply)
 	operations, deploymentByOperationID := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = operations
 	s.overlayStoredDisplayMetadata(ctx, httpResp, apply, deploymentByOperationID)

@@ -426,6 +426,12 @@ type Apply struct {
 	// CompletedAt is when the apply reached a terminal state.
 	CompletedAt *time.Time
 
+	// RevertSkippedAt records when skip-revert was dispatched for this apply.
+	// Non-nil means revert was skipped and finalization is in progress; it is
+	// core control state surfaced to progress consumers, set by both the
+	// control-plane skip-revert handler and the data-plane finalizer.
+	RevertSkippedAt *time.Time
+
 	// UpdatedAt is when the apply was last updated.
 	UpdatedAt time.Time
 }

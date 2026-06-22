@@ -917,15 +917,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	return false
 }
 
-// markRevertSkipped sets RevertSkippedAt on the VitessApplyData record so
-// progress consumers know finalization is in progress.
+// markRevertSkipped records skip-revert on the apply so progress consumers know
+// finalization is in progress.
 func (c *LocalClient) markRevertSkipped(ctx context.Context, apply *storage.Apply) {
-	now := time.Now()
-	if vad, err := c.storage.VitessApplyData().GetByApplyID(ctx, apply.ID); err == nil {
-		vad.RevertSkippedAt = &now
-		if saveErr := c.storage.VitessApplyData().Save(ctx, vad); saveErr != nil {
-			c.logger.Warn("failed to save revert_skipped_at", "apply_id", apply.ApplyIdentifier, "error", saveErr)
-		}
+	if err := c.storage.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()); err != nil {
+		c.logger.Warn("failed to record skip-revert on apply", "apply_id", apply.ApplyIdentifier, "error", err)
 	}
 }
 

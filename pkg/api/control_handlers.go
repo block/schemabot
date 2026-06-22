@@ -1619,25 +1619,10 @@ func (s *Service) handleSkipRevert(w http.ResponseWriter, r *http.Request) {
 	}
 	metrics.RecordControlOperation(r.Context(), "skip_revert", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 
-	// Record skip-revert on VitessApplyData for progress visibility
+	// Record skip-revert on the apply for progress visibility.
 	if resp.Accepted && apply.Engine == storage.EnginePlanetScale {
-		vitessDataStore := s.storage.VitessApplyData()
-		if vitessDataStore == nil {
-			s.logger.Error("vitess apply data store not available after skip-revert", "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
-		} else {
-			vad, err := vitessDataStore.GetByApplyID(r.Context(), apply.ID)
-			switch {
-			case err != nil:
-				s.logger.Error("failed to load vitess apply data after skip-revert", "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier, "error", err)
-			case vad == nil:
-				s.logger.Warn("vitess apply data missing after skip-revert", "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
-			default:
-				now := time.Now()
-				vad.RevertSkippedAt = &now
-				if err := vitessDataStore.Save(r.Context(), vad); err != nil {
-					s.logger.Error("failed to save vitess apply data after skip-revert", "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier, "error", err)
-				}
-			}
+		if err := s.storage.Applies().SetRevertSkipped(r.Context(), apply.ID, time.Now()); err != nil {
+			s.logger.Error("failed to record skip-revert on apply", "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier, "error", err)
 		}
 	}
 	if resp.Accepted {

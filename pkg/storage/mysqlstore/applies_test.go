@@ -3148,3 +3148,37 @@ func TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithoutPendingS
 	require.NoError(t, err)
 	assert.Nil(t, claimed, "an apply without a pending stop is not a reconciliation candidate")
 }
+
+// SetRevertSkipped records skip-revert on the apply and the timestamp round-trips
+// through Get, so progress can show that revert was skipped without an
+// engine-specific side table. It is a targeted write that leaves other fields
+// (here, state) untouched.
+func TestApplyStore_SetRevertSkipped(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "vitess", "staging")
+	apply := createTestApply(t, store, lock, "apply_revert_skipped", 1)
+
+	got, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Nil(t, got.RevertSkippedAt, "revert_skipped_at starts unset")
+
+	// Age updated_at so a heartbeat bump would be observable: updated_at is the
+	// apply's lease heartbeat (the staleness gate in FindNextApply), and
+	// SetRevertSkipped must not renew it from a non-lease caller.
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 5 MINUTE WHERE id = ?`, apply.ID)
+	require.NoError(t, err)
+	before, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()))
+
+	got, err = store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.RevertSkippedAt, "revert_skipped_at round-trips through Get")
+	assert.Equal(t, apply.State, got.State, "SetRevertSkipped must not change other apply fields")
+	assert.Equal(t, before.UpdatedAt, got.UpdatedAt, "SetRevertSkipped preserves the lease heartbeat (updated_at)")
+}

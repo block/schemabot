@@ -305,6 +305,14 @@ type ApplyStore interface {
 	// If not called for > 1 minute, another driver can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
 
+	// SetRevertSkipped records when skip-revert was dispatched for an apply, so
+	// progress consumers can show that revert was skipped and finalization is in
+	// progress. It is a targeted write of revert_skipped_at that preserves the
+	// apply's updated_at lease heartbeat and touches no other fields; both the
+	// control-plane skip-revert handler (no lease) and the data-plane finalizer
+	// call it without disturbing recovery-claim staleness.
+	SetRevertSkipped(ctx context.Context, applyID int64, at time.Time) error
+
 	// CheckLease verifies that an operator apply lease is still current without
 	// mutating the apply row.
 	CheckLease(ctx context.Context, lease ApplyLease) error

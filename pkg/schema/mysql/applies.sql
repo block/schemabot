@@ -22,6 +22,7 @@ CREATE TABLE `applies` (
   `lease_acquired_at` datetime DEFAULT NULL,
   `started_at` datetime DEFAULT NULL,
   `completed_at` datetime DEFAULT NULL,
+  `revert_skipped_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),

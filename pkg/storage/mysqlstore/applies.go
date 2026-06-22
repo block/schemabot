@@ -26,13 +26,13 @@ const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, dat
 	repository, pull_request, environment, deployment, caller, installation_id, external_id, engine,
 	state, error_message, options, attempt,
 	lease_owner, lease_token, lease_acquired_at,
-	created_at, started_at, completed_at, updated_at`
+	created_at, started_at, completed_at, updated_at, revert_skipped_at`
 
 const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_id, a.database_name, a.database_type,
 	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.engine,
 	a.state, a.error_message, a.options, a.attempt,
 	a.lease_owner, a.lease_token, a.lease_acquired_at,
-	a.created_at, a.started_at, a.completed_at, a.updated_at`
+	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at`
 
 const (
 	// maxRecoveryAttempts is the retry budget for failed_retryable applies. The
@@ -1560,6 +1560,24 @@ func failPendingStartControlRequestTx(ctx context.Context, tx *sql.Tx, applyID i
 // If not called for > 1 minute, another driver can claim the apply via FindNextApply.
 // When ctx has an apply lease, a stale token returns ErrApplyLeaseLost so the
 // old operator owner stops before writing state or external side effects.
+// SetRevertSkipped records when skip-revert was dispatched for an apply. It is a
+// targeted update of revert_skipped_at only — it touches no other apply fields
+// and is not lease-guarded — so both the control-plane skip-revert handler (no
+// lease) and the data-plane finalizer can set this visibility flag.
+//
+// updated_at is pinned to its current value so this write does not trip the
+// column's ON UPDATE CURRENT_TIMESTAMP. updated_at is the apply's lease
+// heartbeat (the staleness gate in FindNextApply); bumping it here would renew
+// the heartbeat from a non-lease caller and could delay another driver's
+// recovery claim.
+func (s *applyStore) SetRevertSkipped(ctx context.Context, applyID int64, at time.Time) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE applies SET revert_skipped_at = ?, updated_at = updated_at WHERE id = ?`, at, applyID); err != nil {
+		return fmt.Errorf("set revert_skipped_at for apply %d: %w", applyID, err)
+	}
+	return nil
+}
+
 func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 	// A drive that holds only an operation lease must never bump the parent
 	// applies row: under fan-out the parent's liveness is owned by the parent
@@ -1862,7 +1880,7 @@ func scanApplies(rows *sql.Rows) ([]*storage.Apply, error) {
 // scanApplyInto scans apply data from any scanner (Row or Rows).
 func scanApplyInto(s scanner) (*storage.Apply, error) {
 	var apply storage.Apply
-	var leaseAcquiredAt, startedAt, completedAt sql.NullTime
+	var leaseAcquiredAt, startedAt, completedAt, revertSkippedAt sql.NullTime
 	var options []byte
 
 	err := s.Scan(
@@ -1872,7 +1890,7 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &apply.Engine,
 		&apply.State, &apply.ErrorMessage, &options, &apply.Attempt,
 		&apply.LeaseOwner, &apply.LeaseToken, &leaseAcquiredAt,
-		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt,
+		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt, &revertSkippedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -1889,6 +1907,9 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 	}
 	if completedAt.Valid {
 		apply.CompletedAt = &completedAt.Time
+	}
+	if revertSkippedAt.Valid {
+		apply.RevertSkippedAt = &revertSkippedAt.Time
 	}
 
 	return &apply, nil

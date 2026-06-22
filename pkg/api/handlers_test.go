@@ -4417,3 +4417,16 @@ func TestRollbackSchemaFilesRejectsPlanWithoutCapturedOriginalFiles(t *testing.T
 	assert.Nil(t, schemaFiles)
 	assert.Contains(t, err.Error(), `no original schema files available for rollback namespace "shop"`)
 }
+
+// setRevertSkippedMetadata surfaces the skip-revert flag from the apply's stored
+// revert_skipped_at, so progress consumers show that revert was skipped — read
+// from apply state, not an engine-specific side table.
+func TestSetRevertSkippedMetadata(t *testing.T) {
+	resp := &apitypes.ProgressResponse{}
+	setRevertSkippedMetadata(resp, &storage.Apply{})
+	assert.NotContains(t, resp.Metadata, "revert_skipped", "no flag before skip-revert is dispatched")
+
+	now := time.Now()
+	setRevertSkippedMetadata(resp, &storage.Apply{RevertSkippedAt: &now})
+	assert.Equal(t, "true", resp.Metadata["revert_skipped"], "flag set once revert_skipped_at is present")
+}
