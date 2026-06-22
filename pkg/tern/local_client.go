@@ -1237,8 +1237,14 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 // request's authoritative DDL changes and schema files so a non-primary
 // deployment applies exactly what the primary deployment planned.
 func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *ternv1.ApplyRequest) (*storage.Plan, error) {
-	schemaFiles := protoToSchemaFiles(req.SchemaFiles)
-	namespaces := namespacesFromApplyRequest(req.DdlChanges, schemaFiles, c.config.Database)
+	schemaFiles, err := c.normalizeSchemaFiles(protoToSchemaFiles(req.SchemaFiles))
+	if err != nil {
+		return nil, fmt.Errorf("materialize plan %s: normalize schema files: %w", req.PlanId, err)
+	}
+	namespaces, err := c.namespacesFromApplyRequest(req.DdlChanges, schemaFiles)
+	if err != nil {
+		return nil, fmt.Errorf("materialize plan %s: %w", req.PlanId, err)
+	}
 	if len(namespaces) == 0 {
 		return nil, fmt.Errorf("materialize plan %s: apply request carried no DDL changes or schema files", req.PlanId)
 	}
@@ -1279,15 +1285,21 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 }
 
 // namespacesFromApplyRequest rebuilds per-namespace plan data from a dispatch
-// request. Table changes are grouped by namespace; vschema changes are omitted
-// because the apply path re-derives the vschema task from the namespace's
-// vschema.json artifact, which is recovered from the declarative schema files.
-func namespacesFromApplyRequest(changes []*ternv1.TableChange, schemaFiles schema.SchemaFiles, fallbackNamespace string) map[string]*storage.NamespacePlanData {
+// request so a deployment that did not plan locally applies exactly what the
+// primary deployment planned. Table changes are grouped by namespace (resolved
+// through planNamespace so the empty and MySQL "default" namespaces map to the
+// database, consistent with plan-time), and each operation is recovered from the
+// authoritative DDL. A vschema change is not a table change — it is applied from
+// the namespace's vschema.json artifact — so the artifact is attached only to
+// namespaces whose request carries an explicit vschema change, mirroring
+// plan-time behavior (the artifact is stored only when the plan detected a
+// change). Attaching it unconditionally would create spurious vschema_update
+// tasks on DDL-only plans, since Vitess always ships a vschema.json schema file.
+func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, schemaFiles schema.SchemaFiles) (map[string]*storage.NamespacePlanData, error) {
 	namespaces := map[string]*storage.NamespacePlanData{}
+	vschemaChangedNamespaces := map[string]bool{}
 	ensure := func(ns string) *storage.NamespacePlanData {
-		if ns == "" {
-			ns = fallbackNamespace
-		}
+		ns = c.planNamespace(ns)
 		if namespaces[ns] == nil {
 			namespaces[ns] = &storage.NamespacePlanData{}
 		}
@@ -1299,31 +1311,59 @@ func namespacesFromApplyRequest(changes []*ternv1.TableChange, schemaFiles schem
 			continue
 		}
 		if ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
+			ensure(ch.Namespace)
+			vschemaChangedNamespaces[c.planNamespace(ch.Namespace)] = true
 			continue
+		}
+		op, err := materializedTableChangeOperation(ch)
+		if err != nil {
+			return nil, err
 		}
 		nsData := ensure(ch.Namespace)
 		nsData.Tables = append(nsData.Tables, storage.TableChange{
 			Namespace: ch.Namespace,
 			Table:     ch.TableName,
 			DDL:       ch.Ddl,
-			Operation: protoChangeTypeToDDLAction(ch.ChangeType),
+			Operation: op,
 		})
 	}
 
-	for ns, nsFiles := range schemaFiles {
-		if nsFiles == nil {
-			continue
+	for ns := range vschemaChangedNamespaces {
+		nsFiles := schemaFiles[ns]
+		vs := ""
+		if nsFiles != nil {
+			vs = nsFiles.Files[vSchemaArtifactName]
 		}
-		if vs, ok := nsFiles.Files[vSchemaArtifactName]; ok && vs != "" {
-			nsData := ensure(ns)
-			if nsData.Artifacts == nil {
-				nsData.Artifacts = map[string]string{}
-			}
-			nsData.Artifacts[vSchemaArtifactName] = vs
+		if vs == "" {
+			return nil, fmt.Errorf("apply request indicates a vschema change for namespace %q but carries no %s artifact", ns, vSchemaArtifactName)
 		}
+		nsData := namespaces[ns]
+		if nsData.Artifacts == nil {
+			nsData.Artifacts = map[string]string{}
+		}
+		nsData.Artifacts[vSchemaArtifactName] = vs
 	}
 
-	return namespaces
+	return namespaces, nil
+}
+
+// materializedTableChangeOperation recovers the storage operation for a
+// materialized table change. The proto change type is authoritative when it maps
+// to a known DDL action; otherwise the operation is classified from the request's
+// authoritative DDL so an unmapped change type does not persist an "unknown"
+// action that would resume as a no-op.
+func materializedTableChangeOperation(ch *ternv1.TableChange) (string, error) {
+	if op := protoChangeTypeToDDLAction(ch.ChangeType); op != "unknown" {
+		return op, nil
+	}
+	if strings.TrimSpace(ch.Ddl) == "" {
+		return "", fmt.Errorf("table change for %q has an unrecognized change type and no DDL to classify", ch.TableName)
+	}
+	op, _, err := ddl.ClassifyStatementOp(ch.Ddl)
+	if err != nil {
+		return "", fmt.Errorf("classify DDL for table %q: %w", ch.TableName, err)
+	}
+	return op, nil
 }
 
 // Apply executes a previously generated plan.

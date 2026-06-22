@@ -145,8 +145,10 @@ func TestPlanForApplyRequest_DuplicateCreateReloads(t *testing.T) {
 
 // namespacesFromApplyRequest groups DDL by namespace, falls back to the client
 // database for unnamespaced changes, drops vschema table changes (re-derived at
-// apply time), and recovers the vschema artifact from the schema files.
+// apply time), and recovers the vschema artifact from the schema files only for
+// namespaces with an explicit vschema change.
 func TestNamespacesFromApplyRequest(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
 	changes := []*ternv1.TableChange{
 		{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "shop"},
 		{TableName: "orders", Ddl: "CREATE TABLE `orders` (`id` bigint)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE, Namespace: ""},
@@ -156,10 +158,11 @@ func TestNamespacesFromApplyRequest(t *testing.T) {
 		"shop": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
 	}
 
-	got := namespacesFromApplyRequest(changes, schemaFiles, "fallbackdb")
+	got, err := c.namespacesFromApplyRequest(changes, schemaFiles)
+	require.NoError(t, err)
 
 	require.Contains(t, got, "shop")
-	require.Contains(t, got, "fallbackdb")
+	require.Contains(t, got, "testapp")
 
 	shop := got["shop"]
 	require.Len(t, shop.Tables, 1, "vschema change must not become a table change")
@@ -167,8 +170,74 @@ func TestNamespacesFromApplyRequest(t *testing.T) {
 	assert.Equal(t, "alter", shop.Tables[0].Operation)
 	assert.Equal(t, `{"sharded":true}`, shop.Artifacts[vSchemaArtifactName])
 
-	fallback := got["fallbackdb"]
+	fallback := got["testapp"]
 	require.Len(t, fallback.Tables, 1)
 	assert.Equal(t, "orders", fallback.Tables[0].Table)
 	assert.Equal(t, "create", fallback.Tables[0].Operation)
+}
+
+// A DDL-only request whose schema files still carry vschema.json (the common
+// Vitess case) must not attach the vschema artifact, so Apply() does not create
+// a spurious vschema_update task.
+func TestNamespacesFromApplyRequest_DDLOnlyOmitsVSchemaArtifact(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	changes := []*ternv1.TableChange{
+		{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "shop"},
+	}
+	schemaFiles := schema.SchemaFiles{
+		"shop": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+	}
+
+	got, err := c.namespacesFromApplyRequest(changes, schemaFiles)
+	require.NoError(t, err)
+
+	require.Contains(t, got, "shop")
+	assert.Empty(t, got["shop"].Artifacts[vSchemaArtifactName], "DDL-only request must not materialize a vschema artifact")
+}
+
+// A vschema change with no vschema.json artifact in the schema files fails
+// closed rather than silently dropping the vschema update.
+func TestNamespacesFromApplyRequest_VSchemaChangeWithoutArtifactFailsClosed(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	changes := []*ternv1.TableChange{
+		{TableName: "VSchema: shop", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, Namespace: "shop"},
+	}
+
+	_, err := c.namespacesFromApplyRequest(changes, schema.SchemaFiles{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "vschema change")
+}
+
+// MySQL treats the literal "default" namespace as the database namespace, so a
+// change carrying Namespace="default" is grouped under the database, consistent
+// with planNamespace at plan time.
+func TestNamespacesFromApplyRequest_DefaultNamespaceMapsToDatabase(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	changes := []*ternv1.TableChange{
+		{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "default"},
+	}
+
+	got, err := c.namespacesFromApplyRequest(changes, schema.SchemaFiles{})
+	require.NoError(t, err)
+
+	require.Contains(t, got, "testapp")
+	assert.NotContains(t, got, "default")
+	require.Len(t, got["testapp"].Tables, 1)
+	assert.Equal(t, "users", got["testapp"].Tables[0].Table)
+}
+
+// An unmapped change type recovers a real operation from the request's
+// authoritative DDL instead of persisting "unknown".
+func TestNamespacesFromApplyRequest_UnmappedChangeTypeClassifiesDDL(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	changes := []*ternv1.TableChange{
+		{TableName: "orders", Ddl: "CREATE TABLE `orders` (`id` bigint)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_OTHER, Namespace: ""},
+	}
+
+	got, err := c.namespacesFromApplyRequest(changes, schema.SchemaFiles{})
+	require.NoError(t, err)
+
+	require.Contains(t, got, "testapp")
+	require.Len(t, got["testapp"].Tables, 1)
+	assert.Equal(t, "create", got["testapp"].Tables[0].Operation)
 }
