@@ -1656,16 +1656,208 @@ func TestGRPCClient_ResumeApplyOperationFailureRecordsTasksOnlyForMultiOpApply(t
 	assert.Empty(t, applyStore.updates, "a multi-op failure must not write the parent applies row directly")
 }
 
-// The remote (gRPC) transport does not park an operation at the cutover barrier,
-// so there is no parked checkpoint for a cutover drive to resume. The operator
-// must fail closed on the sentinel rather than silently dropping the claim.
-func TestGRPCClient_ResumeApplyOperationCutoverFailsClosedUnsupported(t *testing.T) {
-	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
+// newCutoverDriveApply returns a multi-deployment parent apply for the remote
+// ordered-cutover drive tests.
+func newCutoverDriveApply() *storage.Apply {
+	return &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-oc",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+}
+
+// buildCutoverDriveStorage wires the storage a remote ordered-cutover drive
+// needs: a multi-operation apply whose claimed operation carries the given state
+// and remote apply id, plus an untouched parked sibling.
+func buildCutoverDriveStorage(apply *storage.Apply, operationID, siblingID int64, opState, opRemoteID string) (*mockStorage, *mockApplyStore, *mockApplyOperationStore, *storage.Task) {
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		Namespace:        "default",
+		State:            state.Task.Running,
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: opState, EngineResumeContext: opRemoteID},
+		siblingID:   {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.WaitingForCutover, EngineResumeContext: "remote-east"},
+	}}
+	// Keep the stored parent row a distinct copy so mutating the in-memory apply
+	// during the drive does not leak a terminal state into stored reads.
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	st := &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: &testControlRequestStore{},
+		operations:      operationStore,
+	}
+	return st, applyStore, operationStore, task
+}
+
+// A barrier-parked multi-deployment operation claimed for ordered cutover forces
+// the swap against the operation's own remote apply id and polls it to terminal
+// while the sibling stays parked. The parent applies row is never written — the
+// operator projection CAS owns parent state.
+func TestGRPCClient_ResumeApplyOperationCutoverDrivesParkedOperation(t *testing.T) {
+	server := &capturingTernServer{
+		cutoverAccepted: true,
+		progressStates:  []ternv1.State{ternv1.State_STATE_WAITING_FOR_CUTOVER, ternv1.State_STATE_COMPLETED},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
 
-	err := client.ResumeApplyOperationCutover(t.Context(), &storage.Apply{ApplyIdentifier: "apply-x"}, 7)
-	require.ErrorIs(t, err, ErrOperationCutoverUnsupportedRemote)
-	assert.Contains(t, err.Error(), "apply-x")
+	apply := newCutoverDriveApply()
+	operationID, siblingID := int64(42), int64(43)
+	st, applyStore, operationStore, task := buildCutoverDriveStorage(apply, operationID, siblingID, state.ApplyOperation.WaitingForCutover, "remote-op-west")
+	client.storage = st
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperationCutover(ctx, apply, operationID))
+
+	assert.Equal(t, "remote-op-west", server.getCutoverApplyID(), "cutover must target the operation's own remote apply id")
+	assert.Equal(t, "remote-op-west", server.getProgressApplyID(), "progress must poll the operation's own remote apply id")
+	assert.Nil(t, server.getApplyRequest(), "a cutover drive must not dispatch a new remote apply")
+	assert.Empty(t, applyStore.updates, "a multi-op cutover drive must not write the parent applies row")
+	assert.True(t, state.IsState(task.State, state.Task.Completed),
+		"the operation's task should reach completed; got %q", task.State)
+	assert.Equal(t, "remote-east", operationStore.ops[siblingID].EngineResumeContext, "the sibling must be untouched")
+}
+
+// A stale-lease recovery whose remote already left the barrier must not re-issue
+// Cutover; it polls the existing swap to terminal.
+func TestGRPCClient_ResumeApplyOperationCutoverDoesNotResendWhenAlreadyCuttingOver(t *testing.T) {
+	server := &capturingTernServer{
+		cutoverAccepted: true,
+		progressStates:  []ternv1.State{ternv1.State_STATE_CUTTING_OVER, ternv1.State_STATE_COMPLETED},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := newCutoverDriveApply()
+	operationID, siblingID := int64(42), int64(43)
+	st, applyStore, _, _ := buildCutoverDriveStorage(apply, operationID, siblingID, state.ApplyOperation.CuttingOver, "remote-op-west")
+	client.storage = st
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperationCutover(ctx, apply, operationID))
+
+	assert.Empty(t, server.getCutoverApplyID(), "an in-flight cutover must not be re-sent")
+	assert.Equal(t, "remote-op-west", server.getProgressApplyID(), "progress must poll the operation's own remote apply id")
+	assert.Empty(t, applyStore.updates, "a multi-op cutover drive must not write the parent applies row")
+}
+
+// The remote already being terminal on preflight reconciles from that poll
+// without sending Cutover, and never writes the parent row.
+func TestGRPCClient_ResumeApplyOperationCutoverReconcilesAlreadyTerminalRemote(t *testing.T) {
+	server := &capturingTernServer{
+		progressStates: []ternv1.State{ternv1.State_STATE_COMPLETED},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := newCutoverDriveApply()
+	operationID, siblingID := int64(42), int64(43)
+	st, applyStore, _, task := buildCutoverDriveStorage(apply, operationID, siblingID, state.ApplyOperation.CuttingOver, "remote-op-west")
+	client.storage = st
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperationCutover(ctx, apply, operationID))
+
+	assert.Empty(t, server.getCutoverApplyID(), "a terminal remote must not be cut over again")
+	assert.Empty(t, applyStore.updates, "a multi-op cutover drive must not write the parent applies row")
+	assert.True(t, state.IsState(task.State, state.Task.Completed),
+		"the operation's task should reconcile to completed; got %q", task.State)
+}
+
+// The cutover drive targets the operation's own remote apply id only; an empty
+// per-operation remote id fails closed rather than falling back to the parent
+// apply external id.
+func TestGRPCClient_ResumeApplyOperationCutoverFailsClosedOnMissingRemoteID(t *testing.T) {
+	server := &capturingTernServer{cutoverAccepted: true}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := newCutoverDriveApply()
+	apply.ExternalID = "parent-remote"
+	operationID, siblingID := int64(42), int64(43)
+	st, applyStore, _, _ := buildCutoverDriveStorage(apply, operationID, siblingID, state.ApplyOperation.WaitingForCutover, "")
+	client.storage = st
+
+	err := client.ResumeApplyOperationCutover(t.Context(), apply, operationID)
+	require.Error(t, err)
+	assert.Empty(t, server.getCutoverApplyID(), "no cutover may be sent without a per-operation remote id")
+	assert.Empty(t, applyStore.updates, "a failed precondition must not write the parent applies row")
+}
+
+// A claim that resolves to no tasks is an invalid or stale claim and must fail
+// closed without touching the remote or the parent apply.
+func TestGRPCClient_ResumeApplyOperationCutoverFailsClosedOnNoTasks(t *testing.T) {
+	server := &capturingTernServer{cutoverAccepted: true}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := newCutoverDriveApply()
+	operationID, siblingID := int64(42), int64(43)
+	st, applyStore, _, _ := buildCutoverDriveStorage(apply, operationID, siblingID, state.ApplyOperation.WaitingForCutover, "remote-op-west")
+	st.tasks = &mockTaskStore{tasks: nil}
+	client.storage = st
+
+	err := client.ResumeApplyOperationCutover(t.Context(), apply, operationID)
+	require.ErrorIs(t, err, ErrNoTasksForApplyOperation)
+	assert.Empty(t, server.getCutoverApplyID(), "no cutover may be sent for an empty claim")
+	assert.Empty(t, applyStore.updates, "an empty claim must not write the parent applies row")
+}
+
+// An operation that is not in a cutover phase (e.g. still copying) must never be
+// forced through the high-risk swap.
+func TestGRPCClient_ResumeApplyOperationCutoverFailsClosedOnNonCutoverState(t *testing.T) {
+	server := &capturingTernServer{cutoverAccepted: true}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := newCutoverDriveApply()
+	operationID, siblingID := int64(42), int64(43)
+	st, applyStore, _, _ := buildCutoverDriveStorage(apply, operationID, siblingID, state.ApplyOperation.Running, "remote-op-west")
+	client.storage = st
+
+	err := client.ResumeApplyOperationCutover(t.Context(), apply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), state.ApplyOperation.Running)
+	assert.Empty(t, server.getCutoverApplyID(), "a copy-phase operation must not be cut over")
+	assert.Empty(t, applyStore.updates, "a rejected claim must not write the parent applies row")
+}
+
+// A remote that rejects the cutover surfaces an error without writing the parent
+// row.
+func TestGRPCClient_ResumeApplyOperationCutoverFailsClosedOnRejectedCutover(t *testing.T) {
+	server := &capturingTernServer{
+		cutoverAccepted: false,
+		cutoverMessage:  "engine busy",
+		progressStates:  []ternv1.State{ternv1.State_STATE_WAITING_FOR_CUTOVER},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := newCutoverDriveApply()
+	operationID, siblingID := int64(42), int64(43)
+	st, applyStore, _, _ := buildCutoverDriveStorage(apply, operationID, siblingID, state.ApplyOperation.WaitingForCutover, "remote-op-west")
+	client.storage = st
+
+	err := client.ResumeApplyOperationCutover(t.Context(), apply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "engine busy")
+	assert.Equal(t, "remote-op-west", server.getCutoverApplyID(), "the cutover was attempted against the operation remote id")
+	assert.Empty(t, applyStore.updates, "a rejected cutover must not write the parent applies row")
 }
 
 func TestGRPCClient_ResumeApplyOperationRejectsMissingOperationID(t *testing.T) {

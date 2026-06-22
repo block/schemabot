@@ -18,14 +18,6 @@ import (
 // callers can match it with errors.Is regardless of the transport.
 var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
 
-// ErrOperationCutoverUnsupportedRemote is returned by
-// GRPCClient.ResumeApplyOperationCutover. The remote (gRPC) drive does not yet
-// park an operation at the cutover barrier, so there is no parked checkpoint for
-// it to resume and drive through cutover; the remote park/drive is a deliberate
-// follow-up. Returning a sentinel keeps the operator fail-closed for the remote
-// transport rather than silently dropping the claim.
-var ErrOperationCutoverUnsupportedRemote = errors.New("operation cutover drive is not supported for remote (gRPC) applies")
-
 // ErrApplyOperationRowMissing is returned by ResumeApplyOperation when tasks
 // scope to the operation but the apply_operation row itself is absent. It is a
 // distinct, more accurate cause than the no-tasks case, but wraps
