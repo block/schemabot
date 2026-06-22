@@ -124,8 +124,13 @@ type ServerConfig struct {
 	// apply-scoped drive; the operation-level path is the foundation for
 	// multi-deployment applies.
 	// Defaults to true when not configured (nil = operation-level claiming); set
-	// it to false to fall back to apply-level claiming. Read via
-	// ShouldClaimOperations.
+	// it to false to claim at the apply level. Read via ShouldClaimOperations.
+	//
+	// Operator note: a deployment that never sets this key claims at the
+	// operation level. This is behavior-preserving while every apply owns one
+	// operation. A data-plane gRPC tern is the exception: it drives applies
+	// inline via LocalClient and does not own the apply_operations lifecycle, so
+	// when this key is unset it defaults to apply-level claiming at startup.
 	OperatorClaimOperations *bool `yaml:"operator_claim_operations,omitempty"`
 
 	// RequirePassingChecks blocks apply when non-SchemaBot PR checks are not
@@ -1579,10 +1584,11 @@ func (c *ServerConfig) ShouldRequirePassingChecks() bool {
 	return *c.RequirePassingChecks
 }
 
-// ShouldClaimOperations returns whether operator drivers claim work at the
-// apply_operations (per-deployment) level via FindNextApplyOperation. Defaults
-// to true when not configured; set operator_claim_operations to false to fall
-// back to apply-level claiming via FindNextApply.
+// ShouldClaimOperations returns true when operator drivers should claim work at
+// the apply_operations (per-deployment) level via FindNextApplyOperation, and
+// false when they should claim at the apply level via FindNextApply. Defaults to
+// true when not configured; set operator_claim_operations to false to claim at
+// the apply level.
 func (c *ServerConfig) ShouldClaimOperations() bool {
 	if c == nil || c.OperatorClaimOperations == nil {
 		return true
