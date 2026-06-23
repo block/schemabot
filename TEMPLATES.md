@@ -1696,7 +1696,7 @@ Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
 
 To stop this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6
+schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -1778,7 +1778,7 @@ Rows: 156,342 / 397,453
 
 Paused — to resume from where it stopped:
 ```
-schemabot start apply-a1b2c3d4e5f6
+schemabot start apply-a1b2c3d4e5f6 -e staging
 ```
 
 </details>
@@ -1820,7 +1820,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 To stop this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6
+schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -1865,7 +1865,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 To stop this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6
+schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -1910,7 +1910,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 To stop this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6
+schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -1956,7 +1956,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 To stop this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6
+schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -2001,7 +2001,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 To stop this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6
+schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -2163,7 +2163,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 Paused — to resume from where it stopped:
 ```
-schemabot start apply-a1b2c3d4e5f6
+schemabot start apply-a1b2c3d4e5f6 -e staging
 ```
 
 </details>
@@ -2269,7 +2269,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 To proceed with cutover:
 ```
-schemabot cutover apply-a1b2c3d4e5f6
+schemabot cutover apply-a1b2c3d4e5f6 -e staging
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -2483,7 +2483,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 Paused — to resume from where it stopped:
 ```
-schemabot start apply-a1b2c3d4e5f6
+schemabot start apply-a1b2c3d4e5f6 -e staging
 ```
 
 </details>
@@ -4707,7 +4707,7 @@ schemabot apply -e staging
 
 To cut over `eu`:
 ```
-schemabot cutover apply-a1b2c3d4e5f6
+schemabot cutover apply-a1b2c3d4e5f6 -e production
 ```
 
 - 🟢 eu — ready for cutover — next in order
@@ -4753,7 +4753,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 To proceed with cutover:
 ```
-schemabot cutover apply-a1b2c3d4e5f6
+schemabot cutover apply-a1b2c3d4e5f6 -e production
 ```
 
 </details>
@@ -4795,7 +4795,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 To stop this schema change:
 ```
-schemabot stop apply-a1b2c3d4e5f6
+schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
 </details>

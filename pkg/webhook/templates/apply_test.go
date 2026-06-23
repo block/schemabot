@@ -193,7 +193,7 @@ func TestRenderApplyStatusComment_ValidatingDeployRequest(t *testing.T) {
 	assert.Contains(t, result, "## Schema Change — Validating Deploy Request")
 	assert.NotContains(t, result, "## Schema Change In Progress")
 	assert.Contains(t, result, "To stop this schema change:")
-	assert.Contains(t, result, "schemabot stop apply-7aa13cf03496454b")
+	assert.Contains(t, result, "schemabot stop apply-7aa13cf03496454b -e staging")
 }
 
 func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
@@ -394,7 +394,7 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	// Footer explains automatic retry — including the failure outcome when
 	// retries are exhausted — and offers stop, not a manual re-apply.
 	assert.Contains(t, result, "SchemaBot retries automatically and marks it failed if retries are exhausted")
-	assert.Contains(t, result, "schemabot stop apply-abc123")
+	assert.Contains(t, result, "schemabot stop apply-abc123 -e staging")
 	assert.NotContains(t, result, "transient")
 	assert.NotContains(t, result, "schemabot apply -e staging")
 }
@@ -1184,7 +1184,7 @@ func TestRenderApplyStatusComment_WaitingForCutover_ReadyNotReady(t *testing.T) 
 	assert.Contains(t, result, "Waiting for cutover")
 
 	// Footer has cutover command
-	assert.Contains(t, result, "schemabot cutover apply-abc123")
+	assert.Contains(t, result, "schemabot cutover apply-abc123 -e staging")
 }
 
 func TestRenderApplyStatusComment_WaitingForCutover_AllReady(t *testing.T) {
@@ -1220,6 +1220,6 @@ func TestRenderApplyStatusComment_RevertWindow(t *testing.T) {
 
 	assert.Contains(t, result, "Pending Revert")
 	assert.Contains(t, result, "Complete (pending revert)")
-	assert.Contains(t, result, "schemabot revert apply-abc123")
-	assert.Contains(t, result, "schemabot skip-revert apply-abc123")
+	assert.Contains(t, result, "schemabot revert apply-abc123 -e staging")
+	assert.Contains(t, result, "schemabot skip-revert apply-abc123 -e staging")
 }

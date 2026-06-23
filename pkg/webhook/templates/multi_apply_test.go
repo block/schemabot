@@ -52,7 +52,7 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	// aggregate is still running. The command is the executable apply-ID form the
 	// CLI accepts today (no --deployment flag yet).
 	assert.Contains(t, out, "To cut over `eu`:")
-	assert.Contains(t, out, "schemabot cutover apply-123")
+	assert.Contains(t, out, "schemabot cutover apply-123 -e production")
 	assert.NotContains(t, out, "--deployment")
 
 	// Per-deployment summary lines, in resolved order, with derived labels.
