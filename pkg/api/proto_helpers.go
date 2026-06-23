@@ -234,12 +234,16 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 		if shard == nil {
 			return nil, fmt.Errorf("shard plan %d is null", i)
 		}
+		shardName := strings.TrimSpace(shard.Shard)
+		if shardName == "" {
+			return nil, fmt.Errorf("shard plan %d has empty shard", i)
+		}
 		namespace := shard.Namespace
 		if namespace == "" {
 			namespace = "default"
 		}
 		out = append(out, storage.ShardPlan{
-			Shard:       shard.Shard,
+			Shard:       shardName,
 			Namespace:   namespace,
 			NeedsChange: shard.NeedsChange,
 		})

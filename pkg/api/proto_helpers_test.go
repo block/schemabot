@@ -178,6 +178,13 @@ func TestProtoShardPlansToStorageRejectsNilShardPlan(t *testing.T) {
 	assert.Contains(t, err.Error(), "shard plan 0 is null")
 }
 
+func TestProtoShardPlansToStorageRejectsEmptyShard(t *testing.T) {
+	_, err := protoShardPlansToStorage([]*ternv1.ShardPlan{{Namespace: "commerce", Shard: "  "}})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "shard plan 0 has empty shard")
+}
+
 // schema_files with a null namespace value is rejected as a hard validation
 // error so the request gets a clear 4xx instead of reaching the converter.
 func TestValidateSchemaFiles_NullNamespaceRejected(t *testing.T) {

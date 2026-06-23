@@ -295,8 +295,10 @@ type Plan struct {
 	Namespaces map[string]*NamespacePlanData
 
 	// Shards is the flattened per-shard membership and drift captured at plan
-	// time. It is also stored under Namespaces so old plan_data rows without
-	// shard metadata still decode cleanly.
+	// time. PlanStore stores this under Namespaces so plan_data remains
+	// namespace-keyed; the flattened field is the convenient read/write API.
+	// Because shard metadata is optional, old plan_data rows without shards still
+	// decode cleanly.
 	Shards []ShardPlan
 
 	// HeadSHA is the PR HEAD SHA at the time the plan was rendered. It is the

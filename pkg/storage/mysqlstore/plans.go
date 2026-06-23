@@ -187,12 +187,18 @@ func scanPlanInto(s scanner) (*storage.Plan, error) {
 }
 
 func namespacesWithShardPlans(plan *storage.Plan) map[string]*storage.NamespacePlanData {
+	if len(plan.Namespaces) == 0 && len(plan.Shards) == 0 {
+		return plan.Namespaces
+	}
 	namespaces := make(map[string]*storage.NamespacePlanData, len(plan.Namespaces))
 	for namespace, nsData := range plan.Namespaces {
 		if nsData == nil {
 			namespaces[namespace] = nil
 			continue
 		}
+		// Plan.Shards is the authoritative flattened write path. Existing
+		// namespace-embedded shards are preserved only when the caller did not
+		// supply flattened shards, such as when re-storing an older decoded shape.
 		shards := append([]storage.ShardPlan(nil), nsData.Shards...)
 		if len(plan.Shards) > 0 {
 			shards = nil

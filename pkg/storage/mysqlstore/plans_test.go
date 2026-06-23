@@ -98,3 +98,28 @@ func TestPlanStore_LoadsPlansWithoutShardPlans(t *testing.T) {
 	require.Contains(t, got.Namespaces, "commerce")
 	assert.Empty(t, got.Namespaces["commerce"].Shards)
 }
+
+func TestPlanStore_RoundTripsNilPlanDataAsNull(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	_, err := store.Plans().Create(ctx, &storage.Plan{
+		PlanIdentifier: "plan_nil_data",
+		Database:       "commerce",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "primary",
+		Target:         "commerce-target",
+		Repository:     "org/repo",
+		PullRequest:    123,
+		SchemaPath:     "schema/commerce",
+		Environment:    "staging",
+		CreatedAt:      time.Now(),
+	})
+	require.NoError(t, err)
+
+	var planData string
+	err = testDB.QueryRowContext(ctx, "SELECT plan_data FROM plans WHERE plan_identifier = ?", "plan_nil_data").Scan(&planData)
+	require.NoError(t, err)
+	assert.Equal(t, "null", planData)
+}
