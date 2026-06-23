@@ -1234,7 +1234,9 @@ func (c *GRPCClient) ResumeApplyOperationCutover(ctx context.Context, apply *sto
 	if !poll {
 		return nil
 	}
-	return c.pollForCompletion(ctx, apply, false, scope)
+	// The cutover drive must carry the swap past the barrier to terminal, so it
+	// never releases at waiting_for_cutover.
+	return c.pollForCompletion(ctx, apply, false, scope, false)
 }
 
 // triggerRemoteOperationCutover preflights the exact remote state for an ordered
@@ -1519,7 +1521,8 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		}
 	}
 
-	return c.pollForCompletion(ctx, apply, startRequested, scope)
+	return c.pollForCompletion(ctx, apply, startRequested, scope,
+		shouldReleaseAtCutoverBarrier(apply, scope.multiOperation, scope.operation))
 }
 
 // completePendingStopBeforeRemoteStart completes an apply-level stop request
@@ -1857,7 +1860,8 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 			oldApplyState)
 	}
 
-	return c.pollForCompletion(ctx, apply, false, scope)
+	return c.pollForCompletion(ctx, apply, false, scope,
+		shouldReleaseAtCutoverBarrier(apply, scope.multiOperation, scope.operation))
 }
 
 func isAmbiguousRemoteApplyDispatchError(err error) bool {
@@ -2558,7 +2562,16 @@ func applyProgressRank(applyState string) int {
 
 // pollForCompletion polls the remote Tern for progress and updates SchemaBot's storage.
 // Also maintains heartbeat to keep the lease on the apply.
-func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply, allowStoppedAfterStart bool, scope applyTaskScope) error {
+//
+// releaseAtCutoverBarrier mirrors the LocalClient copy drive: when set, an
+// operation-scoped barrier copy drive exits the moment the remote reaches
+// waiting_for_cutover so the operator persists the parked operation row and
+// frees it for the deployment-ordered cutover claim, instead of holding the
+// lease and polling the parked remote indefinitely. It is false for the cutover
+// drive (which must drive the swap past the barrier to terminal) and for
+// single-operation / whole-apply drives (which keep waiting for a manual
+// cutover unchanged).
+func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply, allowStoppedAfterStart bool, scope applyTaskScope, releaseAtCutoverBarrier bool) error {
 	ticker := time.NewTicker(grpcProgressPollInterval)
 	defer ticker.Stop()
 
@@ -2738,6 +2751,24 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 			if persisted && oldApplyState != apply.State {
 				c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply changed state: %s -> %s", oldApplyState, apply.State), oldApplyState)
+			}
+
+			// Park-and-release at the cutover barrier, mirroring the LocalClient
+			// copy drive. The tasks were just synced to waiting_for_cutover above,
+			// so exit the drive here: the operator persists the operation row at
+			// waiting_for_cutover and frees it for the deployment-ordered cutover
+			// claim. Without this an operation-scoped barrier copy drive would
+			// hold its lease and poll the parked remote forever, so the cutover
+			// claim never sees a parked operation and the rollout stalls.
+			if releaseAtCutoverBarrier && state.IsState(apply.State, state.Apply.WaitingForCutover) {
+				slog.Info("operation parked at cutover barrier; exiting remote copy drive",
+					"apply_id", apply.ApplyIdentifier,
+					"external_id", apply.ExternalID,
+					"database", apply.Database,
+					"environment", apply.Environment,
+					"deployment", apply.Deployment,
+					"operation_state", apply.State)
+				return nil
 			}
 		}
 	}
