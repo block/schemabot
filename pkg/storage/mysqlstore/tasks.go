@@ -297,7 +297,7 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 }
 
 // GetByApplyOperationID returns the drive tasks for a single apply_operation.
-// Unsharded operations load their per-table rows (shard = ”). Sharded work
+// Unsharded operations load their per-table rows (shard = ""). Sharded work
 // operations load the row whose namespace/shard/table matches the operation key,
 // so TargetShards can be rebuilt from storage while reflected per-shard progress
 // rows for unsharded operations stay out of the drive pipeline.
