@@ -236,6 +236,11 @@ func multiDeployClearTernStorage(t *testing.T, deployments ...string) {
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 			defer cancel()
 
+			if err := db.PingContext(ctx); err != nil {
+				t.Logf("cleanup: ping tern storage db (%s): %v", d, err)
+				return
+			}
+
 			rows, err := db.QueryContext(ctx, "SHOW TABLES")
 			if err != nil {
 				t.Logf("cleanup: show tables on tern storage (%s): %v", d, err)
@@ -298,7 +303,10 @@ func multiDeployEnsureNoActiveChange(t *testing.T, database, env string, deploym
 				"environment": env,
 				"apply_id":    active.ApplyID,
 			})
+			status := resp.StatusCode
 			_ = resp.Body.Close()
+			require.Equalf(t, http.StatusOK, status,
+				"release cutover barrier for %s/%s (apply %s)", database, env, active.ApplyID)
 			time.Sleep(time.Second)
 			continue
 		}
