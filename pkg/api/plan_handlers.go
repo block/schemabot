@@ -1104,9 +1104,16 @@ func buildShardedApplyOperationGroups(
 }
 
 func validateShardOperationKeyParts(namespace, shard, table string) error {
-	for label, value := range map[string]string{"namespace": namespace, "shard": shard, "table": table} {
-		if strings.Contains(value, "/") {
-			return fmt.Errorf("operation key %s component %q contains reserved delimiter %q", label, value, "/")
+	for _, part := range []struct {
+		label string
+		value string
+	}{
+		{label: "namespace", value: namespace},
+		{label: "shard", value: shard},
+		{label: "table", value: table},
+	} {
+		if strings.Contains(part.value, "/") {
+			return fmt.Errorf("operation key %s component %q contains reserved delimiter %q", part.label, part.value, "/")
 		}
 	}
 	return nil
