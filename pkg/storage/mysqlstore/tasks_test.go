@@ -226,9 +226,9 @@ func TestTaskStore_PerShardTaskRoundTrip(t *testing.T) {
 	assert.Equal(t, "-80", got.Shard)
 	assert.Equal(t, 1, got.CutoverAttempts)
 
-	// Both shards of the same table coexist under one operation. They are read
-	// via the per-shard reader; the per-table GetByApplyOperationID excludes them
-	// so they never re-enter the per-table pipeline on reload.
+	// Both shards of the same table coexist under one operation. With no sharded
+	// operation key, GetByApplyOperationID treats them as reflected progress rows
+	// and keeps them out of the drive pipeline on reload.
 	tasks, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
 	require.Len(t, tasks, 2)
@@ -251,6 +251,57 @@ func TestTaskStore_PerShardTaskRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, reloaded.CutoverAttempts, "cutover_attempts is updatable")
 	assert.Equal(t, "-80", reloaded.Shard, "shard is fixed at creation, not changed by Update")
+}
+
+// A sharded work operation's operation key identifies which shard task is real
+// drive input. Other shard rows remain progress detail and must not be replayed
+// as extra table changes if the operation is resumed.
+func TestTaskStore_GetByApplyOperationIDIncludesMatchingShardedWorkTask(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "resolute", storage.DatabaseTypeStrata, "staging")
+	apply := createTestApply(t, store, lock, "apply_sharded_work_tasks", 1)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:       apply.ID,
+		Deployment:    "region-a",
+		OperationKey:  "commerce/-80/users",
+		OperationKind: storage.ApplyOperationKindWork,
+		Target:        "resolute",
+	})
+	require.NoError(t, err)
+
+	now := time.Now()
+	createShardTask := func(identifier, shard string) {
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier:   identifier,
+			ApplyID:          apply.ID,
+			ApplyOperationID: &opID,
+			PlanID:           apply.PlanID,
+			Database:         apply.Database,
+			DatabaseType:     apply.DatabaseType,
+			Engine:           storage.EngineStrata,
+			Environment:      apply.Environment,
+			State:            state.Task.Pending,
+			Namespace:        "commerce",
+			TableName:        "users",
+			Shard:            shard,
+			DDL:              "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			DDLAction:        "ALTER",
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		})
+		require.NoError(t, err)
+	}
+	createShardTask("task_users_-80", "-80")
+	createShardTask("task_users_80-", "80-")
+
+	tasks, err := store.Tasks().GetByApplyOperationID(ctx, opID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, "task_users_-80", tasks[0].TaskIdentifier)
+	assert.Equal(t, "-80", tasks[0].Shard)
 }
 
 // An unsharded engine (MySQL/Spirit) uses the empty-string shard sentinel, which

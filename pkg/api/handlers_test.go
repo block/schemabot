@@ -2641,8 +2641,8 @@ func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *
 			},
 		}},
 		operations: &staticApplyOperationStore{operations: []*storage.ApplyOperation{
-			{ID: opAID, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.Running, StartedAt: &startedAt},
-			{ID: opBID, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.Failed, ErrorMessage: "engine failed", StartedAt: &startedAt, CompletedAt: &completedAt},
+			{ID: opAID, ApplyID: apply.ID, Deployment: "deploy-a", OperationKind: storage.ApplyOperationKindWork, Target: "target-a", State: state.ApplyOperation.Running, StartedAt: &startedAt},
+			{ID: opBID, ApplyID: apply.ID, Deployment: "deploy-b", OperationKind: storage.ApplyOperationKindGroupFinalizer, Target: "target-b", State: state.ApplyOperation.Failed, ErrorMessage: "engine failed", StartedAt: &startedAt, CompletedAt: &completedAt},
 		}},
 	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
 
@@ -2651,10 +2651,12 @@ func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *
 	require.NoError(t, err)
 	require.Len(t, resp.Operations, 2)
 	assert.Equal(t, "deploy-a", resp.Operations[0].Deployment)
+	assert.Equal(t, storage.ApplyOperationKindWork, resp.Operations[0].OperationKind)
 	assert.Equal(t, "target-a", resp.Operations[0].Target)
 	assert.Equal(t, state.ApplyOperation.Running, resp.Operations[0].State)
 	assert.Equal(t, startedAt.Format(time.RFC3339), resp.Operations[0].StartedAt)
 	assert.Equal(t, "deploy-b", resp.Operations[1].Deployment)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, resp.Operations[1].OperationKind)
 	assert.Equal(t, apitypes.ErrCodeEngineError, resp.Operations[1].ErrorCode)
 	assert.Equal(t, "engine failed", resp.Operations[1].ErrorMessage)
 	assert.Equal(t, completedAt.Format(time.RFC3339), resp.Operations[1].CompletedAt)

@@ -216,6 +216,7 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.ProgressOperationResponse {
 	resp := &apitypes.ProgressOperationResponse{
 		Deployment:    op.Deployment,
+		OperationKind: op.OperationKind,
 		Target:        op.Target,
 		State:         op.State,
 		CutoverPolicy: op.CutoverPolicy,
