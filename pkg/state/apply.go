@@ -16,6 +16,7 @@ var Apply = struct {
 	Pending           string
 	Running           string
 	RunningDegraded   string
+	Paused            string
 	Resuming          string
 	WaitingForDeploy  string
 	WaitingForCutover string
@@ -41,6 +42,7 @@ var Apply = struct {
 	Pending:           "pending",
 	Running:           "running",
 	RunningDegraded:   "running_degraded",
+	Paused:            "paused",
 	Resuming:          "resuming",
 	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
@@ -132,20 +134,38 @@ func DeriveApplyState(taskStates []string) string {
 }
 
 // RolloutChild is one apply_operation's contribution to the parent apply's
-// rollout projection: its derived state plus whether the on_failure policy
-// captured on that operation lets the rollout continue past a terminal failure.
+// rollout projection: its derived state plus how the on_failure policy captured
+// on that operation treats a terminal failure of this child.
 //
-// ContinueOnFailure must be set by the caller using the exact-match semantics of
-// the claim predicate: only the literal on_failure value "continue" is
-// continuable; "halt", "pause", and any unrecognized value are not, so the
-// projection fails closed (a failed sibling keeps the apply failed) on anything
-// but an explicit continue.
+// The caller sets the two flags using the exact-match semantics of the claim
+// predicate, so the projection mirrors what the operator will actually do:
+//
+//   - ContinueOnFailure: the failure does not block later siblings and does not
+//     force an immediate terminal verdict. True for on_failure "continue", and
+//     for on_failure "pause" once the rollout has been released (a released
+//     pause behaves like continue for ordering).
+//   - PauseOnFailure: the failure holds the rollout for a human. True for
+//     on_failure "pause" before release.
+//
+// Both default to false, so "halt" and any unrecognized policy fail closed: a
+// failed sibling keeps the apply failed. The two flags are mutually exclusive —
+// a child is either continuable, pause-held, or fail-closed. Setting both is a
+// caller bug; the projection fails closed in that case rather than loosening
+// rollout gating.
+//
+// Children must be supplied in deployment order (the same (created_at, id) order
+// the claim predicate uses), because a pause-held failure only holds the rollout
+// when there is later, not-yet-terminal work to hold.
 type RolloutChild struct {
 	// State is the child operation's derived apply state.
 	State string
-	// ContinueOnFailure is true only when the operation's on_failure policy is
-	// exactly "continue".
+	// ContinueOnFailure is true when the operation's on_failure policy lets the
+	// rollout continue past this child's terminal failure ("continue", or a
+	// released "pause").
 	ContinueOnFailure bool
+	// PauseOnFailure is true when the operation's on_failure policy is an
+	// unreleased "pause": a terminal failure holds the rollout for a human.
+	PauseOnFailure bool
 }
 
 // DeriveRolloutApplyState projects the parent apply's state over all of its
@@ -159,15 +179,23 @@ type RolloutChild struct {
 // verdict so the remaining siblings get their turn instead of the first failure
 // terminalizing the whole apply.
 //
-// When the base projection is failed (at least one child terminally failed):
+// When the base projection is failed (at least one child terminally failed),
+// each failed child is classified by its policy flags:
 //
-//   - if any failed child is not continuable (ContinueOnFailure false), the
-//     failure stands and the apply is failed (fail closed, matching halt); else
-//   - if every child is terminal, the rollout is settled and the apply is
-//     failed (the verdict still reflects the failure); else
-//   - the apply is held running_degraded so the still-in-flight siblings can
-//     run to completion under continue while surfacing that a sibling has
-//     already failed.
+//   - halt or unrecognized (both flags false): the failure stands and the apply
+//     is failed (fail closed); this dominates every other outcome.
+//   - unreleased pause (PauseOnFailure) with later, not-yet-terminal work to
+//     hold: the apply is held paused so a human can release or stop it.
+//   - continue, or a released pause (ContinueOnFailure): the failure neither
+//     forces a terminal verdict nor holds the rollout.
+//
+// After classifying every child, in precedence order:
+//
+//   - any fail-closed child → failed;
+//   - else any pause-held child → paused;
+//   - else if every child is terminal → failed (the verdict still reflects the
+//     failure once the continue/released rollout has settled);
+//   - else → running_degraded (continue/released siblings still in flight).
 //
 // An empty child set returns Pending, matching DeriveApplyState.
 func DeriveRolloutApplyState(children []RolloutChild) string {
@@ -185,18 +213,59 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 	}
 
 	allTerminal := true
-	for _, c := range children {
-		if IsState(c.State, Apply.Failed) && !c.ContinueOnFailure {
-			return Apply.Failed
-		}
+	hardFail := false
+	pausedHold := false
+	for i, c := range children {
 		if !IsTerminalApplyState(c.State) {
 			allTerminal = false
 		}
+		if !IsState(c.State, Apply.Failed) {
+			continue
+		}
+		switch {
+		case c.ContinueOnFailure && c.PauseOnFailure:
+			// Invalid: the flags are mutually exclusive. Fail closed rather than
+			// let a caller bug loosen rollout gating by silently winning the
+			// continue branch below.
+			hardFail = true
+		case c.ContinueOnFailure:
+			// continue, or a released pause: does not force a terminal verdict
+			// and does not hold the rollout.
+		case c.PauseOnFailure && hasLaterNonTerminal(children, i):
+			// unreleased pause with later work still to run: hold for a human.
+			pausedHold = true
+		case c.PauseOnFailure:
+			// unreleased pause with nothing later to hold: the rollout is
+			// effectively settled, so let the terminal/degraded checks below
+			// decide rather than forcing failed here.
+		default:
+			// halt or any unrecognized policy: fail closed.
+			hardFail = true
+		}
+	}
+	if hardFail {
+		return Apply.Failed
+	}
+	if pausedHold {
+		return Apply.Paused
 	}
 	if allTerminal {
 		return Apply.Failed
 	}
 	return Apply.RunningDegraded
+}
+
+// hasLaterNonTerminal reports whether any child after failedIndex (in
+// deployment order) is not yet in a terminal apply state. A pause-held failure
+// only holds the rollout when there is such later work for the operator to
+// release or stop.
+func hasLaterNonTerminal(children []RolloutChild, failedIndex int) bool {
+	for later := failedIndex + 1; later < len(children); later++ {
+		if !IsTerminalApplyState(children[later].State) {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeApplyState converts a task state string to its canonical lowercase form.
@@ -208,6 +277,8 @@ func normalizeApplyState(raw string) string {
 		return Apply.Running
 	case "RUNNING_DEGRADED":
 		return Apply.RunningDegraded
+	case "PAUSED":
+		return Apply.Paused
 	case "WAITING_FOR_DEPLOY":
 		return Apply.WaitingForDeploy
 	case "WAITING_FOR_CUTOVER":
