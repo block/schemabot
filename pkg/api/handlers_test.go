@@ -2457,6 +2457,50 @@ func TestProgressByApplyIDMultiOperationServedFromStorage(t *testing.T) {
 	assert.Equal(t, "engine failed", resp.Operations[1].ErrorMessage)
 }
 
+func TestProgressByApplyIDMultiOperationFallsBackToSingleDeploymentOnStorageError(t *testing.T) {
+	// A multi-operation apply is normally served from storage, but if the
+	// storage read fails the handler must fall back to the single-deployment
+	// path rather than fail the request: every apply created today has one
+	// operation, so this only degrades the dormant multi-op case.
+	mock := &mockTernClient{
+		isRemote:     true,
+		progressResp: &ternv1.ProgressResponse{State: ternv1.State_STATE_RUNNING},
+	}
+	apply := activeTestApply("apply-multi-ops-fallback")
+	apply.ExternalID = "remote-multi-ops-fallback"
+	operations := &staticApplyOperationStore{operations: []*storage.ApplyOperation{
+		{ID: 1, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.Running},
+		{ID: 2, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.Running},
+	}}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		tasks:      &capturingTaskStore{err: errors.New("tasks store unavailable")},
+		controls:   &memoryControlRequestStore{},
+		operations: operations,
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": mock,
+	}, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-multi-ops-fallback", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, mock.progressReq, "storage-error fallback must reach the single-deployment proto Progress RPC path")
+
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, state.Apply.Running, resp.State)
+	// Operation rows were listed successfully, so the per-deployment enrichment
+	// is still present even though the storage progress read fell back.
+	require.Len(t, resp.Operations, 2)
+	assert.Equal(t, "deploy-a", resp.Operations[0].Deployment)
+	assert.Equal(t, "deploy-b", resp.Operations[1].Deployment)
+}
+
 func TestProgressByApplyIDActivePathToleratesOperationStorageError(t *testing.T) {
 	// Operation enrichment is observability, not a safety gate: a storage error
 	// from ListByApply must omit operations rather than fail the request.

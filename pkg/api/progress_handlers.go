@@ -240,13 +240,23 @@ func (s *Service) progressOperationsForApply(ctx context.Context, apply *storage
 	if err != nil {
 		return nil, nil, fmt.Errorf("list apply operations for apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
 	}
+	responses, deploymentByOperationID := progressOperationsFromRows(ops)
+	return responses, deploymentByOperationID, nil
+}
+
+// progressOperationsFromRows projects already-fetched operation rows into the
+// API response shape and the operation-id→deployment map. Keeping the
+// transformation separate from the storage read lets a single ListByApply
+// result feed both multi-operation detection and per-deployment enrichment on
+// the polled progress path.
+func progressOperationsFromRows(ops []*storage.ApplyOperation) ([]*apitypes.ProgressOperationResponse, map[int64]string) {
 	responses := make([]*apitypes.ProgressOperationResponse, 0, len(ops))
 	deploymentByOperationID := make(map[int64]string, len(ops))
 	for _, op := range ops {
 		responses = append(responses, progressOperationResponseFromStorage(op))
 		deploymentByOperationID[op.ID] = op.Deployment
 	}
-	return responses, deploymentByOperationID, nil
+	return responses, deploymentByOperationID
 }
 
 func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string) {
@@ -303,6 +313,15 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// List the operation rows once: the result drives both multi-operation
+	// detection here and the per-deployment enrichment on the single-deployment
+	// path below, so a polled progress read hits apply_operations a single time.
+	ops, opsErr := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
+	if opsErr != nil {
+		s.logger.Warn("could not determine apply operation count; serving progress via the single-deployment path",
+			"apply_id", applyID, "database", apply.Database, "environment", apply.Environment, "error", opsErr)
+	}
+
 	// A multi-operation apply has no single remote data-plane id — each
 	// operation carries its own — and its aggregate state is derived by the
 	// operator from the operation rows. Serve it from storage so operators see
@@ -311,18 +330,15 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// (which would also rewrite a running aggregate to pending). On a storage
 	// error, fall back to the single-deployment path: every apply created today
 	// has one operation, so this only degrades the dormant multi-op case.
-	if multiOp, err := s.applyHasMultipleOperations(r.Context(), apply); err != nil {
-		s.logger.Warn("could not determine apply operation count; serving progress via the single-deployment path",
-			"apply_id", applyID, "database", apply.Database, "environment", apply.Environment, "error", err)
-	} else if multiOp {
+	if opsErr == nil && len(ops) > 1 {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
-			s.logger.Error("failed to read multi-operation apply progress from storage", "apply_id", applyID, "state", apply.State, "error", err)
-			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
+			s.logger.Warn("failed to read multi-operation apply progress from storage; falling back to the single-deployment path",
+				"apply_id", applyID, "state", apply.State, "error", err)
+		} else {
+			s.writeJSON(w, http.StatusOK, httpResp)
 			return
 		}
-		s.writeJSON(w, http.StatusOK, httpResp)
-		return
 	}
 
 	// Active apply — use the deployment stored on the apply record.
@@ -367,7 +383,12 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	}
 
 	httpResp := progressResponseFromProto(resp)
-	httpResp.Operations, _ = s.bestEffortProgressOperations(r.Context(), apply)
+	// Reuse the operation rows already listed above for multi-op detection.
+	// Operation rows are observability enrichment, not an apply safety gate, so
+	// a storage error (already logged) just omits the per-deployment breakdown.
+	if opsErr == nil {
+		httpResp.Operations, _ = progressOperationsFromRows(ops)
+	}
 	httpResp.ApplyID = apply.ApplyIdentifier
 	httpResp.Database = apply.Database
 	httpResp.Environment = apply.Environment
