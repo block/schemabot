@@ -2421,6 +2421,57 @@ func TestApplyStore_ExpireRetryableExpiresOldFailures(t *testing.T) {
 	assert.NotNil(t, persisted.CompletedAt)
 }
 
+// TestApplyStore_ExpireRetryableTerminalizesRetryableOperations verifies OC-5
+// Part A: when a multi-deployment apply's retry budget is spent, ExpireRetryable
+// terminalizes the apply's failed_retryable operation rows to failed alongside
+// the apply, but leaves a healthy successor parked at waiting_for_cutover
+// untouched. The deployment-order claim gates read earlier.state from
+// apply_operations, so a row left failed_retryable would keep blocking the
+// healthy successor from cutting over under on_failure "continue" even though
+// the rollout has already failed.
+func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_ops_expired", 510, state.Apply.FailedRetryable, "staging")
+	apply.Attempt = maxRecoveryAttempts
+	require.NoError(t, store.Applies().Update(ctx, apply))
+
+	failedOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+		OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+	parkedOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.WaitingForCutover,
+		OnFailure: storage.OnFailureContinue,
+	})
+	require.NoError(t, err)
+
+	expired, err := store.Applies().ExpireRetryable(ctx)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)
+
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, state.Apply.Failed, persistedApply.State)
+
+	failedOp, err := store.ApplyOperations().Get(ctx, failedOpID)
+	require.NoError(t, err)
+	require.NotNil(t, failedOp)
+	assert.Equal(t, state.ApplyOperation.Failed, failedOp.State, "failed_retryable operation must be terminalized to failed once the parent budget is spent")
+	assert.NotNil(t, failedOp.CompletedAt, "terminalized operation must stamp completed_at")
+
+	parkedOp, err := store.ApplyOperations().Get(ctx, parkedOpID)
+	require.NoError(t, err)
+	require.NotNil(t, parkedOp)
+	assert.Equal(t, state.ApplyOperation.WaitingForCutover, parkedOp.State, "a healthy successor parked at the cutover barrier must be left untouched")
+}
+
 func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestination(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

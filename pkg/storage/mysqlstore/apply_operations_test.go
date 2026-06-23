@@ -1132,6 +1132,79 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinB
 	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesParentBudget
+// verifies OC-5 Part B2: an operation-only redispatch of a failed_retryable
+// operation in a multi-deployment apply consumes one unit of the parent apply's
+// retry budget (applies.attempt += 1). Without this the operation-only retry
+// path never advances applies.attempt, so ExpireRetryable's budget gate never
+// fires and a permanently failing deployment retries forever — stranding a
+// healthy sibling parked at the cutover barrier under on_failure "continue".
+func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesParentBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_multiop_budget", 1, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	redispatchID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	// A sibling operation makes this a genuine multi-deployment apply.
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.WaitingForCutover,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the failed_retryable operation within budget must be reclaimable")
+	assert.Equal(t, redispatchID, claimed.ID)
+
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "a multi-op redispatch must consume one unit of the parent retry budget")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotConsumeParentBudget
+// verifies OC-5 Part B2's guard: a single-operation apply's parent attempt is
+// incremented by the ClaimApplyByID its drive performs, so the operation claim
+// must NOT also bump it — doing so would double-count the budget. The
+// EXISTS-sibling guard keeps the redispatch charge to multi-op applies only.
+func TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotConsumeParentBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_singleop_budget", 1, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, id, claimed.ID)
+
+	persistedApply, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedApply)
+	assert.Equal(t, maxRecoveryAttempts-1, persistedApply.Attempt, "a single-op apply's retry budget is charged by ClaimApplyByID, not by the operation claim")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetExhausted
 // verifies the recovery budget is enforced: once the parent apply's attempt
 // count reaches the limit, the failed_retryable operation is no longer
