@@ -7,7 +7,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -17,6 +19,16 @@ import (
 // lockColumns lists all columns for SELECT queries.
 const lockColumns = `id, database_name, database_type, repository, pull_request, owner,
 	pending_plan_id, created_at, updated_at`
+
+// acquireMaxAttempts bounds how many times Acquire retries a transient lock
+// conflict before giving up. Concurrent same-owner callers racing to claim the
+// same key can make InnoDB pick one as a deadlock victim; the victim is rolled
+// back, so a bounded retry resolves the race.
+const acquireMaxAttempts = 5
+
+// acquireBaseBackoff is the first retry delay; it grows exponentially with
+// full jitter on each subsequent attempt.
+const acquireBaseBackoff = 5 * time.Millisecond
 
 // lockStore implements storage.LockStore using MySQL.
 type lockStore struct {
@@ -32,6 +44,30 @@ type lockStore struct {
 // confirm command loads. A re-acquire that passes an empty PendingPlanID (CLI)
 // leaves the existing value intact.
 func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
+	var lastErr error
+	for attempt := range acquireMaxAttempts {
+		if attempt > 0 {
+			if err := sleepBackoff(ctx, attempt); err != nil {
+				return err
+			}
+		}
+		err := s.acquireOnce(ctx, lock)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableLockError(err) {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("acquire lock for %s/%s owner=%s after %d attempts: %w",
+		lock.DatabaseName, lock.DatabaseType, lock.Owner, acquireMaxAttempts, lastErr)
+}
+
+// acquireOnce performs a single claim attempt. Concurrent same-owner callers
+// racing to claim the same key can hit a transient InnoDB lock conflict on the
+// INSERT below; Acquire retries those.
+func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 	existing, err := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
 	if err != nil {
 		return fmt.Errorf("read existing lock for %s/%s: %w", lock.DatabaseName, lock.DatabaseType, err)
@@ -289,4 +325,38 @@ func isDuplicateKeyError(err error) bool {
 		return true
 	}
 	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
+}
+
+// MySQL error codes for transient lock contention. InnoDB picks a deadlock
+// victim (1213) or times out a lock wait (1205) when callers race for the same
+// rows; both roll the statement back, so the caller can safely retry.
+const (
+	mysqlErrDeadlock        = 1213
+	mysqlErrLockWaitTimeout = 1205
+)
+
+// isRetryableLockError reports whether err is a transient InnoDB lock conflict
+// that resolves on retry: a deadlock victim or a lock-wait timeout. Both leave
+// the database unchanged, so re-running the operation is safe.
+func isRetryableLockError(err error) bool {
+	var mysqlErr *gomysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == mysqlErrDeadlock || mysqlErr.Number == mysqlErrLockWaitTimeout
+}
+
+// sleepBackoff waits before the next retry using exponential backoff with full
+// jitter, returning early if the context is cancelled.
+func sleepBackoff(ctx context.Context, attempt int) error {
+	maxDelay := acquireBaseBackoff << (attempt - 1)
+	delay := time.Duration(rand.Int64N(int64(maxDelay) + 1))
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
