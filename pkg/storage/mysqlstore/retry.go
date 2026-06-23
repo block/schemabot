@@ -1,7 +1,8 @@
 // retry.go centralizes retry handling for transient InnoDB lock contention.
 // Concurrent callers racing for the same rows can be chosen as a deadlock victim
-// or time out waiting for a lock; both roll the statement back, so the operation
-// can be safely re-run.
+// or time out waiting for a lock; both roll the failed work back — the offending
+// statement, or the whole transaction when the work runs inside one — so the
+// operation can be safely re-run.
 package mysqlstore
 
 import (
@@ -24,7 +25,8 @@ const lockRetryBaseBackoff = 5 * time.Millisecond
 
 // MySQL error codes for transient lock contention. InnoDB picks a deadlock
 // victim (1213) or times out a lock wait (1205) when callers race for the same
-// rows; both roll the statement back, so the caller can safely retry.
+// rows; both roll back the failed attempt (statement or enclosing transaction),
+// so the caller can safely retry.
 const (
 	mysqlErrDeadlock        = 1213
 	mysqlErrLockWaitTimeout = 1205
@@ -34,9 +36,10 @@ const (
 // victim 1213, lock-wait timeout 1205) with bounded attempts and jittered
 // backoff. It returns promptly if the context is cancelled between attempts.
 //
-// fn must be idempotent: a retried statement was rolled back, so re-running it
-// from a clean read is safe. Non-retryable errors (including genuine
-// application conflicts) are returned immediately, unchanged.
+// fn must be idempotent: a retried attempt was fully rolled back — the offending
+// statement, or the entire transaction when fn runs one — so re-running it from a
+// clean read is safe. Non-retryable errors (including genuine application
+// conflicts) are returned immediately, unchanged.
 func withLockRetry(ctx context.Context, op string, fn func() error) error {
 	var lastErr error
 	for attempt := range lockRetryMaxAttempts {
