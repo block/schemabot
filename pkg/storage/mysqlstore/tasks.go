@@ -311,6 +311,7 @@ func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID 
 				t.shard = ''
 				OR (
 					ao.operation_kind = ?
+					-- Keep this in sync with shardOperationKey's namespace/shard/table format.
 					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', t.table_name)
 				)
 			)

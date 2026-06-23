@@ -394,10 +394,11 @@ type TaskStore interface {
 	// Used for aggregating task states to derive Apply state.
 	GetByApplyID(ctx context.Context, applyID int64) ([]*Task, error)
 
-	// GetByApplyOperationID returns the per-table tasks for a single
-	// apply_operation (one deployment of a multi-deployment apply). Used to drive
-	// and reconcile one operation independently of its sibling deployments.
-	// Per-shard detail rows are excluded — read them via
+	// GetByApplyOperationID returns the drive tasks for a single apply_operation.
+	// Unsharded operations return their per-table tasks. Sharded work operations
+	// return the task whose namespace/shard/table matches the operation key so the
+	// drive can rebuild its shard selector. Reflected per-shard progress rows that
+	// do not match a sharded work operation key are excluded — read them via
 	// GetShardProgressByApplyOperationID.
 	GetByApplyOperationID(ctx context.Context, applyOperationID int64) ([]*Task, error)
 
