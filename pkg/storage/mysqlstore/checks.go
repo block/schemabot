@@ -36,25 +36,29 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 		applyID = check.ApplyID
 	}
 
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO checks (
-			repository, pull_request, head_sha,
-			environment, database_type, database_name,
-			check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE
-			head_sha = VALUES(head_sha),
-			check_run_id = VALUES(check_run_id),
-			apply_id = VALUES(apply_id),
-			has_changes = VALUES(has_changes),
-			status = VALUES(status),
-			conclusion = VALUES(conclusion),
-			blocking_reason = VALUES(blocking_reason),
-			error_message = VALUES(error_message)
-	`, check.Repository, check.PullRequest, check.HeadSHA,
-		check.Environment, check.DatabaseType, check.DatabaseName,
-		checkRunID, applyID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage)
-	return err
+	op := fmt.Sprintf("upsert check result for %s#%d %s/%s/%s",
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	return withLockRetry(ctx, op, func() error {
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO checks (
+				repository, pull_request, head_sha,
+				environment, database_type, database_name,
+				check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON DUPLICATE KEY UPDATE
+				head_sha = VALUES(head_sha),
+				check_run_id = VALUES(check_run_id),
+				apply_id = VALUES(apply_id),
+				has_changes = VALUES(has_changes),
+				status = VALUES(status),
+				conclusion = VALUES(conclusion),
+				blocking_reason = VALUES(blocking_reason),
+				error_message = VALUES(error_message)
+		`, check.Repository, check.PullRequest, check.HeadSHA,
+			check.Environment, check.DatabaseType, check.DatabaseName,
+			checkRunID, applyID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage)
+		return err
+	})
 }
 
 // UpsertPlanResult stores plan-derived check state without overwriting
@@ -65,49 +69,53 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check)
 		checkRunID = check.CheckRunID
 	}
 
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO checks (
-			repository, pull_request, head_sha,
-			environment, database_type, database_name,
-			check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message
-		) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
-	`, check.Repository, check.PullRequest, check.HeadSHA,
-		check.Environment, check.DatabaseType, check.DatabaseName,
-		checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage)
-	// Fast path: no existing check state for this PR/environment/database, so the
-	// insert is the complete write. Any non-duplicate error is a real storage
-	// failure; duplicate key means the row exists and needs the guarded update
-	// below.
-	if err == nil {
-		return nil
-	}
-	if !isDuplicateKeyError(err) {
-		return err
-	}
+	op := fmt.Sprintf("upsert plan check result for %s#%d %s/%s/%s",
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	return withLockRetry(ctx, op, func() error {
+		_, err := s.db.ExecContext(ctx, `
+			INSERT INTO checks (
+				repository, pull_request, head_sha,
+				environment, database_type, database_name,
+				check_run_id, apply_id, has_changes, status, conclusion, blocking_reason, error_message
+			) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+		`, check.Repository, check.PullRequest, check.HeadSHA,
+			check.Environment, check.DatabaseType, check.DatabaseName,
+			checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage)
+		// Fast path: no existing check state for this PR/environment/database, so
+		// the insert is the complete write. Any non-duplicate error is a real
+		// storage failure; duplicate key means the row exists and needs the
+		// guarded update below.
+		if err == nil {
+			return nil
+		}
+		if !isDuplicateKeyError(err) {
+			return err
+		}
 
-	// Preserve in-progress apply-owned state regardless of the plan's head SHA.
-	// Once an apply has started, the stored row is authoritative until the apply
-	// completes (CompleteForApply, MarkActionRequiredForApply) or an explicit
-	// recovery path releases it. A plan result — even from a newer PR commit that
-	// diffs cleanly against the mid-apply database — must not take ownership or
-	// convert the row into a passing check.
-	_, err = s.db.ExecContext(ctx, `
-		UPDATE checks
-		SET head_sha = ?,
-		    check_run_id = ?,
-		    apply_id = NULL,
-		    has_changes = ?,
-		    status = ?,
-		    conclusion = ?,
-		    blocking_reason = ?,
-		    error_message = ?
-		WHERE repository = ? AND pull_request = ?
-		  AND environment = ? AND database_type = ? AND database_name = ?
-		  AND NOT (status = ? AND apply_id IS NOT NULL)
-	`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
-		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-		checkStatusInProgress)
-	return err
+		// Preserve in-progress apply-owned state regardless of the plan's head SHA.
+		// Once an apply has started, the stored row is authoritative until the apply
+		// completes (CompleteForApply, MarkActionRequiredForApply) or an explicit
+		// recovery path releases it. A plan result — even from a newer PR commit that
+		// diffs cleanly against the mid-apply database — must not take ownership or
+		// convert the row into a passing check.
+		_, err = s.db.ExecContext(ctx, `
+			UPDATE checks
+			SET head_sha = ?,
+			    check_run_id = ?,
+			    apply_id = NULL,
+			    has_changes = ?,
+			    status = ?,
+			    conclusion = ?,
+			    blocking_reason = ?,
+			    error_message = ?
+			WHERE repository = ? AND pull_request = ?
+			  AND environment = ? AND database_type = ? AND database_name = ?
+			  AND NOT (status = ? AND apply_id IS NOT NULL)
+		`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage,
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+			checkStatusInProgress)
+		return err
+	})
 }
 
 // RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check

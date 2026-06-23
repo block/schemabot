@@ -18,23 +18,34 @@ type controlRequestStore struct {
 }
 
 func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
-	controlReq, alreadyPending, err := s.requestPending(ctx, req)
-	if err == nil || !isDuplicateKeyError(err) {
-		return controlReq, alreadyPending, err
-	}
+	var controlReq *storage.ApplyControlRequest
+	var alreadyPending bool
+	op := fmt.Sprintf("request control request for apply %d operation %s", req.ApplyID, req.Operation)
+	err := withLockRetry(ctx, op, func() error {
+		var attemptErr error
+		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req)
+		if attemptErr == nil || !isDuplicateKeyError(attemptErr) {
+			return attemptErr
+		}
 
-	slog.DebugContext(ctx, "retrying control request after duplicate insert",
-		"apply_id", req.ApplyID,
-		"operation", req.Operation)
+		slog.DebugContext(ctx, "retrying control request after duplicate insert",
+			"apply_id", req.ApplyID,
+			"operation", req.Operation)
 
-	// requestPending opens its transaction at READ COMMITTED. The unique key on
-	// apply_id + operation is the durable guard when two first-time callers both
-	// observe no row and race to insert. Retry once so the losing insert re-reads
-	// the winning row and returns "already requested"; if the retry also fails,
-	// return that storage error instead of hiding an unexpected conflict.
-	controlReq, alreadyPending, err = s.requestPending(ctx, req)
+		// requestPending opens its transaction at READ COMMITTED. The unique key
+		// on apply_id + operation is the durable guard when two first-time
+		// callers both observe no row and race to insert. Re-read once so the
+		// losing insert returns the winning row as "already requested"; if the
+		// re-read also fails, return that storage error instead of hiding an
+		// unexpected conflict.
+		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req)
+		if attemptErr != nil {
+			return fmt.Errorf("retry control request after duplicate insert for apply %d operation %s: %w", req.ApplyID, req.Operation, attemptErr)
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, false, fmt.Errorf("retry control request after duplicate insert for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+		return nil, false, err
 	}
 	return controlReq, alreadyPending, nil
 }
