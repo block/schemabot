@@ -227,14 +227,16 @@ func multiDeployClearTernStorage(t *testing.T, deployments ...string) {
 	t.Helper()
 	for _, d := range deployments {
 		db, err := sql.Open("mysql", multiDeployTernStorageDSN(t, d))
-		if err != nil {
-			t.Logf("cleanup: open tern storage db (%s): %v", d, err)
-			continue
-		}
+		require.NoErrorf(t, err, "cleanup: open tern storage db (%s)", d)
 		func() {
 			defer utils.CloseAndLog(db)
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 			defer cancel()
+
+			// sql.Open is lazy and rarely validates the DSN or connectivity, so
+			// ping before issuing cleanup queries: a silently skipped cleanup
+			// leaves a sibling's Tern rows behind and makes later tests flaky.
+			require.NoErrorf(t, db.PingContext(ctx), "cleanup: ping tern storage db (%s)", d)
 
 			rows, err := db.QueryContext(ctx, "SHOW TABLES")
 			if err != nil {
@@ -533,18 +535,18 @@ func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
 	// earlier failure.
 	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
 		func() bool {
-			ops := multiDeployOperationStates(t, apply.ApplyID)
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
 			return failedApplyState(ops[first].State) &&
 				state.IsState(ops[second].State, state.Apply.Completed)
 		},
 		func() string {
-			ops := multiDeployOperationStates(t, apply.ApplyID)
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
 			return fmt.Sprintf("waiting for %s failed + %s completed; %s=%q %s=%q",
 				first, second, first, ops[first].State, second, ops[second].State)
 		},
 	)
 
-	final := multiDeployOperationStates(t, apply.ApplyID)
+	final := multiDeployOps(t, apply.ApplyID, first, second)
 	assert.Truef(t, failedApplyState(final[first].State), "%s should be failed, was %q", first, final[first].State)
 	assert.Truef(t, state.IsState(final[second].State, state.Apply.Completed),
 		"%s should complete under on_failure: continue, was %q", second, final[second].State)

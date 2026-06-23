@@ -11,9 +11,14 @@
 # rollout-failure policy:
 #   - production           -> on_failure: halt (default): a failed deployment
 #                             halts the rollout; healthy siblings do not cut over.
-#   - production-continue  -> on_failure: continue: a failed deployment is
-#                             treated as settled; healthy siblings still cut over
-#                             and complete, and the apply settles to failed.
+#   - production-continue  -> on_failure: continue: a failed deployment should
+#                             be treated as settled so healthy siblings still cut
+#                             over and complete while the apply settles to failed.
+#                             This env encodes that intended behavior; until the
+#                             barrier-release semantics for a continue-failed
+#                             predecessor land (OC-5), the healthy sibling parks
+#                             at waiting_for_cutover and the scenario is expected
+#                             to fail.
 # Both use cutover_policy: barrier and deployment_order [eu, us].
 
 # SchemaBot's own storage database
