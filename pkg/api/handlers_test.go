@@ -1998,9 +1998,11 @@ func TestCreateStoredApplyFansOutShardedPlanOperations(t *testing.T) {
 	assert.Equal(t, DefaultDeployment, applies.operations[0].Deployment)
 	assert.Equal(t, "commerce-target", applies.operations[0].Target)
 	assert.Equal(t, "commerce/-80/users", applies.operations[0].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[0].OperationKind)
 	assert.Equal(t, DefaultDeployment, applies.operations[1].Deployment)
 	assert.Equal(t, "commerce-target", applies.operations[1].Target)
 	assert.Equal(t, "commerce/80-/users", applies.operations[1].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[1].OperationKind)
 	require.Len(t, tasks.tasks, 2)
 	assert.Equal(t, "-80", tasks.tasks[0].Shard)
 	assert.Equal(t, "users", tasks.tasks[0].TableName)
@@ -2010,6 +2012,116 @@ func TestCreateStoredApplyFansOutShardedPlanOperations(t *testing.T) {
 	assert.Equal(t, "users", tasks.tasks[1].TableName)
 	require.NotNil(t, tasks.tasks[1].ApplyOperationID)
 	assert.Equal(t, applies.operations[1].ID, *tasks.tasks[1].ApplyOperationID)
+}
+
+func TestCreateStoredApplyFansOutShardedPlanWithFinalizerOperation(t *testing.T) {
+	// A sharded plan with a namespace-level routing metadata change keeps the
+	// work operations shard-scoped and queues the metadata change as a finalizer
+	// operation that is driven through the same operation-scoped path.
+	applies := &capturingApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	plan := executeApplyTestPlan()
+	plan.DatabaseType = storage.DatabaseTypeStrata
+	plan.Target = "commerce-target"
+	plan.Namespaces = map[string]*storage.NamespacePlanData{
+		"commerce": {
+			Artifacts: map[string]string{vSchemaArtifactName: "{\"sharded\":true}"},
+			Tables: []storage.TableChange{
+				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
+			},
+		},
+	}
+	plan.Shards = []storage.ShardPlan{
+		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
+		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+	}
+	cfg := testServerConfig()
+	cfg.Databases = map[string]DatabaseConfig{}
+	cfg.Databases["testdb"] = DatabaseConfig{
+		Type: storage.DatabaseTypeStrata,
+		Environments: map[string]EnvironmentConfig{
+			"staging": {Target: "commerce-target", Deployment: DefaultDeployment},
+		},
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, cfg, map[string]tern.Client{}, logger)
+
+	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-sharded-finalizer", true)
+
+	require.NoError(t, err)
+	require.Len(t, applies.operations, 3)
+	assert.Equal(t, "commerce/-80/users", applies.operations[0].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[0].OperationKind)
+	assert.Equal(t, "commerce/80-/users", applies.operations[1].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[1].OperationKind)
+	assert.Equal(t, "commerce/group_finalizer", applies.operations[2].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, applies.operations[2].OperationKind)
+
+	require.Len(t, tasks.tasks, 3)
+	assert.Equal(t, "-80", tasks.tasks[0].Shard)
+	assert.Equal(t, "users", tasks.tasks[0].TableName)
+	assert.Equal(t, "80-", tasks.tasks[1].Shard)
+	assert.Equal(t, "users", tasks.tasks[1].TableName)
+	assert.Empty(t, tasks.tasks[2].Shard)
+	assert.Equal(t, "VSchema: commerce", tasks.tasks[2].TableName)
+	assert.Equal(t, "vschema_update", tasks.tasks[2].DDLAction)
+	require.NotNil(t, tasks.tasks[2].ApplyOperationID)
+	assert.Equal(t, applies.operations[2].ID, *tasks.tasks[2].ApplyOperationID)
+}
+
+func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
+	applies := &capturingApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	plan := executeApplyTestPlan()
+	plan.DatabaseType = storage.DatabaseTypeStrata
+	plan.Namespaces = map[string]*storage.NamespacePlanData{
+		"commerce": {
+			Tables: []storage.TableChange{
+				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
+			},
+		},
+		"routing": {
+			Artifacts: map[string]string{vSchemaArtifactName: "{\"routing\":true}"},
+		},
+	}
+	plan.Shards = []storage.ShardPlan{{Namespace: "commerce", Shard: "-", NeedsChange: true}}
+	cfg := testServerConfig()
+	cfg.Databases = map[string]DatabaseConfig{}
+	cfg.Databases["testdb"] = DatabaseConfig{
+		Type: storage.DatabaseTypeStrata,
+		Environments: map[string]EnvironmentConfig{
+			"staging": {Target: "commerce-target", Deployment: DefaultDeployment},
+		},
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, cfg, map[string]tern.Client{}, logger)
+
+	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-finalizer-only-namespace", true)
+
+	require.NoError(t, err)
+	require.Len(t, applies.operations, 1)
+	assert.Empty(t, applies.operations[0].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindWork, applies.operations[0].OperationKind)
+	require.Len(t, tasks.tasks, 2)
+	assert.Equal(t, "users", tasks.tasks[0].TableName)
+	assert.Equal(t, "VSchema: routing", tasks.tasks[1].TableName)
+	assert.Equal(t, "vschema_update", tasks.tasks[1].DDLAction)
 }
 
 func TestCreateStoredApplyDoesNotShardWithoutClientOptIn(t *testing.T) {
@@ -2049,6 +2161,13 @@ func TestCreateStoredApplyDoesNotShardWithoutClientOptIn(t *testing.T) {
 
 func TestValidateShardOperationKeyPartsRejectsDelimiter(t *testing.T) {
 	err := validateShardOperationKeyParts("commerce", "-80/80-", "users")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved delimiter")
+}
+
+func TestValidateOperationKeyPartRejectsFinalizerNamespaceDelimiter(t *testing.T) {
+	err := validateOperationKeyPart("namespace", "commerce/eu")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "reserved delimiter")

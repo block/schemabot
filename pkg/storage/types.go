@@ -204,6 +204,12 @@ const (
 	EngineStrata      = "strata"
 )
 
+// ApplyOperationKind constants classify operation rows by scheduling role.
+const (
+	ApplyOperationKindWork           = "work"
+	ApplyOperationKindGroupFinalizer = "group_finalizer"
+)
+
 // EngineForType returns the engine name for a database type.
 func EngineForType(dbType string) string {
 	switch dbType {
@@ -503,6 +509,11 @@ type ApplyOperation struct {
 	// OperationKey disambiguates multiple execution operations in the same apply
 	// and deployment. Empty is the legacy single-operation key.
 	OperationKey string
+
+	// OperationKind classifies the operation's scheduling role. The default
+	// "work" kind is ordinary engine work; "group_finalizer" runs after its
+	// grouped work siblings succeed.
+	OperationKind string
 
 	// Target is the Tern-facing address resolved for this deployment at apply
 	// time. Mirrors plans.target / applies.target

@@ -19,7 +19,7 @@ import (
 )
 
 // applyOperationColumns lists all columns for SELECT queries.
-const applyOperationColumns = `id, apply_id, deployment, operation_key, target, state, error_message,
+const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, state, error_message,
 	cutover_policy, on_failure, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
@@ -73,13 +73,18 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		onFailure = storage.OnFailureHalt
 	}
 
+	operationKind := ad.OperationKind
+	if operationKind == "" {
+		operationKind = storage.ApplyOperationKindWork
+	}
+
 	result, err := exec.ExecContext(ctx, `
 		INSERT INTO apply_operations (
-			apply_id, deployment, operation_key, target, state, error_message, cutover_policy, on_failure,
+			apply_id, deployment, operation_key, operation_kind, target, state, error_message, cutover_policy, on_failure,
 			started_at, completed_at, engine_resume_context, engine_resume_metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		ad.ApplyID, ad.Deployment, ad.OperationKey, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
+		ad.ApplyID, ad.Deployment, ad.OperationKey, operationKind, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
@@ -96,6 +101,7 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 	}
 	ad.ID = id
 	ad.State = stateVal
+	ad.OperationKind = operationKind
 	ad.CutoverPolicy = cutoverPolicy
 	ad.OnFailure = onFailure
 	return id, nil
@@ -615,6 +621,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	activeStatePlaceholders := placeholders(len(activeStates))
 
 	queryArgs := []any{state.ApplyOperation.Pending}
+	queryArgs = append(queryArgs, storage.ApplyOperationKindGroupFinalizer)
 	// Sibling-gate args for the pending claim, cutover_policy-aware (see the
 	// gate SQL below). Under barrier, an earlier sibling stops blocking once it
 	// reaches the cutover barrier or succeeds (waiting_for_cutover, cutting_over,
@@ -633,6 +640,12 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		state.ApplyOperation.Completed,
 		storage.OnFailureContinue,
 		state.ApplyOperation.Failed,
+	)
+	queryArgs = append(queryArgs,
+		storage.ApplyOperationKindGroupFinalizer,
+		storage.ApplyOperationKindWork,
+		storage.ApplyOperationKindWork,
+		state.ApplyOperation.Completed,
 	)
 	// Pending stop gate: a pending operation is not claimable for start while
 	// its apply has a pending stop control request. This is what makes `stop`
@@ -717,22 +730,47 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		WHERE (
 			(
 				state = ?
-				AND NOT EXISTS (
-					SELECT 1
-					FROM apply_operations AS earlier
-					WHERE earlier.apply_id = apply_operations.apply_id
-						AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-						AND (
-							(
-								apply_operations.cutover_policy = ?
-								AND earlier.state NOT IN (?, ?, ?, ?)
-							)
-							OR (
-								apply_operations.cutover_policy <> ?
-								AND earlier.state <> ?
+				AND (
+					(
+						apply_operations.operation_kind <> ?
+						AND NOT EXISTS (
+							SELECT 1
+							FROM apply_operations AS earlier
+							WHERE earlier.apply_id = apply_operations.apply_id
+								AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
+								AND (
+									(
+										apply_operations.cutover_policy = ?
+										AND earlier.state NOT IN (?, ?, ?, ?)
+									)
+									OR (
+										apply_operations.cutover_policy <> ?
+										AND earlier.state <> ?
+									)
+								)
+								AND NOT (apply_operations.on_failure = ? AND earlier.state = ?)
+						)
+					)
+					OR (
+						apply_operations.operation_kind = ?
+						AND EXISTS (
+							SELECT 1
+							FROM apply_operations AS sibling
+							WHERE sibling.apply_id = apply_operations.apply_id
+								AND sibling.deployment = apply_operations.deployment
+								AND sibling.operation_kind = ?
+								AND SUBSTRING_INDEX(sibling.operation_key, '/', 1) = SUBSTRING_INDEX(apply_operations.operation_key, '/', 1)
+						)
+						AND NOT EXISTS (
+							SELECT 1
+							FROM apply_operations AS sibling
+							WHERE sibling.apply_id = apply_operations.apply_id
+								AND sibling.deployment = apply_operations.deployment
+								AND sibling.operation_kind = ?
+								AND SUBSTRING_INDEX(sibling.operation_key, '/', 1) = SUBSTRING_INDEX(apply_operations.operation_key, '/', 1)
+								AND sibling.state <> ?
 							)
 						)
-						AND NOT (apply_operations.on_failure = ? AND earlier.state = ?)
 				)
 				AND NOT EXISTS (
 					SELECT 1
@@ -1288,7 +1326,7 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
 
 	if err := s.Scan(
-		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.Target, &ad.State, &errMsg,
+		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &ad.State, &errMsg,
 		&ad.CutoverPolicy, &ad.OnFailure, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {

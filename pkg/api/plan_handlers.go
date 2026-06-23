@@ -30,6 +30,7 @@ import (
 )
 
 const applyOperationKeyMaxLen = 255
+const finalizerOperationKeySegment = "group_finalizer"
 
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
@@ -1053,15 +1054,29 @@ func canBuildShardedOperationGroups(plan *storage.Plan, taskChanges []storage.Ta
 	if len(shardsByNamespace) == 0 {
 		return false
 	}
+	hasWorkChange := false
+	workNamespaces := make(map[string]struct{})
+	finalizerNamespaces := make(map[string]struct{})
 	for _, ddlChange := range taskChanges {
-		if ddlChange.DDL == "" || ddlChange.Table == "" || ddlChange.Operation == "vschema_update" {
+		if isGroupFinalizerChange(ddlChange) {
+			finalizerNamespaces[ddlChange.Namespace] = struct{}{}
+			continue
+		}
+		if ddlChange.DDL == "" || ddlChange.Table == "" {
 			return false
 		}
 		if len(shardsByNamespace[ddlChange.Namespace]) == 0 {
 			return false
 		}
+		workNamespaces[ddlChange.Namespace] = struct{}{}
+		hasWorkChange = true
 	}
-	return true
+	for namespace := range finalizerNamespaces {
+		if _, ok := workNamespaces[namespace]; !ok {
+			return false
+		}
+	}
+	return hasWorkChange
 }
 
 func buildShardedApplyOperationGroups(
@@ -1075,10 +1090,13 @@ func buildShardedApplyOperationGroups(
 	now time.Time,
 ) ([]*storage.ApplyOperationWithTasks, error) {
 	shardsByNamespace := changingShardsByNamespace(plan.Shards)
-	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*len(taskChanges))
+	workChanges, finalizerChanges := splitShardedTaskChanges(taskChanges)
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*(len(workChanges)+len(finalizerChanges)))
 	groupsByTargetAndKey := make(map[string]*storage.ApplyOperationWithTasks)
 	for _, target := range targets {
-		for _, ddlChange := range taskChanges {
+		workNamespaces := make(map[string]struct{})
+		for _, ddlChange := range workChanges {
+			workNamespaces[ddlChange.Namespace] = struct{}{}
 			for _, shard := range shardsByNamespace[ddlChange.Namespace] {
 				if err := validateShardOperationKeyParts(ddlChange.Namespace, shard.Shard, ddlChange.Table); err != nil {
 					return nil, err
@@ -1099,8 +1117,52 @@ func buildShardedApplyOperationGroups(
 				group.Tasks = append(group.Tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard.Shard, now))
 			}
 		}
+		for _, namespace := range sortedFinalizerNamespaces(finalizerChanges) {
+			if _, ok := workNamespaces[namespace]; !ok {
+				return nil, fmt.Errorf("group finalizer for namespace %q has no work operation siblings", namespace)
+			}
+			if err := validateOperationKeyPart("namespace", namespace); err != nil {
+				return nil, err
+			}
+			operationKey := finalizerOperationKey(namespace)
+			if len(operationKey) > applyOperationKeyMaxLen {
+				return nil, fmt.Errorf("operation key for namespace %q finalizer exceeds %d characters", namespace, applyOperationKeyMaxLen)
+			}
+			operation := newPendingApplyOperation(target, operationKey, cutoverPolicy, onFailure, now)
+			operation.OperationKind = storage.ApplyOperationKindGroupFinalizer
+			groups = append(groups, &storage.ApplyOperationWithTasks{
+				Operation: operation,
+				Tasks:     []*storage.Task{buildApplyTask(plan, finalizerChanges[namespace], environment, applyOpts, "", now)},
+			})
+		}
 	}
 	return groups, nil
+}
+
+func splitShardedTaskChanges(taskChanges []storage.TableChange) ([]storage.TableChange, map[string]storage.TableChange) {
+	workChanges := make([]storage.TableChange, 0, len(taskChanges))
+	finalizerChanges := make(map[string]storage.TableChange)
+	for _, change := range taskChanges {
+		if isGroupFinalizerChange(change) {
+			finalizerChanges[change.Namespace] = change
+			continue
+		}
+		workChanges = append(workChanges, change)
+	}
+	return workChanges, finalizerChanges
+}
+
+func sortedFinalizerNamespaces(finalizerChanges map[string]storage.TableChange) []string {
+	namespaces := make([]string, 0, len(finalizerChanges))
+	for namespace := range finalizerChanges {
+		namespaces = append(namespaces, namespace)
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+func isGroupFinalizerChange(change storage.TableChange) bool {
+	return change.Operation == "vschema_update"
 }
 
 func validateShardOperationKeyParts(namespace, shard, table string) error {
@@ -1112,9 +1174,16 @@ func validateShardOperationKeyParts(namespace, shard, table string) error {
 		{label: "shard", value: shard},
 		{label: "table", value: table},
 	} {
-		if strings.Contains(part.value, "/") {
-			return fmt.Errorf("operation key %s component %q contains reserved delimiter %q", part.label, part.value, "/")
+		if err := validateOperationKeyPart(part.label, part.value); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func validateOperationKeyPart(label, value string) error {
+	if strings.Contains(value, "/") {
+		return fmt.Errorf("operation key %s component %q contains reserved delimiter %q", label, value, "/")
 	}
 	return nil
 }
@@ -1139,10 +1208,15 @@ func shardOperationKey(namespace, shard, table string) string {
 	return namespace + "/" + shard + "/" + table
 }
 
+func finalizerOperationKey(namespace string) string {
+	return namespace + "/" + finalizerOperationKeySegment
+}
+
 func newPendingApplyOperation(target routing.ExecutionTarget, operationKey, cutoverPolicy, onFailure string, now time.Time) *storage.ApplyOperation {
 	return &storage.ApplyOperation{
 		Deployment:    target.Deployment,
 		OperationKey:  operationKey,
+		OperationKind: storage.ApplyOperationKindWork,
 		Target:        target.Target,
 		State:         state.ApplyOperation.Pending,
 		CutoverPolicy: cutoverPolicy,

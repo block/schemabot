@@ -44,6 +44,7 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.Equal(t, "region-a", got.Deployment)
 	assert.Equal(t, "payments", got.Target)
 	assert.Equal(t, state.ApplyOperation.Pending, got.State)
+	assert.Equal(t, storage.ApplyOperationKindWork, got.OperationKind)
 	assert.Equal(t, storage.CutoverPolicyRolling, got.CutoverPolicy, "an unset cutover_policy defaults to rolling")
 	assert.Empty(t, got.ErrorMessage)
 	assert.Nil(t, got.StartedAt)
@@ -52,6 +53,39 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.Empty(t, got.EngineResumeMetadata)
 	assert.NotZero(t, got.CreatedAt)
 	assert.NotZero(t, got.UpdatedAt)
+}
+
+func TestApplyOperationStore_OperationKindRoundTrip(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_kind_roundtrip", 1)
+
+	defaulted := &storage.ApplyOperation{ApplyID: apply.ID, Deployment: "region-a", Target: "payments"}
+	defaultedID, err := store.ApplyOperations().Insert(ctx, defaulted)
+	require.NoError(t, err)
+	assert.Equal(t, storage.ApplyOperationKindWork, defaulted.OperationKind)
+
+	finalizerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:       apply.ID,
+		Deployment:    "region-a",
+		OperationKey:  "commerce/group_finalizer",
+		OperationKind: storage.ApplyOperationKindGroupFinalizer,
+		Target:        "payments",
+	})
+	require.NoError(t, err)
+
+	gotDefaulted, err := store.ApplyOperations().Get(ctx, defaultedID)
+	require.NoError(t, err)
+	require.NotNil(t, gotDefaulted)
+	assert.Equal(t, storage.ApplyOperationKindWork, gotDefaulted.OperationKind)
+
+	gotFinalizer, err := store.ApplyOperations().Get(ctx, finalizerID)
+	require.NoError(t, err)
+	require.NotNil(t, gotFinalizer)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, gotFinalizer.OperationKind)
 }
 
 // TestApplyOperationStore_CutoverPolicyRoundTrip verifies that an explicit
@@ -1497,6 +1531,78 @@ func TestApplyOperationStore_FindNextApplyOperation_OrdersSiblings(t *testing.T)
 	done, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	assert.Nil(t, done)
+}
+
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsFinalizerAfterWorkSiblingsComplete(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_finalizer_claim", 1)
+
+	workA, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/users", OperationKind: storage.ApplyOperationKindWork,
+	})
+	require.NoError(t, err)
+	workB, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/users", OperationKind: storage.ApplyOperationKindWork,
+	})
+	require.NoError(t, err)
+	finalizer, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, workA, claimed.ID)
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, workA))
+
+	claimed, err = store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, workB, claimed.ID)
+
+	blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, blocked)
+
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, workB))
+	claimed, err = store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, finalizer, claimed.ID)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
+}
+
+func TestApplyOperationStore_FindNextApplyOperation_BlocksFinalizerAfterFailedWorkSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_finalizer_failed_work", 1)
+
+	workA, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/users", OperationKind: storage.ApplyOperationKindWork,
+	})
+	require.NoError(t, err)
+	workB, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/users", OperationKind: storage.ApplyOperationKindWork,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, workA))
+	require.NoError(t, store.ApplyOperations().MarkFailed(ctx, workB, "copy failed"))
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed)
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_HaltsOnFailedSibling verifies

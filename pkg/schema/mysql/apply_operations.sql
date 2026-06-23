@@ -3,6 +3,7 @@ CREATE TABLE `apply_operations` (
   `apply_id` bigint unsigned NOT NULL,
   `deployment` varchar(255) NOT NULL,
   `operation_key` varchar(255) NOT NULL DEFAULT '',
+  `operation_kind` varchar(32) NOT NULL DEFAULT 'work',
   `target` varchar(255) NOT NULL DEFAULT '',
   `engine_resume_context` varchar(255) DEFAULT NULL,
   `engine_resume_metadata` json DEFAULT NULL,
