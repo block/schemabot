@@ -1685,8 +1685,9 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 	}
 
 	// Terminalize the apply's retryable operation rows alongside the apply: once
-	// the parent's retry budget is spent the rollout's verdict is final, so a
-	// per-deployment operation that exhausted its retries is permanently failed,
+	// the apply is being expired — whether its retry budget is spent or its
+	// recovery freshness window has elapsed — the rollout's verdict is final, so
+	// a per-deployment operation that was still retryable is permanently failed,
 	// not retryable. The deployment-order claim gates read earlier.state from
 	// apply_operations, so a row left failed_retryable would keep blocking a
 	// healthy later deployment under on_failure "continue" even though the

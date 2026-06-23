@@ -902,18 +902,23 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		// sibling parked at the cutover barrier under on_failure "continue". The
 		// EXISTS-sibling guard selects multi-op, and the failed_retryable parent
 		// guard keeps this to genuine redispatches (a terminal-failed parent never
-		// re-leases its operations).
+		// re-leases its operations). The attempt < budget guard makes the
+		// increment idempotent once the budget is spent: two operators can claim
+		// different failed_retryable operations of the same apply concurrently, and
+		// the row lock this UPDATE takes serializes them, so the second sees the
+		// already-incremented attempt and does not overshoot maxRecoveryAttempts.
 		if ad.State == state.ApplyOperation.FailedRetryable {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE applies a
 				SET a.attempt = a.attempt + 1, a.updated_at = NOW()
 				WHERE a.id = ?
 					AND a.state = ?
+					AND a.attempt < ?
 					AND EXISTS (
 						SELECT 1 FROM apply_operations o
 						WHERE o.apply_id = a.id AND o.id <> ?
 					)
-			`, ad.ApplyID, state.Apply.FailedRetryable, ad.ID); err != nil {
+			`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts, ad.ID); err != nil {
 				return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
 			}
 		}
