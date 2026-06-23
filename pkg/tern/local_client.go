@@ -1249,6 +1249,10 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 		return nil, fmt.Errorf("materialize plan %s: apply request carried no DDL changes or schema files", req.PlanId)
 	}
 
+	if err := c.verifyMaterializedPlanMatchesLiveSchema(ctx, req, schemaFiles); err != nil {
+		return nil, fmt.Errorf("materialize plan %s: %w", req.PlanId, err)
+	}
+
 	target := req.Target
 	if target == "" {
 		target = c.config.Database
@@ -1364,6 +1368,191 @@ func materializedTableChangeOperation(ch *ternv1.TableChange) (string, error) {
 		return "", fmt.Errorf("classify DDL for table %q: %w", ch.TableName, err)
 	}
 	return op, nil
+}
+
+// driftChangeKey identifies a single table DDL change for drift comparison. Two
+// changes are the same iff they target the same namespace and table with the
+// same operation and canonicalized DDL.
+type driftChangeKey struct {
+	namespace string
+	table     string
+	operation string
+	ddl       string
+}
+
+// driftChangeMultiset counts table DDL changes by key so duplicate changes are
+// compared exactly (set equality would silently tolerate a duplicated change).
+type driftChangeMultiset map[driftChangeKey]int
+
+// verifyMaterializedPlanMatchesLiveSchema fails closed unless the reviewed DDL
+// carried by a dispatch request is exactly what this deployment would plan
+// against its own live schema. A non-primary deployment never planned locally —
+// the reviewed plan was computed against the primary deployment's live schema —
+// so blindly materializing it would silently replay the primary's DDL on a
+// deployment whose schema may have drifted. Recomputing the local diff and
+// requiring an exact match keeps non-primary drift from being applied unreviewed.
+func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, schemaFiles schema.SchemaFiles) error {
+	if len(req.TargetShards) > 0 {
+		return fmt.Errorf("drift guard does not support shard-scoped applies (target_shards=%v); a whole-deployment replan cannot be compared to a shard subset", req.TargetShards)
+	}
+
+	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
+		Database:    c.config.Database,
+		Type:        c.config.Type,
+		Environment: req.Environment,
+		Target:      req.Target,
+	}, c.config.Database, schemaFiles)
+	if err != nil {
+		return fmt.Errorf("recompute local plan: %w", err)
+	}
+
+	recomputed, err := c.driftMultisetFromPlanResult(result)
+	if err != nil {
+		return fmt.Errorf("recomputed plan: %w", err)
+	}
+	dispatched, err := c.driftMultisetFromApplyRequest(req.DdlChanges)
+	if err != nil {
+		return fmt.Errorf("dispatched plan: %w", err)
+	}
+	if err := compareDriftMultisets(recomputed, dispatched); err != nil {
+		return fmt.Errorf("local schema has drifted from the reviewed plan (database %q, target %q): %w", c.config.Database, req.Target, err)
+	}
+
+	if err := compareVSchemaParity(vschemaNamespacesFromPlanResult(c, result), vschemaNamespacesFromApplyRequest(c, req.DdlChanges)); err != nil {
+		return fmt.Errorf("local vschema has drifted from the reviewed plan (database %q, target %q): %w", c.config.Database, req.Target, err)
+	}
+	return nil
+}
+
+// driftMultisetFromPlanResult builds the table DDL multiset this deployment
+// would plan against its own live schema. VSchema changes carry no table DDL and
+// are compared separately, so they are excluded here.
+func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult) (driftChangeMultiset, error) {
+	ms := driftChangeMultiset{}
+	for _, sc := range result.Changes {
+		ns := c.planNamespace(sc.Namespace)
+		for _, tc := range sc.TableChanges {
+			canon, err := canonicalDDLForDrift(tc.DDL)
+			if err != nil {
+				return nil, fmt.Errorf("table %q: %w", tc.Table, err)
+			}
+			ms[driftChangeKey{ns, tc.Table, ddl.StatementTypeToOp(tc.Operation), canon}]++
+		}
+	}
+	return ms, nil
+}
+
+// driftMultisetFromApplyRequest builds the table DDL multiset the dispatch
+// request carries as the reviewed, authoritative plan. VSchema changes are
+// compared separately and excluded here. Nil entries are corrupt input and fail
+// closed.
+func (c *LocalClient) driftMultisetFromApplyRequest(changes []*ternv1.TableChange) (driftChangeMultiset, error) {
+	ms := driftChangeMultiset{}
+	for _, ch := range changes {
+		if ch == nil {
+			return nil, fmt.Errorf("dispatch request carried a nil table change")
+		}
+		if ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
+			continue
+		}
+		op, err := materializedTableChangeOperation(ch)
+		if err != nil {
+			return nil, err
+		}
+		canon, err := canonicalDDLForDrift(ch.Ddl)
+		if err != nil {
+			return nil, fmt.Errorf("table %q: %w", ch.TableName, err)
+		}
+		ms[driftChangeKey{c.planNamespace(ch.Namespace), ch.TableName, op, canon}]++
+	}
+	return ms, nil
+}
+
+// canonicalDDLForDrift normalizes a DDL statement for comparison and fails
+// closed if it cannot be parsed — ddl.Canonicalize returns the input unchanged
+// on a parse failure, so an unparseable statement would otherwise compare by raw
+// text and could mask drift.
+func canonicalDDLForDrift(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("empty DDL")
+	}
+	if _, _, err := ddl.ClassifyStatement(raw); err != nil {
+		return "", fmt.Errorf("unparseable DDL: %w", err)
+	}
+	return ddl.Canonicalize(raw), nil
+}
+
+// compareDriftMultisets reports drift unless the recomputed and dispatched table
+// DDL multisets are exactly equal.
+func compareDriftMultisets(recomputed, dispatched driftChangeMultiset) error {
+	var missing, unexpected []string
+	for key, want := range dispatched {
+		if recomputed[key] < want {
+			missing = append(missing, formatDriftKey(key))
+		}
+	}
+	for key, have := range recomputed {
+		if have > dispatched[key] {
+			unexpected = append(unexpected, formatDriftKey(key))
+		}
+	}
+	if len(missing) == 0 && len(unexpected) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	sort.Strings(unexpected)
+	return fmt.Errorf("reviewed changes this deployment would not plan: %v; changes this deployment would plan that were not reviewed: %v", missing, unexpected)
+}
+
+func formatDriftKey(k driftChangeKey) string {
+	return fmt.Sprintf("%s.%s/%s", k.namespace, k.table, k.operation)
+}
+
+// vschemaNamespacesFromPlanResult returns the namespaces the recomputed plan
+// detected a vschema change for.
+func vschemaNamespacesFromPlanResult(c *LocalClient, result *engine.PlanResult) map[string]bool {
+	out := map[string]bool{}
+	for _, sc := range result.Changes {
+		if sc.Metadata["vschema_changed"] == "true" {
+			out[c.planNamespace(sc.Namespace)] = true
+		}
+	}
+	return out
+}
+
+// vschemaNamespacesFromApplyRequest returns the namespaces the dispatch request
+// carries a vschema change for.
+func vschemaNamespacesFromApplyRequest(c *LocalClient, changes []*ternv1.TableChange) map[string]bool {
+	out := map[string]bool{}
+	for _, ch := range changes {
+		if ch != nil && ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
+			out[c.planNamespace(ch.Namespace)] = true
+		}
+	}
+	return out
+}
+
+// compareVSchemaParity reports drift unless the recomputed and dispatched
+// vschema-changed namespaces are exactly equal.
+func compareVSchemaParity(recomputed, dispatched map[string]bool) error {
+	var missing, unexpected []string
+	for ns := range dispatched {
+		if !recomputed[ns] {
+			missing = append(missing, ns)
+		}
+	}
+	for ns := range recomputed {
+		if !dispatched[ns] {
+			unexpected = append(unexpected, ns)
+		}
+	}
+	if len(missing) == 0 && len(unexpected) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	sort.Strings(unexpected)
+	return fmt.Errorf("reviewed vschema changes this deployment would not plan: %v; vschema changes this deployment would plan that were not reviewed: %v", missing, unexpected)
 }
 
 // Apply executes a previously generated plan.
