@@ -2155,7 +2155,7 @@ func TestGRPCClient_ProgressPollTerminalErrorFailsApply(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid apply_id")
 
@@ -2202,7 +2202,7 @@ func TestGRPCClient_ProgressPollRepeatedRetryableErrorsPauseApply(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "remote service unavailable")
 
@@ -2264,7 +2264,7 @@ func TestGRPCClient_ProgressPollBoundsStoppedAfterStart(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, true, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, true, wholeApplyTaskScope(), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "start accepted")
 	assert.Contains(t, err.Error(), "remained stopped after start grace period")
@@ -2316,10 +2316,115 @@ func TestGRPCClient_ProgressPollAdoptsTerminalTablesAfterStart(t *testing.T) {
 		logs:    &mockApplyLogStore{},
 	}
 
-	err := client.pollForCompletion(t.Context(), apply, true, wholeApplyTaskScope())
+	err := client.pollForCompletion(t.Context(), apply, true, wholeApplyTaskScope(), false)
 	require.NoError(t, err)
 	assert.Equal(t, state.Apply.Completed, apply.State)
 	assert.Equal(t, state.Task.Completed, task.State)
+}
+
+// An operation-scoped barrier copy drive must stop driving the moment the remote
+// parks at the cutover barrier: it persists the operation's tasks at
+// waiting_for_cutover and returns so the operator can mark the operation row
+// parked and free it for the deployment-ordered cutover claim. Without releasing
+// here the drive would hold its lease and poll the parked remote forever, so the
+// cutover claim never sees a parked operation and the rollout stalls.
+func TestGRPCClient_PollForCompletionReleasesAtCutoverBarrier(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_WAITING_FOR_CUTOVER,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.WaitingForCutover,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              60,
+		ApplyIdentifier: "apply-barrier-park",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "eu",
+		Environment:     "production",
+		ExternalID:      "remote-barrier-park",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             61,
+		TaskIdentifier: "task-barrier-park",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: &storedApply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    &mockApplyLogStore{},
+	}
+
+	// A generous deadline: the drive must return promptly at the barrier, not
+	// run until the deadline.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), true)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
+	assert.Equal(t, state.Task.WaitingForCutover, task.State)
+}
+
+// The cutover drive (and any non-barrier drive) must NOT release at the barrier:
+// it keeps polling a remote parked at waiting_for_cutover so it can carry the
+// swap past the barrier to terminal. With releaseAtCutoverBarrier false the
+// drive polls until the context deadline rather than returning.
+func TestGRPCClient_PollForCompletionDoesNotReleaseWhenBarrierReleaseDisabled(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_WAITING_FOR_CUTOVER,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.WaitingForCutover,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              62,
+		ApplyIdentifier: "apply-barrier-hold",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "eu",
+		Environment:     "production",
+		ExternalID:      "remote-barrier-hold",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	task := &storage.Task{
+		ID:             63,
+		TaskIdentifier: "task-barrier-hold",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: &storedApply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    &mockApplyLogStore{},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
 }
 
 func TestGRPCClient_ResumeApplyDoesNotRegressRunningApplyToPendingProgress(t *testing.T) {
@@ -2710,7 +2815,7 @@ func TestGRPCClient_PollSetsTerminalTaskMetadataFromRemoteTaskProgress(t *testin
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Task.Completed, task.State)
@@ -2754,7 +2859,7 @@ func TestGRPCClient_PollReconcilesLaggingTaskWhenRemoteApplyCompletedAndTaskProg
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Apply.Completed, applyStore.apply.State)
@@ -2797,7 +2902,7 @@ func TestGRPCClient_PollKeepsApplyActiveWhenReconcilingLaggingTaskStorageFails(t
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "storage unavailable")
 	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
@@ -2843,7 +2948,7 @@ func TestGRPCClient_PollReconcilesLaggingTaskWhenRemoteApplyStoppedAndTaskProgre
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Apply.Stopped, applyStore.apply.State)
@@ -2931,7 +3036,7 @@ func TestGRPCClient_PollReturnsTerminalStorageUpdateError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "update terminal remote gRPC apply")
 	assert.Contains(t, err.Error(), "storage unavailable")
@@ -2967,7 +3072,7 @@ func TestGRPCClient_PollKeepsApplyActiveWhenTerminalTaskLoadFails(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "load tasks to sync terminal gRPC progress")
 	assert.Contains(t, err.Error(), "task storage unavailable")
@@ -3010,7 +3115,7 @@ func TestGRPCClient_PollSkipsTaskFinalizationWhenStoredApplyAlreadyTerminal(t *t
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.NoError(t, err)
 
 	assert.Equal(t, state.Apply.Failed, apply.State)
@@ -4241,7 +4346,7 @@ func TestGRPCClient_PollFailsWhenRemoteApplyIsNotFound(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "remote-not-found")
 
@@ -4282,7 +4387,7 @@ func TestGRPCClient_PollFailsWhenExactRemoteApplyHasNoActiveProgress(t *testing.
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no active schema change")
 
@@ -4320,7 +4425,7 @@ func TestGRPCClient_PollFailsWhenRemoteApplyStateIsUnmapped(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unmapped remote state")
 	assert.Equal(t, state.Apply.Running, apply.State)
@@ -4364,7 +4469,7 @@ func TestGRPCClient_RemoteProgressLossDoesNotOverwriteTerminalApply(t *testing.T
 
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope())
+	err := client.pollForCompletion(ctx, apply, false, wholeApplyTaskScope(), false)
 	require.Error(t, err)
 
 	assert.Equal(t, state.Apply.Completed, apply.State)
