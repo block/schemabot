@@ -444,8 +444,9 @@ type psMetadata struct {
 	// the durable baseline that lets a later process — a resume on another pod,
 	// or an API progress poll — discover this deploy's own context by diffing
 	// against it; the process that captured the baseline would otherwise be the
-	// only one that knows it. Timestamp values are diagnostic and feed the
-	// earliest-requested tie-break; membership drives the baseline diff.
+	// only one that knows it. Map membership drives the baseline diff; the stored
+	// timestamp values are diagnostic only — the earliest-requested tie-break in
+	// discovery reads requested_timestamp from the current rows, not from these.
 	ExistingMigrationCtxs map[string]MigrationContextTimestamps `json:"existing_migration_contexts,omitempty"`
 }
 

@@ -4,12 +4,12 @@ package localscale_test
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,17 +19,17 @@ import (
 	"github.com/block/schemabot/pkg/psclient"
 )
 
-// A PlanetScale deploy's per-shard progress keys off the Vitess migration_context
-// discovered by diffing SHOW VITESS_MIGRATIONS against a pre-deploy baseline. The
-// baseline is persisted in the deploy operation's engine resume metadata, so a
-// process that never captured it — an API progress poll on another pod, or a
-// resume — can still recover the context instead of leaving per-shard progress
-// empty.
+// A PlanetScale deploy's per-shard progress keys off the Vitess schema-change
+// context (the `migration_context` column in SHOW VITESS_MIGRATIONS), discovered
+// by diffing the current contexts against a pre-deploy baseline. The baseline is
+// persisted in the deploy operation's engine resume metadata, so a process that
+// never captured it — an API progress poll on another replica, or a resume — can
+// still recover the context instead of leaving per-shard progress empty.
 //
-// This drives the real recovery path against LocalScale: a first deploy seeds a
-// terminal context (the durable baseline); a second deploy with deferred cutover
-// parks an in-flight context; then Progress is called with the stored context
-// blanked but the baseline present, and must rediscover the in-flight context.
+// This drives the real recovery path against LocalScale: a single deploy with
+// deferred cutover parks an in-flight context, then Progress is called with the
+// stored context blanked but the persisted baseline present, and must rediscover
+// the in-flight context.
 func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
 	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
@@ -37,21 +37,16 @@ func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
 
 	const keyspace = "testapp_sharded"
 
-	// First deploy: completes and leaves a terminal context behind. It stands in
-	// for the contexts that already exist before the change under test deploys —
-	// the durable baseline a later process diffs against.
-	baselineBranch := createBranchWithDDL(t, ctx, "recover-baseline",
-		map[string][]string{keyspace: {"ALTER TABLE `users` ADD COLUMN `recover_baseline_col` varchar(16) NULL"}}, nil)
-	baselineDR := createDeploy(t, ctx, baselineBranch, true)
-	deploy(t, ctx, baselineDR.Number, false)
-	waitForDeployState(t, ctx, baselineDR.Number, drState.CompletePendingRevert, drState.Complete)
-
+	// Snapshot the contexts that already exist as the pre-deploy baseline the
+	// recovery diffs against. It may be empty (a clean keyspace) or carry terminal
+	// history from earlier work; either way the change under test is excluded
+	// because it has not deployed yet.
 	baselineContexts := captureMigrationContexts(t, ctx, keyspace)
-	require.NotEmpty(t, baselineContexts, "first deploy should leave a baseline migration_context")
 
-	// Second deploy with deferred cutover: the change under test. Its migration
-	// parks in flight (waiting for cutover) rather than completing, so its context
-	// is a live, non-terminal candidate for discovery.
+	// One deploy with deferred cutover (auto_cutover=false): its migration parks
+	// in flight (waiting for cutover) rather than completing, so its context is a
+	// live, non-terminal candidate that recovery can discover and attach progress
+	// to. A single deploy avoids an earlier deploy's revert window blocking it.
 	changeBranch := createBranchWithDDL(t, ctx, "recover-change",
 		map[string][]string{keyspace: {"ALTER TABLE `users` ADD COLUMN `recover_change_col` varchar(16) NULL"}}, nil)
 	changeDR := createDeploy(t, ctx, changeBranch, false)
@@ -63,8 +58,9 @@ func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
 	)
 	creds := newRecoveryCredentials(t, ctx)
 
-	// The stored context is blank (the bug condition), but the baseline is present
-	// in engine resume metadata, so Progress must rediscover the in-flight context.
+	// The stored context is blank (the bug condition); with only the persisted
+	// baseline in engine resume metadata, Progress must rediscover the in-flight
+	// context against the live migrations.
 	rs, err := planetscale.BuildResumeState(planetscale.ResumeData{
 		BranchName:            changeBranch,
 		DeployRequestID:       changeDR.Number,
@@ -131,8 +127,13 @@ func newRecoveryCredentials(t *testing.T, ctx context.Context) *engine.Credentia
 		Branch:       "main",
 	})
 	require.NoError(t, err, "CreateBranchPassword for main vtgate")
+	cfg := mysql.NewConfig()
+	cfg.User = pw.Username
+	cfg.Passwd = pw.PlainText
+	cfg.Net = "tcp"
+	cfg.Addr = pw.Hostname // namespace-free; the engine runs USE per keyspace
 	return &engine.Credentials{
-		DSN: fmt.Sprintf("%s:%s@tcp(%s)/", pw.Username, pw.PlainText, pw.Hostname),
+		DSN: cfg.FormatDSN(),
 		Metadata: map[string]string{
 			"organization": testOrg,
 			"main_branch":  "main",

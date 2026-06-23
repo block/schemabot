@@ -83,14 +83,17 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
-	// Late migration-context recovery. A progress poll can run in a process that
-	// never captured the pre-deploy baseline — a different pod, or an apply whose
-	// deploy was created before Vitess exposed its context — so the stored context
-	// is empty even though the deploy is live and producing per-shard migrations.
-	// Recover it from the durable baseline persisted in engine resume metadata,
-	// anchored to the deploy's creation time, and keep the rest of the resume
-	// state intact so the per-shard query below can attach progress.
-	if req.ResumeState.MigrationContext == "" && len(meta.ExistingMigrationCtxs) > 0 {
+	// Late schema-change-context recovery. A progress poll can run in a process
+	// that never captured the pre-deploy baseline — a different replica, or an
+	// apply whose deploy was created before Vitess exposed its context — so the
+	// stored context is empty even though the deploy is live and producing
+	// per-shard migrations. Rediscover it, diffing against whatever baseline is
+	// persisted in engine resume metadata (possibly empty on a fresh database, in
+	// which case every in-flight context is a candidate) and anchored to the
+	// deploy's creation time; selection stays ambiguous and keeps the empty value
+	// when it can't safely choose. Keep the rest of the resume state intact so the
+	// per-shard query below can attach progress.
+	if req.ResumeState.MigrationContext == "" {
 		recovered := e.discoverMigrationContext(ctx, client, req.Database, req.Credentials, meta.ExistingMigrationCtxs, dr.CreatedAt)
 		if recovered != "" {
 			e.logger.Info("recovered migration context on progress poll",
