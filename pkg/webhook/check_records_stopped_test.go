@@ -3,6 +3,7 @@
 package webhook
 
 import (
+	"context"
 	"database/sql"
 	"log/slog"
 	"os"
@@ -28,6 +29,7 @@ func TestUpdateCheckRecordForApplyResult_StoppedThenCompleted(t *testing.T) {
 
 	db, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
+	require.NoError(t, db.PingContext(ctx))
 	t.Cleanup(func() { _ = db.Close() })
 
 	const (
@@ -37,12 +39,16 @@ func TestUpdateCheckRecordForApplyResult_StoppedThenCompleted(t *testing.T) {
 		env  = "staging"
 	)
 
-	clear := func() {
-		_, _ = db.ExecContext(ctx, "DELETE FROM checks WHERE repository = ? AND pull_request = ?", repo, pr)
-		_, _ = db.ExecContext(ctx, "DELETE FROM applies WHERE repository = ? AND pull_request = ?", repo, pr)
+	clear := func(c context.Context) {
+		_, err := db.ExecContext(c, "DELETE FROM checks WHERE repository = ? AND pull_request = ?", repo, pr)
+		require.NoError(t, err)
+		_, err = db.ExecContext(c, "DELETE FROM applies WHERE repository = ? AND pull_request = ?", repo, pr)
+		require.NoError(t, err)
 	}
-	clear()
-	t.Cleanup(clear)
+	clear(ctx)
+	// Cleanup runs after t.Context() is cancelled, so derive a non-cancelled
+	// context from it for the cleanup deletes.
+	t.Cleanup(func() { clear(context.WithoutCancel(ctx)) })
 
 	st := mysqlstore.New(db)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))

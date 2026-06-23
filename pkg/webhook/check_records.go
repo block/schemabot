@@ -326,6 +326,14 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 	// apply's success can never update it. Leave the check in_progress so the PR
 	// stays blocked while paused and a later resume can complete it.
 	if state.IsState(apply.State, state.Apply.Stopped) {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "apply_finished",
+			Repository:   repo,
+			Database:     apply.Database,
+			DatabaseType: apply.DatabaseType,
+			Environment:  apply.Environment,
+			Status:       "noop",
+		})
 		h.logger.Info("apply stopped; leaving check in_progress so a resume can complete it",
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
