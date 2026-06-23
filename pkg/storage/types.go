@@ -448,6 +448,17 @@ func (a *Apply) Lease() ApplyLease {
 	}
 }
 
+// IsRollback reports whether this apply reverts a previously applied schema
+// change. It reads the durable rollback option so any terminal path can tell a
+// rollback from an ordinary apply without the rollback command's in-memory
+// context.
+func (a *Apply) IsRollback() bool {
+	if a == nil {
+		return false
+	}
+	return ParseApplyOptions(a.Options).Rollback
+}
+
 // ApplyOperation represents one child row in the apply_operations table:
 // the per-(deployment, target) slice of a multi-deployment apply, and the
 // unit of work the operator (claim loop) reconciles.
@@ -581,6 +592,13 @@ type ApplyOptions struct {
 	// Target is the opaque endpoint-discovery target forwarded to Tern.
 	// Defaults to the apply database when empty.
 	Target string `json:"target,omitempty"`
+
+	// Rollback marks an apply that reverts a previously applied schema change
+	// (executed from a rollback plan). It is durable so any terminal path can
+	// distinguish a rollback from an ordinary apply: a completed rollback must
+	// leave the required check action_required (the PR's change has been reverted
+	// and must not merge as-is), not success.
+	Rollback bool `json:"rollback,omitempty"`
 }
 
 // ControlOperation identifies a user-requested control operation.
@@ -632,6 +650,7 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 		DeferDeploy:  options["defer_deploy"] == "true",
 		SkipRevert:   options["skip_revert"] == "true",
 		Target:       options["target"],
+		Rollback:     options["rollback"] == "true",
 	}
 	if rawVolume := options["volume"]; rawVolume != "" {
 		volume, err := strconv.Atoi(rawVolume)
@@ -665,6 +684,9 @@ func (opts ApplyOptions) Map() map[string]string {
 	}
 	if opts.Target != "" {
 		options["target"] = opts.Target
+	}
+	if opts.Rollback {
+		options["rollback"] = "true"
 	}
 	return options
 }

@@ -240,6 +240,16 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 			"apply_state", apply.State, "check_apply_id", check.ApplyID,
 			"check_head_sha", check.HeadSHA)
 
+		// A completed rollback must reconcile to action_required, not success: its
+		// success is a reverted PR change that must not merge as-is. Route it to the
+		// rollback finalizer instead of the ordinary apply-result update, which
+		// would mark the check successful.
+		if apply.IsRollback() && state.IsState(apply.State, state.Apply.Completed) {
+			h.setCheckActionRequired(repo, pr, apply.InstallationID, apply)
+			reconciled = true
+			continue
+		}
+
 		updated, err := h.updateCheckRecordForApplyResult(ctx, repo, pr, apply)
 		if err != nil {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
