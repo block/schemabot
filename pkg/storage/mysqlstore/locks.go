@@ -32,6 +32,16 @@ type lockStore struct {
 // confirm command loads. A re-acquire that passes an empty PendingPlanID (CLI)
 // leaves the existing value intact.
 func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
+	op := fmt.Sprintf("acquire lock for %s/%s owner=%s", lock.DatabaseName, lock.DatabaseType, lock.Owner)
+	return withLockRetry(ctx, op, func() error {
+		return s.acquireOnce(ctx, lock)
+	})
+}
+
+// acquireOnce performs a single claim attempt. Concurrent same-owner callers
+// racing to claim the same key can hit a transient InnoDB lock conflict on the
+// INSERT below; Acquire retries those.
+func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 	existing, err := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
 	if err != nil {
 		return fmt.Errorf("read existing lock for %s/%s: %w", lock.DatabaseName, lock.DatabaseType, err)
