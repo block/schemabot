@@ -245,16 +245,22 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 		// rollback finalizer instead of the ordinary apply-result update, which
 		// would mark the check successful.
 		if apply.IsRollback() && state.IsState(apply.State, state.Apply.Completed) {
-			h.setCheckActionRequired(repo, pr, apply.InstallationID, apply)
-			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-				Operation:    "stale_check_reconciliation",
-				Repository:   repo,
-				Database:     check.DatabaseName,
-				DatabaseType: check.DatabaseType,
-				Environment:  check.Environment,
-				Status:       "success",
-			})
-			reconciled = true
+			// setCheckActionRequired emits its own rollback_finished
+			// success/skipped/error metric; only count the reconciliation as a
+			// success here when the stored check was actually updated, so an
+			// ownership-miss skip does not inflate the stale-reconcile success
+			// count or trigger a spurious aggregate refresh.
+			if h.setCheckActionRequired(repo, pr, apply.InstallationID, apply) {
+				metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+					Operation:    "stale_check_reconciliation",
+					Repository:   repo,
+					Database:     check.DatabaseName,
+					DatabaseType: check.DatabaseType,
+					Environment:  check.Environment,
+					Status:       "success",
+				})
+				reconciled = true
+			}
 			continue
 		}
 
@@ -407,7 +413,11 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 
 // setCheckActionRequired sets the rollback apply's check back to action_required.
 // Used after a rollback completes because the PR's schema changes need to be re-applied.
-func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int64, apply *storage.Apply) {
+// It reports whether the stored check was actually updated; callers that count
+// their own reconciliation outcome should not record success on a skip (this
+// function already emits its own skipped/ownership-miss metric). It emits its own
+// rollback_finished success/skipped/error metrics regardless.
+func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int64, apply *storage.Apply) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -426,7 +436,7 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
 			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
 			"error", err)
-		return
+		return false
 	}
 	if check == nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -441,7 +451,7 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 			"repo", repo, "pr", pr, "database", apply.Database,
 			"database_type", apply.DatabaseType, "environment", apply.Environment,
 			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
-		return
+		return false
 	}
 
 	check.Status = checkStatusCompleted
@@ -465,7 +475,7 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
 			"check_apply_id", check.ApplyID, "check_status", check.Status,
 			"check_head_sha", check.HeadSHA, "error", err)
-		return
+		return false
 	}
 	if !updated {
 		metrics.RecordCheckOwnershipMiss(ctx, "rollback_finished", repo, apply.Database, apply.DatabaseType, apply.Deployment, apply.Environment)
@@ -483,7 +493,7 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
 			"apply_state", apply.State, "check_apply_id", check.ApplyID,
 			"check_status", check.Status, "check_head_sha", check.HeadSHA)
-		return
+		return false
 	}
 
 	h.logger.Info("check set to action_required after rollback",
@@ -510,4 +520,5 @@ func (h *Handler) setCheckActionRequired(repo string, pr int, installationID int
 			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
 			"error", err)
 	}
+	return true
 }
