@@ -319,6 +319,21 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
 	}
 
+	// A stopped apply is a resumable pause, not a terminal outcome. Driving the
+	// stored check to a terminal conclusion here both misrepresents the pause and
+	// locks out the eventual completion: CompleteForApply only advances a check
+	// that is still in_progress, so once a stop marks it completed the resumed
+	// apply's success can never update it. Leave the check in_progress so the PR
+	// stays blocked while paused and a later resume can complete it.
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		h.logger.Info("apply stopped; leaving check in_progress so a resume can complete it",
+			"repo", repo, "pr", pr, "database", apply.Database,
+			"database_type", apply.DatabaseType, "environment", apply.Environment,
+			"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
+			"check_status", check.Status)
+		return false, nil
+	}
+
 	var conclusion string
 	switch {
 	case state.IsState(apply.State, state.Apply.Completed) && checkBlockedByRemovedSchemaAfterApply(check):
