@@ -2,6 +2,7 @@ CREATE TABLE `apply_operations` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `apply_id` bigint unsigned NOT NULL,
   `deployment` varchar(255) NOT NULL,
+  `operation_key` varchar(255) NOT NULL DEFAULT '',
   `target` varchar(255) NOT NULL DEFAULT '',
   `engine_resume_context` varchar(255) DEFAULT NULL,
   `engine_resume_metadata` json DEFAULT NULL,
@@ -17,7 +18,7 @@ CREATE TABLE `apply_operations` (
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `idx_apply_operation` (`apply_id`,`deployment`),
+  UNIQUE KEY `idx_apply_operation` (`apply_id`,`deployment`,`operation_key`),
   KEY `idx_deployment_state` (`deployment`,`state`),
   KEY `idx_state_created_id` (`state`,`created_at`,`id`),
   KEY `idx_apply_created_id` (`apply_id`,`created_at`,`id`)

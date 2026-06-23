@@ -1,6 +1,6 @@
 // apply_operations.go implements ApplyOperationStore for per-(apply,
-// deployment) child rows under a multi-deployment apply — the unit of work
-// the operator claims.
+// deployment, operation_key) child rows under a multi-operation apply — the
+// unit of work the operator claims.
 package mysqlstore
 
 import (
@@ -19,7 +19,7 @@ import (
 )
 
 // applyOperationColumns lists all columns for SELECT queries.
-const applyOperationColumns = `id, apply_id, deployment, target, state, error_message,
+const applyOperationColumns = `id, apply_id, deployment, operation_key, target, state, error_message,
 	cutover_policy, on_failure, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
@@ -33,7 +33,7 @@ type applyOperationStore struct {
 }
 
 // Insert stores a new apply_operations row and returns its ID.
-// Translates a unique-key conflict on (apply_id, deployment) into
+// Translates a unique-key conflict on (apply_id, deployment, operation_key) into
 // storage.ErrApplyOperationExists so callers can branch cleanly.
 func (s *applyOperationStore) Insert(ctx context.Context, ad *storage.ApplyOperation) (int64, error) {
 	return insertApplyOperation(ctx, s.db, ad)
@@ -48,8 +48,8 @@ type sqlExecer interface {
 
 // insertApplyOperation inserts one apply_operations row using the supplied
 // executer (pool or transaction). On success the row's ID and State fields
-// are set. A duplicate-key violation on (apply_id, deployment) is translated
-// to storage.ErrApplyOperationExists for callers to branch on.
+// are set. A duplicate-key violation on (apply_id, deployment, operation_key)
+// is translated to storage.ErrApplyOperationExists for callers to branch on.
 func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.ApplyOperation) (int64, error) {
 	stateVal := ad.State
 	if stateVal == "" {
@@ -75,11 +75,11 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 
 	result, err := exec.ExecContext(ctx, `
 		INSERT INTO apply_operations (
-			apply_id, deployment, target, state, error_message, cutover_policy, on_failure,
+			apply_id, deployment, operation_key, target, state, error_message, cutover_policy, on_failure,
 			started_at, completed_at, engine_resume_context, engine_resume_metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		ad.ApplyID, ad.Deployment, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
+		ad.ApplyID, ad.Deployment, ad.OperationKey, ad.Target, stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
@@ -87,7 +87,7 @@ func insertApplyOperation(ctx context.Context, exec sqlExecer, ad *storage.Apply
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlErrDupEntry {
 			return 0, storage.ErrApplyOperationExists
 		}
-		return 0, fmt.Errorf("insert apply_operations (apply=%d, deployment=%s): %w", ad.ApplyID, ad.Deployment, err)
+		return 0, fmt.Errorf("insert apply_operations (apply=%d, deployment=%s, operation_key=%s): %w", ad.ApplyID, ad.Deployment, ad.OperationKey, err)
 	}
 
 	id, err := result.LastInsertId()
@@ -111,13 +111,20 @@ func (s *applyOperationStore) Get(ctx context.Context, id int64) (*storage.Apply
 	return scanApplyOperation(row)
 }
 
-// GetByApplyAndDeployment returns the child row for (apply_id, deployment), or nil if not found.
+// GetByApplyAndDeployment returns the legacy unkeyed child row for
+// (apply_id, deployment), or nil if not found.
 func (s *applyOperationStore) GetByApplyAndDeployment(ctx context.Context, applyID int64, deployment string) (*storage.ApplyOperation, error) {
+	return s.GetByApplyDeploymentAndOperationKey(ctx, applyID, deployment, "")
+}
+
+// GetByApplyDeploymentAndOperationKey returns the child row for
+// (apply_id, deployment, operation_key), or nil if not found.
+func (s *applyOperationStore) GetByApplyDeploymentAndOperationKey(ctx context.Context, applyID int64, deployment, operationKey string) (*storage.ApplyOperation, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT `+applyOperationColumns+`
 		FROM apply_operations
-		WHERE apply_id = ? AND deployment = ?
-	`, applyID, deployment)
+		WHERE apply_id = ? AND deployment = ? AND operation_key = ?
+	`, applyID, deployment, operationKey)
 	return scanApplyOperation(row)
 }
 
@@ -1281,7 +1288,7 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
 
 	if err := s.Scan(
-		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.Target, &ad.State, &errMsg,
+		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.Target, &ad.State, &errMsg,
 		&ad.CutoverPolicy, &ad.OnFailure, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {

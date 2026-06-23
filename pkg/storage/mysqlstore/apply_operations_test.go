@@ -194,6 +194,27 @@ func TestApplyOperationStore_GetByApplyAndDeployment(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "region-a", got.Deployment)
+	assert.Empty(t, got.OperationKey)
+
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "shard/-80", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	got, err = store.ApplyOperations().GetByApplyAndDeployment(ctx, apply.ID, "region-a")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Empty(t, got.OperationKey, "legacy lookup must return the unkeyed operation")
+
+	got, err = store.ApplyOperations().GetByApplyDeploymentAndOperationKey(ctx, apply.ID, "region-a", "shard/-80")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "region-a", got.Deployment)
+	assert.Equal(t, "shard/-80", got.OperationKey)
+
+	got, err = store.ApplyOperations().GetByApplyDeploymentAndOperationKey(ctx, apply.ID, "region-a", "shard/80-")
+	require.NoError(t, err)
+	require.Nil(t, got)
 
 	// Unknown deployment for this apply → nil, no error.
 	got, err = store.ApplyOperations().GetByApplyAndDeployment(ctx, apply.ID, "region-zzz")
@@ -214,9 +235,21 @@ func TestApplyOperationStore_UniqueConstraint(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Duplicate (apply_id, deployment) → typed error.
+	// Duplicate (apply_id, deployment, operation_key) → typed error.
 	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a",
+	})
+	require.ErrorIs(t, err, storage.ErrApplyOperationExists)
+
+	// Same deployment with a distinct operation key for the same apply → ok.
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "shard/-80",
+	})
+	require.NoError(t, err)
+
+	// Duplicate keyed operation → typed error.
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "shard/-80",
 	})
 	require.ErrorIs(t, err, storage.ErrApplyOperationExists)
 
@@ -250,7 +283,7 @@ func TestApplyOperationStore_ListByApply(t *testing.T) {
 	// Insert three children in deployment order.
 	for _, dep := range []string{"region-a", "region-b", "region-c"} {
 		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-			ApplyID: apply.ID, Deployment: dep, Target: "payments",
+			ApplyID: apply.ID, Deployment: dep, OperationKey: "schema", Target: "payments",
 		})
 		require.NoError(t, err)
 	}
@@ -262,10 +295,43 @@ func TestApplyOperationStore_ListByApply(t *testing.T) {
 	// ListByApply is ordered by (created_at, id); rows inserted in the same
 	// second tie-break on id, preserving insertion (deployment) order.
 	deps := make([]string, len(got))
+	operationKeys := make([]string, len(got))
 	for i, ad := range got {
 		deps[i] = ad.Deployment
+		operationKeys[i] = ad.OperationKey
 	}
 	assert.Equal(t, []string{"region-a", "region-b", "region-c"}, deps)
+	assert.Equal(t, []string{"schema", "schema", "schema"}, operationKeys)
+}
+
+func TestApplyOperationStore_ListByApply_AllowsMultipleOperationKeysPerDeployment(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_md_same_deployment_keys", 1)
+
+	for _, operationKey := range []string{"shard/-80", "shard/80-"} {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID:      apply.ID,
+			Deployment:   "region-a",
+			OperationKey: operationKey,
+			Target:       "payments",
+		})
+		require.NoError(t, err)
+	}
+
+	got, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+
+	operationKeys := make([]string, len(got))
+	for i, ad := range got {
+		assert.Equal(t, "region-a", ad.Deployment)
+		operationKeys[i] = ad.OperationKey
+	}
+	assert.Equal(t, []string{"shard/-80", "shard/80-"}, operationKeys)
 }
 
 // TestApplyOperationStore_ListByApply_OrderedByCreatedAt proves ListByApply

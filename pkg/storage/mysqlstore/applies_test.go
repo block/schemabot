@@ -709,12 +709,12 @@ func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnOperationFailure(t *t
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
-	// Two operations sharing the same deployment violates the
-	// UNIQUE KEY (apply_id, deployment) constraint on the second insert and
+	// Two operations sharing the same storage identity violate the UNIQUE KEY
+	// (apply_id, deployment, operation_key) constraint on the second insert and
 	// must roll back the whole transaction — no orphan apply or tasks rows.
 	operations := []*storage.ApplyOperation{
-		{Deployment: "payments-a", Target: "payments", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
-		{Deployment: "payments-a", Target: "payments", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
+		{Deployment: "payments-a", OperationKey: "schema", Target: "payments", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
+		{Deployment: "payments-a", OperationKey: "schema", Target: "payments", State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now},
 	}
 
 	_, err := store.Applies().CreateWithTasksAndOperations(ctx, apply, nil, operations)
