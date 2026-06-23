@@ -246,6 +246,14 @@ func (h *Handler) reconcileStaleChecks(ctx context.Context, client *ghclient.Ins
 		// would mark the check successful.
 		if apply.IsRollback() && state.IsState(apply.State, state.Apply.Completed) {
 			h.setCheckActionRequired(repo, pr, apply.InstallationID, apply)
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:    "stale_check_reconciliation",
+				Repository:   repo,
+				Database:     check.DatabaseName,
+				DatabaseType: check.DatabaseType,
+				Environment:  check.Environment,
+				Status:       "success",
+			})
 			reconciled = true
 			continue
 		}
