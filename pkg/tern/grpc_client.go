@@ -2755,11 +2755,9 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 
 			// Park-and-release at the cutover barrier, mirroring the LocalClient
 			// copy drive. The tasks were just synced to waiting_for_cutover above,
-			// so exit the drive here: the operator persists the operation row at
-			// waiting_for_cutover and frees it for the deployment-ordered cutover
-			// claim. Without this an operation-scoped barrier copy drive would
-			// hold its lease and poll the parked remote forever, so the cutover
-			// claim never sees a parked operation and the rollout stalls.
+			// so exit the drive here and release the lease: the operator persists
+			// the operation row at waiting_for_cutover and frees it for the
+			// deployment-ordered cutover claim to pick up.
 			if releaseAtCutoverBarrier && state.IsState(apply.State, state.Apply.WaitingForCutover) {
 				slog.Info("operation parked at cutover barrier; exiting remote copy drive",
 					"apply_id", apply.ApplyIdentifier,
