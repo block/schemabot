@@ -189,3 +189,31 @@ func TestDriftGuard_RecomputeErrorFailsClosed(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "recompute local plan")
 }
+
+// canonicalDDLForDrift must fail closed on DDL it cannot parse: ddl.Canonicalize
+// returns its input unchanged on a parse failure, so without this guard an
+// unparseable statement would silently compare by raw text and could mask drift.
+func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
+	t.Run("unparseable DDL is rejected", func(t *testing.T) {
+		_, err := canonicalDDLForDrift("this is not valid sql")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unparseable DDL")
+	})
+
+	t.Run("empty DDL is rejected", func(t *testing.T) {
+		_, err := canonicalDDLForDrift("   ")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "empty DDL")
+	})
+
+	t.Run("parseable DDL is canonicalized", func(t *testing.T) {
+		// Whitespace and unquoted identifiers normalize to the same canonical form
+		// regardless of incidental formatting, so equivalent DDL compares equal.
+		spaced, err := canonicalDDLForDrift("ALTER TABLE   users   ADD COLUMN email varchar(255)")
+		require.NoError(t, err)
+		quoted, err := canonicalDDLForDrift("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		require.NoError(t, err)
+		assert.Equal(t, quoted, spaced)
+		assert.NotEmpty(t, spaced)
+	})
+}

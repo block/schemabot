@@ -1506,7 +1506,11 @@ func compareDriftMultisets(recomputed, dispatched driftChangeMultiset) error {
 }
 
 func formatDriftKey(k driftChangeKey) string {
-	return fmt.Sprintf("%s.%s/%s", k.namespace, k.table, k.operation)
+	// Include the canonicalized DDL: the multiset keys on it, so two changes for
+	// the same namespace/table/operation that differ only in DDL must render
+	// differently or the drift message would list identical-looking entries on
+	// both sides and hide what actually drifted.
+	return fmt.Sprintf("%s.%s/%s (%s)", k.namespace, k.table, k.operation, k.ddl)
 }
 
 // vschemaNamespacesFromPlanResult returns the namespaces the recomputed plan
