@@ -300,7 +300,10 @@ func multiDeployEnsureNoActiveChange(t *testing.T, database, env string, deploym
 				"environment": env,
 				"apply_id":    active.ApplyID,
 			})
+			status := resp.StatusCode
 			_ = resp.Body.Close()
+			require.Equalf(t, http.StatusOK, status,
+				"release cutover barrier for %s/%s (apply %s)", database, env, active.ApplyID)
 			time.Sleep(time.Second)
 			continue
 		}
