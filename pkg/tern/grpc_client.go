@@ -101,6 +101,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -1785,15 +1786,16 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 
 	resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
-		PlanId:      plan.PlanIdentifier,
-		Options:     options,
-		Database:    apply.Database,
-		Type:        apply.DatabaseType,
-		DdlChanges:  tasksToProtoTableChanges(tasks),
-		SchemaFiles: schemaFilesToProto(plan.SchemaFiles),
-		Environment: apply.Environment,
-		Target:      target,
-		Caller:      apply.Caller,
+		PlanId:       plan.PlanIdentifier,
+		Options:      options,
+		Database:     apply.Database,
+		Type:         apply.DatabaseType,
+		DdlChanges:   tasksToProtoTableChanges(tasks),
+		SchemaFiles:  schemaFilesToProto(plan.SchemaFiles),
+		Environment:  apply.Environment,
+		Target:       target,
+		Caller:       apply.Caller,
+		TargetShards: taskTargetShards(tasks),
 	})
 	if err != nil {
 		if isAmbiguousRemoteApplyDispatchError(err) {
@@ -1974,6 +1976,23 @@ func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
 		})
 	}
 	return changes
+}
+
+func taskTargetShards(tasks []*storage.Task) []string {
+	seen := make(map[string]struct{})
+	var shards []string
+	for _, task := range tasks {
+		if task.Shard == "" {
+			continue
+		}
+		if _, ok := seen[task.Shard]; ok {
+			continue
+		}
+		seen[task.Shard] = struct{}{}
+		shards = append(shards, task.Shard)
+	}
+	sort.Strings(shards)
+	return shards
 }
 
 // storedApplyTransitionStatus describes whether a driver may copy a remote

@@ -6,8 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -176,37 +174,6 @@ func TestApplyEventStateTransition(t *testing.T) {
 		assert.Equal(t, state.Apply.PreparingBranch, got)
 		assert.Equal(t, state.Apply.PreparingBranch, apply.State)
 	})
-}
-
-func TestPlanNamespacesToChanges_VSchemaOnlyWhenStored(t *testing.T) {
-	namespaces := map[string]*storage.NamespacePlanData{
-		"ks_with_vschema": {
-			Tables:    []storage.TableChange{{Table: "users", DDL: "ALTER TABLE users ADD COLUMN x INT", Operation: "alter"}},
-			Artifacts: map[string]string{"vschema.json": `{"tables":{"users":{}}}`},
-		},
-		"ks_without_vschema": {
-			Tables: []storage.TableChange{{Table: "orders", DDL: "ALTER TABLE orders ADD COLUMN y INT", Operation: "alter"}},
-		},
-	}
-
-	changes := planNamespacesToChanges(namespaces)
-	require.Len(t, changes, 2)
-
-	byNS := make(map[string]engine.SchemaChange)
-	for _, c := range changes {
-		byNS[c.Namespace] = c
-	}
-
-	// Keyspace with VSchema stored should have metadata["vschema"] set
-	assert.Equal(t, "true", byNS["ks_with_vschema"].Metadata["vschema_changed"])
-
-	// Keyspace without VSchema should NOT have metadata["vschema"] set
-	assert.Empty(t, byNS["ks_without_vschema"].Metadata["vschema_changed"],
-		"keyspace without VSchema change should not have vschema metadata")
-
-	// Operation field should be preserved (storage string → Spirit type via OpToStatementType)
-	assert.Equal(t, statement.StatementAlterTable, byNS["ks_with_vschema"].TableChanges[0].Operation)
-	assert.Equal(t, statement.StatementAlterTable, byNS["ks_without_vschema"].TableChanges[0].Operation)
 }
 
 func TestDeriveOverallState(t *testing.T) {

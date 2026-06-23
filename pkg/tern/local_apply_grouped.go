@@ -42,9 +42,9 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		"Calling engine.Apply for all tables", "", "")
 
-	// Build per-namespace changes from the plan. For Vitess databases, each
-	// namespace is a keyspace (e.g., "testapp", "testapp_sharded"). For MySQL,
-	c.logger.Info("building changes from plan", "namespaces", len(plan.Namespaces), "plan_id", plan.PlanIdentifier)
+	// Build per-namespace changes from the scoped tasks. Whole-apply drives pass
+	// every task, while operation-scoped drives pass only one operation's tasks.
+	c.logger.Info("building changes from scoped tasks", "task_count", len(tasks), "plan_id", plan.PlanIdentifier)
 	if len(plan.Namespaces) == 0 {
 		c.failApplyWithTasks(ctx, apply, tasks, "plan has no namespace data")
 		return
@@ -63,7 +63,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
 		return
 	}
-	changes := planNamespacesToChanges(plan.Namespaces)
+	changes := groupedResumeChanges(tasks)
 
 	// Mark the apply as started before calling the engine. The engine may run
 	// for a long time (branch creation, DDL application, deploy request) and
@@ -83,16 +83,17 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		return
 	}
 
-	// Grouped mode: all DDLs in one engine call. Use the apply identifier as
-	// MigrationContext so all table work shares one context for progress tracking.
+	// Grouped mode: all DDLs in one engine call. Use the apply identifier so all
+	// table work shares one context for progress tracking.
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
-		Database:    apply.Database,
-		PlanID:      plan.PlanIdentifier,
-		Changes:     changes,
-		SchemaFiles: plan.SchemaFiles,
-		Options:     options,
-		ResumeState: &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
-		Credentials: creds,
+		Database:     apply.Database,
+		PlanID:       plan.PlanIdentifier,
+		Changes:      changes,
+		TargetShards: taskTargetShards(tasks),
+		SchemaFiles:  plan.SchemaFiles,
+		Options:      options,
+		ResumeState:  &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
+		Credentials:  creds,
 		OnEvent: func(event engine.ApplyEvent) {
 			oldState := apply.State
 			newState := deriveApplyPhase(event)

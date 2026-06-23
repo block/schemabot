@@ -1923,7 +1923,7 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout", "")
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout", false)
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(123), storedApplyID)
@@ -1946,6 +1946,112 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 	require.NotNil(t, tasks.tasks[1].ApplyOperationID)
 	assert.Equal(t, applies.operations[0].ID, *tasks.tasks[0].ApplyOperationID)
 	assert.Equal(t, applies.operations[1].ID, *tasks.tasks[1].ApplyOperationID)
+}
+
+func TestCreateStoredApplyFansOutShardedPlanOperations(t *testing.T) {
+	// A sharded plan queues one operation per changed shard/table so each shard
+	// can be claimed and driven independently while unchanged shards stay out of
+	// the apply operation set.
+	applies := &capturingApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	plan := executeApplyTestPlan()
+	plan.DatabaseType = storage.DatabaseTypeStrata
+	plan.Target = "commerce-target"
+	plan.Namespaces = map[string]*storage.NamespacePlanData{
+		"commerce": {
+			Tables: []storage.TableChange{
+				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
+			},
+		},
+	}
+	plan.Shards = []storage.ShardPlan{
+		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
+		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+		{Namespace: "commerce", Shard: "-", NeedsChange: false},
+	}
+	cfg := testServerConfig()
+	cfg.Databases = map[string]DatabaseConfig{}
+	cfg.Databases["testdb"] = DatabaseConfig{
+		Type: storage.DatabaseTypeStrata,
+		Environments: map[string]EnvironmentConfig{
+			"staging": {Target: "commerce-target", Deployment: DefaultDeployment},
+		},
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, cfg, map[string]tern.Client{}, logger)
+
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-sharded-fanout", true)
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(123), storedApplyID)
+	require.NotNil(t, apply)
+	assert.Equal(t, storage.EngineStrata, apply.Engine)
+	require.Len(t, applies.operations, 2)
+	assert.Equal(t, DefaultDeployment, applies.operations[0].Deployment)
+	assert.Equal(t, "commerce-target", applies.operations[0].Target)
+	assert.Equal(t, "commerce/-80/users", applies.operations[0].OperationKey)
+	assert.Equal(t, DefaultDeployment, applies.operations[1].Deployment)
+	assert.Equal(t, "commerce-target", applies.operations[1].Target)
+	assert.Equal(t, "commerce/80-/users", applies.operations[1].OperationKey)
+	require.Len(t, tasks.tasks, 2)
+	assert.Equal(t, "-80", tasks.tasks[0].Shard)
+	assert.Equal(t, "users", tasks.tasks[0].TableName)
+	require.NotNil(t, tasks.tasks[0].ApplyOperationID)
+	assert.Equal(t, applies.operations[0].ID, *tasks.tasks[0].ApplyOperationID)
+	assert.Equal(t, "80-", tasks.tasks[1].Shard)
+	assert.Equal(t, "users", tasks.tasks[1].TableName)
+	require.NotNil(t, tasks.tasks[1].ApplyOperationID)
+	assert.Equal(t, applies.operations[1].ID, *tasks.tasks[1].ApplyOperationID)
+}
+
+func TestCreateStoredApplyDoesNotShardWithoutClientOptIn(t *testing.T) {
+	applies := &capturingApplyStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	plan := executeApplyTestPlan()
+	plan.Namespaces = map[string]*storage.NamespacePlanData{
+		"commerce": {
+			Tables: []storage.TableChange{
+				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
+			},
+		},
+	}
+	plan.Shards = []storage.ShardPlan{
+		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+		{Namespace: "commerce", Shard: "80-", NeedsChange: true},
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+		controls:  &memoryControlRequestStore{},
+	}, testServerConfig(), map[string]tern.Client{}, logger)
+
+	_, _, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-no-sharded-fanout", false)
+
+	require.NoError(t, err)
+	require.Len(t, applies.operations, 1)
+	assert.Empty(t, applies.operations[0].OperationKey)
+	require.Len(t, tasks.tasks, 1)
+	assert.Empty(t, tasks.tasks[0].Shard)
+}
+
+func TestValidateShardOperationKeyPartsRejectsDelimiter(t *testing.T) {
+	err := validateShardOperationKeyParts("commerce", "-80/80-", "users")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reserved delimiter")
 }
 
 func TestProgressByApplyIDServesQueuedRemoteApplyFromStorage(t *testing.T) {

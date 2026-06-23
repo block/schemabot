@@ -235,16 +235,17 @@ type TableChange struct {
 }
 
 // ApplyRequest contains the input for starting a schema change.
-// On first apply, set ResumeState.MigrationContext to group related DDL.
+// On first apply, set the resume context to group related DDL.
 // On resume after restart, pass the full ResumeState from storage.
 type ApplyRequest struct {
-	PlanID      string             // Plan being executed (for tracing and apply→plan linkage)
-	Database    string             // Target database
-	Changes     []SchemaChange     // Per-namespace changes to apply (DDL + files from plan)
-	SchemaFiles schema.SchemaFiles // Full declarative schema files (for engines that apply whole files)
-	Options     map[string]string  // Options like "defer_cutover", "skip_revert"
-	ResumeState *ResumeState       // Migration context (fresh) or full resume state (restart)
-	Credentials *Credentials       // Resolved credentials (from discovery)
+	PlanID       string             // Plan being executed (for tracing and apply→plan linkage)
+	Database     string             // Target database
+	Changes      []SchemaChange     // Per-namespace changes to apply (DDL + files from plan)
+	TargetShards []string           // Optional shard selector for sharded engines
+	SchemaFiles  schema.SchemaFiles // Full declarative schema files (for engines that apply whole files)
+	Options      map[string]string  // Options like "defer_cutover", "skip_revert"
+	ResumeState  *ResumeState       // Fresh context or full resume state after restart
+	Credentials  *Credentials       // Resolved credentials (from discovery)
 
 	// OnStateChange is called by the engine to persist ResumeState at key milestones
 	// during Apply (e.g., after branch creation, after deploy request creation).

@@ -625,13 +625,14 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	// engine keys per-table progress on the same namespace/table pairs the
 	// tasks carry.
 	result, err := eng.Apply(ctx, &engine.ApplyRequest{
-		Database:    apply.Database,
-		PlanID:      plan.PlanIdentifier,
-		Changes:     groupedResumeChanges(tasks),
-		SchemaFiles: plan.SchemaFiles,
-		Options:     options,
-		ResumeState: resumeState,
-		Credentials: creds,
+		Database:     apply.Database,
+		PlanID:       plan.PlanIdentifier,
+		Changes:      groupedResumeChanges(tasks),
+		TargetShards: taskTargetShards(tasks),
+		SchemaFiles:  plan.SchemaFiles,
+		Options:      options,
+		ResumeState:  resumeState,
+		Credentials:  creds,
 		OnStateChange: func(rs *engine.ResumeState) {
 			if rs == nil {
 				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)

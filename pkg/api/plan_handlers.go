@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,7 +26,10 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
+
+const applyOperationKeyMaxLen = 255
 
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
@@ -854,7 +858,7 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		client.SetObserver(storedApplyID, observer)
 	}
 
-	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, attachObserver)
+	applyIdentifier, storedApplyID, err := s.enqueueApply(ctx, plan, req, options, clientSupportsShardedApplyFanout(client), attachObserver)
 	if err != nil {
 		recordApplyError("enqueue apply", err)
 		return nil, 0, err
@@ -881,10 +885,11 @@ func (s *Service) enqueueApply(
 	plan *storage.Plan,
 	req ApplyRequest,
 	options map[string]string,
+	shardedFanoutSupported bool,
 	onApplyCreated func(int64),
 ) (string, int64, error) {
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier, "")
+	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier, shardedFanoutSupported)
 	if err != nil {
 		return "", 0, err
 	}
@@ -900,7 +905,7 @@ func (s *Service) createStoredApply(
 	req ApplyRequest,
 	options map[string]string,
 	applyIdentifier string,
-	externalID string,
+	shardedFanoutSupported bool,
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
@@ -945,7 +950,6 @@ func (s *Service) createStoredApply(
 		Deployment:      targets[0].Deployment,
 		Caller:          req.Caller,
 		InstallationID:  req.InstallationID,
-		ExternalID:      externalID,
 		Engine:          storage.EngineForType(plan.DatabaseType),
 		State:           state.Apply.Pending,
 		Options:         storage.MarshalApplyOptions(applyOpts),
@@ -954,48 +958,20 @@ func (s *Service) createStoredApply(
 	}
 
 	taskChanges := applyTaskChanges(plan)
-	buildTasks := func() []*storage.Task {
-		tasks := make([]*storage.Task, 0, len(taskChanges))
-		for _, ddlChange := range taskChanges {
-			task := &storage.Task{
-				TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
-				PlanID:         plan.ID,
-				Database:       plan.Database,
-				DatabaseType:   plan.DatabaseType,
-				Engine:         storage.EngineForType(plan.DatabaseType),
-				Repository:     plan.Repository,
-				PullRequest:    plan.PullRequest,
-				Environment:    req.Environment,
-				State:          state.Task.Pending,
-				Options:        storage.MarshalApplyOptions(applyOpts),
-				Namespace:      ddlChange.Namespace,
-				TableName:      ddlChange.Table,
-				DDL:            ddlChange.DDL,
-				DDLAction:      ddlChange.Operation,
-				CreatedAt:      now,
-				UpdatedAt:      now,
-			}
-			tasks = append(tasks, task)
-		}
-		return tasks
-	}
-
 	cutoverPolicy := s.config.CutoverPolicyFor(plan.Database, req.Environment)
 	onFailure := s.config.OnFailure(plan.Database, req.Environment)
-	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
-	for _, target := range targets {
-		groups = append(groups, &storage.ApplyOperationWithTasks{
-			Operation: &storage.ApplyOperation{
-				Deployment:    target.Deployment,
-				Target:        target.Target,
-				State:         state.ApplyOperation.Pending,
-				CutoverPolicy: cutoverPolicy,
-				OnFailure:     onFailure,
-				CreatedAt:     now,
-				UpdatedAt:     now,
-			},
-			Tasks: buildTasks(),
-		})
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, targets, req.Environment, applyOpts, cutoverPolicy, onFailure, now, shardedFanoutSupported)
+	if err != nil {
+		return nil, 0, err
+	}
+	if shardedFanout {
+		s.logger.Info("createStoredApply: queueing sharded apply operation groups",
+			"plan_id", plan.PlanIdentifier,
+			"database", plan.Database,
+			"database_type", plan.DatabaseType,
+			"environment", req.Environment,
+			"deployment_count", len(targets),
+			"operation_group_count", len(groups))
 	}
 
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
@@ -1021,6 +997,11 @@ func (s *Service) createStoredApply(
 	return apply, storedApplyID, nil
 }
 
+func clientSupportsShardedApplyFanout(client tern.Client) bool {
+	capability, ok := client.(tern.ShardedApplyFanoutSupport)
+	return ok && capability.SupportsShardedApplyFanout()
+}
+
 func applyTaskChanges(plan *storage.Plan) []storage.TableChange {
 	changes := append([]storage.TableChange{}, plan.FlatDDLChanges()...)
 	for namespace, nsData := range plan.Namespaces {
@@ -1033,6 +1014,179 @@ func applyTaskChanges(plan *storage.Plan) []storage.TableChange {
 		}
 	}
 	return changes
+}
+
+func buildApplyOperationGroups(
+	plan *storage.Plan,
+	taskChanges []storage.TableChange,
+	targets []routing.ExecutionTarget,
+	environment string,
+	applyOpts storage.ApplyOptions,
+	cutoverPolicy string,
+	onFailure string,
+	now time.Time,
+	shardedFanoutSupported bool,
+) ([]*storage.ApplyOperationWithTasks, bool, error) {
+	if shardedFanoutSupported && canBuildShardedOperationGroups(plan, taskChanges) {
+		groups, err := buildShardedApplyOperationGroups(plan, taskChanges, targets, environment, applyOpts, cutoverPolicy, onFailure, now)
+		if err != nil {
+			return nil, false, err
+		}
+		return groups, true, nil
+	}
+
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
+	for _, target := range targets {
+		groups = append(groups, &storage.ApplyOperationWithTasks{
+			Operation: newPendingApplyOperation(target, "", cutoverPolicy, onFailure, now),
+			Tasks:     buildApplyTasks(plan, taskChanges, environment, applyOpts, "", now),
+		})
+	}
+	return groups, false, nil
+}
+
+func canBuildShardedOperationGroups(plan *storage.Plan, taskChanges []storage.TableChange) bool {
+	if plan == nil || len(plan.Shards) == 0 || len(taskChanges) == 0 {
+		return false
+	}
+	shardsByNamespace := changingShardsByNamespace(plan.Shards)
+	if len(shardsByNamespace) == 0 {
+		return false
+	}
+	for _, ddlChange := range taskChanges {
+		if ddlChange.DDL == "" || ddlChange.Table == "" || ddlChange.Operation == "vschema_update" {
+			return false
+		}
+		if len(shardsByNamespace[ddlChange.Namespace]) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func buildShardedApplyOperationGroups(
+	plan *storage.Plan,
+	taskChanges []storage.TableChange,
+	targets []routing.ExecutionTarget,
+	environment string,
+	applyOpts storage.ApplyOptions,
+	cutoverPolicy string,
+	onFailure string,
+	now time.Time,
+) ([]*storage.ApplyOperationWithTasks, error) {
+	shardsByNamespace := changingShardsByNamespace(plan.Shards)
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets)*len(taskChanges))
+	groupsByTargetAndKey := make(map[string]*storage.ApplyOperationWithTasks)
+	for _, target := range targets {
+		for _, ddlChange := range taskChanges {
+			for _, shard := range shardsByNamespace[ddlChange.Namespace] {
+				if err := validateShardOperationKeyParts(ddlChange.Namespace, shard.Shard, ddlChange.Table); err != nil {
+					return nil, err
+				}
+				operationKey := shardOperationKey(ddlChange.Namespace, shard.Shard, ddlChange.Table)
+				if len(operationKey) > applyOperationKeyMaxLen {
+					return nil, fmt.Errorf("operation key for namespace %q shard %q table %q exceeds %d characters", ddlChange.Namespace, shard.Shard, ddlChange.Table, applyOperationKeyMaxLen)
+				}
+				groupKey := target.Deployment + "\x00" + operationKey
+				group := groupsByTargetAndKey[groupKey]
+				if group == nil {
+					group = &storage.ApplyOperationWithTasks{
+						Operation: newPendingApplyOperation(target, operationKey, cutoverPolicy, onFailure, now),
+					}
+					groupsByTargetAndKey[groupKey] = group
+					groups = append(groups, group)
+				}
+				group.Tasks = append(group.Tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard.Shard, now))
+			}
+		}
+	}
+	return groups, nil
+}
+
+func validateShardOperationKeyParts(namespace, shard, table string) error {
+	for label, value := range map[string]string{"namespace": namespace, "shard": shard, "table": table} {
+		if strings.Contains(value, "/") {
+			return fmt.Errorf("operation key %s component %q contains reserved delimiter %q", label, value, "/")
+		}
+	}
+	return nil
+}
+
+func changingShardsByNamespace(shards []storage.ShardPlan) map[string][]storage.ShardPlan {
+	shardsByNamespace := make(map[string][]storage.ShardPlan)
+	for _, shard := range shards {
+		if !shard.NeedsChange {
+			continue
+		}
+		shardsByNamespace[shard.Namespace] = append(shardsByNamespace[shard.Namespace], shard)
+	}
+	for namespace := range shardsByNamespace {
+		sort.Slice(shardsByNamespace[namespace], func(i, j int) bool {
+			return shardsByNamespace[namespace][i].Shard < shardsByNamespace[namespace][j].Shard
+		})
+	}
+	return shardsByNamespace
+}
+
+func shardOperationKey(namespace, shard, table string) string {
+	return namespace + "/" + shard + "/" + table
+}
+
+func newPendingApplyOperation(target routing.ExecutionTarget, operationKey, cutoverPolicy, onFailure string, now time.Time) *storage.ApplyOperation {
+	return &storage.ApplyOperation{
+		Deployment:    target.Deployment,
+		OperationKey:  operationKey,
+		Target:        target.Target,
+		State:         state.ApplyOperation.Pending,
+		CutoverPolicy: cutoverPolicy,
+		OnFailure:     onFailure,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+}
+
+func buildApplyTasks(
+	plan *storage.Plan,
+	taskChanges []storage.TableChange,
+	environment string,
+	applyOpts storage.ApplyOptions,
+	shard string,
+	now time.Time,
+) []*storage.Task {
+	tasks := make([]*storage.Task, 0, len(taskChanges))
+	for _, ddlChange := range taskChanges {
+		tasks = append(tasks, buildApplyTask(plan, ddlChange, environment, applyOpts, shard, now))
+	}
+	return tasks
+}
+
+func buildApplyTask(
+	plan *storage.Plan,
+	ddlChange storage.TableChange,
+	environment string,
+	applyOpts storage.ApplyOptions,
+	shard string,
+	now time.Time,
+) *storage.Task {
+	return &storage.Task{
+		TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
+		PlanID:         plan.ID,
+		Database:       plan.Database,
+		DatabaseType:   plan.DatabaseType,
+		Engine:         storage.EngineForType(plan.DatabaseType),
+		Repository:     plan.Repository,
+		PullRequest:    plan.PullRequest,
+		Environment:    environment,
+		State:          state.Task.Pending,
+		Options:        storage.MarshalApplyOptions(applyOpts),
+		Namespace:      ddlChange.Namespace,
+		TableName:      ddlChange.Table,
+		Shard:          shard,
+		DDL:            ddlChange.DDL,
+		DDLAction:      ddlChange.Operation,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
 }
 
 // ExecuteRollbackPlanForApply generates a rollback plan for a specific apply.

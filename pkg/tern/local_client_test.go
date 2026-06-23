@@ -893,6 +893,41 @@ func TestGroupedResumeChangesVSchemaOnly(t *testing.T) {
 	assert.Equal(t, "true", changes[0].Metadata["vschema_changed"])
 }
 
+func TestGroupedResumeChangesPreservesMultiNamespaceScopedTasks(t *testing.T) {
+	tasks := []*storage.Task{
+		{Namespace: "commerce", TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter"},
+		{Namespace: "routing", TableName: "VSchema: routing", DDLAction: "vschema_update"},
+	}
+
+	changes := groupedResumeChanges(tasks)
+
+	require.Len(t, changes, 2)
+	byNamespace := make(map[string]engine.SchemaChange)
+	for _, change := range changes {
+		byNamespace[change.Namespace] = change
+	}
+	commerce := byNamespace["commerce"]
+	require.Len(t, commerce.TableChanges, 1)
+	assert.Equal(t, "users", commerce.TableChanges[0].Table)
+	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", commerce.TableChanges[0].DDL)
+	assert.Equal(t, statement.StatementAlterTable, commerce.TableChanges[0].Operation)
+	assert.Empty(t, commerce.Metadata["vschema_changed"])
+	routing := byNamespace["routing"]
+	assert.Empty(t, routing.TableChanges)
+	assert.Equal(t, "true", routing.Metadata["vschema_changed"])
+}
+
+func TestTaskTargetShardsReturnsSortedUniqueShardSelector(t *testing.T) {
+	tasks := []*storage.Task{
+		{Shard: "80-"},
+		{Shard: ""},
+		{Shard: "-80"},
+		{Shard: "80-"},
+	}
+
+	assert.Equal(t, []string{"-80", "80-"}, taskTargetShards(tasks))
+}
+
 func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              123,

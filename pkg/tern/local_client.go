@@ -1596,6 +1596,14 @@ func engineProgressIsExternallyAuthoritative(eng engine.Engine) bool {
 	return ok && source.ProgressIsExternallyAuthoritative()
 }
 
+// SupportsShardedApplyFanout reports whether this local client can drive
+// sharded work as independent SchemaBot apply operations. Engines that expose
+// externally authoritative progress own their execution ordering outside
+// SchemaBot, so apply-create must keep them as one operation.
+func (c *LocalClient) SupportsShardedApplyFanout() bool {
+	return !engineProgressIsExternallyAuthoritative(c.getEngine())
+}
+
 // Progress returns detailed progress for an active schema change.
 // Returns ALL tasks for the current apply: completed, running, and pending.
 // req.ApplyId is required so progress is always scoped to a single apply.

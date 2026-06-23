@@ -918,6 +918,7 @@ func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 		ApplyID:          apply.ID,
 		ApplyOperationID: &operationID,
 		TableName:        "users",
+		Shard:            "-80",
 		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
 		DDLAction:        "alter",
 		Namespace:        "default",
@@ -954,6 +955,7 @@ func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 	require.NotNil(t, req, "expected operation-scoped apply to be dispatched to remote Tern")
 	require.Len(t, req.DdlChanges, 1)
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
+	assert.Equal(t, []string{"-80"}, req.TargetShards)
 }
 
 func TestGRPCClient_ResumeApplyOperationDispatchParksBarrierCutoverRemotely(t *testing.T) {

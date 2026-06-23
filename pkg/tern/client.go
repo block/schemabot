@@ -120,3 +120,9 @@ type Client interface {
 	// Close releases any resources held by the client.
 	Close() error
 }
+
+// ShardedApplyFanoutSupport is an optional client capability for engines that
+// can drive sharded work as independent SchemaBot apply operations.
+type ShardedApplyFanoutSupport interface {
+	SupportsShardedApplyFanout() bool
+}

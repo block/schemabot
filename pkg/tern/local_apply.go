@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/state"
@@ -418,31 +417,4 @@ func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, up
 		return ""
 	}
 	return newState
-}
-
-// planNamespacesToChanges converts stored plan namespace data to engine schema
-// changes for the Apply call. VSchema metadata is only set when the plan
-// stored a VSchema diff (i.e., the Plan detected a real change).
-func planNamespacesToChanges(namespaces map[string]*storage.NamespacePlanData) []engine.SchemaChange {
-	var changes []engine.SchemaChange
-	for namespace, nsData := range namespaces {
-		var tableChanges []engine.TableChange
-		for _, tc := range nsData.Tables {
-			tableChanges = append(tableChanges, engine.TableChange{
-				Table:     tc.Table,
-				DDL:       tc.DDL,
-				Operation: ddl.OpToStatementType(tc.Operation),
-			})
-		}
-		metadata := make(map[string]string)
-		if namespaceHasVSchemaArtifact(nsData) {
-			metadata["vschema_changed"] = "true"
-		}
-		changes = append(changes, engine.SchemaChange{
-			Namespace:    namespace,
-			TableChanges: tableChanges,
-			Metadata:     metadata,
-		})
-	}
-	return changes
 }
