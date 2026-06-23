@@ -44,6 +44,9 @@ var applyMetadata = map[string]ApplyStateInfo{
 	Apply.RunningDegraded: {
 		Label: "Running (degraded)",
 	},
+	Apply.Paused: {
+		Label: "Paused",
+	},
 	Apply.Resuming: {
 		Label: "Resuming",
 	},
