@@ -959,24 +959,6 @@ type ApplyLogFilter struct {
 	Limit     int    // Optional: limit results (default 100)
 }
 
-// VitessApplyData holds Vitess-specific data for deploy request tracking.
-// Stored in vitess_apply_data table, one row per apply when database_type = 'vitess'.
-type VitessApplyData struct {
-	ApplyID          int64
-	BranchName       string
-	DeployRequestID  uint64
-	MigrationContext string
-	DeployRequestURL string
-	IsInstant        bool // True when PlanetScale reported the deploy as instant-eligible
-	DeferredDeploy   bool // True when deploy was deferred (--defer-deploy flag)
-
-	// RevertSkippedAt records when skip-revert was dispatched. Non-nil means
-	// finalization is in progress — the deploy request is transitioning across
-	// shards from complete_pending_revert to complete. On large keyspaces
-	// this can take longer as shards are processed in batches.
-	RevertSkippedAt *time.Time
-}
-
 // EngineResumeState stores opaque resume data owned by the engine package.
 type EngineResumeState struct {
 	ApplyOperationID int64

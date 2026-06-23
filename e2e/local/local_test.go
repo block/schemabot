@@ -126,7 +126,6 @@ func TestLocal_SchemaBot_SchemaApplied(t *testing.T) {
 		"settings",
 		"plans",
 		"tasks",
-		"vitess_apply_data",
 	}
 
 	for _, table := range expectedTables {
@@ -1309,7 +1308,7 @@ func TestLocal_Demo_FullValidation(t *testing.T) {
 	require.NoError(t, err, "connect to schemabot MySQL")
 	defer utils.CloseAndLog(schemabotDB)
 
-	schemabotTables := []string{"locks", "checks", "settings", "plans", "tasks", "vitess_apply_data"}
+	schemabotTables := []string{"locks", "checks", "settings", "plans", "tasks"}
 	for _, table := range schemabotTables {
 		var count int
 		err := schemabotDB.QueryRowContext(t.Context(),

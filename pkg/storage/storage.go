@@ -39,9 +39,6 @@ type Storage interface {
 	// Settings returns the settings store.
 	Settings() SettingsStore
 
-	// VitessApplyData returns the Vitess apply data store.
-	VitessApplyData() VitessApplyDataStore
-
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -551,15 +548,6 @@ type ApplyOperationStore interface {
 	// is resumable, so completed_at is left nil. Apply-lease guarded when a lease
 	// is present in ctx.
 	MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error)
-}
-
-// VitessApplyDataStore manages Vitess-specific apply data (deploy request tracking).
-type VitessApplyDataStore interface {
-	// Save creates or updates Vitess apply data for an apply.
-	Save(ctx context.Context, data *VitessApplyData) error
-
-	// GetByApplyID returns the Vitess apply data for the given apply ID.
-	GetByApplyID(ctx context.Context, applyID int64) (*VitessApplyData, error)
 }
 
 // ApplyLogStore manages apply log entries for debugging and audit.

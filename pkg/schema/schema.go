@@ -8,7 +8,6 @@
 //   - plans: Schema change plans
 //   - tasks: Schema change tasks
 //   - apply_operations: Per-(apply, deployment) child rows for multi-deployment applies
-//   - vitess_apply_data: Vitess-specific per-apply deploy metadata
 package schema
 
 import "embed"

@@ -32,19 +32,18 @@ type mockStorage struct {
 	pingErr error
 }
 
-func (m *mockStorage) Locks() storage.LockStore                      { return nil }
-func (m *mockStorage) Plans() storage.PlanStore                      { return nil }
-func (m *mockStorage) Applies() storage.ApplyStore                   { return nil }
-func (m *mockStorage) Tasks() storage.TaskStore                      { return nil }
-func (m *mockStorage) ApplyLogs() storage.ApplyLogStore              { return nil }
-func (m *mockStorage) ControlRequests() storage.ControlRequestStore  { return nil }
-func (m *mockStorage) ApplyComments() storage.ApplyCommentStore      { return nil }
-func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore  { return nil }
-func (m *mockStorage) VitessApplyData() storage.VitessApplyDataStore { return nil }
-func (m *mockStorage) Checks() storage.CheckStore                    { return nil }
-func (m *mockStorage) Settings() storage.SettingsStore               { return nil }
-func (m *mockStorage) Ping(ctx context.Context) error                { return m.pingErr }
-func (m *mockStorage) Close() error                                  { return nil }
+func (m *mockStorage) Locks() storage.LockStore                     { return nil }
+func (m *mockStorage) Plans() storage.PlanStore                     { return nil }
+func (m *mockStorage) Applies() storage.ApplyStore                  { return nil }
+func (m *mockStorage) Tasks() storage.TaskStore                     { return nil }
+func (m *mockStorage) ApplyLogs() storage.ApplyLogStore             { return nil }
+func (m *mockStorage) ControlRequests() storage.ControlRequestStore { return nil }
+func (m *mockStorage) ApplyComments() storage.ApplyCommentStore     { return nil }
+func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil }
+func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
+func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
+func (m *mockStorage) Ping(ctx context.Context) error               { return m.pingErr }
+func (m *mockStorage) Close() error                                 { return nil }
 
 type mockPlanLookupStore struct {
 	plan *storage.Plan
@@ -88,21 +87,13 @@ func (m *mockStorageWithPlanLookup) Plans() storage.PlanStore { return m.plans }
 
 type mockStorageWithApplyStores struct {
 	mockStorage
-	plans           storage.PlanStore
-	applies         storage.ApplyStore
-	tasks           storage.TaskStore
-	locks           storage.LockStore
-	applyLogs       storage.ApplyLogStore
-	controls        storage.ControlRequestStore
-	operations      storage.ApplyOperationStore
-	vitessApplyData storage.VitessApplyDataStore
-}
-
-func (m *mockStorageWithApplyStores) VitessApplyData() storage.VitessApplyDataStore {
-	if m.vitessApplyData == nil {
-		return &staticVitessApplyDataStore{}
-	}
-	return m.vitessApplyData
+	plans      storage.PlanStore
+	applies    storage.ApplyStore
+	tasks      storage.TaskStore
+	locks      storage.LockStore
+	applyLogs  storage.ApplyLogStore
+	controls   storage.ControlRequestStore
+	operations storage.ApplyOperationStore
 }
 
 func (m *mockStorageWithApplyStores) Plans() storage.PlanStore         { return m.plans }
@@ -149,22 +140,6 @@ func (s *staticApplyOperationStore) GetEngineResumeState(_ context.Context, oper
 		return rs, nil
 	}
 	return nil, storage.ErrEngineResumeStateNotFound
-}
-
-type staticVitessApplyDataStore struct {
-	storage.VitessApplyDataStore
-	data map[int64]*storage.VitessApplyData
-	err  error
-}
-
-func (s *staticVitessApplyDataStore) GetByApplyID(_ context.Context, applyID int64) (*storage.VitessApplyData, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	if d, ok := s.data[applyID]; ok {
-		return d, nil
-	}
-	return nil, storage.ErrVitessApplyDataNotFound
 }
 
 type staticPlanStore struct {
@@ -2572,8 +2547,8 @@ func TestProgressResponseFromProtoPreservesVSchemaChangeType(t *testing.T) {
 }
 
 // The engine's display metadata on the progress response (branch, deploy-request
-// URL, instant) is carried through to the API response, so the renderer no longer
-// needs the vitess_apply_data side-table overlay for it.
+// URL, instant) is carried through to the API response, so the renderer reads it
+// straight from the progress projection.
 func TestProgressResponseFromProtoCopiesMetadata(t *testing.T) {
 	resp := progressResponseFromProto(&ternv1.ProgressResponse{
 		State: ternv1.State_STATE_RUNNING,

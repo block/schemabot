@@ -53,9 +53,6 @@ var (
 	// (apply_id, deployment, operation_key) is being inserted but already exists.
 	ErrApplyOperationExists = errors.New("apply operation already exists")
 
-	// ErrVitessApplyDataNotFound is returned when no vitess apply data exists for an apply.
-	ErrVitessApplyDataNotFound = errors.New("vitess apply data not found")
-
 	// ErrEngineResumeStateNotFound is returned when no opaque engine resume state exists for an operation.
 	ErrEngineResumeStateNotFound = errors.New("engine resume state not found")
 )

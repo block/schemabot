@@ -124,7 +124,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	// Enrich with per-shard progress from SHOW VITESS_MIGRATIONS.
 	// Requires a vtgate DSN (Credentials.DSN) and a migration context
-	// (from VitessApplyData) to query per-shard state.
+	// (from the engine resume state) to query per-shard state.
 	hasMigrationContext := req.Credentials.DSN != "" &&
 		req.ResumeState != nil && req.ResumeState.MigrationContext != ""
 	if hasMigrationContext {

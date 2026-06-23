@@ -333,14 +333,12 @@
 // This lets a VSchema-only deploy (zero DDLs) still have a task to aggregate and
 // surfaces the in_progress_vschema phase in the progress view.
 //
-// # Storage Tables
+// # Storage
 //
-// vitess_apply_data — per-apply deploy metadata. One row per apply:
-//   - apply_id:           links to the apply
-//   - branch_name:        the branch created for this deploy
-//   - deploy_request_id:  PlanetScale deploy request number
-//   - migration_context:  groups all SHOW VITESS_MIGRATIONS rows for this deploy
-//   - deploy_request_url: link to the deploy request in PlanetScale console
+// Per-apply deploy metadata (branch name, deploy request number/URL, migration
+// context) is opaque engine state: it rides in the apply operation's engine
+// resume metadata, which the tern layer persists and replays without
+// interpreting it — there is no engine-specific side table.
 //
 // DDL tasks use the regular tasks table. Per-task Vitess data is minimal:
 // just the engine_migration_id (Vitess migration UUID) on the task record.

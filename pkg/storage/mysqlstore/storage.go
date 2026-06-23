@@ -21,7 +21,6 @@ type Storage struct {
 	applyOperations *applyOperationStore
 	checks          *checkStore
 	settings        *settingsStore
-	vitessApplyData *vitessApplyDataStore
 }
 
 // New creates a new MySQL storage instance.
@@ -38,7 +37,6 @@ func New(db *sql.DB) *Storage {
 		applyOperations: &applyOperationStore{db: db},
 		checks:          &checkStore{db: db},
 		settings:        &settingsStore{db: db},
-		vitessApplyData: &vitessApplyDataStore{db: db},
 	}
 }
 
@@ -90,11 +88,6 @@ func (s *Storage) Checks() storage.CheckStore {
 // Settings returns the settings store.
 func (s *Storage) Settings() storage.SettingsStore {
 	return s.settings
-}
-
-// VitessApplyData returns the Vitess apply data store.
-func (s *Storage) VitessApplyData() storage.VitessApplyDataStore {
-	return s.vitessApplyData
 }
 
 // Ping verifies the database connection is alive.

@@ -424,7 +424,6 @@ type exactProgressStorage struct {
 	tasks           storage.TaskStore
 	logs            storage.ApplyLogStore
 	controlRequests storage.ControlRequestStore
-	vitessApplyData storage.VitessApplyDataStore
 	applyOperations storage.ApplyOperationStore
 }
 
@@ -438,9 +437,6 @@ func (s *exactProgressStorage) ApplyLogs() storage.ApplyLogStore {
 }
 func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
 	return s.controlRequests
-}
-func (s *exactProgressStorage) VitessApplyData() storage.VitessApplyDataStore {
-	return s.vitessApplyData
 }
 func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 	return s.applyOperations
