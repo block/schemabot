@@ -23,7 +23,10 @@ func installManualMeterReader(t *testing.T) *sdkmetric.ManualReader {
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	prev := otel.GetMeterProvider()
 	otel.SetMeterProvider(mp)
-	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prev)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
 	return reader
 }
 
