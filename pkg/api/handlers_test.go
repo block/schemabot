@@ -1031,6 +1031,62 @@ func TestExecutePlanUnavailableRemoteErrorIncludesDeployment(t *testing.T) {
 	assert.Equal(t, codes.Unavailable, status.Code(err))
 }
 
+func TestExecutePlanPersistsShardPlans(t *testing.T) {
+	plans := &capturingPlanStore{}
+	mockClient := &mockTernClient{
+		planResp: &ternv1.PlanResponse{
+			PlanId: "plan-shards",
+			Changes: []*ternv1.SchemaChange{{
+				Namespace: "commerce",
+				TableChanges: []*ternv1.TableChange{{
+					TableName:  "users",
+					Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+					ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+				}},
+			}},
+			Shards: []*ternv1.ShardPlan{
+				{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+				{Namespace: "commerce", Shard: "80-", NeedsChange: false},
+			},
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"commerce": {
+				Type: storage.DatabaseTypeVitess,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {Target: "commerce-target", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"staging": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+		"primary/staging": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+		Database:    "commerce",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeVitess,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"commerce": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)"}},
+		},
+		Repository: "example/app",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, plans.created)
+	assert.Equal(t, []storage.ShardPlan{
+		{Namespace: "commerce", Shard: "-80", NeedsChange: true},
+		{Namespace: "commerce", Shard: "80-", NeedsChange: false},
+	}, plans.created.Shards)
+}
+
 func TestExecutePullSchemaRoutesConfiguredMySQLTarget(t *testing.T) {
 	mockClient := &mockTernClient{
 		pullSchemaResp: &ternv1.PullSchemaResponse{

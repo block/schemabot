@@ -225,6 +225,28 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 	return result, nil
 }
 
+func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, error) {
+	if len(shards) == 0 {
+		return nil, nil
+	}
+	out := make([]storage.ShardPlan, 0, len(shards))
+	for i, shard := range shards {
+		if shard == nil {
+			return nil, fmt.Errorf("shard plan %d is null", i)
+		}
+		namespace := shard.Namespace
+		if namespace == "" {
+			namespace = "default"
+		}
+		out = append(out, storage.ShardPlan{
+			Shard:       shard.Shard,
+			Namespace:   namespace,
+			NeedsChange: shard.NeedsChange,
+		})
+	}
+	return out, nil
+}
+
 // protoChangeTypeToOperation converts a proto ChangeType enum to a storage operation string.
 func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 	switch ct {

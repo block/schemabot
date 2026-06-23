@@ -580,6 +580,10 @@ func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *
 	if err != nil {
 		return fmt.Errorf("convert plan namespaces: %w", err)
 	}
+	shards, err := protoShardPlansToStorage(resp.Shards)
+	if err != nil {
+		return fmt.Errorf("convert plan shards: %w", err)
+	}
 	storedPlan := &storage.Plan{
 		PlanIdentifier: resp.PlanId,
 		Database:       req.Database,
@@ -592,6 +596,7 @@ func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *
 		Environment:    req.Environment,
 		SchemaFiles:    protoToSchemaFiles(req.SchemaFiles),
 		Namespaces:     namespaces,
+		Shards:         shards,
 		HeadSHA:        headSHA,
 		CreatedAt:      time.Now(),
 	}
