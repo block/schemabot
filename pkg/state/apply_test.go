@@ -517,6 +517,14 @@ func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 			children: []RolloutChild{rcPause(Apply.Failed), rc(Apply.Failed, false), rcPause(Apply.Pending)},
 			want:     Apply.Failed,
 		},
+		{
+			name: "invalid both-flags failure fails closed rather than continuing",
+			children: []RolloutChild{
+				{State: Apply.Failed, ContinueOnFailure: true, PauseOnFailure: true},
+				rc(Apply.Pending, true),
+			},
+			want: Apply.Failed,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

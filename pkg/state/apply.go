@@ -149,7 +149,9 @@ func DeriveApplyState(taskStates []string) string {
 //
 // Both default to false, so "halt" and any unrecognized policy fail closed: a
 // failed sibling keeps the apply failed. The two flags are mutually exclusive —
-// a child is either continuable, pause-held, or fail-closed.
+// a child is either continuable, pause-held, or fail-closed. Setting both is a
+// caller bug; the projection fails closed in that case rather than loosening
+// rollout gating.
 //
 // Children must be supplied in deployment order (the same (created_at, id) order
 // the claim predicate uses), because a pause-held failure only holds the rollout
@@ -221,6 +223,11 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 			continue
 		}
 		switch {
+		case c.ContinueOnFailure && c.PauseOnFailure:
+			// Invalid: the flags are mutually exclusive. Fail closed rather than
+			// let a caller bug loosen rollout gating by silently winning the
+			// continue branch below.
+			hardFail = true
 		case c.ContinueOnFailure:
 			// continue, or a released pause: does not force a terminal verdict
 			// and does not hold the rollout.
