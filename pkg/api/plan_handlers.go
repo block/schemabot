@@ -1162,6 +1162,7 @@ func sortedFinalizerNamespaces(finalizerChanges map[string]storage.TableChange) 
 }
 
 func isGroupFinalizerChange(change storage.TableChange) bool {
+	// Routing metadata is the only creation-time group-finalizer payload today.
 	return change.Operation == "vschema_update"
 }
 

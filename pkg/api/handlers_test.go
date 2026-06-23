@@ -2078,6 +2078,8 @@ func TestCreateStoredApplyFansOutShardedPlanWithFinalizerOperation(t *testing.T)
 }
 
 func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
+	// A routing-only namespace with no shard work keeps the apply on the
+	// single-operation path so the routing change is preserved.
 	applies := &capturingApplyStore{}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	tasks := &capturingTaskStore{}
