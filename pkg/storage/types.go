@@ -460,13 +460,13 @@ func (a *Apply) IsRollback() bool {
 }
 
 // ApplyOperation represents one child row in the apply_operations table:
-// the per-(deployment, operation_key, target) slice of a multi-operation apply,
-// and the unit of work the operator (claim loop) reconciles.
+// the per-(deployment, operation_key) slice of a multi-operation apply, and the
+// unit of work the driver claim loop reconciles.
 //
 // In the multi-operation data model, one applies row owns 1..N
 // apply_operations rows. Each row carries its
 // own state machine (mirroring state.Apply, so cutover/stop/revert/triage
-// work per-row), its own lock identity, and its own progress; the operator
+// work per-row), its own lock identity, and its own progress; the driver
 // can act on each operation independently while keeping `apply_id` as the
 // user-facing handle for the whole rollout. applies.state is derived from
 // the child rows' states via the existing state.DeriveApplyState().
@@ -487,12 +487,12 @@ type ApplyOperation struct {
 	// and deployment. Empty is the legacy single-operation key.
 	OperationKey string
 
-	// Target is the Tern-facing target selected by server config at apply
-	// time for this deployment. Mirrors plans.target / applies.target
+	// Target is the Tern-facing address resolved for this deployment at apply
+	// time. Mirrors plans.target / applies.target
 	// semantics. Empty for legacy / single-deployment shapes.
 	Target string
 
-	// State is the per-deployment state machine value. See state.ApplyOperation.
+	// State is the per-operation state machine value. See state.ApplyOperation.
 	State string
 
 	// ErrorMessage contains error details if state is failed.

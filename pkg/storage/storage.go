@@ -467,7 +467,7 @@ type ApplyOperationStore interface {
 	// (apply_id, deployment, operation_key), or nil if not found.
 	GetByApplyDeploymentAndOperationKey(ctx context.Context, applyID int64, deployment, operationKey string) (*ApplyOperation, error)
 
-	// ListByApply returns all child rows for an apply in stable claim order.
+	// ListByApply returns all child rows for an apply in (created_at, id) order.
 	ListByApply(ctx context.Context, applyID int64) ([]*ApplyOperation, error)
 
 	// UpdateState transitions a child row to a new state. Updates the state

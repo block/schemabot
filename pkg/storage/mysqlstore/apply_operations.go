@@ -1,6 +1,6 @@
 // apply_operations.go implements ApplyOperationStore for per-(apply,
 // deployment, operation_key) child rows under a multi-operation apply — the
-// unit of work the operator claims.
+// unit of work the driver claims.
 package mysqlstore
 
 import (
