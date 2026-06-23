@@ -255,12 +255,13 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 	return Apply.RunningDegraded
 }
 
-// hasLaterNonTerminal reports whether any child after index i (in deployment
-// order) is not yet in a terminal apply state. A pause-held failure only holds
-// the rollout when there is such later work for the operator to release or stop.
-func hasLaterNonTerminal(children []RolloutChild, i int) bool {
-	for j := i + 1; j < len(children); j++ {
-		if !IsTerminalApplyState(children[j].State) {
+// hasLaterNonTerminal reports whether any child after failedIndex (in
+// deployment order) is not yet in a terminal apply state. A pause-held failure
+// only holds the rollout when there is such later work for the operator to
+// release or stop.
+func hasLaterNonTerminal(children []RolloutChild, failedIndex int) bool {
+	for later := failedIndex + 1; later < len(children); later++ {
+		if !IsTerminalApplyState(children[later].State) {
 			return true
 		}
 	}
