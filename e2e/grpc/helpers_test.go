@@ -246,6 +246,49 @@ func grpcProgressByApplyID(t *testing.T, applyID string) grpcProgressResponse {
 	return result
 }
 
+// grpcApplyLogEntry is one operator-facing apply-log event returned by
+// GET /api/logs. The fan-out drive writes every operation's events under the
+// parent apply id, so this timeline is the merged view across deployments.
+type grpcApplyLogEntry struct {
+	EventType string `json:"event_type"`
+	Level     string `json:"level"`
+	Message   string `json:"message"`
+	OldState  string `json:"old_state"`
+	NewState  string `json:"new_state"`
+}
+
+type grpcApplyLogsResponse struct {
+	Logs    []grpcApplyLogEntry `json:"logs"`
+	ApplyID string              `json:"apply_id"`
+}
+
+// grpcApplyLogs fetches the operator-facing apply-log timeline for an apply.
+func grpcApplyLogs(t *testing.T, applyID string, limit int) []grpcApplyLogEntry {
+	t.Helper()
+	path := fmt.Sprintf("/api/logs?apply_id=%s&limit=%d", applyID, limit)
+	resp := grpcGet(t, path)
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		require.Failf(t, "apply logs fetch failed", "status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+	var result grpcApplyLogsResponse
+	grpcDecodeJSON(t, resp, &result)
+	return result.Logs
+}
+
+// grpcMetrics scrapes the Prometheus /metrics endpoint and returns the raw
+// exposition text.
+func grpcMetrics(t *testing.T) string {
+	t.Helper()
+	resp := grpcGet(t, "/metrics")
+	require.Equalf(t, http.StatusOK, resp.StatusCode, "GET /metrics status")
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	require.NoError(t, err, "read /metrics body")
+	return string(body)
+}
+
 func grpcWaitForApplyState(t *testing.T, applyID, expectedState string, timeout time.Duration) {
 	t.Helper()
 	var lastState string
