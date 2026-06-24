@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -485,6 +486,107 @@ func TestGRPCMultiDeploy_FailureHaltsRollout(t *testing.T) {
 		"%s must not complete after %s failed, was %q", second, first, final[second].State)
 	prog := grpcProgressByApplyID(t, apply.ApplyID)
 	assert.Truef(t, failedApplyState(prog.State), "aggregate apply state should be failed, was %q", prog.State)
+
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+}
+
+// TestGRPCMultiDeploy_OrderedCutoverObservability asserts that a fan-out
+// ordered cutover emits the operator-facing signals needed to triage a rollout
+// from the apply-log timeline and the metrics endpoint alone: each deployment's
+// copy parks at the cutover barrier (a state transition into
+// waiting_for_cutover), the operator triggers an ordered cutover (a
+// cutover_triggered event), every operation is driven to completed, and the
+// Prometheus endpoint exposes the apply lifecycle counters while recording no
+// operator resume failures for the database.
+func TestGRPCMultiDeploy_OrderedCutoverObservability(t *testing.T) {
+	requireMultiDeploy(t)
+
+	const (
+		database = "testapp"
+		env      = "production"
+	)
+	// Matches deployment_order in grpc-schemabot-multideploy.yaml.
+	first, second := "eu", "us"
+
+	tableName := uniqueGRPCTableName("md_obs")
+	createDDL := fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)", tableName)
+	for _, d := range []string{first, second} {
+		multiDeployCreateTestTable(t, d, tableName, createDDL)
+		multiDeploySeedRows(t, d, tableName, "name, data",
+			"CONCAT('user_', seq), REPEAT('x', 200)", 10000)
+	}
+
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+
+	plan := grpcPlan(t, database, env, map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			"CREATE TABLE %s (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT);", tableName),
+	})
+	require.Empty(t, plan.Errors, "plan errors: %v", plan.Errors)
+	require.NotEmpty(t, plan.PlanID, "plan_id")
+
+	apply := grpcApply(t, plan.PlanID, env, nil)
+	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
+
+	// Drive the whole ordered cutover to terminal so the full operator-facing
+	// timeline has been written before we inspect it.
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			require.Falsef(t, failedApplyState(ops[first].State), "%s operation failed: %s", first, ops[first].ErrorMessage)
+			require.Falsef(t, failedApplyState(ops[second].State), "%s operation failed: %s", second, ops[second].ErrorMessage)
+			return state.IsState(ops[first].State, state.Apply.Completed) &&
+				state.IsState(ops[second].State, state.Apply.Completed)
+		},
+		func() string {
+			ops := multiDeployOperationStates(t, apply.ApplyID)
+			return fmt.Sprintf("waiting for both deployments completed; %s=%q %s=%q",
+				first, ops[first].State, second, ops[second].State)
+		},
+	)
+
+	// Apply-log timeline: an operator reading the apply log must see each
+	// deployment park at the barrier, the ordered cutover being triggered, and
+	// the rollout reaching completed.
+	logs := grpcApplyLogs(t, apply.ApplyID, 500)
+	require.NotEmpty(t, logs, "apply log timeline is empty")
+
+	var (
+		parkedAtBarrier int // state transitions into waiting_for_cutover
+		cutoverTriggers int // cutover_triggered events
+		reachedComplete int // state transitions into completed
+	)
+	for _, e := range logs {
+		switch {
+		case e.EventType == "state_transition" && state.IsState(e.NewState, state.Apply.WaitingForCutover):
+			parkedAtBarrier++
+		case e.EventType == "cutover_triggered":
+			cutoverTriggers++
+		case e.EventType == "state_transition" && state.IsState(e.NewState, state.Apply.Completed):
+			reachedComplete++
+		}
+	}
+	const deploymentCount = 2 // eu + us
+	assert.GreaterOrEqualf(t, parkedAtBarrier, deploymentCount,
+		"expected each deployment to park at the barrier (state transition into %s) in the apply log", state.Apply.WaitingForCutover)
+	assert.GreaterOrEqual(t, cutoverTriggers, deploymentCount,
+		"expected each deployment to be driven through an ordered cutover (cutover_triggered) in the apply log")
+	assert.GreaterOrEqualf(t, reachedComplete, deploymentCount,
+		"expected each deployment to reach a completion signal (state transition into %s) in the apply log", state.Apply.Completed)
+
+	// Metrics endpoint: the apply lifecycle counter is exposed and no operator
+	// resume failures were recorded for this database during the ordered drive.
+	metrics := grpcMetrics(t)
+	assert.Contains(t, metrics, "schemabot_applies_total",
+		"metrics endpoint should expose the apply lifecycle counter")
+	for line := range strings.SplitSeq(metrics, "\n") {
+		if strings.HasPrefix(line, "schemabot_operator_resume_failures_total{") &&
+			strings.Contains(line, fmt.Sprintf("database=%q", database)) {
+			assert.Failf(t, "operator resume failure recorded",
+				"ordered cutover should record no operator resume failures: %s", line)
+		}
+	}
 
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
 }
