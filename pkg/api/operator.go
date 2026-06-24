@@ -557,6 +557,10 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_missing")
 		return
 	}
+	if state.IsTerminalApplyState(apply.State) {
+		s.reconcileClaimedOperationFromTerminalParent(operationLeaseCtx, driverID, op, apply)
+		return
+	}
 
 	// The claimed operation row's deployment is the authoritative routing key; an
 	// empty deployment is a corrupt row with no routing key, so fail closed.
@@ -951,29 +955,7 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 		return
 	}
 	if state.IsTerminalApplyState(parent.State) {
-		s.logger.Info("operator: parent apply already terminal; reconciling operation to terminal state",
-			"driver", driverID,
-			"apply_operation_id", op.ID,
-			"apply_id", parent.ApplyIdentifier,
-			"deployment", op.Deployment,
-			"environment", parent.Environment,
-			"state", parent.State)
-		marked, err := s.markOperationFromApplyState(ctx, driverID, op, parent)
-		if err != nil {
-			s.logger.Error("operator: failed to reconcile apply_operation from terminal parent; derived apply state not updated",
-				"driver", driverID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
-				"deployment", op.Deployment, "environment", parent.Environment, "state", parent.State, "error", err)
-			return
-		}
-		if !marked {
-			return
-		}
-		if _, err := s.updateApplyStateFromOperations(ctx, driverID, parent, rejectFailedApplyReopen); err != nil {
-			s.logger.Error("operator: failed to update derived apply state for terminal parent",
-				"driver", driverID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
-				"deployment", op.Deployment, "environment", parent.Environment, "error", err)
-			return
-		}
+		s.reconcileClaimedOperationFromTerminalParent(ctx, driverID, op, parent)
 		return
 	}
 	s.logger.Warn("operator: parent apply not claimable for operation; operation will be retried",
@@ -984,6 +966,32 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 		"environment", parent.Environment,
 		"state", parent.State)
 	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
+}
+
+func (s *Service) reconcileClaimedOperationFromTerminalParent(ctx context.Context, driverID int, op *storage.ApplyOperation, parent *storage.Apply) {
+	s.logger.Info("operator: parent apply already terminal; reconciling operation to terminal state",
+		"driver", driverID,
+		"apply_operation_id", op.ID,
+		"apply_id", parent.ApplyIdentifier,
+		"deployment", op.Deployment,
+		"environment", parent.Environment,
+		"state", parent.State)
+	marked, err := s.markOperationFromApplyState(ctx, driverID, op, parent)
+	if err != nil {
+		s.logger.Error("operator: failed to reconcile apply_operation from terminal parent; derived apply state not updated",
+			"driver", driverID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", parent.Environment, "state", parent.State, "error", err)
+		return
+	}
+	if !marked {
+		return
+	}
+	if _, err := s.updateApplyStateFromOperations(ctx, driverID, parent, rejectFailedApplyReopen); err != nil {
+		s.logger.Error("operator: failed to update derived apply state for terminal parent",
+			"driver", driverID, "apply_operation_id", op.ID, "apply_id", parent.ApplyIdentifier,
+			"deployment", op.Deployment, "environment", parent.Environment, "error", err)
+		return
+	}
 }
 
 // failOperationWithoutTasks terminalizes an operation whose drive failed closed
