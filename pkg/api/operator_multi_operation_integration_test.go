@@ -337,6 +337,73 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 				"an operation-only lease must not authorize a direct parent applies write")
 		}
 	})
+
+	t.Run("ConcurrentSameDeploymentShardWorkDrives", func(t *testing.T) {
+		// The per-shard work operations of one deployment fan out: two drivers
+		// claim and drive both pending shards of region-a at the same time. The
+		// group_finalizer then drives only after both shards complete, and the
+		// parent terminalizes after the finalizer. Under serial claiming the
+		// second shard would be unclaimable while the first runs, so the drive
+		// gate would time out — this asserts the shards run concurrently.
+		resetMatrixTables(t, ctx, db)
+		seed := seedShardedFinalizerApply(t, ctx, stor)
+
+		rec := &driveRecorder{}
+		// Both shard work drives block until both have entered ResumeApplyOperation;
+		// the finalizer drive does not participate in the gate.
+		gate := newDriveGate(t, 2)
+		svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Completed, gate: gate},
+		}))
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); driveOneOperation(t, ctx, svc, rec, 1) }()
+		go func() { defer wg.Done(); driveOneOperation(t, ctx, svc, rec, 2) }()
+		wg.Wait()
+
+		assert.ElementsMatch(t, []string{"commerce/-80/users", "commerce/80-/users"}, rec.resumeOperationKeys(),
+			"both shard work operations of the deployment must be claimed concurrently by distinct drivers")
+		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.workAID))
+		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.workBID))
+		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.finalizerID),
+			"the finalizer must remain pending until both shard work siblings complete")
+		assert.Equal(t, state.Apply.Pending, getApply(t, ctx, stor, seed.applyID).State,
+			"the parent must stay non-terminal while the finalizer is pending")
+
+		// The finalizer is now claimable; drive it and the parent terminalizes.
+		driveNextOperation(t, ctx, svc, 1)
+		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.finalizerID))
+		assert.Equal(t, state.Apply.Completed, getApply(t, ctx, stor, seed.applyID).State)
+		assert.Equal(t, 1, svc.matrixSummary.count(),
+			"the aggregate terminal summary publishes once after the finalizer completes")
+	})
+
+	t.Run("PendingStopHaltsRemainingShardWork", func(t *testing.T) {
+		// A pending stop must halt every not-yet-started shard of a deployment,
+		// even though the shards are independently claimable. With both shard
+		// work operations still pending, the queued stop stops them rather than
+		// starting more shard work.
+		resetMatrixTables(t, ctx, db)
+		seed := seedShardedFinalizerApply(t, ctx, stor)
+		requestPendingStop(t, ctx, stor, seed.applyID)
+
+		rec := &driveRecorder{}
+		svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Pending},
+		}))
+
+		svc.recoverApplies(ctx, 1)
+
+		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any shard work")
+		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.workAID),
+			"a pending shard must be stopped, not started, under a pending stop")
+		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.workBID),
+			"every remaining pending shard must be stopped under a pending stop")
+		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.finalizerID),
+			"the finalizer is halted, not started, once the rollout is stopped")
+		assert.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID), "the pending stop request must be completed")
+	})
 }
 
 // --- harness ------------------------------------------------------------
@@ -658,7 +725,9 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 	}
 	m.rec.recordResume(m.deployment, op)
 
-	if m.outcome.gate != nil {
+	// The gate proves work drives run concurrently; the group_finalizer drives
+	// only after its work siblings settle, so it never participates in the gate.
+	if m.outcome.gate != nil && op.OperationKind != storage.ApplyOperationKindGroupFinalizer {
 		m.outcome.gate.arriveAndWait()
 	}
 
