@@ -445,9 +445,17 @@ func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 type exactProgressApplyOperationStore struct {
 	storage.ApplyOperationStore
 	data    *storage.EngineResumeState
+	ops     []*storage.ApplyOperation
 	err     error
 	saveErr error
 	saved   *storage.EngineResumeState
+}
+
+func (s *exactProgressApplyOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.ops, nil
 }
 
 func (s *exactProgressApplyOperationStore) SaveEngineResumeState(_ context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
@@ -610,8 +618,9 @@ func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *test
 		t.Run(tc.name, func(t *testing.T) {
 			client := &LocalClient{
 				storage: &exactProgressStorage{
-					applies: &exactProgressApplyStore{apply: tc.apply},
-					tasks:   &exactProgressTaskStore{tasks: tc.tasks},
+					applies:         &exactProgressApplyStore{apply: tc.apply},
+					tasks:           &exactProgressTaskStore{tasks: tc.tasks},
+					applyOperations: &exactProgressApplyOperationStore{},
 				},
 				logger: slog.Default(),
 			}
@@ -623,6 +632,32 @@ func TestLocalClient_ProgressByApplyIDReturnsNotFoundForMissingApplyData(t *test
 			require.ErrorIs(t, err, tc.wantError)
 		})
 	}
+}
+
+// A VSchema-only apply carries no task rows — it is driven by a task-less
+// group_finalizer. Progress must serve such an apply from its operation rows
+// (the operator maintains apply.State by deriving it from them) rather than
+// failing it as "no tasks".
+func TestLocalClient_ProgressServesTaskLessApplyFromOperations(t *testing.T) {
+	client := &LocalClient{
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: &storage.Apply{
+				ID: 7, ApplyIdentifier: "apply-vschema-only", State: state.Apply.Completed,
+			}},
+			tasks: &exactProgressTaskStore{},
+			applyOperations: &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Completed},
+			}},
+		},
+		logger: slog.Default(),
+	}
+
+	resp, err := client.Progress(t.Context(), &ternv1.ProgressRequest{
+		ApplyId:     "apply-vschema-only",
+		Environment: "staging",
+	})
+	require.NoError(t, err)
+	assert.True(t, isTerminalProtoState(resp.State), "task-less completed apply should report a terminal state, got %v", resp.State)
 }
 
 func groupedResumeStateClient(databaseType string, applyOperations storage.ApplyOperationStore) *LocalClient {

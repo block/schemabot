@@ -1854,7 +1854,26 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, err)
 	}
 	if len(tasks) == 0 {
-		return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, storage.ErrTaskNotFound)
+		// A task-less apply — e.g. a VSchema-only apply driven by a
+		// group_finalizer, which carries no task rows. Serve its state from the
+		// apply row, which the operator maintains by deriving it from the
+		// operation rows; the API progress handler overlays the engine display
+		// fields (VSchema status/diff, branch) from the operations' resume
+		// metadata. An apply with neither tasks nor operations is genuinely
+		// taskless work and stays the fail-closed not-found case.
+		ops, opErr := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+		if opErr != nil {
+			return nil, fmt.Errorf("list apply_operations for apply %s: %w", req.ApplyId, opErr)
+		}
+		if len(ops) == 0 {
+			return nil, fmt.Errorf("get tasks for apply %s: %w", req.ApplyId, storage.ErrTaskNotFound)
+		}
+		c.logger.Info("Progress: serving task-less apply from operations",
+			"apply_id", req.ApplyId, "operation_count", len(ops), "state", apply.State)
+		return &ternv1.ProgressResponse{
+			State:  storageStateToProto(apply.State),
+			Engine: c.protoEngine(),
+		}, nil
 	}
 
 	c.logger.Debug("Progress: found tasks", "count", len(tasks), "database", c.config.Database, "apply_id", req.ApplyId)
