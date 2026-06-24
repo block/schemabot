@@ -207,11 +207,26 @@ func (r *PlanResult) FlatTableChanges() []TableChange {
 type SchemaChange struct {
 	Namespace    string        // MySQL schema, Vitess keyspace, Postgres schema
 	TableChanges []TableChange // Per-table DDL changes
+	// Shards reports per-shard membership and drift for a sharded namespace. It
+	// is captured at plan time so apply-create can deterministically rebuild
+	// per-shard operation groups after the plan request has returned. Engines
+	// that are not sharded (Spirit) leave this empty; the gRPC plan path carries
+	// the equivalent data on the proto PlanResponse.
+	Shards []ShardPlan
 	// Metadata contains engine-specific plan annotations, such as display diffs
 	// or apply flags. It is not rollback input; rollback uses OriginalFiles.
 	Metadata              map[string]string
 	OriginalFiles         map[string]string // Declarative schema files and artifacts for this namespace before applying
 	OriginalFilesCaptured bool              // True when OriginalFiles was captured, including an empty namespace
+}
+
+// ShardPlan records per-shard membership and drift for a sharded namespace,
+// captured at plan time. It mirrors storage.ShardPlan so an in-process engine
+// can emit shard fanout metadata without the engine package importing storage.
+type ShardPlan struct {
+	Shard       string // Shard name (e.g., "-80", "80-")
+	Namespace   string // Namespace/keyspace this shard belongs to
+	NeedsChange bool   // True if this shard requires a schema change
 }
 
 // LintViolation represents a lint finding from schema analysis.

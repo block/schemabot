@@ -1024,6 +1024,20 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 				Operation: ddl.StatementTypeToOp(tc.Operation),
 			})
 		}
+		// Carry per-shard fanout metadata from the engine into stored plan data,
+		// mirroring the gRPC path's protoShardPlansToStorage. Apply-create reads
+		// NamespacePlanData.Shards to rebuild per-shard operation groups.
+		for _, sp := range sc.Shards {
+			namespace := sp.Namespace
+			if namespace == "" {
+				namespace = ns
+			}
+			nsData.Shards = append(nsData.Shards, storage.ShardPlan{
+				Shard:       sp.Shard,
+				Namespace:   namespace,
+				NeedsChange: sp.NeedsChange,
+			})
+		}
 		if len(sc.OriginalFiles) > 0 {
 			nsData.OriginalFiles = sc.OriginalFiles
 		}
